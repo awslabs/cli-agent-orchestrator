@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 DASHBOARD_RESOURCE_URI = "ui://cao/dashboard"
 AGENT_RESOURCE_URI = "ui://cao/agent"
 EVENT_STREAM_RESOURCE_URI = "ui://cao/event-stream"
+GRAPH_RESOURCE_URI = "ui://cao/graph"
 
 # Default Content-Security-Policy domains for the sandboxed iframe, expressed in the
 # **structured** SEP-1865 ``_meta.ui.csp`` shape (NOT a raw CSP string). The host
@@ -52,6 +53,7 @@ _RESOURCE_FILES = {
     DASHBOARD_RESOURCE_URI: "dashboard.html",
     AGENT_RESOURCE_URI: "agent.html",
     EVENT_STREAM_RESOURCE_URI: "event-stream.html",
+    GRAPH_RESOURCE_URI: "graph.html",
 }
 
 # Preferred iframe sizes per resource. NOTE: `preferredFrameSize` is a
@@ -66,6 +68,7 @@ PREFERRED_FRAMES: Dict[str, Dict[str, int]] = {
     DASHBOARD_RESOURCE_URI: {"width": 1280, "height": 800},
     AGENT_RESOURCE_URI: {"width": 1024, "height": 720},
     EVENT_STREAM_RESOURCE_URI: {"width": 640, "height": 480},
+    GRAPH_RESOURCE_URI: {"width": 1280, "height": 800},
 }
 
 

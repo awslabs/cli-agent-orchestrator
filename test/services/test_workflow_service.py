@@ -467,6 +467,81 @@ async def test_cancel_terminal_run_conflict(monkeypatch):
         ws.cancel_run("runDone")
 
 
+@pytest.mark.asyncio
+async def test_cancel_interrupts_in_flight_wait_converges_cancelled(monkeypatch):
+    """#409b: a run blocked inside an in-flight (hung) step wait converges to
+    CANCELLED when cancelled — not observed only at the next boundary.
+
+    The mocked run_agent_step blocks on the run's cancel_event exactly as the
+    real _wait_for_completion does, then raises StepCancelledError. The engine
+    must settle the run CANCELLED (not FAILED, not COMPLETED) and NOT consume the
+    retry budget (attempts stays 1)."""
+    from cli_agent_orchestrator.services.agent_step import StepCancelledError
+
+    async def _hang_until_cancelled(*a, **kw):
+        run_id = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"]
+        cancel_event = kw["cancel_event"]
+        # Fire the cancel from "outside" once the step is in-flight, then honor it
+        # exactly as the real substrate would (interrupt the wait, raise).
+        ws.cancel_run(run_id)
+        await cancel_event.wait()
+        raise StepCancelledError(terminal_id="term-hung")
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_hang_until_cancelled))
+    steps = [
+        WorkflowStep(id="s1", provider="p", agent="g", prompt="a", retries=3),
+        WorkflowStep(id="s2", provider="p", agent="g", prompt="b"),
+    ]
+    res = await ws.start_run(_spec(steps=steps), {}, "runHang")
+
+    assert res.state == RunState.CANCELLED
+    states = {s.id: s.state for s in res.steps}
+    # Interrupted step is SKIPPED (not FAILED, not stuck RUNNING) and its retry
+    # budget was NOT consumed — a cancel is not a run-failure.
+    assert states["s1"] == StepState.SKIPPED
+    assert states["s2"] == StepState.SKIPPED
+    assert res.steps[0].attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_sets_event_on_record(monkeypatch):
+    """cancel_run fires the record's cancel_event (the interrupt seam) in addition
+    to flagging cancelled — so an in-flight wait can observe it immediately."""
+
+    async def _side(*a, **kw):
+        run_id = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"]
+        rec = ws.run_registry[run_id]
+        assert not rec.cancel_event.is_set()
+        ws.cancel_run(run_id)
+        assert rec.cancelled is True
+        assert rec.cancel_event.is_set()  # the interrupt seam fired
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    res = await ws.start_run(_spec(), {}, "runEvt")
+    assert res.state == RunState.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_double_cancel_is_idempotent(monkeypatch):
+    """Cancelling twice while a step is in flight must not raise (setting an
+    already-set Event is a no-op) and still converges CANCELLED."""
+
+    async def _side(*a, **kw):
+        run_id = kw["env_vars"]["CAO_WORKFLOW_RUN_ID"]
+        ws.cancel_run(run_id)
+        ws.cancel_run(run_id)  # second cancel — must be a no-op, never raise
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    steps = [
+        WorkflowStep(id="s1", provider="p", agent="g", prompt="a"),
+        WorkflowStep(id="s2", provider="p", agent="g", prompt="b"),
+    ]
+    res = await ws.start_run(_spec(steps=steps), {}, "runDbl")
+    assert res.state == RunState.CANCELLED
+
+
 # ---------------------------------------------------------------------------
 # get_run_status
 # ---------------------------------------------------------------------------

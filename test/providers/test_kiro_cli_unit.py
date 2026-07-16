@@ -305,7 +305,7 @@ class TestKiroCliProviderStatusDetection:
         assert status == TerminalStatus.ERROR
 
     def test_get_status_with_empty_output(self):
-        """Test status detection with empty output."""
+        """Test status detection with empty output -> UNKNOWN (no dispatch-timing guess)."""
         output = ""
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")

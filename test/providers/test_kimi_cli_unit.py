@@ -109,6 +109,7 @@ class TestKimiCliProviderInitialization:
         mock_profile.model = None
         mock_profile.system_prompt = "You are a helpful assistant"
         mock_profile.mcpServers = None
+        mock_profile.provider_init_timeout = None
         mock_load.return_value = mock_profile
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="developer")
@@ -153,6 +154,7 @@ class TestKimiCliProviderInitialization:
                 "args": ["-y", "cao-mcp-server"],
             }
         }
+        mock_profile.provider_init_timeout = None
         mock_load.return_value = mock_profile
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="developer")
@@ -241,7 +243,7 @@ class TestKimiCliProviderStatusDetection:
         )
 
     def test_get_status_unknown_empty(self):
-        """Test UNKNOWN on empty output."""
+        """Empty output -> UNKNOWN (native=None always falls through, no guess)."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         assert provider.get_status("") == TerminalStatus.UNKNOWN
 

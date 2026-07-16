@@ -22,6 +22,29 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var, falling back when the value is invalid."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    """Read a float env var, falling back when the value is invalid OR non-positive.
+
+    For env vars that feed a ``threading.Event.wait(timeout)``-style poll
+    interval, a non-positive value isn't just atypical, it's actually
+    invalid for the parameter's meaning: ``Event.wait(0)``/``wait(negative)``
+    returns immediately, turning a periodic poll loop into a hot spin (round-3
+    Copilot review on #397, ``PIPE_LIVENESS_CHECK_INTERVAL_S``). Treated the
+    same way ``_env_float`` already treats a malformed string — fall back to
+    the default — rather than introducing a separate arbitrary floor value.
+    """
+    value = _env_float(name, default)
+    return value if value > 0 else default
+
+
 # =============================================================================
 # Session Configuration
 # =============================================================================
@@ -77,6 +100,63 @@ STATE_BUFFER_MAX = 8192
 # can emit thousands of small chunks in a short burst, so keep this comfortably
 # above the old 1024 default while still bounded.
 EVENT_BUS_MAX_QUEUE_SIZE = _env_int("CAO_EVENT_BUS_MAX_QUEUE_SIZE", 16384)
+
+# ---- pipe-pane liveness watchdog (issue #388) -------------------------------
+# tmux's own pipe-pane forwarder can silently stop delivering bytes to the FIFO
+# after a burst of alternate-screen redraws — the pane keeps rendering (visible
+# via capture-pane) but the piped copy freezes, so the FIFO reader, the
+# StatusMonitor buffer, and GET /terminals/{id}/output all stall on stale
+# content indefinitely (pane_pipe still reports 1; nothing errors). The
+# FifoManager watchdog compares tmux's live pane content against whether the
+# FIFO delivered any bytes in the same window: pane advanced + FIFO silent =
+# a stalled forwarder, which it re-arms (stop_pipe_pane then pipe_pane — a bare
+# re-pipe would just toggle the already-"piped" pane OFF).
+PIPE_LIVENESS_CHECK_INTERVAL_S = _env_positive_float("CAO_PIPE_LIVENESS_CHECK_INTERVAL_S", 4.0)
+# Lines of live pane content compared to decide whether the pane advanced. A
+# tail is enough: a stall diverges the visible screen, and comparing only the
+# tail keeps each check to one cheap capture-pane call.
+PIPE_LIVENESS_TAIL_LINES = _env_int("CAO_PIPE_LIVENESS_TAIL_LINES", 80)
+# Consecutive diverging checks (pane advanced, FIFO delivered nothing) before
+# re-arming. Default 2, not 1: a single diverging check can be a false
+# positive on a healthy-but-bursty pipe (a burst lands just before the check
+# boundary and the reader hasn't drained it yet) and the immediate
+# stop-then-start re-arm loses any bytes produced in that gap. Requiring two
+# consecutive diverging checks absorbs that race at the cost of one extra
+# interval of recovery latency on a genuine stall.
+PIPE_LIVENESS_STALL_CHECKS = _env_int("CAO_PIPE_LIVENESS_STALL_CHECKS", 2)
+# Consecutive re-arm *failures* (rearm() itself raising) before the watchdog
+# gives up on a terminal and drops its enrollment, instead of retrying forever
+# with a WARNING/exception log every failure.
+PIPE_LIVENESS_MAX_REARM_FAILURES = _env_int("CAO_PIPE_LIVENESS_MAX_REARM_FAILURES", 5)
+# Cold-start stall deadline (harness-control#93): the divergence check above
+# can ONLY ever catch a pipe that WAS delivering and then went stale — it
+# requires a change from an established "healthy" baseline. A pipe that has
+# been dead since the terminal was created never establishes one: if the
+# shell renders its prompt once and then sits idle (the common case), every
+# check sees the identical content as the last, "diverged_from_baseline" is
+# always False, and the watchdog can wait forever without ever re-arming —
+# meanwhile wait_for_shell() times out (60s default) waiting for a FIFO
+# buffer that was never going to fill. This is a separate, positive check:
+# has the FIFO delivered ANYTHING at all since the terminal was registered?
+# If not, and this much time has passed, and the live pane already has real
+# content (ruling out "still genuinely booting, nothing to show yet"), the
+# forwarder never started forwarding in the first place — re-arm immediately
+# rather than waiting on a divergence that will never arrive. Deliberately
+# much shorter than PIPE_LIVENESS_CHECK_INTERVAL_S's steady-state cadence:
+# this is a one-shot "did it ever start" deadline, not a recurring poll.
+PIPE_LIVENESS_COLD_START_GRACE_S = _env_float("CAO_PIPE_LIVENESS_COLD_START_GRACE_S", 3.0)
+# Cap on cold-start re-arm ATTEMPTS (not exceptions — rearm() succeeding but the
+# pipe still never delivering counts here too), separate from
+# PIPE_LIVENESS_MAX_REARM_FAILURES (which only counts rearm() raising). Without
+# this, a terminal whose pipe is genuinely, permanently dead (not just racing a
+# one-time attach timing gap) would re-trigger the cold-start check every grace
+# period forever: a successful rearm() doesn't mark the FIFO as having
+# delivered — only the reader thread pulling a real byte off it does — so
+# "still False after grace period" stays true and the same terminal gets
+# re-armed and replayed indefinitely, an unbounded stop/start + replay loop.
+# After this many attempts, give up loudly and drop the terminal from the
+# watchdog, exactly like the rearm()-exception path already does.
+PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS = _env_int("CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS", 5)
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against
@@ -463,8 +543,9 @@ WORKFLOW_RUN_REQUEST_TIMEOUT = (WORKFLOW_STEP_TIMEOUT + 120.0) * 12 + 180.0  # =
 SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES = frozenset({"cli_agent_orchestrator"})
 
 # Modules whose import earns a nondeterminism WARNING (U1-A3, Q3=A): resume
-# replays journaled calls and requires deterministic re-execution. Import-level
-# only — no call-site analysis. A warning never fails a script (FR-1.7).
+# re-executes the frozen script, including completed ``run_step`` calls, so
+# deterministic control flow keeps repeated work predictable. Import-level only
+# — no call-site analysis. A warning never fails a script (FR-1.7).
 SCRIPT_LINT_NONDETERMINISM_MODULES = frozenset({"random", "secrets", "uuid", "time", "datetime"})
 
 # Env-var injection allowlist for POST /terminals/run-step (Bolt 2, U2/C6,

@@ -149,23 +149,54 @@ def _toml_scalar(value: Any) -> str:
     return f'"{escaped}"'
 
 
+# codexConfig keys are dotted CONFIG PATHS ("features.fast_mode") — dots are
+# the path separator and intentional. MCP server names and env keys are single
+# TOML BARE KEYS: a dot there would silently create a NESTED table
+# (mcp_servers.my.srv.command → mcp_servers['my']['srv'], not
+# mcp_servers['my.srv']), so codex would never find the server.
 _CODEX_CONFIG_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+_CODEX_BARE_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_config_key(key: Any, *, source: str, allow_dots: bool = False) -> str:
+    """Validate a key that is interpolated into a Codex ``-c`` override path.
+
+    Spaces, ``=``, quotes, or control characters are rejected so a
+    misconfigured profile fails fast with a clear error instead of silently
+    emitting a malformed ``-c`` override (an unescaped quote or newline in the
+    KEY half would corrupt the TOML the same way an unescaped value would).
+
+    ``allow_dots=True`` permits dotted config paths (codexConfig keys like
+    ``features.fast_mode``). MCP server names and env keys must be single
+    TOML bare keys: a dot there would nest the entry under the wrong TOML
+    table (see pattern comment above). ``source`` names the profile field
+    for the error message.
+    """
+    if allow_dots:
+        pattern = _CODEX_CONFIG_KEY_PATTERN
+        expected = "a dotted config path over [A-Za-z0-9_.-] (e.g. 'features.fast_mode')"
+    else:
+        pattern = _CODEX_BARE_KEY_PATTERN
+        expected = (
+            "a single TOML bare key over [A-Za-z0-9_-] (no dots -- a dot "
+            "would nest the entry under the wrong TOML table)"
+        )
+    # fullmatch, not match: with ``$`` alone, re.match accepts a TRAILING
+    # newline ("srv\n" passes ^...$), which is exactly the bug class this
+    # validation exists to close.
+    if not isinstance(key, str) or not pattern.fullmatch(key):
+        raise ValueError(f"Invalid {source} key {key!r}: must be {expected}")
+    return key
 
 
 def _toml_override(key: str, value: Any) -> str:
     """Build one ``key=<toml-scalar>`` Codex ``-c`` override, validating the key.
 
-    Keys must be non-empty dotted config paths over ``[A-Za-z0-9_.-]`` (e.g.
-    ``features.fast_mode``); spaces, ``=``, quotes, or control characters are
-    rejected so a misconfigured profile fails fast instead of silently emitting
-    a malformed ``-c`` override. Value-serialization failures from
-    :func:`_toml_scalar` are re-raised with the offending key for context.
+    Key validation is delegated to :func:`_validate_config_key`.
+    Value-serialization failures from :func:`_toml_scalar` are re-raised with
+    the offending key for context.
     """
-    if not isinstance(key, str) or not _CODEX_CONFIG_KEY_PATTERN.match(key):
-        raise ValueError(
-            f"Invalid codexConfig key {key!r}: must be a dotted config path over "
-            "[A-Za-z0-9_.-] (e.g. 'features.fast_mode')"
-        )
+    _validate_config_key(key, source="codexConfig", allow_dots=True)
     try:
         return f"{key}={_toml_scalar(value)}"
     except TypeError as exc:
@@ -275,6 +306,13 @@ class CodexProvider(BaseProvider):
             # Each server field is set via dotted path: mcp_servers.<name>.<field>=<value>
             if profile.mcpServers:
                 for server_name, server_config in profile.mcpServers.items():
+                    # Codex-only validation: the server name becomes part of
+                    # the -c override PATH (a TOML dotted path), so it must be
+                    # a single bare key — a quote/newline would corrupt the
+                    # TOML and a dot would nest the server under the wrong
+                    # table. Other providers write JSON configs where any
+                    # string key is valid, so they don't need this.
+                    _validate_config_key(server_name, source="mcpServers name")
                     prefix = f"mcp_servers.{server_name}"
                     if isinstance(server_config, dict):
                         cfg = dict(server_config)
@@ -292,6 +330,7 @@ class CodexProvider(BaseProvider):
                         command_parts.extend(["-c", f"{prefix}.args={args_toml}"])
                     if "env" in cfg and cfg["env"]:
                         for env_key, env_val in cfg["env"].items():
+                            _validate_config_key(env_key, source="mcpServers env")
                             command_parts.extend(
                                 ["-c", f"{prefix}.env.{env_key}={_toml_scalar(str(env_val))}"]
                             )
@@ -405,10 +444,13 @@ class CodexProvider(BaseProvider):
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
         if not output:
             return TerminalStatus.UNKNOWN
 

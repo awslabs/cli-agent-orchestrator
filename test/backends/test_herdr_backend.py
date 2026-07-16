@@ -934,16 +934,29 @@ class TestGetNativeStatus:
         assert result == TerminalStatus.IDLE
 
     @patch("subprocess.run")
-    def test_unknown_returns_error(self, mock_run, backend):
+    def test_unknown_returns_none(self, mock_run, backend):
+        """herdr 'unknown' -> None (not ERROR): a wrapped exec launch hides the
+        agent CLI, so herdr never registers it and reports 'unknown' for a
+        healthy pane. None lets the caller resolve status another way."""
         self._setup_fresh_resolution(backend)
         mock_run.side_effect = self._make_resolution_side_effects(
             _completed(self._make_pane_get_response("unknown"))
         )
 
-        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        result = backend.get_native_status("s", "w")
+        assert result is None
+
+    @patch("subprocess.run")
+    def test_unrecognized_status_returns_none(self, mock_run, backend):
+        """Any agent_status herdr may add later that CAO does not map -> None,
+        same as 'unknown' (never leaks through as a bogus status)."""
+        self._setup_fresh_resolution(backend)
+        mock_run.side_effect = self._make_resolution_side_effects(
+            _completed(self._make_pane_get_response("some-future-state"))
+        )
 
         result = backend.get_native_status("s", "w")
-        assert result == TerminalStatus.ERROR
+        assert result is None
 
     @patch("subprocess.run")
     def test_command_failure_returns_none(self, mock_run, backend):

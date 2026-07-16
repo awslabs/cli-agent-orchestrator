@@ -164,6 +164,42 @@ class TestLoadAndValidate:
         assert spec.name == "once"
         assert opens["count"] == 1
 
+    def test_oversized_spec_read_is_capped_not_full_file(self, spec_dir, monkeypatch):
+        """The byte-cap check must not read an oversized file fully into memory
+        first — ``fh.read()`` is called with a bounded size argument (MAX+1),
+        so a multi-gigabyte spec is rejected after reading only MAX+1 bytes,
+        not after buffering the whole file."""
+        from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
+
+        path = _write_spec(spec_dir, "huge", "x" * (WORKFLOW_MAX_SPEC_BYTES * 4))
+        real_open = open
+        captured = {}
+
+        class _WrappedFile:
+            def __init__(self, fh):
+                self._fh = fh
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._fh.__exit__(*exc)
+
+            def read(self, size=-1):
+                captured["size"] = size
+                return self._fh.read(size)
+
+        def wrapped_open(file, *a, **kw):
+            fh = real_open(file, *a, **kw)
+            if str(file) == os.path.realpath(str(path)):
+                return _WrappedFile(fh)
+            return fh
+
+        monkeypatch.setattr("builtins.open", wrapped_open)
+        with pytest.raises(ValueError, match="bytes"):
+            svc.load_and_validate(str(path), base_dir=str(spec_dir))
+        assert captured["size"] == WORKFLOW_MAX_SPEC_BYTES + 1
+
 
 class TestValidateOnly:
     def test_pass(self, spec_dir):
@@ -297,3 +333,154 @@ class TestDeleteWorkflow:
         svc.delete_workflow("twice", scan_dir=str(spec_dir))
         with pytest.raises(KeyError):
             svc.delete_workflow("twice", scan_dir=str(spec_dir))
+
+
+def _write_script(spec_dir: Path, name: str, body: str = "def main():\n    pass\n") -> Path:
+    path = spec_dir / f"{name}.py"
+    path.write_text(body)
+    return path
+
+
+class TestScriptTierGetWorkflow:
+    """Tier detection + ScriptSpec resolution (issue #312, Bolt 4 / U5, A1)."""
+
+    def test_py_extension_resolves_to_scriptspec(self, spec_dir):
+        from cli_agent_orchestrator.models.workflow import ScriptSpec
+
+        path = _write_script(spec_dir, "scr")
+        spec = svc.get_workflow(str(path), scan_dir=str(spec_dir))
+        assert isinstance(spec, ScriptSpec)
+        assert spec.name == "scr"
+        assert spec.findings == []
+
+    def test_py_non_utf8_spec_raises_valueerror_not_unicodedecodeerror(self, spec_dir):
+        """A ``.py`` spec containing invalid UTF-8 bytes must surface as the
+        narrow ``ValueError`` the API maps to 400 — a bare ``UnicodeDecodeError``
+        would leak past the boundary's ``except ValueError`` (it IS a
+        ``ValueError`` subclass, but the read path re-raises it explicitly here
+        for an unambiguous error message rather than relying on subclassing)."""
+        path = spec_dir / "badenc.py"
+        path.write_bytes(b"def main():\n    x = '\xff\xfe'\n    pass\n")
+        with pytest.raises(ValueError):
+            svc.get_workflow(str(path), scan_dir=str(spec_dir))
+
+    def test_py_load_time_lint_carries_findings(self, spec_dir):
+        path = _write_script(spec_dir, "badscr", "def main(:\n")
+        spec = svc.get_workflow(str(path), scan_dir=str(spec_dir))
+        assert any(f.rule_id == "syntax" for f in spec.findings)
+
+    def test_cross_tier_collision_raises_at_access_time(self, spec_dir):
+        from cli_agent_orchestrator.models.workflow import TierCollisionError
+
+        _write_spec(spec_dir, "dup")
+        _write_script(spec_dir, "dup")
+        with pytest.raises(TierCollisionError):
+            svc.get_workflow(str(spec_dir / "dup.py"), scan_dir=str(spec_dir))
+
+    def test_unrecognized_extension_raises_valueerror(self, spec_dir):
+        path = spec_dir / "weird.txt"
+        path.write_text("hello")
+        with pytest.raises(ValueError):
+            svc.get_workflow(str(path), scan_dir=str(spec_dir))
+
+    def test_yaml_arm_stays_byte_identical(self, spec_dir):
+        # A .yaml file alongside a UNRELATED .py file (different stem) must
+        # resolve exactly as before — no collision, no new dispatch executed.
+        path = _write_spec(spec_dir, "onlyyaml")
+        _write_script(spec_dir, "unrelated")
+        spec = svc.get_workflow(str(path), scan_dir=str(spec_dir))
+        assert spec.name == "onlyyaml"
+        assert spec.mode == "sequential"
+
+    def test_py_traversal_escaping_scan_dir_rejected(self, spec_dir, tmp_path):
+        """A ``.py`` path reaching outside ``scan_dir`` via ``..`` traversal is
+        rejected by ``_safe_spec_path`` before the file is ever opened
+        (CodeQL py/path-injection sink at ``_read_script_spec``'s ``open()``)."""
+        outside = tmp_path / "outside.py"
+        outside.write_text("def main():\n    pass\n")
+        with pytest.raises(ValueError, match="escapes its validated directory"):
+            svc.get_workflow(str(spec_dir / ".." / "outside.py"), scan_dir=str(spec_dir))
+
+    def test_py_symlink_escaping_scan_dir_rejected(self, spec_dir):
+        """A ``.py`` symlink inside ``scan_dir`` whose target resolves OUTSIDE it
+        is rejected — the resolved (not the literal) path is what's checked."""
+        target = "/etc/hosts"
+        link = spec_dir / "sneaky.py"
+        if not os.path.exists(target):
+            pytest.skip("no stable escape target on this platform")
+        os.symlink(target, link)
+        with pytest.raises(ValueError, match="escapes its validated directory"):
+            svc.get_workflow(str(link), scan_dir=str(spec_dir))
+
+    def test_py_bare_name_lookup_with_tampered_index_row_still_rejected(
+        self, isolated_db, spec_dir, tmp_path
+    ):
+        """The bare-name arm of ``get_workflow`` resolves through
+        ``_resolve_source_path`` -> a raw string pulled out of SQLite, then
+        ``_load_by_extension`` -> ``_read_script_spec``. If the index row's
+        ``source_path`` were ever tampered/stale/out-of-policy (e.g. a scan_dir
+        reconfigured after indexing, or direct DB manipulation), the bare-name
+        lookup must NOT trust that string — ``_read_script_spec`` re-validates
+        it via ``_safe_spec_path`` before ever calling ``open()``, so the
+        escape is still caught even though the name-based path never touches
+        ``_safe_spec_path`` directly on the way in."""
+        import sqlite3
+
+        outside = tmp_path / "outside.py"
+        outside.write_text("def main():\n    pass\n")
+
+        with sqlite3.connect(str(isolated_db)) as conn:
+            conn.execute(
+                "INSERT INTO workflow_index "
+                "(name, source_path, mode, step_count, description, indexed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("tampered", str(outside), "script", None, "", "2026-01-01T00:00:00Z"),
+            )
+            conn.commit()
+
+        # A name-based lookup that skips rebuild would read the tampered row
+        # straight from the index; rebuild itself would also drop this row
+        # since the file lives outside scan_dir. Either way, calling the
+        # lower-level read primitive directly with the tampered string proves
+        # _read_script_spec's OWN re-validation is what's protecting it.
+        with pytest.raises(ValueError, match="escapes its validated directory"):
+            svc._read_script_spec(str(outside), "tampered", base_dir=str(spec_dir))
+
+
+class TestScriptTierRebuildIndex:
+    """``rebuild_index_from_files`` .py glob widening (A2, BR-4)."""
+
+    def test_script_row_has_none_step_count(self, isolated_db, spec_dir):
+        _write_script(spec_dir, "scr")
+        rows = svc.list_workflows(scan_dir=str(spec_dir))
+        assert len(rows) == 1
+        assert rows[0].mode == "script"
+        assert rows[0].step_count is None
+
+    def test_yaml_row_step_count_unchanged(self, isolated_db, spec_dir):
+        _write_spec(spec_dir, "yamlwf")
+        rows = svc.list_workflows(scan_dir=str(spec_dir))
+        assert rows[0].step_count == 1
+
+    def test_colliding_stem_skipped_from_index_other_names_still_index(self, isolated_db, spec_dir):
+        # The .py arm skips a colliding stem (BR-2); the pre-existing YAML arm
+        # is unaffected — its own scan loop indexes "dup.yaml" unchanged
+        # (FR-5.1) even though the SAME name also has a colliding .py sibling.
+        # Only the .py arm's OWN row is suppressed; other .py names still index.
+        _write_spec(spec_dir, "dup")
+        _write_script(spec_dir, "dup")
+        _write_script(spec_dir, "solo")
+        rows = svc.list_workflows(scan_dir=str(spec_dir))
+        by_name = {r.name: r for r in rows}
+        assert sorted(by_name) == ["dup", "solo"]
+        assert by_name["dup"].mode == "sequential"  # the YAML row, not a script row
+        assert by_name["solo"].mode == "script"
+
+
+class TestRenderFindings:
+    def test_renders_lint_findings_as_dicts(self):
+        from cli_agent_orchestrator.models.workflow import LintFinding
+
+        findings = [LintFinding(rule_id="syntax", severity="error", line=1, message="bad")]
+        rendered = svc.render_findings(findings)
+        assert rendered == [{"rule_id": "syntax", "severity": "error", "line": 1, "message": "bad"}]

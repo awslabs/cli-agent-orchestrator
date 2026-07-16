@@ -36,7 +36,12 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_terminal_shell_command,
 )
-from cli_agent_orchestrator.constants import FIFO_DIR, SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import (
+    FIFO_DIR,
+    PIPE_LIVENESS_TAIL_LINES,
+    SESSION_PREFIX,
+    TERMINAL_LOG_DIR,
+)
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
@@ -172,8 +177,10 @@ async def create_terminal(
             ``new_session=True``, these are stored on the session record and
             inherited by every worker spawned later in the same session. On
             ``new_session=False``, the persisted session vars are merged in
-            automatically; the explicit ``env_vars`` argument is ignored to
-            keep the per-session view consistent. See issue #248.
+            automatically and the explicit ``env_vars`` argument is merged on
+            top, winning on key conflict — per-step vars (e.g. workflow
+            routing ids) must reach the window even inside an existing
+            session. See issues #248 and #408.
         caller_id: Terminal ID of the supervisor that created this terminal
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
@@ -187,6 +194,14 @@ async def create_terminal(
         TimeoutError: If provider initialization times out
     """
     session_created = False  # tracks whether THIS call created the tmux session
+    # harness-control#186: tracks whether THIS call created a new WINDOW in an
+    # already-existing session (the `new_session=False` branch below — what
+    # every MCP spawn/assign-into-existing-session call does). Independent of
+    # `session_created` above: on failure, the cleanup path already tears
+    # down the whole session (window included) when THIS call created a brand
+    # new one, but had no equivalent for a window added to a session that
+    # already existed — see the `except` block.
+    window_created = False
     try:
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -229,13 +244,18 @@ async def create_terminal(
             # Add window to existing session
             if not get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
+            # Merge explicit per-step env_vars over the persisted session env
+            # (per-step wins on conflict): workflow routing ids like
+            # CAO_WORKFLOW_RUN_ID must reach the window even when it joins an
+            # existing session (issue #408).
             window_name = get_backend().create_window(
                 session_name,
                 window_name,
                 terminal_id,
                 working_directory,
-                extra_env=get_session_env(session_name),
+                extra_env={**get_session_env(session_name), **(env_vars or {})},
             )
+            window_created = True  # only set after successful creation
 
         # Step 3: Load the profile once for allowed tool resolution before
         # provider initialization. The skill catalog is computed only for
@@ -290,14 +310,28 @@ async def create_terminal(
         # socket events and their pipe_pane is a no-op, so skip the FIFO there and
         # rely on the herdr inbox registration below.
         if not get_backend().supports_event_inbox():
-            # Reader must exist BEFORE pipe-pane starts so it captures from the start.
-            fifo_manager.create_reader(terminal_id)
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+            # Reader must exist BEFORE pipe-pane starts so it captures from the
+            # start. Enroll it in the pipe-pane liveness watchdog (issue #388):
+            # supply a probe for tmux's live pane content and a re-arm that
+            # re-attaches a stalled forwarder. The re-arm does stop-then-start,
+            # NOT a bare pipe_pane() — a stalled pane still reports pane_pipe=1,
+            # so the backend's ``pipe-pane -o`` toggle would just switch the
+            # dead pipe OFF instead of restarting it.
+            def _probe_pane(s=session_name, w=window_name) -> str:
+                return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+                get_backend().stop_pipe_pane(s, w)
+                get_backend().pipe_pane(s, w, p)
+
+            fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
 
             # Configure pipe-pane to stream output to the FIFO. This enables
             # real-time event-driven processing via StatusMonitor and LogWriter
             # (LogWriter writes TERMINAL_LOG_DIR/{id}.log from the FIFO). A pane
             # has a single pipe-pane target, so we pipe ONLY to the FIFO.
-            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
             get_backend().pipe_pane(session_name, window_name, str(fifo_path))
 
             # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
@@ -429,6 +463,24 @@ async def create_terminal(
             # secrets don't linger in memory or bleed into a future reuse
             # of the same name.
             clear_session_env(session_name)
+        elif window_created and session_name and window_name:
+            # harness-control#186: a window added to an ALREADY-EXISTING session
+            # (new_session=False -- every MCP spawn/assign-into-existing-session
+            # call) has no session-level teardown to fall back on above, since
+            # `session_created` is False and the pre-existing session must stay
+            # up. Live-reproduced without this: a provider init timeout here
+            # (e.g. "Claude Code initialization timed out after 60s") rolls back
+            # the DB row and stops the FIFO/provider/status-monitor above, but
+            # the tmux WINDOW itself — the actual pane, still running whatever
+            # shell/process the provider left behind — was never torn down.
+            # Result: the caller (the spawning agent's MCP tool call) gets a
+            # hard error back, AND a permanently orphaned window is left behind:
+            # invisible to this terminal's own list/tree (the DB row is gone),
+            # never cleaned up, sitting there indefinitely.
+            try:
+                get_backend().kill_window(session_name, window_name)
+            except Exception:
+                pass  # Ignore cleanup errors
         raise
 
 

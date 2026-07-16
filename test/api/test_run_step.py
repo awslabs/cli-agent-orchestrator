@@ -90,6 +90,56 @@ class TestRunStepEndpoint:
         assert resp.status_code == 500
         assert "boom" in resp.json()["detail"]
 
+    @pytest.mark.parametrize(
+        ("exc", "expected_status"),
+        [(TimeoutError("raw timeout"), 504), (RuntimeError("unexpected"), 500)],
+    )
+    def test_untyped_failure_settles_script_step_failed(
+        self, client, monkeypatch, exc, expected_status
+    ):
+        """Failures outside StepExecutionError must not leave a script step RUNNING."""
+        from cli_agent_orchestrator.models.workflow import StepState
+        from cli_agent_orchestrator.models.workflow_runtime import RunState
+        from cli_agent_orchestrator.services import workflow_journal, workflow_service
+        from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
+
+        run_id = "run-bookkeeping"
+        env_vars = {
+            "CAO_WORKFLOW_RUN_ID": run_id,
+            "CAO_WORKFLOW_GENERATION": "1",
+            "CAO_WORKFLOW_STEP_ID": "step-1",
+        }
+        record = ScriptRunRecord(
+            run_id=run_id,
+            workflow_name="wf",
+            state=RunState.RUNNING,
+            cancelled=False,
+            current_step_id=None,
+            step_states={},
+            process=None,
+            generation="1",
+            started_at="2026-07-15T00:00:00Z",
+            finished_at=None,
+        )
+        monkeypatch.setitem(workflow_service.run_registry, run_id, record)
+        monkeypatch.setattr(workflow_journal, "append_step", lambda *args, **kwargs: None)
+        monkeypatch.setattr(workflow_journal, "update_step", lambda *args, **kwargs: None)
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.workflow_service.check_generation",
+                return_value=None,
+            ),
+            patch(_RUN_STEP, new=AsyncMock(side_effect=exc)),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=env_vars))
+
+        assert resp.status_code == expected_status
+        step = record.step_states["step-1"]
+        assert step.state == StepState.FAILED
+        assert step.attempts == 1
+        assert step.error == str(exc)
+
     def test_missing_required_field_is_422(self, client):
         # Pydantic request-model validation rejects a missing prompt.
         resp = client.post(TERMINALS_RUN_STEP_ROUTE, json={"provider": "p", "agent": "a"})

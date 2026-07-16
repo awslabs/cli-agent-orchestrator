@@ -366,10 +366,13 @@ class KiroCliProvider(BaseProvider):
         BaseProvider helper consults the backend and disambiguates herdr's
         ambiguous "idle" via _task_dispatched (set by mark_input_received).
         """
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
         if not output:
             return TerminalStatus.UNKNOWN
 

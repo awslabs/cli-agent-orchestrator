@@ -55,7 +55,11 @@ from cli_agent_orchestrator.models.workflow_runtime import (
     WorkflowRunResult,
 )
 from cli_agent_orchestrator.services import workflow_journal
-from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
+from cli_agent_orchestrator.services.agent_step import (
+    StepCancelledError,
+    StepExecutionError,
+    run_agent_step,
+)
 from cli_agent_orchestrator.services.step_output_store import (
     _validate_key_part,
     step_output_store,
@@ -108,14 +112,11 @@ class StaleGenerationError(ValueError):
 
 
 class ReplayDivergenceError(Exception):
-    """A resumed script call's fingerprint diverged from its journaled row (A2, DR-4).
+    """The reserved replay lookup found a fingerprint mismatch (A2, DR-4).
 
-    U3 addition (issue #312, script-tier journal extension, C3). NOT a
-    ``ValueError`` / NOT mapped to an HTTP status at the resume route boundary
-    (business-rules "Error-to-status mapping" table) — the script changed between
-    runs at the same ``(run_id, step_id)`` key, so resume cannot honor the replay
-    determinism contract (ADR-5). The run is failed loudly (state -> FAILED,
-    surfaced in the run result), never silently re-executed.
+    U3 addition (issue #312, script-tier journal extension, C3). The current
+    run-step route does not call ``lookup_replay``, so this exception is not
+    mapped at an HTTP boundary or surfaced by script resume today.
     """
 
 
@@ -155,6 +156,13 @@ class RunRecord:
     step_states: Dict[str, StepRunState] = field(default_factory=dict)
     started_at: str = ""
     finished_at: Optional[str] = None
+    # Set by cancel_run to interrupt the CURRENTLY in-flight step wait (issue
+    # #409b). Without it, cancel was only observed at the NEXT step boundary — so
+    # exactly the runs hung inside a long/never-settling step wait (the codex-IDLE
+    # case #409a targets) could not be cancelled at all. ``asyncio.Event`` is
+    # constructed here; it binds to the running loop lazily on first await, so
+    # building a RunRecord outside a loop (unit tests) is safe.
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 # Process-local run registry (ADR-8, B3-LC-2 singleton). A process restart loses
@@ -511,6 +519,7 @@ async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> S
                 "CAO_WORKFLOW_RUN_ID": record.run_id,
                 "CAO_WORKFLOW_STEP_ID": step.id,
             },
+            cancel_event=record.cancel_event,
         )
         st.terminal_id = result.terminal_id
         rec = step_output_store.get(record.run_id, step.id)
@@ -563,12 +572,31 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                     "CAO_WORKFLOW_RUN_ID": record.run_id,
                     "CAO_WORKFLOW_STEP_ID": step.id,
                 },
+                cancel_event=record.cancel_event,
             )
             st.terminal_id = result.terminal_id
             # Resolve the structured return INSIDE the try so a crash during the
             # reprompt (§3 re-raises StepExecutionError) is caught below and
             # consumes an attempt (Q6=A, Trace C).
             outcome = await _collect_structured_output(record, step)
+        except StepCancelledError as exc:
+            # An in-flight cancel (#409b) is NOT a run-failure: do NOT consume the
+            # rest of the retry budget and do NOT mark the step FAILED. Settle the
+            # interrupted step SKIPPED (its work is abandoned; there is no
+            # CANCELLED step state, and leaving it RUNNING would reproduce exactly
+            # the stuck-`running` smell #409 targets). Then return so the drive
+            # loop converges the run to CANCELLED. The interrupted step already
+            # self-tore-down its own terminal inside run_agent_step.
+            if exc.terminal_id is not None:
+                st.terminal_id = exc.terminal_id
+            st.state = StepState.SKIPPED
+            await _ajournal(_journal_step, record, step.id)
+            logger.info(
+                "run '%s' step '%s' wait interrupted by cancel; converging CANCELLED",
+                record.run_id,
+                step.id,
+            )
+            return
         except StepExecutionError as exc:
             st.error = str(exc)
             if exc.terminal_id is not None:
@@ -679,7 +707,14 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
         logger.error("drive: run '%s' failed with an engine error", record.run_id)
         raise
 
-    # Finalize.
+    # Finalize. A cancel that interrupted the FINAL (or only) step's in-flight
+    # wait (#409b) leaves the loop with no further boundary iteration to observe
+    # ``record.cancelled`` — converge to CANCELLED here so the run never settles
+    # COMPLETED after being cancelled. Any still-PENDING steps (none, for a
+    # last-step cancel) are marked SKIPPED for consistency with the boundary path.
+    if record.cancelled and record.state not in (RunState.FAILED, RunState.CANCELLED):
+        await _skip_remaining(record, order, from_index=0)
+        record.state = RunState.CANCELLED
     if record.state not in (RunState.FAILED, RunState.CANCELLED):
         record.state = RunState.COMPLETED
     record.current_step_id = None
@@ -690,6 +725,37 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
 
     # Aggregate the result.
     return _build_result(record, order)
+
+
+# ---------------------------------------------------------------------------
+# U5 addition (issue #312, RunSurface, C4/C1 boundary) — shared run-admission
+# pre-check (BR-9a), extracted from start_run's own inline checks so the YAML
+# arm (start_run, below) and the script arm (U5's run route,
+# ``run_script_workflow`` has no admission check of its own) share ONE
+# implementation, never two that could drift.
+# ---------------------------------------------------------------------------
+def _check_run_id_available(run_id: str) -> None:
+    """Raise ``KeyError`` if ``run_id`` is already claimed, by either tier.
+
+    Checks, in order: (1) a live in-process record (``run_registry``) or an
+    in-flight drive (``_active_drives``); (2) a best-effort durable journal
+    read — a restart-survived remnant's ``run_id`` must not be silently
+    reused to open a second drive under an old id. The journal read is
+    wrapped in a broad, best-effort catch (a broken journal must never block
+    a NEW run, B4-BR-5) — never a substitute for the engine's own admission,
+    just the sole gate ahead of it (BR-9a).
+    """
+    if run_id in run_registry or run_id in _active_drives:
+        raise KeyError(f"run_id '{run_id}' already exists")
+    try:
+        existing_row = workflow_journal.get_run(run_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal read is best-effort; a broken journal must not block new runs (B4-BR-5)
+        logger.debug("journal: _check_run_id_available('%s') failed; proceeding: %s", run_id, e)
+        existing_row = None
+    if existing_row is not None:
+        raise KeyError(f"run_id '{run_id}' already exists")
 
 
 # ---------------------------------------------------------------------------
@@ -709,24 +775,12 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
     (-> reserved seam) for a non-sequential mode, ``WorkflowEngineError`` (-> 500)
     on an engine-internal invariant violation (e.g. a bad template reference).
     """
-    # 1. Validate run_id via the shared key validator (B3-BR-1).
+    # 1. Validate run_id via the shared key validator (B3-BR-1), then the
+    # shared admission pre-check (U5, BR-9a) — extracted below so both the
+    # YAML arm (here) and the script arm (U5's run route) share ONE
+    # implementation, never two that can drift.
     _validate_key_part(run_id, "run_id")
-    if run_id in run_registry or run_id in _active_drives:
-        raise KeyError(f"run_id '{run_id}' already exists")
-    # A durable journal row also claims the id: after a restart the registry is
-    # empty, but re-using an old run_id must NOT overwrite its journal history.
-    # Best-effort read only — a broken journal must never block NEW runs.
-    # Read stays on-loop deliberately: a small point read via the sync helper
-    # shared with the sync status path.
-    try:
-        existing_row = workflow_journal.get_run(run_id)
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — journal read is best-effort; a broken journal must not block new runs (B4-BR-5)
-        logger.debug("journal: start_run get_run('%s') failed; proceeding: %s", run_id, e)
-        existing_row = None
-    if existing_row is not None:
-        raise KeyError(f"run_id '{run_id}' already exists")
+    _check_run_id_available(run_id)
 
     # 2. Validate inputs BEFORE any side effect (B3-BR-2 / FR-1.5, fail fast).
     resolved_inputs = _validate_inputs(spec, inputs)
@@ -771,11 +825,16 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
 def cancel_run(run_id: str) -> None:
     """Cooperatively cancel a running workflow (§5, B3-BR-7).
 
-    Sets the ``cancelled`` flag; the engine observes it at the NEXT step boundary
-    (the in-flight step runs to natural completion and self-tears-down its own
-    terminal). Never raises into the engine/worker path. Raises ``KeyError`` (->
-    404) for an unknown run and ``ValueError`` (-> 409) for a run already in a
-    terminal state.
+    Sets the ``cancelled`` flag AND fires ``cancel_event`` so the engine interrupts
+    the CURRENTLY in-flight step wait (issue #409b) rather than observing the cancel
+    only at the next step boundary — that boundary-only behavior meant a run hung
+    inside a long or never-settling step wait (the codex-IDLE case #409a addresses)
+    could never converge to CANCELLED. The interrupted step tears down its own
+    terminal; the drive loop then settles the run CANCELLED.
+
+    Idempotent (setting an already-set Event is a no-op), never raises into the
+    engine/worker path. Raises ``KeyError`` (-> 404) for an unknown run and
+    ``ValueError`` (-> 409) for a run already in a terminal state.
     """
     record = run_registry.get(run_id)
     if record is None:
@@ -783,9 +842,11 @@ def cancel_run(run_id: str) -> None:
     if record.state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
         raise ValueError(f"run '{run_id}' is already {record.state.value}; cannot cancel")
     record.cancelled = True
-    # Best-effort: there is no separate live terminal for cancel to tear down (the
-    # running step owns and releases its own). Any future best-effort cleanup must
-    # be wrapped + logged and must never raise into this path.
+    # Interrupt any in-flight step wait immediately (#409b). Guard the attribute
+    # for records rebuilt from an older journal shape that predates the field.
+    cancel_event = getattr(record, "cancel_event", None)
+    if cancel_event is not None:
+        cancel_event.set()
     logger.info("cancel_run: run '%s' flagged for cooperative cancel", run_id)
 
 
@@ -802,11 +863,29 @@ def get_run_status(run_id: str) -> RunStatus:
     """
     record = run_registry.get(run_id)
     if record is None:
-        # Cache miss (cold read / after a restart): rebuild from the journal ONCE,
-        # then re-populate the cache (§2, B4-BR-4). A genuinely-absent run (absent
-        # from BOTH cache and journal) raises KeyError -> 404 (F1, contract
-        # unchanged). The rebuild returns None on absent and NEVER raises ValueError
-        # on this status read path.
+        # Cache miss (cold read / after a restart). U5-Q1=A: a script-tier run's
+        # cold-miss fallback must NOT attempt ``_rebuild_record_from_journal``
+        # (YAML-only, ``WorkflowSpec.model_validate_json`` would corrupt-degrade
+        # a ScriptSpec snapshot) — short-circuit to the journal row's last-known
+        # state directly, without the fast path gaining any new dispatch branch.
+        row = None
+        try:
+            row = workflow_journal.get_run(run_id)
+        except (
+            Exception
+        ) as e:  # noqa: BLE001 — journal read is best-effort on a status read (B4-RD-4)
+            logger.debug("journal: get_run('%s') failed on cold status read: %s", run_id, e)
+        if row is not None and row.tier == "script":
+            return RunStatus(
+                run_id=row.run_id,
+                state=RunState(row.state),
+                current_step_id=row.current_step_id,
+                steps=[],
+            )
+        # Rebuild from the journal ONCE, then re-populate the cache (§2, B4-BR-4).
+        # A genuinely-absent run (absent from BOTH cache and journal) raises
+        # KeyError -> 404 (F1, contract unchanged). The rebuild returns None on
+        # absent and NEVER raises ValueError on this status read path.
         record = _rebuild_record_from_journal(run_id)
         if record is not None:
             run_registry[run_id] = record

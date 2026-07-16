@@ -13,12 +13,13 @@ from cli_agent_orchestrator.ext_apps import (
     AGENT_RESOURCE_URI,
     DASHBOARD_RESOURCE_URI,
     EVENT_STREAM_RESOURCE_URI,
+    GRAPH_RESOURCE_URI,
     PREFERRED_FRAMES,
     get_resource_body,
     register_apps,
     ui_meta,
 )
-from cli_agent_orchestrator.ext_apps.apps import RESOURCE_MIME_TYPE
+from cli_agent_orchestrator.ext_apps.apps import _RESOURCE_FILES, RESOURCE_MIME_TYPE
 
 
 class TestUiMeta:
@@ -75,6 +76,27 @@ class TestUiMeta:
             DASHBOARD_RESOURCE_URI,
             AGENT_RESOURCE_URI,
             EVENT_STREAM_RESOURCE_URI,
+            GRAPH_RESOURCE_URI,
+        }
+
+    def test_graph_resource_uses_dashboard_size_frame(self) -> None:
+        meta = ui_meta(visibility=["model", "app"], resource_uri=GRAPH_RESOURCE_URI)
+        assert meta["ui"]["preferredFrameSize"] == {"width": 1280, "height": 800}
+        assert meta["ui"]["domain"] == "cao-graph"
+
+
+class TestGraphResourceRegistration:
+    def test_graph_resource_file_mapping(self) -> None:
+        assert _RESOURCE_FILES[GRAPH_RESOURCE_URI] == "graph.html"
+
+    def test_graph_resource_uses_default_csp(self) -> None:
+        # No new CSP domain for the graph resource — reuses DEFAULT_CSP unchanged.
+        meta = ui_meta(visibility=["model", "app"], resource_uri=GRAPH_RESOURCE_URI)
+        assert meta["ui"]["csp"] == {
+            "connectDomains": ["http://127.0.0.1:9889", "http://localhost:9889"],
+            "resourceDomains": [],
+            "frameDomains": [],
+            "baseUriDomains": [],
         }
 
 
@@ -118,7 +140,7 @@ class TestRegisterApps:
         assert register_apps(NoResourceMCP()) is False
 
     def test_registers_when_enabled_and_built(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # type: ignore[no-untyped-def]
-        for name in ("dashboard.html", "agent.html", "event-stream.html"):
+        for name in ("dashboard.html", "agent.html", "event-stream.html", "graph.html"):
             (tmp_path / name).write_text(f"<title>{name}</title>", encoding="utf-8")
         monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
         monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(tmp_path))
@@ -138,4 +160,37 @@ class TestRegisterApps:
             DASHBOARD_RESOURCE_URI,
             AGENT_RESOURCE_URI,
             EVENT_STREAM_RESOURCE_URI,
+            GRAPH_RESOURCE_URI,
         }
+
+    def test_graph_resource_gated_by_apps_enabled(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:  # type: ignore[no-untyped-def]
+        """The graph resource follows the same CAO_MCP_APPS_ENABLED gate as the rest."""
+
+        (tmp_path / "graph.html").write_text("<title>graph.html</title>", encoding="utf-8")
+        monkeypatch.setenv("CAO_MCP_APPS_STATIC_DIR", str(tmp_path))
+
+        class StubMCP:
+            def resource(self, uri, **kw):  # type: ignore[no-untyped-def]
+                def decorator(fn):  # type: ignore[no-untyped-def]
+                    return fn
+
+                return decorator
+
+        monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+        assert register_apps(StubMCP()) is False
+
+        monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+        registered: list[str] = []
+
+        class RecordingMCP:
+            def resource(self, uri, **kw):  # type: ignore[no-untyped-def]
+                def decorator(fn):  # type: ignore[no-untyped-def]
+                    registered.append(uri)
+                    return fn
+
+                return decorator
+
+        assert register_apps(RecordingMCP()) is True
+        assert GRAPH_RESOURCE_URI in registered

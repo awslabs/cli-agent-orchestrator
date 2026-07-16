@@ -137,7 +137,20 @@ def test_get_run_status_unknown_404(client, monkeypatch):
     assert resp.status_code == 404
 
 
+def _seed_yaml_record(monkeypatch, run_id="run1"):
+    """Seed a live YAML-tier record so U5's cancel dispatch (BR-15, registry-first)
+    routes into the (mocked) base ``cancel_run`` — the same call the pre-U5 route
+    made unconditionally. Without a live record, U5 dispatches through the
+    journal-fallback arm (BR-16) instead of the live-registry arm."""
+    import types
+
+    monkeypatch.setattr(
+        workflow_service, "run_registry", {run_id: types.SimpleNamespace(tier="yaml")}
+    )
+
+
 def test_cancel_run_200(client, monkeypatch):
+    _seed_yaml_record(monkeypatch, "run1")
     monkeypatch.setattr(workflow_service, "cancel_run", lambda rid: None)
     resp = client.post("/workflows/runs/run1/cancel")
     assert resp.status_code == 200
@@ -148,12 +161,16 @@ def test_cancel_run_unknown_404(client, monkeypatch):
     def _raise(rid):
         raise KeyError(rid)
 
+    # "ghost" has no live record AND no journal row -> the journal-fallback
+    # arm (BR-16) raises 404 before ever calling cancel_run.
     monkeypatch.setattr(workflow_service, "cancel_run", _raise)
     resp = client.post("/workflows/runs/ghost/cancel")
     assert resp.status_code == 404
 
 
 def test_cancel_finished_run_409(client, monkeypatch):
+    _seed_yaml_record(monkeypatch, "run1")
+
     def _raise(rid):
         raise ValueError("run 'run1' is already completed; cannot cancel")
 

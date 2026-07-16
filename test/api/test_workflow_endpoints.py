@@ -185,18 +185,39 @@ class TestResumeEndpoint:
     ResumeCorruptError->422) and that the subtypes are caught before bare ValueError.
     """
 
+    @staticmethod
+    def _seed_yaml_row(monkeypatch, run_id="runX"):
+        """Seed a journaled YAML-tier row so U5's resume dispatch (BR-11, reads
+        the journal's tier column) routes into the (mocked)
+        ``resume_from_last_completed`` — the same call the pre-U5 route made
+        unconditionally."""
+        from cli_agent_orchestrator.services import workflow_journal
+
+        row = workflow_journal.RunRow(
+            run_id=run_id,
+            workflow_name="wf",
+            spec_snapshot="{}",
+            inputs_json="{}",
+            state="failed",
+            current_step_id=None,
+            started_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:00:01Z",
+            tier="yaml",
+        )
+        monkeypatch.setattr(workflow_journal, "get_run", lambda rid: row)
+
     def test_unknown_run_maps_to_404(self, client, monkeypatch):
-        from cli_agent_orchestrator.services import workflow_service as ws
+        from cli_agent_orchestrator.services import workflow_journal
 
-        async def _raise(run_id):
-            raise KeyError("nope")
-
-        monkeypatch.setattr(ws, "resume_from_last_completed", _raise)
+        # No journal row at all -> 404 before any tier dispatch (BR-11).
+        monkeypatch.setattr(workflow_journal, "get_run", lambda rid: None)
         resp = client.post("/workflows/runs/runX/resume")
         assert resp.status_code == 404
 
     def test_terminal_or_live_run_maps_to_409(self, client, monkeypatch):
         from cli_agent_orchestrator.services import workflow_service as ws
+
+        self._seed_yaml_row(monkeypatch)
 
         async def _raise(run_id):
             raise ws.ResumeNotAllowedError("already completed")
@@ -208,6 +229,8 @@ class TestResumeEndpoint:
     def test_corrupt_snapshot_maps_to_422(self, client, monkeypatch):
         from cli_agent_orchestrator.services import workflow_service as ws
 
+        self._seed_yaml_row(monkeypatch)
+
         async def _raise(run_id):
             raise ws.ResumeCorruptError("corrupt")
 
@@ -218,6 +241,8 @@ class TestResumeEndpoint:
     def test_bad_run_id_maps_to_400(self, client, monkeypatch):
         from cli_agent_orchestrator.services import workflow_service as ws
 
+        self._seed_yaml_row(monkeypatch)
+
         async def _raise(run_id):
             raise ValueError("bad run_id")
 
@@ -227,6 +252,8 @@ class TestResumeEndpoint:
 
     def test_engine_error_maps_to_500(self, client, monkeypatch):
         from cli_agent_orchestrator.services import workflow_service as ws
+
+        self._seed_yaml_row(monkeypatch)
 
         async def _raise(run_id):
             raise ws.WorkflowEngineError("bad template reference")
@@ -243,6 +270,8 @@ class TestResumeEndpoint:
             WorkflowRunResult,
         )
         from cli_agent_orchestrator.services import workflow_service as ws
+
+        self._seed_yaml_row(monkeypatch)
 
         async def _ok(run_id):
             return WorkflowRunResult(

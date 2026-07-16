@@ -13,9 +13,12 @@
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
+    "graphology": "^0.26.0",
+    "graphology-layout": "^0.6.1",
     "lucide-react": "^0.562.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "sigma": "^3.0.3",
     "zustand": "^4.4.0"
   },
   "devDependencies": {

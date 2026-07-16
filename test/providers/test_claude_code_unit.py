@@ -8,6 +8,11 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.agent_profile import (
+    AgentProfile,
+    ContainerConfig,
+    ContainerPathMap,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, ProviderError
 
@@ -127,6 +132,7 @@ class TestClaudeCodeProviderInitialization:
         mock_profile.system_prompt = "Test system prompt"
         mock_profile.mcpServers = None
         mock_profile.permissionMode = None
+        mock_profile.provider_init_timeout = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
@@ -223,6 +229,7 @@ class TestClaudeCodeProviderInitialization:
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"server1": {"command": "test", "args": ["--flag"]}}
         mock_profile.permissionMode = None
+        mock_profile.provider_init_timeout = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
@@ -460,8 +467,15 @@ class TestClaudeCodeProviderStatusDetection:
         assert status != TerminalStatus.WAITING_USER_ANSWER
         assert status == TerminalStatus.COMPLETED
 
-    def test_get_status_error_empty(self):
-        """Test UNKNOWN status with empty output."""
+    def test_get_status_empty_buffer_returns_unknown(self):
+        """Empty buffer -> UNKNOWN (native=None always falls through to buffer analysis).
+
+        The backend's get_native_status() returns None (tmux always; herdr
+        'unknown'); this always falls through to buffer analysis -- no
+        dispatch-timing guess. On tmux, BaseProvider._resolve_buffer() is a
+        pass-through, so the empty buffer hits Claude Code's own no-output
+        default (UNKNOWN) directly.
+        """
         output = ""
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -1219,6 +1233,73 @@ class TestClaudeCodeProviderMisc:
         assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"
 
 
+class TestClaudeCodeProviderContainerPathTranslation:
+    """_build_claude_command must translate temp-file paths for container profiles.
+
+    Unit coverage of _translate_path itself lives in test_base_provider.py. These
+    tests cover the INTEGRATION point: that _build_claude_command routes the temp
+    prompt-file and MCP-config paths through _translate_path so the guest paths —
+    not the host paths — reach the emitted --append-system-prompt-file and
+    --mcp-config arguments.
+    """
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_temp_file_paths_translated_to_guest(self, mock_load, tmp_path):
+        """host CAO_HOME_DIR prefix -> guest path in both temp-file CLI args."""
+        # Map the (patched) CAO_HOME_DIR host prefix to a container guest path.
+        mock_load.return_value = AgentProfile(
+            name="test-agent",
+            description="d",
+            system_prompt="You are a container agent.",
+            mcpServers={"test-mcp": {"command": "echo", "args": []}},
+            container=ContainerConfig(
+                path_maps=[ContainerPathMap(host=str(tmp_path), guest="/app/config")]
+            ),
+        )
+
+        provider = ClaudeCodeProvider("test-container", "sess", "win", "test-agent")
+        with patch("cli_agent_orchestrator.providers.claude_code.CAO_HOME_DIR", tmp_path):
+            command = provider._build_claude_command()
+
+        args = shlex.split(command)
+        prompt_arg = args[args.index("--append-system-prompt-file") + 1]
+        mcp_arg = args[args.index("--mcp-config") + 1]
+
+        # Both args carry the translated guest path, not the host path.
+        assert prompt_arg == "/app/config/tmp/test-container.prompt"
+        assert mcp_arg == "/app/config/tmp/test-container.mcp.json"
+        # The host prefix must not leak into either arg (translation happened).
+        assert str(tmp_path) not in prompt_arg
+        assert str(tmp_path) not in mcp_arg
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_temp_file_paths_unchanged_without_container(self, mock_load, tmp_path):
+        """No container -> paths are the real host paths (translation is a no-op).
+
+        Guards against the assertions above passing for the wrong reason: the
+        guest prefix only appears when a container maps it.
+        """
+        mock_load.return_value = AgentProfile(
+            name="test-agent",
+            description="d",
+            system_prompt="You are a host agent.",
+            mcpServers={"test-mcp": {"command": "echo", "args": []}},
+        )
+
+        provider = ClaudeCodeProvider("test-host", "sess", "win", "test-agent")
+        with patch("cli_agent_orchestrator.providers.claude_code.CAO_HOME_DIR", tmp_path):
+            command = provider._build_claude_command()
+
+        args = shlex.split(command)
+        prompt_arg = args[args.index("--append-system-prompt-file") + 1]
+        mcp_arg = args[args.index("--mcp-config") + 1]
+
+        assert prompt_arg == str(tmp_path / "tmp" / "test-host.prompt")
+        assert mcp_arg == str(tmp_path / "tmp" / "test-host.mcp.json")
+        assert "/app/config" not in prompt_arg
+        assert "/app/config" not in mcp_arg
+
+
 class TestClaudeCodeProviderModelFlag:
     """Tests that profile.model is forwarded to Claude Code via --model."""
 
@@ -1372,7 +1453,7 @@ class TestClaudeCodeProviderStartupPrompts:
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(timeout=2.0)
+        provider._handle_startup_prompts(idle_gap=2.0)
 
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
@@ -1382,20 +1463,35 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.1.0"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(timeout=2.0)
+        provider._handle_startup_prompts(idle_gap=2.0)
 
         mock_tmux.send_special_key.assert_not_called()
 
+    @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings")
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_handle_startup_prompts_timeout(self, mock_tmux, mock_time):
-        """Test startup prompt handler times out gracefully."""
+    def test_handle_startup_prompts_timeout(self, mock_tmux, mock_time, mock_settings):
+        """Handler gives up gracefully at the outer cap when no prompt ever appears.
+
+        should-fix-3: the idle-gap exit does not apply until a first prompt has
+        been handled, so with only "Loading..." ever showing, the loop runs
+        until the outer cap (provider_init_timeout=60) rather than the old
+        20s idle-gap boundary.
+        """
+        mock_settings.return_value = {
+            "provider_init_timeout": 60,
+            "startup_prompt_handler_timeout": 20,
+        }
         mock_tmux.get_history.return_value = "Loading..."
-        mock_time.time.side_effect = [0.0, 0.0, 25.0]
+        # monotonic() calls: outer_deadline, last_prompt_time, iter-1 now (no
+        # prompt handled yet -> idle-gap check skipped, polls "Loading..."),
+        # iter-2 now (still no prompt -> idle-gap check skipped), iter-3 now
+        # (61s >= 60s outer cap -> return).
+        mock_time.monotonic.side_effect = [0.0, 0.0, 0.0, 25.0, 61.0]
         mock_time.sleep = MagicMock()
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(timeout=20.0)
+        provider._handle_startup_prompts(idle_gap=20.0)
 
         mock_tmux.send_special_key.assert_not_called()
 
@@ -1408,7 +1504,7 @@ class TestClaudeCodeProviderStartupPrompts:
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(timeout=5.0)
+        provider._handle_startup_prompts(idle_gap=5.0)
 
         mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
@@ -1423,7 +1519,7 @@ class TestClaudeCodeProviderStartupPrompts:
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(timeout=5.0)
+        provider._handle_startup_prompts(idle_gap=5.0)
 
         # Verify Down arrow sent via send_keys and Enter via send_special_key
         mock_tmux.send_keys.assert_called_once()
@@ -1439,7 +1535,7 @@ class TestClaudeCodeProviderStartupPrompts:
         ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(timeout=5.0)
+        provider._handle_startup_prompts(idle_gap=5.0)
 
         # Bypass: send_keys (Down) + send_special_key (Enter)
         # Trust: send_special_key (Enter) — called twice total
@@ -1870,3 +1966,62 @@ class TestBackgroundWaitReviewHardening:
             + "\n  ⏵⏵ bypass permissions on\n"
         )
         assert self._p().get_status(output) == TerminalStatus.COMPLETED
+
+
+class TestWaitUntilInputReady:
+    """Settle-check gate: 'box rendered' is not 'box accepting input'.
+
+    The gate requires the rendered pane to be stable across two consecutive
+    captures AND still showing the input box before the first paste is sent.
+    """
+
+    BOX = "─" * 40 + "\n> \n" + "─" * 40
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_ready_when_pane_stable_with_box(self, mock_tmux):
+        mock_tmux.get_history.side_effect = [self.BOX, self.BOX]
+        provider = ClaudeCodeProvider("t1", "sess", "win")
+        assert await provider.wait_until_input_ready(timeout=3.0) is True
+        assert mock_tmux.get_history.call_count == 2
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_waits_out_still_painting_pane(self, mock_tmux):
+        # Startup content still changing between captures (banner, tips, MCP
+        # status lines) — exactly the window where Ink drops keystrokes. The
+        # gate must NOT pass until two identical box-bearing captures.
+        mock_tmux.get_history.side_effect = [
+            "Welcome to Claude Code",
+            "Welcome to Claude Code\ntips...",
+            self.BOX,
+            self.BOX,
+        ]
+        provider = ClaudeCodeProvider("t2", "sess", "win")
+        assert await provider.wait_until_input_ready(timeout=5.0) is True
+        assert mock_tmux.get_history.call_count == 4
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_stable_pane_without_box_does_not_pass(self, mock_tmux):
+        # A stable pane that never shows the input box (e.g. stuck on an
+        # error screen) must time out with False, not report ready.
+        mock_tmux.get_history.return_value = "some stable non-box content"
+        provider = ClaudeCodeProvider("t3", "sess", "win")
+        assert await provider.wait_until_input_ready(timeout=1.2) is False
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_capture_failure_returns_false_not_raise(self, mock_tmux):
+        # Backend hiccups must never fail initialization via the gate.
+        mock_tmux.get_history.side_effect = RuntimeError("pane gone")
+        provider = ClaudeCodeProvider("t4", "sess", "win")
+        assert await provider.wait_until_input_ready(timeout=2.0) is False
+
+    @pytest.mark.asyncio
+    async def test_base_provider_default_is_immediate_true(self):
+        # Non-TUI providers keep the old behavior: no extra gate.
+        from cli_agent_orchestrator.providers.base import BaseProvider
+
+        provider = ClaudeCodeProvider("t5", "sess", "win")
+        assert await BaseProvider.wait_until_input_ready(provider) is True

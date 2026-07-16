@@ -59,7 +59,7 @@ class TestHandleStartupPromptsBranches:
             "⚠ Bypass Permissions mode\n" "1. No, exit\n" "2. Yes, I accept\n"
         )
 
-        provider._handle_startup_prompts(timeout=1.0)
+        provider._handle_startup_prompts(idle_gap=1.0)
 
         # Down arrow sent via send_keys, Enter via send_special_key
         mock_backend.send_keys.assert_called_once()
@@ -93,7 +93,7 @@ class TestHandleStartupPromptsBranches:
         )
         mock_backend.get_history.side_effect = [echoed_launch_cmd, trust_frame]
 
-        provider._handle_startup_prompts(timeout=5.0)
+        provider._handle_startup_prompts(idle_gap=5.0)
 
         # Trust dialog accepted via Enter — proves we did not early-return on the
         # echoed "> memory_store" marker.
@@ -106,7 +106,7 @@ class TestHandleStartupPromptsBranches:
         """When welcome banner is visible, returns immediately."""
         mock_backend.get_history.return_value = "Welcome to Claude Code v2.5.0"
 
-        provider._handle_startup_prompts(timeout=1.0)
+        provider._handle_startup_prompts(idle_gap=1.0)
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_trust_prompt_detected(self, mock_backend, provider):
@@ -115,7 +115,7 @@ class TestHandleStartupPromptsBranches:
             "Do you trust the files in this folder?\n" "❯ Yes, I trust this folder"
         )
 
-        provider._handle_startup_prompts(timeout=1.0)
+        provider._handle_startup_prompts(idle_gap=1.0)
 
         mock_backend.send_special_key.assert_called_once_with(
             provider.session_name, provider.window_name, "Enter"

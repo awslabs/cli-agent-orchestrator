@@ -23,9 +23,12 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +188,22 @@ class BaseProvider(ABC):
         """
         return 0.3
 
+    async def wait_until_input_ready(self, timeout: float = 5.0) -> bool:
+        """Wait until the provider's input surface actually accepts keystrokes.
+
+        Called after ``initialize()``'s status wait reports IDLE/COMPLETED and
+        before the first paste is sent. For most CLIs the status wait is
+        sufficient and this default returns immediately. TUI providers whose
+        renderer drops keystrokes for a beat after the prompt first renders
+        (e.g. Claude Code's Ink input box) override this with a real readiness
+        check, so the first ``send_input`` does not race the widget.
+
+        Returns True when input is believed ready; False on timeout. Callers
+        treat False as "proceed anyway" (best effort) — the method must never
+        raise for a readiness miss.
+        """
+        return True
+
     @property
     def accepts_input_while_processing(self) -> bool:
         """Whether this provider buffers pasted input during PROCESSING for next-turn pickup.
@@ -264,7 +283,7 @@ class BaseProvider(ABC):
         self._done_first_detected = 0.0
         self._idle_first_detected = 0.0
 
-    def _resolve_native_status(self) -> Optional[TerminalStatus]:
+    def _resolve_native_status(self, buffer: Optional[str] = None) -> Optional[TerminalStatus]:
         """Resolve status from the backend's native agent state, if available.
 
         On the herdr backend, ``pipe_pane`` is a no-op so the StatusMonitor
@@ -272,17 +291,30 @@ class BaseProvider(ABC):
         rather than buffer parsing. Every provider calls this at the top of
         ``get_status()``; when it returns non-None the buffer path is skipped.
 
-        The tmux backend returns None from ``get_native_status()``, so this
-        returns None and the caller falls through to its buffer analysis
-        unchanged.
+        ``get_native_status()`` returns None when the backend cannot resolve a
+        real agent state — always on tmux, and on herdr when the agent_status
+        is "unknown" (a wrapped ``podman``/``docker exec`` launch hides the
+        agent CLI from herdr). In both cases this returns None unconditionally
+        so the caller falls through to buffer analysis via ``_resolve_buffer()``
+        — never a guess derived from dispatch timing. A guess here previously
+        traded fail-fast init detection (a dead/wedged launch reported ERROR)
+        for optimistic PROCESSING/IDLE, which silently masked real failures
+        until a hardcoded staleness window elapsed. Buffer analysis on real
+        pane content (see ``_resolve_buffer``) restores both fail-fast ERROR
+        detection and a real COMPLETED path without that tradeoff.
 
-        The only ambiguous native state is IDLE: herdr reports "idle" both
-        before any task has been dispatched AND after a task completed (e.g. the
-        user focused the tab, resetting "done" -> "idle"). ``_task_dispatched``
-        (set by mark_input_received()) disambiguates. COMPLETED ("done") and
-        IDLE-post-dispatch both wait 10s from first detection for the pane buffer
-        to flush before reporting COMPLETED, so extract_last_message sees settled
-        output; the idle path gives up (reports COMPLETED) 300s after dispatch.
+        The only ambiguous non-None native state is IDLE: herdr reports "idle"
+        both before any task has been dispatched AND after a task completed
+        (e.g. the user focused the tab, resetting "done" -> "idle").
+        ``_task_dispatched`` (set by mark_input_received()) disambiguates.
+        COMPLETED ("done") and IDLE-post-dispatch both wait 10s from first
+        detection for the pane buffer to flush before reporting COMPLETED, so
+        extract_last_message sees settled output; the idle path gives up
+        (reports COMPLETED) 300s after dispatch.
+
+        Args:
+            buffer: Unused; retained so existing call sites (``self.
+                _resolve_native_status(output)``) do not need updating.
         """
         from cli_agent_orchestrator.backends.registry import get_backend
 
@@ -293,6 +325,8 @@ class BaseProvider(ABC):
             native.value if native is not None else None,
         )
         if native is None:
+            # Unresolvable at the backend level (tmux always; herdr "unknown").
+            # Fall through to buffer analysis unchanged — no guessing here.
             return None
         if native == TerminalStatus.PROCESSING:
             # Reset flush-wait timers — herdr is actively working, so any
@@ -356,6 +390,53 @@ class BaseProvider(ABC):
         # COMPLETED (no task dispatched), WAITING_USER_ANSWER, ERROR -- return directly
         logger.debug("[get_status] terminal=%s -> %s (native)", self.terminal_id, native.value)
         return native
+
+    def _resolve_buffer(self, buffer: Optional[str]) -> str:
+        """Resolve the buffer ``get_status()`` should parse when native status is None.
+
+        Event-inbox backends (herdr) never populate the pushed StatusMonitor
+        buffer -- ``pipe_pane`` is a no-op there (see ``_resolve_native_status``)
+        -- so an empty ``buffer`` on herdr does not mean the pane has no
+        content, only that the push pipeline was never fed. Falling straight
+        through to a provider's "no output" default (UNKNOWN, or ERROR for
+        hermes) on every herdr call was the original #359 gap; guessing status
+        from dispatch timing (the #400 native-None matrix this replaces) traded
+        that gap for silently masking real failures behind an optimistic
+        window. Reading the backend's live pane content instead lets each
+        provider's EXISTING pattern matching (idle prompt, error text, response
+        markers) run against real content: a dead launch's error text is
+        visible, a wedged pane genuinely shows no prompt, and a finished turn's
+        response is genuinely there to extract.
+
+        On tmux, ``buffer`` is already populated by the FIFO push pipeline, so
+        this is a pure pass-through -- no extra backend round-trip.
+
+        Args:
+            buffer: The StatusMonitor's pushed buffer for this terminal (may be
+                empty or None).
+
+        Returns:
+            ``buffer`` unchanged (tmux, or a non-empty herdr buffer), or a live
+            ``get_history()`` read (herdr with an empty pushed buffer). Never
+            raises -- a backend read failure falls back to ``buffer`` (or "").
+        """
+        if buffer:
+            return buffer
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        backend = get_backend()
+        if not backend.supports_event_inbox():
+            return buffer or ""
+        try:
+            return backend.get_history(self.session_name, self.window_name)
+        except Exception as e:
+            logger.debug(
+                "[get_status] terminal=%s live buffer read failed, falling back to "
+                "pushed buffer: %s",
+                self.terminal_id,
+                e,
+            )
+            return buffer or ""
 
     @staticmethod
     def _extract_questions(user_messages: List[str]) -> List[str]:
@@ -439,6 +520,56 @@ class BaseProvider(ABC):
         if system_prompt:
             return f"{system_prompt}\n\n{self._skill_prompt}"
         return self._skill_prompt
+
+    def get_init_timeout(self, profile: Optional["AgentProfile"] = None) -> int:
+        """Resolve the provider initialization timeout (seconds).
+
+        Returns the per-profile ``provider_init_timeout`` override when the
+        profile declares one, else the server default from
+        ``get_server_settings()`` (60s). Lets containerized profiles, whose
+        wrapped CLI can take far longer to reach IDLE, declare a longer init
+        cap without changing global config.
+
+        Passed the loaded profile as a parameter (like ``_translate_path``)
+        rather than reading ``self`` — subclasses store a profile *name string*
+        in ``self._agent_profile``, not an ``AgentProfile`` object.
+        """
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        if profile is not None and profile.provider_init_timeout is not None:
+            return profile.provider_init_timeout
+        return int(get_server_settings()["provider_init_timeout"])
+
+    def _translate_path(self, path: str, profile: Optional["AgentProfile"] = None) -> str:
+        """Translate a host path to a container guest path using profile path_maps.
+
+        Uses longest-prefix-match: if multiple path_maps match, the one with the
+        longest host prefix wins.  If no map matches, returns the path unchanged.
+
+        ``best_len`` starts at -1 (not 0) so a root mapping (``host="/"``) can
+        still win when it is the only match: ``rstrip("/")`` reduces ``"/"`` to
+        ``""`` (length 0), and ``0 > 0`` is never true, so starting the
+        comparison at 0 silently dropped every root mapping regardless of
+        whether anything more specific matched.
+        """
+        if profile is None or profile.container is None or not profile.container.path_maps:
+            return path
+
+        best_match = None
+        best_len = -1
+        for mapping in profile.container.path_maps:
+            host_prefix = mapping.host.rstrip("/")
+            if path == host_prefix or path.startswith(host_prefix + "/"):
+                if len(host_prefix) > best_len:
+                    best_match = mapping
+                    best_len = len(host_prefix)
+
+        if best_match is None:
+            return path
+
+        host_prefix = best_match.host.rstrip("/")
+        guest_prefix = best_match.guest.rstrip("/")
+        return guest_prefix + path[best_len:]
 
     def _update_status(self, status: TerminalStatus) -> None:
         """Update internal status."""

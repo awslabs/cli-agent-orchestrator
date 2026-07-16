@@ -11,6 +11,7 @@ Tools implemented here:
 * ``render_agent_view`` — per-agent detail        (visibility ``["model","app"]``)
 * ``cao_fetch_history`` — replay the ring buffer   (visibility ``["app"]``)
 * ``subscribe_events``  — SSE endpoint descriptor   (visibility ``["app"]``)
+* ``render_graph_view`` — GraphView wire shape       (visibility ``["model","app"]``)
 * ``submit_command``    — single mutation choke point **(Phase II skeleton)**
 
 **HTTP-only boundary.** Every read of Backplane state goes through
@@ -39,6 +40,7 @@ from cli_agent_orchestrator.ext_apps import (
     AGENT_RESOURCE_URI,
     DASHBOARD_RESOURCE_URI,
     EVENT_STREAM_RESOURCE_URI,
+    GRAPH_RESOURCE_URI,
     register_apps,
     ui_meta,
 )
@@ -258,6 +260,22 @@ def _subscribe_events_impl() -> Dict[str, Any]:
         "history_tool": "cao_fetch_history",
         "ring_capacity": 500,
     }
+
+
+def _render_graph_view_impl(
+    provider: str, scope: Optional[str] = None, scope_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Wrap ``GET /graph/{provider}`` for ``ui://cao/graph`` (HTTP-only).
+
+    ``GET /graph/{provider}`` is scope-gated and refuses private tiers
+    (``session`` / ``agent`` → 400) as of #424. This tool adds no gate of its
+    own; it forwards the caller's ``scope`` / ``scope_id`` and relies on the
+    route to enforce auth (it does not bypass it). Lets ``requests.HTTPError``
+    propagate (mirrors ``_render_agent_view_impl``).
+    """
+
+    result: Dict[str, Any] = _get_json(f"/graph/{provider}", scope=scope, scope_id=scope_id)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +562,12 @@ def register_app_tools(mcp: Any) -> bool:
         """Return the SSE endpoint descriptor for live events."""
         return _subscribe_events_impl()
 
+    async def render_graph_view(
+        provider: str, scope: Optional[str] = None, scope_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Return a GraphView wire shape for the given provider via ``GET /graph/{provider}``."""
+        return _render_graph_view_impl(provider, scope=scope, scope_id=scope_id)
+
     async def submit_command(kind: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Single mutation choke point: classify, scope-check, then route (Phase III)."""
         return _submit_command_impl(kind, payload or {})
@@ -559,6 +583,9 @@ def register_app_tools(mcp: Any) -> bool:
         cao_fetch_history, "cao_fetch_history", ["app"], EVENT_STREAM_RESOURCE_URI, None
     )
     ok &= _register(subscribe_events, "subscribe_events", ["app"], EVENT_STREAM_RESOURCE_URI, None)
+    ok &= _register(
+        render_graph_view, "render_graph_view", ["model", "app"], GRAPH_RESOURCE_URI, None
+    )
     ok &= _register(submit_command, "submit_command", ["app"], None, [SCOPE_WRITE, SCOPE_ADMIN])
 
     # Mount the ui://cao/* resources too (best-effort; independent of tool result).

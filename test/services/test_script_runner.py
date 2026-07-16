@@ -48,8 +48,10 @@ from cli_agent_orchestrator.services.script_runner import (
     _bump,
     _RingBuffer,
     _scan_sentinel,
+    _step_call_fingerprint,
     cancel_script_run,
     make_step_terminal_recorder,
+    record_step_completion,
     resume_script_run,
     run_script_workflow,
 )
@@ -488,6 +490,35 @@ async def test_cancel_idempotent_second_is_noop(monkeypatch: pytest.MonkeyPatch)
     assert row is not None and row.generation == "1"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_state", [RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED]
+)
+async def test_cancel_terminal_record_is_service_noop(
+    monkeypatch: pytest.MonkeyPatch, terminal_state: RunState
+):
+    """Direct callers cannot rewrite a retained terminal record to CANCELLED."""
+
+    async def _must_not_sweep(run_id):
+        raise AssertionError("terminal run must return before cancellation work")
+
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _must_not_sweep)
+    _seed_script_run("run-terminal", state=terminal_state.value, generation="1")
+    process = _FakeProcess()
+    record = _make_record("run-terminal", process=process, generation="1")
+    record.state = terminal_state
+    record.finished_at = "2026-07-08T00:00:01Z"
+
+    await cancel_script_run(record)
+
+    row = workflow_journal.get_run("run-terminal")
+    assert row is not None and row.state == terminal_state.value
+    assert row.generation == "1"
+    assert record.state == terminal_state
+    assert record.cancelled is False
+    assert process.signals == []
+
+
 # ---------------------------------------------------------------------------
 # A2 — resume admission + happy path
 # ---------------------------------------------------------------------------
@@ -820,6 +851,197 @@ def test_terminal_recorder_none_for_non_script_record():
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 — record_step_completion (RUNNING -> COMPLETED/FAILED transition)
+# ---------------------------------------------------------------------------
+def _kw(run_id: str, step_id: str) -> dict:
+    """The run/step env a genuine script run-step call carries."""
+    return {"CAO_WORKFLOW_RUN_ID": run_id, "CAO_WORKFLOW_STEP_ID": step_id}
+
+
+def test_step_call_fingerprint_stable_and_field_separated():
+    """The fingerprint is deterministic and its fields cannot collide across the
+    boundary (``a|b`` must differ from ``ab|``)."""
+    fp1 = _step_call_fingerprint("kiro_cli", "dev", "go")
+    fp2 = _step_call_fingerprint("kiro_cli", "dev", "go")
+    assert fp1 == fp2 and len(fp1) == 64  # sha256 hexdigest
+    # A field-boundary shift must change the digest (NUL separation).
+    assert _step_call_fingerprint("a", "b", "c") != _step_call_fingerprint("ab", "", "c")
+
+
+def test_completion_guard_none_without_script_record():
+    """Same BR-31 guard as the recorder: no run/step env or no live script
+    record -> None (YAML/handoff callers untouched)."""
+    assert record_step_completion(None, provider="p", agent="a", prompt="x") is None
+    assert (
+        record_step_completion({"CAO_WORKFLOW_RUN_ID": "x"}, provider="p", agent="a", prompt="x")
+        is None
+    )
+    # run/step present but no record in the registry.
+    assert record_step_completion(_kw("ghost", "s1"), provider="p", agent="a", prompt="x") is None
+
+
+def test_completion_transitions_running_to_completed(_patched_journal):
+    """Happy path: a settle with no error flips a seeded RUNNING step to COMPLETED,
+    bumps attempts, and journals the completed row (so resume can replay it)."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    record = _make_record("run-c", process=None, generation="1")
+    record.step_states["s1"] = StepRunState(
+        step_id="s1", state=StepState.RUNNING, terminal_id="term-1"
+    )
+    workflow_service.run_registry["run-c"] = record
+
+    settle = record_step_completion(
+        _kw("run-c", "s1"), provider="kiro_cli", agent="dev", prompt="go"
+    )
+    assert settle is not None
+    settle("term-1", None)
+
+    st = record.step_states["s1"]
+    assert st.state == StepState.COMPLETED
+    assert st.attempts == 1
+    assert st.error is None
+    # The completed step is written through to the journal with a stable
+    # fingerprint AND its attempts persisted (so a resume's lookup_replay /
+    # rebuild sees the real state, not append_step's hardcoded attempts=0).
+    row = workflow_journal.get_step("run-c", "s1")
+    assert row is not None
+    assert row.state == "completed"
+    assert row.attempts == 1
+    assert row.call_fingerprint == _step_call_fingerprint("kiro_cli", "dev", "go")
+
+
+def test_completion_adopts_validated_structured_output(_patched_journal):
+    """A worker that returned schema-valid output via workflow_return has that
+    output copied onto the step state and settles COMPLETED."""
+    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services.step_output_store import record_step_output
+
+    record = _make_record("run-out", process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry["run-out"] = record
+    # Worker emitted a valid output (no schema -> validated=True).
+    record_step_output("run-out", "s1", {"answer": 42})
+
+    settle = record_step_completion(_kw("run-out", "s1"), provider="p", agent="a", prompt="go")
+    settle("term-1", None)
+
+    st = record.step_states["s1"]
+    assert st.state == StepState.COMPLETED
+    assert st.output is not None and st.output.output == {"answer": 42}
+    # The structured output round-trips to the durable row (not NULL), preserving
+    # complete status history and the reserved lookup_replay primitive's data.
+    row = workflow_journal.get_step("run-out", "s1")
+    assert row is not None and row.output_json is not None
+    assert json.loads(row.output_json) == {"answer": 42}
+
+
+def test_completion_unvalidated_output_settles_completed_unvalidated(_patched_journal):
+    """Edge case: a present-but-schema-invalid output settles
+    COMPLETED_UNVALIDATED (missing==invalid), mirroring the YAML tier."""
+    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services.step_output_store import record_step_output
+
+    record = _make_record("run-inv", process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry["run-inv"] = record
+    # Output fails its schema -> validated=False, state COMPLETED_UNVALIDATED.
+    record_step_output(
+        "run-inv",
+        "s1",
+        {"answer": "not-an-int"},
+        {"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"]},
+    )
+
+    settle = record_step_completion(_kw("run-inv", "s1"), provider="p", agent="a", prompt="go")
+    settle("term-1", None)
+
+    st = record.step_states["s1"]
+    assert st.state == StepState.COMPLETED_UNVALIDATED
+    assert st.output is not None and st.output.validated is False
+
+
+def test_completion_error_transitions_running_to_failed(_patched_journal):
+    """Edge case: a settle carrying an error flips the step to FAILED, records the
+    error string, and journals FAILED."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    record = _make_record("run-f", process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry["run-f"] = record
+
+    settle = record_step_completion(_kw("run-f", "s1"), provider="p", agent="a", prompt="go")
+    settle("term-1", "terminal term-1 reached ERROR status")
+
+    st = record.step_states["s1"]
+    assert st.state == StepState.FAILED
+    assert st.error == "terminal term-1 reached ERROR status"
+    row = workflow_journal.get_step("run-f", "s1")
+    assert row is not None and row.state == "failed"
+    # The error string persists durably (append_step hardcodes error=NULL; the
+    # update_step second write is what carries it).
+    assert row.error == "terminal term-1 reached ERROR status"
+
+
+def test_completion_creates_step_state_when_missing(_patched_journal):
+    """Edge case: if no prior RUNNING seed exists (the terminal-created callback
+    never fired), the settle still records the transition rather than KeyError-ing."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    record = _make_record("run-m", process=None, generation="1")  # empty step_states
+    workflow_service.run_registry["run-m"] = record
+
+    settle = record_step_completion(_kw("run-m", "s1"), provider="p", agent="a", prompt="go")
+    settle(None, None)
+
+    assert "s1" in record.step_states
+    assert record.step_states["s1"].state == StepState.COMPLETED
+    assert record.step_states["s1"].attempts == 1
+
+
+def test_completion_journal_failure_never_raises(monkeypatch, _patched_journal):
+    """INV-4: a journal write failure during settle is swallowed — the in-memory
+    transition still lands, the call never raises."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    record = _make_record("run-j", process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry["run-j"] = record
+
+    def _boom(*a, **k):
+        raise RuntimeError("db gone")
+
+    monkeypatch.setattr(workflow_journal, "append_step", _boom)
+
+    settle = record_step_completion(_kw("run-j", "s1"), provider="p", agent="a", prompt="go")
+    settle("term-1", None)  # must not raise
+    # In-memory transition still applied despite the journal write failing.
+    assert record.step_states["s1"].state == StepState.COMPLETED
+
+
+def test_get_run_status_script_cold_miss_uses_journal_row_without_yaml_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A journal-only script run returns its row state and no reconstructed steps."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    _seed_script_run("run-cold", state="failed", generation="3")
+
+    def _must_not_rebuild(run_id):
+        raise AssertionError("script status must not use the YAML journal rebuild")
+
+    monkeypatch.setattr(workflow_service, "_rebuild_record_from_journal", _must_not_rebuild)
+
+    status = workflow_service.get_run_status("run-cold")
+
+    assert status.run_id == "run-cold"
+    assert status.state == RunState.FAILED
+    assert status.current_step_id is None
+    assert status.steps == []
+    assert "run-cold" not in workflow_service.run_registry
 
 
 # ---------------------------------------------------------------------------

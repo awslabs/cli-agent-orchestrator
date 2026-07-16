@@ -2,8 +2,11 @@ import { useState, useEffect } from 'react'
 import { api, MemorySummary, MemoryDetail } from '../api'
 import { useStore } from '../store'
 import { ConfirmModal } from './ConfirmModal'
-import { Brain, Search, Trash2, ChevronDown, ChevronRight } from 'lucide-react'
+import { Brain, Search, Trash2, ChevronDown, ChevronRight, List, Share2 } from 'lucide-react'
 import { CustomSelect } from './CustomSelect'
+import { MemoryGraphView } from './MemoryGraphView'
+
+type ViewMode = 'list' | 'graph'
 
 const SCOPE_OPTIONS = [
   { value: '', label: 'All scopes' },
@@ -43,6 +46,13 @@ export function MemoryPanel() {
   const [typeFilter, setTypeFilter] = useState('')
   const [search, setSearch] = useState('')
 
+  // List⇄Graph view toggle. Component state only (no persistence).
+  const [viewMode, setViewMode] = useState<ViewMode>('list')
+  // scope_id for the graph view in project scope. Shared with the list clear
+  // logic conceptually, but the list doesn't need one. Defaulted from the
+  // listed memories when a project scope_id is discoverable.
+  const [graphScopeId, setGraphScopeId] = useState('')
+
   // Expanded detail state; detail is keyed by row id so a slow fetch for a
   // previously-expanded row can't land under the currently-expanded one
   const [expandedKey, setExpandedKey] = useState<string | null>(null)
@@ -70,6 +80,15 @@ export function MemoryPanel() {
   useEffect(() => {
     fetchMemories()
   }, [scopeFilter, typeFilter])
+
+  // Default the graph's project scope_id from the listed memories when one is
+  // discoverable and the user hasn't typed their own. Keeps the graph view
+  // usable in project scope without forcing the user to know the canonical id.
+  useEffect(() => {
+    if (scopeFilter !== 'project' || graphScopeId) return
+    const discovered = memories.find(m => m.scope === 'project' && m.scope_id)?.scope_id
+    if (discovered) setGraphScopeId(discovered)
+  }, [scopeFilter, memories, graphScopeId])
 
   const handleExpand = async (m: MemorySummary) => {
     const id = rowId(m)
@@ -148,15 +167,64 @@ export function MemoryPanel() {
     }
   }
 
-  if (loading) {
-    return <div className="text-gray-500 text-sm py-8 text-center">Loading memories...</div>
-  }
-
   const filtered = memories.filter(m => !search || m.key.includes(search.toLowerCase()))
 
   return (
     <div className="space-y-6">
-      {/* Memory List */}
+      {/* View-mode toggle + shared scope selector. The scope (and, in graph +
+          project mode, scope_id) is shared across both views. */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <div className="inline-flex rounded-lg border border-gray-700 overflow-hidden" role="tablist" aria-label="Memory view mode">
+          <button
+            role="tab"
+            aria-selected={viewMode === 'list'}
+            onClick={() => setViewMode('list')}
+            className={`flex items-center gap-2 px-3 py-2 text-sm font-medium transition-colors ${
+              viewMode === 'list' ? 'bg-emerald-600 text-white' : 'bg-gray-900 text-gray-400 hover:text-white hover:bg-gray-800'
+            }`}
+          >
+            <List size={14} />
+            List
+          </button>
+          <button
+            role="tab"
+            aria-selected={viewMode === 'graph'}
+            onClick={() => setViewMode('graph')}
+            className={`flex items-center gap-2 px-3 py-2 text-sm font-medium transition-colors ${
+              viewMode === 'graph' ? 'bg-emerald-600 text-white' : 'bg-gray-900 text-gray-400 hover:text-white hover:bg-gray-800'
+            }`}
+          >
+            <Share2 size={14} />
+            Graph
+          </button>
+        </div>
+
+        <CustomSelect
+          value={scopeFilter}
+          onChange={setScopeFilter}
+          options={SCOPE_OPTIONS}
+          className="w-40"
+        />
+
+        {/* Graph + project needs a concrete scope_id (defaulted from the listed
+            memories when discoverable). Only shown where it applies. */}
+        {viewMode === 'graph' && scopeFilter === 'project' && (
+          <input
+            type="text"
+            value={graphScopeId}
+            onChange={e => setGraphScopeId(e.target.value)}
+            placeholder="project scope_id (e.g. github-com-…)"
+            className="bg-gray-900 border border-gray-700 text-gray-200 text-xs rounded-lg px-3 py-2 w-72 focus:border-emerald-500 focus:outline-none font-mono"
+          />
+        )}
+      </div>
+
+      {viewMode === 'graph' ? (
+        <MemoryGraphView scope={scopeFilter} scopeId={graphScopeId} />
+      ) : loading ? (
+        <div className="text-gray-500 text-sm py-8 text-center">Loading memories...</div>
+      ) : (
+      /* Memory List */
       <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5">
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">
@@ -173,14 +241,8 @@ export function MemoryPanel() {
           </button>
         </div>
 
-        {/* Filters */}
+        {/* Filters (list-only: type + key search) */}
         <div className="flex items-center gap-3 mb-4">
-          <CustomSelect
-            value={scopeFilter}
-            onChange={setScopeFilter}
-            options={SCOPE_OPTIONS}
-            className="w-40"
-          />
           <CustomSelect
             value={typeFilter}
             onChange={setTypeFilter}
@@ -278,6 +340,7 @@ export function MemoryPanel() {
           </div>
         )}
       </div>
+      )}
 
       {/* Delete Confirmation Modal */}
       <ConfirmModal
