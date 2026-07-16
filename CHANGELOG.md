@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - self-healing pipe-pane liveness watchdog for silently-stalled FIFO forwarding (fixes #388) (#397), including detection of a stall that settles into a new static frame before the next poll and of a pipe that never delivers a single byte from terminal creation (cold start, harness-control#93) — see `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` / `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` in `docs/configuration.md`
 - web: attach web terminals through the configured backend so herdr-backed terminals no longer fail to attach (#417)
 - honor profile frontmatter `provider:` during install (flag > frontmatter > default) (#414)
-- deliver messages with `tmux paste-buffer -p` instead of hand-crafting bracketed-paste markers; tmux >= 3.7 sanitizes pasted buffers through vis(3), rendering the hand-crafted `ESC [200~`/`ESC [201~` markers as literal `^[[200~` garbage in the receiving TUI (#413)
+- deliver messages with `tmux paste-buffer -p` on tmux >= 3.7, which sanitizes pasted buffers through vis(3) and rendered the previously hand-crafted `ESC [200~`/`ESC [201~` markers as literal `^[[200~` garbage in the receiving TUI; tmux < 3.7 keeps the hand-crafted wrap so TUIs that never enable DECSET 2004 (e.g. kiro-cli) still receive multi-line messages as a single input (#413)
 
 ### Security
 
