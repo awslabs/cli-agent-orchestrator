@@ -447,12 +447,35 @@ class CreateFlowRequest(BaseModel):
         return v
 
 
+def _reconcile_memory_at_startup() -> None:
+    """Apply bounded memory repair and keep server startup resilient."""
+    try:
+        from cli_agent_orchestrator.services import memory_reconciliation
+
+        repair_report = memory_reconciliation.reconcile_memory_startup()
+        if repair_report is not None:
+            logger.info(repair_report.summary_text())
+    except Exception as exc:
+        report = getattr(exc, "report", None)
+        if report is not None:
+            logger.error(
+                "%s; automatic memory repair was incomplete; run `cao memory repair --apply`",
+                report.summary_text(),
+            )
+        else:
+            logger.error(
+                "automatic memory repair failed (%s); run `cao memory repair --apply`",
+                type(exc).__name__,
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     init_db()
+    _reconcile_memory_at_startup()
     registry = PluginRegistry()
     await registry.load()
     app.state.plugin_registry = registry

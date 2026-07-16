@@ -22,6 +22,7 @@ from cli_agent_orchestrator.models.workflow_runtime import ReturnAck
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
+    MemoryPartialWriteError,
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
@@ -1343,6 +1344,20 @@ async def memory_store(
             "file_path": memory.file_path,
             "action": memory.action
             or ("updated" if memory.created_at != memory.updated_at else "created"),
+        }
+    except MemoryPartialWriteError as e:
+        return {
+            "success": False,
+            "error_kind": e.error_kind,
+            "error": str(e),
+            "partial_write": {
+                "key": e.key,
+                "scope": e.scope,
+                "scope_id": e.scope_id,
+                "file_path": e.file_path,
+                "completed_phases": e.completed_phases,
+                "repair_command": e.repair_command,
+            },
         }
     except MemoryDisabledError as e:
         return {"success": False, "disabled": True, "error": str(e)}
