@@ -4,10 +4,14 @@ from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
+from cli_agent_orchestrator.cli.commands.update import _DIRECTORY as _DIR
 from cli_agent_orchestrator.cli.commands.update import (
+    _GIT,
+    _PATH,
+    _REGISTRY,
+    _REGISTRY_PINNED,
     _build_command,
-    _git_source_from_receipt,
-    _local_source_from_receipt,
+    _classify_source,
     _receipt_path,
     update,
 )
@@ -15,29 +19,38 @@ from cli_agent_orchestrator.cli.commands.update import (
 _MOD = "cli_agent_orchestrator.cli.commands.update"
 _PACKAGE = "cli-agent-orchestrator"
 
-# Real uv format (verified against uv 0.8.x): the git ref is embedded in the
-# URL as a ``?rev=<ref>`` query param, NOT a separate rev/branch/tag key.
+# Real uv formats (verified against uv 0.8.x / 0.9.x).
 _GIT_RECEIPT_REAL = """
 [tool]
 requirements = [{ name = "cli-agent-orchestrator", git = "https://github.com/awslabs/cli-agent-orchestrator.git?rev=main" }]
 """
 
-# Bare git URL with no ref (uv omits ?rev= when installed without @<ref>).
 _GIT_RECEIPT_NO_REF = """
 [tool]
 requirements = [{ name = "cli-agent-orchestrator", git = "https://github.com/awslabs/cli-agent-orchestrator.git" }]
 """
 
-# Defensive: a hypothetical separate-key rev shape (older/other uv versions).
 _GIT_RECEIPT_SEPARATE_REV = """
 [tool]
 requirements = [{ name = "cli-agent-orchestrator", git = "https://github.com/awslabs/cli-agent-orchestrator.git", branch = "main" }]
 """
 
-# Real uv format for a PyPI/registry install: a bare name, no specifier key.
+# Unpinned registry install: a bare name, no specifier.
 _REGISTRY_RECEIPT = """
 [tool]
 requirements = [{ name = "cli-agent-orchestrator" }]
+"""
+
+# Exact-version pin (verified real shape via `uv tool install ruff==0.11.0`).
+_REGISTRY_PINNED_RECEIPT = """
+[tool]
+requirements = [{ name = "cli-agent-orchestrator", specifier = "==2.1.0" }]
+"""
+
+# A bounded, non-exact specifier is treated as an ordinary registry install.
+_REGISTRY_BOUNDED_RECEIPT = """
+[tool]
+requirements = [{ name = "cli-agent-orchestrator", specifier = ">=2.0.0" }]
 """
 
 _DIRECTORY_RECEIPT = """
@@ -45,11 +58,17 @@ _DIRECTORY_RECEIPT = """
 requirements = [{ name = "cli-agent-orchestrator", directory = "/home/me/cli-agent-orchestrator" }]
 """
 
-# Real uv format for a wheel/path install (verified: mcp-obsidian uses this).
 _PATH_RECEIPT = """
 [tool]
 requirements = [{ name = "cli-agent-orchestrator", path = "/home/me/dist/cli_agent_orchestrator-2.3.0-py3-none-any.whl" }]
 """
+
+# Structurally corrupt but syntactically valid TOML (wrong shapes).
+_TOOL_NOT_TABLE = 'tool = "corrupt"\n'
+_REQS_NOT_LIST = "[tool]\nrequirements = 42\n"
+_DIR_NOT_STRING = (
+    "[tool]\nrequirements = [{ name = " '"cli-agent-orchestrator", directory = true }]\n'
+)
 
 
 def _completed(returncode):
@@ -66,6 +85,12 @@ def _dir_run(stdout="", returncode=0):
     return result
 
 
+def _write(tmp_path, content):
+    r = tmp_path / "uv-receipt.toml"
+    r.write_text(content)
+    return r
+
+
 class TestReceiptPath:
     """_receipt_path locates uv's receipt via `uv tool dir` (or degrades)."""
 
@@ -73,7 +98,7 @@ class TestReceiptPath:
     @patch(f"{_MOD}.shutil.which", return_value=None)
     def test_none_when_uv_missing(self, _which, mock_run):
         assert _receipt_path() is None
-        mock_run.assert_not_called()  # no subprocess when uv is absent
+        mock_run.assert_not_called()
 
     @patch(f"{_MOD}.subprocess.run")
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
@@ -91,7 +116,6 @@ class TestReceiptPath:
     @patch(f"{_MOD}.subprocess.run")
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
     def test_none_when_receipt_file_absent(self, _which, mock_run, tmp_path):
-        # `uv tool dir` resolves, but CAO isn't installed there.
         mock_run.return_value = _dir_run(stdout=f"{tmp_path}\n")
         assert _receipt_path() is None
 
@@ -103,109 +127,98 @@ class TestReceiptPath:
 
     @patch(f"{_MOD}.subprocess.run", side_effect=OSError("boom"))
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
-    def test_none_when_uv_tool_dir_raises(self, _which, _run):
+    def test_none_when_uv_tool_dir_raises_oserror(self, _which, _run):
+        assert _receipt_path() is None
+
+    @patch(
+        f"{_MOD}.subprocess.run",
+        side_effect=__import__("subprocess").CalledProcessError(1, ["uv", "tool", "dir"]),
+    )
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_none_when_uv_tool_dir_nonzero_exit(self, _which, _run):
+        # `uv tool dir` exits non-zero -> degrade to None (not raise).
         assert _receipt_path() is None
 
 
-class TestGitSourceFromReceipt:
-    """_git_source_from_receipt classifies the install source from the receipt."""
+class TestClassifySource:
+    """_classify_source maps a receipt to (kind, detail)."""
 
-    def test_real_git_receipt_with_rev_query(self, tmp_path):
-        # The exact shape uv writes for `uv tool install git+...@main`.
-        r = tmp_path / "uv-receipt.toml"
-        r.write_text(_GIT_RECEIPT_REAL)
-        assert (
-            _git_source_from_receipt(r)
-            == "git+https://github.com/awslabs/cli-agent-orchestrator.git?rev=main"
+    def test_none_receipt_is_registry(self):
+        assert _classify_source(None) == (_REGISTRY, None)
+
+    def test_git_with_rev_query(self, tmp_path):
+        assert _classify_source(_write(tmp_path, _GIT_RECEIPT_REAL)) == (
+            _GIT,
+            "git+https://github.com/awslabs/cli-agent-orchestrator.git?rev=main",
         )
 
-    def test_git_receipt_no_ref(self, tmp_path):
-        r = tmp_path / "uv-receipt.toml"
-        r.write_text(_GIT_RECEIPT_NO_REF)
-        assert (
-            _git_source_from_receipt(r)
-            == "git+https://github.com/awslabs/cli-agent-orchestrator.git"
+    def test_git_no_ref(self, tmp_path):
+        assert _classify_source(_write(tmp_path, _GIT_RECEIPT_NO_REF)) == (
+            _GIT,
+            "git+https://github.com/awslabs/cli-agent-orchestrator.git",
         )
 
-    def test_git_receipt_separate_rev_key_pins_rev(self, tmp_path):
-        # Defensive against a receipt that carries the ref as a separate key.
-        r = tmp_path / "uv-receipt.toml"
-        r.write_text(_GIT_RECEIPT_SEPARATE_REV)
-        assert (
-            _git_source_from_receipt(r)
-            == "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
+    def test_git_separate_rev_key(self, tmp_path):
+        assert _classify_source(_write(tmp_path, _GIT_RECEIPT_SEPARATE_REV)) == (
+            _GIT,
+            "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
         )
 
-    def test_registry_receipt_returns_none(self, tmp_path):
-        r = tmp_path / "uv-receipt.toml"
-        r.write_text(_REGISTRY_RECEIPT)
-        assert _git_source_from_receipt(r) is None
+    def test_registry_unpinned(self, tmp_path):
+        assert _classify_source(_write(tmp_path, _REGISTRY_RECEIPT)) == (_REGISTRY, None)
 
-    def test_directory_receipt_returns_none(self, tmp_path):
-        r = tmp_path / "uv-receipt.toml"
-        r.write_text(_DIRECTORY_RECEIPT)
-        assert _git_source_from_receipt(r) is None
+    def test_registry_bounded_specifier_is_plain_registry(self, tmp_path):
+        # A non-exact bound (>=) still upgrades cleanly via `uv tool upgrade`.
+        assert _classify_source(_write(tmp_path, _REGISTRY_BOUNDED_RECEIPT)) == (_REGISTRY, None)
 
-    def test_unreadable_receipt_returns_none(self, tmp_path):
-        # read_text raises (file vanished) -> caught, None.
-        assert _git_source_from_receipt(tmp_path / "does-not-exist.toml") is None
+    def test_registry_exact_pin(self, tmp_path):
+        assert _classify_source(_write(tmp_path, _REGISTRY_PINNED_RECEIPT)) == (
+            _REGISTRY_PINNED,
+            "==2.1.0",
+        )
 
-    def test_non_dict_requirement_is_skipped(self, tmp_path):
-        # A stray non-table entry in requirements must not crash the parser.
-        r = tmp_path / "uv-receipt.toml"
-        r.write_text('[tool]\nrequirements = ["not-a-table"]\n')
-        assert _git_source_from_receipt(r) is None
-
-
-class TestLocalSourceFromReceipt:
-    """_local_source_from_receipt surfaces a local directory/path install."""
-
-    def test_directory_receipt_returns_kind_and_path(self, tmp_path):
-        r = tmp_path / "uv-receipt.toml"
-        r.write_text(_DIRECTORY_RECEIPT)
-        assert _local_source_from_receipt(r) == (
-            "directory",
+    def test_directory(self, tmp_path):
+        assert _classify_source(_write(tmp_path, _DIRECTORY_RECEIPT)) == (
+            _DIR,
             "/home/me/cli-agent-orchestrator",
         )
 
-    def test_path_receipt_returns_kind_and_path(self, tmp_path):
-        r = tmp_path / "uv-receipt.toml"
-        r.write_text(_PATH_RECEIPT)
-        assert _local_source_from_receipt(r) == (
-            "path",
+    def test_path(self, tmp_path):
+        assert _classify_source(_write(tmp_path, _PATH_RECEIPT)) == (
+            _PATH,
             "/home/me/dist/cli_agent_orchestrator-2.3.0-py3-none-any.whl",
         )
 
-    def test_registry_receipt_returns_none(self, tmp_path):
-        r = tmp_path / "uv-receipt.toml"
-        r.write_text(_REGISTRY_RECEIPT)
-        assert _local_source_from_receipt(r) is None
+    # --- robustness: malformed / wrong-shape receipts degrade to registry ---
 
-    def test_git_receipt_returns_none(self, tmp_path):
-        r = tmp_path / "uv-receipt.toml"
-        r.write_text(_GIT_RECEIPT_REAL)
-        assert _local_source_from_receipt(r) is None
+    def test_unparseable_toml_degrades(self, tmp_path):
+        assert _classify_source(_write(tmp_path, "not : valid : toml [[[")) == (_REGISTRY, None)
 
-    def test_unparseable_receipt_returns_none(self, tmp_path):
-        r = tmp_path / "uv-receipt.toml"
-        r.write_text("this is : not : valid toml [[[")
-        assert _local_source_from_receipt(r) is None
+    def test_unreadable_file_degrades(self, tmp_path):
+        assert _classify_source(tmp_path / "missing.toml") == (_REGISTRY, None)
 
-    def test_no_matching_requirement_returns_none(self, tmp_path):
-        # Requirements present, but none is CAO (skip non-matching, then exhaust).
-        r = tmp_path / "uv-receipt.toml"
-        r.write_text(
-            "[tool]\nrequirements = ["
-            '"not-a-table", '
-            '{ name = "other-pkg", directory = "/somewhere" }]\n'
+    def test_tool_not_a_table_degrades(self, tmp_path):
+        # `tool = "corrupt"` — decoded tool is a str; must not raise AttributeError.
+        assert _classify_source(_write(tmp_path, _TOOL_NOT_TABLE)) == (_REGISTRY, None)
+
+    def test_requirements_not_a_list_degrades(self, tmp_path):
+        assert _classify_source(_write(tmp_path, _REQS_NOT_LIST)) == (_REGISTRY, None)
+
+    def test_non_string_directory_degrades(self, tmp_path):
+        # A boolean `directory` must not be treated as a path / reach shlex.quote.
+        assert _classify_source(_write(tmp_path, _DIR_NOT_STRING)) == (_REGISTRY, None)
+
+    def test_no_matching_requirement_degrades(self, tmp_path):
+        r = _write(
+            tmp_path,
+            '[tool]\nrequirements = ["stray", { name = "other", directory = "/x" }]\n',
         )
-        assert _local_source_from_receipt(r) is None
+        assert _classify_source(r) == (_REGISTRY, None)
 
 
 class TestBuildCommand:
-    def test_git_source_reinstalls(self):
-        cmd = _build_command("git+https://example.com/x.git")
-        assert cmd == [
+    def test_git_reinstalls(self):
+        assert _build_command(_GIT, "git+https://example.com/x.git") == [
             "uv",
             "tool",
             "install",
@@ -214,40 +227,54 @@ class TestBuildCommand:
             "--reinstall",
         ]
 
-    def test_no_git_source_upgrades(self):
-        assert _build_command(None) == [
+    def test_registry_upgrades(self):
+        assert _build_command(_REGISTRY, None) == ["uv", "tool", "upgrade", _PACKAGE]
+
+    def test_pinned_registry_unpins_via_at_latest(self):
+        assert _build_command(_REGISTRY_PINNED, "==2.1.0") == [
             "uv",
             "tool",
-            "upgrade",
-            "cli-agent-orchestrator",
+            "install",
+            f"{_PACKAGE}@latest",
+            "--upgrade",
         ]
 
 
 class TestUpdateCommand:
     @patch(f"{_MOD}.subprocess.run")
-    @patch(f"{_MOD}._git_source_from_receipt", return_value=None)
+    @patch(f"{_MOD}._classify_source", return_value=(_REGISTRY, None))
     @patch(f"{_MOD}._receipt_path", return_value=None)
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
-    def test_registry_install_runs_upgrade(self, _which, _receipt, _git, mock_run):
+    def test_registry_runs_upgrade(self, _which, _rp, _cls, mock_run):
         mock_run.return_value = _completed(0)
         result = CliRunner().invoke(update, [])
-
         assert result.exit_code == 0
-        mock_run.assert_called_once_with(["uv", "tool", "upgrade", "cli-agent-orchestrator"])
+        mock_run.assert_called_once_with(["uv", "tool", "upgrade", _PACKAGE])
         assert "up to date" in result.output
 
     @patch(f"{_MOD}.subprocess.run")
-    @patch(f"{_MOD}._local_source_from_receipt", return_value=None)
+    @patch(f"{_MOD}._classify_source", return_value=(_REGISTRY_PINNED, "==2.1.0"))
+    @patch(f"{_MOD}._receipt_path", return_value=None)
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_pinned_registry_unpins(self, _which, _rp, _cls, mock_run):
+        mock_run.return_value = _completed(0)
+        result = CliRunner().invoke(update, [])
+        assert result.exit_code == 0
+        mock_run.assert_called_once_with(
+            ["uv", "tool", "install", f"{_PACKAGE}@latest", "--upgrade"]
+        )
+        assert "unpinning from ==2.1.0" in result.output
+
+    @patch(f"{_MOD}.subprocess.run")
     @patch(
-        f"{_MOD}._git_source_from_receipt",
-        return_value="git+https://github.com/awslabs/cli-agent-orchestrator.git",
+        f"{_MOD}._classify_source",
+        return_value=(_GIT, "git+https://github.com/awslabs/cli-agent-orchestrator.git"),
     )
     @patch(f"{_MOD}._receipt_path")
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
-    def test_git_install_forces_reinstall(self, _which, _receipt, _git, _local, mock_run):
+    def test_git_forces_reinstall(self, _which, _rp, _cls, mock_run):
         mock_run.return_value = _completed(0)
         result = CliRunner().invoke(update, [])
-
         assert result.exit_code == 0
         mock_run.assert_called_once_with(
             [
@@ -261,62 +288,55 @@ class TestUpdateCommand:
         )
 
     @patch(f"{_MOD}.subprocess.run")
-    @patch(
-        f"{_MOD}._local_source_from_receipt",
-        return_value=("directory", "/home/me/cli-agent-orchestrator"),
-    )
+    @patch(f"{_MOD}._classify_source", return_value=(_DIR, "/home/me/cli-agent-orchestrator"))
     @patch(f"{_MOD}._receipt_path")
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
-    def test_local_dir_install_informs_without_running_uv(self, _which, _receipt, _local, mock_run):
+    def test_directory_informs_without_running_uv(self, _which, _rp, _cls, mock_run):
         result = CliRunner().invoke(update, [])
-
         assert result.exit_code != 0
         assert "local directory" in result.output
         assert "/home/me/cli-agent-orchestrator" in result.output
-        assert "git -C" in result.output  # directory-specific guidance
-        # Must NOT run a no-op uv upgrade for a local install.
+        # Reinstall shown as the definite step; git pull only as the common case.
+        assert "uv tool install /home/me/cli-agent-orchestrator --reinstall" in result.output
+        assert "git checkout" in result.output
         mock_run.assert_not_called()
 
     @patch(f"{_MOD}.subprocess.run")
-    @patch(
-        f"{_MOD}._local_source_from_receipt",
-        return_value=("path", "/home/me/dist/cao.whl"),
-    )
+    @patch(f"{_MOD}._classify_source", return_value=(_PATH, "/home/me/dist/cao.whl"))
     @patch(f"{_MOD}._receipt_path")
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
-    def test_path_install_informs_without_running_uv(self, _which, _receipt, _local, mock_run):
+    def test_path_informs_without_running_uv(self, _which, _rp, _cls, mock_run):
         result = CliRunner().invoke(update, [])
-
         assert result.exit_code != 0
         assert "local path" in result.output
         assert "/home/me/dist/cao.whl" in result.output
-        assert "git -C" not in result.output  # path guidance omits git pull
+        assert "rebuild" in result.output
+        assert "git -C" not in result.output  # no git pull for a wheel
         mock_run.assert_not_called()
 
     @patch(f"{_MOD}.subprocess.run")
     @patch(f"{_MOD}.shutil.which", return_value=None)
     def test_missing_uv_is_a_clickexception(self, _which, mock_run):
         result = CliRunner().invoke(update, [])
-
         assert result.exit_code != 0
         assert "uv is not on PATH" in result.output
-        mock_run.assert_not_called()  # fails BEFORE any subprocess
+        mock_run.assert_not_called()
 
     @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._classify_source", return_value=(_REGISTRY, None))
     @patch(f"{_MOD}._receipt_path", return_value=None)
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
-    def test_nonzero_exit_surfaces_error(self, _which, _receipt, mock_run):
+    def test_nonzero_exit_surfaces_error(self, _which, _rp, _cls, mock_run):
         mock_run.return_value = _completed(2)
         result = CliRunner().invoke(update, [])
-
         assert result.exit_code != 0
         assert "exited with code 2" in result.output
 
     @patch(f"{_MOD}.subprocess.run", side_effect=OSError("cannot exec"))
+    @patch(f"{_MOD}._classify_source", return_value=(_REGISTRY, None))
     @patch(f"{_MOD}._receipt_path", return_value=None)
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
-    def test_oserror_is_wrapped(self, _which, _receipt, _run):
+    def test_oserror_is_wrapped(self, _which, _rp, _cls, _run):
         result = CliRunner().invoke(update, [])
-
         assert result.exit_code != 0
         assert "Failed to run uv" in result.output

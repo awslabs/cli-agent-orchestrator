@@ -100,10 +100,18 @@ PyPI publishes tagged releases only, so it will lag behind `main` between releas
 uv tool install cli-agent-orchestrator --upgrade
 
 # Pin a specific release
-uv tool install cli-agent-orchestrator==2.1.0
+uv tool install cli-agent-orchestrator==2.3.0
 ```
 
 For local development (`git clone` + `uv sync`) and the testing/quality workflow, see [DEVELOPMENT.md](DEVELOPMENT.md).
+
+#### Updating CAO
+
+```bash
+cao update
+```
+
+`cao update` upgrades CAO in place, picking the right uv command for **how you installed it** (git, PyPI, an exact pin, or a local clone/wheel) by reading uv's install receipt. Requires that CAO was installed as a **uv tool**; after updating, restart any running `cao-server`. See [docs/updating.md](docs/updating.md) for the full per-source behavior.
 
 ## Devcontainer Feature
 
