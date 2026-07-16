@@ -33,6 +33,13 @@ _CC = "cli_agent_orchestrator.providers.claude_code"
 # get_init_timeout reads the server default from settings_service (lazy import).
 _SETTINGS = "cli_agent_orchestrator.services.settings_service.get_server_settings"
 
+# A rendered pane that satisfies NEW_TUI_BOX_PATTERN, returned by the mocked
+# backend's get_history so initialize()'s final wait_until_input_ready() settle
+# check sees a stable, input-ready box and returns immediately. Without a string
+# here get_history yields a bare MagicMock, which strip_terminal_escapes ->
+# re.sub rejects with "expected string or bytes-like object" (see PR #441).
+_READY_PANE = "────────\n> \n────────"
+
 
 class TestInitializePassesResolvedInitTimeout:
     """The timeout get_init_timeout resolves must cap every wait in initialize().
@@ -65,6 +72,7 @@ class TestInitializePassesResolvedInitTimeout:
         """provider_init_timeout=180 caps wait_for_shell, handler, and wait_until_status."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_backend.get_history.return_value = _READY_PANE
         mock_load.return_value = AgentProfile(name="a", description="d", provider_init_timeout=180)
 
         provider = ClaudeCodeProvider("t1", "sess", "win", "agent-x")
@@ -98,6 +106,7 @@ class TestInitializePassesResolvedInitTimeout:
         """No provider_init_timeout on the profile -> the 60s server default flows through."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_backend.get_history.return_value = _READY_PANE
         mock_load.return_value = AgentProfile(name="a", description="d")
 
         provider = ClaudeCodeProvider("t1", "sess", "win", "agent-x")
@@ -129,6 +138,7 @@ class TestInitializePassesResolvedInitTimeout:
         """No agent profile at all (_load_profile -> None) -> server default flows through."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_backend.get_history.return_value = _READY_PANE
 
         provider = ClaudeCodeProvider("t1", "sess", "win")  # agent_profile=None
         result = await provider.initialize()
@@ -165,6 +175,7 @@ class TestInitializePassesResolvedInitTimeout:
         """
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_backend.get_history.return_value = _READY_PANE
         mock_load.return_value = AgentProfile(name="a", description="d", provider_init_timeout=180)
 
         provider = ClaudeCodeProvider("t1", "sess", "win", "agent-x")
