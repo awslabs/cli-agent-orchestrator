@@ -543,6 +543,13 @@ class HerdrBackend(TerminalBackend):
         # Equivalent to `tmux attach-session -t <session>`.
         os.execvp("herdr", ["herdr", "--session", self._herdr_session])
 
+    def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
+        """Focus the requested Herdr tab and return the browser PTY attach command."""
+        workspace_id = self._resolve_workspace_id(session_name)
+        tab_id = self._resolve_tab_id(session_name, workspace_id, window_name)
+        self._run_herdr(["tab", "focus", tab_id])
+        return ["herdr", "--session", self._herdr_session]
+
     # --- Capability overrides ---
 
     def supports_event_inbox(self) -> bool:

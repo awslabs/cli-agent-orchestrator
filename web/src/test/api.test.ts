@@ -272,4 +272,58 @@ describe('API wrapper', () => {
       expect.objectContaining({ method: 'DELETE' })
     )
   })
+
+  it('getGraph builds /graph/{provider} with scope + scope_id', async () => {
+    mockResponse({ nodes: [], edges: [], meta: {} })
+    await api.getGraph('memory', 'project', 'my-proj')
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/graph/memory?scope=project&scope_id=my-proj',
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    )
+  })
+
+  it('getGraph omits scope_id when not given', async () => {
+    mockResponse({ nodes: [], edges: [], meta: {} })
+    await api.getGraph('memory', 'global')
+    expect(mockFetch).toHaveBeenCalledWith('/graph/memory?scope=global', expect.any(Object))
+  })
+
+  it('exportGraph POSTs the sink/dest body with scope query params', async () => {
+    mockResponse({ written_files: ['/v/a.md'], sink: 'obsidian', dest: 'global-vault' })
+    const res = await api.exportGraph('memory', { sink: 'obsidian', dest: 'global-vault' }, 'global')
+    expect(res.written_files).toEqual(['/v/a.md'])
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/graph/memory/export?scope=global',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ options: {}, sink: 'obsidian', dest: 'global-vault' }),
+      })
+    )
+  })
+
+  it('getGraph surfaces server detail + status on error', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      json: () => Promise.resolve({ detail: "scope 'session' is private" }),
+    })
+    await expect(api.getGraph('memory', 'session')).rejects.toMatchObject({
+      status: 400,
+      detail: "scope 'session' is private",
+    })
+  })
+
+  it('exportGraph surfaces the 422 secret-gate detail', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 422,
+      statusText: 'Unprocessable Entity',
+      json: () => Promise.resolve({ detail: "export rejected: secret pattern 'aws-key' detected" }),
+    })
+    await expect(
+      api.exportGraph('memory', { sink: 'obsidian', dest: 'x' }, 'global')
+    ).rejects.toMatchObject({ status: 422, detail: "export rejected: secret pattern 'aws-key' detected" })
+  })
 })
