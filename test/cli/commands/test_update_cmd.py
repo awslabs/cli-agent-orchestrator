@@ -8,10 +8,12 @@ from cli_agent_orchestrator.cli.commands.update import (
     _build_command,
     _git_source_from_receipt,
     _local_source_from_receipt,
+    _receipt_path,
     update,
 )
 
 _MOD = "cli_agent_orchestrator.cli.commands.update"
+_PACKAGE = "cli-agent-orchestrator"
 
 # Real uv format (verified against uv 0.8.x): the git ref is embedded in the
 # URL as a ``?rev=<ref>`` query param, NOT a separate rev/branch/tag key.
@@ -56,6 +58,55 @@ def _completed(returncode):
     return result
 
 
+def _dir_run(stdout="", returncode=0):
+    """A subprocess.run result for the `uv tool dir` call."""
+    result = MagicMock()
+    result.stdout = stdout
+    result.returncode = returncode
+    return result
+
+
+class TestReceiptPath:
+    """_receipt_path locates uv's receipt via `uv tool dir` (or degrades)."""
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}.shutil.which", return_value=None)
+    def test_none_when_uv_missing(self, _which, mock_run):
+        assert _receipt_path() is None
+        mock_run.assert_not_called()  # no subprocess when uv is absent
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_returns_receipt_when_present(self, _which, mock_run, tmp_path):
+        (tmp_path / _PACKAGE).mkdir()
+        receipt = tmp_path / _PACKAGE / "uv-receipt.toml"
+        receipt.write_text(_REGISTRY_RECEIPT)
+        mock_run.return_value = _dir_run(stdout=f"{tmp_path}\n")
+
+        assert _receipt_path() == receipt
+        mock_run.assert_called_once_with(
+            ["uv", "tool", "dir"], capture_output=True, text=True, check=True
+        )
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_none_when_receipt_file_absent(self, _which, mock_run, tmp_path):
+        # `uv tool dir` resolves, but CAO isn't installed there.
+        mock_run.return_value = _dir_run(stdout=f"{tmp_path}\n")
+        assert _receipt_path() is None
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_none_when_uv_tool_dir_empty_output(self, _which, mock_run):
+        mock_run.return_value = _dir_run(stdout="\n")
+        assert _receipt_path() is None
+
+    @patch(f"{_MOD}.subprocess.run", side_effect=OSError("boom"))
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_none_when_uv_tool_dir_raises(self, _which, _run):
+        assert _receipt_path() is None
+
+
 class TestGitSourceFromReceipt:
     """_git_source_from_receipt classifies the install source from the receipt."""
 
@@ -95,6 +146,16 @@ class TestGitSourceFromReceipt:
         r.write_text(_DIRECTORY_RECEIPT)
         assert _git_source_from_receipt(r) is None
 
+    def test_unreadable_receipt_returns_none(self, tmp_path):
+        # read_text raises (file vanished) -> caught, None.
+        assert _git_source_from_receipt(tmp_path / "does-not-exist.toml") is None
+
+    def test_non_dict_requirement_is_skipped(self, tmp_path):
+        # A stray non-table entry in requirements must not crash the parser.
+        r = tmp_path / "uv-receipt.toml"
+        r.write_text('[tool]\nrequirements = ["not-a-table"]\n')
+        assert _git_source_from_receipt(r) is None
+
 
 class TestLocalSourceFromReceipt:
     """_local_source_from_receipt surfaces a local directory/path install."""
@@ -128,6 +189,16 @@ class TestLocalSourceFromReceipt:
     def test_unparseable_receipt_returns_none(self, tmp_path):
         r = tmp_path / "uv-receipt.toml"
         r.write_text("this is : not : valid toml [[[")
+        assert _local_source_from_receipt(r) is None
+
+    def test_no_matching_requirement_returns_none(self, tmp_path):
+        # Requirements present, but none is CAO (skip non-matching, then exhaust).
+        r = tmp_path / "uv-receipt.toml"
+        r.write_text(
+            "[tool]\nrequirements = ["
+            '"not-a-table", '
+            '{ name = "other-pkg", directory = "/somewhere" }]\n'
+        )
         assert _local_source_from_receipt(r) is None
 
 
