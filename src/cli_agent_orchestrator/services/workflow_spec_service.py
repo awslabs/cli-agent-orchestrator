@@ -23,6 +23,7 @@ The service raises only NARROW exceptions (``ValueError`` / ``FileNotFoundError`
 
 from __future__ import annotations
 
+import ast
 import glob
 import hashlib
 import logging
@@ -30,23 +31,26 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union, cast
 
 import yaml
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import (
+    WORKFLOW_INPUT_TYPES,
     WORKFLOW_MAX_SPEC_BYTES,
     WORKFLOW_NAME_RE,
     WORKFLOW_SPEC_DIR,
 )
 from cli_agent_orchestrator.models.workflow import (
+    InputDecl,
     LintFinding,
     ScriptSpec,
     TierCollisionError,
     ValidationResult,
     WorkflowIndexRow,
     WorkflowSpec,
+    _default_matches_type,
 )
 from cli_agent_orchestrator.models.workflow import validate_only as _model_validate_only
 from cli_agent_orchestrator.services.script_lint import lint_script
@@ -444,6 +448,98 @@ def _check_tier_collision(stem: str, safe_dir: str) -> None:
         raise TierCollisionError(stem)
 
 
+def _extract_inputs(source: str) -> Dict[str, InputDecl]:
+    """AST-parse a script's module-level ``INPUTS`` declaration (Unit A, FR-A1).
+
+    Finds the FIRST module-level assignment to the name ``INPUTS`` and builds the
+    typed ``InputDecl`` map the run-path validator (``_validate_inputs``) consumes.
+    NEVER executes or imports the module — this is a pure ``ast`` walk (M2, the
+    no-execution + HTTP-only guarantee), so a script with import-time side effects
+    is parsed, not run.
+
+    Rules (BR-A1/BR-A2):
+    - Unparseable source (``SyntaxError``) -> ``ValueError`` (mapped to 400 at the
+      run route; caught by ``rebuild_index_from_files``). ``SyntaxError`` is NOT a
+      ``ValueError`` subclass, so it is re-raised as one explicitly.
+    - No module-level ``INPUTS`` -> ``{}`` (INPUTS is OPTIONAL).
+    - ``INPUTS`` must be a dict literal; each key a string; each value a dict
+      literal with keys ``⊆ {type, required, default}``; ``type`` one of
+      ``WORKFLOW_INPUT_TYPES``; a default whose type disagrees with ``type`` is a
+      ``ValueError`` (reuses the shared author-time ``_default_matches_type``).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        # SyntaxError is not a ValueError subclass; map it so the run-route
+        # boundary (ValueError -> 400) and rebuild's ``except ValueError`` catch it.
+        raise ValueError(f"malformed workflow script: {e}") from e
+
+    inputs_node: Optional[ast.expr] = None
+    for stmt in tree.body:  # module-level statements only (no nested scopes)
+        if isinstance(stmt, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == "INPUTS" for t in stmt.targets):
+                inputs_node = stmt.value
+                break
+        elif isinstance(stmt, ast.AnnAssign):
+            target = stmt.target
+            if isinstance(target, ast.Name) and target.id == "INPUTS" and stmt.value is not None:
+                inputs_node = stmt.value
+                break
+
+    if inputs_node is None:
+        return {}  # INPUTS is optional (BR-A1)
+
+    if not isinstance(inputs_node, ast.Dict):
+        raise ValueError("INPUTS must be a dict literal")
+
+    result: Dict[str, InputDecl] = {}
+    for key_node, value_node in zip(inputs_node.keys, inputs_node.values):
+        if key_node is None:  # ``{**spread}`` has a None key — not a literal entry
+            raise ValueError("INPUTS must be a dict literal (no ** unpacking)")
+        try:
+            key = ast.literal_eval(key_node)
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(f"INPUTS key is not a literal: {e}") from e
+        if not isinstance(key, str):
+            raise ValueError(f"INPUTS key {key!r} must be a string")
+        if not isinstance(value_node, ast.Dict):
+            raise ValueError(f"INPUTS['{key}'] must be a dict literal")
+
+        fields: Dict[str, object] = {}
+        for fk_node, fv_node in zip(value_node.keys, value_node.values):
+            if fk_node is None:
+                raise ValueError(f"INPUTS['{key}'] must be a dict literal (no ** unpacking)")
+            try:
+                fk = ast.literal_eval(fk_node)
+            except (ValueError, SyntaxError) as e:
+                raise ValueError(f"INPUTS['{key}'] has a non-literal key: {e}") from e
+            if fk not in ("type", "required", "default"):
+                raise ValueError(
+                    f"INPUTS['{key}'] has unexpected key '{fk}' "
+                    "(allowed: type, required, default)"
+                )
+            try:
+                fields[fk] = ast.literal_eval(fv_node)
+            except (ValueError, SyntaxError) as e:
+                raise ValueError(f"INPUTS['{key}']['{fk}'] is not a literal: {e}") from e
+
+        declared_type = fields.get("type")
+        if declared_type not in WORKFLOW_INPUT_TYPES:
+            raise ValueError(
+                f"INPUTS['{key}'] type {declared_type!r} is invalid "
+                f"(allowed: {', '.join(WORKFLOW_INPUT_TYPES)})"
+            )
+        default = cast(Union[str, int, bool, None], fields.get("default"))
+        if default is not None and not _default_matches_type(default, str(declared_type)):
+            raise ValueError(
+                f"INPUTS['{key}'] default {default!r} does not match declared "
+                f"type '{declared_type}'"
+            )
+        result[key] = InputDecl(**fields)  # type: ignore[arg-type]
+
+    return result
+
+
 def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> ScriptSpec:
     """Read + lint a ``.py`` spec file into a ``ScriptSpec`` (A1, E1).
 
@@ -472,12 +568,29 @@ def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> S
         raise ValueError(f"spec is not valid UTF-8: {e}") from e
     content_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
     result = lint_script(source, display_path)
+    # Unit A: extract the typed INPUTS declaration (AST-only, never executed).
+    # A malformed INPUTS raises ValueError, propagating exactly as a bad YAML
+    # spec does (-> 400 at the run route / skipped in rebuild).
+    #
+    # LOAD-PATH graceful degradation: if the lint pass already recorded a
+    # ``syntax`` finding, the source has no parseable AST — there is nothing for
+    # ``_extract_inputs`` to walk, and re-raising here would abort the load and
+    # DROP that informational finding (BR-6). So we SKIP extraction and let the
+    # syntax finding stand (spec.inputs = {}). A syntactically VALID script with
+    # a bad INPUTS literal has no syntax finding, so ``_extract_inputs`` still
+    # runs and still raises ValueError — the real author error the load path
+    # must surface. The run path stays fail-closed via ``_validate_inputs``.
+    if any(f.rule_id == "syntax" for f in result.findings):
+        inputs: Dict[str, InputDecl] = {}
+    else:
+        inputs = _extract_inputs(source)
     return ScriptSpec(
         name=stem,
         path=display_path,
         source=source,
         content_hash=content_hash,
         findings=result.findings,
+        inputs=inputs,
     )
 
 

@@ -472,6 +472,12 @@ WORKFLOW_MAX_SPEC_BYTES = 256 * 1024
 WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH = 8
 WORKFLOW_MAX_INPUTS = 64
 
+# Max size (bytes) of the compact-JSON resolved inputs map delivered to a script
+# run via the CAO_WORKFLOW_INPUTS spawn-env key. Enforced at the run route, on
+# the RESOLVED map, BEFORE any journal write or registry registration (ADR-5) —
+# never inside _build_env. An oversized payload is rejected as ValueError -> 400.
+WORKFLOW_INPUTS_MAX_BYTES = 32768
+
 # Units (from units-generation) whose constructs are EXECUTABLE in the current
 # Bolt. Empty in Bolt 1: the run engine (N5) is not shipped, so every
 # non-sequential mode and every loop/conditional construct tags as reserved.

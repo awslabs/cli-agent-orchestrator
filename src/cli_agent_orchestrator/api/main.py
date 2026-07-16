@@ -1794,12 +1794,26 @@ async def start_workflow_run_endpoint(
     run_id = body.run_id or f"run-{uuid.uuid4().hex[:16]}"
 
     if isinstance(spec, ScriptSpec):
+        # Unit A (ADR-6 / blocker #2): validate + cap the inputs BEFORE any
+        # journal row or registry entry is created — no orphan RUNNING row can
+        # result from bad/oversized input (BR-A3). The RESOLVED map (defaults
+        # filled, types checked, undeclared rejected) is what gets journaled and
+        # delivered, never the raw request body.
+        from cli_agent_orchestrator.constants import WORKFLOW_INPUTS_MAX_BYTES
+
+        try:
+            resolved = workflow_service._validate_inputs(spec, body.inputs)
+            payload = json.dumps(resolved, separators=(",", ":"))
+            if len(payload.encode("utf-8")) > WORKFLOW_INPUTS_MAX_BYTES:
+                raise ValueError(f"workflow inputs exceed {WORKFLOW_INPUTS_MAX_BYTES} bytes")
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         try:
             workflow_service._check_run_id_available(run_id)
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         try:
-            result = await script_runner.run_script_workflow(spec, body.inputs, run_id)
+            result = await script_runner.run_script_workflow(spec, resolved, run_id)
         except script_runner.ScriptLintError as e:
             raise HTTPException(
                 status_code=422,
