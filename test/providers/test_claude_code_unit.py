@@ -1471,21 +1471,23 @@ class TestClaudeCodeProviderStartupPrompts:
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_handle_startup_prompts_timeout(self, mock_tmux, mock_time, mock_settings):
-        """Handler gives up gracefully once the idle gap elapses with no prompt.
+        """Handler gives up gracefully at the outer cap when no prompt ever appears.
 
-        New idle-gap semantics (issue #400): the loop keeps polling and exits
-        only after ``idle_gap`` seconds pass with no new prompt (bounded by the
-        ``provider_init_timeout`` outer cap). Here only "Loading..." ever shows,
-        so once the idle gap elapses the handler returns having answered nothing.
+        should-fix-3: the idle-gap exit does not apply until a first prompt has
+        been handled, so with only "Loading..." ever showing, the loop runs
+        until the outer cap (provider_init_timeout=60) rather than the old
+        20s idle-gap boundary.
         """
         mock_settings.return_value = {
             "provider_init_timeout": 60,
             "startup_prompt_handler_timeout": 20,
         }
         mock_tmux.get_history.return_value = "Loading..."
-        # monotonic() calls: outer_deadline, last_prompt_time, iter-1 now (polls
-        # "Loading..."), iter-2 now (25s - 0s >= 20s idle gap -> return).
-        mock_time.monotonic.side_effect = [0.0, 0.0, 0.0, 25.0]
+        # monotonic() calls: outer_deadline, last_prompt_time, iter-1 now (no
+        # prompt handled yet -> idle-gap check skipped, polls "Loading..."),
+        # iter-2 now (still no prompt -> idle-gap check skipped), iter-3 now
+        # (61s >= 60s outer cap -> return).
+        mock_time.monotonic.side_effect = [0.0, 0.0, 0.0, 25.0, 61.0]
         mock_time.sleep = MagicMock()
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")

@@ -385,6 +385,15 @@ class ClaudeCodeProvider(BaseProvider):
         hard-capped by ``outer_timeout`` so a wedged start cannot hang init
         indefinitely.
 
+        The idle-gap exit is gated on having handled at least one prompt.
+        ``last_prompt_time`` has no real "last prompt" to measure from until
+        the FIRST one arrives, so treating the handler's start time as if it
+        were one let a first dialog later than ``idle_gap`` (e.g. issue #400's
+        own cold-node-plus-gateway-connect scenario) get missed entirely — the
+        loop would exit at the idle-gap boundary having never seen it. Before
+        any prompt has been observed, only ``outer_timeout`` can end the loop;
+        the idle-gap clock starts only once a prompt has actually been handled.
+
         Args:
             idle_gap: Seconds of no-new-prompt quiet that ends the loop. Defaults
                 to the ``startup_prompt_handler_timeout`` setting.
@@ -399,13 +408,14 @@ class ClaudeCodeProvider(BaseProvider):
             outer_timeout = get_server_settings()["provider_init_timeout"]
         outer_deadline = time.monotonic() + outer_timeout
         last_prompt_time = time.monotonic()
+        any_prompt_handled = False
         bypass_accepted = False
         while True:
             now = time.monotonic()
             if now >= outer_deadline:
                 logger.warning("Startup prompt handler hit provider_init_timeout outer cap")
                 return
-            if now - last_prompt_time >= idle_gap:
+            if any_prompt_handled and now - last_prompt_time >= idle_gap:
                 return  # no new prompt within the idle gap — startup settled
 
             output = get_backend().get_history(self.session_name, self.window_name)
@@ -430,6 +440,7 @@ class ClaudeCodeProvider(BaseProvider):
                 status_monitor.notify_input_sent(self.terminal_id)
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 bypass_accepted = True
+                any_prompt_handled = True
                 last_prompt_time = time.monotonic()  # reset idle timer — trust prompt may follow
                 time.sleep(1.0)
                 continue

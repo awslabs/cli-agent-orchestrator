@@ -91,15 +91,21 @@ class TestClaudeCodeIdleGap:
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_no_prompt_exits_after_idle_gap(self, mock_backend, mock_time):
-        """No prompt ever appears — loop exits after idle_gap seconds."""
+    def test_no_prompt_exits_at_outer_cap_not_idle_gap(self, mock_backend, mock_time):
+        """No prompt ever appears — the idle gap does NOT apply until a first prompt lands.
+
+        Before any prompt is observed, ``last_prompt_time`` has nothing real to
+        measure a gap from, so only the outer cap can end the loop. This is the
+        should-fix-3 rework: the exit at t=25 (old idle-gap boundary) must NOT
+        fire here — only t=61 (past the 60s outer cap) does.
+        """
         mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 60
             0.0,  # last_prompt_time = 0
-            5.0,  # iter1 now: gap=5<20, not past deadline
-            # output: "Loading..." → no prompt match, sleep
-            25.0,  # iter2 now: gap=25>=20 → return (idle gap elapsed)
+            5.0,  # iter1 now: no prompt handled yet, idle-gap check skipped -> sleep
+            25.0,  # iter2 now: still no prompt handled -> idle-gap check skipped -> sleep
+            61.0,  # iter3 now: 61>=60 -> outer cap -> return
         ]
         mock_backend.get_history.return_value = "Loading..."
 
@@ -109,6 +115,32 @@ class TestClaudeCodeIdleGap:
         # No prompts handled
         mock_backend.send_special_key.assert_not_called()
         mock_backend.send_keys.assert_not_called()
+
+    @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
+    @patch("cli_agent_orchestrator.providers.claude_code.time")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_first_prompt_later_than_idle_gap_still_handled(self, mock_backend, mock_time):
+        """A FIRST dialog later than idle_gap (the issue #400 scenario) is now caught.
+
+        Before this fix, a first prompt at t=35 (past the 20s idle-gap default)
+        would never be seen: the loop measured the gap from handler-start, not
+        from a real prompt, and exited at t=20. Now the idle-gap clock only
+        starts once a prompt has actually been handled, so a first prompt at
+        t=35 is well within the still-open outer cap and is handled.
+        """
+        mock_time.sleep = MagicMock()
+        mock_time.monotonic.side_effect = [
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            35.0,  # iter1 now: no prompt handled yet -> idle-gap check skipped ->
+            # trust prompt found in output -> handled -> return
+        ]
+        mock_backend.get_history.return_value = "Yes, I trust this folder"
+
+        p = self._make()
+        p._handle_startup_prompts()
+
+        mock_backend.send_special_key.assert_called_once_with("sess", "win", "Enter")
 
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _outer_cap_settings)
     @patch("cli_agent_orchestrator.providers.claude_code.time")
@@ -250,16 +282,21 @@ class TestKimiCliIdleGap:
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_server_settings", _settings)
     @patch("cli_agent_orchestrator.providers.kimi_cli.time")
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_no_prompt_exits_after_idle_gap(self, mock_get_backend, mock_time):
-        """No upgrade dialog — exits after idle_gap with no action."""
+    def test_no_prompt_exits_at_outer_cap_not_idle_gap(self, mock_get_backend, mock_time):
+        """No upgrade dialog ever appears — the idle gap does NOT apply pre-first-prompt.
+
+        should-fix-3 rework: with no dialog ever handled, only the outer cap
+        (not the idle-gap boundary at t=20) can end the loop.
+        """
         mock_time.sleep = MagicMock()
         mock_backend = MagicMock()
         mock_get_backend.return_value = mock_backend
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 60
             0.0,  # last_prompt_time = 0
-            5.0,  # iter1: gap=5<20, output has no prompt, not ready → sleep
-            25.0,  # iter2: gap=25>=20 → return
+            5.0,  # iter1: no dialog handled yet -> idle-gap check skipped, not ready -> sleep
+            25.0,  # iter2: still no dialog -> idle-gap check skipped, not ready -> sleep
+            61.0,  # iter3: 61>=60 -> outer cap -> return
         ]
         mock_backend.get_history.return_value = "Starting kimi..."
 
@@ -269,6 +306,40 @@ class TestKimiCliIdleGap:
             p._handle_startup_dialog()
 
         mock_backend.send_keys.assert_not_called()
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_server_settings", _settings)
+    @patch("cli_agent_orchestrator.providers.kimi_cli.time")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
+    def test_first_dialog_later_than_idle_gap_still_handled(self, mock_get_backend, mock_time):
+        """A FIRST upgrade dialog later than idle_gap (issue #400 scenario) is caught.
+
+        Before this fix, a first dialog at t=35 (past the 20s default) would
+        never be seen -- the loop would have exited at t=20. Now the idle-gap
+        clock only starts once a dialog has actually been handled, so a first
+        dialog at t=35 is well within the still-open outer cap and is handled;
+        the loop then detects readiness on the next poll (t=36) and returns.
+        """
+        mock_time.sleep = MagicMock()
+        mock_backend = MagicMock()
+        mock_get_backend.return_value = mock_backend
+        mock_time.monotonic.side_effect = [
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            35.0,  # iter1: no dialog handled yet -> idle-gap check skipped ->
+            # upgrade dialog found in output -> handled -> continue
+            35.0,  # last_prompt_time reset to 35
+            36.0,  # iter2: gap=1<20, output -> kimi ready -> return
+        ]
+        mock_backend.get_history.side_effect = [
+            "Skip reminders for version 1.2.3\n[Enter] Upgrade now",
+            "Welcome to Kimi!\n💫",
+        ]
+
+        p = self._make()
+        with patch.object(p, "get_status", return_value=TerminalStatus.IDLE):
+            p._handle_startup_dialog()
+
+        mock_backend.send_keys.assert_called_once_with("sess", "win", "s", enter_count=0)
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_server_settings", _outer_cap_settings)
     @patch("cli_agent_orchestrator.providers.kimi_cli.time")
@@ -420,16 +491,21 @@ class TestAntigravityCliIdleGap:
     @patch("cli_agent_orchestrator.providers.antigravity_cli.get_server_settings", _settings)
     @patch("cli_agent_orchestrator.providers.antigravity_cli.time")
     @patch("cli_agent_orchestrator.providers.antigravity_cli.get_backend")
-    def test_no_prompt_exits_after_idle_gap(self, mock_get_backend, mock_time):
-        """No dialog — exits after idle_gap with no action."""
+    def test_no_prompt_exits_at_outer_cap_not_idle_gap(self, mock_get_backend, mock_time):
+        """No dialog ever appears — the idle gap does NOT apply pre-first-dialog.
+
+        should-fix-3 rework: with no dialog ever handled, only the outer cap
+        (not the idle-gap boundary at t=20) can end the loop.
+        """
         mock_time.sleep = MagicMock()
         mock_backend = MagicMock()
         mock_get_backend.return_value = mock_backend
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 60
             0.0,  # last_prompt_time = 0
-            5.0,  # iter1: gap=5<20, no dialog, no ready footer → sleep
-            25.0,  # iter2: gap=25>=20 → return
+            5.0,  # iter1: no dialog handled yet -> idle-gap check skipped, no ready footer -> sleep
+            25.0,  # iter2: still no dialog -> idle-gap check skipped, no ready footer -> sleep
+            61.0,  # iter3: 61>=60 -> outer cap -> return
         ]
         mock_backend.get_history.return_value = "Starting agy..."
 
@@ -438,6 +514,38 @@ class TestAntigravityCliIdleGap:
 
         mock_backend.send_special_key.assert_not_called()
         mock_backend.send_keys.assert_not_called()
+
+    @patch("cli_agent_orchestrator.providers.antigravity_cli.get_server_settings", _settings)
+    @patch("cli_agent_orchestrator.providers.antigravity_cli.time")
+    @patch("cli_agent_orchestrator.providers.antigravity_cli.get_backend")
+    def test_first_dialog_later_than_idle_gap_still_handled(self, mock_get_backend, mock_time):
+        """A FIRST trust dialog later than idle_gap (issue #400 scenario) is caught.
+
+        Before this fix, a first dialog at t=35 (past the 20s default) would
+        never be seen. Now the idle-gap clock only starts once a dialog has
+        actually been handled, so a first dialog at t=35 is well within the
+        still-open outer cap.
+        """
+        mock_time.sleep = MagicMock()
+        mock_backend = MagicMock()
+        mock_get_backend.return_value = mock_backend
+        mock_time.monotonic.side_effect = [
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            35.0,  # iter1: no dialog handled yet -> idle-gap check skipped ->
+            # trust prompt found -> handled -> continue
+            35.0,  # last_prompt_time reset to 35
+            36.0,  # iter2: gap=1<20, ready footer -> return
+        ]
+        mock_backend.get_history.side_effect = [
+            "Yes, I trust this folder\nrequires permission to read",
+            "? for shortcuts\n> ",
+        ]
+
+        p = self._make()
+        p._handle_startup_dialog()
+
+        mock_backend.send_special_key.assert_called_once_with("sess", "win", "Enter")
 
     @patch(
         "cli_agent_orchestrator.providers.antigravity_cli.get_server_settings", _outer_cap_settings
