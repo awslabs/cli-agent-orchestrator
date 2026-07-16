@@ -259,7 +259,8 @@ export const api = {
 
   // Graph (Issue #348). The projection runs wiki_lint (ripgrep detectors)
   // server-side, so both routes get a wide timeout — a populated scope can take
-  // ~60s. Errors surface as ApiError (status + server detail) for the caller.
+  // ~30s typical, up to ~148s under load. Errors surface as ApiError (status +
+  // server detail) for the caller.
   getGraph: (provider = 'memory', scope?: string, scopeId?: string) => {
     const params = [
       scope ? `scope=${encodeURIComponent(scope)}` : '',

@@ -267,8 +267,11 @@ def _render_graph_view_impl(
 ) -> Dict[str, Any]:
     """Wrap ``GET /graph/{provider}`` for ``ui://cao/graph`` (HTTP-only).
 
-    The route is ungated by design (FR-12); this tool adds no scope gate of its
-    own and lets ``requests.HTTPError`` propagate (mirrors ``_render_agent_view_impl``).
+    ``GET /graph/{provider}`` is scope-gated and refuses private tiers
+    (``session`` / ``agent`` → 400) as of #424. This tool adds no gate of its
+    own; it forwards the caller's ``scope`` / ``scope_id`` and relies on the
+    route to enforce auth (it does not bypass it). Lets ``requests.HTTPError``
+    propagate (mirrors ``_render_agent_view_impl``).
     """
 
     result: Dict[str, Any] = _get_json(f"/graph/{provider}", scope=scope, scope_id=scope_id)

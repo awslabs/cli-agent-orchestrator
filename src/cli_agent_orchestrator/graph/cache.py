@@ -91,6 +91,13 @@ class GraphViewCache:
         if entry is None:
             return None
         if self._clock() - entry.created_monotonic >= self._ttl:
+            # Evict the expired entry so ``_entries`` doesn't retain a stale
+            # GraphView for every key ever queried. ``_locks`` is intentionally
+            # NOT pruned here: it holds one tiny ``asyncio.Lock`` per key
+            # (bounded by the number of distinct keys, a small finite set), and
+            # a concurrent coroutine may be awaiting that very lock — dropping
+            # it mid-flight would let a second builder run for the same key.
+            del self._entries[key]
             return None
         return entry
 

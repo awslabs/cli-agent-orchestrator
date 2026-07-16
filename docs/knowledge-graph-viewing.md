@@ -11,16 +11,13 @@ has a **Memory tab** with a List⇄Graph toggle that renders your real memory
 graph, lets you drag and click nodes to read memories, and exports to Obsidian —
 all against the same `GraphView` contract. Beyond that first-party viewer, the
 same shape fans out to a sink you point the graph at: a file you open in
-Obsidian/Gephi, the built-in Sigma renderer inside an MCP-Apps host, or a
-dependency-light standalone dev page. This doc explains the design (for the "how
-is this built" reader) and then gives copy-pasteable steps to actually see your
-graph (for the "just show me" reader).
+Obsidian/Gephi, or the built-in Sigma renderer inside an MCP-Apps host. This doc
+explains the design (for the "how is this built" reader) and then gives
+copy-pasteable steps to actually see your graph (for the "just show me" reader).
 
 > **Ports in this doc are examples.** `cao-server` defaults to `127.0.0.1:9889`
-> (`CAO_API_PORT`); the web dev server runs on `5173` and proxies to it. The
-> standalone-explorer examples further down use server port **9894** and serve
-> the page on **8900** — match your own `CAO_API_PORT` and the page's editable
-> server field.
+> (`CAO_API_PORT`); the web dev server runs on `5173` and proxies to it — match
+> your own `CAO_API_PORT`.
 
 ## Design in brief
 
@@ -293,8 +290,7 @@ The web app is **same-origin** with the API (`api.ts` uses `BASE = ''`). In dev,
 the Vite dev server proxies `/graph`, `/memory`, `/sessions`, `/terminals`,
 `/agents`, `/settings`, `/flows`, and `/health` to `cao-server` on `:9889`
 (`web/vite.config.ts`). So there is **no CORS setup for this path** — do **not**
-set `CAO_CORS_ORIGINS` for the web UI (that's only for the standalone explorer,
-option D).
+set `CAO_CORS_ORIGINS` for the web UI.
 
 ```bash
 # Terminal 1 — from the worktree root, start the API server (default :9889).
@@ -403,7 +399,7 @@ flow.
 > some third-party builds (e.g. Claude "cowork"-style deployments) may **not**
 > implement the MCP-Apps UI capability. In that case you get the tool's JSON
 > output (or a mermaid fallback), **not** the Sigma canvas. That's a host
-> limitation, not a CAO bug — use option A, B, or D instead.
+> limitation, not a CAO bug — use option A or B instead.
 
 > **Node clicks are host-mediated.** Clicking a node calls `onOpenTopic`, which
 > in this build calls `app.silentlyNoteToModel(...)` — it *tells the model* a
@@ -411,54 +407,99 @@ flow.
 > a host driving the model, a click does nothing visible. (The web UI's Graph
 > view, option A, gives you a real click-to-read side panel instead.)
 
-## Viewing option D — the standalone explorer (secondary / headless aid)
-
-Lives at **`cao_mcp_apps/dev/memory-explorer/`**. It's a single self-contained
-HTML page (deps via CDN) that loads your real memory graph from a running
-`cao-server`, renders it with Sigma.js, and lets you click a node to read that
-memory — the same experience as the web UI's Graph view, but with **no build
-step and no npm**.
-
-Use it **if you're not running the web UI** (option A) or want a dependency-light
-page — e.g. a quick headless check. It is a **read-only local dev aid** (under
-`cao_mcp_apps/dev/`, sanctioned but dev-tier, not shipped product code) and hits
-the same public routes, so the same security behaviors apply (private-tier
-**400**, secret-gate **422** on export).
-
-Unlike option A, this page is served from a **different origin** than the API,
-so it **does** need CORS: `cao-server` must be started with the page's origin in
-`CAO_CORS_ORIGINS`, or the browser blocks every fetch. Full run steps and CORS
-troubleshooting are in the tool's own
-[`README.md`](../cao_mcp_apps/dev/memory-explorer/README.md); briefly:
-
-```bash
-# 1. Start cao-server with the page's origin allowed (CORS required here).
-CAO_API_PORT=9894 \
-CAO_CORS_ORIGINS="http://127.0.0.1:8900,http://localhost:8900" \
-uv run cao-server
-
-# 2. Serve the page on the matching origin
-cd cao_mcp_apps/dev/memory-explorer
-python3 -m http.server 8900
-```
-
-Then open <http://127.0.0.1:8900/index.html>, pick a scope (default `global`;
-`project` needs a `scope_id`), click **Load graph**, and click any node to read
-its memory. Same cold-load cost and 300s cache behavior as option A (it calls
-the same routes). Assumes **auth off** — it sends no bearer token, so an
-IdP-enabled server would `401`/`403` the fetches (the page surfaces that rather
-than crashing).
-
 ## Choosing a path
 
 | I want to… | Use |
 |---|---|
 | Just view / explore the graph, click a node to read a memory | **The web UI Memory tab** (option A) — the recommended default |
-| Explore + click-to-read with **no build step / no npm** | The standalone **explorer** (option D) |
 | A portable artifact for Gephi / yEd / networkx | **GraphML** export (option B) |
 | The graph in Obsidian's own graph view | **Obsidian** export (option B) |
 | Script against the graph data | `GET /graph/memory` via `curl` (the API) |
 | The graph rendered **inside my agent host** | The built-in **Sigma renderer** (option C) — needs a UI-capable host |
+
+## Future directions (roadmap — not yet built)
+
+> **Status: forward-looking.** None of this section is implemented today; it
+> sketches how the *shipped* `GraphView` contract is designed to extend. Unlike
+> the rest of this doc — which is verified how-to — everything below is
+> anticipated work tracked as **separate issues under the same epic (#348)**.
+> There are no run commands here and nothing to enable. Read "would" / "could"
+> as exactly that. Where the epic itself leaves a question open, it's flagged as
+> open, not settled.
+
+The thesis this doc opens with — **CAO emits a standard typed `GraphView`; it
+does not own the engine** — is what makes growth cheap. Memory is the *first*
+provider, not the only intended one. Any future provider that projects its
+subsystem into the same `{nodes, edges, meta}` shape inherits the renderer and
+**every** sink (Obsidian / OKF / GraphML, and any future sink) for free — no new
+engine work. The epic (Issue #348) names the follow-ups below; this appendix
+mirrors that roadmap rather than inventing one. The authoritative list lives in
+the epic's design record (`aidlc/.../260709-graph-layer/aidlc-state.md`, the
+*Follow-ups* and *Open questions* sections).
+
+### 1. New CAO-subsystem providers
+
+The epic anticipates three more providers, each a new `GraphProvider` projecting
+a different CAO subsystem into the same `GraphView`:
+
+- an **orchestration provider** — live fleet topology fed by the SSE event
+  stream; the epic notes it would **replace the topology placeholder** currently
+  stubbed in `ext_apps`;
+- a **workflow DAG provider** — a run's task graph as nodes and edges;
+- an **audit / lineage provider** — where a piece of knowledge came from and
+  what it derived.
+
+Each would light up in the web UI, the Sigma renderer, and every file export
+with no changes to the engine. One design tension is called out as an **open
+question** in the epic and is worth restating here: **snapshot vs. live.** The
+memory provider projects a *bounded snapshot* (`meta` carries `live: false` and
+an `as_of` timestamp — see [Caching & staleness](#caching--staleness)), whereas
+an orchestration provider would project a *live event stream* (a rolling SSE
+ring buffer). The contract is meant to serve both without a redesign; proving
+that out is future work, not a shipped guarantee.
+
+### 2. A broader knowledge-base provider
+
+Beyond CAO's own subsystems, the same seam could project **non-memory knowledge**
+— team knowledge under `aidlc/knowledge/`, docs, decisions/ADRs, or an external
+KB — as just another provider emitting the same `GraphView` shape. What lets
+heterogeneous sources *converge* rather than each inventing its own semantics is
+the **typed `EdgeType` taxonomy** already baked into the contract (see
+[The `GraphView` contract](#the-graphview-contract)). This is deliberate: the
+epic's maintainer field note argues for keeping **lifecycle edges separate from
+topical edges** (`relates_to` aids navigation, but a `supersedes`-style edge
+changes whether older knowledge may still govern behavior) and for carrying
+**provenance / authority in node metadata** — is this accepted guidance, a
+proposal, a session observation, or superseded history? The shipped contract
+already reserves that room: `Node.status` (`active` / `proposal` / `observation`
+/ `superseded`) and the lifecycle edge family exist today precisely so future
+providers converge on one shared vocabulary instead of drifting apart.
+
+### 3. A server-side, query-capable knowledge store
+
+Today's sinks are **export-only** — they serialize a `GraphView` to a file or
+render it, and that's the end of the line. The epic sketches a **second sink
+tier**: a *query-capable* store that a graph could be loaded into and then
+**traversed** — the kind of cross-scope, multi-hop traversal and graph analytics
+that flat SQLite can't do. The epic explored **AWS Neptune** as the exemplar of
+this tier, but note the honest history: Neptune was ultimately **removed from
+the epic entirely (not merely deferred)**, because its one differentiating
+capability depends on an unsolved design problem. That problem is the epic's
+first **open question — cross-scope edges.** Memory edges never cross the
+`(scope, scope_id)` boundary today (see
+[What the memory provider projects](#what-the-memory-provider-projects)), so a
+whole-knowledge-base view currently fragments per scope. A query-capable store
+is only *useful* once cross-scope edges exist — and that design isn't settled.
+So this tier is explicitly a **future / optional adapter, not core**: it is the
+heaviest tier (infrastructure, IAM, bulk-load), gated behind an open question,
+and would ship — if ever — as an optional plugin, never as part of the base
+engine.
+
+> **Where to track this.** The epic's design record holds the live *Follow-ups*
+> list (Notion sink; orchestration / workflow DAG / audit-lineage providers) and
+> the *Open questions* (cross-scope edges, shared edge-type taxonomy, snapshot
+> vs. live, query-capable sinks). Treat that record — not this appendix — as the
+> source of truth for what's planned vs. merely mused.
 
 ## See also
 
@@ -466,8 +507,6 @@ than crashing).
   `CAO_MCP_APPS_ENABLED`, the auth layer, and which hosts render MCP UI.
 - [`web/README.md`](../web/README.md) — the web UI's architecture, the canonical
   dev-vs-production run story, and the Vite proxy config.
-- [`cao_mcp_apps/dev/memory-explorer/README.md`](../cao_mcp_apps/dev/memory-explorer/README.md)
-  — full explorer run guide, CORS troubleshooting, and export toast states.
 - **Source of truth:**
   - Contract: `src/cli_agent_orchestrator/graph/models.py`
   - Providers: `src/cli_agent_orchestrator/graph/providers/`

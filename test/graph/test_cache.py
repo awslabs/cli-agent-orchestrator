@@ -136,6 +136,48 @@ class TestGraphViewCache:
 
         assert calls["n"] == 2 and cached is False
 
+    @pytest.mark.asyncio
+    async def test_expired_entry_is_evicted_not_just_missed(self):
+        """An expired entry is REMOVED from ``_entries`` on access, so the map
+        does not retain a stale GraphView for every key ever queried.
+        """
+        clock = _FakeClock()
+        cache = GraphViewCache(ttl_s=300.0, clock=clock)
+
+        async def builder():
+            return _view("a")
+
+        key = ("memory", "global", None)
+        await cache.get_or_build(key, builder)
+        assert key in cache._entries  # cached while fresh
+
+        clock.advance(300.1)  # past TTL
+        assert cache._fresh(key) is None  # treated as a miss...
+        assert key not in cache._entries  # ...AND evicted, not merely skipped
+
+    @pytest.mark.asyncio
+    async def test_repeated_expired_lookups_do_not_grow_entries(self):
+        """Across many distinct keys whose entries have all expired, a second
+        round of lookups must not leave ``_entries`` growing without bound —
+        each expired access evicts the entry it read.
+        """
+        clock = _FakeClock()
+        cache = GraphViewCache(ttl_s=300.0, clock=clock)
+
+        async def builder():
+            return _view("a")
+
+        keys = [("memory", "global", f"k{i}") for i in range(50)]
+        for key in keys:
+            await cache.get_or_build(key, builder)
+        assert len(cache._entries) == 50
+
+        clock.advance(300.1)  # expire every entry
+        # Read each key once (a miss): eviction should drain _entries.
+        for key in keys:
+            assert cache._fresh(key) is None
+        assert len(cache._entries) == 0
+
     def test_make_meta_does_not_mutate_base(self):
         base = {"provider": "memory", "scope": "global"}
         out = make_meta(base, cached=True, as_of="2026-07-14T00:00:00+00:00")

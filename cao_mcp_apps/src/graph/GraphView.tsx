@@ -43,6 +43,12 @@ function buildGraph(snapshot: GraphViewData): Graph {
     });
   }
   for (const edge of snapshot.edges as GraphEdgeData[]) {
+    // graphology's simple Graph throws if an endpoint isn't a node or if an
+    // edge already exists between the pair. The memory provider can emit BOTH
+    // a relates_to and a contradiction edge for the same topic pair, so guard
+    // both cases (mirrors web/ MemoryGraphView.tsx buildGraph()).
+    if (!graph.hasNode(edge.source) || !graph.hasNode(edge.target)) continue;
+    if (graph.hasEdge(edge.source, edge.target)) continue;
     const isContradiction = edge.type === "contradiction";
     graph.addEdge(edge.source, edge.target, {
       color: isContradiction ? CONTRADICTION_COLOR : DEFAULT_EDGE_COLOR,

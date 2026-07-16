@@ -1,9 +1,8 @@
 // Knowledge-graph sub-view for the Memory panel (Issue #348).
 //
-// Ports the standalone dev explorer (cao_mcp_apps/dev/memory-explorer) into the
-// web/ React stack: renders the memory graph with Sigma over a graphology graph,
-// lets you click a node to READ that topic's content (plain text — memory
-// bodies are untrusted agent output), and export the loaded scope to an
+// Renders the memory graph with Sigma over a graphology graph in the web/ React
+// stack: lets you click a node to READ that topic's content (plain text —
+// memory bodies are untrusted agent output), and export the loaded scope to an
 // Obsidian vault. All I/O goes through api.ts; this component never fetch()es.
 //
 // Visual constants mirror cao_mcp_apps/src/graph/GraphView.tsx exactly.
@@ -87,6 +86,11 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
   // drag isn't mistaken for a click-to-read (Sigma can still fire clickNode on
   // mouse-up). Reset on every downNode.
   const dragRef = useRef<{ node: string | null; moved: boolean }>({ node: null, moved: false })
+  // Monotonic id for the in-flight graph fetch. Each fetchGraph() call claims
+  // the next id; only the latest may touch view/error/loading. Guards against a
+  // stale request landing after the user switched scope/scopeId — mirrors the
+  // latest-wins pattern openTopic() uses for the side panel.
+  const fetchSeqRef = useRef(0)
 
   const graphable = GRAPHABLE_SCOPES.has(scope)
 
@@ -123,12 +127,18 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
 
   const fetchGraph = async () => {
     if (!graphable) return
+    // Claim this fetch's id; a later fetchGraph() (scope switch) bumps it, so
+    // any state update below is skipped once we're no longer the latest.
+    const seq = ++fetchSeqRef.current
+    const isStale = () => fetchSeqRef.current !== seq
     setLoading(true)
     setError(null)
     try {
       const data = await api.getGraph('memory', scope, effectiveScopeId)
+      if (isStale()) return
       setView(data)
     } catch (e) {
+      if (isStale()) return
       const err = e as ApiError
       setView(null)
       if (err.status === 400) {
@@ -137,10 +147,11 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
         setError(err.detail || 'Graph provider not found (is memory enabled?).')
       } else if (err.name === 'AbortError') {
         // The AbortController in api.ts fired after the 120s graph budget. The
-        // wiki-lint projection can legitimately take ~60s, so a full timeout
-        // usually means the CAO server is stuck or down rather than merely slow.
+        // wiki-lint projection is ~30s typical / up to ~148s under load, so a
+        // full timeout usually means the CAO server is stuck or down rather
+        // than merely slow.
         setError(
-          'Graph fetch timed out (waited 120s). The wiki-lint projection can take ~60s, so a full timeout usually means the CAO server is stuck or down. In dev the UI proxies to cao-server on :9889 — check it’s running (uv run cao-server), then Refresh.',
+          'Graph fetch timed out (waited 120s). The wiki-lint projection is ~30s typical, up to ~148s under load, so a full timeout usually means the CAO server is stuck or down. In dev the UI proxies to cao-server on :9889 — check it’s running (uv run cao-server), then Refresh.',
         )
       } else if (err.status === undefined) {
         // No HTTP status = the fetch never reached a server (connection
@@ -154,7 +165,9 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
         setError(err.detail || err.message || 'The CAO server returned an error.')
       }
     } finally {
-      setLoading(false)
+      // Only the latest request may flip the spinner off — a stale finally
+      // must not mask the current request's loading state.
+      if (!isStale()) setLoading(false)
     }
   }
 
@@ -350,7 +363,7 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
             <div className="absolute inset-0 flex flex-col items-center justify-center text-center px-6" data-testid="graph-loading">
               <RefreshCw size={26} className="text-emerald-500 animate-spin mb-3" />
               <p className="text-gray-300 text-sm">Building graph…</p>
-              <p className="text-gray-500 text-xs mt-1">This can take ~60s — the server runs wiki-lint detectors.</p>
+              <p className="text-gray-500 text-xs mt-1">This can take ~30s (up to ~148s under load) — the server runs wiki-lint detectors.</p>
             </div>
           ) : error ? (
             <div className="absolute inset-0 flex flex-col items-center justify-center text-center px-6" data-testid="graph-error">

@@ -436,6 +436,176 @@ describe('MemoryPanel — List⇄Graph toggle & graph view', () => {
     expect(errBox.textContent).not.toMatch(/9894/)
   })
 
+  it('a stale graph fetch (scope switched mid-flight) does NOT overwrite the current view', async () => {
+    // Two graphs so we can tell which scope's data landed. The FIRST fetch
+    // (project) is held open until AFTER the second (global) resolves, so the
+    // late project resolution must be ignored by the latest-wins guard.
+    const PROJECT_GRAPH = {
+      nodes: [{ id: 'proj-only', kind: 'topic', label: 'Proj', status: 'active', attrs: {} }],
+      edges: [],
+      meta: {},
+    }
+    let releaseProject: (v: unknown) => void = () => {}
+    const projectGate = new Promise(res => {
+      releaseProject = res
+    })
+    mockFetch.mockImplementation((url: string) => {
+      const u = String(url)
+      if (u.startsWith('/graph/memory?scope=project')) {
+        // Hold the project fetch until the test releases it.
+        return projectGate.then(() => ({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          json: () => Promise.resolve(PROJECT_GRAPH),
+        }))
+      }
+      if (u.startsWith('/graph/memory?scope=global')) {
+        return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(GRAPH) })
+      }
+      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES) })
+    })
+
+    render(<MemoryPanel />)
+    await screen.findByText('project-conventions')
+    fireEvent.click(screen.getByRole('tab', { name: /graph/i }))
+
+    // Start the (slow) project fetch.
+    fireEvent.click(screen.getAllByText('All scopes')[0])
+    fireEvent.click(screen.getByRole('button', { name: 'project' }))
+
+    // Switch to global before the project fetch resolves; global resolves first
+    // and renders its graph.
+    fireEvent.click(screen.getByRole('button', { name: 'project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'global' }))
+    await waitFor(() => expect(getLastSigma()).toBeDefined())
+    const graphAfterGlobal = getLastSigma()!.graph as import('graphology').default
+    expect(graphAfterGlobal.hasNode('hub1')).toBe(true)
+    expect(graphAfterGlobal.hasNode('proj-only')).toBe(false)
+
+    // Now let the stale project fetch resolve — it must NOT clobber global.
+    releaseProject(undefined)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const graphNow = getLastSigma()!.graph as import('graphology').default
+    // Still global's graph — the late project resolution was ignored.
+    expect(graphNow.hasNode('hub1')).toBe(true)
+    expect(graphNow.hasNode('proj-only')).toBe(false)
+    // No error was set by the stale request, and the canvas is still shown.
+    expect(screen.queryByTestId('graph-error')).toBeNull()
+    expect(screen.getByTestId('graph-canvas')).toBeInTheDocument()
+  })
+
+  it('a stale graph fetch that REJECTS does NOT clobber the current view with an error (catch-path guard)', async () => {
+    // Companion to the success case above, but the held project fetch REJECTS
+    // (500) after global has already rendered. The catch-path isStale() guard
+    // (fetchGraph :141) must swallow it: no setError, no setView(null). Without
+    // that guard, the late rejection would blow away global's graph and show an
+    // error box.
+    let releaseProject: (v: unknown) => void = () => {}
+    const projectGate = new Promise(res => {
+      releaseProject = res
+    })
+    mockFetch.mockImplementation((url: string) => {
+      const u = String(url)
+      if (u.startsWith('/graph/memory?scope=project')) {
+        // Held open; when released, resolve to a non-OK response so fetchJSON
+        // throws an ApiError (exercising fetchGraph's catch).
+        return projectGate.then(() => ({
+          ok: false,
+          status: 500,
+          statusText: 'Server Error',
+          json: () => Promise.resolve({ detail: 'boom' }),
+        }))
+      }
+      if (u.startsWith('/graph/memory?scope=global')) {
+        return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(GRAPH) })
+      }
+      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES) })
+    })
+
+    render(<MemoryPanel />)
+    await screen.findByText('project-conventions')
+    fireEvent.click(screen.getByRole('tab', { name: /graph/i }))
+
+    // Start the (slow, doomed) project fetch, then switch to global before it
+    // settles. Global resolves first and renders its graph.
+    fireEvent.click(screen.getAllByText('All scopes')[0])
+    fireEvent.click(screen.getByRole('button', { name: 'project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'global' }))
+    await waitFor(() => expect(getLastSigma()).toBeDefined())
+    const graphAfterGlobal = getLastSigma()!.graph as import('graphology').default
+    expect(graphAfterGlobal.hasNode('hub1')).toBe(true)
+    expect(graphAfterGlobal.hasNode('proj-only')).toBe(false)
+
+    // Now let the stale project fetch REJECT — the catch guard must ignore it.
+    releaseProject(undefined)
+    // Flush the reject → res.json() → throw → catch → finally microtask chain.
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // No error box appeared and global's graph is untouched.
+    expect(screen.queryByTestId('graph-error')).toBeNull()
+    expect(screen.getByTestId('graph-canvas')).toBeInTheDocument()
+    const graphNow = getLastSigma()!.graph as import('graphology').default
+    expect(graphNow.hasNode('hub1')).toBe(true)
+    expect(graphNow.hasNode('proj-only')).toBe(false)
+  })
+
+  it('a stale fetch settling does NOT flip loading off while the current fetch is still pending (finally-path guard)', async () => {
+    // The stale project fetch settles while the current global fetch is STILL
+    // in flight. fetchGraph's finally-path isStale() guard (:170) must leave
+    // loading=true so the spinner keeps showing. Without that guard, the stale
+    // finally would setLoading(false) and mask the pending global spinner.
+    let releaseProject: (v: unknown) => void = () => {}
+    const projectGate = new Promise(res => {
+      releaseProject = res
+    })
+    // Global never resolves during this test — it stays pending so its spinner
+    // is the state under test.
+    const globalGate = new Promise<never>(() => {})
+    mockFetch.mockImplementation((url: string) => {
+      const u = String(url)
+      if (u.startsWith('/graph/memory?scope=project')) {
+        return projectGate.then(() => ({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          json: () => Promise.resolve(GRAPH),
+        }))
+      }
+      if (u.startsWith('/graph/memory?scope=global')) {
+        return globalGate
+      }
+      return Promise.resolve({ ok: true, status: 200, statusText: 'OK', json: () => Promise.resolve(MEMORIES) })
+    })
+
+    render(<MemoryPanel />)
+    await screen.findByText('project-conventions')
+    fireEvent.click(screen.getByRole('tab', { name: /graph/i }))
+
+    // Start project (fetch A, loading=true), then switch to global (fetch B,
+    // still pending). Both leave loading=true; the spinner is showing.
+    fireEvent.click(screen.getAllByText('All scopes')[0])
+    fireEvent.click(screen.getByRole('button', { name: 'project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'project' }))
+    fireEvent.click(screen.getByRole('button', { name: 'global' }))
+    await waitFor(() => expect(screen.getByTestId('graph-loading')).toBeInTheDocument())
+
+    // Settle the STALE project fetch — its finally must NOT clear loading.
+    releaseProject(undefined)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Global is still pending, so the spinner is still up: the stale finally
+    // did not mask it.
+    expect(screen.getByTestId('graph-loading')).toBeInTheDocument()
+    // And the stale success payload did not render a graph either.
+    expect(getLastSigma()).toBeUndefined()
+  })
+
   it('422 secret-gate export shows the pattern detail and NO content', async () => {
     routeFetch(url => {
       if (url.startsWith('/graph/memory/export')) {

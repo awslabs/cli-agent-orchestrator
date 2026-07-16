@@ -218,6 +218,46 @@ describe("GraphView — Sigma mount contract", () => {
   });
 });
 
+describe("GraphView — duplicate / dangling edge guards", () => {
+  it("renders without throwing when a topic pair carries BOTH a relates_to and a contradiction edge", async () => {
+    // graphology's simple Graph throws on a second edge between the same pair.
+    // The memory provider can emit relates_to + contradiction for one pair;
+    // buildGraph must keep the first and skip the duplicate rather than crash.
+    const dup = snapshot({
+      edges: [
+        { source: "hub1", target: "orphan1", type: "relates_to", attrs: {} },
+        { source: "hub1", target: "orphan1", type: "contradiction", attrs: {} },
+      ],
+    });
+
+    render(<GraphView initialSnapshot={dup} />);
+
+    // A throw in buildGraph would prevent the canvas from ever mounting.
+    await waitFor(() => expect(lastMockSigma()).toBeDefined());
+    const graph = lastMockSigma()!.graph as import("graphology").default;
+    // Exactly one edge survives for the duplicated pair.
+    expect(graph.size).toBe(1);
+    expect(graph.hasEdge("hub1", "orphan1")).toBe(true);
+  });
+
+  it("skips an edge that references an unknown node instead of throwing", async () => {
+    const dangling = snapshot({
+      edges: [
+        { source: "hub1", target: "n3", type: "relates_to", attrs: {} },
+        { source: "hub1", target: "ghost", type: "relates_to", attrs: {} },
+      ],
+    });
+
+    render(<GraphView initialSnapshot={dangling} />);
+
+    await waitFor(() => expect(lastMockSigma()).toBeDefined());
+    const graph = lastMockSigma()!.graph as import("graphology").default;
+    expect(graph.size).toBe(1);
+    expect(graph.hasEdge("hub1", "n3")).toBe(true);
+    expect(graph.hasNode("ghost")).toBe(false);
+  });
+});
+
 describe("GraphView — click-through delegates navigation (FR-19 AC2)", () => {
   it("invokes onOpenTopic with the clicked node id and its attrs", async () => {
     const onOpenTopic = vi.fn();
