@@ -187,6 +187,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
         "int",
         20,
     ),
+    "CAO_STATE_BUFFER_MAX": ("server.state_buffer_max", "int", 32768),
 }
 
 # Reverse index: dotted path -> env var name, for get()'s env-precedence lookup.

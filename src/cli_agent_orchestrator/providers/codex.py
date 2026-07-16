@@ -502,7 +502,7 @@ class CodexProvider(BaseProvider):
             # No user-message marker in the cleaned buffer. Two cases:
             # - Fresh init: no assistant content either → IDLE.
             # - Long-running response: the › user marker has been evicted from
-            #   the 8KB rolling buffer by the time the response settles, but an
+            #   the rolling state buffer by the time the response settles, but an
             #   assistant bullet is still visible. Without this branch we'd
             #   return IDLE forever and ``wait_for_status(completed)`` in the
             #   e2e tests would time out.

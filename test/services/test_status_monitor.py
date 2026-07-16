@@ -397,3 +397,57 @@ class TestRawDebounceArmedDetection:
         sm._process_chunk("t1", "● Working on task...")
 
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+
+class TestProcessChunkBufferTruncation:
+    """_process_chunk truncates the rolling buffer to the live
+    state_buffer_max server setting, not a fixed constant."""
+
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_truncates_to_configured_state_buffer_max(
+        self, mock_get_backend, mock_pm, mock_get_settings
+    ):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        mock_get_settings.return_value = {"state_buffer_max": 10}
+
+        sm = StatusMonitor()
+        sm._detect_status = lambda tid, buf: TerminalStatus.UNKNOWN
+
+        sm._process_chunk("t1", "0123456789ABCDEF")  # 16 bytes, cap is 10
+
+        assert sm.get_buffer("t1") == "6789ABCDEF"
+
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_marker_evicted_at_small_cap_survives_at_larger_cap(
+        self, mock_get_backend, mock_pm, mock_get_settings
+    ):
+        """Same real mechanism the live rig test proved end-to-end: a marker
+        near the start of a chunk is evicted once enough trailing bytes
+        follow it past the configured cap, and survives when the cap is
+        raised — driven here purely by the configured setting, not a
+        hardcoded 8192."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+
+        payload = "MARKER" + "x" * 20  # 26 bytes total, marker is the first 6
+
+        mock_get_settings.return_value = {"state_buffer_max": 10}
+        sm_small = StatusMonitor()
+        sm_small._detect_status = lambda tid, buf: TerminalStatus.UNKNOWN
+        sm_small._process_chunk("t1", payload)
+        assert "MARKER" not in sm_small.get_buffer("t1")
+
+        mock_get_settings.return_value = {"state_buffer_max": 32768}
+        sm_large = StatusMonitor()
+        sm_large._detect_status = lambda tid, buf: TerminalStatus.UNKNOWN
+        sm_large._process_chunk("t1", payload)
+        assert "MARKER" in sm_large.get_buffer("t1")

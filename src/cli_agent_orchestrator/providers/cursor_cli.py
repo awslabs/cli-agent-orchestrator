@@ -626,7 +626,8 @@ class CursorCliProvider(BaseProvider):
         7. UNKNOWN — fallback when no marker matches.
 
         Args:
-            output: Raw terminal output (rolling buffer, up to ~8KB).
+            output: Raw terminal output (rolling buffer, up to ``state_buffer_max``
+                bytes -- server setting, 32KB default).
 
         Returns:
             Current TerminalStatus.
@@ -670,12 +671,12 @@ class CursorCliProvider(BaseProvider):
         #
         # We check the *tail* of the buffer (last ~1KB) so a long
         # response that scrolls older processing markers out of the
-        # rolling 8KB window does not flip us back to IDLE during
-        # processing. The 1KB window is well below the 8KB buffer
-        # cap, and the input-box line is rendered in the last few
-        # hundred bytes on every Cursor TUI frame, so the indicator
-        # is always present in the tail whenever the agent is
-        # working.
+        # rolling state-buffer window does not flip us back to IDLE
+        # during processing. The 1KB window is well below the buffer
+        # cap (``state_buffer_max``, server setting, 32KB default),
+        # and the input-box line is rendered in the last few hundred
+        # bytes on every Cursor TUI frame, so the indicator is always
+        # present in the tail whenever the agent is working.
         TUI_TAIL_WINDOW = 1024
         tail = clean[-TUI_TAIL_WINDOW:]
         processing_indicator_in_tail = (

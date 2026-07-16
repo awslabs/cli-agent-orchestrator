@@ -138,7 +138,8 @@ class BaseProvider(ABC):
         its get_status) and must NOT be "fixed" to comply.
 
         Args:
-            buffer: Raw terminal output (up to ~8KB rolling buffer).
+            buffer: Raw terminal output (rolling buffer, up to ``state_buffer_max``
+                bytes -- server setting, 32KB default).
 
         Returns:
             TerminalStatus - always returns a valid status.

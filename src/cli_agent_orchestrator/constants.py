@@ -69,9 +69,10 @@ FIFO_DIR.mkdir(parents=True, exist_ok=True)
 # =============================================================================
 # Event-Driven State Detection Configuration
 # =============================================================================
-# Rolling buffer size for state detection (8KB)
-# Keeps trailing 8KB of terminal output for pattern matching
-STATE_BUFFER_MAX = 8192
+# The rolling per-terminal raw-output buffer StatusMonitor keeps for raw-path
+# status detection and GET /terminals/{id}/output (mode=full) is a server
+# tuning value, not a fixed constant -- see settings_service.py's
+# ``_SERVER_DEFAULTS["state_buffer_max"]`` / ``get_server_settings()``.
 
 # Max events buffered per subscriber queue before dropping. Claude's TUI startup
 # can emit thousands of small chunks in a short burst, so keep this comfortably

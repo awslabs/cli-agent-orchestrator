@@ -823,8 +823,9 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 
     ``FULL`` mode returns the StatusMonitor rolling buffer (the streamed output
     accumulated from the FIFO pipeline), which is bounded to the most recent
-    ``STATE_BUFFER_MAX`` bytes (8KB); it falls back to a tmux history capture
-    only when that buffer is empty. This is a deliberate trade-off in the
+    ``state_buffer_max`` bytes (server setting, see settings_service.py; 32KB
+    default); it falls back to a tmux history capture only when that buffer
+    is empty. This is a deliberate trade-off in the
     event-driven architecture (instant, no tmux call) — it is *not* unbounded
     scrollback, so very long sessions are truncated to the tail. Use the
     on-disk ``{id}.log`` (LogWriter) or the delete-time ``{id}.scrollback``

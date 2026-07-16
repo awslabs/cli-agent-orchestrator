@@ -32,7 +32,8 @@ CLI flag  >  CAO_* environment variable  >  settings.json  >  built-in default
     "mcp_request_timeout": 30,
     "event_bus_max_queue_size": 1024,
     "provider_init_timeout": 60,
-    "startup_prompt_handler_timeout": 20
+    "startup_prompt_handler_timeout": 20,
+    "state_buffer_max": 32768
   },
   "memory": {
     "enabled": true,
@@ -118,6 +119,7 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `event_bus_max_queue_size` | `1024` | Max events buffered per subscriber queue in the internal event bus. |
 | `provider_init_timeout` | `60` | Seconds to wait for the initial shell prompt before launching a CLI provider. |
 | `startup_prompt_handler_timeout` | `20` | Seconds the Claude Code startup prompt handler waits for workspace trust dialogs. |
+| `state_buffer_max` | `32768` | Bytes of raw terminal output `StatusMonitor` keeps per terminal for raw-path status detection and `GET /terminals/{id}/output` (`mode=full`). Not unbounded scrollback — a long, chatty session is truncated to this trailing window; raise it if a still-pending prompt is getting evicted before it's read back. |
 
 ### Memory (`memory`)
 

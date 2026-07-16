@@ -115,7 +115,7 @@ Chunks are **coalesced** before publishing (`_COALESCE_WINDOW = 50ms`). TUI prov
 
 ### Status Monitor (`services/status_monitor.py`) — Publisher + Consumer
 
-Subscribes to `terminal.*.output`. Accumulates output into a rolling buffer (8KB) per terminal, detects status via the registered provider (returning `UNKNOWN` until a provider is registered for the terminal), and publishes `terminal.{id}.status` on change. Also the source of truth for current terminal status.
+Subscribes to `terminal.*.output`. Accumulates output into a rolling buffer (`state_buffer_max` server setting, 32KB by default, see `docs/configuration.md`) per terminal, detects status via the registered provider (returning `UNKNOWN` until a provider is registered for the terminal), and publishes `terminal.{id}.status` on change. Also the source of truth for current terminal status.
 
 Two buffer-reset primitives with different semantics:
 
