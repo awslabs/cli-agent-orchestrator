@@ -284,7 +284,14 @@ class TmuxClient:
         target = f"{validated_session}:{validated_window}"
         buf_name = f"cao_{uuid.uuid4().hex[:8]}"
         try:
-            logger.info(f"send_keys: {target} - keys: {keys}")
+            # Log metadata only at INFO: the payload is the full launch
+            # command / message, which can include MCP env values (API
+            # tokens from a profile's mcpServers.env) and entire system
+            # prompts. This matches send_keys_via_paste, which logs only
+            # the text length at INFO. Full content additionally remains
+            # available here at DEBUG for local delivery troubleshooting.
+            logger.info(f"send_keys: {target} - keys length: {len(keys)}")
+            logger.debug(f"send_keys: {target} - keys: {keys}")
             if force_bracketed_paste:
                 # Wrap unconditionally and use -r (no newline→CR conversion).
                 # paste-buffer -p only adds bracketed sequences if tmux tracks
