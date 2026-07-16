@@ -58,7 +58,6 @@ class TestInitializePassesResolvedInitTimeout:
             yield
 
     @pytest.mark.asyncio
-    @patch.object(ClaudeCodeProvider, "wait_until_input_ready")
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
     @patch.object(ClaudeCodeProvider, "_handle_startup_prompts")
@@ -75,7 +74,6 @@ class TestInitializePassesResolvedInitTimeout:
         mock_handle,
         mock_build,
         mock_ensure,
-        mock_wait_ready,
     ):
         """provider_init_timeout=180 caps wait_for_shell, handler, and wait_until_status."""
         mock_wait_shell.return_value = True
@@ -92,7 +90,6 @@ class TestInitializePassesResolvedInitTimeout:
         assert mock_handle.call_args.kwargs["outer_timeout"] == 180
 
     @pytest.mark.asyncio
-    @patch.object(ClaudeCodeProvider, "wait_until_input_ready")
     @patch(_SETTINGS, return_value={"provider_init_timeout": 60})
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
@@ -111,7 +108,6 @@ class TestInitializePassesResolvedInitTimeout:
         mock_build,
         mock_ensure,
         mock_settings,
-        mock_wait_ready,
     ):
         """No provider_init_timeout on the profile -> the 60s server default flows through."""
         mock_wait_shell.return_value = True
@@ -128,7 +124,6 @@ class TestInitializePassesResolvedInitTimeout:
         assert mock_handle.call_args.kwargs["outer_timeout"] == 60
 
     @pytest.mark.asyncio
-    @patch.object(ClaudeCodeProvider, "wait_until_input_ready")
     @patch(_SETTINGS, return_value={"provider_init_timeout": 60})
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
@@ -145,7 +140,6 @@ class TestInitializePassesResolvedInitTimeout:
         mock_build,
         mock_ensure,
         mock_settings,
-        mock_wait_ready,
     ):
         """No agent profile at all (_load_profile -> None) -> server default flows through."""
         mock_wait_shell.return_value = True
@@ -161,7 +155,6 @@ class TestInitializePassesResolvedInitTimeout:
         assert mock_handle.call_args.kwargs["outer_timeout"] == 60
 
     @pytest.mark.asyncio
-    @patch.object(ClaudeCodeProvider, "wait_until_input_ready")
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
     @patch.object(ClaudeCodeProvider, "_handle_startup_prompts")
@@ -178,7 +171,6 @@ class TestInitializePassesResolvedInitTimeout:
         mock_handle,
         mock_build,
         mock_ensure,
-        mock_wait_ready,
     ):
         """initialize() must pass the timeout as outer_timeout, never positionally.
 
@@ -246,10 +238,12 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
     from the per-profile value) governs the outer deadline instead.
     """
 
+    @pytest.mark.asyncio
+    @patch(f"{_CC}.asyncio.sleep")
     @patch(f"{_CC}.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_passed_outer_timeout_extends_deadline_past_settings_default(
-        self, mock_backend, mock_time
+    async def test_passed_outer_timeout_extends_deadline_past_settings_default(
+        self, mock_backend, mock_time, mock_sleep
     ):
         """A prompt at t=100 is still handled when outer_timeout=180.
 
@@ -260,7 +254,6 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
         get_history -- so the trust Enter firing is the discriminating signal.
         idle_gap is pinned huge so only the outer cap can end the loop.
         """
-        mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 0 + 180 = 180
             0.0,  # last_prompt_time = 0
@@ -269,13 +262,17 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
         mock_backend.get_history.return_value = "Yes, I trust this folder"
 
         provider = ClaudeCodeProvider("t1", "sess", "win")
-        provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
+        await provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
 
         mock_backend.send_special_key.assert_called_once()
 
+    @pytest.mark.asyncio
+    @patch(f"{_CC}.asyncio.sleep")
     @patch(f"{_CC}.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_passed_outer_timeout_caps_a_wedged_start(self, mock_backend, mock_time):
+    async def test_passed_outer_timeout_caps_a_wedged_start(
+        self, mock_backend, mock_time, mock_sleep
+    ):
         """With no prompt ever appearing, the loop exits at the passed outer_timeout.
 
         idle_gap is pinned above outer_timeout so the idle-gap exit can never
@@ -283,7 +280,6 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
         """
         import logging
 
-        mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
             0.0,  # outer_deadline = 180
             0.0,  # last_prompt_time = 0
@@ -293,7 +289,7 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
         mock_backend.get_history.return_value = "still starting..."
         provider = ClaudeCodeProvider("t1", "sess", "win")
         with patch.object(logging.getLogger(_CC), "warning") as mock_warn:
-            provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
+            await provider._handle_startup_prompts(idle_gap=1000, outer_timeout=180)
 
         mock_backend.send_special_key.assert_not_called()
         mock_backend.send_keys.assert_not_called()
