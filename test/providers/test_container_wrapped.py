@@ -8,8 +8,10 @@ COMBINE on a real provider (ClaudeCodeProvider) through its public surface —
 startup-prompt handler — in the container-wrapped scenario a wrapped
 ``podman``/``docker exec`` launch produces:
 
-  Task 1: herdr "unknown" agent_status surfaces as native None, and an
-          unresolved native status is aged out to ERROR past a staleness cap.
+  Task 1: herdr "unknown" agent_status surfaces as native None, which always
+          falls through to a LIVE buffer read (BaseProvider._resolve_buffer)
+          rather than a dispatch-timing guess -- restoring fail-fast ERROR
+          detection and a real COMPLETED path for wrapped agents.
   Task 2: host->guest path translation of the temp prompt/MCP files reaches the
           emitted CLI command.
   Task 3: idle-gap startup-prompt handling keeps polling for late dialogs under
@@ -20,7 +22,6 @@ startup-prompt handler — in the container-wrapped scenario a wrapped
 All backends and subprocesses are mocked — no Docker/Podman/tmux required.
 """
 
-import logging
 import shlex
 from unittest.mock import MagicMock, patch
 
@@ -103,46 +104,84 @@ def test_build_command_with_container_profile(mock_load, tmp_path):
 
 
 @patch(_BACKEND)
-def test_status_during_init_native_none(mock_backend):
-    """Tasks 1: dispatched + native None + empty buffer + fresh -> PROCESSING.
+def test_status_during_init_native_none_reads_live_buffer(mock_backend):
+    """Task 1: dispatched + native None -> live get_history() read, not a clock guess.
 
-    A wrapped exec hides the agent CLI from herdr, so get_native_status() is None
-    and the StatusMonitor buffer is empty. Within the staleness window the shared
-    resolver optimistically reports PROCESSING rather than stalling init.
+    A wrapped exec hides the agent CLI from herdr, so get_native_status() is
+    None. The shared resolver no longer infers PROCESSING from elapsed dispatch
+    time; it falls through to BaseProvider._resolve_buffer(), which reads the
+    backend's live pane content on herdr (supports_event_inbox=True). Claude
+    Code's own buffer-parsing then sees a real spinner line and reports
+    PROCESSING because the agent is genuinely still working, not because a
+    timer says so.
     """
     mock_backend.get_native_status.return_value = None
+    mock_backend.supports_event_inbox.return_value = True
+    mock_backend.get_history.return_value = "✻ Orbiting…"
 
     provider = ClaudeCodeProvider("t1", "sess", "win")
     provider.mark_input_received()  # real dispatch hook: sets _task_dispatched=True
     assert provider._task_dispatched is True
-    provider._last_dispatch_time = 1000.0  # pin for a deterministic elapsed
 
-    with patch(_BASE_TIME, return_value=1060.0):  # 60s elapsed, inside the 120s window
-        assert provider.get_status("") == TerminalStatus.PROCESSING
+    assert provider.get_status("") == TerminalStatus.PROCESSING
 
 
 @patch(_BACKEND)
-def test_status_staleness_timeout(mock_backend, caplog):
-    """Task 1: dispatched + native None + empty buffer past the staleness cap -> ERROR.
+def test_status_wedged_pane_reports_unknown_not_error_from_a_clock(mock_backend):
+    """Task 1: a genuinely idle-content-free wedged pane must not become ERROR by clock alone.
 
-    Boundary value: elapsed == 120s is NOT < the 120s timeout, so the optimistic
-    PROCESSING window has closed and the wedged agent is reported ERROR with a
-    WARNING log.
+    Regresses must-fix 2: the removed staleness cap flipped ANY unresolved
+    native status to ERROR purely from elapsed wall-clock time since dispatch,
+    even for a pane that never showed error text -- which meant a long-running
+    but healthy turn on a wrapped agent could never reach COMPLETED and would
+    hard-fail. With native=None now always falling through, a pane with no
+    recognizable content reports Claude Code's own empty-buffer default
+    (UNKNOWN) regardless of how long ago dispatch happened -- it does NOT
+    become ERROR just because a lot of time passed.
     """
     mock_backend.get_native_status.return_value = None
+    mock_backend.supports_event_inbox.return_value = True
+    mock_backend.get_history.return_value = ""  # pane alive, but no content yet
 
     provider = ClaudeCodeProvider("t1", "sess", "win")
     provider.mark_input_received()
     provider._last_dispatch_time = 1000.0
 
-    with patch(_BASE_TIME, return_value=1000.0 + 120.0):
-        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.providers.base"):
-            result = provider.get_status("")
+    with patch(_BASE_TIME, return_value=1000.0 + 300.0):  # would have been "stale" pre-fix
+        result = provider.get_status("")
 
-    assert result == TerminalStatus.ERROR
-    assert any(
-        "staleness timeout" in r.message and r.levelno == logging.WARNING for r in caplog.records
-    ), "a stale unresolved native status must log a WARNING"
+    assert result == TerminalStatus.UNKNOWN
+
+
+@patch(_BACKEND)
+def test_status_dead_launch_reports_unknown_not_false_idle(mock_backend):
+    """Task 1: fail-fast is restored -- a dead launch no longer reports false-success IDLE.
+
+    Pre-#400, herdr 'unknown' mapped straight to ERROR, so wait_until_status()
+    kept polling a dead pane until a real TimeoutError. #400 regressed this: a
+    dead launch (no task ever dispatched, so _task_dispatched=False) reported
+    optimistic IDLE immediately -- init "succeeded" and pasted the task into a
+    dead pane. This test proves the rework restores fail-fast: the live read
+    sees plain shell output with no Claude Code prompt/response markers at
+    all, so Claude Code's own buffer parsing reports UNKNOWN. UNKNOWN is not in
+    {IDLE, COMPLETED}, so init's wait_until_status keeps polling toward a real
+    TimeoutError instead of falsely declaring success.
+    """
+    mock_backend.get_native_status.return_value = None
+    mock_backend.supports_event_inbox.return_value = True
+    # A dead/exited launch: the shell prompt is back, no Claude Code TUI ever
+    # rendered (no ❯/>, no ⏺/●, no separator) -- genuinely unrecognizable.
+    mock_backend.get_history.return_value = "bash: claude: command not found\n$ "
+
+    provider = ClaudeCodeProvider("t1", "sess", "win")
+    # No task dispatched -- this is the pre-dispatch init-wait scenario, where
+    # the #400 regression's guess (IDLE) was most damaging (false init success).
+    assert provider._task_dispatched is False
+
+    result = provider.get_status("")
+
+    assert result == TerminalStatus.UNKNOWN
+    assert result not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
 
 
 @patch("cli_agent_orchestrator.providers.claude_code.time")
