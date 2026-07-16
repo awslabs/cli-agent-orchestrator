@@ -39,6 +39,8 @@ Define the agent's role, responsibilities, and behavior here.
 - `codexConfig` (object, `codex` only): Inline Codex config overrides passed as `-c key=value` at launch (e.g. `model_reasoning_effort`, `service_tier`, `features.fast_mode`). Keys may be dotted config paths; values become TOML scalars. See [Inline Codex Config Overrides](codex-cli.md#inline-codex-config-overrides).
 - `hermesProfile` (string, `hermes` only): Optional Hermes profile wrapper command CAO should launch instead of the default `hermes`, for example one created with `hermes profile alias test-worker`. This is intentionally separate from `codexProfile`: Codex consumes profile names via `codex --profile <name>`, while Hermes aliases are executable commands launched directly as `<alias> chat ...`. See [Hermes Provider](hermes.md).
 - `prompt` (string): Additional prompt text
+- `container` (object): Host-to-guest path mappings for an agent whose CLI runs wrapped inside a container (`podman exec`, `docker exec`, `nerdctl exec`, a devcontainer, etc.). See [Container-Wrapped Agents](#container-wrapped-agents).
+- `provider_init_timeout` (int, seconds): Per-profile override for the provider initialization timeout, replacing the server-wide `provider_init_timeout` default (60s — see [Configuration](configuration.md#server-server)) for this agent only. Also the outer cap on the startup-prompt handler (Claude Code, Kimi, Antigravity). Use this for containerized profiles whose wrapped CLI takes far longer to reach IDLE than a native launch.
 
 ## Tool Restrictions
 
@@ -135,6 +137,28 @@ You review code for quality and correctness.
 ```
 
 > **Note:** The `cao launch --provider` CLI flag is an explicit override and always takes precedence over the profile's `provider` key for the initial session.
+
+## Container-Wrapped Agents
+
+When a CLI agent runs inside a container (via a wrapper command like `podman exec`, `docker exec`, or `nerdctl exec`), the files CAO writes to the host filesystem — the per-terminal system-prompt file and MCP config JSON under `~/.aws/cli-agent-orchestrator/tmp/` — are not visible to the process at their host paths. The `container.path_maps` field declares the bind-mount contract so CAO can translate a host path to the corresponding guest path before passing it as a CLI flag.
+
+```markdown
+---
+name: containerized-worker
+description: Agent running inside a podman container
+container:
+  path_maps:
+    - host: /home/user/.aws/cli-agent-orchestrator/tmp
+      guest: /workspace/cao-tmp
+provider_init_timeout: 180
+---
+
+You are a containerized worker agent.
+```
+
+- `container.path_maps` (array of `{host, guest}`): Host-prefix-to-guest-prefix mappings. When CAO builds a temp-file path (system prompt, MCP config) that starts with a mapped `host` prefix, the path is rewritten to the corresponding `guest` prefix using longest-prefix-match — if multiple entries match, the one with the longest `host` prefix wins. A path with no matching prefix is passed through unchanged. The container must actually bind-mount `host` to `guest` (e.g. `podman run -v /home/user/.aws/cli-agent-orchestrator/tmp:/workspace/cao-tmp`) for the translated path to resolve inside the container — CAO only rewrites the string, it does not configure the mount.
+- Currently wired into the `claude_code` provider only (the temp prompt file and `--mcp-config` path). Other providers pass their config inline or via different mechanisms and do not consume `path_maps`.
+- Pair `container.path_maps` with `provider_init_timeout` (see [Optional Fields](#optional-fields)): a wrapped launch (cold container start, image pull, nested process supervision) routinely takes longer to reach IDLE than a native one, and the per-profile override raises the cap without changing the server-wide default for every other agent.
 
 ## Installation
 
