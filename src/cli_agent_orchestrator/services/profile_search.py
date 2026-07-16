@@ -4,7 +4,8 @@ Backs both ``cao profile find`` (CLI) and the ``find_profiles`` MCP tool.
 Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/340
 
 Design constraints (v1):
-- Read-only: searches metadata only; never reads or returns prompt bodies.
+- Read-only: matches on metadata only. Files are read to parse frontmatter,
+  but the prompt body is never indexed, matched against, or returned.
 - Ephemeral: the corpus is rebuilt from ``list_agent_profiles()`` on every
   query. Profile counts are small (tens), so a persistent index would only
   add staleness risk (profiles are installed/removed outside CAO's control).
@@ -19,8 +20,8 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Fields included in each search result. The profile prompt body is NEVER
-# read or returned — discovery is metadata-only by design.
+# Fields included in each search result. The profile prompt body is never
+# indexed or returned — discovery is metadata-only by design.
 RESULT_FIELDS = ("name", "description", "capabilities", "tags", "role", "source")
 
 DEFAULT_LIMIT = 10
@@ -58,6 +59,8 @@ def _result(profile: Dict, score: float) -> Dict:
     normalizes via ``_discovery_fields``).
     """
     out = {field: profile.get(field, "") for field in RESULT_FIELDS}
+    desc = profile.get("description")
+    out["description"] = desc if isinstance(desc, str) else ""
     tags = profile.get("tags")
     capabilities = profile.get("capabilities")
     out["tags"] = [str(t) for t in tags] if isinstance(tags, list) else []
@@ -98,31 +101,39 @@ def search_profiles(
         from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
 
         profiles = list_agent_profiles()
+    # Exclude profiles whose frontmatter failed to parse: they cannot be
+    # loaded by handoff/assign, so recommending them would be misleading.
+    profiles = [p for p in profiles if p.get("parse_ok", True)]
     if not profiles:
         return []
 
     corpus_tokens = [_tokenize(_searchable_text(p)) for p in profiles]
     if not any(corpus_tokens):
-        # Every profile tokenized to empty text; BM25Okapi would divide by
-        # zero (avgdl == 0) and nothing could match anyway.
+        # Every profile tokenized to empty text; BM25 would divide by zero
+        # (avgdl == 0) and nothing could match anyway.
         return []
 
     try:
-        from rank_bm25 import BM25Okapi  # type: ignore[import-untyped]
+        from rank_bm25 import BM25Plus  # type: ignore[import-untyped]
 
-        scores = list(BM25Okapi(corpus_tokens).get_scores(query_tokens))
+        # BM25Plus lower-bounds term contributions so scores stay positive.
+        # Plain BM25Okapi produces zero/negative IDF for terms present in most
+        # of a small corpus, which can rank a profile matching every query
+        # term below partial matches.
+        scores = list(BM25Plus(corpus_tokens).get_scores(query_tokens))
     except ImportError:
         logger.debug("rank_bm25 not installed; using token-overlap fallback")
         scores = _overlap_scores(query_tokens, corpus_tokens)
 
-    # BM25 IDF can go negative/zero on tiny corpora, so gate inclusion on an
-    # actual token hit rather than on score > 0 (same rationale as
-    # memory_service._bm25_relevance).
+    # Rank primarily by query-term coverage (how many distinct query tokens
+    # the profile matches), with BM25 as the tie-breaker. This guarantees a
+    # profile matching more of the query never ranks below a partial match,
+    # regardless of corpus-level IDF effects.
     query_set = set(query_tokens)
     matched = [
-        (profile, score)
+        (profile, len(query_set & set(doc_tokens)), score)
         for profile, score, doc_tokens in zip(profiles, scores, corpus_tokens)
         if query_set & set(doc_tokens)
     ]
-    matched.sort(key=lambda pair: (-pair[1], pair[0].get("name", "")))
-    return [_result(profile, score) for profile, score in matched[:limit]]
+    matched.sort(key=lambda item: (-item[1], -item[2], item[0].get("name", "")))
+    return [_result(profile, score) for profile, _coverage, score in matched[:limit]]

@@ -12,6 +12,7 @@
     },
     "description": {
       "type": "string",
+      "maxLength": 1024,
       "description": "Brief description of the agent's purpose."
     },
     "capabilities": {

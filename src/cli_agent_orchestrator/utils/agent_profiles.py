@@ -49,24 +49,28 @@ def _safe_join(root: Path, *parts: str) -> Path | None:
 # The schema is only enforced at install/validate time; profiles can reach the
 # stores without passing through it (manual copy, git checkout), so the read
 # path re-enforces the limits before the values feed search corpora and the
-# find_profiles MCP surface.
+# find_profiles MCP surface. (The full file is read to parse frontmatter, but
+# the prompt body is never indexed or returned by discovery.)
 _DISCOVERY_MAX_ITEMS = 32
 _CAPABILITY_MAX_LEN = 128
+_DESCRIPTION_MAX_LEN = 1024
 _TAG_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _discovery_fields(metadata: dict) -> Dict:
-    """Extract optional discovery metadata (capabilities/tags/role) from frontmatter.
+    """Extract discovery metadata (description/capabilities/tags/role) from frontmatter.
 
-    Non-list values are coerced to empty lists, and schema limits (item counts,
-    lengths, tag charset) are enforced here so downstream search code can rely
-    on bounded, well-shaped values even for profiles that never went through
-    ``cao install`` validation.
+    Non-string descriptions and non-list tag/capability values are coerced to
+    empty, and schema limits (item counts, lengths, tag charset) are enforced
+    here so downstream search code can rely on bounded, well-shaped values
+    even for profiles that never went through ``cao install`` validation.
     """
+    desc_raw = metadata.get("description")
     caps_raw = metadata.get("capabilities")
     tags_raw = metadata.get("tags")
     role = metadata.get("role")
 
+    description = desc_raw[:_DESCRIPTION_MAX_LEN] if isinstance(desc_raw, str) else ""
     capabilities = (
         [str(c)[:_CAPABILITY_MAX_LEN] for c in caps_raw[:_DISCOVERY_MAX_ITEMS]]
         if isinstance(caps_raw, list)
@@ -78,6 +82,7 @@ def _discovery_fields(metadata: dict) -> Dict:
         else []
     )
     return {
+        "description": description,
         "capabilities": capabilities,
         "tags": tags,
         "role": str(role) if isinstance(role, str) else "",
@@ -110,41 +115,39 @@ def _scan_directory(
     for item in directory.iterdir():
         if item.is_dir():
             profile_name = item.name
-            desc = ""
             discovery = _discovery_fields({})
+            parse_ok = True
             # Check for agent.md inside directory
             agent_md = item / "agent.md"
             if agent_md.exists():
                 try:
                     data = frontmatter.loads(agent_md.read_text())
-                    desc = data.metadata.get("description", "")
                     discovery = _discovery_fields(data.metadata)
                 except Exception:
-                    pass
+                    parse_ok = False
             _record(profile_name)
             if profile_name not in profiles:
                 profiles[profile_name] = {
                     "name": profile_name,
-                    "description": desc,
                     "source": source_label,
+                    "parse_ok": parse_ok,
                     **discovery,
                 }
         elif item.suffix == ".md" and item.is_file():
             profile_name = item.stem
-            desc = ""
             discovery = _discovery_fields({})
+            parse_ok = True
             try:
                 data = frontmatter.loads(item.read_text())
-                desc = data.metadata.get("description", "")
                 discovery = _discovery_fields(data.metadata)
             except Exception:
-                pass
+                parse_ok = False
             _record(profile_name)
             if profile_name not in profiles:
                 profiles[profile_name] = {
                     "name": profile_name,
-                    "description": desc,
                     "source": source_label,
+                    "parse_ok": parse_ok,
                     **discovery,
                 }
 
@@ -216,15 +219,15 @@ def list_agent_profiles() -> List[Dict]:
                     data = frontmatter.loads(item.read_text())
                     profiles[profile_name] = {
                         "name": profile_name,
-                        "description": data.metadata.get("description", ""),
                         "source": "built-in",
+                        "parse_ok": True,
                         **_discovery_fields(data.metadata),
                     }
                 except Exception:
                     profiles[profile_name] = {
                         "name": profile_name,
-                        "description": "",
                         "source": "built-in",
+                        "parse_ok": False,
                         **_discovery_fields({}),
                     }
     except Exception as e:

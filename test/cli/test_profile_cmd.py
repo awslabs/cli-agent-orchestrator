@@ -539,3 +539,24 @@ class TestFindCmd:
         assert result.exit_code != 0
         assert "Profile search failed" in result.output
         assert "Traceback" not in result.output
+
+    def test_find_survives_mapping_description(self, runner):
+        """Regression (#438 re-review): a YAML mapping description reached
+        description[:108] and crashed with KeyError: slice(None, 108, None)."""
+        weird = [
+            {
+                "name": "weird-agent",
+                "description": {"a": "b"},
+                "tags": [],
+                "capabilities": [],
+                "role": "",
+                "source": "local",
+            }
+        ]
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",
+            return_value=weird,
+        ):
+            result = runner.invoke(profile, ["find", "weird"])
+        assert result.exit_code == 0
+        assert "weird-agent" in result.output

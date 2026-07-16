@@ -188,7 +188,16 @@ class TestDiscoveryFields:
 
     def test_non_list_values_coerced_to_empty(self):
         out = self._fields({"tags": "sqs", "capabilities": 42, "role": ["dev"]})
-        assert out == {"capabilities": [], "tags": [], "role": ""}
+        assert out == {"description": "", "capabilities": [], "tags": [], "role": ""}
+
+    def test_description_normalized(self):
+        """Regression (#438 re-review): mapping/list descriptions crashed the
+        CLI (KeyError on slice) and escaped MCP bounds; oversized strings
+        expanded the corpus unbounded."""
+        assert self._fields({"description": {"a": "b"}})["description"] == ""
+        assert self._fields({"description": ["x"]})["description"] == ""
+        assert self._fields({"description": None})["description"] == ""
+        assert len(self._fields({"description": "x" * 5000})["description"]) == 1024
 
     def test_items_coerced_to_str_and_bounded(self):
         out = self._fields({"capabilities": [123, "x" * 500], "tags": ["ok_tag", 99]})
@@ -280,3 +289,119 @@ class TestFindProfilesMcpTool:
 
         monkeypatch.setattr("cli_agent_orchestrator.services.profile_search.search_profiles", boom)
         assert server.find_profiles(query="sqs", limit=5) == []
+
+
+class TestCoverageFirstRanking:
+    """Regression (#438 re-review): Okapi BM25 IDF goes zero/negative when a
+    term appears in most of a small corpus, ranking a profile that matches
+    every query term below partial matches. Coverage-primary sort with
+    BM25Plus tie-break guarantees broader query coverage ranks first."""
+
+    def _p(self, name, description):
+        return {"name": name, "description": description, "tags": [], "capabilities": []}
+
+    def test_full_match_ranks_first_on_tiny_corpus(self):
+        profiles = [
+            self._p("monitor-only", "monitor things"),
+            self._p("sqs-only", "sqs things"),
+            self._p("both", "sqs monitor"),
+        ]
+        results = search_profiles("sqs monitor", profiles=profiles)
+        assert results[0]["name"] == "both"
+
+    def test_full_match_survives_limit(self):
+        profiles = [
+            self._p("monitor-only", "monitor things"),
+            self._p("sqs-only", "sqs things"),
+            self._p("both", "sqs monitor"),
+        ]
+        results = search_profiles("sqs monitor", profiles=profiles, limit=1)
+        assert [r["name"] for r in results] == ["both"]
+
+    def test_single_profile_corpus(self):
+        results = search_profiles("sqs", profiles=[self._p("only", "sqs stuff")])
+        assert results and results[0]["name"] == "only"
+
+    def test_two_profile_common_term(self):
+        profiles = [self._p("a-sqs", "sqs"), self._p("b-both", "sqs monitor")]
+        results = search_profiles("sqs monitor", profiles=profiles)
+        assert results[0]["name"] == "b-both"
+
+    def test_scores_non_negative(self):
+        profiles = [
+            self._p("monitor-only", "monitor things"),
+            self._p("sqs-only", "sqs things"),
+            self._p("both", "sqs monitor"),
+        ]
+        for r in search_profiles("sqs monitor", profiles=profiles):
+            assert r["score"] >= 0
+
+    def test_bm25_tiebreak_within_equal_coverage(self):
+        # Equal coverage (1 term each); heavier term frequency wins tie-break.
+        profiles = [
+            self._p("mentions-once", "sqs plus lots of other unrelated words here"),
+            self._p("focused", "sqs sqs sqs"),
+        ]
+        results = search_profiles("sqs", profiles=profiles)
+        assert results[0]["name"] == "focused"
+
+
+class TestParseFailedExclusion:
+    """Regression (#438 re-review): parse-failed profiles were indexed by
+    filename and could be recommended, then fail to load on handoff."""
+
+    def test_parse_failed_excluded_from_results(self):
+        profiles = [
+            {
+                "name": "broken-monitor",
+                "description": "",
+                "tags": [],
+                "capabilities": [],
+                "parse_ok": False,
+            },
+            {
+                "name": "monitor-ok",
+                "description": "monitor",
+                "tags": [],
+                "capabilities": [],
+                "parse_ok": True,
+            },
+        ]
+        names = [r["name"] for r in search_profiles("monitor", profiles=profiles)]
+        assert names == ["monitor-ok"]
+
+    def test_missing_parse_ok_treated_as_valid(self):
+        # Backwards compatibility: dicts without the flag are searchable.
+        profiles = [
+            {"name": "legacy-monitor", "description": "monitor", "tags": [], "capabilities": []}
+        ]
+        assert search_profiles("monitor", profiles=profiles)
+
+    def test_broken_yaml_on_disk_listed_but_not_searchable(self, tmp_path, monkeypatch):
+        """End-to-end: discover-then-load consistency."""
+        import cli_agent_orchestrator.utils.agent_profiles as ap
+
+        store = tmp_path / "store"
+        store.mkdir()
+        (store / "broken-monitor.md").write_text(
+            "---\nname: [unclosed\ndescription: {bad\n---\nbody\n"
+        )
+        (store / "good-monitor.md").write_text(
+            "---\nname: good-monitor\ndescription: monitor queues\n---\nbody\n"
+        )
+        monkeypatch.setattr(ap, "LOCAL_AGENT_STORE_DIR", store)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs", lambda: []
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+        local = [p for p in ap.list_agent_profiles() if p["source"] == "local"]
+        # list still shows both (existing behavior preserved)
+        assert {p["name"] for p in local} == {"broken-monitor", "good-monitor"}
+        # search only recommends the loadable one
+        names = [r["name"] for r in search_profiles("monitor", profiles=local)]
+        assert names == ["good-monitor"]
