@@ -94,7 +94,9 @@ class TestClaudeCodeIdleGap:
     @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    async def test_no_prompt_exits_at_outer_cap_not_idle_gap(self, mock_backend, mock_time, mock_sleep):
+    async def test_no_prompt_exits_at_outer_cap_not_idle_gap(
+        self, mock_backend, mock_time, mock_sleep
+    ):
         """No prompt ever appears — the idle gap does NOT apply until a first prompt lands.
 
         Before any prompt is observed, ``last_prompt_time`` has nothing real to
@@ -123,7 +125,9 @@ class TestClaudeCodeIdleGap:
     @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    async def test_first_prompt_later_than_idle_gap_still_handled(self, mock_backend, mock_time, mock_sleep):
+    async def test_first_prompt_later_than_idle_gap_still_handled(
+        self, mock_backend, mock_time, mock_sleep
+    ):
         """A FIRST dialog later than idle_gap (the issue #400 scenario) is now caught.
 
         Before this fix, a first prompt at t=35 (past the 20s idle-gap default)

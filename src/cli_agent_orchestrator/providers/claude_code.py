@@ -525,7 +525,11 @@ class ClaudeCodeProvider(BaseProvider):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Prevent bypass permissions dialog from appearing (settings-based fix).
-        self._ensure_skip_bypass_prompt_setting()
+        # harness-control#215 self-ROAST finding: this does blocking file I/O
+        # (~/.claude/settings.json read+write) directly on the event loop this
+        # coroutine runs on -- small in practice, but offloaded for the same
+        # reason as the calls below, so nothing in initialize() blocks the loop.
+        await asyncio.to_thread(self._ensure_skip_bypass_prompt_setting)
 
         # Build properly escaped command string
         command = self._build_claude_command(profile)
