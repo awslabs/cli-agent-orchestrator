@@ -1,6 +1,7 @@
 """Tests for the install service."""
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -8,18 +9,21 @@ import frontmatter
 import pytest
 import requests  # type: ignore[import-untyped]
 
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.utils.skill_injection import refresh_agent_md_prompt
 
 
-def _profile_text(*, name: str, include_prompt: bool = True) -> str:
+def _profile_text(*, name: str, include_prompt: bool = True, provider: str | None = None) -> str:
     """Build a profile fixture with env placeholders in prompt and MCP config."""
     prompt_lines = "Fallback prompt\n" if include_prompt else ""
+    provider_line = f"provider: {provider}\n" if provider else ""
     return (
         "---\n"
         f"name: {name}\n"
         "description: Test agent\n"
+        f"{provider_line}"
         "role: developer\n"
         "mcpServers:\n"
         "  service:\n"
@@ -387,6 +391,107 @@ class TestInstallAgent:
         assert result.success is False
         assert "Failed to install agent" in result.message
         assert "Unexpected error" in result.message
+
+
+class TestInstallProviderResolution:
+    """Tests for provider precedence: explicit flag > frontmatter > default (GH #414)."""
+
+    def test_explicit_provider_wins_over_frontmatter(self, install_paths: dict[str, Path]) -> None:
+        """An explicit provider argument should override the profile's frontmatter."""
+        local_profile = install_paths["local_store_dir"] / "fm-agent.md"
+        local_profile.write_text(
+            _profile_text(name="fm-agent", provider="claude_code"), encoding="utf-8"
+        )
+
+        result = install_agent("fm-agent", "kiro_cli")
+
+        assert result.success is True
+        assert result.provider == "kiro_cli"
+        assert (install_paths["kiro_dir"] / "fm-agent.json").exists()
+
+    def test_frontmatter_provider_used_when_flag_absent(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """Without an explicit provider, the profile's frontmatter provider wins."""
+        local_profile = install_paths["local_store_dir"] / "fm-agent.md"
+        local_profile.write_text(
+            _profile_text(name="fm-agent", provider="claude_code"), encoding="utf-8"
+        )
+
+        result = install_agent("fm-agent")
+
+        assert result.success is True
+        assert result.provider == "claude_code"
+        # claude_code installs write a context file only — no kiro config,
+        # which is exactly what the pre-fix behaviour would have produced.
+        assert result.agent_file is None
+        assert not (install_paths["kiro_dir"] / "fm-agent.json").exists()
+
+    def test_default_provider_used_when_flag_and_frontmatter_absent(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """No flag and no frontmatter provider should fall back to DEFAULT_PROVIDER."""
+        local_profile = install_paths["local_store_dir"] / "plain-agent.md"
+        local_profile.write_text(_profile_text(name="plain-agent"), encoding="utf-8")
+
+        result = install_agent("plain-agent")
+
+        assert result.success is True
+        assert result.provider == DEFAULT_PROVIDER
+        assert (install_paths["kiro_dir"] / "plain-agent.json").exists()
+
+    def test_invalid_frontmatter_provider_warns_and_falls_back(
+        self, install_paths: dict[str, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A bogus frontmatter provider should log a warning and use the default."""
+        local_profile = install_paths["local_store_dir"] / "bogus-agent.md"
+        local_profile.write_text(
+            _profile_text(name="bogus-agent", provider="bogus_provider"), encoding="utf-8"
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="cli_agent_orchestrator.services.install_service"
+        ):
+            result = install_agent("bogus-agent")
+
+        assert result.success is True
+        assert result.provider == DEFAULT_PROVIDER
+        assert (install_paths["kiro_dir"] / "bogus-agent.json").exists()
+        assert "invalid provider 'bogus_provider'" in caplog.text
+
+    def test_explicit_invalid_provider_fails_before_download(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """An explicit bad provider must fail fast BEFORE any URL download."""
+        with patch("cli_agent_orchestrator.services.install_service.requests.get") as mock_get:
+            result = install_agent(
+                "https://raw.githubusercontent.com/org/repo/main/agent.md",
+                "bad_provider",
+            )
+
+        assert result.success is False
+        assert result.message.startswith("Invalid provider 'bad_provider'.")
+        mock_get.assert_not_called()
+
+    def test_builtin_profile_without_frontmatter_provider_uses_default(
+        self, install_paths: dict[str, Path], tmp_path: Path
+    ) -> None:
+        """Built-in store profiles carry no frontmatter provider — bare installs keep the default."""
+        built_in_dir = tmp_path / "builtin-agent-store"
+        built_in_dir.mkdir()
+        (built_in_dir / "developer.md").write_text(
+            _profile_text(name="developer"), encoding="utf-8"
+        )
+
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            return_value=built_in_dir,
+        ):
+            result = install_agent("developer")
+
+        assert result.success is True
+        assert result.provider == DEFAULT_PROVIDER
+        assert (install_paths["kiro_dir"] / "developer.json").exists()
 
 
 class TestInstallAgentHardening:

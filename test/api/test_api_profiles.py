@@ -106,6 +106,34 @@ class TestInstallAgentProfileEndpoint:
             },
         )
 
+    def test_omitted_provider_forwards_none_for_frontmatter_resolution(self, client) -> None:
+        """Requests without a provider should forward None so the service
+        resolves the profile's frontmatter provider (flag > frontmatter >
+        default precedence, GH #414) — identically to the CLI."""
+        service_result = InstallResult(
+            success=True,
+            message="Agent 'developer' installed successfully",
+            agent_name="developer",
+            provider="claude_code",
+        )
+
+        with patch(
+            "cli_agent_orchestrator.api.main.install_agent",
+            return_value=service_result,
+        ) as mock_install:
+            response = client.post(
+                "/agents/profiles/install",
+                json={"source": "developer"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["provider"] == "claude_code"
+        mock_install.assert_called_once_with(
+            source="developer",
+            provider=None,
+            env_vars=None,
+        )
+
     def test_returns_400_for_invalid_source(self, client) -> None:
         """Structured service failures should be surfaced as 400s."""
         with patch(
