@@ -14,3 +14,27 @@ def _no_llm_compile_in_tests(monkeypatch):
     var themselves or stub the ``wiki_compiler`` seams.
     """
     monkeypatch.setenv("CAO_MEMORY_COMPILE_MODE", "append")
+
+
+@pytest.fixture
+def isolated_memory_db(tmp_path, monkeypatch):
+    """Route default memory sessions to an initialized per-test SQLite database."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from cli_agent_orchestrator.clients import database
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'memory-metadata.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    database.Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(
+        database,
+        "SessionLocal",
+        sessionmaker(autocommit=False, autoflush=False, bind=engine),
+    )
+    try:
+        yield engine
+    finally:
+        engine.dispose()
