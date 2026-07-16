@@ -4,7 +4,7 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import click
 
@@ -175,10 +175,10 @@ def update():
         # A local install has no remote to advance from; `uv tool upgrade` would
         # be a silent no-op that then reports success. Tell the user the exact
         # steps instead of pretending to update.
-        location: Any = detail
+        assert detail is not None  # local kinds always carry a location
         raise click.ClickException(
-            f"CAO was installed from a local {kind} ({location}). "
-            f"`cao update` can't advance a local install; {_local_fix_hint(kind, location)}"
+            f"CAO was installed from a local {kind} ({detail}). "
+            f"`cao update` can't advance a local install; {_local_fix_hint(kind, detail)}"
         )
 
     command = _build_command(kind, detail)
