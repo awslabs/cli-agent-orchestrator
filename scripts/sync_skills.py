@@ -39,7 +39,7 @@ SHIPPED_SKILLS: List[str] = [
     "cao-supervisor-protocols",
     "cao-worker-protocols",
     "cao-memory",
-    "workflow-author",
+    "cao-workflow",
     "cao-plugin",
     "cao-provider",
 ]
