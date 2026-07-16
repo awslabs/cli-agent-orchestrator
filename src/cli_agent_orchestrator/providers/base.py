@@ -529,12 +529,18 @@ class BaseProvider(ABC):
 
         Uses longest-prefix-match: if multiple path_maps match, the one with the
         longest host prefix wins.  If no map matches, returns the path unchanged.
+
+        ``best_len`` starts at -1 (not 0) so a root mapping (``host="/"``) can
+        still win when it is the only match: ``rstrip("/")`` reduces ``"/"`` to
+        ``""`` (length 0), and ``0 > 0`` is never true, so starting the
+        comparison at 0 silently dropped every root mapping regardless of
+        whether anything more specific matched.
         """
         if profile is None or profile.container is None or not profile.container.path_maps:
             return path
 
         best_match = None
-        best_len = 0
+        best_len = -1
         for mapping in profile.container.path_maps:
             host_prefix = mapping.host.rstrip("/")
             if path == host_prefix or path.startswith(host_prefix + "/"):

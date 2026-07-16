@@ -126,6 +126,22 @@ class TestTranslatePath:
         profile = _profile(("/host", "/guest"))
         assert self.provider._translate_path("/hostile/x.txt", profile) == "/hostile/x.txt"
 
+    def test_root_mapping_alone_is_applied(self):
+        """A host="/" mapping must not silently no-op (nit fix, PR #428 review).
+
+        rstrip("/") reduces "/" to "" (length 0); the prior best_len=0 seed
+        made `len("") > 0` always false, so a root mapping never won even when
+        it was the only entry -- the guest translation was silently dropped.
+        """
+        profile = _profile(("/", "/guest"))
+        assert self.provider._translate_path("/host/x.txt", profile) == "/guest/host/x.txt"
+
+    def test_root_mapping_loses_to_more_specific_prefix(self):
+        """A root mapping still only wins when nothing more specific matches."""
+        profile = _profile(("/", "/guest"), ("/host", "/deep"))
+        assert self.provider._translate_path("/host/x.txt", profile) == "/deep/x.txt"
+        assert self.provider._translate_path("/other/x.txt", profile) == "/guest/other/x.txt"
+
 
 class TestResolveNativeStatus:
     """Tests for BaseProvider._resolve_native_status.

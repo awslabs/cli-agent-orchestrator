@@ -12,11 +12,6 @@ from typing import TYPE_CHECKING, Any, List, Optional
 if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
-# Sentinel so _build_claude_command can tell "caller passed no profile, load it"
-# from "caller explicitly passed None" (native/missing profile). initialize()
-# loads the profile once and passes it in; direct callers omit it and get a load.
-_UNSET: Any = object()
-
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -28,6 +23,15 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_sta
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+# Sentinel so _build_claude_command can tell "caller passed no profile, load it"
+# from "caller explicitly passed None" (native/missing profile). initialize()
+# loads the profile once and passes it in; direct callers omit it and get a
+# load. NOT a candidate for removal in favor of a plain `None` default: that
+# would make _build_claude_command reload the profile from disk a SECOND time
+# whenever initialize() already resolved it to None (no CAO profile found),
+# reintroducing the double-disk-read this sentinel exists to prevent.
+_UNSET: Any = object()
 
 
 # Custom exception for provider errors
