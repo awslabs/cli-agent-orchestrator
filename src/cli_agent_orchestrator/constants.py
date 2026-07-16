@@ -264,6 +264,9 @@ def graph_export_root() -> Path:
     return Path(os.environ.get("CAO_GRAPH_EXPORT_ROOT", str(GRAPH_EXPORT_ROOT_DEFAULT)))
 
 
+# OpenTelemetry service.name for CAO's spans/metrics.
+OTEL_SERVICE_NAME = "cao"
+
 # Provider-specific agent directories
 KIRO_AGENTS_DIR = Path(os.environ.get("CAO_AGENTS_DIR", str(Path.home() / ".kiro" / "agents")))
 COPILOT_AGENTS_DIR = Path.home() / ".copilot" / "agents"  # Copilot custom agents
@@ -310,6 +313,9 @@ CORS_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    # Secondary Vite dev-server port (used when :5173 is already taken).
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
 ] + _split_env_list("CAO_CORS_ORIGINS")
 
 

@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add script-tier workflows: a `.py` workflow spec is now runnable via `cao workflow run` (and the `workflow_run`/`workflow_cancel` MCP tools), with the same `resume`/`cancel`/`status` support as YAML workflows — tier is detected automatically from the file extension (#312)
 - add optional `skills` field to `AgentProfile` to scope the per-agent skill catalog via an fnmatch allowlist; runtime-prompt providers only, `load_skill` resolution unchanged (#351)
+
+- **AG-UI typed-event stream** — new `/agui/v1/stream` Server-Sent Events endpoint that maps CAO's normalized fleet events to [AG-UI](https://github.com/ag-ui-protocol/ag-ui) typed events (`RUN_*`, `STEP_*`, `TEXT_MESSAGE_CONTENT`, `TOOL_CALL_START`, `STATE_SNAPSHOT`, `STATE_DELTA`, `GENERATIVE_UI`, `RUN_ERROR`), so any AG-UI-compatible client renders CAO with no custom adapter. Default-off via `CAO_AGUI_ENABLED`; supports `?since=` history replay and, when auth is enabled, a `?access_token=` query-parameter JWT for browser `EventSource` clients. Message bodies are never carried (metadata-only by construction).
+
+- **Generative UI** — agents author allow-listed UI components (approval cards, choice prompts, diff summaries, progress/metrics, agent cards) via the `emit_ui` MCP tool / `POST /agui/v1/emit_ui`. Intents are validated **server-side** against a frozen allow-list (no arbitrary markup) and rendered uniformly across heterogeneous providers. See [docs/agui.md](docs/agui.md#generative-ui).
+
+- **OpenTelemetry GenAI instrumentation** — opt-in, shipped as the `[otel]` optional extra (`pip install cli-agent-orchestrator[otel]`); the base install degrades to no-ops. The inter-agent dispatch seam (`send_message` / `handoff` / `assign`) emits a GenAI `execute_tool` span and a `cao.orchestration.dispatches` counter over OTLP, and propagates W3C trace context (`traceparent`) into plugin events. GenAI `invoke_agent` / `chat` span helpers ship for instrumenting agent- and model-level calls. See [docs/otel-deployment.md](docs/otel-deployment.md).
+
+- **Native multi-agent workflow spec** — a trusted-author YAML workflow grammar with authoring/validation endpoints, a run-engine seam, and `workflow_run` / `workflow_return` / `workflow_cancel` MCP tools (#312).
+
+- **`mock_cli` provider** — a credentials-free mock agent for deterministic CI of orchestration logic without real CLI binaries or secrets. See [docs/mock-cli-provider.md](docs/mock-cli-provider.md).
+
+- add Antigravity CLI (`agy`) provider — Google's terminal-native coding agent and the successor to the Gemini CLI after the free "Login with Google" path was retired (#323)
+
 - add herdr terminal backend with event-driven inbox delivery (#271)
 
 - bundle built-in memory plugins for Claude Code, Kiro, and Codex (#269)

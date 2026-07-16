@@ -1194,6 +1194,53 @@ async def send_message(
 
 
 @mcp.tool()
+async def emit_ui(
+    component: str = Field(
+        description=(
+            "UI component to render. Must be one of the allow-listed components: "
+            "approval_card, choice_prompt, diff_summary, progress, metric, agent_card."
+        ),
+    ),
+    props: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="JSON props for the component (e.g. {'title': ..., 'risk': 'high'}).",
+    ),
+) -> Dict[str, Any]:
+    """Render a generative-UI component to the operator's AG-UI dashboard.
+
+    Lets an agent author a small, declarative UI intent (an approval card, a
+    choice prompt, a diff summary, a progress/metric readout, …) that appears
+    live in any AG-UI client watching this fleet. The intent is validated
+    server-side against a frozen allow-list — arbitrary HTML/markup is never
+    accepted — so this is safe to call from any agent.
+
+    Args:
+        component: One of the allow-listed component names.
+        props: JSON-serializable props for the component (bounded to 8 KB).
+
+    Returns:
+        Dict with the emitted event id and component name.
+    """
+    terminal_id = os.getenv("CAO_TERMINAL_ID")
+    response = requests.post(
+        f"{API_BASE_URL}/agui/v1/emit_ui",
+        json={
+            "component": component,
+            "props": props or {},
+            "terminal_id": terminal_id,
+        },
+        timeout=_mcp_timeout(),
+    )
+    if response.status_code == 400:
+        raise ValueError(_extract_error_detail(response, "invalid UI intent"))
+    if response.status_code == 404:
+        # AG-UI surface disabled — degrade gracefully rather than erroring the agent.
+        return {"ok": False, "reason": "AG-UI surface disabled (set CAO_AGUI_ENABLED)"}
+    response.raise_for_status()
+    return response.json()
+
+
+@mcp.tool()
 async def answer_user_prompt(
     terminal_id: str = Field(description="Target terminal ID waiting for user input"),
     answer: str = Field(

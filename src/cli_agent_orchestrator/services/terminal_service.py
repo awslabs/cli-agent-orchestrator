@@ -789,17 +789,33 @@ def send_input(
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
         if registry is not None and sender_id is not None and orchestration_type is not None:
-            dispatch_plugin_event(
-                registry,
-                "post_send_message",
-                PostSendMessageEvent(
-                    session_id=metadata["tmux_session"],
-                    sender=sender_id,
-                    receiver=terminal_id,
-                    message=original_message,
-                    orchestration_type=orchestration_type,
-                ),
+            # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
+            # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
+            # count it, and propagate the active trace context into the plugin
+            # event so downstream consumers can continue the trace.
+            from cli_agent_orchestrator.telemetry import (
+                execute_tool_span,
+                inject_traceparent,
+                record_orchestration_dispatch,
             )
+
+            with execute_tool_span(
+                f"send_message:{orchestration_value}",
+                conversation_id=metadata["tmux_session"],
+            ):
+                record_orchestration_dispatch(orchestration_value)
+                dispatch_plugin_event(
+                    registry,
+                    "post_send_message",
+                    PostSendMessageEvent(
+                        session_id=metadata["tmux_session"],
+                        sender=sender_id,
+                        receiver=terminal_id,
+                        message=original_message,
+                        orchestration_type=orchestration_type,
+                        traceparent=inject_traceparent(),
+                    ),
+                )
         return True
 
     except Exception as e:

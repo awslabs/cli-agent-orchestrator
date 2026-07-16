@@ -1,0 +1,8 @@
+{
+  "name": "cao-skills",
+  "description": "CAO development skills — provider creation, plugin creation, dev workflow, and orchestration protocols",
+  "version": "1.0.0",
+  "author": {
+    "name": "awslabs"
+  }
+}

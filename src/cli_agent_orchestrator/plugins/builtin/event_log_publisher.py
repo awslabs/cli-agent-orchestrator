@@ -28,28 +28,12 @@ from cli_agent_orchestrator.plugins import (
     hook,
 )
 from cli_agent_orchestrator.plugins.base import CaoPlugin
-from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.services.agui_enablement import agui_surface_enabled
 from cli_agent_orchestrator.services.event_log_service import get_event_log
 from cli_agent_orchestrator.services.event_primitives import normalize_kind
 from cli_agent_orchestrator.services.sse_bus import get_bus
 
 logger = logging.getLogger(__name__)
-
-
-def _apps_enabled() -> bool:
-    """Return whether the MCP Apps surface is enabled via ``apps.enabled``
-    (``CAO_MCP_APPS_ENABLED`` env var or ``settings.json``).
-
-    Mirrors the gate used by ``mcp_apps`` / ``app_tools`` / ``sep2133`` so this
-    observer is genuinely default-off. The plugin is still discovered and loaded
-    by the entry-point registry, but when the flag is unset its lifecycle hooks
-    no-op: no normalization, no ring-buffer retention, and no SSE fan-out. That
-    preserves the "default-off, zero-cost-when-unused" contract — an operator who
-    never enables the surface neither pays the per-event cost nor accumulates 24h
-    of fleet metadata in process memory.
-    """
-
-    return bool(ConfigService.get("apps.enabled", default=False))
 
 
 class EventLogPublisher(CaoPlugin):
@@ -77,11 +61,11 @@ class EventLogPublisher(CaoPlugin):
         explicitly from event fields and deliberately exclude message bodies.
         """
 
-        # Default-off gate: when the MCP Apps surface is disabled the observer
-        # does nothing, so the ring buffer / SSE bus are never touched (see
-        # ``_apps_enabled``). This keeps the lifecycle hooks zero-cost and
-        # retains no fleet metadata unless an operator opts in.
-        if not _apps_enabled():
+        # Default-off gate: when the AG-UI / MCP Apps surface is disabled the
+        # observer does nothing, so the ring buffer / SSE bus are never touched
+        # (see ``agui_surface_enabled``). This keeps the lifecycle hooks
+        # zero-cost and retains no fleet metadata unless an operator opts in.
+        if not agui_surface_enabled():
             return
 
         kind = normalize_kind(event_type, detail)
@@ -160,3 +144,8 @@ class EventLogPublisher(CaoPlugin):
             event.session_name,
             {"event_type": event.event_type, "session_name": event.session_name},
         )
+
+
+# Backward-compatible alias. Some tests/consumers refer to this class as
+# ``EventLogPublisherPlugin``; keep the old name importable so they resolve it.
+EventLogPublisherPlugin = EventLogPublisher
