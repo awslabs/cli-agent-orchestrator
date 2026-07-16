@@ -184,9 +184,11 @@ def test_status_dead_launch_reports_unknown_not_false_idle(mock_backend):
     assert result not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
 
 
+@pytest.mark.asyncio
+@patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
 @patch("cli_agent_orchestrator.providers.claude_code.time")
 @patch(_BACKEND)
-def test_idle_timeout_prompt_handler(mock_backend, mock_time):
+async def test_idle_timeout_prompt_handler(mock_backend, mock_time, mock_sleep):
     """Tasks 3 + 4: the idle gap keeps polling for a LATE dialog inside the outer cap.
 
     A cold containerized start renders dialogs late and in sequence. The bypass
@@ -199,7 +201,6 @@ def test_idle_timeout_prompt_handler(mock_backend, mock_time):
     forwards from the per-profile provider_init_timeout — so no settings mock is
     needed and the Task 3<->Task 4 wiring is what is under test.
     """
-    mock_time.sleep = MagicMock()
     mock_time.monotonic.side_effect = [
         0.0,  # outer_deadline = 0 + 180 (per-profile init timeout)
         0.0,  # last_prompt_time = 0
@@ -213,7 +214,7 @@ def test_idle_timeout_prompt_handler(mock_backend, mock_time):
     ]
 
     provider = ClaudeCodeProvider("t1", "sess", "win")
-    provider._handle_startup_prompts(idle_gap=20.0, outer_timeout=180.0)
+    await provider._handle_startup_prompts(idle_gap=20.0, outer_timeout=180.0)
 
     # Bypass: Down arrow (send_keys) + Enter (send_special_key). Trust: Enter.
     assert mock_backend.send_keys.call_count == 1
