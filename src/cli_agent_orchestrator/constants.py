@@ -71,8 +71,16 @@ TMUX_HISTORY_LINES = 200
 # =============================================================================
 # Application Directory Structure
 # =============================================================================
-# Base directory for all CAO data (~/.aws/cli-agent-orchestrator)
-CAO_HOME_DIR = Path.home() / ".aws" / "cli-agent-orchestrator"
+# Base directory for all CAO data. Defaults to ``~/.aws/cli-agent-orchestrator``,
+# overridable via the ``CAO_HOME_DIR`` env var (read at import, mirroring the
+# ``CAO_AGENTS_DIR`` / ``CAO_GRAPH_EXPORT_ROOT`` convention). Every path below
+# derives from it, so one override relocates the whole tree. Motivating case:
+# Kiro CLI Agent Sandboxing blocks reads under ``~/.aws`` at the OS level
+# (seccomp-bpf) to protect credentials; pointing this outside ``~/.aws`` keeps
+# the sandbox enabled. Must be set before this module is first imported.
+CAO_HOME_DIR = Path(
+    os.environ.get("CAO_HOME_DIR", str(Path.home() / ".aws" / "cli-agent-orchestrator"))
+)
 
 # Managed environment variable file
 CAO_ENV_FILE = CAO_HOME_DIR / ".env"

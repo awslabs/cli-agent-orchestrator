@@ -16,9 +16,9 @@ SETTINGS_FILE = CAO_HOME_DIR / "settings.json"
 # Default agent directories per provider
 _DEFAULTS = {
     "kiro_cli": str(Path.home() / ".kiro" / "agents"),
-    "claude_code": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
-    "codex": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
-    "cao_installed": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-context"),
+    "claude_code": str(CAO_HOME_DIR / "agent-store"),
+    "codex": str(CAO_HOME_DIR / "agent-store"),
+    "cao_installed": str(CAO_HOME_DIR / "agent-context"),
 }
 
 

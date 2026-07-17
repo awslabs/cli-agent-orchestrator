@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 class TestServerConstants:
     """Tests for server configuration constants."""
@@ -324,6 +326,100 @@ class TestCaoHomeDir:
         from cli_agent_orchestrator.constants import CAO_HOME_DIR, SKILLS_DIR
 
         assert SKILLS_DIR == CAO_HOME_DIR / "skills"
+
+
+class TestCaoHomeDirEnvOverride:
+    """The ``CAO_HOME_DIR`` env var relocates CAO's entire data tree.
+
+    Some environments restrict access to ``~/.aws`` (where CAO stores its data
+    by default) to protect AWS credentials, which can leave CAO unable to read
+    its own agent profiles. Setting ``CAO_HOME_DIR`` moves the whole tree
+    elsewhere. The override is read at import, so a single reload must
+    propagate to every derived path.
+    """
+
+    def _reload_constants(self, env_overrides):
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_HOME_DIR", None)
+        env_copy.update(env_overrides)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def _reload_constants_and_settings(self, override):
+        """Reload constants, then settings_service, under a CAO_HOME_DIR override.
+
+        ``settings_service`` binds ``CAO_HOME_DIR`` at its own import time, so it
+        must be reloaded *after* constants for the override to reach its
+        ``_DEFAULTS`` agent-dir map. Passing ``None`` restores the defaults.
+        """
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_HOME_DIR", None)
+        if override is not None:
+            env_copy["CAO_HOME_DIR"] = str(override)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+            import cli_agent_orchestrator.services.settings_service as settings_module
+
+            importlib.reload(constants_module)
+            importlib.reload(settings_module)
+            return constants_module, settings_module
+
+    @pytest.fixture(autouse=True)
+    def _restore_default_constants(self):
+        # Reloading under an override mutates the shared modules in place; reload
+        # them back to their default-env state after each test so the override
+        # cannot leak into tests (here or in other files) that import directly.
+        yield
+        self._reload_constants_and_settings(None)
+
+    def test_override_relocates_home_dir(self, tmp_path):
+        override = tmp_path / "cao-home"
+        mod = self._reload_constants({"CAO_HOME_DIR": str(override)})
+        assert mod.CAO_HOME_DIR == override
+
+    def test_derived_paths_follow_override(self, tmp_path):
+        override = tmp_path / "cao-home"
+        mod = self._reload_constants({"CAO_HOME_DIR": str(override)})
+        assert mod.DB_DIR == override / "db"
+        assert mod.LOG_DIR == override / "logs"
+        assert mod.FIFO_DIR == override / "fifos"
+        assert mod.AGENT_CONTEXT_DIR == override / "agent-context"
+        assert mod.LOCAL_AGENT_STORE_DIR == override / "agent-store"
+        assert mod.SKILLS_DIR == override / "skills"
+        assert mod.MEMORY_BASE_DIR == override / "memory"
+        assert mod.DATABASE_FILE == override / "db" / "cli-agent-orchestrator.db"
+
+    def test_import_time_dirs_created_under_override(self, tmp_path):
+        # constants.py mkdirs TERMINAL_LOG_DIR and FIFO_DIR at import; under the
+        # override they must be created below the new root, never under ~/.aws.
+        override = tmp_path / "cao-home"
+        self._reload_constants({"CAO_HOME_DIR": str(override)})
+        assert (override / "logs" / "terminal").is_dir()
+        assert (override / "fifos").is_dir()
+
+    def test_agent_dir_defaults_follow_override(self, tmp_path):
+        # Load-bearing for the restricted-~/.aws case: the agent-store and
+        # agent-context defaults used for the handoff profile read must relocate.
+        override = tmp_path / "cao-home"
+        _, settings_module = self._reload_constants_and_settings(override)
+        assert settings_module._DEFAULTS["claude_code"] == str(override / "agent-store")
+        assert settings_module._DEFAULTS["codex"] == str(override / "agent-store")
+        assert settings_module._DEFAULTS["cao_installed"] == str(override / "agent-context")
+        # kiro_cli tracks ~/.kiro, not CAO_HOME_DIR, so it is intentionally unchanged.
+        assert settings_module._DEFAULTS["kiro_cli"] == str(Path.home() / ".kiro" / "agents")
+
+    def test_default_when_env_not_set(self):
+        mod = self._reload_constants({})
+        assert mod.CAO_HOME_DIR == Path.home() / ".aws" / "cli-agent-orchestrator"
 
 
 class TestSessionConstants:
