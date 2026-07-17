@@ -269,7 +269,7 @@
   // -----------------------------------------------------------------------
   // Generative-UI rendering — allow-list gated, JSON props only.
   // -----------------------------------------------------------------------
-  function renderComponent(component, props) {
+  function renderComponent(component, props) { // NOSONAR -- component renderer: per-component-type DOM construction is inherent
     props = (props && typeof props === "object") ? props : {};
     var card = el("div", "gcard");
     var head = el("div", "ghead");

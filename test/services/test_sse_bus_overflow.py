@@ -112,7 +112,9 @@ async def test_overflow_recovery_replays_every_event(monkeypatch) -> None:
     replayed = [event["id"] for event in log.after_id(delivered[-1])]
     observed = delivered + replayed
 
-    missing = sorted(set(published) - set(observed))
+    missing = sorted(
+        set(published) - set(observed)
+    )  # NOSONAR -- set difference is the idiomatic way to compute missing event ids.
     assert observed == published, f"overflow recovery lost {missing}"
 
     bus.unregister(sub)

@@ -34,7 +34,7 @@ SERVER_LOG="$(mktemp -t agui-demo-server.XXXXXX.log)"
 
 cleanup() {
     local code=$?
-    if [ "${DEMO_FLEET}" = "1" ]; then
+    if [ "${DEMO_FLEET}" = "1" ]]; then
         cao shutdown --session "cao-${FLEET_SESSION}" >/dev/null 2>&1 || true
     fi
     [ -n "${SERVER_PID}" ] && kill "${SERVER_PID}" >/dev/null 2>&1 || true
@@ -46,12 +46,12 @@ trap cleanup EXIT INT TERM
 # Prefer the repo venv's cao-server; fall back to whatever is on PATH
 # (uv run / an activated venv).
 CAO_SERVER_BIN="cao-server"
-if [ -x "${REPO_ROOT}/.venv/bin/cao-server" ]; then
+if [[ -x "${REPO_ROOT}/.venv/bin/cao-server" ]]; then
     CAO_SERVER_BIN="${REPO_ROOT}/.venv/bin/cao-server"
 fi
 
 # Optional mock_cli fleet (demo-only; needs tmux + the fixture binary on PATH).
-if [ "${DEMO_FLEET}" = "1" ]; then
+if [[ "${DEMO_FLEET}" == "1" ]]; then
     if command -v tmux >/dev/null 2>&1; then
         export PATH="${REPO_ROOT}/test/providers/fixtures/bin:${PATH}"
         echo "[agui-demo] mock_cli fleet enabled (fixture binary on PATH)" >&2
@@ -77,7 +77,7 @@ if ! curl -fsS "${BASE}/health" >/dev/null 2>&1; then
 fi
 echo "[agui-demo] server healthy." >&2
 
-if [ "${DEMO_FLEET}" = "1" ]; then
+if [[ "${DEMO_FLEET}" == "1" ]]; then
     cao install "${REPO_ROOT}/examples/agui-dashboard/fleet_worker.md" >/dev/null 2>&1 || true
     cao launch --agents fleet_worker --provider mock_cli --async --yolo \
         --session-name "${FLEET_SESSION}" \

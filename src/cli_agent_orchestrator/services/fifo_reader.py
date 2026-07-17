@@ -253,7 +253,9 @@ class FifoManager:
         except OSError:
             pass
 
-    def _reader_loop(self, terminal_id: str, fifo_path, stop_flag: threading.Event) -> None:
+    def _reader_loop(  # NOSONAR
+        self, terminal_id: str, fifo_path, stop_flag: threading.Event
+    ) -> None:  # NOSONAR -- FIFO reader: state machine handling open/close/error paths is inherent.
         """Read chunks from FIFO and publish to the event bus.
 
         Never blocks in a FIFO ``open()`` (issue #382): the previous design

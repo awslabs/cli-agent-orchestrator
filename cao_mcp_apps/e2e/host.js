@@ -459,6 +459,48 @@
     return { success: true, kind };
   }
 
+  function handleInitialize(winInfo, id) {
+    replyTo(winInfo, id, {
+      hostContext: { theme: "light", uiSurface: true },
+      // Advertise host-delegated capabilities so the views surface them
+      // (e.g. the dashboard's "Open full Web UI" → ui/open-link).
+      hostCapabilities: { openLinks: {} },
+    });
+  }
+
+  function handleNotificationsInitialized(winInfo) {
+    winInfo.initialized = true;
+    // Deliver the "tool result that opened the view" so views needing an
+    // initial payload (the agent view needs a terminal_id) hydrate.
+    if (winInfo.view === "agent") {
+      pushTo(winInfo, "ui/notifications/tool-result", {
+        structuredContent: agentSnapshot(AGENT_VIEW_ID),
+      });
+    }
+    if (winInfo.view === "graph") {
+      pushTo(winInfo, "ui/notifications/tool-result", {
+        structuredContent: graphSnapshot(),
+      });
+    }
+    if (winInfo.resolve) winInfo.resolve();
+  }
+
+  function handleUpdateModelContext(winInfo, id, params) {
+    state.modelNotes.push(params);
+    replyTo(winInfo, id, {});
+  }
+
+  function sendUnknownMethodError(winInfo, id, method) {
+    winInfo.win.postMessage(
+      {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32601, message: `unknown ${method}` },
+      },
+      "*",
+    );
+  }
+
   function onMessage(event) {
     const data = event.data;
     if (!data || data.jsonrpc !== "2.0") return;
@@ -473,50 +515,22 @@
     if (!winInfo) return;
 
     const { id, method, params } = data;
-    if (method === "ui/initialize") {
-      replyTo(winInfo, id, {
-        hostContext: { theme: "light", uiSurface: true },
-        // Advertise host-delegated capabilities so the views surface them
-        // (e.g. the dashboard's "Open full Web UI" → ui/open-link).
-        hostCapabilities: { openLinks: {} },
-      });
-      return;
-    }
-    if (method === "ui/notifications/initialized") {
-      winInfo.initialized = true;
-      // Deliver the "tool result that opened the view" so views needing an
-      // initial payload (the agent view needs a terminal_id) hydrate.
-      if (winInfo.view === "agent") {
-        pushTo(winInfo, "ui/notifications/tool-result", {
-          structuredContent: agentSnapshot(AGENT_VIEW_ID),
-        });
-      }
-      if (winInfo.view === "graph") {
-        pushTo(winInfo, "ui/notifications/tool-result", {
-          structuredContent: graphSnapshot(),
-        });
-      }
-      if (winInfo.resolve) winInfo.resolve();
-      return;
-    }
-    if (method === "ui/update-model-context") {
-      state.modelNotes.push(params);
-      replyTo(winInfo, id, {});
-      return;
-    }
-    if (method === "tools/call") {
-      handleToolCall(winInfo, id, params.name, params.arguments || {});
+    const handlers = {
+      "ui/initialize": () => handleInitialize(winInfo, id),
+      "ui/notifications/initialized": () =>
+        handleNotificationsInitialized(winInfo),
+      "ui/update-model-context": () =>
+        handleUpdateModelContext(winInfo, id, params),
+      "tools/call": () =>
+        handleToolCall(winInfo, id, params.name, params.arguments || {}),
+    };
+    const handler = handlers[method];
+    if (handler) {
+      handler();
       return;
     }
     if (id !== undefined && id !== null) {
-      winInfo.win.postMessage(
-        {
-          jsonrpc: "2.0",
-          id,
-          error: { code: -32601, message: `unknown ${method}` },
-        },
-        "*",
-      );
+      sendUnknownMethodError(winInfo, id, method);
     }
   }
 
