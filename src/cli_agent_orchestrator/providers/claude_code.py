@@ -1,5 +1,6 @@
 """Claude Code provider implementation."""
 
+import asyncio
 import json
 import logging
 import os
@@ -7,7 +8,10 @@ import re
 import shlex
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
@@ -20,6 +24,15 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_sta
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+# Sentinel so _build_claude_command can tell "caller passed no profile, load it"
+# from "caller explicitly passed None" (native/missing profile). initialize()
+# loads the profile once and passes it in; direct callers omit it and get a
+# load. NOT a candidate for removal in favor of a plain `None` default: that
+# would make _build_claude_command reload the profile from disk a SECOND time
+# whenever initialize() already resolved it to None (no CAO profile found),
+# reintroducing the double-disk-read this sentinel exists to prevent.
+_UNSET: Any = object()
 
 
 # Custom exception for provider errors
@@ -163,7 +176,26 @@ class ClaudeCodeProvider(BaseProvider):
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
 
-    def _build_claude_command(self) -> str:
+    def _load_profile(self) -> Optional["AgentProfile"]:
+        """Load this terminal's CAO agent profile from disk, if any.
+
+        Returns None when no profile name was given or the named profile does
+        not exist (the "pass --agent <name> to the native store" path). Raises
+        ProviderError on a genuine load/parse failure so a broken profile is not
+        silently ignored.
+
+        ``self._agent_profile`` is a profile *name string*, not an object.
+        """
+        if self._agent_profile is None:
+            return None
+        try:
+            return load_agent_profile(self._agent_profile)
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+
+    def _build_claude_command(self, profile: Optional["AgentProfile"] = _UNSET) -> str:
         """Build Claude Code command with agent profile if provided.
 
         Returns properly escaped shell command string that can be safely sent via tmux.
@@ -175,6 +207,11 @@ class ClaudeCodeProvider(BaseProvider):
         2. No CAO profile found -> pass --agent <name> directly to Claude Code's
            native agent store (~/.claude/agents/)
         3. Full CAO profile -> decompose into CLI flags (model, prompt, MCP, etc.)
+
+        Args:
+            profile: Pre-loaded profile. When omitted, the profile is loaded from
+                disk here. initialize() loads it once and passes it in so the
+                profile is not read from disk twice per launch.
         """
         # --dangerously-skip-permissions: bypass the workspace trust dialog and
         # tool permission prompts. CAO already confirms workspace access during
@@ -182,14 +219,8 @@ class ClaudeCodeProvider(BaseProvider):
         # (supervisor and worker) is redundant and blocks handoff/assign flows.
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
 
-        profile = None
-        if self._agent_profile is not None:
-            try:
-                profile = load_agent_profile(self._agent_profile)
-            except FileNotFoundError:
-                profile = None
-            except Exception as e:
-                raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+        if profile is _UNSET:
+            profile = self._load_profile()
 
         # Determine permission mode for the base command.
         # Priority: explicit permissionMode > yolo/root detection > default yolo.
@@ -237,7 +268,9 @@ class ClaudeCodeProvider(BaseProvider):
                     prompt_file.chmod(0o600)
                 except OSError:
                     pass
-                command_parts.extend(["--append-system-prompt-file", str(prompt_file)])
+                command_parts.extend(
+                    ["--append-system-prompt-file", self._translate_path(str(prompt_file), profile)]
+                )
 
             # Add MCP config if present.
             # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
@@ -269,7 +302,13 @@ class ClaudeCodeProvider(BaseProvider):
                     mcp_file.chmod(0o600)
                 except OSError:
                     pass
-                command_parts.extend(["--mcp-config", str(mcp_file), "--strict-mcp-config"])
+                command_parts.extend(
+                    [
+                        "--mcp-config",
+                        self._translate_path(str(mcp_file), profile),
+                        "--strict-mcp-config",
+                    ]
+                )
 
         # Apply tool restrictions via --disallowedTools flags.
         # --dangerously-skip-permissions bypasses prompts but --disallowedTools
@@ -328,7 +367,9 @@ class ClaudeCodeProvider(BaseProvider):
             json.dump(settings, f, indent=2)
         logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
 
-    def _handle_startup_prompts(self, timeout: Optional[float] = None) -> None:
+    def _handle_startup_prompts(
+        self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
+    ) -> None:
         """Auto-accept startup prompts that may appear before the REPL is ready.
 
         Claude Code may show up to two prompts during startup:
@@ -339,12 +380,49 @@ class ClaudeCodeProvider(BaseProvider):
            this in most cases; this handler is a defensive fallback.
         2. **Workspace trust dialog** – shows "Yes, I trust this folder";
            requires ``Enter``.
+
+        Idle-gap semantics (see issue #400): a cold or containerized start can
+        render these dialogs LATE and in sequence, past the old fixed ~20s
+        window. Instead of a total-window budget, ``idle_gap`` is the maximum
+        quiet stretch tolerated BETWEEN prompts: the loop keeps polling and
+        resets the idle timer every time it answers a prompt, exiting only once
+        no new prompt appears for ``idle_gap`` seconds. Total runtime is still
+        hard-capped by ``outer_timeout`` so a wedged start cannot hang init
+        indefinitely.
+
+        The idle-gap exit is gated on having handled at least one prompt.
+        ``last_prompt_time`` has no real "last prompt" to measure from until
+        the FIRST one arrives, so treating the handler's start time as if it
+        were one let a first dialog later than ``idle_gap`` (e.g. issue #400's
+        own cold-node-plus-gateway-connect scenario) get missed entirely — the
+        loop would exit at the idle-gap boundary having never seen it. Before
+        any prompt has been observed, only ``outer_timeout`` can end the loop;
+        the idle-gap clock starts only once a prompt has actually been handled.
+
+        Args:
+            idle_gap: Seconds of no-new-prompt quiet that ends the loop. Defaults
+                to the ``startup_prompt_handler_timeout`` setting.
+            outer_timeout: Hard cap (seconds) on total handler runtime. Defaults
+                to the ``provider_init_timeout`` setting; initialize() passes the
+                per-profile-resolved value so a containerized profile's longer
+                init budget also governs this handler.
         """
-        if timeout is None:
-            timeout = get_server_settings()["startup_prompt_handler_timeout"]
-        start_time = time.time()
+        if idle_gap is None:
+            idle_gap = get_server_settings()["startup_prompt_handler_timeout"]
+        if outer_timeout is None:
+            outer_timeout = get_server_settings()["provider_init_timeout"]
+        outer_deadline = time.monotonic() + outer_timeout
+        last_prompt_time = time.monotonic()
+        any_prompt_handled = False
         bypass_accepted = False
-        while time.time() - start_time < timeout:
+        while True:
+            now = time.monotonic()
+            if now >= outer_deadline:
+                logger.warning("Startup prompt handler hit provider_init_timeout outer cap")
+                return
+            if any_prompt_handled and now - last_prompt_time >= idle_gap:
+                return  # no new prompt within the idle gap — startup settled
+
             output = get_backend().get_history(self.session_name, self.window_name)
             if not output:
                 time.sleep(1.0)
@@ -367,8 +445,10 @@ class ClaudeCodeProvider(BaseProvider):
                 status_monitor.notify_input_sent(self.terminal_id)
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 bypass_accepted = True
+                any_prompt_handled = True
+                last_prompt_time = time.monotonic()  # reset idle timer — trust prompt may follow
                 time.sleep(1.0)
-                continue  # Trust prompt may follow
+                continue
 
             # 2) Handle workspace trust prompt
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
@@ -390,21 +470,25 @@ class ClaudeCodeProvider(BaseProvider):
             #    rendered, leaving it unaccepted; initialize() then blocked on
             #    {IDLE, COMPLETED} for 30s and the session was killed. Trust/bypass
             #    dialogs are handled explicitly above; if no banner ever appears the
-            #    loop just waits out its timeout and the downstream
+            #    loop just waits out its idle gap and the downstream
             #    wait_until_status() remains the real readiness gate.
             if re.search(r"Welcome to|Claude Code v\d+", clean_output):
                 logger.info("Claude Code started without prompts")
                 return
 
             time.sleep(1.0)
-        logger.warning("Startup prompt handler timed out")
 
     async def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+        # Load the profile once so the per-profile provider_init_timeout override
+        # (if any) governs every wait below, and reuse it for the command build
+        # so the profile is not read from disk twice.
+        profile = self._load_profile()
+        init_timeout = self.get_init_timeout(profile)
+
         # Wait for shell prompt to appear in the tmux window
-        init_timeout = get_server_settings()["provider_init_timeout"]
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
@@ -412,7 +496,7 @@ class ClaudeCodeProvider(BaseProvider):
         self._ensure_skip_bypass_prompt_setting()
 
         # Build properly escaped command string
-        command = self._build_claude_command()
+        command = self._build_claude_command(profile)
 
         # Send Claude Code command using the backend. Arm the StatusMonitor
         # stickiness gate so the launching command can drive a fresh
@@ -420,8 +504,10 @@ class ClaudeCodeProvider(BaseProvider):
         status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, command)
 
-        # Handle startup prompts (bypass permissions + workspace trust)
-        self._handle_startup_prompts()
+        # Handle startup prompts (bypass permissions + workspace trust).
+        # Pass the resolved timeout as the outer cap so a containerized profile's
+        # longer init budget also governs the startup-prompt handler.
+        self._handle_startup_prompts(outer_timeout=init_timeout)
 
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
@@ -430,7 +516,6 @@ class ClaudeCodeProvider(BaseProvider):
         # drives wait_until_status; it only fires once the provider's own
         # get_status returns IDLE/COMPLETED on Claude-rendered content, so the
         # old stale-zsh-prompt false-IDLE guard is no longer needed.
-        init_timeout = get_server_settings()["provider_init_timeout"]
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
@@ -439,8 +524,55 @@ class ClaudeCodeProvider(BaseProvider):
         ):
             raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
 
+        # The status wait fires as soon as the input box RENDERS, but the Ink
+        # renderer drops keystrokes for a beat after that — "box rendered" is
+        # not "box accepting input". Gate on actual input readiness so the
+        # first paste does not race the widget (best effort: a False return
+        # proceeds anyway rather than failing init).
+        await self.wait_until_input_ready()
+
         self._initialized = True
         return True
+
+    async def wait_until_input_ready(self, timeout: float = 5.0) -> bool:
+        """Settle-check readiness gate for the Ink input box.
+
+        The new-TUI input box matching NEW_TUI_BOX_PATTERN appears one render
+        pass before the widget accepts keystrokes. Require the rendered pane
+        content to be STABLE across two consecutive captures ~0.5s apart (and
+        still showing the input box) before declaring input-ready. A changing
+        pane means Ink is still painting startup content (banner, tips, MCP
+        status), during which the first keystrokes get dropped.
+
+        Uses capture-pane (rendered screen) rather than the pipe-pane buffer:
+        stability of the RENDERED output is the actual readiness signal.
+        """
+        poll = 0.5
+        deadline = time.monotonic() + timeout
+        previous: Optional[str] = None
+        while time.monotonic() < deadline:
+            try:
+                current = get_backend().get_history(
+                    self.session_name, self.window_name, tail_lines=40
+                )
+            except Exception as exc:  # backend hiccup: don't fail init for the gate
+                logger.warning("input-ready settle check capture failed: %s", exc)
+                return False
+            if (
+                previous is not None
+                and current == previous
+                and NEW_TUI_BOX_PATTERN.search(strip_terminal_escapes(current))
+            ):
+                logger.debug("input-ready settle check passed for %s", self.terminal_id)
+                return True
+            previous = current
+            await asyncio.sleep(poll)
+        logger.warning(
+            "input-ready settle check timed out after %.1fs for %s; proceeding anyway",
+            timeout,
+            self.terminal_id,
+        )
+        return False
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Claude Code status.
@@ -466,10 +598,13 @@ class ClaudeCodeProvider(BaseProvider):
         """
         # Native status (herdr): when the backend knows agent state, trust it and
         # skip buffer reads. Tmux returns None -- falls through to buffer analysis.
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
         if not output:
             return TerminalStatus.UNKNOWN
 

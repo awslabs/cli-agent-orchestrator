@@ -115,6 +115,7 @@ jobs:
           cao --help
           cao-server --help
           cao-mcp-server --help
+          python -c "import cao_workflow; assert cao_workflow.run_step"
 
   publish-pypi:
     name: Publish to PyPI (maintainer-approved)

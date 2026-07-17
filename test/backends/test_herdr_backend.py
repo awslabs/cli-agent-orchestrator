@@ -116,6 +116,35 @@ class TestHerdrBackendCommands:
         assert result[1]["name"] == "cao-proj2"
 
     @patch("subprocess.run")
+    def test_prepare_web_attach_focuses_tab_and_returns_herdr_command(self, mock_run, backend):
+        """Browser attachment focuses the requested Herdr tab before opening its TUI."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-1", "workspace_id": "w1", "label": "developer-abcd"}]
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(),
+        ]
+
+        command = backend.prepare_web_attach("cao-test", "developer-abcd")
+
+        assert command == ["herdr", "--session", "cao"]
+        assert mock_run.call_args_list[-1].args[0][-3:] == ["tab", "focus", "tab-1"]
+
+    def test_prepare_web_attach_propagates_tab_not_found(self, backend):
+        """Browser attachment propagates a missing requested Herdr tab."""
+        error = TerminalNotFoundError("cao-test:missing-window")
+
+        with (
+            patch.object(backend, "_resolve_workspace_id", return_value="w1"),
+            patch.object(backend, "_resolve_tab_id", side_effect=error),
+            pytest.raises(TerminalNotFoundError) as exc_info,
+        ):
+            backend.prepare_web_attach("cao-test", "missing-window")
+
+        assert exc_info.value is error
+
+    @patch("subprocess.run")
     def test_create_session_calls_workspace_create(self, mock_run, backend):
         """create_session should call herdr workspace create with --label and inject env."""
         # Include root_pane.pane_id so _parse_new_pane_id succeeds and _inject_env_vars
@@ -905,16 +934,29 @@ class TestGetNativeStatus:
         assert result == TerminalStatus.IDLE
 
     @patch("subprocess.run")
-    def test_unknown_returns_error(self, mock_run, backend):
+    def test_unknown_returns_none(self, mock_run, backend):
+        """herdr 'unknown' -> None (not ERROR): a wrapped exec launch hides the
+        agent CLI, so herdr never registers it and reports 'unknown' for a
+        healthy pane. None lets the caller resolve status another way."""
         self._setup_fresh_resolution(backend)
         mock_run.side_effect = self._make_resolution_side_effects(
             _completed(self._make_pane_get_response("unknown"))
         )
 
-        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        result = backend.get_native_status("s", "w")
+        assert result is None
+
+    @patch("subprocess.run")
+    def test_unrecognized_status_returns_none(self, mock_run, backend):
+        """Any agent_status herdr may add later that CAO does not map -> None,
+        same as 'unknown' (never leaks through as a bogus status)."""
+        self._setup_fresh_resolution(backend)
+        mock_run.side_effect = self._make_resolution_side_effects(
+            _completed(self._make_pane_get_response("some-future-state"))
+        )
 
         result = backend.get_native_status("s", "w")
-        assert result == TerminalStatus.ERROR
+        assert result is None
 
     @patch("subprocess.run")
     def test_command_failure_returns_none(self, mock_run, backend):

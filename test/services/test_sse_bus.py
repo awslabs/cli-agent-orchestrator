@@ -153,9 +153,9 @@ def test_dead_loop_subscriber_is_dropped() -> None:
             raise RuntimeError("Event loop is closed")
 
     queue: "asyncio.Queue[dict]" = asyncio.Queue(maxsize=8)
-    entry = (queue, _DeadLoop())
+    sub = sse_bus_module._Subscriber(queue, _DeadLoop(), False)  # type: ignore[arg-type]
     with bus._lock:
-        bus._subs.append(entry)  # type: ignore[arg-type]
+        bus._subs.append(sub)
     assert bus.subscriber_count == 1
 
     # publish must not raise, and must drop the dead subscriber.
@@ -165,3 +165,21 @@ def test_dead_loop_subscriber_is_dropped() -> None:
     # A second publish is a clean no-op — the stale entry is gone.
     bus.publish({"id": "2", "kind": "launch"})
     assert bus.subscriber_count == 0
+
+
+@pytest.mark.asyncio
+async def test_subscribe_finally_tolerates_already_removed_entry():
+    """If the entry was already removed (e.g. by publish's dead-loop cleanup),
+    the generator's finally must swallow the ValueError rather than raise."""
+    bus = SseBus()
+    gen, task = await _start(bus)
+    with bus._lock:
+        bus._subs.clear()  # simulate the entry having been removed already
+    await _stop(gen, task)  # finally runs remove() -> ValueError -> pass
+    assert bus.subscriber_count == 0
+
+
+def test_reset_bus_drops_singleton():
+    first = get_bus()
+    sse_bus_module.reset_bus()
+    assert get_bus() is not first

@@ -12,10 +12,10 @@ Covers the four additive algorithms from
 - ``update_run_generation``: persists a bumped generation (A4).
 - A crash-injection-style resume scenario (NFR-REL-2/M3): journal COMPLETED
   steps with fingerprints, simulate a crash (no live registry entry), then
-  verify ``lookup_replay`` would replay the completed calls (no re-execution)
-  and the tail (never-arrived call) executes fresh.
+  verify the reserved ``lookup_replay`` primitive classifies completed calls
+  and the never-arrived tail correctly. Runtime resume does not call it.
 - ``_is_resumable_for_tier`` (DR-7/DR-8): the tier-aware resumability predicate
-  U3 supplies for U4/U5 to wire into the resume route later.
+  used by the script resume path.
 - Migration idempotency: the additive ``ALTER TABLE`` migrators are safe to run
   twice and preserve INV-2 defaults on a pre-existing (pre-U3-shaped) row.
 
@@ -102,7 +102,7 @@ def test_append_step_upserts_on_conflict_without_overwriting_fingerprint(_patche
     _seed_run("run-1")
     workflow_journal.append_step("run-1", "call-1", "running", "2026-07-03T00:00:01Z", FP_A)
     # A second attempt at the SAME key arrives with a DIFFERENT fingerprint value
-    # supplied by the caller (e.g. a bug, or a resume replaying the arrival) —
+    # supplied by the caller (e.g. a bug or an explicit lookup integration) —
     # append_step must not let it clobber the originally-recorded fingerprint.
     workflow_journal.append_step("run-1", "call-1", "completed", "2026-07-03T00:00:02Z", FP_B)
 
@@ -193,18 +193,13 @@ def test_update_run_generation_persists_bump(_patched_journal):
 # ---------------------------------------------------------------------------
 # Crash-injection-style resume scenario (NFR-REL-2 / M3)
 # ---------------------------------------------------------------------------
-def test_crash_then_resume_replays_completed_and_executes_tail(_patched_journal):
+def test_crash_snapshot_lookup_classifies_completed_and_tail(_patched_journal):
     """Simulate a crash mid-run: two calls journaled COMPLETED, a third never arrived.
 
     No live registry entry exists (the process is gone — the crash). Rebuilding
-    the resume decision purely from ``lookup_replay`` must:
-      - replay call-1 and call-2 (COMPLETED + matching fingerprint) without
-        re-executing them,
-      - decide call-3 (never arrived) needs fresh execution.
-
-    Full end-to-end resume-route wiring is out of scope for U3 (the runner/route
-    belongs to U4/U5) — this exercises the journal primitives at the granularity
-    U3 ships (per the code-generation-plan's explicit scoping note).
+    a hypothetical replay decision from ``lookup_replay`` classifies call-1 and
+    call-2 as reusable and call-3 as absent. The current runtime does not consume
+    these decisions; script resume re-executes all three calls.
     """
     _seed_run("run-1", state="running", generation="1")
     workflow_journal.append_step("run-1", "call-1", "running", "2026-07-03T00:00:01Z", FP_A)

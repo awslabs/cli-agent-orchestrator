@@ -1,15 +1,21 @@
 """Shared fixtures for end-to-end tests.
 
 E2E tests require:
-- A running CAO server (cao-server / uvicorn on localhost:9889)
-- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, copilot)
+- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, gemini, copilot)
 - tmux available on the system
+
+The CAO server is started automatically by the ``cao_server`` fixture from
+``test.fixtures.cao_server``. New tests should consume ``cao_server`` /
+``cao_terminal`` directly. The ``API_BASE_URL`` patch loop below is a
+back-compat shim for the 12 older modules that import the constant at
+module top.
 
 Run with: uv run pytest -m e2e test/e2e/ -v
 """
 
 import shutil
 import time
+from test.fixtures.cao_server import CaoServer, _patch_api_base_url_for_e2e
 
 import pytest
 import requests
@@ -18,14 +24,18 @@ from cli_agent_orchestrator.constants import API_BASE_URL
 
 
 @pytest.fixture(scope="session", autouse=True)
-def require_cao_server():
-    """Skip all E2E tests if CAO server is not reachable."""
+def require_cao_server(cao_server: CaoServer):
+    """Delegates to the managed ``cao_server`` subprocess fixture.
+
+    Also patches ``API_BASE_URL`` everywhere it has been bound at import
+    time by the 12 older e2e modules, so their helper f-strings resolve
+    to the dynamically-allocated port. Originals are restored on teardown.
+    """
+    restore = _patch_api_base_url_for_e2e(cao_server)
     try:
-        resp = requests.get(f"{API_BASE_URL}/health", timeout=5)
-        if resp.status_code != 200:
-            pytest.skip("CAO server not healthy")
-    except requests.ConnectionError:
-        pytest.skip("CAO server not running — start with: uv run cao-server")
+        yield cao_server
+    finally:
+        restore()
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -69,6 +79,24 @@ def require_kimi():
 
 
 @pytest.fixture()
+def require_gemini():
+    """Skip test if gemini CLI is not available.
+
+    Includes a post-test cooldown to avoid Gemini API rate limiting (429).
+    Gemini CLI has known issues with rate limit retry logic (GitHub #6986,
+    #9248) — sequential tests can exhaust the per-minute RPM quota, causing
+    the CLI to hang during initialization or task processing.
+    """
+    if not _cli_available("gemini"):
+        pytest.skip("gemini CLI not installed")
+    yield
+    # Cool down after each Gemini CLI test to stay within API rate limits.
+    # Gemini's free-tier RPM limit is low; sequential tests exhaust the quota
+    # and cause the CLI to hang in a retry loop during initialization.
+    time.sleep(15)
+
+
+@pytest.fixture()
 def require_copilot():
     """Skip test if copilot CLI is not available."""
     if not _cli_available("copilot"):
@@ -87,13 +115,6 @@ def require_hermes():
     """Skip test if Hermes CLI is not available."""
     if not _cli_available("hermes"):
         pytest.skip("Hermes CLI not installed")
-
-
-@pytest.fixture()
-def require_antigravity():
-    """Skip test if Antigravity CLI (``agy``) is not available."""
-    if not _cli_available("agy"):
-        pytest.skip("Antigravity CLI (agy) not installed")
 
 
 @pytest.fixture()

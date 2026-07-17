@@ -62,7 +62,7 @@ class WorkflowIndexRow(BaseModel):
     name: str
     source_path: str
     mode: str
-    step_count: int
+    step_count: Optional[int]
     description: str = ""
     indexed_at: str
 

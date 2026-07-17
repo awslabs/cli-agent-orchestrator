@@ -126,19 +126,54 @@ class TestSharedNativeStatus:
         provider._done_first_detected = time.time() - 11.0
         assert provider.get_status("") == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_native_none_falls_through_to_buffer(self, mock_backend, provider_cls, _flag):
-        """tmux backend returns None -> buffer path runs; empty buffer is not COMPLETED/IDLE.
+    @staticmethod
+    def _empty_output_default(provider_cls) -> TerminalStatus:
+        """Each provider's own no-output default (unaffected by this fix)."""
+        return TerminalStatus.ERROR if provider_cls is HermesProvider else TerminalStatus.UNKNOWN
 
-        Guards the fall-through: with native None and an empty buffer every
-        provider must return its buffer-path default (UNKNOWN, or ERROR for
-        hermes) — never a native status leaking through.
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_native_none_falls_through_to_live_buffer_default(
+        self, mock_backend, provider_cls, _flag
+    ):
+        """native None -> always falls through; a genuinely empty live-read buffer
+        then hits each provider's own no-output default (UNKNOWN, ERROR for hermes).
+
+        On the herdr backend an 'unknown' agent_status surfaces as native None.
+        Before this fix, base resolution guessed IDLE from dispatch state
+        instead of falling through -- silently reporting init success even for
+        a dead/wedged launch (issue #400's own regression). Now native=None
+        always falls through to BaseProvider._resolve_buffer(), which does a
+        live get_history() read on herdr (mocked here to genuinely empty "");
+        every provider's own empty-output branch then applies, exactly as it
+        would on the tmux backend. No provider overrides _resolve_native_status,
+        so this holds for all of them.
         """
         mock_backend.get_native_status.return_value = None
         mock_backend.get_history.return_value = ""
+        mock_backend.supports_event_inbox.return_value = True
         provider = _make(provider_cls)
-        result = provider.get_status("")
-        assert result in (TerminalStatus.UNKNOWN, TerminalStatus.ERROR)
+        # _task_dispatched defaults to False
+        assert provider.get_status("") == self._empty_output_default(provider_cls)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_native_none_dispatch_state_no_longer_affects_outcome(
+        self, mock_backend, provider_cls, _flag
+    ):
+        """A dispatched-but-quiet pane must NOT guess PROCESSING/ERROR from a clock.
+
+        Regresses the must-fix-2 bug: the removed staleness matrix reported
+        PROCESSING for ~120s then ERROR purely from elapsed wall-clock time
+        since dispatch, even though the pane never produced any content. With
+        native=None always falling through, dispatch state must not change the
+        result at all -- only real buffer content can.
+        """
+        mock_backend.get_native_status.return_value = None
+        mock_backend.get_history.return_value = ""
+        mock_backend.supports_event_inbox.return_value = True
+        provider = _make(provider_cls)
+        provider.mark_input_received()
+        provider._last_dispatch_time = time.time() - 300.0  # would have been "stale" pre-fix
+        assert provider.get_status("") == self._empty_output_default(provider_cls)
 
     def test_mark_input_received_sets_dispatch_flags(self, provider_cls, _flag):
         """mark_input_received() sets shared _task_dispatched AND the provider's own flag."""

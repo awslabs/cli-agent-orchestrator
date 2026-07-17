@@ -251,6 +251,24 @@ class KimiCliProvider(BaseProvider):
         super().mark_input_received()
         self._has_received_input = True
 
+    def _try_load_profile(self):
+        """Best-effort profile load for timeout resolution only.
+
+        Returns None on any load failure instead of raising -- unlike
+        ``_build_kimi_command``'s inline load, which legitimately raises
+        ``ProviderError`` on a broken profile. This helper only feeds
+        ``BaseProvider.get_init_timeout``, so a missing/unloadable profile
+        should fall back to the server default here, not abort init before
+        the real (error-raising) load in ``_build_kimi_command`` gets a chance
+        to report the actual problem.
+        """
+        if self._agent_profile is None:
+            return None
+        try:
+            return load_agent_profile(self._agent_profile)
+        except Exception:
+            return None
+
     def _build_kimi_command(self) -> str:
         """Build Kimi CLI command with agent profile and MCP config if provided.
 
@@ -411,30 +429,69 @@ class KimiCliProvider(BaseProvider):
 
         cls._mcp_timeout_configured = True
 
-    def _handle_startup_dialog(self, timeout: Optional[float] = None) -> None:
+    def _handle_startup_dialog(
+        self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
+    ) -> None:
         """Dismiss kimi's startup upgrade-reminder dialog if it appears.
 
         Mirrors ClaudeCodeProvider._handle_startup_prompts: polls the pane for
         the interactive "[s] Skip reminders for version X" menu and answers 's'
         so kimi can proceed to its ready prompt. Exits early if kimi is already
         ready (no newer version → no dialog), so a no-update start isn't delayed.
+
+        Idle-gap semantics (see issue #400): a cold or containerized start can
+        render the dialog LATE, past the old fixed ~20s window. Rather than a
+        total-window budget, ``idle_gap`` is the maximum quiet stretch tolerated
+        with no new prompt: answering the dialog resets the idle timer, and the
+        loop exits once no prompt appears for ``idle_gap`` seconds (or kimi is
+        ready). Total runtime is hard-capped by ``outer_timeout``.
+
+        The idle-gap exit only starts counting once the first dialog has been
+        handled -- until then, a first dialog arriving later than ``idle_gap``
+        (the scenario issue #400 itself reports) would otherwise be missed: the
+        loop would exit at the idle-gap boundary having never seen it. Before
+        any dialog is observed, only ``outer_timeout`` can end the loop.
+
+        Args:
+            idle_gap: Seconds of no-new-prompt quiet that ends the loop. Defaults
+                to the ``startup_prompt_handler_timeout`` setting.
+            outer_timeout: Hard cap (seconds) on total handler runtime. Defaults
+                to the ``provider_init_timeout`` setting; initialize() passes the
+                per-profile-resolved value so a containerized profile's longer
+                init budget also governs this handler (mirrors ClaudeCodeProvider).
         """
-        if timeout is None:
-            timeout = get_server_settings()["startup_prompt_handler_timeout"]
-        start_time = time.time()
-        while time.time() - start_time < timeout:
+        if idle_gap is None:
+            idle_gap = get_server_settings()["startup_prompt_handler_timeout"]
+        if outer_timeout is None:
+            outer_timeout = get_server_settings()["provider_init_timeout"]
+        outer_deadline = time.monotonic() + outer_timeout
+        last_prompt_time = time.monotonic()
+        any_prompt_handled = False
+        upgrade_dismissed = False
+        while True:
+            now = time.monotonic()
+            if now >= outer_deadline:
+                logger.warning("Kimi startup dialog handler hit provider_init_timeout outer cap")
+                return
+            if any_prompt_handled and now - last_prompt_time >= idle_gap:
+                return  # no new prompt within the idle gap — startup settled
             output = get_backend().get_history(self.session_name, self.window_name)
             if output:
                 clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
-                if re.search(UPGRADE_PROMPT_PATTERN, clean_output):
+                # Answer the upgrade dialog once; its text lingers in the buffer
+                # after dismissal, so the flag stops a re-answer on later polls.
+                if not upgrade_dismissed and re.search(UPGRADE_PROMPT_PATTERN, clean_output):
                     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                     logger.info("Kimi upgrade-reminder dialog detected, skipping reminders")
                     status_monitor.notify_input_sent(self.terminal_id)
                     # 's' = "Skip reminders for version X"; single-key menu, no Enter.
                     get_backend().send_keys(self.session_name, self.window_name, "s", enter_count=0)
+                    upgrade_dismissed = True
+                    any_prompt_handled = True
+                    last_prompt_time = time.monotonic()  # reset idle timer
                     time.sleep(1.0)
-                    return
+                    continue
                 # Already at a ready prompt → no dialog to handle, stop early.
                 if self.get_status(output) in (
                     TerminalStatus.IDLE,
@@ -457,8 +514,23 @@ class KimiCliProvider(BaseProvider):
         Raises:
             TimeoutError: If shell or Kimi CLI doesn't start within timeout
         """
+        # Resolve the per-profile provider_init_timeout override (if any) so it
+        # governs the startup-dialog handler's outer cap too, mirroring
+        # ClaudeCodeProvider. Best-effort: a missing/unloadable profile falls
+        # back to the server default here; _build_kimi_command below still
+        # raises its own ProviderError on a genuine load failure.
+        init_timeout = self.get_init_timeout(self._try_load_profile())
+        # The readiness wait (dialog handler + wait_until_status) keeps its
+        # existing 120s floor above the server's provider_init_timeout default
+        # (60s) -- first-run setup / concurrent launches routinely exceed 60s.
+        # A profile override raises this further for containerized launches.
+        # Both waits MUST share this value: before this fix the dialog handler
+        # capped at the (shorter) server default while wait_until_status used
+        # a hardcoded 120s, so a dialog appearing after 60s but before 120s
+        # was never dismissed.
+        ready_timeout = max(120.0, init_timeout)
+
         # Wait for shell prompt to appear in the tmux window
-        init_timeout = get_server_settings()["provider_init_timeout"]
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
@@ -470,20 +542,18 @@ class KimiCliProvider(BaseProvider):
 
         # Dismiss the startup upgrade-reminder dialog before waiting for ready:
         # unanswered it blocks kimi from reaching its prompt (init would time out).
-        self._handle_startup_dialog()
+        self._handle_startup_dialog(outer_timeout=ready_timeout)
 
         # Wait for Kimi CLI to reach IDLE or COMPLETED state (prompt visible).
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
-        # Longer timeout (120s) to account for first-run setup and when
-        # multiple Kimi instances are starting concurrently (e.g. assign flow).
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=120.0,
+            timeout=ready_timeout,
             polling_interval=1.0,
         ):
-            raise TimeoutError("Kimi CLI initialization timed out after 120 seconds")
+            raise TimeoutError(f"Kimi CLI initialization timed out after {ready_timeout} seconds")
 
         self._initialized = True
         return True
@@ -516,10 +586,13 @@ class KimiCliProvider(BaseProvider):
         """
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
         if not output:
             return TerminalStatus.UNKNOWN
 

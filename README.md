@@ -1,5 +1,7 @@
 # CLI Agent Orchestrator (CAO)
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 [![PyPI version](https://img.shields.io/pypi/v/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
 [![Python versions](https://img.shields.io/pypi/pyversions/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/awslabs/cli-agent-orchestrator)
@@ -32,6 +34,7 @@ CAO implements a hierarchical multi-agent system — one supervisor agent delega
 - **Orchestration primitives over MCP** — `handoff` (sync, wait for completion), `assign` (async, fire-and-forget), and `send_message` (inbox delivery between agents). Hermes workers also use `answer_user_prompt` for structured approval and clarify prompts; other providers may fall back to ordinary text delivery until they implement equivalent prompt states. See [Multi-Agent Orchestration](#multi-agent-orchestration).
 - **Cross-provider mixing** — run workers on different CLIs in the same session. Pin a profile to a provider via agent frontmatter. See [Cross-Provider Orchestration](#cross-provider-orchestration).
 - **Scheduled flows** — cron-like scheduling for unattended agent runs. See [docs/flows.md](docs/flows.md).
+- **Multi-step workflows** — author and run parameterized, multi-step agent pipelines with fan-out and resume. See [docs/workflows.md](docs/workflows.md).
 - **Web UI, CLI, and MCP control planes** — manage sessions from the browser, `cao session` commands, or the `cao-ops-mcp` server. See [docs/control-planes.md](docs/control-planes.md).
 - **Tool restrictions per agent** — `role` + `allowedTools` in the profile, translated to each provider's native enforcement where available. See [docs/tool-restrictions.md](docs/tool-restrictions.md).
 - **Persistent agent memory** — agents store and recall knowledge across sessions using `memory_store` and `memory_recall` MCP tools. CAO automatically injects relevant memories as context at session start. See [docs/memory.md](docs/memory.md).
@@ -100,10 +103,18 @@ PyPI publishes tagged releases only, so it will lag behind `main` between releas
 uv tool install cli-agent-orchestrator --upgrade
 
 # Pin a specific release
-uv tool install cli-agent-orchestrator==2.1.0
+uv tool install cli-agent-orchestrator==2.3.0
 ```
 
 For local development (`git clone` + `uv sync`) and the testing/quality workflow, see [DEVELOPMENT.md](DEVELOPMENT.md).
+
+#### Updating CAO
+
+```bash
+cao update
+```
+
+`cao update` upgrades CAO in place, picking the right uv command for **how you installed it** (git, PyPI, an exact pin, or a local clone/wheel) by reading uv's install receipt. Requires that CAO was installed as a **uv tool**; after updating, restart any running `cao-server`. See [docs/updating.md](docs/updating.md) for the full per-source behavior.
 
 ## Devcontainer Feature
 

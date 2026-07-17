@@ -17,6 +17,19 @@ class McpServer(BaseModel):
     timeout: Optional[int] = None
 
 
+class ContainerPathMap(BaseModel):
+    """Single host->guest path mapping for container environments."""
+
+    host: str
+    guest: str
+
+
+class ContainerConfig(BaseModel):
+    """Container environment configuration."""
+
+    path_maps: Optional[List[ContainerPathMap]] = None
+
+
 class AgentProfile(BaseModel):
     """Agent profile configuration with Q CLI agent fields."""
 
@@ -32,6 +45,17 @@ class AgentProfile(BaseModel):
     # the full catalog (backward-compatible); [] = no skills advertised. Consumed
     # by CAO when composing the prompt, not passed through to provider JSON.
     skills: Optional[List[str]] = None
+
+    # CAO-native. Host->guest path maps for container-backed agents. Consumed by
+    # the provider layer to translate host paths (e.g. temp prompt/MCP files)
+    # into the guest paths the containerized CLI sees; not passed to provider JSON.
+    container: Optional[ContainerConfig] = None
+
+    # CAO-native. Per-profile override for provider initialization timeout (seconds).
+    # When set, this value is used as the hard outer cap for CLI agent initialization
+    # instead of the server default (60s from settings_service). Allows containerized
+    # profiles to declare longer init times (e.g., 180s) without changing global config.
+    provider_init_timeout: Optional[int] = None
 
     # Q CLI agent fields (all optional, will be passed through to JSON)
     prompt: Optional[str] = None

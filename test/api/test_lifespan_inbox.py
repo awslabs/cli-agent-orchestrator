@@ -105,6 +105,12 @@ def _patched_lifespan(backend: object, tasks: list):
         # No-op the side-effecting startup calls.
         patch_main("setup_logging")
         patch_main("init_db")
+        stack.enter_context(
+            patch(
+                "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                return_value=None,
+            )
+        )
         patch_main("cleanup_old_data")
         patch_main("flow_daemon", new=_fake_flow_daemon)
         patch_main("opencode_inbox_delivery_daemon", new=_fake_opencode_daemon)

@@ -12,15 +12,16 @@ import struct
 import subprocess
 import termios
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Dict, List, Optional, cast
+from typing import Annotated, Any, Dict, List, Optional, cast
 
 from fastapi import (
     BackgroundTasks,
     Body,
     Depends,
     FastAPI,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -35,7 +36,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from cli_agent_orchestrator.backends import TerminalNotFoundError
+from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -52,6 +53,7 @@ from cli_agent_orchestrator.constants import (
     DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
+    OTEL_SERVICE_NAME,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
@@ -63,6 +65,11 @@ from cli_agent_orchestrator.constants import (
     add_local_cors_origins,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
+from cli_agent_orchestrator.graph.providers import get_provider
+
+# Import the sinks package for its import-time @register_sink side effects
+# ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
+from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.memory import (
@@ -78,6 +85,7 @@ from cli_agent_orchestrator.security.auth import (
     SCOPE_READ,
     SCOPE_WRITE,
     SCOPES_SUPPORTED,
+    extract_scopes_from_token,
     get_authorization_servers,
     get_current_scopes,
     is_auth_enabled,
@@ -85,6 +93,7 @@ from cli_agent_orchestrator.security.auth import (
 )
 from cli_agent_orchestrator.services import (
     flow_service,
+    secret_gate,
     session_service,
     terminal_service,
 )
@@ -97,6 +106,7 @@ from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
+from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 from cli_agent_orchestrator.services.inbox_service import inbox_service
@@ -105,8 +115,9 @@ from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
+from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
-from cli_agent_orchestrator.utils.logging import setup_logging
+from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
     load_skill_content,
@@ -344,6 +355,25 @@ class WorkflowRunRequest(BaseModel):
     )
 
 
+class GraphExportRequest(BaseModel):
+    """Request body for ``POST /graph/{provider}/export`` (U4, Issue #348)."""
+
+    sink: str = Field(description="Registered sink name (resolved via get_sink; KeyError -> 404)")
+    dest: str = Field(
+        description=(
+            "Export destination, confined UNDER the configured graph-export root "
+            "(CAO_GRAPH_EXPORT_ROOT). Treated as a path RELATIVE to that root; an "
+            "absolute path is accepted only if it already resolves under the root, "
+            "otherwise the export is rejected (400). Traversal/symlink escapes are "
+            "rejected via safe_join_under_base."
+        )
+    )
+    options: dict = Field(
+        default_factory=dict,
+        description="Opaque per-sink options forwarded as **options; the route never inspects them",
+    )
+
+
 class StepOutputResponse(BaseModel):
     """Response for the structured-return endpoint — mirrors the stored record."""
 
@@ -372,10 +402,14 @@ class InstallAgentProfileRequest(BaseModel):
 
     ``env_vars`` travels in the JSON body rather than as a query parameter so
     that any secrets callers inject are not written to HTTP access logs.
+
+    ``provider`` may be omitted (None): the install service then honours the
+    profile's frontmatter ``provider:`` key, falling back to the default
+    provider — the same flag > frontmatter > default precedence as the CLI.
     """
 
     source: str
-    provider: str = DEFAULT_PROVIDER
+    provider: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
 
 
@@ -417,12 +451,46 @@ class CreateFlowRequest(BaseModel):
         return v
 
 
+def _reconcile_memory_at_startup() -> None:
+    """Apply bounded memory repair and keep server startup resilient."""
+    try:
+        from cli_agent_orchestrator.services import memory_reconciliation
+
+        repair_report = memory_reconciliation.reconcile_memory_startup()
+        if repair_report is not None:
+            logger.info(repair_report.summary_text())
+    except Exception as exc:
+        report = getattr(exc, "report", None)
+        if report is not None:
+            logger.error(
+                "%s; automatic memory repair was incomplete; run `cao memory repair --apply`",
+                report.summary_text(),
+            )
+        else:
+            logger.error(
+                "automatic memory repair failed (%s); run `cao memory repair --apply`",
+                type(exc).__name__,
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
+    # Scrub credential query params (``?access_token=`` / ``?ticket=``) from
+    # uvicorn's access log before any request is served. Installed here — not
+    # only in ``main()`` — so the imported-app deployment path
+    # (``uvicorn cli_agent_orchestrator.api.main:app``) is covered too. Idempotent.
+    install_access_log_redaction()
+    # OpenTelemetry (ported): opt-in — no-op unless OTEL_SDK_DISABLED=false.
+    # Safe to call unconditionally; failure-isolated so it never blocks boot.
+    try:
+        init_telemetry(OTEL_SERVICE_NAME)
+    except Exception:
+        logger.warning("OTel telemetry init failed; continuing", exc_info=True)
     init_db()
+    _reconcile_memory_at_startup()
     registry = PluginRegistry()
     await registry.load()
     app.state.plugin_registry = registry
@@ -515,7 +583,17 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    # Stop the pipe-pane liveness watchdog thread (issue #388). It is a plain
+    # threading.Thread (not asyncio), so join it directly rather than via
+    # asyncio.gather with the tasks above.
+    fifo_manager.stop_watchdog()
+
     await registry.teardown()
+    # OpenTelemetry (ported): flush + shut down exporters (no-op when disabled).
+    try:
+        shutdown_telemetry()
+    except Exception:
+        logger.warning("Error shutting down OTel telemetry", exc_info=True)
     logger.info("Shutting down CLI Agent Orchestrator server...")
 
 
@@ -677,6 +755,39 @@ def _require_mcp_apps_enabled() -> None:
         )
 
 
+def _agui_enabled() -> bool:
+    """Whether the AG-UI SSE surface (``/agui/v1/stream``, ``emit_ui``) is enabled.
+
+    Two enablement paths, both deliberate (documented in docs/agui.md):
+
+    * ``CAO_AGUI_ENABLED`` — the dedicated flag, so AG-UI can be turned on
+      independently of the MCP Apps iframe surface.
+    * ``CAO_MCP_APPS_ENABLED`` (via ``_mcp_apps_enabled()``) — the pre-existing
+      MCP Apps flag also enables AG-UI, because the two surfaces are read-outs
+      of the same in-process event source (``EventLogPublisher`` → ``SseBus``)
+      with the same privacy boundary; an operator who exposed that data to the
+      iframe has already made the disclosure decision AG-UI relies on.
+
+    With neither flag set the surface is absent (404s) and the server is
+    byte-identical to a build without this feature.
+    """
+
+    if os.environ.get("CAO_AGUI_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    # Shared with the EventLogPublisher observer so the route and the publisher
+    # that feeds it can never disagree about whether the surface is live.
+    from cli_agent_orchestrator.services.agui_enablement import agui_surface_enabled
+
+    return agui_surface_enabled()
+
+
+def _require_agui_enabled() -> None:
+    """Raise 404 when the AG-UI surface is disabled (default-off)."""
+
+    if not _agui_enabled():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="AG-UI surface disabled")
+
+
 @app.get("/events")
 async def events_stream(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
@@ -744,6 +855,260 @@ async def events_history(
             )
     events = get_event_log().history(limit=limit, since=since, kinds=kinds_filter)
     return {"events": events}
+
+
+@app.get("/agui/v1/stream")
+async def agui_stream(
+    since: Optional[str] = Query(
+        default=None,
+        description=(
+            "ISO-8601 lower bound. When set, buffered events after this "
+            "timestamp are replayed (as AG-UI frames) before the live stream; "
+            "clients dedupe by event id."
+        ),
+    ),
+    access_token: Optional[str] = Query(
+        default=None,
+        description=(
+            "JWT for auth-enabled mode. Native EventSource cannot set an "
+            "Authorization header, so the token travels as this query parameter."
+        ),
+    ),
+    last_event_id: Optional[str] = Header(
+        default=None,
+        alias="Last-Event-ID",
+        description=(
+            "Native EventSource reconnect cursor. When set (and ``?since=`` is "
+            "not), buffered events after this event id are replayed before the "
+            "live stream, so no event is lost across a reconnect. ``?since=`` "
+            "takes precedence when both are supplied."
+        ),
+    ),
+):
+    """Stream fleet events as AG-UI typed events (Server-Sent Events).
+
+    This is the L2 standalone-dashboard surface (consumed by any AG-UI client). It
+    shares the exact same source as ``/events`` — the in-process ``SseBus`` fed
+    by the ``EventLogPublisher`` — but re-maps each normalized six-primitive
+    record onto AG-UI typed events via ``agui_stream.to_agui_event`` before it
+    hits the wire, so any AG-UI-compatible client renders CAO with no custom
+    adapter code.
+
+    Each SSE frame is a *named* AG-UI event: ``event: <AGUI_TYPE>`` +
+    ``data: <json>``. Message bodies are never carried (the ring buffer stores
+    metadata only and the mapping redacts by construction).
+
+    Default-off: returns 404 unless the AG-UI surface is enabled via
+    ``CAO_AGUI_ENABLED`` (or the MCP Apps surface is on). When auth is enabled,
+    a ``cao:read``-bearing JWT must be supplied via ``?access_token=`` (native
+    EventSource cannot send Authorization headers).
+    """
+    _require_agui_enabled()
+
+    # Auth: query-parameter token (EventSource can't set headers). Default-off
+    # (no AUTH0_DOMAIN / CAO_AUTH_JWKS_URI) grants the full scope set.
+    if is_auth_enabled():
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="access_token query parameter required when auth is enabled",
+            )
+        try:
+            scopes = extract_scopes_from_token(access_token)
+        except HTTPException:
+            raise
+        except Exception:
+            # PyJWTError subclasses (malformed/expired/bad signature) or a JWKS
+            # fetch failure. Fails closed either way; map to a clean 401 instead
+            # of an opaque 500 so auth telemetry stays trustworthy.
+            logger.info("agui_stream: token validation failed", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid or expired access_token",
+            )
+        if not any(s in scopes for s in (SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="insufficient scope (cao:read required)",
+            )
+    else:
+        scopes = [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]
+
+    from fastapi.responses import StreamingResponse
+
+    from cli_agent_orchestrator.clients.database import list_terminals_by_session
+    from cli_agent_orchestrator.services import session_service
+    from cli_agent_orchestrator.services.agui_stream import (
+        state_delta_frame,
+        state_snapshot_frame,
+        to_agui_event,
+    )
+    from cli_agent_orchestrator.services.event_log_service import get_event_log
+    from cli_agent_orchestrator.services.sse_bus import get_bus
+    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
+
+    def _fleet_snapshot() -> Dict:
+        """Build the current DashboardSnapshot from live session/terminal state.
+
+        Failure-isolated: any backend hiccup yields an empty snapshot rather
+        than tearing down the stream. ``list_sessions`` already returns ``[]``
+        on error, so an unavailable tmux/herdr backend degrades gracefully.
+        """
+        sessions = session_service.list_sessions()
+        terminals: List[Dict] = []
+        for sess in sessions:
+            try:
+                terminals.extend(list_terminals_by_session(sess["id"]))
+            except Exception:
+                logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
+        return build_dashboard_snapshot(sessions, terminals, list(scopes))
+
+    def _sse(event_id: Optional[str], agui_type: str, data: Dict) -> str:
+        """Format one SSE frame, with an ``id:`` cursor when the event has one."""
+
+        prefix = f"id: {event_id}\n" if event_id is not None else ""
+        return f"{prefix}event: {agui_type}\ndata: {json.dumps(data)}\n\n"
+
+    async def event_generator():
+        # Register the live subscription BEFORE replaying history / taking the
+        # snapshot, so an event published during the replay->live handoff is
+        # buffered in this queue rather than lost. The small replay/live overlap
+        # is de-duplicated by event id below, so a ``?since=`` reconnect resumes
+        # with neither a gap nor a duplicate. The queue is metadata-only, same
+        # as the live path.
+        bus = get_bus()
+        # Opt into overflow-as-gap-signal: if this subscriber's bounded queue
+        # fills, the drain loop closes the stream (instead of silently dropping
+        # events on an open connection) so the client reconnects with
+        # Last-Event-ID and replays the dropped records exactly once (F2).
+        sub = bus.register(overflow_close=True)
+        try:
+            replayed_ids: set = set()
+
+            # Optional replay. Precedence: an explicit ``?since=`` timestamp wins;
+            # otherwise a native-EventSource ``Last-Event-ID`` reconnect replays
+            # the records buffered after that id. Either way, re-emit the
+            # buffered history as AG-UI frames and remember the ids so the live
+            # drain skips the overlap. Failure-isolated: a log hiccup logs and
+            # falls through to the live stream rather than 500-ing.
+            try:
+                replay_records = None
+                if since:
+                    replay_records = get_event_log().history(since=since)
+                elif last_event_id:
+                    replay_records = get_event_log().after_id(last_event_id)
+                if replay_records is not None:
+                    for record in replay_records:
+                        rid = record.get("id")
+                        if rid is not None:
+                            replayed_ids.add(rid)
+                        rtype, rdata = to_agui_event(record)
+                        yield _sse(rid, rtype, rdata)
+            except Exception:
+                logger.warning("agui_stream: history replay failed", exc_info=True)
+
+            # AG-UI shared-state: emit a full STATE_SNAPSHOT on connect so any
+            # client hydrates its projection, then keep it current with minimal
+            # RFC-6902 STATE_DELTA patches after each fleet event.
+            prev_snapshot: Optional[Dict] = None
+            try:
+                prev_snapshot = _fleet_snapshot()
+                agui_type, data = state_snapshot_frame(prev_snapshot)
+                yield _sse(None, agui_type, data)
+            except Exception:
+                logger.warning("agui_stream: initial STATE_SNAPSHOT failed", exc_info=True)
+
+            # Drain the subscriber registered above (buffered handoff events
+            # first, then live), via the bus's drain seam so a fake can terminate
+            # the stream cleanly in tests. On overflow the drain closes so the
+            # client reconnects (F2); cancellation on client disconnect
+            # propagates through the ``finally`` that unregisters the subscriber.
+            async for event in bus.drain(sub):
+                rid = event.get("id")
+                # Skip the replay/live overlap so a reconnecting client that
+                # passed ``?since=`` never sees an event twice.
+                if rid is not None and rid in replayed_ids:
+                    replayed_ids.discard(rid)
+                    continue
+                agui_type, data = to_agui_event(event)
+                yield _sse(rid, agui_type, data)
+
+                # Recompute the fleet snapshot and emit a STATE_DELTA when it
+                # moved. NB: recomputes on every event; a debounce/cache is a
+                # natural follow-up for high event rates (this is the opt-in L2
+                # dashboard surface, not the orchestration hot path).
+                try:
+                    curr = _fleet_snapshot()
+                    if prev_snapshot is not None:
+                        delta = state_delta_frame(prev_snapshot, curr)
+                        if delta is not None:
+                            dtype, ddata = delta
+                            yield _sse(None, dtype, ddata)
+                    prev_snapshot = curr
+                except Exception:
+                    logger.warning("agui_stream: STATE_DELTA computation failed", exc_info=True)
+        finally:
+            bus.unregister(sub)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+class EmitUIRequest(BaseModel):
+    """Body for POST /agui/v1/emit_ui — an agent-authored generative-UI intent."""
+
+    component: str
+    props: Dict[str, Any] = Field(default_factory=dict)
+    terminal_id: Optional[str] = None
+    session_name: Optional[str] = None
+
+
+@app.post("/agui/v1/emit_ui")
+async def agui_emit_ui(
+    body: EmitUIRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Producer for agent-authored generative-UI intents (closes the AG-UI loop).
+
+    An agent — via the ``emit_ui`` MCP tool — declares a component from the
+    frozen allow-list; the intent is validated **server-side** here and
+    published onto the fleet event bus, where ``agui_stream.to_agui_event`` maps
+    it to a ``GENERATIVE_UI`` frame on ``/agui/v1/stream``. Off-list components
+    and oversized/non-serializable props are rejected (400) so a bad intent
+    never reaches the bus. Requires ``cao:write`` when auth is enabled.
+    """
+    _require_agui_enabled()
+
+    from cli_agent_orchestrator.services.agui_stream import GENERATIVE_UI_COMPONENTS
+    from cli_agent_orchestrator.services.event_log_service import get_event_log
+    from cli_agent_orchestrator.services.sse_bus import get_bus
+
+    if body.component not in GENERATIVE_UI_COMPONENTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unknown UI component '{body.component}'. "
+                f"Allowed: {sorted(GENERATIVE_UI_COMPONENTS)}"
+            ),
+        )
+    try:
+        encoded = json.dumps(body.props)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="props must be JSON-serializable",
+        )
+    if len(encoded.encode("utf-8")) > 8 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="props payload too large (>8KB)"
+        )
+
+    detail = {
+        "event_type": "agent_ui",
+        "ui": {"component": body.component, "props": body.props},
+    }
+    event = get_event_log().append("other", body.terminal_id, body.session_name, detail)
+    get_bus().publish(event)
+    return {"ok": True, "event_id": event.get("id"), "component": body.component}
 
 
 # Topology widget static bundle at /widgets/topology/ — the vanilla SSE-driven
@@ -1447,10 +1812,32 @@ async def run_step(
     # can tear it down if the subprocess dies mid-call. No-op for YAML/handoff
     # callers (no run/step env or no script record in the registry).
     from cli_agent_orchestrator.services import workflow_service
-    from cli_agent_orchestrator.services.script_runner import make_step_terminal_recorder
+    from cli_agent_orchestrator.services.script_runner import (
+        make_step_terminal_recorder,
+        record_step_completion,
+    )
     from cli_agent_orchestrator.services.workflow_service import StaleGenerationError
 
     on_terminal_created = make_step_terminal_recorder(body.env_vars)
+    # BR-31 companion: the recorder above seeds a step RUNNING at terminal
+    # creation, but nothing transitions it — so a completed script run reports
+    # every step frozen at running/attempts=0/output=null. ``on_step_settled``
+    # transitions the shared ScriptRunRecord's step RUNNING->COMPLETED on success
+    # (or ->FAILED on a StepExecutionError), matching the YAML tier. No-op for
+    # YAML/handoff callers (same guard as the recorder). Settling is best-effort:
+    # it must never turn a successful step into an HTTP error, so ``_settle_step``
+    # swallows + logs any bookkeeping failure.
+    on_step_settled = record_step_completion(
+        body.env_vars, provider=body.provider, agent=body.agent, prompt=body.prompt
+    )
+
+    def _settle_step(terminal_id: Optional[str], error: Optional[str]) -> None:
+        if on_step_settled is None:
+            return
+        try:
+            on_step_settled(terminal_id, error)
+        except Exception:  # noqa: BLE001 — step bookkeeping is best-effort; never fail the step
+            logger.warning("run_step: script step completion bookkeeping failed", exc_info=True)
 
     # The generation fence (ADR-9 anti-double-drive, DR-5): a script run-step call
     # carrying BOTH CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_GENERATION must be checked
@@ -1487,6 +1874,10 @@ async def run_step(
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,
         )
+        # Success -> transition the script step RUNNING->COMPLETED (no-op for
+        # non-script callers). Before building the response so a settle failure
+        # is logged, not raised.
+        _settle_step(result.terminal_id, None)
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
@@ -1499,12 +1890,15 @@ async def run_step(
         # apart instead of reporting every failure as a timeout. The detail is a
         # structured object carrying terminal_id, so callers read it as a field
         # rather than regex-scraping the message (the future engine reads it too).
+        # Transition the script step RUNNING->FAILED (no-op for non-script callers).
+        _settle_step(e.terminal_id, str(e))
         code = status.HTTP_502_BAD_GATEWAY if e.kind == "error" else status.HTTP_504_GATEWAY_TIMEOUT
         raise HTTPException(
             status_code=code,
             detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},
         )
     except TimeoutError as e:
+        _settle_step(None, str(e))
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
@@ -1513,6 +1907,7 @@ async def run_step(
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
+        _settle_step(None, str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to run step: {str(e)}",
@@ -1530,14 +1925,58 @@ async def run_step(
 
 @app.post("/workflows/validate")
 async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
-    """Validate a workflow spec without running it (FR-1.3). Returns ValidationResult."""
+    """Validate a workflow spec without running it (FR-1.3/A1a). Returns ValidationResult.
+
+    Extension-based dispatch (U5, A1a, BR-23a): ``.yaml``/``.yml`` calls
+    ``validate_only`` UNCHANGED (FR-5.1); ``.py`` calls ``lint_script``
+    DIRECTLY — NOT via ``get_workflow``/``ScriptSpec`` — staying read-only,
+    side-effect-free, and collision-check-free like the YAML arm (BR-23b).
+    The complete ``ScriptValidationResult`` is returned with ``model_dump()``.
+    """
+    import os as _os
+
     from cli_agent_orchestrator.services import workflow_spec_service
 
-    try:
-        result = workflow_spec_service.validate_only(body.path)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    return result.model_dump()
+    ext = _os.path.splitext(body.path)[1].lower()
+    if ext in (".yaml", ".yml"):
+        try:
+            result = workflow_spec_service.validate_only(body.path)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        return result.model_dump()
+    if ext == ".py":
+        from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
+        from cli_agent_orchestrator.models.workflow import ScriptValidationResult
+        from cli_agent_orchestrator.services.script_lint import lint_script
+
+        try:
+            # ``_safe_spec_path`` returns the resolved, contained path; every
+            # filesystem op below MUST use THIS value (not ``body.path``) so the
+            # resolve-then-contain check dominates the sink (CodeQL sanitizer
+            # requirement — it does not track taint through a re-derived path).
+            real_path = workflow_spec_service._safe_spec_path(body.path)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        try:
+            with open(real_path, "rb") as fh:
+                # Capped read: an oversized file is rejected without ever
+                # being fully read into memory.
+                raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
+        except OSError as e:
+            return ScriptValidationResult(
+                status="fail", errors=[f"could not read spec: {e}"]
+            ).model_dump()
+        if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
+            return ScriptValidationResult(
+                status="fail",
+                errors=[f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)"],
+            ).model_dump()
+        source = raw.decode("utf-8", errors="replace")
+        result = lint_script(source, real_path)
+        return result.model_dump()
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST, detail=f"unrecognized spec extension: {ext}"
+    )
 
 
 @app.get("/workflows")
@@ -1554,7 +1993,15 @@ async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> L
 
 @app.get("/workflows/{name}")
 async def get_workflow_endpoint(name: str) -> Dict:
-    """Return the parsed/validated spec for a workflow name (FR-2.1)."""
+    """Return the parsed/validated spec for a workflow name (FR-2.1, A1).
+
+    Widened return: ``get_workflow`` may now resolve a ``.py`` name to a
+    ``ScriptSpec`` (U5, C4) — ``.model_dump()`` is unconditional on either
+    return type (BR-7a), so no branch is needed here. ``TierCollisionError``
+    (a same-stem cross-tier sibling, BR-2/BR-3) maps to 409, checked BEFORE
+    the bare ``ValueError`` arm (it is a ``ValueError`` subclass).
+    """
+    from cli_agent_orchestrator.models.workflow import TierCollisionError
     from cli_agent_orchestrator.services import workflow_spec_service
 
     try:
@@ -1565,6 +2012,8 @@ async def get_workflow_endpoint(name: str) -> Dict:
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except TierCollisionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return spec.model_dump()
@@ -1636,11 +2085,28 @@ async def start_workflow_run_endpoint(
     body: WorkflowRunRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Resolve a spec, run it to completion inline, return the WorkflowRunResult."""
+    """Resolve a spec, run it to completion inline, return the WorkflowRunResult.
+
+    Tier dispatch (U5, A3, BR-8): ONE ``isinstance(spec, ScriptSpec)`` check,
+    immediately after ``get_workflow`` resolves the spec — no downstream code
+    re-derives the tier. The YAML arm (``start_run``) is called UNCHANGED
+    (FR-5.1). The script arm pre-checks run_id availability itself (BR-9a —
+    ``run_script_workflow`` has no admission gate of its own) before calling
+    ``run_script_workflow``; a lint failure maps to 422 with a findings body
+    (BR-10), via the shared ``render_findings`` helper.
+    """
     import uuid
 
-    from cli_agent_orchestrator.models.workflow import NotBuiltYetError
-    from cli_agent_orchestrator.services import workflow_service, workflow_spec_service
+    from cli_agent_orchestrator.models.workflow import (
+        NotBuiltYetError,
+        ScriptSpec,
+        TierCollisionError,
+    )
+    from cli_agent_orchestrator.services import (
+        script_runner,
+        workflow_service,
+        workflow_spec_service,
+    )
 
     try:
         spec = workflow_spec_service.get_workflow(body.name_or_path)
@@ -1651,10 +2117,45 @@ async def start_workflow_run_endpoint(
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except TierCollisionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     run_id = body.run_id or f"run-{uuid.uuid4().hex[:16]}"
+
+    if isinstance(spec, ScriptSpec):
+        # Unit A (ADR-6 / blocker #2): validate + cap the inputs BEFORE any
+        # journal row or registry entry is created — no orphan RUNNING row can
+        # result from bad/oversized input (BR-A3). The RESOLVED map (defaults
+        # filled, types checked, undeclared rejected) is what gets journaled and
+        # delivered, never the raw request body.
+        from cli_agent_orchestrator.constants import WORKFLOW_INPUTS_MAX_BYTES
+
+        try:
+            resolved = workflow_service._validate_inputs(spec, body.inputs)
+            payload = json.dumps(resolved, separators=(",", ":"))
+            if len(payload.encode("utf-8")) > WORKFLOW_INPUTS_MAX_BYTES:
+                raise ValueError(f"workflow inputs exceed {WORKFLOW_INPUTS_MAX_BYTES} bytes")
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        try:
+            workflow_service._check_run_id_available(run_id)
+        except KeyError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        try:
+            result = await script_runner.run_script_workflow(spec, resolved, run_id)
+        except script_runner.ScriptLintError as e:
+            raise HTTPException(
+                status_code=422,
+                detail={"findings": workflow_spec_service.render_findings(e.findings)},
+            )
+        except KeyError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        return result.model_dump()
+
     try:
         result = await workflow_service.start_run(spec, body.inputs, run_id)
     except NotBuiltYetError as e:
@@ -1686,8 +2187,56 @@ async def cancel_workflow_run_endpoint(
     run_id: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Cooperatively cancel a running workflow (FR-5.4)."""
-    from cli_agent_orchestrator.services import workflow_service
+    """Cooperatively cancel a running workflow (FR-5.4, U5 A5).
+
+    Tier dispatch reads the LIVE ``run_registry`` record FIRST (BR-15) —
+    ``getattr(record, "tier", "yaml")`` — because cancel's async/sync split is
+    a property of which function to call on a live process. If absent
+    (crash remnant or already-finalized), falls back to the durable journal
+    (BR-16): absent row -> 404; terminal state -> 409; otherwise the row is a
+    JOURNALED-BUT-NOT-LIVE run — no in-memory record for ``cancel_run`` (which
+    only ever consults ``run_registry``) to flip, so this arm marks the journal
+    row CANCELLED directly rather than calling ``cancel_run`` (which would
+    unconditionally raise ``KeyError`` here and mask every crash-remnant cancel
+    as a 404).
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+    from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+
+    record = workflow_service.run_registry.get(run_id)
+    if record is None:
+        row = workflow_journal.get_run(run_id)
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
+            )
+        try:
+            row_state = RunState(row.state)
+        except ValueError:
+            row_state = None
+        if row_state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run '{run_id}' is already {row.state}; cannot cancel",
+            )
+        finished_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        workflow_journal.update_run_state(run_id, RunState.CANCELLED.value, finished_at)
+        return {"success": True, "run_id": run_id}
+
+    if getattr(record, "tier", "yaml") == "script":
+        record_state = getattr(record, "state", None)
+        if record_state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"run '{run_id}' is already "
+                    f"{getattr(record_state, 'value', record_state)}; cannot cancel"
+                ),
+            )
+        await script_runner.cancel_script_run(
+            cast(script_runner.ScriptRunRecord, record)
+        )  # NEVER raises (BR-19)
+        return {"success": True, "run_id": run_id}
 
     try:
         workflow_service.cancel_run(run_id)
@@ -1703,16 +2252,37 @@ async def resume_workflow_run_endpoint(
     run_id: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Resume a crashed/failed run from its durable journal (FR-6.2, N6).
+    """Resume a crashed/failed run from its durable journal (FR-6.2, N6, U5 A4).
 
-    Re-drives the snapshotted spec from the journal, skipping already-completed
-    steps and re-running the rest with fresh terminals; awaited INLINE like the run
-    endpoint and returns the same ``WorkflowRunResult``. Error mapping
-    (business-logic-model §5): malformed run_id -> 400, unknown run -> 404, terminal
-    or live-RUNNING run -> 409, corrupt snapshot -> 422. The two resume subtypes are
-    caught BEFORE the bare ``ValueError`` arm so they map to their distinct codes.
+    Tier dispatch reads the run's **journaled** tier (``RunRow.tier``), NEVER
+    by re-resolving a spec (BR-11) — the spec file may have moved/changed
+    since the run started. Any ``tier`` value other than the literal string
+    ``"script"`` routes to the YAML arm (U5-Q2=A, default-to-YAML). The YAML
+    arm (``resume_from_last_completed``) is called UNCHANGED (FR-5.1). The
+    script arm's typed-error catch order matches the boundary table: narrower
+    ``ResumeNotAllowedError``/``ResumeCorruptError`` (both ``ValueError``
+    subclasses) are caught BEFORE the bare ``ValueError`` arm.
     """
-    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+
+    row = workflow_journal.get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+
+    if row.tier == "script":
+        try:
+            result = await script_runner.resume_script_run(run_id)
+        except KeyError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
+            )
+        except workflow_service.ResumeNotAllowedError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        except workflow_service.ResumeCorruptError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        return result.model_dump()
 
     try:
         result = await workflow_service.resume_from_last_completed(run_id)
@@ -1729,6 +2299,132 @@ async def resume_workflow_run_endpoint(
     except workflow_service.WorkflowEngineError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     return result.model_dump()
+
+
+# ── graph layer (U4, Issue #348) ────────────────────────────────────────
+#
+# Two routes over the provider/sink seams. There is ZERO branching over the
+# provider or sink NAME (NFR-5): the only conditionals are try/except on
+# registry-resolution outcome. Names resolve through get_provider/get_sink,
+# which raise KeyError for an unregistered name (mapped to 404 here).
+
+
+@app.get("/graph/{provider}")
+async def get_graph_endpoint(
+    provider: str,
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Project a provider's GraphView and return its wire shape.
+
+    Scope-gated (D5 posture): when auth is enabled, any of
+    ``cao:read`` / ``cao:write`` / ``cao:admin`` is required (read is the
+    floor) — identical to ``/events``. This SUPERSEDES the original FR-12
+    "UNGATED by design" wording: the graph carries private-scope
+    structure, including contradiction-edge summaries of memory CONTENT, so
+    an unauthenticated caller must not be able to read it (PR #424 review).
+
+    Private tiers are REFUSED outright: a ``scope`` of ``session`` or
+    ``agent`` is rejected with 400 even for an authed ``cao:read`` caller,
+    mirroring ``/memory/export`` — the API surface never exposes private
+    tiers (D5). All other query params (``scope_id`` and any extras) are
+    forwarded to the provider as ``**filters``.
+
+    Error taxonomy: unregistered provider -> 404; private-scope request or
+    provider ValueError (e.g. a bad filter value) -> 400.
+    """
+    filters = dict(request.query_params)
+
+    # Private-scope gate (D5): the graph route takes ``scope`` as a query
+    # string, so compare its value against the private MemoryScope values.
+    # Mirrors /memory/export's MemoryScope.SESSION/AGENT refusal. The check is
+    # case-insensitive so ``scope=Session`` / ``scope=AGENT`` can't slip past;
+    # only this local comparison is normalized — the raw value is still
+    # forwarded to the provider in ``filters`` unchanged.
+    requested_scope = filters.get("scope")
+    if requested_scope is not None and requested_scope.lower() in (
+        MemoryScope.SESSION.value,
+        MemoryScope.AGENT.value,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{requested_scope}' is private and cannot be read via the graph API",
+        )
+
+    try:
+        inst = get_provider(provider)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown graph provider '{provider}'",
+        )
+    try:
+        view = await inst.project(**filters)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return view.to_dict()
+
+
+@app.post("/graph/{provider}/export")
+async def export_graph_endpoint(
+    provider: str,
+    body: GraphExportRequest,
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Project a provider's view and export it through a named sink (FR-12).
+
+    Scope-gated (401 no/invalid token, 403 valid-but-insufficient). The
+    serialized view is scanned by ``secret_gate`` BEFORE the sink is
+    invoked; a hit rejects the export with 422 and the sink's ``export`` is
+    never called. The 422 detail names only the matched PATTERN, never the
+    matched bytes.
+
+    Error taxonomy: unregistered provider or sink -> 404; secret hit -> 422;
+    provider/sink ValueError -> 400; sink OSError (e.g. dest is an existing
+    directory, permission denied, ENOSPC) -> 400 — a bad-dest-shape failure
+    kept consistent with the ValueError mapping rather than leaking a 500.
+    """
+    filters = dict(request.query_params)
+    try:
+        prov = get_provider(provider)
+        sink = get_sink(body.sink)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown graph provider '{provider}' or sink '{body.sink}'",
+        )
+
+    try:
+        view = await prov.project(**filters)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    # Credential gate (ADR-5): scan the serialized view; on a hit, reject
+    # before the sink writes anything. secret_gate returns the pattern NAME,
+    # never the matched bytes, so the detail is safe to surface.
+    serialized = json.dumps(view.to_dict())
+    hit = secret_gate.scan_for_secrets(serialized)
+    if hit is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"export rejected: secret pattern '{hit}' detected",
+        )
+
+    try:
+        written_files = sink.export(view, body.dest, **body.options)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OSError as e:
+        # dest is an existing directory (IsADirectoryError), permission
+        # denied, ENOSPC, etc. — a bad destination, mapped to 400 for
+        # consistency with the ValueError branch rather than a bare 500.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"export failed writing to destination: {e}",
+        )
+
+    return {"written_files": written_files, "sink": body.sink, "dest": body.dest}
 
 
 @app.delete("/terminals/{terminal_id}")
@@ -1896,6 +2592,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # or future code paths could still bypass that, and tmux parses
     # ':' / '.' as target delimiters. Bind the validator return values
     # so the sanitization is explicit at the actual sink below.
+    # This tmux-shaped validation is deliberately applied to every backend.
     try:
         session_name = validate_tmux_name(metadata["tmux_session"], "session_name")
         window_name = validate_tmux_name(metadata["tmux_window"], "window_name")
@@ -1903,14 +2600,23 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4003, reason="Invalid tmux target name")
         return
 
-    # Create PTY pair for tmux attach
+    try:
+        attach_command = await asyncio.to_thread(
+            get_backend().prepare_web_attach, session_name, window_name
+        )
+    except TerminalBackendError as e:
+        logger.error(f"Web attach failed for terminal {terminal_id}: {e}")
+        await websocket.close(code=4004, reason="Failed to attach terminal")
+        return
+
+    # Create PTY pair for backend attach
     master_fd, slave_fd = pty.openpty()
 
     # Set initial terminal size
     winsize = struct.pack("HHHH", 24, 80, 0, 0)
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
 
-    # Start tmux attach inside the PTY.
+    # Start the configured backend's interactive client inside the PTY.
     # Container/devcontainer environments often leave TERM unset or set to
     # ``dumb``, which strips colours, breaks cursor positioning and corrupts
     # the Ink-based TUIs that agent CLIs render. Force a sane default so the
@@ -1918,7 +2624,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # Any explicit non-dumb TERM the operator set is preserved.
     pty_env = _build_pty_env()
     proc = subprocess.Popen(
-        ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"],
+        attach_command,
         stdin=slave_fd,
         stdout=slave_fd,
         stderr=slave_fd,
@@ -2545,6 +3251,9 @@ def main():
     # literal ``*`` is honoured and disables the check (matches the
     # existing CAO_WS_ALLOWED_CLIENTS="*" semantics).
     forwarded_ips = "*" if "*" in TRUSTED_FORWARDER_IPS else ",".join(TRUSTED_FORWARDER_IPS)
+    # Credential query params (``?access_token=``) are scrubbed from uvicorn's
+    # access log by ``install_access_log_redaction()``, installed in the app
+    # lifespan so both ``cao-server`` and ``uvicorn ...:app`` are covered.
     uvicorn.run(
         app,
         host=host,

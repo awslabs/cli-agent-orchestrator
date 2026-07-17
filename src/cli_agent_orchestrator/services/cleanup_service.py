@@ -1,7 +1,6 @@
 """Cleanup service for old terminals, messages, and logs."""
 
 import logging
-import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from cli_agent_orchestrator.constants import (
     TERMINAL_LOG_DIR,
 )
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.memory_format import parse_index_entry
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 logger = logging.getLogger(__name__)
@@ -200,17 +200,14 @@ def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:
             continue
 
         # Parse entry: - [key](scope/key.md) — type:X tags:Y ~Ntok updated:Z
-        match = re.match(
-            r"^- \[([^\]]+)\]\(([^)]+)\) — type:(\S+) tags:\S* ~\d+tok updated:(\S+)$",
-            line,
-        )
+        match = parse_index_entry(line)
         if not match:
             continue
 
-        key = match.group(1)
-        relative_path = match.group(2)
-        memory_type = match.group(3)
-        updated_str = match.group(4)
+        key = match.group("key")
+        relative_path = match.group("path")
+        memory_type = match.group("type")
+        updated_str = match.group("updated")
 
         # Extract scope_id from nested path for session/agent scopes:
         #   session/<scope_id>/<key>.md  →  scope_id

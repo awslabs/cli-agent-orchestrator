@@ -271,6 +271,7 @@ def test_register_app_tools_enabled_sets_visibility(monkeypatch: pytest.MonkeyPa
         "render_agent_view",
         "cao_fetch_history",
         "subscribe_events",
+        "render_graph_view",
         "submit_command",
     }
     assert fake.registered["render_dashboard"]["meta"]["ui"]["visibility"] == ["model", "app"]
@@ -505,6 +506,67 @@ def test_submit_command_auth_enabled_without_local_token(monkeypatch: pytest.Mon
     assert result["success"] is False
     assert result["kind"] == "create_session"
     assert "CAO_AUTH_LOCAL_TOKEN" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# render_graph_view — B4 graph renderer tool wrapping GET /graph/{provider}.
+
+
+def test_render_graph_view_wraps_get_json_with_params() -> None:
+    """render_graph_view calls _get_json with the provider path and scope/scope_id params."""
+
+    captured: Dict[str, Any] = {}
+
+    def _fake_get_json(path: str, **params: Any) -> Any:
+        captured["path"] = path
+        captured["params"] = params
+        return {"nodes": [], "edges": [], "meta": {}}
+
+    with patch.object(app_tools, "_get_json", _fake_get_json):
+        result = app_tools._render_graph_view_impl("memory", scope="global", scope_id="s1")
+
+    assert captured["path"] == "/graph/memory"
+    assert captured["params"] == {"scope": "global", "scope_id": "s1"}
+    assert result == {"nodes": [], "edges": [], "meta": {}}
+
+
+def test_render_graph_view_propagates_http_error() -> None:
+    """A requests.HTTPError from _get_json propagates out of render_graph_view (no swallow)."""
+
+    def _boom(path: str, **params: Any) -> Any:
+        raise app_tools.requests.HTTPError("boom")
+
+    with patch.object(app_tools, "_get_json", _boom):
+        with pytest.raises(app_tools.requests.HTTPError):
+            app_tools._render_graph_view_impl("memory")
+
+
+def test_register_app_tools_registers_render_graph_view(monkeypatch: pytest.MonkeyPatch) -> None:
+    """render_graph_view registers with model+app visibility and the graph resource URI."""
+
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    fake = _FakeMCP()
+    assert app_tools.register_app_tools(fake) is True
+
+    assert "render_graph_view" in fake.registered
+    meta = fake.registered["render_graph_view"]["meta"]["ui"]
+    assert meta["visibility"] == ["model", "app"]
+    assert meta["resourceUri"] == "ui://cao/graph"
+    assert meta["requiredScopes"] == []
+
+
+@pytest.mark.asyncio
+async def test_render_graph_view_tool_delegates_to_impl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The registered async render_graph_view tool is a thin wrapper over the _impl."""
+
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    fake = _FakeMCP()
+    assert app_tools.register_app_tools(fake) is True
+    reg = {name: entry["fn"] for name, entry in fake.registered.items()}
+
+    with patch.object(app_tools, "_render_graph_view_impl", return_value={"nodes": []}) as mocked:
+        assert await reg["render_graph_view"]("memory", scope="global") == {"nodes": []}
+        mocked.assert_called_once_with("memory", scope="global", scope_id=None)
 
 
 def test_submit_command_forwards_bearer_when_token_present(

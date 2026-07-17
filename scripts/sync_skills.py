@@ -33,13 +33,14 @@ from typing import List
 # Canonical, explicit allowlist of skills that ship inside the package.
 # Keep this in sync with the repo-root ``skills/`` directories intended to ship.
 SHIPPED_SKILLS: List[str] = [
+    "agui-author",
     "cao-mcp-apps",
     "mcp-apps-builder",
     "cao-session-management",
     "cao-supervisor-protocols",
     "cao-worker-protocols",
     "cao-memory",
-    "workflow-author",
+    "cao-workflow",
     "cao-plugin",
     "cao-provider",
 ]

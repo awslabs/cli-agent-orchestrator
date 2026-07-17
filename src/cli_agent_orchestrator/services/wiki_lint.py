@@ -197,13 +197,18 @@ class _ReadOnlyViolation(RuntimeError):
     """Raised by the flush-blocker event listener when a write is attempted."""
 
 
-def _open_readonly_session() -> Any:
+def _open_readonly_session(db_engine: Any = None) -> Any:
     """Return a SQLAlchemy session pre-wired to abort on flush."""
     from sqlalchemy import event
 
-    from cli_agent_orchestrator.clients.database import SessionLocal
+    if db_engine is None:
+        from cli_agent_orchestrator.clients.database import SessionLocal
 
-    session = SessionLocal()
+        session = SessionLocal()
+    else:
+        from sqlalchemy.orm import sessionmaker
+
+        session = sessionmaker(autocommit=False, autoflush=False, bind=db_engine)()
 
     @event.listens_for(session, "before_flush")
     def _abort_on_flush(s: Any, flush_context: Any, instances: Any) -> None:  # type: ignore[no-untyped-def]
@@ -226,7 +231,7 @@ def _detect_orphan_pages(
     db_keys: set,
     base_resolved: Path,
 ) -> list:
-    """Walk wiki/<scope_id>/*.md; flag files missing from index.md AND SQLite."""
+    """Walk one canonical scope directory and report projection drift."""
     issues: list = []
     wiki_root = project_dir / "wiki"
     if not wiki_root.exists():
@@ -235,8 +240,15 @@ def _detect_orphan_pages(
     # Containment guard rooted at base_dir.
     base_str = str(base_resolved)
     cap = ISSUE_CAPS["orphan_page"]
+    if scope in {"session", "agent"} and scope_id is not None:
+        topic_root = wiki_root / scope / scope_id
+    else:
+        canonical_root = wiki_root / scope
+        # Preserve the direct detector's legacy fixture shape.
+        topic_root = canonical_root if canonical_root.is_dir() else wiki_root
+
     candidates: list = []
-    for md_file in wiki_root.rglob("*.md"):
+    for md_file in topic_root.glob("*.md"):
         if md_file.name == "index.md":
             continue
         try:
@@ -253,9 +265,16 @@ def _detect_orphan_pages(
     index_path = wiki_root / "index.md"
     if index_path.exists():
         try:
+            current_scope: Optional[str] = None
             for line in index_path.read_text(encoding="utf-8").splitlines():
-                m = re.search(r"\[([a-z0-9-]{1,60})\]", line)
-                if m:
+                if line.startswith("## "):
+                    current_scope = line[3:].strip()
+                    continue
+                m = re.search(r"\[([a-z0-9-]{1,60})\]\(([^)]+)\)", line)
+                if m and current_scope == scope:
+                    if scope in {"session", "agent"} and scope_id is not None:
+                        if not m.group(2).startswith(f"{scope}/{scope_id}/"):
+                            continue
                     index_keys.add(m.group(1))
         except OSError:
             pass
@@ -263,9 +282,9 @@ def _detect_orphan_pages(
     truncated = 0
     for resolved in candidates:
         key = resolved.stem
-        if key in index_keys:
-            continue
-        if key in db_keys:
+        in_index = key in index_keys
+        in_database = key in db_keys
+        if in_index and in_database:
             continue
         if len(issues) >= cap:
             truncated += 1
@@ -274,7 +293,11 @@ def _detect_orphan_pages(
             _make_issue(
                 issue_type="orphan_page",
                 key=key,
-                description=f"wiki file present but missing from index and SQLite (scope={scope})",
+                description=(
+                    "wiki file has projection drift "
+                    f"(scope={scope}, index={'present' if in_index else 'missing'}, "
+                    f"sqlite={'present' if in_database else 'missing'})"
+                ),
                 severity="warning",
                 scope_id=scope_id,
             )
@@ -871,6 +894,8 @@ async def run_lint(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     max_pairs: int = DEFAULT_MAX_PAIRS,
     repo_root: Optional[str] = None,
+    base_dir: Optional[Path] = None,
+    db_engine: Any = None,
 ) -> list:
     """Run all detectors and return a list of LintIssue.
 
@@ -910,9 +935,9 @@ async def run_lint(
     try:
         from cli_agent_orchestrator.services.memory_service import MemoryService
 
-        svc = MemoryService()
+        svc = MemoryService(base_dir=base_dir, db_engine=db_engine)
         base_resolved = svc.base_dir.resolve()
-        session = _open_readonly_session()
+        session = _open_readonly_session(db_engine)
         try:
             q = session.query(MemoryMetadataModel)
             if scope is not None:
@@ -932,6 +957,18 @@ async def run_lint(
                 rows.append(row_dict)
         finally:
             session.close()
+
+        from cli_agent_orchestrator.services.memory_reconciliation import (
+            discover_canonical_scope_dirs,
+        )
+
+        for discovered_scope, discovered_scope_id, container in discover_canonical_scope_dirs(
+            svc.base_dir
+        ):
+            scope_dirs.setdefault(
+                (discovered_scope, discovered_scope_id),
+                container,
+            )
     except Exception as e:
         logger.warning(f"lint SQL load failed: {e}")
         issues.append(
@@ -959,7 +996,12 @@ async def run_lint(
         except OSError:
             continue
         rows_by_scope.setdefault((r["scope"], r["scope_id"]), []).append(r)
-        scope_dirs.setdefault((r["scope"], r["scope_id"]), Path(r["file_path"]).parent.parent)
+        container = (
+            svc.base_dir / str(r["scope_id"])
+            if r["scope"] == "project" and r["scope_id"] is not None
+            else svc.base_dir / "global"
+        )
+        scope_dirs.setdefault((r["scope"], r["scope_id"]), container)
 
     # Detector: orphan_page (per scope dir).
     try:

@@ -145,12 +145,13 @@ class TestGetStatusFromFixtures:
         assert provider.get_status(output) == TerminalStatus.IDLE
 
     def test_empty_output_returns_unknown(self):
-        # Merged tree: empty output → UNKNOWN (was ERROR).
+        # native=None always falls through (no dispatch-timing guess); on tmux
+        # the live-read fallback is a pass-through, so an empty buffer hits
+        # OpenCode's own no-output default directly.
         provider = make_provider()
         assert provider.get_status("") == TerminalStatus.UNKNOWN
 
     def test_none_output_returns_unknown(self):
-        # Merged tree: None output → UNKNOWN (was ERROR).
         provider = make_provider()
         assert provider.get_status(None) == TerminalStatus.UNKNOWN
 

@@ -548,6 +548,13 @@ class HerdrBackend(TerminalBackend):
         # Equivalent to `tmux attach-session -t <session>`.
         os.execvp("herdr", ["herdr", "--session", self._herdr_session])
 
+    def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
+        """Focus the requested Herdr tab and return the browser PTY attach command."""
+        workspace_id = self._resolve_workspace_id(session_name)
+        tab_id = self._resolve_tab_id(session_name, workspace_id, window_name)
+        self._run_herdr(["tab", "focus", tab_id])
+        return ["herdr", "--session", self._herdr_session]
+
     # --- Capability overrides ---
 
     def supports_event_inbox(self) -> bool:
@@ -565,10 +572,17 @@ class HerdrBackend(TerminalBackend):
         - blocked  -> WAITING_USER_ANSWER
         - done     -> COMPLETED
         - idle     -> IDLE  (caller disambiguates IDLE vs COMPLETED via _task_dispatched)
-        - unknown  -> ERROR  (pane exists but no agent registered yet)
+        - unknown  -> None  (herdr has no agent registered for the pane)
 
-        Returns None only on backend errors (command failure, parse error) so
-        the caller can fall through to buffer analysis as a last resort.
+        "unknown" maps to None (not ERROR) because a wrapped launch command
+        (e.g. ``podman exec`` / ``docker exec``) makes herdr's foreground
+        process the wrapper, not the nested agent CLI, so herdr never registers
+        the agent and reports "unknown" indefinitely. None signals
+        "unknown/unresolvable at the backend level" and lets the caller resolve
+        status another way rather than flagging a healthy pane as ERROR.
+
+        Returns None on backend errors (command failure, parse error) and for
+        an "unknown"/unrecognized agent_status.
         """
         try:
             pane_id = self._resolve_pane_id_from_window(session_name, window_name)
@@ -594,8 +608,8 @@ class HerdrBackend(TerminalBackend):
             return TerminalStatus.COMPLETED
         if agent_status == "idle":
             return TerminalStatus.IDLE
-        # "unknown" and any unrecognized value
-        return TerminalStatus.ERROR
+        # "unknown" and any unrecognized value: unresolvable at backend level.
+        return None
 
     def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
         """Resolve CAO terminal_id to herdr pane_id.

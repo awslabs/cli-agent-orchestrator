@@ -1,11 +1,36 @@
 const BASE = ''  // Vite proxy handles routing to backend
 
+/**
+ * Error thrown by fetchJSON on a non-OK response. Carries the HTTP status and
+ * the server's `detail` string so callers can branch on them (e.g. the graph
+ * export's 422 secret-gate path surfaces `detail` — the matched PATTERN name
+ * only, never the memory bytes). `message` stays "<status> <statusText>" for
+ * back-compat with existing callers.
+ */
+export interface ApiError extends Error {
+  status?: number
+  detail?: string
+}
+
 async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: number }): Promise<T> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), opts?.timeoutMs ?? 10000)
   try {
     const res = await fetch(`${BASE}${url}`, { ...opts, signal: controller.signal })
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+    if (!res.ok) {
+      // Best-effort read of the JSON error body to expose the server's
+      // `detail` without leaking a full response. A non-JSON body is fine —
+      // detail just stays undefined.
+      let detail: string | undefined
+      try {
+        const body = await res.json()
+        if (body && typeof body.detail === 'string') detail = body.detail
+      } catch { /* non-JSON error body */ }
+      const err: ApiError = new Error(`${res.status} ${res.statusText}`)
+      err.status = res.status
+      err.detail = detail
+      throw err
+    }
     return res.json()
   } finally {
     clearTimeout(timeout)
@@ -113,6 +138,46 @@ export interface MemoryDetail extends MemorySummary {
   content: string
 }
 
+// ── Graph layer (Issue #348) ────────────────────────────────────────────
+// Wire shape of GET /graph/{provider}. Mirrors the server's GraphView.to_dict
+// (src/cli_agent_orchestrator/api/main.py get_graph_endpoint). `attrs` is an
+// open bag — the renderer reads is_hub / is_orphan but the server may add more.
+export interface GraphNode {
+  id: string
+  kind: string
+  label: string
+  status: string
+  attrs: Record<string, unknown>
+}
+
+export interface GraphEdge {
+  source: string
+  target: string
+  type: string
+  attrs: Record<string, unknown>
+}
+
+export interface GraphView {
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+  meta: Record<string, unknown>
+}
+
+// Request body for POST /graph/{provider}/export. `dest` MUST be a relative
+// name; the server confines it under CAO_GRAPH_EXPORT_ROOT and rejects
+// absolute/traversal paths with 400.
+export interface GraphExportBody {
+  sink: string
+  dest: string
+  options?: Record<string, unknown>
+}
+
+export interface GraphExportResult {
+  written_files: string[]
+  sink: string
+  dest: string
+}
+
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
@@ -191,4 +256,34 @@ export const api = {
     fetchJSON<{ success: boolean }>(`/memory/${encodeURIComponent(key)}?scope=${encodeURIComponent(scope)}${scopeId ? `&scope_id=${encodeURIComponent(scopeId)}` : ''}`, { method: 'DELETE' }),
   clearMemories: (scope: string, scopeId?: string) =>
     fetchJSON<{ success: boolean; deleted_count: number }>(`/memory?scope=${encodeURIComponent(scope)}${scopeId ? `&scope_id=${encodeURIComponent(scopeId)}` : ''}`, { method: 'DELETE' }),
+
+  // Graph (Issue #348). The projection runs wiki_lint (ripgrep detectors)
+  // server-side, so both routes get a wide timeout — a populated scope can take
+  // ~30s typical, up to ~148s under load. Errors surface as ApiError (status +
+  // server detail) for the caller.
+  getGraph: (provider = 'memory', scope?: string, scopeId?: string) => {
+    const params = [
+      scope ? `scope=${encodeURIComponent(scope)}` : '',
+      scopeId ? `scope_id=${encodeURIComponent(scopeId)}` : '',
+    ].filter(Boolean).join('&')
+    return fetchJSON<GraphView>(
+      `/graph/${encodeURIComponent(provider)}${params ? `?${params}` : ''}`,
+      { timeoutMs: 120000 },
+    )
+  },
+  exportGraph: (provider = 'memory', body: GraphExportBody, scope?: string, scopeId?: string) => {
+    const params = [
+      scope ? `scope=${encodeURIComponent(scope)}` : '',
+      scopeId ? `scope_id=${encodeURIComponent(scopeId)}` : '',
+    ].filter(Boolean).join('&')
+    return fetchJSON<GraphExportResult>(
+      `/graph/${encodeURIComponent(provider)}/export${params ? `?${params}` : ''}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ options: {}, ...body }),
+        timeoutMs: 60000,
+      },
+    )
+  },
 }

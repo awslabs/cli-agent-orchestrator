@@ -15,6 +15,7 @@ from cli_agent_orchestrator.providers.devin_cli import DevinCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ class ProviderManager:
             ProviderType.CURSOR_CLI.value: self._create_cursor_cli_provider,
             ProviderType.ANTIGRAVITY_CLI.value: self._create_antigravity_cli_provider,
             ProviderType.DEVIN_CLI.value: self._create_devin_cli_provider,
+            ProviderType.MOCK_CLI.value: self._create_mock_cli_provider,
         }
 
         if provider_type not in factories:
@@ -238,6 +240,21 @@ class ProviderManager:
             agent_profile,
             allowed_tools,
             skill_prompt=skill_prompt,
+        )
+
+    def _create_mock_cli_provider(
+        self,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        allowed_tools: Optional[List[str]],
+        **kwargs,
+    ) -> MockCliProvider:
+        return MockCliProvider(
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            allowed_tools,
         )
 
     def create_provider(

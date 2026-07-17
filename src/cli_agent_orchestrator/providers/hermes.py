@@ -204,10 +204,13 @@ class HermesProvider(BaseProvider):
         # Native status (herdr): trust the backend's agent state when available.
         # Must precede the empty-buffer -> ERROR default below: on herdr the
         # buffer is always empty, so without this every status would be ERROR.
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
         if not output:
             return TerminalStatus.ERROR
 

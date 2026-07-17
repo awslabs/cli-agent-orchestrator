@@ -670,6 +670,242 @@ class TestCreateTerminal:
         assert mock_provider_manager.create_provider.call_args.kwargs.get("allowed_tools") is None
 
 
+class TestCreateTerminalEnvVars:
+    """Tests for env_vars handling on both session paths (issues #248/#408).
+
+    #408 regression: the new_session=False branch previously passed only the
+    persisted session env to create_window and silently DROPPED the explicit
+    env_vars argument, so per-step workflow routing ids
+    (CAO_WORKFLOW_RUN_ID/STEP_ID) never reached the terminal.
+    """
+
+    def _wire_happy_mocks(
+        self,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_provider_manager,
+        mock_fifo_dir,
+        *,
+        session_exists,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = session_exists
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_env_vars_reach_window_in_existing_session(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_get_session_env,
+    ):
+        """#408 happy path: explicit env_vars must reach create_window's
+        extra_env on the new_session=False path (merged with session env)."""
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=True,
+        )
+        mock_get_session_env.return_value = {"SESSION_VAR": "from-session"}
+
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            new_session=False,
+            env_vars={"CAO_WORKFLOW_RUN_ID": "run-1", "CAO_WORKFLOW_STEP_ID": "s1"},
+        )
+
+        extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        # Both the persisted session env AND the per-step vars are present.
+        assert extra_env == {
+            "SESSION_VAR": "from-session",
+            "CAO_WORKFLOW_RUN_ID": "run-1",
+            "CAO_WORKFLOW_STEP_ID": "s1",
+        }
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_per_step_env_var_wins_over_persisted_session_var(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_get_session_env,
+    ):
+        """#408 conflict rule: on a same-named key the explicit per-step value
+        wins over the persisted session value."""
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=True,
+        )
+        mock_get_session_env.return_value = {"SHARED_KEY": "session-value", "KEEP": "kept"}
+
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            new_session=False,
+            env_vars={"SHARED_KEY": "per-step-value"},
+        )
+
+        extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        assert extra_env["SHARED_KEY"] == "per-step-value"  # per-step wins
+        assert extra_env["KEEP"] == "kept"  # non-conflicting session var kept
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_no_env_vars_existing_session_uses_session_env_only(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_get_session_env,
+    ):
+        """env_vars=None on new_session=False: the window still gets exactly the
+        persisted session env (pre-#408 behavior preserved)."""
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=True,
+        )
+        mock_get_session_env.return_value = {"SESSION_VAR": "from-session"}
+
+        await create_terminal(
+            "kiro_cli", "developer", session_name="cao-existing", new_session=False
+        )
+
+        extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        assert extra_env == {"SESSION_VAR": "from-session"}
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.set_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_new_session_true_path_unchanged(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_set_session_env,
+    ):
+        """new_session=True is untouched by #408: env_vars go verbatim to
+        create_session's extra_env and are persisted via set_session_env."""
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=False,
+        )
+
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            new_session=True,
+            env_vars={"FOO": "bar"},
+        )
+
+        assert mock_tmux.create_session.call_args.kwargs["extra_env"] == {"FOO": "bar"}
+        mock_set_session_env.assert_called_once_with("cao-session", {"FOO": "bar"})
+        mock_tmux.create_window.assert_not_called()
+
+
 class TestGetTerminal:
     """Tests for get_terminal function."""
 

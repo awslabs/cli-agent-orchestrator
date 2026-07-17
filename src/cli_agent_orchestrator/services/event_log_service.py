@@ -147,6 +147,36 @@ class EventLog:
             return out
         return out[len(out) - limit :]
 
+    def after_id(self, event_id: str) -> List[Dict]:
+        """Return fresh events strictly after the row with ``event_id``.
+
+        Powers the AG-UI stream's ``Last-Event-ID`` reconnect replay (F1): given
+        the last event id a client received, return every currently-retained
+        record that follows it, in chronological (insertion) order, after TTL
+        filtering.
+
+        If ``event_id`` is not found among the fresh rows — it was evicted from
+        the bounded buffer, aged out, or never existed — every fresh record is
+        returned instead of nothing. Over-delivering is safe (the client dedupes
+        by event id) and strictly better than a silent gap.
+
+        Args:
+            event_id: The client's last-seen event id (exclusive lower bound).
+
+        Returns:
+            Events in non-decreasing timestamp order, after ``event_id``.
+        """
+
+        # Reuse history()'s TTL/ordering guarantees (bounded by the ring
+        # capacity), then slice after the id.
+        fresh = self.history(limit=RING_CAPACITY)
+
+        for i, event in enumerate(fresh):
+            if event.get("id") == event_id:
+                return fresh[i + 1 :]
+        # Id not found among fresh rows: replay everything (client dedupes).
+        return fresh
+
     def __len__(self) -> int:
         """Return the current number of buffered events (<= RING_CAPACITY)."""
 
@@ -167,3 +197,11 @@ def get_event_log() -> EventLog:
             if _log is None:
                 _log = EventLog()
     return _log
+
+
+def reset_event_log() -> None:
+    """Drop the singleton (used by tests to start clean)."""
+
+    global _log
+    with _log_lock:
+        _log = None

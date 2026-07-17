@@ -70,6 +70,41 @@ class TestInstallCommand:
             {"API_TOKEN": "secret-token"},
         )
 
+    def test_install_without_provider_flag_passes_none_and_echoes_resolved_provider(
+        self, runner: CliRunner
+    ) -> None:
+        """Omitting --provider should pass None so the service resolves frontmatter.
+
+        The final summary line must echo the provider the service actually
+        resolved (flag > frontmatter > default), not the CLI default.
+        """
+        service_result = InstallResult(
+            success=True,
+            message="Agent 'developer' installed successfully",
+            agent_name="developer",
+            context_file="/tmp/agent-context/developer.md",
+            agent_file="/tmp/copilot/developer.agent.md",
+            source_kind="name",
+            provider="copilot_cli",
+        )
+
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=service_result,
+        ) as mock_install:
+            result = runner.invoke(install, ["developer"])
+
+        assert result.exit_code == 0
+        assert "copilot_cli agent: /tmp/copilot/developer.agent.md" in result.output
+        mock_install.assert_called_once_with("developer", None, None)
+
+    def test_install_help_documents_provider_precedence(self, runner: CliRunner) -> None:
+        """--provider help text should document flag > frontmatter > default."""
+        result = runner.invoke(install, ["--help"])
+
+        assert result.exit_code == 0
+        assert "frontmatter" in result.output
+
     def test_install_url_source_prints_download_confirmation(self, runner: CliRunner) -> None:
         """URL installs should print a download confirmation line."""
         service_result = InstallResult(

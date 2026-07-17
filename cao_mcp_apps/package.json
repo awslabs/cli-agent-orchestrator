@@ -17,7 +17,8 @@
     "build:dashboard": "vite build -c vite.config.dashboard.ts",
     "build:agent": "vite build -c vite.config.agent.ts",
     "build:events": "vite build -c vite.config.events.ts",
-    "build:all": "npm run build:dashboard && npm run build:agent && npm run build:events",
+    "build:graph": "vite build -c vite.config.graph.ts",
+    "build:all": "npm run build:dashboard && npm run build:agent && npm run build:events && npm run build:graph",
     "demo": "node scripts/record-demo.mjs",
     "lint-staged": "lint-staged"
   },
@@ -31,16 +32,19 @@
     ]
   },
   "dependencies": {
+    "graphology": "^0.26.0",
+    "graphology-layout": "^0.6.1",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "sigma": "^3.0.3"
   },
   "devDependencies": {
     "@playwright/test": "^1.48.0",
     "@testing-library/dom": "^10.4.0",
     "@testing-library/react": "^16.0.1",
+    "@types/node": "^22.10.1",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
-    "@types/node": "^22.10.1",
     "@vitejs/plugin-react": "^6.0.3",
     "@vitest/coverage-v8": "^4.1.9",
     "fast-check": "^3.23.1",

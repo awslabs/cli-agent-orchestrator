@@ -14,3 +14,5 @@ class ProviderType(str, Enum):
     CURSOR_CLI = "cursor_cli"
     ANTIGRAVITY_CLI = "antigravity_cli"
     DEVIN_CLI = "devin_cli"
+    # Credentials-free mock provider for tests/CI (no real CLI binary).
+    MOCK_CLI = "mock_cli"

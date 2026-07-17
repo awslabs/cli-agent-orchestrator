@@ -21,6 +21,10 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.memory import Memory, MemoryScope, MemoryType
 from cli_agent_orchestrator.services.memory_archive.base import ExportReport, ImportReport
+from cli_agent_orchestrator.services.memory_format import (
+    normalize_memory_tags,
+    parse_index_entry,
+)
 from cli_agent_orchestrator.utils.path_validation import (
     safe_join_under_base,
     validate_path_component,
@@ -42,6 +46,31 @@ class MemoryDisabledError(RuntimeError):
     Read paths (recall, get_memory_context_for_terminal) instead return an
     empty result, since silent empty reads are a safer no-op than raising.
     """
+
+
+class MemoryPartialWriteError(RuntimeError):
+    """Raised when durable wiki projections outlive a failed metadata write."""
+
+    error_kind = "memory_metadata_partial_write"
+    repair_command = "cao memory repair --apply"
+
+    def __init__(
+        self,
+        *,
+        key: str,
+        scope: str,
+        scope_id: Optional[str],
+        file_path: str,
+    ) -> None:
+        self.key = key
+        self.scope = scope
+        self.scope_id = scope_id
+        self.file_path = file_path
+        self.completed_phases = ["wiki", "index"]
+        super().__init__(
+            "Memory content and index were saved, but SQLite metadata could not be updated. "
+            f"Run `{self.repair_command}`."
+        )
 
 
 def _is_memory_enabled() -> bool:
@@ -724,11 +753,7 @@ class MemoryService:
         else:
             key = self._sanitize_key(key)
 
-        # Normalize tags: strip whitespace and rejoin with commas. The
-        # index entry format expects tags to contain no spaces (the
-        # parser uses ``tags:(\S*)``), so ``"ci, deploy"`` would
-        # otherwise become unrecallable through the index.
-        tags = ",".join(t.strip() for t in tags.split(",") if t.strip())
+        tags = normalize_memory_tags(tags)
 
         now = datetime.now(timezone.utc)
         timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -793,7 +818,7 @@ class MemoryService:
                     f"type: {memory_type} | tags: {tags} -->"
                 )
                 existing_content = re.sub(
-                    r"<!-- id: [a-f0-9\-]+ \| scope: [^|]+ \| type: [^|]+ \| tags: [^>]*-->",
+                    r"<!-- id: [a-f0-9\-]+ \| scope: [^|]+ " r"\| type: [^|]+ \| tags: .*? -->",
                     new_header,
                     existing_content,
                     count=1,
@@ -908,7 +933,19 @@ class MemoryService:
                     last_compiled_at=last_compiled_at,
                 )
             except Exception as e:
-                logger.warning(f"Memory metadata SQLite upsert failed (key={key}): {e}")
+                logger.error(
+                    "Memory metadata SQLite upsert failed after durable writes "
+                    "(key=%s scope=%s scope_id=%s)",
+                    key,
+                    scope,
+                    scope_id,
+                )
+                raise MemoryPartialWriteError(
+                    key=key,
+                    scope=scope,
+                    scope_id=scope_id,
+                    file_path=str(wiki_path),
+                ) from e
 
             logger.info(f"Memory {action}: key={key} scope={scope} scope_id={scope_id}")
         finally:
@@ -1249,8 +1286,8 @@ class MemoryService:
 
     @staticmethod
     def _tags_from_file(content: str) -> str:
-        m = re.search(r"\| tags: ([^>]*)-->", content)
-        return m.group(1).strip() if m else ""
+        m = re.search(r"\| tags: (.*?) -->", content)
+        return normalize_memory_tags(m.group(1)) if m else ""
 
     # -------------------------------------------------------------------------
     # Cross-references (See-Also)
@@ -2374,12 +2411,9 @@ class MemoryService:
                 continue
 
             # Parse entry lines: - [key](scope/key.md) — type:X tags:Y ~Ntok updated:Z
-            match = re.match(
-                r"^- \[([^\]]+)\]\(([^)]+)\) — type:(\S+) tags:(\S*) ~\d+tok updated:(\S+)$",
-                line,
-            )
+            match = parse_index_entry(line)
             if match and current_scope:
-                relative_path = match.group(2)
+                relative_path = match.group("path")
                 # Session/agent entries embed scope_id in the path
                 # (e.g. ``session/<scope_id>/<key>.md``). Extract it
                 # here so callers (CLI clear, recall→forget) can
@@ -2395,11 +2429,11 @@ class MemoryService:
 
                 entries.append(
                     {
-                        "key": match.group(1),
+                        "key": match.group("key"),
                         "relative_path": relative_path,
-                        "memory_type": match.group(3),
-                        "tags": match.group(4),
-                        "updated_at": match.group(5),
+                        "memory_type": match.group("type"),
+                        "tags": normalize_memory_tags(match.group("tags")),
+                        "updated_at": match.group("updated"),
                         "scope": current_scope,
                         "scope_id": entry_scope_id,
                     }
@@ -2414,8 +2448,8 @@ class MemoryService:
         memory_id = id_match.group(1) if id_match else str(uuid.uuid4())
 
         # Extract tags from comment
-        tags_match = re.search(r"tags: ([^\n|]*?)(?:\s*-->|\s*\|)", file_content)
-        tags = tags_match.group(1).strip() if tags_match else entry.get("tags", "")
+        tags_match = re.search(r"\| tags: (.*?) -->", file_content)
+        tags = normalize_memory_tags(tags_match.group(1)) if tags_match else entry.get("tags", "")
 
         # Extract scope from comment
         scope_match = re.search(r"scope: (\S+)", file_content)
