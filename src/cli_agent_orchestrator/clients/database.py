@@ -163,7 +163,7 @@ class HandoffResultModel(Base):
     __tablename__ = "handoff_results"
 
     job_id = Column(String, primary_key=True)
-    state = Column(String, nullable=False)          # "running" | "completed" | "error"
+    state = Column(String, nullable=False)  # "running" | "completed" | "error"
     terminal_id = Column(String, nullable=True)
     last_message = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
@@ -246,8 +246,7 @@ def _migrate_add_handoff_results() -> None:
 
     try:
         with sqlite3.connect(str(DATABASE_FILE)) as conn:
-            conn.execute(
-                """
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS handoff_results (
                     job_id TEXT PRIMARY KEY,
                     state TEXT NOT NULL,
@@ -257,8 +256,7 @@ def _migrate_add_handoff_results() -> None:
                     created_at DATETIME,
                     updated_at DATETIME
                 )
-                """
-            )
+                """)
             conn.commit()
     except Exception as e:
         logger.warning(f"Migration check for handoff_results failed: {e}")
@@ -959,9 +957,7 @@ def delete_old_handoff_results(cutoff: datetime) -> int:
     """
     with SessionLocal() as db:
         deleted = (
-            db.query(HandoffResultModel)
-            .filter(HandoffResultModel.created_at < cutoff)
-            .delete()
+            db.query(HandoffResultModel).filter(HandoffResultModel.created_at < cutoff).delete()
         )
         db.commit()
         return deleted

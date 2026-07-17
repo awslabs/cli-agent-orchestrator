@@ -2,6 +2,7 @@
 
 Uses an in-memory SQLite database so no file system state is required.
 """
+
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -23,9 +24,7 @@ def _use_test_db(monkeypatch):
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
     TestSession = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.clients.database.SessionLocal", TestSession
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.SessionLocal", TestSession)
     yield
 
 
@@ -89,7 +88,7 @@ class TestDeleteOldHandoffResults:
         upsert_handoff_result("old-2", "error")
         upsert_handoff_result("new-1", "running")
         # Backdate old-1 and old-2 by reaching into the DB directly.
-        from cli_agent_orchestrator.clients.database import SessionLocal, HandoffResultModel
+        from cli_agent_orchestrator.clients.database import HandoffResultModel, SessionLocal
 
         past = _utcnow() - timedelta(days=20)
         with SessionLocal() as db:

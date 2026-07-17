@@ -6,6 +6,7 @@ Verifies:
   so the caller can retrieve the result later.
 - The normal synchronous path still works and job_id/pending are absent.
 """
+
 import asyncio
 import uuid
 from unittest.mock import MagicMock, patch
