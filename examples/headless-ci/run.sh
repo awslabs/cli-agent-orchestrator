@@ -63,7 +63,7 @@ while true; do
 
     NOW=$(date +%s)
     ELAPSED=$((NOW - START))
-    if [ "${ELAPSED}" -ge "${TIMEOUT}" ]; then
+    if [[ "${ELAPSED}" -ge "${TIMEOUT}" ]]; then
         echo "[ci] timeout after ${TIMEOUT}s (last status: ${STATUS:-unknown})" >&2
         cao session status "${PREFIXED}" --workers || true
         exit 124

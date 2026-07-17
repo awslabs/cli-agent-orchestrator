@@ -858,7 +858,7 @@ async def events_history(
 
 
 @app.get("/agui/v1/stream")
-async def agui_stream(
+async def agui_stream(  # NOSONAR -- AG-UI streaming endpoint; complexity is structural due to auth + since/last-event-id replay branches.
     since: Optional[str] = Query(
         default=None,
         description=(
@@ -2098,7 +2098,7 @@ async def record_step_output_endpoint(
 
 
 @app.post("/workflows/runs", responses={422: {"description": "Script lint findings"}})
-async def start_workflow_run_endpoint(
+async def start_workflow_run_endpoint(  # NOSONAR -- run-engine dispatch endpoint; complexity comes from narrow exception mapping for YAML vs script specs.
     body: WorkflowRunRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:

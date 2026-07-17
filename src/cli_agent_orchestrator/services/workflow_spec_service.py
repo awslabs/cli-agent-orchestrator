@@ -466,7 +466,11 @@ def _check_tier_collision(stem: str, safe_dir: str) -> None:
         raise TierCollisionError(stem)
 
 
-def _extract_inputs(source: str) -> Dict[str, InputDecl]:
+def _extract_inputs(  # NOSONAR
+    source: str,
+) -> Dict[
+    str, InputDecl
+]:  # NOSONAR -- AST validator: nested loops/conditionals are inherent to dict-literal structural validation.
     """AST-parse a script's module-level ``INPUTS`` declaration (Unit A, FR-A1).
 
     Finds the FIRST module-level assignment to the name ``INPUTS`` and builds the

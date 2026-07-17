@@ -146,14 +146,14 @@ def test_post_export_happy_path(client, stub_test_sink):
     """POST export resolves provider+sink, projects, exports, returns the envelope."""
     resp = client.post(
         "/graph/stub/export",
-        json={"sink": "stub-test-sink", "dest": "/tmp/does-not-matter", "options": {}},
+        json={"sink": "stub-test-sink", "dest": "cao-test-dest", "options": {}},
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body == {
-        "written_files": ["/tmp/does-not-matter/stub-a.md", "/tmp/does-not-matter/index.md"],
+        "written_files": ["cao-test-dest/stub-a.md", "cao-test-dest/index.md"],
         "sink": "stub-test-sink",
-        "dest": "/tmp/does-not-matter",
+        "dest": "cao-test-dest",
     }
     # provider projected + sink.export called exactly once.
     assert stub_test_sink.call_count == 1
@@ -163,7 +163,7 @@ def test_post_export_unregistered_sink_404(client):
     """An unregistered sink name is a 404."""
     resp = client.post(
         "/graph/stub/export",
-        json={"sink": "no-such-sink", "dest": "/tmp/x"},
+        json={"sink": "no-such-sink", "dest": "cao-test-dest"},
     )
     assert resp.status_code == 404
 
@@ -172,7 +172,7 @@ def test_post_export_unregistered_provider_404(client, stub_test_sink):
     """An unregistered provider name is a 404."""
     resp = client.post(
         "/graph/no-such-provider/export",
-        json={"sink": "stub-test-sink", "dest": "/tmp/x"},
+        json={"sink": "stub-test-sink", "dest": "cao-test-dest"},
     )
     assert resp.status_code == 404
 
@@ -181,7 +181,7 @@ def test_post_export_no_token_401(client, stub_test_sink, auth_on):
     """With auth enabled, a request with no token is 401 (authentication)."""
     resp = client.post(
         "/graph/stub/export",
-        json={"sink": "stub-test-sink", "dest": "/tmp/x"},
+        json={"sink": "stub-test-sink", "dest": "cao-test-dest"},
     )
     assert resp.status_code == 401
 
@@ -191,7 +191,7 @@ def test_post_export_read_only_scope_403(client, stub_test_sink, auth_on):
     app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
     resp = client.post(
         "/graph/stub/export",
-        json={"sink": "stub-test-sink", "dest": "/tmp/x"},
+        json={"sink": "stub-test-sink", "dest": "cao-test-dest"},
     )
     assert resp.status_code == 403
 
@@ -202,7 +202,7 @@ def test_post_export_write_or_admin_scope_admitted(client, stub_test_sink, auth_
     app.dependency_overrides[auth.get_current_scopes] = _override_scopes([scope])
     resp = client.post(
         "/graph/stub/export",
-        json={"sink": "stub-test-sink", "dest": "/tmp/x"},
+        json={"sink": "stub-test-sink", "dest": "cao-test-dest"},
     )
     assert resp.status_code == 200
 
@@ -237,7 +237,7 @@ def test_post_export_secret_gate_422_and_sink_not_called(client, monkeypatch):
 
     resp = client.post(
         "/graph/secret-provider/export",
-        json={"sink": "spy-sink", "dest": "/tmp/x"},
+        json={"sink": "spy-sink", "dest": "cao-test-dest"},
     )
     assert resp.status_code == 422
     assert "aws_access_key" in resp.json()["detail"]
@@ -322,7 +322,7 @@ def test_post_export_provider_value_error_400(client, value_error_provider, stub
     """
     resp = client.post(
         f"/graph/{value_error_provider}/export",
-        json={"sink": "stub-test-sink", "dest": "/tmp/x", "options": {}},
+        json={"sink": "stub-test-sink", "dest": "cao-test-dest", "options": {}},
     )
     assert resp.status_code == 400
     assert "bad filter value" in resp.json()["detail"]
@@ -332,7 +332,7 @@ def test_post_export_sink_value_error_400(client, value_error_sink):
     """A sink ValueError on POST /export is mapped to 400 by the route."""
     resp = client.post(
         "/graph/stub/export",
-        json={"sink": value_error_sink, "dest": "/tmp/x", "options": {}},
+        json={"sink": value_error_sink, "dest": "cao-test-dest", "options": {}},
     )
     assert resp.status_code == 400
     assert "bad dest / options" in resp.json()["detail"]

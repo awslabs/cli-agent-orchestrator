@@ -1,5 +1,6 @@
 """U5 — OkfGraphSink tests: happy path, export-root confinement, collisions, escaping."""
 
+import asyncio
 import os
 
 import pytest
@@ -22,14 +23,13 @@ def export_root(tmp_path, monkeypatch):
     return os.path.realpath(str(root))
 
 
-@pytest.mark.asyncio
-async def test_okf_export_stub_bundle(export_root):
+def test_okf_export_stub_bundle(export_root):
     """Exporting the stub provider's view produces a well-formed OKF bundle.
 
     dest is RELATIVE to the configured export root; every written path stays
     under the resolved root.
     """
-    view = await StubGraphProvider().project()
+    view = asyncio.run(StubGraphProvider().project())
 
     written = OkfGraphSink().export(view, "bundle")
 
