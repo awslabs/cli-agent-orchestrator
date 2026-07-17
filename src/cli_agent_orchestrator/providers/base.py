@@ -295,7 +295,9 @@ class BaseProvider(ABC):
         self._done_first_detected = 0.0
         self._idle_first_detected = 0.0
 
-    def _resolve_native_status(self, buffer: Optional[str] = None) -> Optional[TerminalStatus]:
+    def _resolve_native_status(  # NOSONAR -- backend status mapping is intentionally branched
+        self, buffer: Optional[str] = None
+    ) -> Optional[TerminalStatus]:
         """Resolve status from the backend's native agent state, if available.
 
         On the herdr backend, ``pipe_pane`` is a no-op so the StatusMonitor

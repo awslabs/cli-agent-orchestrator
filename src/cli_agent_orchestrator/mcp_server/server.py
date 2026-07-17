@@ -1222,7 +1222,7 @@ async def emit_ui(
         Dict with the emitted event id and component name.
     """
     terminal_id = os.getenv("CAO_TERMINAL_ID")
-    response = requests.post(
+    response = requests.post(  # NOSONAR -- MCP tool short-calls the local CAO server; httpx migration tracked
         f"{API_BASE_URL}/agui/v1/emit_ui",
         json={
             "component": component,

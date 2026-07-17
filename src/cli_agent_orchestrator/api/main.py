@@ -2634,7 +2634,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             get_backend().prepare_web_attach, session_name, window_name
         )
     except TerminalBackendError as e:
-        logger.error(f"Web attach failed for terminal {terminal_id}: {e}")
+        logger.exception("Web attach failed for terminal %s: %s", terminal_id, e)
         await websocket.close(code=4004, reason="Failed to attach terminal")
         return
 

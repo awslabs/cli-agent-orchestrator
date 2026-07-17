@@ -42,6 +42,7 @@ def _terminating_stream(monkeypatch):
             pass
 
         async def drain(self, queue):
+            # Empty async generator used by tests that never produce events.
             return
             yield  # pragma: no cover
 
