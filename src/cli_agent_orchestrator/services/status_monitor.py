@@ -531,6 +531,65 @@ class StatusMonitor:
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
+    def _detect_from_live_pane(self, terminal_id: str) -> Optional[TerminalStatus]:
+        """Detect status from tmux's LIVE pane instead of the FIFO-fed buffer.
+
+        Ground-truth escape hatch for a stalled pipe-pane forwarder (#388). tmux
+        can silently stop forwarding a pane's output to the FIFO after a burst of
+        alternate-screen redraws — Claude Code's Ink TUI is exactly that shape.
+        The rolling buffer then freezes on whatever it last saw (typically the
+        pre-launch shell prompt, which detects as UNKNOWN) while the pane itself
+        renders a perfectly healthy, idle agent.
+
+        The liveness watchdog cannot recover this case: once the TUI finishes
+        painting, the pane is STATIC, so its "pane advanced but FIFO silent"
+        divergence test never trips — a settled frame is indistinguishable from a
+        genuinely idle terminal. Live-reproduced: agent idle at a ready prompt,
+        status pinned at UNKNOWN, wait_until_status timing out at 60s.
+
+        capture-pane is immune to the stall (it reads tmux's own screen), and the
+        providers' detectors already understand composited screen content — it is
+        what _handle_startup_prompts() has always used to spot trust/bypass
+        dialogs while the FIFO was dead. So when the pushed pipeline knows
+        nothing, ask tmux directly.
+
+        Only consulted on a cached UNKNOWN (see get_status), so this costs one
+        capture-pane per poll on a terminal we know nothing about — never on the
+        hot per-chunk path this class's docstring warns about forking from.
+        """
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            return None
+        if provider is None:
+            return None
+
+        session_name = getattr(provider, "session_name", None)
+        window_name = getattr(provider, "window_name", None)
+        if not session_name or not window_name:
+            return None
+
+        try:
+            content = get_backend().get_history(session_name, window_name, strip_escapes=True)
+        except Exception as e:
+            logger.debug(f"live-pane detect [{terminal_id}]: capture-pane failed: {e}")
+            return None
+
+        if not content.strip():
+            return None
+
+        try:
+            if getattr(provider, "supports_screen_detection", False):
+                # capture-pane output IS a composited viewport — exactly what
+                # get_status_from_screen expects (escape-free rows).
+                return provider.get_status_from_screen(content.split("\n"))
+            return provider.get_status(content)
+        except Exception as e:
+            logger.debug(f"live-pane detect [{terminal_id}]: detection failed: {e}")
+            return None
+
     def get_status(self, terminal_id: str) -> TerminalStatus:
         """Get current terminal status — the single source of truth for both backends.
 
@@ -583,6 +642,22 @@ class StatusMonitor:
                 f"fresh={fresh.value}, buffer_len={len(buffer)}"
             )
             if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
+                self._apply_detection(terminal_id, fresh)
+                return fresh
+
+        # A cached UNKNOWN on a pipe-pane backend means the pushed pipeline has
+        # told us nothing at all — either it has not started yet, or the
+        # forwarder stalled and the buffer is frozen on stale content. Both are
+        # indistinguishable from here, and in both cases tmux's live pane is the
+        # ground truth. Ask it directly rather than waiting on a stream that may
+        # never resume. Same escape-hatch shape as the PROCESSING case above:
+        # only ever upgrades a non-answer into a real one.
+        if cached == TerminalStatus.UNKNOWN:
+            fresh = self._detect_from_live_pane(terminal_id)
+            if fresh is not None and fresh != TerminalStatus.UNKNOWN:
+                logger.debug(
+                    f"get_status [{terminal_id}]: cached=UNKNOWN, live pane -> {fresh.value}"
+                )
                 self._apply_detection(terminal_id, fresh)
                 return fresh
         return cached
