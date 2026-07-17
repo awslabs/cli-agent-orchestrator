@@ -273,6 +273,13 @@ Example: multi-role feature development.
 
 ![Multi-role Feature Development](./docs/assets/multi-role-feature-development.png)
 
+**4. Discovery** — find and describe peer agents without a supervisor routing everything.
+
+- `create_session` sets an ordered, general-to-specific `group` array on a terminal at creation time (e.g. `["tenant_1", "project_5", "folder_12"]`); a running agent's own group can be reassigned later via `PATCH /terminals/{id}/group` (API-only, not an MCP tool — see [docs/api.md](docs/api.md)). Consumers own what the levels mean, CAO only does ordered-prefix matching.
+- `list_siblings` (MCP tool) returns every OTHER terminal sharing a leading prefix of the caller's own group — a caller can never see a wider scope than its own group, and a terminal with no group set finds no siblings
+- `update_metadata` (MCP tool) lets an agent publish a short, free-form description of what it's doing right now, visible to siblings via `list_siblings`; it's a whole-dict replace (last-write-wins under concurrent calls), not a merge
+- Use this for flat peer discovery among agents in the same group (e.g. "who else is working on this project?") rather than a strict supervisor/worker hierarchy — combine with `send_message` once a sibling is found
+
 ### Cross-Provider Orchestration
 
 Workers inherit the provider of the terminal that spawned them by default. To pin a profile to a specific provider, add `provider` to its frontmatter:
@@ -336,7 +343,7 @@ Because `cao session` is just shell commands, any AI assistant that supports she
 
 | Server | Who uses it | Purpose |
 |--------|-------------|---------|
-| `cao-mcp-server` | Agents **inside** a CAO session | Inter-agent orchestration (`handoff`, `assign`, `send_message`) |
+| `cao-mcp-server` | Agents **inside** a CAO session | Inter-agent orchestration (`handoff`, `assign`, `send_message`) and group-based discovery (`list_siblings`, `update_metadata`) |
 | `cao-ops-mcp` | A primary agent **outside** a CAO session | Meta management (install profiles, launch/monitor sessions) |
 
 **Setup** — add to your primary agent's MCP configuration. Requires `cao-server` running at `localhost:9889`.

@@ -651,6 +651,11 @@ def update_group(terminal_id: str, group: Optional[List[str]]) -> bool:
 def update_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
     """Replace a terminal's free-form metadata dict.
 
+    Whole-dict replace, not a merge: concurrent calls are last-write-wins
+    (tedswinyar, PR #433 review). Acceptable for this field -- callers should
+    re-send the full intended dict each time rather than assuming a partial
+    update accumulates on top of a prior one.
+
     Returns:
         False if the terminal does not exist, True otherwise.
     """
@@ -671,8 +676,15 @@ def list_siblings(caller_id: str, depth: Optional[int] = None) -> List[Dict[str,
     discovery, per #432) rather than erroring.
 
     Returns:
-        List of ``{id, group, metadata}`` dicts for every OTHER terminal
-        whose group shares the resolved prefix.
+        List of ``{id, group, metadata, status}`` dicts for every OTHER
+        terminal whose group shares the resolved prefix. ``status`` is a
+        live, point-in-time snapshot (tedswinyar, PR #433 review): a handoff
+        terminal that has COMPLETED can still delete itself between this
+        call returning and a caller's follow-up ``send_message`` to it, so a
+        discovered sibling is never a guarantee it's still reachable --
+        ``status`` lets a caller skip an obviously-finished sibling
+        proactively, but callers should still expect sends to occasionally
+        fail against a sibling that disappeared in that window.
     """
     caller_group = get_terminal_group(caller_id)
     if not caller_group:
@@ -681,7 +693,10 @@ def list_siblings(caller_id: str, depth: Optional[int] = None) -> List[Dict[str,
     effective_depth = max_depth if depth is None else depth
     effective_depth = max(1, min(effective_depth, max_depth))
     prefix = caller_group[:effective_depth]
-    return list_siblings_by_group_prefix(caller_id, prefix)
+    siblings = list_siblings_by_group_prefix(caller_id, prefix)
+    for sibling in siblings:
+        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+    return siblings
 
 
 def get_working_directory(terminal_id: str) -> Optional[str]:

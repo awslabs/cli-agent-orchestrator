@@ -1333,9 +1333,15 @@ async def list_siblings(
 
     Resolves your identity from your own CAO_TERMINAL_ID (never a value you
     pass in) and looks up your own persisted `group`. Returns the id, group,
-    and metadata of every OTHER terminal whose group shares the resolved
-    prefix. If you have no group set, you have no siblings — this is not an
-    error.
+    metadata, and status of every OTHER terminal whose group shares the
+    resolved prefix. If you have no group set, you have no siblings — this
+    is not an error.
+
+    `status` is a live snapshot at call time, not a guarantee -- a sibling
+    (especially a handoff terminal) can complete and delete itself between
+    this call and your next message to it, so expect send_message to a
+    discovered sibling to occasionally fail even when status looked healthy
+    here.
 
     Use this to find other agents working in the same project/folder/tenant,
     then message them with send_message using the returned id.
@@ -1348,15 +1354,20 @@ async def update_metadata(
     metadata: Dict[str, Any] = Field(
         description=(
             "Free-form JSON describing what this terminal is doing right "
-            "now. Replaces any existing metadata entirely (not merged). "
-            "Visible to sibling terminals via list_siblings."
+            "now. Replaces any existing metadata entirely (not merged) -- "
+            "concurrent calls are last-write-wins, so if you're updating "
+            "part of a larger metadata dict, re-send the whole thing each "
+            "time rather than assuming earlier fields still apply. Visible "
+            "to sibling terminals via list_siblings."
         )
     ),
 ) -> Dict[str, Any]:
     """Update your own terminal's metadata, visible to siblings via list_siblings.
 
     Use this so other agents in your group can see a short description of
-    what you're currently working on without messaging you directly.
+    what you're currently working on without messaging you directly. Whole-
+    dict replace, last-write-wins under concurrent calls -- not an
+    accumulating/merging store.
     """
     return _update_metadata_impl(metadata)
 

@@ -660,9 +660,17 @@ def list_siblings_by_group_prefix(caller_id: str, prefix: List[str]) -> List[Dic
 
     This SQL-level match assumes the stored ``group`` was encoded with the
     same ``json.dumps`` defaults used below (notably ``ensure_ascii=True``,
-    the default) — true today since ``update_terminal_group`` is the only
-    write path and uses plain ``json.dumps(group)``. If that write path ever
-    changes its encoding, this prefilter must change with it.
+    the default) — true today of both write paths (``create_terminal`` and
+    ``update_terminal_group``), which both use plain ``json.dumps(group)``.
+    If either write path ever changes its encoding, this prefilter must
+    change with it.
+
+    A single row with corrupt ``group`` JSON (e.g. hand-edited DB, a future
+    write-path bug) is logged and excluded rather than raising and failing
+    discovery for every OTHER terminal in the same request (tedswinyar, PR
+    #433 review). Corrupt ``metadata`` JSON on an otherwise-matching sibling
+    is likewise logged and reported back as ``metadata=None`` -- the sibling
+    itself is still real and discoverable, only its metadata is unreadable.
     """
     import json as _json
 
@@ -684,17 +692,38 @@ def list_siblings_by_group_prefix(caller_id: str, prefix: List[str]) -> List[Dic
         )
         siblings = []
         for row in rows:
-            sibling_group = _json.loads(row.group)
+            try:
+                sibling_group = _json.loads(row.group)
+                if not isinstance(sibling_group, list):
+                    raise ValueError(f"decoded to {type(sibling_group).__name__}, expected list")
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    "list_siblings_by_group_prefix: skipping terminal %s -- "
+                    "corrupt group JSON (%s)",
+                    row.id,
+                    e,
+                )
+                continue
             if len(sibling_group) < depth:
                 continue
             if sibling_group[:depth] == prefix:
+                metadata = None
+                if row.metadata_json:
+                    try:
+                        metadata = _json.loads(row.metadata_json)
+                    except (TypeError, ValueError) as e:
+                        logger.warning(
+                            "list_siblings_by_group_prefix: terminal %s has "
+                            "corrupt metadata JSON (%s); returning it with "
+                            "metadata=None",
+                            row.id,
+                            e,
+                        )
                 siblings.append(
                     {
                         "id": row.id,
                         "group": sibling_group,
-                        "metadata": (
-                            _json.loads(row.metadata_json) if row.metadata_json else None
-                        ),
+                        "metadata": metadata,
                     }
                 )
         return siblings

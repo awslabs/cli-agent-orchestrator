@@ -73,6 +73,10 @@ Create a new session with one terminal.
 - `session_name` (string, optional): Custom session name
 - `working_directory` (string, optional): Working directory for the agent session
 
+**Request body (optional, JSON):**
+- `group` (array of strings, optional): Ordered, general-to-specific grouping array for sibling discovery (e.g. `["tenant_1", "project_5", "folder_12"]`; see `GET /terminals/{terminal_id}/siblings`). Omit to opt this terminal out of group-based discovery. Capped at 16 elements, 128 characters each.
+- `metadata` (object, optional): Free-form JSON describing what this terminal is doing, visible to sibling terminals. Capped at 16 KiB encoded.
+
 **Response:** Terminal object (201 Created)
 
 ### GET /sessions
@@ -118,6 +122,8 @@ Create an additional terminal in an existing session.
 
 **Response:** Terminal object (201 Created). When `defer_init=true`, the returned status is `unknown` (the provider is still initializing on a background task); poll `GET /terminals/{id}` for the live status before sending further input.
 
+**Note:** unlike `POST /sessions`, this endpoint (and the handoff/assign spawn path) cannot set `group`/`metadata` at creation time — only a session's initial terminal can. This is deliberate: consumers own group assignment, and a mid-session worker that wants to be discoverable calls `PATCH /terminals/{terminal_id}/group` (WRITE-scoped) once it exists.
+
 ### GET /sessions/{session_name}/terminals
 List all terminals in a session.
 
@@ -135,6 +141,8 @@ Get terminal details.
   "session_name": "string",
   "agent_profile": "string",
   "caller_id": "string|null",
+  "group": ["string", "..."] | null,
+  "metadata": {"...": "..."} | null,
   "status": "idle|processing|completed|waiting_user_answer|error",
   "last_active": "timestamp"
 }
@@ -234,6 +242,59 @@ Delete a terminal.
   "success": true
 }
 ```
+
+### PATCH /terminals/{terminal_id}/group
+Replace a terminal's group array. Lets a consumer whose own grouping can
+change after a terminal already exists (e.g. a folder/project reassignment)
+keep `group` from going stale.
+
+**Request body (JSON):**
+- `group` (array of strings or `null`, **required**): the new group array. The field itself must be present in the body — an omitted `group` is rejected with `422` rather than silently treated the same as an explicit `null` (clearing the group is always an explicit choice). An explicit `null` or `[]` clears the group, opting the terminal back out of discovery. Capped at 16 elements, 128 characters each; over-cap requests are rejected with `422`.
+
+**Response:** Terminal object (200 OK)
+
+**Errors:** `404` if the terminal does not exist; `422` if `group` is omitted or exceeds the size caps.
+
+### PATCH /terminals/{terminal_id}/metadata
+Replace a terminal's free-form metadata dict. Called by the running agent
+itself via the `update_metadata` MCP tool (as well as by any other
+authorized API caller).
+
+**Request body (JSON):**
+- `metadata` (object or `null`, **required**): the new metadata dict, replacing any existing metadata **entirely** — this is a whole-dict replace, not a merge, and concurrent calls are last-write-wins. The field itself must be present in the body — an omitted `metadata` is rejected with `422`, same reasoning as `group` above. An explicit `null` or `{}` clears it. Capped at 16 KiB encoded; over-cap requests are rejected with `422`.
+
+**Response:** Terminal object (200 OK)
+
+**Errors:** `404` if the terminal does not exist; `422` if `metadata` is omitted or exceeds the size cap.
+
+### GET /terminals/{terminal_id}/siblings
+List sibling terminals sharing a leading prefix of `terminal_id`'s own
+`group`. `terminal_id` in the URL IS the caller's resolved identity — the
+comparison always uses THAT terminal's own persisted `group`, so a caller
+can never request a scope wider than its own group. A terminal with no
+`group` set finds no siblings (participates in no discovery) rather than
+erroring.
+
+**Parameters:**
+- `depth` (integer, optional, `>= 1`): how many leading elements of the terminal's own group to match against. Omit for the widest scope the terminal is allowed to see (its full own group). The server clamps this to at most `len(own group)` — it can never be widened past it. `depth=0` (or negative) is rejected with `422` rather than silently reinterpreted as an unscoped, all-terminals query.
+
+**Response:** Array of sibling objects (200 OK)
+```json
+[
+  {
+    "id": "string",
+    "group": ["string", "..."],
+    "metadata": {"...": "..."} | null,
+    "status": "idle|processing|completed|waiting_user_answer|error|unknown"
+  }
+]
+```
+
+**Note:** `status` is a live, point-in-time snapshot, not a delivery guarantee — a handoff terminal can complete and delete itself between this call returning and a caller's follow-up message to it, so callers should still expect sends to an apparently-live sibling to occasionally fail.
+
+**Note:** sibling `metadata` is set by the worker's own running agent (via `update_metadata`) with no operator review in the loop — treat it as untrusted content, the same trust domain as an inbound `send_message` body, not as trusted server data.
+
+**Errors:** `404` if `terminal_id` does not exist.
 
 ---
 

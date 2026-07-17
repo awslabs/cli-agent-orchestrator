@@ -360,12 +360,42 @@ class TestListSiblingsDepthClamping:
 
         mock_list_prefix.assert_called_once_with("caller-1", ["tenant_1"])
 
+    @patch(f"{_TS}.status_monitor")
     @patch(f"{_TS}.list_siblings_by_group_prefix")
     @patch(f"{_TS}.get_terminal_group")
-    def test_returns_prefix_match_results_unchanged(self, mock_get_group, mock_list_prefix):
+    def test_returns_prefix_match_results_unchanged(
+        self, mock_get_group, mock_list_prefix, mock_status_monitor
+    ):
         mock_get_group.return_value = ["tenant_1"]
         mock_list_prefix.return_value = [{"id": "sib-1", "group": ["tenant_1"], "metadata": None}]
+        mock_status_monitor.get_status.return_value = MagicMock(value="idle")
 
         result = list_siblings("caller-1", depth=1)
 
-        assert result == [{"id": "sib-1", "group": ["tenant_1"], "metadata": None}]
+        assert result == [
+            {"id": "sib-1", "group": ["tenant_1"], "metadata": None, "status": "idle"}
+        ]
+
+    @patch(f"{_TS}.status_monitor")
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_group")
+    def test_status_is_a_live_snapshot_per_sibling(
+        self, mock_get_group, mock_list_prefix, mock_status_monitor
+    ):
+        """tedswinyar, PR #433 review: siblings include a live status snapshot
+        (point-in-time, not a delivery guarantee -- see the docstring) so a
+        discovering agent can skip an obviously-finished sibling. Each
+        sibling's status is looked up individually, not assumed uniform."""
+        mock_get_group.return_value = ["tenant_1"]
+        mock_list_prefix.return_value = [
+            {"id": "sib-1", "group": ["tenant_1"], "metadata": None},
+            {"id": "sib-2", "group": ["tenant_1"], "metadata": None},
+        ]
+        statuses = {"sib-1": MagicMock(value="completed"), "sib-2": MagicMock(value="idle")}
+        mock_status_monitor.get_status.side_effect = lambda terminal_id: statuses[terminal_id]
+
+        result = list_siblings("caller-1", depth=1)
+
+        assert [s["status"] for s in result] == ["completed", "idle"]
+        mock_status_monitor.get_status.assert_any_call("sib-1")
+        mock_status_monitor.get_status.assert_any_call("sib-2")

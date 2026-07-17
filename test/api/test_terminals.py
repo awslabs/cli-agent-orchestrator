@@ -7,6 +7,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.constants import (
+    TERMINAL_GROUP_ELEMENT_MAX_LEN,
+    TERMINAL_GROUP_MAX_ELEMENTS,
+    TERMINAL_METADATA_MAX_BYTES,
+)
 from cli_agent_orchestrator.models.terminal import Terminal
 
 
@@ -1004,3 +1009,119 @@ class TestListSiblingsEndpoint:
 
             assert response.status_code == 200
             assert response.json() == []
+
+
+class TestGroupSizeCap:
+    """call-me-ram, PR #433 review: group elements/count are agent-writable
+    (via update_group) and must be capped -- an uncapped array lets a worker
+    grow the terminals.group TEXT column arbitrarily, amplified into every
+    sibling's list_siblings response."""
+
+    def test_group_at_cap_accepted(self, client):
+        group = [f"g{i}" for i in range(TERMINAL_GROUP_MAX_ELEMENTS)]
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=group)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": group})
+
+            assert response.status_code == 200
+            mock_svc.update_group.assert_called_once_with("abcd1234", group)
+
+    def test_group_over_element_count_cap_rejected(self, client):
+        group = [f"g{i}" for i in range(TERMINAL_GROUP_MAX_ELEMENTS + 1)]
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.patch("/terminals/abcd1234/group", json={"group": group})
+
+            assert response.status_code == 422
+            mock_svc.update_group.assert_not_called()
+
+    def test_group_element_at_length_cap_accepted(self, client):
+        element = "x" * TERMINAL_GROUP_ELEMENT_MAX_LEN
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=[element])
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": [element]})
+
+            assert response.status_code == 200
+
+    def test_group_element_over_length_cap_rejected(self, client):
+        element = "x" * (TERMINAL_GROUP_ELEMENT_MAX_LEN + 1)
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.patch("/terminals/abcd1234/group", json={"group": [element]})
+
+            assert response.status_code == 422
+            mock_svc.update_group.assert_not_called()
+
+    def test_empty_group_not_subject_to_caps(self, client):
+        """Clearing the group ([]/null) must never be rejected by the caps
+        meant for growth, not clearing."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": []})
+
+            assert response.status_code == 200
+
+    def test_create_session_group_over_cap_rejected_with_422(self, client):
+        group = [f"g{i}" for i in range(TERMINAL_GROUP_MAX_ELEMENTS + 1)]
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                json={"group": group},
+            )
+
+            assert response.status_code == 422
+            mock_svc.create_session.assert_not_called()
+
+
+class TestMetadataSizeCap:
+    """call-me-ram, PR #433 review: metadata is a raw agent-writable
+    Dict[str, Any] (via update_metadata) and must be capped by encoded
+    bytes, following the WORKFLOW_MAX_SPEC_BYTES precedent."""
+
+    def test_metadata_at_byte_cap_accepted(self, client):
+        # Reserve room for the JSON envelope (quotes, braces, key) so the
+        # encoded dict lands at (not under) the cap.
+        padding = "x" * (TERMINAL_METADATA_MAX_BYTES - len('{"k": ""}'))
+        metadata = {"k": padding}
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(metadata=metadata)
+
+            response = client.patch("/terminals/abcd1234/metadata", json={"metadata": metadata})
+
+            assert response.status_code == 200
+
+    def test_metadata_over_byte_cap_rejected(self, client):
+        padding = "x" * TERMINAL_METADATA_MAX_BYTES
+        metadata = {"k": padding}
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.patch("/terminals/abcd1234/metadata", json={"metadata": metadata})
+
+            assert response.status_code == 422
+            mock_svc.update_metadata.assert_not_called()
+
+    def test_empty_metadata_not_subject_to_cap(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(metadata=None)
+
+            response = client.patch("/terminals/abcd1234/metadata", json={"metadata": {}})
+
+            assert response.status_code == 200
+
+    def test_create_session_metadata_over_cap_rejected_with_422(self, client):
+        metadata = {"k": "x" * TERMINAL_METADATA_MAX_BYTES}
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                json={"metadata": metadata},
+            )
+
+            assert response.status_code == 422
+            mock_svc.create_session.assert_not_called()
