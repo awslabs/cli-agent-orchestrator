@@ -78,11 +78,9 @@ export function GraphView({
   useEffect(() => {
     if (!app) return;
     let stop: (() => void) | undefined;
-    let mounted = true;
 
     // Register handlers BEFORE connect (lifecycle invariant).
     const unsubscribe = app.onToolResult((result) => {
-      if (!mounted) return;
       const snap = (result?.structuredContent ?? result) as
         GraphViewData | undefined;
       if (snap && Array.isArray(snap.nodes)) {
@@ -92,26 +90,21 @@ export function GraphView({
     });
 
     void app.connect().then(() => {
-      if (!mounted) return;
       stop = app.startPolling(
         "render_graph_view",
         POLL_INTERVAL_MS,
         (snap) => {
-          if (!mounted) return;
           if (snap && Array.isArray((snap as GraphViewData).nodes)) {
             setUnreachable(false);
             setSnapshot(snap as GraphViewData);
           }
         },
         { provider, scope, scope_id: scopeId },
-        () => {
-          if (mounted) setUnreachable(true);
-        },
+        () => setUnreachable(true),
       );
     });
 
     return () => {
-      mounted = false;
       unsubscribe();
       if (stop) stop();
     };
