@@ -107,13 +107,18 @@ async def test_overflow_recovery_replays_every_event(monkeypatch) -> None:
     await _settle()
 
     # First connection: drain the pre-gap prefix until the stream closes.
-    delivered = [event["id"] async for event in bus.drain(sub)]  # NOSONAR -- bus.drain() returns an async iterable
+    delivered = [
+        event["id"] async for event in bus.drain(sub)
+    ]  # NOSONAR -- bus.drain() returns an async iterable
     # Reconnect: replay everything after the last id the client actually saw.
     replayed = [event["id"] for event in log.after_id(delivered[-1])]
     observed = delivered + replayed
 
     missing = sorted(
-        set(published) - set(observed)  # NOSONAR -- set difference is the idiomatic way to compute missing event ids
+        set(published)
+        - set(
+            observed
+        )  # NOSONAR -- set difference is the idiomatic way to compute missing event ids
     )
     assert observed == published, f"overflow recovery lost {missing}"
 

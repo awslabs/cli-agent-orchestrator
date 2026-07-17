@@ -402,7 +402,9 @@ class _HasInputs(Protocol):
     inputs: Dict[str, "InputDecl"]
 
 
-def _validate_inputs(spec: _HasInputs, inputs: Dict[str, Any]) -> Dict[str, Any]:  # NOSONAR -- input validation state machine is intentionally branched
+def _validate_inputs(
+    spec: _HasInputs, inputs: Dict[str, Any]
+) -> Dict[str, Any]:  # NOSONAR -- input validation state machine is intentionally branched
     """Validate ``inputs`` against ``spec.inputs`` BEFORE any step runs (B3-BR-2).
 
     Every required input must be present; each value must match its declared type;
@@ -669,7 +671,9 @@ def _build_result(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRe
     )
 
 
-async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunResult:  # NOSONAR -- workflow drive loop is intentionally branched
+async def _drive(
+    record: RunRecord, order: List[WorkflowStep]
+) -> WorkflowRunResult:  # NOSONAR -- workflow drive loop is intentionally branched
     """Sequence ``record`` over ``order``, finalize, and aggregate (§1 steps 6-8).
 
     THE single execution path (B4-RD-5): ``start_run`` and

@@ -195,7 +195,9 @@ class ClaudeCodeProvider(BaseProvider):
         except Exception as e:
             raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
-    def _build_claude_command(self, profile: Optional["AgentProfile"] = _UNSET) -> str:  # NOSONAR -- command routing is intentionally branched
+    def _build_claude_command(
+        self, profile: Optional["AgentProfile"] = _UNSET
+    ) -> str:  # NOSONAR -- command routing is intentionally branched
         """Build Claude Code command with agent profile if provided.
 
         Returns properly escaped shell command string that can be safely sent via tmux.
