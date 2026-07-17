@@ -82,8 +82,8 @@ class TestInstallCommand:
             success=True,
             message="Agent 'developer' installed successfully",
             agent_name="developer",
-            context_file="/tmp/agent-context/developer.md",
-            agent_file="/tmp/copilot/developer.agent.md",
+            context_file="/tmp/agent-context/developer.md",  # NOSONAR -- test fixture path
+            agent_file="/tmp/copilot/developer.agent.md",  # NOSONAR -- test fixture path
             source_kind="name",
             provider="copilot_cli",
         )

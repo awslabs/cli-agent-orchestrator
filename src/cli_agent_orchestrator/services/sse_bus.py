@@ -72,7 +72,11 @@ class SseBus:
         self._subs: List[_Subscriber] = []
         self._lock = threading.Lock()
 
-    def publish(self, event: Dict) -> None:
+    def publish(  # NOSONAR
+        self, event: Dict
+    ) -> (
+        None
+    ):  # NOSONAR -- thread-safe event dispatch: nested queue-full handling is inherent to overflow semantics.
         """Deliver an event to every subscriber with available capacity.
 
         Thread-safe and non-blocking. ``asyncio.Queue`` is not thread-safe, and

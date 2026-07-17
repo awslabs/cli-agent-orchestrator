@@ -97,7 +97,7 @@ class StepCancelledError(Exception):
         self.terminal_id = terminal_id
 
 
-async def _wait_for_completion(
+async def _wait_for_completion(  # NOSONAR -- terminal status polling loop: state-machine branches are inherent to completion detection.
     terminal_id: str,
     timeout: float,
     cancel_event: Optional["asyncio.Event"] = None,

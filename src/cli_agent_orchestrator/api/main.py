@@ -462,12 +462,12 @@ def _reconcile_memory_at_startup() -> None:
     except Exception as exc:
         report = getattr(exc, "report", None)
         if report is not None:
-            logger.error(
+            logger.exception(
                 "%s; automatic memory repair was incomplete; run `cao memory repair --apply`",
                 report.summary_text(),
             )
         else:
-            logger.error(
+            logger.exception(
                 "automatic memory repair failed (%s); run `cao memory repair --apply`",
                 type(exc).__name__,
             )

@@ -715,7 +715,9 @@ async def test_resume_happy_materializes_and_deletes_temp(monkeypatch: pytest.Mo
     workflow_journal.insert_run(
         run_id="run-resume",
         workflow_name="wf",
-        spec_snapshot=json.dumps({"source": source, "path": "/tmp/wf.py"}),
+        spec_snapshot=json.dumps(
+            {"source": source, "path": "/tmp/wf.py"}
+        ),  # NOSONAR -- test fixture path
         inputs_json="{}",
         state="failed",
         started_at="2026-07-08T00:00:00Z",
@@ -751,7 +753,9 @@ async def test_resume_reads_inputs_json_and_delivers_verbatim(monkeypatch: pytes
     workflow_journal.insert_run(
         run_id="run-inputs",
         workflow_name="wf",
-        spec_snapshot=json.dumps({"source": "print('x')\n", "path": "/tmp/wf.py"}),
+        spec_snapshot=json.dumps(
+            {"source": "print('x')\n", "path": "/tmp/wf.py"}
+        ),  # NOSONAR -- test fixture path
         inputs_json=json.dumps(journaled),
         state="failed",
         started_at="2026-07-08T00:00:00Z",
@@ -778,7 +782,9 @@ async def test_resume_malformed_inputs_json_degrades_to_empty(monkeypatch: pytes
     workflow_journal.insert_run(
         run_id="run-badinputs",
         workflow_name="wf",
-        spec_snapshot=json.dumps({"source": "print('x')\n", "path": "/tmp/wf.py"}),
+        spec_snapshot=json.dumps(
+            {"source": "print('x')\n", "path": "/tmp/wf.py"}
+        ),  # NOSONAR -- test fixture path
         inputs_json="[not, a, dict]",  # non-object -> degrade to {}
         state="failed",
         started_at="2026-07-08T00:00:00Z",
@@ -1154,7 +1160,9 @@ def _seed_script_run(run_id: str, *, state: str = "running", generation: str = "
     workflow_journal.insert_run(
         run_id=run_id,
         workflow_name="wf",
-        spec_snapshot=json.dumps({"source": "print('x')\n", "path": "/tmp/wf.py"}),
+        spec_snapshot=json.dumps(
+            {"source": "print('x')\n", "path": "/tmp/wf.py"}
+        ),  # NOSONAR -- test fixture path
         inputs_json="{}",
         state=state,
         started_at="2026-07-08T00:00:00Z",

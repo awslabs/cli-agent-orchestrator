@@ -171,7 +171,10 @@ class TestValidateTierDispatch:
 class TestRunTierDispatch:
     def _script_spec(self, name="scriptwf"):
         return ScriptSpec(
-            name=name, path=f"/tmp/{name}.py", source=_GOOD_SCRIPT, content_hash="deadbeef"
+            name=name,
+            path=f"/tmp/{name}.py",  # NOSONAR -- test fixture path, not actual filesystem access
+            source=_GOOD_SCRIPT,
+            content_hash="deadbeef",
         )
 
     def test_script_happy_path_dispatches_to_run_script_workflow(self, client, monkeypatch):
