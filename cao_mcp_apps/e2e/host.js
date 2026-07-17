@@ -515,22 +515,23 @@
     if (!winInfo) return;
 
     const { id, method, params } = data;
-    const handlers = {
-      "ui/initialize": () => handleInitialize(winInfo, id),
-      "ui/notifications/initialized": () =>
-        handleNotificationsInitialized(winInfo),
-      "ui/update-model-context": () =>
-        handleUpdateModelContext(winInfo, id, params),
-      "tools/call": () =>
-        handleToolCall(winInfo, id, params.name, params.arguments || {}),
-    };
-    const handler = handlers[method];
-    if (handler) {
-      handler();
-      return;
-    }
-    if (id !== undefined && id !== null) {
-      sendUnknownMethodError(winInfo, id, method);
+    switch (method) {
+      case "ui/initialize":
+        handleInitialize(winInfo, id);
+        break;
+      case "ui/notifications/initialized":
+        handleNotificationsInitialized(winInfo);
+        break;
+      case "ui/update-model-context":
+        handleUpdateModelContext(winInfo, id, params);
+        break;
+      case "tools/call":
+        handleToolCall(winInfo, id, params.name, params.arguments || {});
+        break;
+      default:
+        if (id !== undefined && id !== null) {
+          sendUnknownMethodError(winInfo, id, method);
+        }
     }
   }
 
