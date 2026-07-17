@@ -791,6 +791,127 @@ class TestListSiblingsByGroupPrefix:
 
         assert [r["id"] for r in result] == ["exact"]
 
+    def test_corrupt_group_json_skipped_not_fatal_to_whole_query(self, test_db, caplog):
+        """tedswinyar, PR #433 review: a row with corrupt JSON in its group
+        column must be logged and skipped, not raise and fail discovery for
+        every OTHER terminal sharing the same prefix."""
+        import logging
+
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="corrupt",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    # Malformed JSON (unterminated array) but still matches the
+                    # SQL LIKE prefilter, so it reaches the Python decode step.
+                    group='["tenant_1", "project_5"',
+                ),
+                TerminalModel(
+                    id="good-1",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_1"]',
+                ),
+                TerminalModel(
+                    id="good-2",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_2"]',
+                ),
+            ],
+        )
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.clients.database"):
+            with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+                result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert {r["id"] for r in result} == {"good-1", "good-2"}
+        assert any("corrupt" in record.getMessage() for record in caplog.records)
+
+    def test_corrupt_group_json_decoding_to_non_list_is_also_skipped(self, test_db, caplog):
+        """Well-formed JSON that decodes to something other than a list (e.g.
+        a stray object) is exactly as unusable for prefix matching as a
+        JSONDecodeError, so it must be treated the same way -- logged and
+        skipped, not crash on the ``sibling_group[:depth]`` slice below.
+
+        This can't happen through the real write path today (both writers
+        always encode a list), so it's reached here by making the decode
+        itself return a dict for the corrupted row -- the same defense
+        that would trigger against a hand-edited DB row.
+        """
+        import json as real_json
+        import logging
+
+        corrupted_group_text = '["tenant_1", "project_5", "onlyme"]'
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="not-a-list",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group=corrupted_group_text,
+                ),
+                TerminalModel(
+                    id="good-1",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+            ],
+        )
+
+        _orig_loads = real_json.loads
+
+        def fake_loads(text):
+            if text == corrupted_group_text:
+                return {"tenant_1": "project_5"}  # decodes fine, but not a list
+            return _orig_loads(text)
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.clients.database"):
+            with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+                with patch("json.loads", side_effect=fake_loads):
+                    result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert [r["id"] for r in result] == ["good-1"]
+        assert any("corrupt" in record.getMessage() for record in caplog.records)
+
+    def test_corrupt_metadata_json_reports_sibling_with_metadata_none(self, test_db, caplog):
+        """A matching sibling with corrupt metadata JSON is still a REAL,
+        discoverable sibling -- only its metadata is unreadable, logged and
+        reported as None rather than dropping the whole sibling."""
+        import logging
+
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="corrupt-metadata",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                    metadata_json="{not valid json",
+                ),
+            ],
+        )
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.clients.database"):
+            with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+                result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert len(result) == 1
+        assert result[0]["id"] == "corrupt-metadata"
+        assert result[0]["metadata"] is None
+        assert any("corrupt" in record.getMessage() for record in caplog.records)
+
     def test_group_element_with_like_special_characters_matches_literally(self, test_db):
         """Group elements containing SQL LIKE wildcards (``%``, ``_``) must
         be matched as literal text, not interpreted as wildcards, in the SQL
@@ -1316,6 +1437,115 @@ class TestTerminalsSchemaMigration:
 
         db_mod._migrate_terminals_schema()
         db_mod._migrate_terminals_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
+        assert columns.count("group") == 1
+        assert columns.count("metadata") == 1
+
+    def test_real_production_upgrade_seeded_rows_survive_init_db(self, tmp_path, monkeypatch):
+        """tedswinyar, PR #433 review: every other migration test here starts
+        from an empty database and only checks the resulting schema. This is
+        the actual production-upgrade case -- a DB with SEVERAL pre-#432
+        terminal rows already in it (the shape right after #284's caller_id
+        migration, no group/metadata columns yet) -- exercised through the
+        real ``init_db()`` entry point (not the internal migration helper
+        directly) and read back through the real application read path
+        (``get_terminal_metadata``, not raw SQL), so this proves the whole
+        upgrade a running server actually performs, twice for idempotency.
+        """
+        import sqlite3
+
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "prod_upgrade.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE terminals ("
+                "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
+                "tmux_window TEXT NOT NULL, provider TEXT NOT NULL, "
+                "agent_profile TEXT, allowed_tools TEXT, shell_command TEXT, "
+                "caller_id TEXT, last_active TIMESTAMP)"
+            )
+            conn.executemany(
+                "INSERT INTO terminals "
+                "(id, tmux_session, tmux_window, provider, agent_profile, "
+                "allowed_tools, shell_command, caller_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        "aaaa1111",
+                        "cao-sess-1",
+                        "developer-0",
+                        "kiro_cli",
+                        "developer",
+                        '["send_message", "handoff"]',
+                        "bash",
+                        None,
+                    ),
+                    (
+                        "bbbb2222",
+                        "cao-sess-1",
+                        "reviewer-0",
+                        "claude_code",
+                        "reviewer",
+                        None,
+                        None,
+                        "aaaa1111",
+                    ),
+                    (
+                        "cccc3333",
+                        "cao-sess-2",
+                        "developer-1",
+                        "codex",
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                ],
+            )
+            conn.commit()
+
+        # A real server binds `engine`/`SessionLocal` to DATABASE_FILE once at
+        # import time -- point BOTH at the seeded legacy file so init_db()'s
+        # create_all/migrations and the subsequent application-level reads
+        # all operate on the same DB (not the process's real one).
+        new_engine = create_engine(
+            f"sqlite:///{db_file}", connect_args={"check_same_thread": False}
+        )
+        monkeypatch.setattr(db_mod, "engine", new_engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=new_engine))
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        def assert_seeded_rows_intact():
+            aaaa = db_mod.get_terminal_metadata("aaaa1111")
+            bbbb = db_mod.get_terminal_metadata("bbbb2222")
+            cccc = db_mod.get_terminal_metadata("cccc3333")
+
+            for row in (aaaa, bbbb, cccc):
+                assert row is not None
+                assert row["group"] is None, "pre-migration rows must read group as NULL"
+                assert row["metadata"] is None, "pre-migration rows must read metadata as NULL"
+
+            # Original pre-migration data must survive untouched.
+            assert aaaa["tmux_session"] == "cao-sess-1"
+            assert aaaa["agent_profile"] == "developer"
+            assert aaaa["allowed_tools"] == ["send_message", "handoff"]
+            assert bbbb["caller_id"] == "aaaa1111"
+            assert cccc["provider"] == "codex"
+
+        db_mod.init_db()
+        assert_seeded_rows_intact()
+
+        # Idempotency: a second real init_db() call (e.g. server restart)
+        # must not fail or corrupt the already-migrated rows.
+        db_mod.init_db()
+        assert_seeded_rows_intact()
 
         with sqlite3.connect(str(db_file)) as conn:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
