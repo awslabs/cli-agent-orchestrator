@@ -1950,18 +1950,22 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
         from cli_agent_orchestrator.services.script_lint import lint_script
 
         try:
-            # ``_safe_spec_path`` returns the resolved, contained path; every
-            # filesystem op below MUST use THIS value (not ``body.path``) so the
-            # resolve-then-contain check dominates the sink (CodeQL sanitizer
-            # requirement — it does not track taint through a re-derived path).
-            real_path = workflow_spec_service._safe_spec_path(body.path)
+            # Resolve and contain the path inline (CodeQL-recognized pattern:
+            # os.path.realpath + str.startswith against the safe base). This
+            # mirrors workflow_spec_service._safe_spec_path without crossing a
+            # helper boundary, so py/path-injection sees the sanitizer.
+            base_dir = workflow_spec_service._safe_dir(None)
+            user_path = body.path
+            candidate = user_path if os.path.isabs(user_path) else os.path.join(base_dir, user_path)
+            real_path = os.path.realpath(os.path.abspath(candidate))
+            if real_path != base_dir and not real_path.startswith(base_dir + os.sep):
+                raise ValueError(
+                    f"workflow spec path '{user_path}' escapes its validated directory"
+                )
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         try:
-            # real_path is sanitized by _safe_spec_path (resolve + containment).
-            # CodeQL's py/path-injection query does not track this custom
-            # sanitizer across the helper boundary; suppress the false positive.
-            with open(real_path, "rb") as fh:  # lgtm[py/path-injection]
+            with open(real_path, "rb") as fh:
                 # Capped read: an oversized file is rejected without ever
                 # being fully read into memory.
                 raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)

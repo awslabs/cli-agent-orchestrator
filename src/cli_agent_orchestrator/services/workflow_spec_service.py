@@ -574,11 +574,18 @@ def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> S
     ``list``/``get`` rendering (BR-6); it is a SEPARATE call from U4's
     run-path defensive re-check.
     """
-    real_path = _safe_spec_path(path, base_dir)
-    # real_path is sanitized by _safe_spec_path (resolve + containment).
-    # CodeQL's py/path-injection query does not track this custom
-    # sanitizer across the helper boundary; suppress the false positive.
-    with open(real_path, "rb") as fh:  # lgtm[py/path-injection]
+    # Resolve and contain the path inline (CodeQL-recognized pattern:
+    # os.path.realpath + str.startswith against a safe base). Repeating the
+    # check here — rather than trusting _safe_spec_path across a helper
+    # boundary — satisfies py/path-injection while preserving the same
+    # security semantics.
+    safe_base = _safe_dir(base_dir)
+    user_path = os.fspath(path)
+    candidate = user_path if os.path.isabs(user_path) else os.path.join(safe_base, user_path)
+    real_path = os.path.realpath(os.path.abspath(candidate))
+    if real_path != safe_base and not real_path.startswith(safe_base + os.sep):
+        raise ValueError(f"script spec path '{path}' escapes its validated directory")
+    with open(real_path, "rb") as fh:
         raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
         raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (short-circuited read)")
