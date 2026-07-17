@@ -20,9 +20,13 @@ _PACKAGE = "cli-agent-orchestrator"
 # whether) `cao update` can advance CAO to a newer version.
 _GIT = "git"  # git+<url>[?rev=...] — reinstall to fetch newer commits
 _REGISTRY = "registry"  # unpinned PyPI — `uv tool upgrade` advances it
-_REGISTRY_PINNED = "registry_pinned"  # exact `==` pin — needs @latest to unpin
+_REGISTRY_CONSTRAINED = "registry_constrained"  # any version constraint — @latest to unpin
 _DIRECTORY = "directory"  # local source tree — user must update + reinstall
 _PATH = "path"  # local wheel/artifact — user must rebuild + reinstall
+_EDITABLE = "editable"  # local editable clone — user must reinstall --editable
+
+# Local source kinds have no remote to advance; `cao update` prints guidance.
+_LOCAL_KINDS = (_DIRECTORY, _PATH, _EDITABLE)
 
 
 def _receipt_path() -> Optional[Path]:
@@ -83,10 +87,13 @@ def _classify_source(receipt: Optional[Path]) -> Tuple[str, Optional[str]]:
     """Classify how CAO was installed into ``(kind, detail)``.
 
     - ``(_GIT, "git+<url>[@rev]")`` — a git source string ready to reinstall.
-    - ``(_DIRECTORY, path)`` / ``(_PATH, path)`` — a local install location.
-    - ``(_REGISTRY_PINNED, "==x.y.z")`` — an exact-version registry pin.
-    - ``(_REGISTRY, None)`` — an unpinned/unknown registry install (the default
-      and the fallback for a missing/unparseable/wrong-shape receipt).
+    - ``(_DIRECTORY, path)`` / ``(_PATH, path)`` / ``(_EDITABLE, path)`` — a
+      local install location.
+    - ``(_REGISTRY_CONSTRAINED, "<spec>")`` — a registry install carrying ANY
+      version constraint (``==``, ``<``, ``~=``, …) that can hold it below the
+      latest release; needs the ``@latest`` unpin path.
+    - ``(_REGISTRY, None)`` — an unconstrained/unknown registry install (the
+      default and the fallback for a missing/unparseable/wrong-shape receipt).
     """
     if receipt is None:
         return (_REGISTRY, None)
@@ -110,10 +117,17 @@ def _classify_source(receipt: Optional[Path]) -> Tuple[str, Optional[str]]:
     path = _str_field(req, "path")
     if path:
         return (_PATH, path)
+    editable = _str_field(req, "editable")
+    if editable:
+        return (_EDITABLE, editable)
 
+    # ANY specifier (not just ``==``) can hold the install below the latest
+    # release — ``<2.4``, ``~=2.3``, combined constraints — and `uv tool upgrade`
+    # honours it and reports "Nothing to upgrade". Route every constraint through
+    # the ``@latest`` unpin path so `cao update` reaches the latest release.
     specifier = _str_field(req, "specifier")
-    if specifier and "==" in specifier:
-        return (_REGISTRY_PINNED, specifier)
+    if specifier:
+        return (_REGISTRY_CONSTRAINED, specifier)
     return (_REGISTRY, None)
 
 
@@ -123,24 +137,31 @@ def _build_command(kind: str, detail: Optional[str]) -> List[str]:
     - git: ``uv tool install <git-source> --upgrade --reinstall``. ``@main`` is
       a MOVING ref that ``uv tool upgrade`` treats as already satisfied, so
       ``--reinstall`` is required to fetch the latest commit.
-    - registry (unpinned): ``uv tool upgrade`` re-resolves to the latest release.
-    - registry (exact pin): ``uv tool upgrade`` is a no-op that reports "Nothing
-      to upgrade"; ``uv tool install <pkg>@latest --upgrade`` unpins to the
-      latest published release.
+    - registry (unconstrained): ``uv tool upgrade`` re-resolves to the latest.
+    - registry (constrained): ``uv tool upgrade`` honours the constraint and can
+      report "Nothing to upgrade"; ``uv tool install <pkg>@latest --upgrade``
+      unpins to the latest published release.
 
-    Local (directory/path) kinds have no remote to advance and are handled by
-    the command before reaching here.
+    Local (directory/path/editable) kinds have no remote to advance and are
+    handled by the command before reaching here.
     """
     if kind == _GIT and detail:
         return ["uv", "tool", "install", detail, "--upgrade", "--reinstall"]
-    if kind == _REGISTRY_PINNED:
+    if kind == _REGISTRY_CONSTRAINED:
         return ["uv", "tool", "install", f"{_PACKAGE}@latest", "--upgrade"]
     return ["uv", "tool", "upgrade", _PACKAGE]
 
 
 def _local_fix_hint(kind: str, location: str) -> str:
-    """User-facing remediation for a local (directory/path) install."""
+    """User-facing remediation for a local (directory/path/editable) install."""
     quoted = shlex.quote(location)
+    if kind == _EDITABLE:
+        # Preserve the editable install rather than converting it to a regular one.
+        return (
+            f"update the local source, then reinstall: "
+            f"uv tool install --editable {quoted} --reinstall "
+            f"(for a git checkout, first run: git -C {quoted} pull)"
+        )
     if kind == _DIRECTORY:
         # A directory source is not necessarily a git checkout, so show the
         # reinstall as the definite step and `git pull` only as the common case.
@@ -157,10 +178,11 @@ def update():
 
     Detects how CAO was installed (from uv's install receipt) and runs the
     matching uv command: a git install is reinstalled from its git source to
-    pick up the latest commit; an unpinned registry install is upgraded to the
-    latest published release; an exact-version pin is unpinned to the latest.
-    A local directory/path install can't be advanced remotely, so the command
-    prints the exact steps instead. Requires that CAO was installed as a uv tool.
+    pick up the latest commit; an unconstrained registry install is upgraded to
+    the latest published release; a version-constrained registry install is
+    unpinned to the latest. A local directory/path/editable install can't be
+    advanced remotely, so the command prints the exact steps instead. Requires
+    that CAO was installed as a uv tool.
     """
     if shutil.which("uv") is None:
         raise click.ClickException(
@@ -171,7 +193,7 @@ def update():
 
     kind, detail = _classify_source(_receipt_path())
 
-    if kind in (_DIRECTORY, _PATH):
+    if kind in _LOCAL_KINDS:
         # A local install has no remote to advance from; `uv tool upgrade` would
         # be a silent no-op that then reports success. Tell the user the exact
         # steps instead of pretending to update.
@@ -185,7 +207,7 @@ def update():
 
     if kind == _GIT:
         source_desc = f"git ({detail})"
-    elif kind == _REGISTRY_PINNED:
+    elif kind == _REGISTRY_CONSTRAINED:
         source_desc = f"the registry (unpinning from {detail})"
     else:
         source_desc = "the registry"

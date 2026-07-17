@@ -6,10 +6,11 @@ from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.update import _DIRECTORY as _DIR
 from cli_agent_orchestrator.cli.commands.update import (
+    _EDITABLE,
     _GIT,
     _PATH,
     _REGISTRY,
-    _REGISTRY_PINNED,
+    _REGISTRY_CONSTRAINED,
     _build_command,
     _classify_source,
     _receipt_path,
@@ -41,16 +42,22 @@ _REGISTRY_RECEIPT = """
 requirements = [{ name = "cli-agent-orchestrator" }]
 """
 
-# Exact-version pin (verified real shape via `uv tool install ruff==0.11.0`).
-_REGISTRY_PINNED_RECEIPT = """
+# Version-constrained registry installs (verified real shapes with uv, e.g.
+# `uv tool install ruff==0.11.0` / `'ruff<0.12'`). ANY constraint can hold the
+# install below the latest release, so all route through the @latest unpin path.
+_REGISTRY_EXACT_PIN_RECEIPT = """
 [tool]
 requirements = [{ name = "cli-agent-orchestrator", specifier = "==2.1.0" }]
 """
 
-# A bounded, non-exact specifier is treated as an ordinary registry install.
-_REGISTRY_BOUNDED_RECEIPT = """
+_REGISTRY_UPPER_BOUND_RECEIPT = """
 [tool]
-requirements = [{ name = "cli-agent-orchestrator", specifier = ">=2.0.0" }]
+requirements = [{ name = "cli-agent-orchestrator", specifier = "<2.4" }]
+"""
+
+_REGISTRY_COMPATIBLE_RELEASE_RECEIPT = """
+[tool]
+requirements = [{ name = "cli-agent-orchestrator", specifier = "~=2.3" }]
 """
 
 _DIRECTORY_RECEIPT = """
@@ -61,6 +68,12 @@ requirements = [{ name = "cli-agent-orchestrator", directory = "/home/me/cli-age
 _PATH_RECEIPT = """
 [tool]
 requirements = [{ name = "cli-agent-orchestrator", path = "/home/me/dist/cli_agent_orchestrator-2.3.0-py3-none-any.whl" }]
+"""
+
+# Editable clone (verified real shape via `uv tool install --editable .`).
+_EDITABLE_RECEIPT = """
+[tool]
+requirements = [{ name = "cli-agent-orchestrator", editable = "/home/me/cli-agent-orchestrator" }]
 """
 
 # Structurally corrupt but syntactically valid TOML (wrong shapes).
@@ -164,17 +177,26 @@ class TestClassifySource:
             "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
         )
 
-    def test_registry_unpinned(self, tmp_path):
+    def test_registry_unconstrained(self, tmp_path):
         assert _classify_source(_write(tmp_path, _REGISTRY_RECEIPT)) == (_REGISTRY, None)
 
-    def test_registry_bounded_specifier_is_plain_registry(self, tmp_path):
-        # A non-exact bound (>=) still upgrades cleanly via `uv tool upgrade`.
-        assert _classify_source(_write(tmp_path, _REGISTRY_BOUNDED_RECEIPT)) == (_REGISTRY, None)
-
-    def test_registry_exact_pin(self, tmp_path):
-        assert _classify_source(_write(tmp_path, _REGISTRY_PINNED_RECEIPT)) == (
-            _REGISTRY_PINNED,
+    def test_registry_exact_pin_is_constrained(self, tmp_path):
+        assert _classify_source(_write(tmp_path, _REGISTRY_EXACT_PIN_RECEIPT)) == (
+            _REGISTRY_CONSTRAINED,
             "==2.1.0",
+        )
+
+    def test_registry_upper_bound_is_constrained(self, tmp_path):
+        # `<2.4` can hold the install below latest — must NOT be plain registry.
+        assert _classify_source(_write(tmp_path, _REGISTRY_UPPER_BOUND_RECEIPT)) == (
+            _REGISTRY_CONSTRAINED,
+            "<2.4",
+        )
+
+    def test_registry_compatible_release_is_constrained(self, tmp_path):
+        assert _classify_source(_write(tmp_path, _REGISTRY_COMPATIBLE_RELEASE_RECEIPT)) == (
+            _REGISTRY_CONSTRAINED,
+            "~=2.3",
         )
 
     def test_directory(self, tmp_path):
@@ -187,6 +209,12 @@ class TestClassifySource:
         assert _classify_source(_write(tmp_path, _PATH_RECEIPT)) == (
             _PATH,
             "/home/me/dist/cli_agent_orchestrator-2.3.0-py3-none-any.whl",
+        )
+
+    def test_editable(self, tmp_path):
+        assert _classify_source(_write(tmp_path, _EDITABLE_RECEIPT)) == (
+            _EDITABLE,
+            "/home/me/cli-agent-orchestrator",
         )
 
     # --- robustness: malformed / wrong-shape receipts degrade to registry ---
@@ -230,8 +258,8 @@ class TestBuildCommand:
     def test_registry_upgrades(self):
         assert _build_command(_REGISTRY, None) == ["uv", "tool", "upgrade", _PACKAGE]
 
-    def test_pinned_registry_unpins_via_at_latest(self):
-        assert _build_command(_REGISTRY_PINNED, "==2.1.0") == [
+    def test_constrained_registry_unpins_via_at_latest(self):
+        assert _build_command(_REGISTRY_CONSTRAINED, "<2.4") == [
             "uv",
             "tool",
             "install",
@@ -253,17 +281,17 @@ class TestUpdateCommand:
         assert "up to date" in result.output
 
     @patch(f"{_MOD}.subprocess.run")
-    @patch(f"{_MOD}._classify_source", return_value=(_REGISTRY_PINNED, "==2.1.0"))
+    @patch(f"{_MOD}._classify_source", return_value=(_REGISTRY_CONSTRAINED, "<2.4"))
     @patch(f"{_MOD}._receipt_path", return_value=None)
     @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
-    def test_pinned_registry_unpins(self, _which, _rp, _cls, mock_run):
+    def test_constrained_registry_unpins(self, _which, _rp, _cls, mock_run):
         mock_run.return_value = _completed(0)
         result = CliRunner().invoke(update, [])
         assert result.exit_code == 0
         mock_run.assert_called_once_with(
             ["uv", "tool", "install", f"{_PACKAGE}@latest", "--upgrade"]
         )
-        assert "unpinning from ==2.1.0" in result.output
+        assert "unpinning from <2.4" in result.output
 
     @patch(f"{_MOD}.subprocess.run")
     @patch(
@@ -312,6 +340,21 @@ class TestUpdateCommand:
         assert "/home/me/dist/cao.whl" in result.output
         assert "rebuild" in result.output
         assert "git -C" not in result.output  # no git pull for a wheel
+        mock_run.assert_not_called()
+
+    @patch(f"{_MOD}.subprocess.run")
+    @patch(f"{_MOD}._classify_source", return_value=(_EDITABLE, "/home/me/cli-agent-orchestrator"))
+    @patch(f"{_MOD}._receipt_path")
+    @patch(f"{_MOD}.shutil.which", return_value="/usr/bin/uv")
+    def test_editable_informs_without_running_uv(self, _which, _rp, _cls, mock_run):
+        result = CliRunner().invoke(update, [])
+        assert result.exit_code != 0
+        assert "local editable" in result.output
+        # Guidance must preserve the editable install (not convert to regular).
+        assert (
+            "uv tool install --editable /home/me/cli-agent-orchestrator --reinstall"
+            in result.output
+        )
         mock_run.assert_not_called()
 
     @patch(f"{_MOD}.subprocess.run")

@@ -20,9 +20,10 @@ different upgrade actions:
 |---|---|---|---|
 | `uv tool install git+…@main` (recommended) | `git = "…?rev=main"` | `uv tool install <git-source> --upgrade --reinstall` | `@main` is a **moving ref**. `uv tool upgrade` treats it as already satisfied ("Nothing to upgrade") and never fetches newer commits, so `--reinstall` is required. |
 | `uv tool install cli-agent-orchestrator` | `{ name = "…" }` | `uv tool upgrade cli-agent-orchestrator` | Re-resolves to the latest published release. |
-| `uv tool install cli-agent-orchestrator==X.Y.Z` | `specifier = "==X.Y.Z"` | `uv tool install cli-agent-orchestrator@latest --upgrade` | An **exact pin** makes `uv tool upgrade` a no-op that still reports success; `@latest` unpins to the newest release. |
+| `uv tool install 'cli-agent-orchestrator==X.Y.Z'` (or any constraint: `<`, `~=`, …) | `specifier = "…"` | `uv tool install cli-agent-orchestrator@latest --upgrade` | **Any version constraint** can hold the install below the latest release, making `uv tool upgrade` a no-op that still reports success; `@latest` unpins to the newest release. |
 | `uv tool install .` (local clone) | `directory = "/path"` | *(nothing — prints guidance)* | A local source tree has no remote to advance. `cao update` tells you to update the source and reinstall. |
 | `uv tool install ./dist/x.whl` | `path = "/path/x.whl"` | *(nothing — prints guidance)* | A built wheel is a frozen artifact. `cao update` tells you to rebuild and reinstall. |
+| `uv tool install --editable .` | `editable = "/path"` | *(nothing — prints guidance)* | An editable clone has no remote to advance. `cao update` tells you to update the source and reinstall **with `--editable`** to preserve the editable install. |
 
 For local installs, `cao update` exits non-zero and prints the exact commands
 to run yourself, e.g. for a directory:
