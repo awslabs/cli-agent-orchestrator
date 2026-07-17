@@ -34,10 +34,10 @@ SERVER_LOG="$(mktemp -t agui-demo-server.XXXXXX.log)"
 
 cleanup() {
     local code=$?
-    if [ "${DEMO_FLEET}" = "1" ]]; then
+    if [[ "${DEMO_FLEET}" = "1" ]]; then
         cao shutdown --session "cao-${FLEET_SESSION}" >/dev/null 2>&1 || true
     fi
-    [ -n "${SERVER_PID}" ] && kill "${SERVER_PID}" >/dev/null 2>&1 || true
+    [[ -n "${SERVER_PID}" ]] && kill "${SERVER_PID}" >/dev/null 2>&1 || true
     rm -f "${SERVER_LOG}"
     exit "${code}"
 }
