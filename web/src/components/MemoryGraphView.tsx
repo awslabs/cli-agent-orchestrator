@@ -95,7 +95,7 @@ function useGraphData(
   const [error, setError] = useState<string | null>(null);
   const fetchSeqRef = useRef(0);
 
-  const refresh = async () => {
+  const refresh = useCallback(async () => {
     if (!graphable) return;
     const seq = ++fetchSeqRef.current;
     const isStale = () => fetchSeqRef.current !== seq;
@@ -112,14 +112,13 @@ function useGraphData(
     } finally {
       if (!isStale()) setLoading(false);
     }
-  };
+  }, [graphable, scope, sid]);
 
   useEffect(() => {
     setView(null);
     setError(null);
-    if (graphable) refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope, scopeId, graphable, sid]);
+    refresh();
+  }, [refresh]);
 
   return { view, loading, error, refresh };
 }
@@ -132,32 +131,37 @@ function useNodeTopic() {
   } | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
 
-  const openTopic = async (nodeId: string, scope: string, scopeId: string) => {
-    const sid = scope === "project" ? scopeId || undefined : undefined;
-    setSelectedNode(nodeId);
-    setDetail(null);
-    setDetailError(null);
-    try {
-      const data = await api.getMemory(nodeId, scope || undefined, sid);
-      setSelectedNode((current) => {
-        if (current === nodeId) setDetail({ id: nodeId, data });
-        return current;
-      });
-    } catch (e) {
-      const err = e as ApiError;
-      setSelectedNode((current) => {
-        if (current === nodeId)
-          setDetailError(err.detail || err.message || "Failed to load memory");
-        return current;
-      });
-    }
-  };
+  const openTopic = useCallback(
+    async (nodeId: string, scope: string, scopeId: string) => {
+      const sid = scope === "project" ? scopeId || undefined : undefined;
+      setSelectedNode(nodeId);
+      setDetail(null);
+      setDetailError(null);
+      try {
+        const data = await api.getMemory(nodeId, scope || undefined, sid);
+        setSelectedNode((current) => {
+          if (current === nodeId) setDetail({ id: nodeId, data });
+          return current;
+        });
+      } catch (e) {
+        const err = e as ApiError;
+        setSelectedNode((current) => {
+          if (current === nodeId)
+            setDetailError(
+              err.detail || err.message || "Failed to load memory",
+            );
+          return current;
+        });
+      }
+    },
+    [],
+  );
 
-  const reset = () => {
+  const reset = useCallback(() => {
     setSelectedNode(null);
     setDetail(null);
     setDetailError(null);
-  };
+  }, []);
 
   return { selectedNode, detail, detailError, openTopic, reset };
 }
@@ -265,7 +269,7 @@ function useGraphExport(
   const { showSnackbar } = useStore();
   const [exporting, setExporting] = useState(false);
 
-  const exportGraph = async () => {
+  const exportGraph = useCallback(async () => {
     if (!hasGraph) return;
     setExporting(true);
     try {
@@ -285,7 +289,7 @@ function useGraphExport(
     } finally {
       setExporting(false);
     }
-  };
+  }, [hasGraph, scope, sid, showSnackbar]);
 
   return { exporting, exportGraph };
 }
