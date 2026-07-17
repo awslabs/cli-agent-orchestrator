@@ -1772,7 +1772,7 @@ async def exit_terminal(
         "the live terminal (read it as a field; never regex-scrape `message`)."
     ),
 )
-async def run_step(
+async def run_step(  # NOSONAR -- step dispatch endpoint: complexity comes from structured exception mapping to HTTP status/detail.
     request: Request,
     body: RunStepRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),

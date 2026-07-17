@@ -173,7 +173,9 @@ class TestSendKeysLogRedaction:
     def test_info_log_omits_payload(self, client, mock_subprocess, mock_uuid, caplog):
         import logging
 
-        secret = "API_TOKEN=super-secret-value"
+        secret = (
+            "API_TOKEN=super-secret-value"  # NOSONAR -- test fixture value, not a real credential
+        )
         with caplog.at_level(logging.INFO, logger="cli_agent_orchestrator.clients.tmux"):
             client.send_keys("sess", "win", f"launch --env {secret}")
 

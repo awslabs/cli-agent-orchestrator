@@ -33,7 +33,7 @@ class _FakeBus:
         return object()
 
     def unregister(self, queue):
-        pass
+        pass  # no-op: test fake does not need to clean up a real queue
 
     async def drain(self, queue):
         for event in self._events:

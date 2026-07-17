@@ -85,7 +85,7 @@ if [ "${DEMO_FLEET}" = "1" ]; then
         echo "[agui-demo] fleet launch failed (continuing; the emit_ui showcase is independent)" >&2
 fi
 
-if [ "${RUN_SHOWCASE}" = "1" ]; then
+if [[ "${RUN_SHOWCASE}" == "1" ]]; then
     echo "[agui-demo] running showcase.sh against the live server" >&2
     CAO_AGUI_BASE="${BASE}" "${REPO_ROOT}/examples/agui-dashboard/showcase.sh"
 fi

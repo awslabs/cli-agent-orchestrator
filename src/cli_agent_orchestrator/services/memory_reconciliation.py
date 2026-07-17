@@ -217,7 +217,11 @@ def _first_symlink_component(path: Path, base: Path) -> Optional[Path]:
     return None
 
 
-def discover_canonical_scope_dirs(base_dir: Path) -> tuple[tuple[str, Optional[str], Path], ...]:
+def discover_canonical_scope_dirs(  # NOSONAR
+    base_dir: Path,
+) -> tuple[
+    tuple[str, Optional[str], Path], ...
+]:  # NOSONAR -- directory-discovery helper: nested iteration over scope containers is inherent to the traversal.
     """Discover canonical scope containers without SQLite or index seeds."""
     discovered: set[tuple[str, Optional[str], Path]] = set()
     global_container = base_dir / "global"

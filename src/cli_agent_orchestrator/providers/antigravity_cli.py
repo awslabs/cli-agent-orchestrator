@@ -400,7 +400,7 @@ class AntigravityCliProvider(BaseProvider):
             # names behind and block terminal teardown.
             self._mcp_server_names = []
 
-    def _handle_startup_dialog(
+    def _handle_startup_dialog(  # NOSONAR -- startup dialog dismissal loop; sequential if/elif branches handle trust, survey, and ready footer.
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
     ) -> None:
         """Dismiss agy's blocking startup dialogs (workspace-trust, survey).

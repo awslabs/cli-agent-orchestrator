@@ -93,7 +93,7 @@ grep -aE '^event:|rejected_component' "${FRAMES}" | head -40 || true
 FRAME_COUNT=$(grep -ac '^event: GENERATIVE_UI' "${FRAMES}" || true)
 
 echo
-if [ "${fail}" -eq 0 ] && [ "${FRAME_COUNT}" -ge 6 ]; then
+if [[ "${fail}" -eq 0 && "${FRAME_COUNT}" -ge 6 ]]; then
     echo "[showcase] PASS: 6 components accepted (HTTP 200), iframe refused (HTTP 400), ${FRAME_COUNT} GENERATIVE_UI frames on the live stream."
 else
     echo "[showcase] FAIL: emit_mismatch=${fail}, generative_ui_frames=${FRAME_COUNT} (need 0 mismatches and >=6 frames)." >&2
