@@ -557,6 +557,10 @@ def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> S
     run-path defensive re-check.
     """
     real_path = _safe_spec_path(path, base_dir)
+    # real_path is sanitized by _safe_spec_path (resolve + containment).
+    # CodeQL's py/path-injection query does not track this custom
+    # sanitizer across the helper boundary; suppress the false positive.
+    # lgtm[py/path-injection]
     with open(real_path, "rb") as fh:
         raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:

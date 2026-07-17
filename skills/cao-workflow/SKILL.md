@@ -147,7 +147,7 @@ explicit, stable `step_id`**. The sequential `call-N` counter fallback is race-f
 deterministic across runs under concurrent scheduling — so resume would replay the wrong
 results. Iterate over `sorted()` inputs so the mapping from item → step_id is stable.
 
-Default `max_workers=2` for `claude_code` (measured: 4 starved the heaviest lens). Expose it as
+Default `max_workers=2` for `claude_code` (measured: 4 starved the heaviest workload). Expose it as
 a tunable input; higher values are fine when steps are light.
 
 ### R2 — Secrets as references, never literals

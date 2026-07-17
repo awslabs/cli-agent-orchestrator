@@ -1958,6 +1958,10 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         try:
+            # real_path is sanitized by _safe_spec_path (resolve + containment).
+            # CodeQL's py/path-injection query does not track this custom
+            # sanitizer across the helper boundary; suppress the false positive.
+            # lgtm[py/path-injection]
             with open(real_path, "rb") as fh:
                 # Capped read: an oversized file is rejected without ever
                 # being fully read into memory.
@@ -2001,7 +2005,10 @@ async def get_workflow_endpoint(name: str) -> Dict:
     (a same-stem cross-tier sibling, BR-2/BR-3) maps to 409, checked BEFORE
     the bare ``ValueError`` arm (it is a ``ValueError`` subclass).
     """
-    from cli_agent_orchestrator.models.workflow import TierCollisionError
+    from cli_agent_orchestrator.models.workflow import (
+        ScriptSpec,
+        TierCollisionError,
+    )
     from cli_agent_orchestrator.services import workflow_spec_service
 
     try:
@@ -2016,7 +2023,14 @@ async def get_workflow_endpoint(name: str) -> Dict:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    return spec.model_dump()
+    data = spec.model_dump()
+    if isinstance(spec, ScriptSpec):
+        # Keep the response YAML-shaped for backward compatibility: the CLI
+        # expects mode/steps/description fields even for script-tier specs.
+        data["mode"] = "script"
+        data["steps"] = []
+        data.setdefault("description", "")
+    return data
 
 
 @app.delete("/workflows/{name}")
@@ -2080,7 +2094,7 @@ async def record_step_output_endpoint(
 # WorkflowEngineError -> 500. Narrow exceptions in the service; mapped here.
 
 
-@app.post("/workflows/runs")
+@app.post("/workflows/runs", responses={422: {"description": "Script lint findings"}})
 async def start_workflow_run_endpoint(
     body: WorkflowRunRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -2247,7 +2261,10 @@ async def cancel_workflow_run_endpoint(
     return {"success": True, "run_id": run_id}
 
 
-@app.post("/workflows/runs/{run_id}/resume")
+@app.post(
+    "/workflows/runs/{run_id}/resume",
+    responses={422: {"description": "Resume journal is corrupt"}},
+)
 async def resume_workflow_run_endpoint(
     run_id: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -2309,6 +2326,24 @@ async def resume_workflow_run_endpoint(
 # which raise KeyError for an unregistered name (mapped to 404 here).
 
 
+def _reject_private_graph_scope(filters: Dict[str, str]) -> None:
+    """Raise 400 if a graph request targets a private memory scope.
+
+    Private tiers (session/agent) must not be projected or exported through
+    the graph API. This helper is shared by the read and export routes so the
+    check stays identical and cannot drift.
+    """
+    scope = filters.get("scope")
+    if scope is not None and scope.lower() in (
+        MemoryScope.SESSION.value,
+        MemoryScope.AGENT.value,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{scope}' is private and cannot be read via the graph API",
+        )
+
+
 @app.get("/graph/{provider}")
 async def get_graph_endpoint(
     provider: str,
@@ -2335,21 +2370,8 @@ async def get_graph_endpoint(
     """
     filters = dict(request.query_params)
 
-    # Private-scope gate (D5): the graph route takes ``scope`` as a query
-    # string, so compare its value against the private MemoryScope values.
-    # Mirrors /memory/export's MemoryScope.SESSION/AGENT refusal. The check is
-    # case-insensitive so ``scope=Session`` / ``scope=AGENT`` can't slip past;
-    # only this local comparison is normalized — the raw value is still
-    # forwarded to the provider in ``filters`` unchanged.
-    requested_scope = filters.get("scope")
-    if requested_scope is not None and requested_scope.lower() in (
-        MemoryScope.SESSION.value,
-        MemoryScope.AGENT.value,
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"scope '{requested_scope}' is private and cannot be read via the graph API",
-        )
+    # Private-scope gate (D5): shared helper for read and export routes.
+    _reject_private_graph_scope(filters)
 
     try:
         inst = get_provider(provider)
@@ -2386,6 +2408,10 @@ async def export_graph_endpoint(
     kept consistent with the ValueError mapping rather than leaking a 500.
     """
     filters = dict(request.query_params)
+
+    # Private-scope gate (D5): export must reject session/agent scopes too.
+    _reject_private_graph_scope(filters)
+
     try:
         prov = get_provider(provider)
         sink = get_sink(body.sink)
