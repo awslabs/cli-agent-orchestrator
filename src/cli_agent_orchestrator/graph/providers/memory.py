@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 # per-instance cache would never hit). DELIBERATE reversal of the original
 # "lint-on-demand, no caching" ADR — see graph/cache.py for the perf finding
 # (ripgrep stale_claim ~20s + LLM ~8.5s ⇒ ~30s typical, up to ~148s under
-# load, past the frontend's 120s timeout). Keyed by (provider, scope, scope_id).
+# load, past the frontend's 120s timeout). Keyed by (base_dir, provider, scope,
+# scope_id) so distinct stores never share an entry.
 _CACHE = GraphViewCache()
 
 
@@ -57,7 +58,7 @@ class MemoryGraphProvider(GraphProvider):
         raw_scope_id = filters.get("scope_id")
         scope_id: Optional[str] = None if raw_scope_id is None else str(raw_scope_id)
 
-        key = ("memory", scope, scope_id)
+        key = (str(self._svc.base_dir), "memory", scope, scope_id)
         view, cached, as_of = await _CACHE.get_or_build(key, lambda: self._build(scope, scope_id))
         # Re-wrap with fresh cache provenance without mutating the cached
         # instance's own meta (the same GraphView object is served to every hit).

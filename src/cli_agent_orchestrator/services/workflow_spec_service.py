@@ -31,7 +31,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Union, cast
+from typing import Callable, Dict, List, Optional, Tuple, Union, cast
 
 import yaml
 
@@ -311,6 +311,39 @@ def upsert_index(spec: Union[WorkflowSpec, ScriptSpec], source_path: str) -> Non
         conn.commit()
 
 
+def _index_one(
+    path: str,
+    safe_dir: str,
+    load: Callable[[str, str], Union[WorkflowSpec, ScriptSpec]],
+    skip_exceptions: Tuple[type, ...],
+    label: str,
+) -> bool:
+    """Resolve ``path`` under ``safe_dir``, load it, and upsert the index.
+
+    Centralizes the load/validate/skip/index flow shared by the YAML and
+    Python rebuild loops. Returns ``True`` when a row is indexed.
+    """
+    try:
+        # Bind containment to the SAME dir we globbed from (not WORKFLOW_SPEC_DIR)
+        # so a caller-supplied scan_dir resolves its own specs. The glob string
+        # is untrusted until re-validated; the resolved realpath is the ONLY
+        # value stored in the index.
+        real_path = _safe_spec_path(path, base_dir=safe_dir)
+        spec = load(real_path, safe_dir)
+    except skip_exceptions as e:
+        logger.warning("rebuild: skipping %s spec %s: %s", label, path, e)
+        return False
+    upsert_index(spec, real_path)
+    return True
+
+
+def _load_script_for_index(real_path: str, safe_dir: str) -> ScriptSpec:
+    """Load a Python script spec, raising TierCollisionError when it collides."""
+    stem = _stem_of(real_path)
+    _check_tier_collision(stem, safe_dir)
+    return _read_script_spec(real_path, stem, base_dir=safe_dir)
+
+
 def rebuild_index_from_files(scan_dir: Optional[str] = None) -> int:
     """Full-rebuild ``workflow_index`` from the spec files in ``scan_dir`` (C1a, A2).
 
@@ -334,38 +367,23 @@ def rebuild_index_from_files(scan_dir: Optional[str] = None) -> int:
         conn.commit()
     rows = 0
     for path in yaml_paths:
-        try:
-            # Bind containment to the SAME dir we globbed from (not WORKFLOW_SPEC_DIR)
-            # so a caller-supplied scan_dir resolves its own specs. The glob
-            # string itself is untrusted until re-validated — resolve it via
-            # _safe_spec_path and store THAT (not the raw glob string) in the
-            # index, matching the .py loop below.
-            real_path = _safe_spec_path(path, base_dir=safe_dir)
-            spec = load_and_validate(real_path, base_dir=safe_dir)
-        except (ValueError, FileNotFoundError) as e:
-            logger.warning("rebuild: skipping unparseable spec %s: %s", path, e)
-            continue
-        upsert_index(spec, real_path)
-        rows += 1
+        if _index_one(
+            path,
+            safe_dir,
+            load_and_validate,
+            (ValueError, FileNotFoundError),
+            "unparseable YAML",
+        ):
+            rows += 1
     for path in py_paths:
-        stem = _stem_of(path)
-        try:
-            _check_tier_collision(stem, safe_dir)
-        except TierCollisionError as e:
-            logger.warning("rebuild: skipping colliding script spec %s: %s", path, e)
-            continue
-        try:
-            # Bind containment to the SAME dir we globbed from, mirroring the
-            # YAML loop above — the glob string is untrusted until re-validated
-            # against safe_dir; the resolved realpath this returns is the ONLY
-            # value passed to _read_script_spec (never the raw glob string).
-            real_path = _safe_spec_path(path, base_dir=safe_dir)
-            script_spec = _read_script_spec(real_path, stem, base_dir=safe_dir)
-        except (ValueError, OSError, UnicodeDecodeError) as e:
-            logger.warning("rebuild: skipping unreadable script spec %s: %s", path, e)
-            continue
-        upsert_index(script_spec, real_path)
-        rows += 1
+        if _index_one(
+            path,
+            safe_dir,
+            _load_script_for_index,
+            (ValueError, OSError, UnicodeDecodeError),
+            "script",
+        ):
+            rows += 1
     return rows
 
 
