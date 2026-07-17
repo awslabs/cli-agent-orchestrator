@@ -314,7 +314,7 @@ def upsert_index(spec: Union[WorkflowSpec, ScriptSpec], source_path: str) -> Non
 def _index_one(
     path: str,
     safe_dir: str,
-    load: Callable[[str, str], Union[WorkflowSpec, ScriptSpec]],
+    load: Callable[[str, str, str], Union[WorkflowSpec, ScriptSpec]],
     skip_exceptions: Tuple[type, ...],
     label: str,
 ) -> bool:
@@ -329,7 +329,7 @@ def _index_one(
         # is untrusted until re-validated; the resolved realpath is the ONLY
         # value stored in the index.
         real_path = _safe_spec_path(path, base_dir=safe_dir)
-        spec = load(real_path, safe_dir)
+        spec = load(real_path, path, safe_dir)
     except skip_exceptions as e:
         logger.warning("rebuild: skipping %s spec %s: %s", label, path, e)
         return False
@@ -337,9 +337,9 @@ def _index_one(
     return True
 
 
-def _load_script_for_index(real_path: str, safe_dir: str) -> ScriptSpec:
+def _load_script_for_index(real_path: str, path: str, safe_dir: str) -> ScriptSpec:
     """Load a Python script spec, raising TierCollisionError when it collides."""
-    stem = _stem_of(real_path)
+    stem = _stem_of(path)
     _check_tier_collision(stem, safe_dir)
     return _read_script_spec(real_path, stem, base_dir=safe_dir)
 
@@ -370,7 +370,7 @@ def rebuild_index_from_files(scan_dir: Optional[str] = None) -> int:
         if _index_one(
             path,
             safe_dir,
-            load_and_validate,
+            lambda real_path, _path, _dir: load_and_validate(real_path, base_dir=_dir),
             (ValueError, FileNotFoundError),
             "unparseable YAML",
         ):
