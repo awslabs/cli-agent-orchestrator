@@ -24,6 +24,7 @@ from cli_agent_orchestrator.services.memory_service import (
     MemoryDisabledError,
     MemoryPartialWriteError,
 )
+from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.terminal import generate_session_name
@@ -1311,7 +1312,7 @@ def find_profiles(
     query: str = Field(
         description="Free-text keywords describing the capability you need (e.g. 'monitor sqs')"
     ),
-    limit: int = Field(default=10, description="Maximum number of results to return"),
+    limit: int = Field(default=DEFAULT_LIMIT, description="Maximum number of results to return"),
 ) -> List[Dict[str, Any]]:
     """Find installed agent profiles by keyword, ranked by relevance.
 
