@@ -29,7 +29,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Set, Union
 
 if TYPE_CHECKING:  # avoid a runtime circular import (script_runner imports this module)
     from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
@@ -41,6 +41,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_STEP_TIMEOUT,
 )
 from cli_agent_orchestrator.models.workflow import (
+    InputDecl,
     NotBuiltYetError,
     RunState,
     StepState,
@@ -389,7 +390,19 @@ def _reprompt_prompt(step: WorkflowStep) -> str:
 # ---------------------------------------------------------------------------
 # §2/§3 — input validation, topo-sort, the two nested loops
 # ---------------------------------------------------------------------------
-def _validate_inputs(spec: WorkflowSpec, inputs: Dict[str, Any]) -> Dict[str, Any]:
+class _HasInputs(Protocol):
+    """Structural type for anything carrying a typed ``inputs`` declaration map.
+
+    Both ``WorkflowSpec`` (YAML tier) and ``ScriptSpec`` (script tier, Unit A)
+    satisfy this — they expose ``inputs: Dict[str, InputDecl]``. Widening
+    ``_validate_inputs`` to this Protocol (ADR-1, FR-A2) lets ONE validator serve
+    both tiers with no ``isinstance`` branch and no behavior change to either.
+    """
+
+    inputs: Dict[str, "InputDecl"]
+
+
+def _validate_inputs(spec: _HasInputs, inputs: Dict[str, Any]) -> Dict[str, Any]:
     """Validate ``inputs`` against ``spec.inputs`` BEFORE any step runs (B3-BR-2).
 
     Every required input must be present; each value must match its declared type;

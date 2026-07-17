@@ -624,3 +624,69 @@ async def test_bad_run_id_rejected(monkeypatch):
     monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
     with pytest.raises(ValueError):
         await ws.start_run(_spec(), {}, "../escape")
+
+
+# ---------------------------------------------------------------------------
+# Unit A — _validate_inputs generalized over both spec tiers (ADR-1, BR-A8)
+# ---------------------------------------------------------------------------
+class _FakeScriptSpecInputs:
+    """Minimal duck-typed spec exposing only ``.inputs`` (the Protocol surface)."""
+
+    def __init__(self, inputs):
+        self.inputs = inputs
+
+
+def test_validate_inputs_scriptspec_fills_defaults_and_types():
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _FakeScriptSpecInputs(
+        {
+            "topic": InputDecl(type="string", required=True),
+            "count": InputDecl(type="int", default=5),
+        }
+    )
+    resolved = ws._validate_inputs(spec, {"topic": "birds"})
+    # Default filled for the omitted, non-required input; provided value kept.
+    assert resolved == {"topic": "birds", "count": 5}
+
+
+def test_validate_inputs_scriptspec_rejects_undeclared():
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _FakeScriptSpecInputs({"topic": InputDecl(type="string")})
+    with pytest.raises(ValueError, match="unknown input 'bogus'"):
+        ws._validate_inputs(spec, {"topic": "x", "bogus": 1})
+
+
+def test_validate_inputs_scriptspec_type_mismatch_rejected():
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _FakeScriptSpecInputs({"count": InputDecl(type="int", required=True)})
+    with pytest.raises(ValueError, match="must be an int"):
+        ws._validate_inputs(spec, {"count": "not-an-int"})
+
+
+def test_validate_inputs_scriptspec_missing_required_rejected():
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _FakeScriptSpecInputs({"topic": InputDecl(type="string", required=True)})
+    with pytest.raises(ValueError, match="missing required input 'topic'"):
+        ws._validate_inputs(spec, {})
+
+
+def test_validate_inputs_yaml_behavior_unchanged_regression():
+    """BR-A8/REL-A4: generalizing the signature must not change WorkflowSpec
+    (YAML) validation — a real WorkflowSpec resolves exactly as before."""
+    from cli_agent_orchestrator.models.workflow import InputDecl
+
+    spec = _spec()
+    spec.inputs = {
+        "topic": InputDecl(type="string", required=True),
+        "count": InputDecl(type="int", default=7),
+        "flag": InputDecl(type="bool", default=True),
+    }
+    resolved = ws._validate_inputs(spec, {"topic": "t"})
+    assert resolved == {"topic": "t", "count": 7, "flag": True}
+    # And the same rejection semantics hold for the YAML tier.
+    with pytest.raises(ValueError, match="unknown input"):
+        ws._validate_inputs(spec, {"topic": "t", "extra": 1})

@@ -210,3 +210,105 @@ class TestSinceFilterIsoForms:
         # A garbage cursor must neither raise nor filter everything out.
         ids = [e["id"] for e in log.history(since="not-a-timestamp")]
         assert ev["id"] in ids
+
+
+class TestEventLogEdgeCases:
+    """Naive-timestamp coercion, malformed rows, and the reset helper."""
+
+    def test_naive_since_is_treated_as_utc(self) -> None:
+        # A naive ``since`` (no tzinfo) must be coerced to UTC and still filter
+        # chronologically without raising.
+        log = EventLog()
+        now = datetime.now(timezone.utc)
+        old = log.append("launch", None, None, {})
+        log._buf[-1]["timestamp"] = (now - timedelta(hours=1)).isoformat()
+        naive_cursor = (now - timedelta(minutes=1)).replace(tzinfo=None).isoformat()
+        ids = [e["id"] for e in log.history(since=naive_cursor)]
+        assert old["id"] not in ids  # predates the (UTC-coerced) cursor
+
+    def test_malformed_stored_timestamp_is_skipped(self) -> None:
+        log = EventLog()
+        log.append("launch", None, None, {})
+        log._buf[-1]["timestamp"] = "not-a-timestamp"  # ValueError branch
+        assert log.history() == []
+
+    def test_missing_stored_timestamp_is_skipped(self) -> None:
+        log = EventLog()
+        log.append("launch", None, None, {})
+        del log._buf[-1]["timestamp"]  # KeyError branch
+        assert log.history() == []
+
+    def test_naive_stored_timestamp_is_treated_as_utc(self) -> None:
+        log = EventLog()
+        ev = log.append("launch", None, None, {})
+        log._buf[-1]["timestamp"] = (
+            (datetime.now() - timedelta(minutes=1)).replace(tzinfo=None).isoformat()
+        )
+        ids = [e["id"] for e in log.history()]
+        assert ev["id"] in ids  # naive-but-recent row is retained
+
+    def test_reset_event_log_drops_singleton(self) -> None:
+        from cli_agent_orchestrator.services.event_log_service import reset_event_log
+
+        first = get_event_log()
+        reset_event_log()
+        assert get_event_log() is not first
+
+
+class TestAfterId:
+    """``after_id`` — the id-based server cursor for ``Last-Event-ID`` reconnect.
+
+    Powers the AG-UI stream's reconnect replay (PR #436, F1): given the last
+    event id the client saw, return every fresh record strictly after it, in
+    chronological order.
+    """
+
+    def test_returns_records_strictly_after_the_id(self) -> None:
+        log = EventLog()
+        e1 = log.append("launch", "t1", None, {})
+        e2 = log.append("completion", "t2", None, {})
+        e3 = log.append("handoff", "t3", None, {})
+
+        result = log.after_id(e1["id"])
+        ids = [e["id"] for e in result]
+        # e1 itself is excluded (strictly after); e2, e3 follow in order.
+        assert ids == [e2["id"], e3["id"]]
+
+    def test_last_id_returns_empty(self) -> None:
+        log = EventLog()
+        log.append("launch", "t1", None, {})
+        last = log.append("launch", "t2", None, {})
+        assert log.after_id(last["id"]) == []
+
+    def test_unknown_id_replays_all_fresh(self) -> None:
+        """An id not in the buffer (evicted / never seen) replays everything
+        currently retained — the client dedupes by id, so over-delivery is safe
+        and avoids a silent gap."""
+        log = EventLog()
+        e1 = log.append("launch", "t1", None, {})
+        e2 = log.append("launch", "t2", None, {})
+        ids = [e["id"] for e in log.after_id("no-such-id")]
+        assert ids == [e1["id"], e2["id"]]
+
+    def test_ttl_is_applied(self) -> None:
+        log = EventLog()
+        stale_ts = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        with log._lock:  # noqa: SLF001
+            log._buf.append(
+                {
+                    "id": "stale",
+                    "kind": "launch",
+                    "terminal_id": "old",
+                    "session_name": None,
+                    "timestamp": stale_ts,
+                    "detail": {},
+                }
+            )
+        fresh = log.append("launch", "t", None, {})
+        # A stale id is not found among fresh rows -> replay all fresh, and the
+        # stale row itself is TTL-excluded.
+        ids = [e["id"] for e in log.after_id("stale")]
+        assert ids == [fresh["id"]]
+
+    def test_empty_log_returns_empty(self) -> None:
+        assert EventLog().after_id("anything") == []

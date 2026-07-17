@@ -16,7 +16,7 @@ your file organization\n\nRemember: Your success is measured by how effectively 
 
 [38;5;174m│[8G[38;5;246mOpus[13G4.8[17G(1M[21Gcontext)[30G·[32GClaude[39GMax[43G·[54G[2m[38;5;174m│[56G[39m[22mAdded[62G`fallbackModel`[78Gsetting[86Gto[89Gconfigure[99Gup[102Gto[105Gthree[111Gfallback[120Gmodels[127Gtried[133Gin[136Gorder[142Gwhen[147Gthe[151Gpri…[156G[38;5;174m│[39m
 
-[38;5;174m│[8G[38;5;246mofficiallyrkram@gmail.com's[36GOrganization[54G[2m[38;5;174m│[56G[22m[38;5;246m[3m/release-notes[71Gfor[75Gmore[156G[23m[38;5;174m│[39m
+[38;5;174m│[8G[38;5;246muser@example.com's[36GOrganization[54G[2m[38;5;174m│[56G[22m[38;5;246m[3m/release-notes[71Gfor[75Gmore[156G[23m[38;5;174m│[39m
 
 [38;5;174m│[16G[38;5;246m~/cli-agent-orchestrator[54G[2m[38;5;174m│[156G[22m│[39m
 

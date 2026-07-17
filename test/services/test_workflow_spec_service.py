@@ -369,6 +369,18 @@ class TestScriptTierGetWorkflow:
         spec = svc.get_workflow(str(path), scan_dir=str(spec_dir))
         assert any(f.rule_id == "syntax" for f in spec.findings)
 
+    def test_py_valid_syntax_but_malformed_inputs_still_raises(self, spec_dir):
+        """Graceful degradation is scoped to UNPARSEABLE source only. A
+        syntactically VALID script whose ``INPUTS`` literal is malformed is a
+        real author error the LOAD path must still surface as ``ValueError`` —
+        skipping ``_extract_inputs`` only when a ``syntax`` finding exists must
+        NOT swallow this case (guards against over-softening the fix)."""
+        path = _write_script(
+            spec_dir, "badinputs", "INPUTS = {'x': {'type': 'nonsense'}}\ndef main():\n    pass\n"
+        )
+        with pytest.raises(ValueError):
+            svc.get_workflow(str(path), scan_dir=str(spec_dir))
+
     def test_cross_tier_collision_raises_at_access_time(self, spec_dir):
         from cli_agent_orchestrator.models.workflow import TierCollisionError
 
@@ -484,3 +496,80 @@ class TestRenderFindings:
         findings = [LintFinding(rule_id="syntax", severity="error", line=1, message="bad")]
         rendered = svc.render_findings(findings)
         assert rendered == [{"rule_id": "syntax", "severity": "error", "line": 1, "message": "bad"}]
+
+
+# ---------------------------------------------------------------------------
+# Unit A — _extract_inputs (AST-only INPUTS extraction, FR-A1 / BR-A1 / BR-A2)
+# ---------------------------------------------------------------------------
+class TestExtractInputs:
+    """AST extraction of a script's ``INPUTS`` declaration — never executed."""
+
+    def test_valid_inputs_parsed(self):
+        src = (
+            "INPUTS = {\n"
+            '    "topic": {"type": "string", "required": True},\n'
+            '    "count": {"type": "int", "default": 3},\n'
+            '    "dry": {"type": "bool", "default": False},\n'
+            '    "root": {"type": "path"},\n'
+            "}\n"
+        )
+        inputs = svc._extract_inputs(src)
+        assert set(inputs) == {"topic", "count", "dry", "root"}
+        assert inputs["topic"].type == "string" and inputs["topic"].required is True
+        assert inputs["count"].type == "int" and inputs["count"].default == 3
+        assert inputs["dry"].type == "bool" and inputs["dry"].default is False
+        assert inputs["root"].type == "path" and inputs["root"].required is False
+
+    def test_absent_inputs_returns_empty(self):
+        assert svc._extract_inputs("x = 1\n\ndef main():\n    return x\n") == {}
+
+    def test_annotated_assignment_supported(self):
+        src = 'INPUTS: dict = {"a": {"type": "string"}}\n'
+        assert svc._extract_inputs(src)["a"].type == "string"
+
+    def test_first_assignment_wins(self):
+        src = 'INPUTS = {"a": {"type": "int"}}\nINPUTS = {"b": {"type": "bool"}}\n'
+        inputs = svc._extract_inputs(src)
+        assert set(inputs) == {"a"} and inputs["a"].type == "int"
+
+    def test_syntax_error_raises_valueerror(self):
+        # SyntaxError is NOT a ValueError subclass — it must be mapped explicitly.
+        with pytest.raises(ValueError, match="malformed workflow script"):
+            svc._extract_inputs("def main(:\n    pass\n")
+
+    def test_non_dict_literal_raises_valueerror(self):
+        with pytest.raises(ValueError, match="must be a dict literal"):
+            svc._extract_inputs("INPUTS = [1, 2, 3]\n")
+
+    def test_bad_type_raises_valueerror(self):
+        with pytest.raises(ValueError, match="is invalid"):
+            svc._extract_inputs('INPUTS = {"a": {"type": "float"}}\n')
+
+    def test_default_type_mismatch_raises_valueerror(self):
+        with pytest.raises(ValueError, match="does not match declared"):
+            svc._extract_inputs('INPUTS = {"a": {"type": "int", "default": "not-int"}}\n')
+
+    def test_unexpected_entry_key_raises_valueerror(self):
+        with pytest.raises(ValueError, match="unexpected key"):
+            svc._extract_inputs('INPUTS = {"a": {"type": "int", "bogus": 1}}\n')
+
+    def test_no_execution_of_module_side_effects(self):
+        """The extractor NEVER runs the module — an import-time side effect that
+        would raise if executed must not fire (M2 no-execution guarantee)."""
+        src = (
+            "raise RuntimeError('this script must never be executed')\n"
+            'INPUTS = {"a": {"type": "string"}}\n'
+        )
+        # A pure AST walk reaches INPUTS without ever evaluating the raise.
+        inputs = svc._extract_inputs(src)
+        assert inputs["a"].type == "string"
+
+    def test_read_script_spec_populates_inputs(self, spec_dir):
+        path = _write_script(spec_dir, "withinputs", 'INPUTS = {"topic": {"type": "string"}}\n')
+        spec = svc.get_workflow(str(path), scan_dir=str(spec_dir))
+        assert spec.inputs["topic"].type == "string"
+
+    def test_read_script_spec_malformed_inputs_raises(self, spec_dir):
+        path = _write_script(spec_dir, "badinputs", "INPUTS = [1, 2]\n")
+        with pytest.raises(ValueError, match="must be a dict literal"):
+            svc.get_workflow(str(path), scan_dir=str(spec_dir))

@@ -224,6 +224,62 @@ jobs:
 
       - name: Run type checker with mypy
         run: uv run mypy src/
+        # Pre-existing repo-wide mypy errors (agent_scaffold/profile/
+        # memory_service — unrelated to AG-UI) are tolerated as non-blocking on
+        # main; this PR introduces none. Mirror main's policy so Code Quality
+        # stays green rather than silently making mypy a hard gate here.
+        continue-on-error: true
+
+  agui-demo:
+    name: AG-UI demo (shift-left recording)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (cao-server for the live AG-UI surface)
+        run: uv sync --all-extras --dev
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install ffmpeg (GIF export)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install recorder deps
+        run: npm install
+        working-directory: examples/agui-eventsource-viewer/tools
+
+      - name: Install Playwright browser (chromium)
+        run: npm run playwright:install
+        working-directory: examples/agui-eventsource-viewer/tools
+
+      - name: Record demo (renders the six components + refusal; gates on drift)
+        # The recorder boots a CAO_AGUI_ENABLED cao-server + a static server,
+        # drives the live generative-UI flow, ASSERTS every component renders and
+        # the off-list component is refused (non-zero exit on drift — shift-left),
+        # and exports docs/media/agui-eventsource-viewer-demo.gif.
+        run: npm run record
+        working-directory: examples/agui-eventsource-viewer/tools
+
+      - name: Upload demo GIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agui-eventsource-viewer-demo
+          path: docs/media/agui-eventsource-viewer-demo.gif
+          if-no-files-found: warn
         continue-on-error: true
 
   security:

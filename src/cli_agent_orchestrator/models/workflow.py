@@ -339,6 +339,12 @@ class ScriptSpec(BaseModel):
     source: str
     content_hash: str
     findings: List[LintFinding] = Field(default_factory=list)
+    # Typed run-time input declarations extracted from a module-level ``INPUTS``
+    # dict literal in the script source (Unit A, FR-A1). AST-parsed at read time,
+    # never executed. Absent ``INPUTS`` -> empty dict. Reuses ``InputDecl`` (the
+    # same contract the YAML tier carries) so the shared ``_validate_inputs``
+    # generalizes across both tiers without a second declaration shape.
+    inputs: Dict[str, InputDecl] = Field(default_factory=dict)
 
 
 class ScriptValidationResult(ValidationResult):

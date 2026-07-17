@@ -8,11 +8,15 @@ import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.terminal_service import (
     _memory_injected_terminals,
     inject_memory_context,
 )
+
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
 
 # ---------------------------------------------------------------------------
 # Helpers

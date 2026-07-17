@@ -33,18 +33,32 @@ _CC = "cli_agent_orchestrator.providers.claude_code"
 # get_init_timeout reads the server default from settings_service (lazy import).
 _SETTINGS = "cli_agent_orchestrator.services.settings_service.get_server_settings"
 
+# A rendered pane that satisfies NEW_TUI_BOX_PATTERN, returned by the mocked
+# backend's get_history so initialize()'s final wait_until_input_ready() settle
+# check sees a stable, input-ready box and returns immediately. Without a string
+# here get_history yields a bare MagicMock, which strip_terminal_escapes ->
+# re.sub rejects with "expected string or bytes-like object" (see PR #441).
+_READY_PANE = "────────\n> \n────────"
+
 
 class TestInitializePassesResolvedInitTimeout:
     """The timeout get_init_timeout resolves must cap every wait in initialize().
 
     Mocks every external call so only the timeout wiring is exercised:
-    load_agent_profile (profile source), wait_for_shell / wait_until_status
-    (the async waits), _build_claude_command (avoids temp-file I/O),
-    _handle_startup_prompts (asserted separately), _ensure_skip_bypass_prompt_setting
-    (avoids writing ~/.claude/settings.json), and the terminal backend.
+    load_agent_profile (profile source), wait_for_shell / wait_until_status /
+    wait_until_input_ready (the async waits), _build_claude_command (avoids
+    temp-file I/O), _handle_startup_prompts (asserted separately),
+    _ensure_skip_bypass_prompt_setting (avoids writing
+    ~/.claude/settings.json), and the terminal backend.
     """
 
+    @pytest.fixture(autouse=True)
+    def _mock_input_ready(self):
+        with patch.object(ClaudeCodeProvider, "wait_until_input_ready"):
+            yield
+
     @pytest.mark.asyncio
+    @patch.object(ClaudeCodeProvider, "wait_until_input_ready")
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
     @patch.object(ClaudeCodeProvider, "_handle_startup_prompts")
@@ -61,10 +75,12 @@ class TestInitializePassesResolvedInitTimeout:
         mock_handle,
         mock_build,
         mock_ensure,
+        mock_wait_ready,
     ):
         """provider_init_timeout=180 caps wait_for_shell, handler, and wait_until_status."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_backend.get_history.return_value = _READY_PANE
         mock_load.return_value = AgentProfile(name="a", description="d", provider_init_timeout=180)
 
         provider = ClaudeCodeProvider("t1", "sess", "win", "agent-x")
@@ -76,6 +92,7 @@ class TestInitializePassesResolvedInitTimeout:
         assert mock_handle.call_args.kwargs["outer_timeout"] == 180
 
     @pytest.mark.asyncio
+    @patch.object(ClaudeCodeProvider, "wait_until_input_ready")
     @patch(_SETTINGS, return_value={"provider_init_timeout": 60})
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
@@ -94,10 +111,12 @@ class TestInitializePassesResolvedInitTimeout:
         mock_build,
         mock_ensure,
         mock_settings,
+        mock_wait_ready,
     ):
         """No provider_init_timeout on the profile -> the 60s server default flows through."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_backend.get_history.return_value = _READY_PANE
         mock_load.return_value = AgentProfile(name="a", description="d")
 
         provider = ClaudeCodeProvider("t1", "sess", "win", "agent-x")
@@ -109,6 +128,7 @@ class TestInitializePassesResolvedInitTimeout:
         assert mock_handle.call_args.kwargs["outer_timeout"] == 60
 
     @pytest.mark.asyncio
+    @patch.object(ClaudeCodeProvider, "wait_until_input_ready")
     @patch(_SETTINGS, return_value={"provider_init_timeout": 60})
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
@@ -125,10 +145,12 @@ class TestInitializePassesResolvedInitTimeout:
         mock_build,
         mock_ensure,
         mock_settings,
+        mock_wait_ready,
     ):
         """No agent profile at all (_load_profile -> None) -> server default flows through."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_backend.get_history.return_value = _READY_PANE
 
         provider = ClaudeCodeProvider("t1", "sess", "win")  # agent_profile=None
         result = await provider.initialize()
@@ -139,6 +161,7 @@ class TestInitializePassesResolvedInitTimeout:
         assert mock_handle.call_args.kwargs["outer_timeout"] == 60
 
     @pytest.mark.asyncio
+    @patch.object(ClaudeCodeProvider, "wait_until_input_ready")
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
     @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
     @patch.object(ClaudeCodeProvider, "_handle_startup_prompts")
@@ -155,6 +178,7 @@ class TestInitializePassesResolvedInitTimeout:
         mock_handle,
         mock_build,
         mock_ensure,
+        mock_wait_ready,
     ):
         """initialize() must pass the timeout as outer_timeout, never positionally.
 
@@ -165,6 +189,7 @@ class TestInitializePassesResolvedInitTimeout:
         """
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_backend.get_history.return_value = _READY_PANE
         mock_load.return_value = AgentProfile(name="a", description="d", provider_init_timeout=180)
 
         provider = ClaudeCodeProvider("t1", "sess", "win", "agent-x")

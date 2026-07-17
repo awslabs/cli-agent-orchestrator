@@ -90,6 +90,14 @@ class TestCliMain:
 
         assert result.exit_code == 0
 
+    def test_cli_has_update_command(self):
+        """Test CLI has update command (issue #26)."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ["update", "--help"])
+
+        assert result.exit_code == 0
+        assert "Update CAO" in result.output
+
     def test_cli_unknown_command(self):
         """Test CLI with unknown command."""
         runner = CliRunner()

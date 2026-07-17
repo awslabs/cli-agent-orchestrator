@@ -264,6 +264,9 @@ def graph_export_root() -> Path:
     return Path(os.environ.get("CAO_GRAPH_EXPORT_ROOT", str(GRAPH_EXPORT_ROOT_DEFAULT)))
 
 
+# OpenTelemetry service.name for CAO's spans/metrics.
+OTEL_SERVICE_NAME = "cao"
+
 # Provider-specific agent directories
 KIRO_AGENTS_DIR = Path(os.environ.get("CAO_AGENTS_DIR", str(Path.home() / ".kiro" / "agents")))
 COPILOT_AGENTS_DIR = Path.home() / ".copilot" / "agents"  # Copilot custom agents
@@ -310,6 +313,9 @@ CORS_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    # Secondary Vite dev-server port (used when :5173 is already taken).
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
 ] + _split_env_list("CAO_CORS_ORIGINS")
 
 
@@ -471,6 +477,12 @@ WORKFLOW_MAX_STEPS = 100
 WORKFLOW_MAX_SPEC_BYTES = 256 * 1024
 WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH = 8
 WORKFLOW_MAX_INPUTS = 64
+
+# Max size (bytes) of the compact-JSON resolved inputs map delivered to a script
+# run via the CAO_WORKFLOW_INPUTS spawn-env key. Enforced at the run route, on
+# the RESOLVED map, BEFORE any journal write or registry registration (ADR-5) —
+# never inside _build_env. An oversized payload is rejected as ValueError -> 400.
+WORKFLOW_INPUTS_MAX_BYTES = 32768
 
 # Units (from units-generation) whose constructs are EXECUTABLE in the current
 # Bolt. Empty in Bolt 1: the run engine (N5) is not shipped, so every

@@ -14,13 +14,14 @@ import termios
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Dict, List, Optional, cast
+from typing import Annotated, Any, Dict, List, Optional, cast
 
 from fastapi import (
     BackgroundTasks,
     Body,
     Depends,
     FastAPI,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -52,6 +53,7 @@ from cli_agent_orchestrator.constants import (
     DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
+    OTEL_SERVICE_NAME,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
@@ -83,6 +85,7 @@ from cli_agent_orchestrator.security.auth import (
     SCOPE_READ,
     SCOPE_WRITE,
     SCOPES_SUPPORTED,
+    extract_scopes_from_token,
     get_authorization_servers,
     get_current_scopes,
     is_auth_enabled,
@@ -112,8 +115,9 @@ from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
+from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
-from cli_agent_orchestrator.utils.logging import setup_logging
+from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
     load_skill_content,
@@ -447,12 +451,46 @@ class CreateFlowRequest(BaseModel):
         return v
 
 
+def _reconcile_memory_at_startup() -> None:
+    """Apply bounded memory repair and keep server startup resilient."""
+    try:
+        from cli_agent_orchestrator.services import memory_reconciliation
+
+        repair_report = memory_reconciliation.reconcile_memory_startup()
+        if repair_report is not None:
+            logger.info(repair_report.summary_text())
+    except Exception as exc:
+        report = getattr(exc, "report", None)
+        if report is not None:
+            logger.error(
+                "%s; automatic memory repair was incomplete; run `cao memory repair --apply`",
+                report.summary_text(),
+            )
+        else:
+            logger.error(
+                "automatic memory repair failed (%s); run `cao memory repair --apply`",
+                type(exc).__name__,
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
+    # Scrub credential query params (``?access_token=`` / ``?ticket=``) from
+    # uvicorn's access log before any request is served. Installed here — not
+    # only in ``main()`` — so the imported-app deployment path
+    # (``uvicorn cli_agent_orchestrator.api.main:app``) is covered too. Idempotent.
+    install_access_log_redaction()
+    # OpenTelemetry (ported): opt-in — no-op unless OTEL_SDK_DISABLED=false.
+    # Safe to call unconditionally; failure-isolated so it never blocks boot.
+    try:
+        init_telemetry(OTEL_SERVICE_NAME)
+    except Exception:
+        logger.warning("OTel telemetry init failed; continuing", exc_info=True)
     init_db()
+    _reconcile_memory_at_startup()
     registry = PluginRegistry()
     await registry.load()
     app.state.plugin_registry = registry
@@ -551,6 +589,11 @@ async def lifespan(app: FastAPI):
     fifo_manager.stop_watchdog()
 
     await registry.teardown()
+    # OpenTelemetry (ported): flush + shut down exporters (no-op when disabled).
+    try:
+        shutdown_telemetry()
+    except Exception:
+        logger.warning("Error shutting down OTel telemetry", exc_info=True)
     logger.info("Shutting down CLI Agent Orchestrator server...")
 
 
@@ -712,6 +755,39 @@ def _require_mcp_apps_enabled() -> None:
         )
 
 
+def _agui_enabled() -> bool:
+    """Whether the AG-UI SSE surface (``/agui/v1/stream``, ``emit_ui``) is enabled.
+
+    Two enablement paths, both deliberate (documented in docs/agui.md):
+
+    * ``CAO_AGUI_ENABLED`` — the dedicated flag, so AG-UI can be turned on
+      independently of the MCP Apps iframe surface.
+    * ``CAO_MCP_APPS_ENABLED`` (via ``_mcp_apps_enabled()``) — the pre-existing
+      MCP Apps flag also enables AG-UI, because the two surfaces are read-outs
+      of the same in-process event source (``EventLogPublisher`` → ``SseBus``)
+      with the same privacy boundary; an operator who exposed that data to the
+      iframe has already made the disclosure decision AG-UI relies on.
+
+    With neither flag set the surface is absent (404s) and the server is
+    byte-identical to a build without this feature.
+    """
+
+    if os.environ.get("CAO_AGUI_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    # Shared with the EventLogPublisher observer so the route and the publisher
+    # that feeds it can never disagree about whether the surface is live.
+    from cli_agent_orchestrator.services.agui_enablement import agui_surface_enabled
+
+    return agui_surface_enabled()
+
+
+def _require_agui_enabled() -> None:
+    """Raise 404 when the AG-UI surface is disabled (default-off)."""
+
+    if not _agui_enabled():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="AG-UI surface disabled")
+
+
 @app.get("/events")
 async def events_stream(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
@@ -779,6 +855,260 @@ async def events_history(
             )
     events = get_event_log().history(limit=limit, since=since, kinds=kinds_filter)
     return {"events": events}
+
+
+@app.get("/agui/v1/stream")
+async def agui_stream(
+    since: Optional[str] = Query(
+        default=None,
+        description=(
+            "ISO-8601 lower bound. When set, buffered events after this "
+            "timestamp are replayed (as AG-UI frames) before the live stream; "
+            "clients dedupe by event id."
+        ),
+    ),
+    access_token: Optional[str] = Query(
+        default=None,
+        description=(
+            "JWT for auth-enabled mode. Native EventSource cannot set an "
+            "Authorization header, so the token travels as this query parameter."
+        ),
+    ),
+    last_event_id: Optional[str] = Header(
+        default=None,
+        alias="Last-Event-ID",
+        description=(
+            "Native EventSource reconnect cursor. When set (and ``?since=`` is "
+            "not), buffered events after this event id are replayed before the "
+            "live stream, so no event is lost across a reconnect. ``?since=`` "
+            "takes precedence when both are supplied."
+        ),
+    ),
+):
+    """Stream fleet events as AG-UI typed events (Server-Sent Events).
+
+    This is the L2 standalone-dashboard surface (consumed by any AG-UI client). It
+    shares the exact same source as ``/events`` — the in-process ``SseBus`` fed
+    by the ``EventLogPublisher`` — but re-maps each normalized six-primitive
+    record onto AG-UI typed events via ``agui_stream.to_agui_event`` before it
+    hits the wire, so any AG-UI-compatible client renders CAO with no custom
+    adapter code.
+
+    Each SSE frame is a *named* AG-UI event: ``event: <AGUI_TYPE>`` +
+    ``data: <json>``. Message bodies are never carried (the ring buffer stores
+    metadata only and the mapping redacts by construction).
+
+    Default-off: returns 404 unless the AG-UI surface is enabled via
+    ``CAO_AGUI_ENABLED`` (or the MCP Apps surface is on). When auth is enabled,
+    a ``cao:read``-bearing JWT must be supplied via ``?access_token=`` (native
+    EventSource cannot send Authorization headers).
+    """
+    _require_agui_enabled()
+
+    # Auth: query-parameter token (EventSource can't set headers). Default-off
+    # (no AUTH0_DOMAIN / CAO_AUTH_JWKS_URI) grants the full scope set.
+    if is_auth_enabled():
+        if not access_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="access_token query parameter required when auth is enabled",
+            )
+        try:
+            scopes = extract_scopes_from_token(access_token)
+        except HTTPException:
+            raise
+        except Exception:
+            # PyJWTError subclasses (malformed/expired/bad signature) or a JWKS
+            # fetch failure. Fails closed either way; map to a clean 401 instead
+            # of an opaque 500 so auth telemetry stays trustworthy.
+            logger.info("agui_stream: token validation failed", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid or expired access_token",
+            )
+        if not any(s in scopes for s in (SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="insufficient scope (cao:read required)",
+            )
+    else:
+        scopes = [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]
+
+    from fastapi.responses import StreamingResponse
+
+    from cli_agent_orchestrator.clients.database import list_terminals_by_session
+    from cli_agent_orchestrator.services import session_service
+    from cli_agent_orchestrator.services.agui_stream import (
+        state_delta_frame,
+        state_snapshot_frame,
+        to_agui_event,
+    )
+    from cli_agent_orchestrator.services.event_log_service import get_event_log
+    from cli_agent_orchestrator.services.sse_bus import get_bus
+    from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
+
+    def _fleet_snapshot() -> Dict:
+        """Build the current DashboardSnapshot from live session/terminal state.
+
+        Failure-isolated: any backend hiccup yields an empty snapshot rather
+        than tearing down the stream. ``list_sessions`` already returns ``[]``
+        on error, so an unavailable tmux/herdr backend degrades gracefully.
+        """
+        sessions = session_service.list_sessions()
+        terminals: List[Dict] = []
+        for sess in sessions:
+            try:
+                terminals.extend(list_terminals_by_session(sess["id"]))
+            except Exception:
+                logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
+        return build_dashboard_snapshot(sessions, terminals, list(scopes))
+
+    def _sse(event_id: Optional[str], agui_type: str, data: Dict) -> str:
+        """Format one SSE frame, with an ``id:`` cursor when the event has one."""
+
+        prefix = f"id: {event_id}\n" if event_id is not None else ""
+        return f"{prefix}event: {agui_type}\ndata: {json.dumps(data)}\n\n"
+
+    async def event_generator():
+        # Register the live subscription BEFORE replaying history / taking the
+        # snapshot, so an event published during the replay->live handoff is
+        # buffered in this queue rather than lost. The small replay/live overlap
+        # is de-duplicated by event id below, so a ``?since=`` reconnect resumes
+        # with neither a gap nor a duplicate. The queue is metadata-only, same
+        # as the live path.
+        bus = get_bus()
+        # Opt into overflow-as-gap-signal: if this subscriber's bounded queue
+        # fills, the drain loop closes the stream (instead of silently dropping
+        # events on an open connection) so the client reconnects with
+        # Last-Event-ID and replays the dropped records exactly once (F2).
+        sub = bus.register(overflow_close=True)
+        try:
+            replayed_ids: set = set()
+
+            # Optional replay. Precedence: an explicit ``?since=`` timestamp wins;
+            # otherwise a native-EventSource ``Last-Event-ID`` reconnect replays
+            # the records buffered after that id. Either way, re-emit the
+            # buffered history as AG-UI frames and remember the ids so the live
+            # drain skips the overlap. Failure-isolated: a log hiccup logs and
+            # falls through to the live stream rather than 500-ing.
+            try:
+                replay_records = None
+                if since:
+                    replay_records = get_event_log().history(since=since)
+                elif last_event_id:
+                    replay_records = get_event_log().after_id(last_event_id)
+                if replay_records is not None:
+                    for record in replay_records:
+                        rid = record.get("id")
+                        if rid is not None:
+                            replayed_ids.add(rid)
+                        rtype, rdata = to_agui_event(record)
+                        yield _sse(rid, rtype, rdata)
+            except Exception:
+                logger.warning("agui_stream: history replay failed", exc_info=True)
+
+            # AG-UI shared-state: emit a full STATE_SNAPSHOT on connect so any
+            # client hydrates its projection, then keep it current with minimal
+            # RFC-6902 STATE_DELTA patches after each fleet event.
+            prev_snapshot: Optional[Dict] = None
+            try:
+                prev_snapshot = _fleet_snapshot()
+                agui_type, data = state_snapshot_frame(prev_snapshot)
+                yield _sse(None, agui_type, data)
+            except Exception:
+                logger.warning("agui_stream: initial STATE_SNAPSHOT failed", exc_info=True)
+
+            # Drain the subscriber registered above (buffered handoff events
+            # first, then live), via the bus's drain seam so a fake can terminate
+            # the stream cleanly in tests. On overflow the drain closes so the
+            # client reconnects (F2); cancellation on client disconnect
+            # propagates through the ``finally`` that unregisters the subscriber.
+            async for event in bus.drain(sub):
+                rid = event.get("id")
+                # Skip the replay/live overlap so a reconnecting client that
+                # passed ``?since=`` never sees an event twice.
+                if rid is not None and rid in replayed_ids:
+                    replayed_ids.discard(rid)
+                    continue
+                agui_type, data = to_agui_event(event)
+                yield _sse(rid, agui_type, data)
+
+                # Recompute the fleet snapshot and emit a STATE_DELTA when it
+                # moved. NB: recomputes on every event; a debounce/cache is a
+                # natural follow-up for high event rates (this is the opt-in L2
+                # dashboard surface, not the orchestration hot path).
+                try:
+                    curr = _fleet_snapshot()
+                    if prev_snapshot is not None:
+                        delta = state_delta_frame(prev_snapshot, curr)
+                        if delta is not None:
+                            dtype, ddata = delta
+                            yield _sse(None, dtype, ddata)
+                    prev_snapshot = curr
+                except Exception:
+                    logger.warning("agui_stream: STATE_DELTA computation failed", exc_info=True)
+        finally:
+            bus.unregister(sub)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+class EmitUIRequest(BaseModel):
+    """Body for POST /agui/v1/emit_ui — an agent-authored generative-UI intent."""
+
+    component: str
+    props: Dict[str, Any] = Field(default_factory=dict)
+    terminal_id: Optional[str] = None
+    session_name: Optional[str] = None
+
+
+@app.post("/agui/v1/emit_ui")
+async def agui_emit_ui(
+    body: EmitUIRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Producer for agent-authored generative-UI intents (closes the AG-UI loop).
+
+    An agent — via the ``emit_ui`` MCP tool — declares a component from the
+    frozen allow-list; the intent is validated **server-side** here and
+    published onto the fleet event bus, where ``agui_stream.to_agui_event`` maps
+    it to a ``GENERATIVE_UI`` frame on ``/agui/v1/stream``. Off-list components
+    and oversized/non-serializable props are rejected (400) so a bad intent
+    never reaches the bus. Requires ``cao:write`` when auth is enabled.
+    """
+    _require_agui_enabled()
+
+    from cli_agent_orchestrator.services.agui_stream import GENERATIVE_UI_COMPONENTS
+    from cli_agent_orchestrator.services.event_log_service import get_event_log
+    from cli_agent_orchestrator.services.sse_bus import get_bus
+
+    if body.component not in GENERATIVE_UI_COMPONENTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unknown UI component '{body.component}'. "
+                f"Allowed: {sorted(GENERATIVE_UI_COMPONENTS)}"
+            ),
+        )
+    try:
+        encoded = json.dumps(body.props)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="props must be JSON-serializable",
+        )
+    if len(encoded.encode("utf-8")) > 8 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="props payload too large (>8KB)"
+        )
+
+    detail = {
+        "event_type": "agent_ui",
+        "ui": {"component": body.component, "props": body.props},
+    }
+    event = get_event_log().append("other", body.terminal_id, body.session_name, detail)
+    get_bus().publish(event)
+    return {"ok": True, "event_id": event.get("id"), "component": body.component}
 
 
 # Topology widget static bundle at /widgets/topology/ — the vanilla SSE-driven
@@ -1794,12 +2124,26 @@ async def start_workflow_run_endpoint(
     run_id = body.run_id or f"run-{uuid.uuid4().hex[:16]}"
 
     if isinstance(spec, ScriptSpec):
+        # Unit A (ADR-6 / blocker #2): validate + cap the inputs BEFORE any
+        # journal row or registry entry is created — no orphan RUNNING row can
+        # result from bad/oversized input (BR-A3). The RESOLVED map (defaults
+        # filled, types checked, undeclared rejected) is what gets journaled and
+        # delivered, never the raw request body.
+        from cli_agent_orchestrator.constants import WORKFLOW_INPUTS_MAX_BYTES
+
+        try:
+            resolved = workflow_service._validate_inputs(spec, body.inputs)
+            payload = json.dumps(resolved, separators=(",", ":"))
+            if len(payload.encode("utf-8")) > WORKFLOW_INPUTS_MAX_BYTES:
+                raise ValueError(f"workflow inputs exceed {WORKFLOW_INPUTS_MAX_BYTES} bytes")
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         try:
             workflow_service._check_run_id_available(run_id)
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         try:
-            result = await script_runner.run_script_workflow(spec, body.inputs, run_id)
+            result = await script_runner.run_script_workflow(spec, resolved, run_id)
         except script_runner.ScriptLintError as e:
             raise HTTPException(
                 status_code=422,
@@ -2906,6 +3250,9 @@ def main():
     # literal ``*`` is honoured and disables the check (matches the
     # existing CAO_WS_ALLOWED_CLIENTS="*" semantics).
     forwarded_ips = "*" if "*" in TRUSTED_FORWARDER_IPS else ",".join(TRUSTED_FORWARDER_IPS)
+    # Credential query params (``?access_token=``) are scrubbed from uvicorn's
+    # access log by ``install_access_log_redaction()``, installed in the app
+    # lifespan so both ``cao-server`` and ``uvicorn ...:app`` are covered.
     uvicorn.run(
         app,
         host=host,

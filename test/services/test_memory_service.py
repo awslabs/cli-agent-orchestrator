@@ -13,6 +13,8 @@ import pytest
 
 from cli_agent_orchestrator.services.memory_service import MemoryService
 
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

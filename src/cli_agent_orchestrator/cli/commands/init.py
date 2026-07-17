@@ -8,6 +8,7 @@ import click
 
 from cli_agent_orchestrator.clients.database import init_db
 from cli_agent_orchestrator.constants import SKILLS_DIR
+from cli_agent_orchestrator.services.memory_reconciliation import reconcile_memory_startup
 
 
 def seed_default_skills() -> int:
@@ -36,7 +37,10 @@ def init():
     """Initialize CLI Agent Orchestrator database."""
     try:
         init_db()
+        repair_report = reconcile_memory_startup()
         seeded_count = seed_default_skills()
+        if repair_report is not None:
+            click.echo(repair_report.summary_text())
         click.echo(
             f"CLI Agent Orchestrator initialized successfully. "
             f"Seeded {seeded_count} builtin skills."

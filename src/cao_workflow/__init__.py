@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from cao_workflow._counter import _next_call_key
 from cao_workflow._identity import _read_identity_env
+from cao_workflow._inputs import get_inputs
 from cao_workflow._transport import URLError, _post
 from cao_workflow.exceptions import (
     ShimError,
@@ -28,6 +29,7 @@ _RUN_STEP_PATH = "/terminals/run-step"
 __all__ = [
     "run_step",
     "emit_output",
+    "get_inputs",
     "StepHandle",
     "ShimError",
     "ShimIdentityError",
