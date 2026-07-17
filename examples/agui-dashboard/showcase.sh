@@ -27,7 +27,7 @@ EMIT="${BASE}/agui/v1/emit_ui"
 # ?access_token= (browsers can't set headers); the POST uses the header.
 AUTH_ARGS=()
 STREAM_URL="${STREAM}"
-if [ -n "${CAO_TOKEN:-}" ]; then
+if [[ -n "${CAO_TOKEN:-}" ]]; then
     AUTH_ARGS=(-H "Authorization: Bearer ${CAO_TOKEN}")
     STREAM_URL="${STREAM}?access_token=${CAO_TOKEN}"
 fi

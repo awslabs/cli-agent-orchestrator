@@ -204,7 +204,7 @@ function bindSigmaEvents(
       dragRef.current.moved = false;
       return;
     }
-    void openTopic(node);
+    void openTopic(node); // NOSONAR -- fire-and-forget async click handler
   });
 
   sigma.on("enterNode", () => {

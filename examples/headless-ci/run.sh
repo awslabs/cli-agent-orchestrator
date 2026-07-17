@@ -59,6 +59,7 @@ while true; do
             cao session status "${PREFIXED}" --workers
             exit 1
             ;;
+        *) ;;  # NOSONAR -- other statuses are intentionally ignored while polling
     esac
 
     NOW=$(date +%s)

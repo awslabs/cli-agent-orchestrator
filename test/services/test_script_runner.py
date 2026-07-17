@@ -754,7 +754,7 @@ async def test_resume_reads_inputs_json_and_delivers_verbatim(monkeypatch: pytes
         run_id="run-inputs",
         workflow_name="wf",
         spec_snapshot=json.dumps(
-            {"source": "print('x')\n", "path": "/tmp/wf.py"}
+            {"source": "print('x')\n", "path": "/tmp/wf.py"}  # NOSONAR -- test fixture path
         ),  # NOSONAR -- test fixture path
         inputs_json=json.dumps(journaled),
         state="failed",
@@ -783,7 +783,7 @@ async def test_resume_malformed_inputs_json_degrades_to_empty(monkeypatch: pytes
         run_id="run-badinputs",
         workflow_name="wf",
         spec_snapshot=json.dumps(
-            {"source": "print('x')\n", "path": "/tmp/wf.py"}
+            {"source": "print('x')\n", "path": "/tmp/wf.py"}  # NOSONAR -- test fixture path
         ),  # NOSONAR -- test fixture path
         inputs_json="[not, a, dict]",  # non-object -> degrade to {}
         state="failed",
@@ -1161,7 +1161,7 @@ def _seed_script_run(run_id: str, *, state: str = "running", generation: str = "
         run_id=run_id,
         workflow_name="wf",
         spec_snapshot=json.dumps(
-            {"source": "print('x')\n", "path": "/tmp/wf.py"}
+            {"source": "print('x')\n", "path": "/tmp/wf.py"}  # NOSONAR -- test fixture path
         ),  # NOSONAR -- test fixture path
         inputs_json="{}",
         state=state,

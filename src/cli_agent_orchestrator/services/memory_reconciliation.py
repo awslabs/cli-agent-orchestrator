@@ -289,7 +289,7 @@ class MemoryReconciliationService:
             finding=RepairFinding(kind=kind, message=message),
         )
 
-    def _iter_candidates(self) -> tuple[list[_Candidate], list[RepairRecord]]:
+    def _iter_candidates(self) -> tuple[list[_Candidate], list[RepairRecord]]:  # NOSONAR -- repair-candidate scan is intentionally branched
         candidates: list[_Candidate] = []
         findings: list[RepairRecord] = []
         if not self.base_dir.exists():

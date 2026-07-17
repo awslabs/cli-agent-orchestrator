@@ -427,7 +427,7 @@ class FifoManager:
                 except Exception:
                     logger.exception("pipe-pane liveness check failed for terminal %s", terminal_id)
 
-    def _check_pipe_liveness(self, terminal_id: str) -> None:
+    def _check_pipe_liveness(self, terminal_id: str) -> None:  # NOSONAR -- liveness state machine is intentionally branched
         """One liveness check for a terminal: re-arm a stalled pipe-pane forwarder.
 
         A stalled forwarder is invisible from inside the FIFO reader (no bytes to
