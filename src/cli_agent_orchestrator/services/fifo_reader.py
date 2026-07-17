@@ -340,7 +340,6 @@ class FifoManager:
                         with self._lock:
                             if terminal_id in self._readers:
                                 self._last_data_at[terminal_id] = time.monotonic()
-                                self._ever_delivered[terminal_id] = True
                         if not pending:
                             batch_start = time.monotonic()
                         pending.extend(raw)
@@ -357,6 +356,22 @@ class FifoManager:
                 ):
                     bus.publish(topic, {"data": pending.decode("utf-8", errors="replace")})
                     pending.clear()
+                    # Cold-start liveness (harness-control#93) asks "has this
+                    # pipeline delivered to CONSUMERS yet" — so it must be
+                    # recorded here, at the publish, not where bytes are pulled
+                    # off the FIFO. Recording it on the raw read let a reader
+                    # that read bytes but never published them (they sit in
+                    # `pending` until the coalesce window closes) satisfy
+                    # `ever_delivered` while the StatusMonitor buffer stayed
+                    # empty — permanently blinding the cold-start check, whose
+                    # whole purpose is to re-arm a forwarder that never
+                    # started. The divergence path cannot cover for it either:
+                    # an idle shell's pane is static, so it never strikes.
+                    # Net effect was a dead pipe that nothing ever re-armed and
+                    # wait_for_shell() timing out at 60s on every launch.
+                    with self._lock:
+                        if terminal_id in self._readers:
+                            self._ever_delivered[terminal_id] = True
         except Exception as e:
             if not stop_flag.is_set():
                 logger.error("FIFO reader for terminal %s exiting on error: %s", terminal_id, e)
