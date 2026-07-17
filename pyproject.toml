@@ -56,6 +56,16 @@ dependencies = [
     "tomli>=2.0.0; python_version < '3.11'",
 ]
 
+[project.optional-dependencies]
+# Opt-in OpenTelemetry GenAI telemetry (telemetry/). The base install stays
+# lean: telemetry/otel.py no-ops when the SDK is absent, matching the
+# default-off posture of the feature itself.
+otel = [
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
+]
+
 [project.scripts]
 "cao" = "cli_agent_orchestrator.cli.main:cli"
 "cao-server" = "cli_agent_orchestrator.api.main:main"
@@ -80,7 +90,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/cli_agent_orchestrator"]
+packages = ["src/cli_agent_orchestrator", "src/cao_workflow"]
 
 [tool.hatch.build]
 artifacts = [
@@ -106,6 +116,9 @@ dev = [
     "hypothesis>=6.0",
     "networkx>=3.0",
     "tomli>=2.0.0; python_version < '3.11'",
+    # JWT/JWKS test fixtures (test/fixtures/jwt_factory.py) mint RS256 tokens
+    # with authlib; runtime verification needs only pyjwt[crypto].
+    "authlib>=1.7.1",
 ]
 
 [tool.black]

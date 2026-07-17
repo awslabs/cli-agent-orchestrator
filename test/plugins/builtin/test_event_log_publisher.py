@@ -189,6 +189,7 @@ class TestDefaultOff:
     @pytest.mark.asyncio
     async def test_hooks_noop_when_surface_disabled(self, monkeypatch) -> None:
         monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+        monkeypatch.delenv("CAO_AGUI_ENABLED", raising=False)
 
         log = EventLog()
         bus = SseBus()
@@ -218,3 +219,47 @@ class TestDefaultOff:
         # No retention and no fan-out while disabled.
         assert log.history() == []
         assert relayed == []
+
+
+class TestAguiEnablement:
+    """The observer honors the dedicated ``CAO_AGUI_ENABLED`` flag.
+
+    Regression (F1): the AG-UI route (``_agui_enabled``) accepts either
+    ``CAO_AGUI_ENABLED`` or the MCP Apps flag, but this publisher previously
+    gated on the MCP Apps flag alone — so ``CAO_AGUI_ENABLED=true`` opened the
+    stream while the observer stayed silent and starved it of lifecycle events.
+    Both surfaces now share ``agui_surface_enabled``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hooks_emit_when_only_agui_enabled(self, monkeypatch) -> None:
+        # Only the dedicated AG-UI flag — the MCP Apps flag stays unset.
+        monkeypatch.delenv("CAO_MCP_APPS_ENABLED", raising=False)
+        monkeypatch.setenv("CAO_AGUI_ENABLED", "true")
+
+        log = EventLog()
+        bus = SseBus()
+        relayed: list[dict] = []
+
+        with patch.object(bus, "publish", side_effect=lambda e: relayed.append(e)):
+            with (
+                patch(
+                    "cli_agent_orchestrator.plugins.builtin.event_log_publisher.get_event_log",
+                    return_value=log,
+                ),
+                patch(
+                    "cli_agent_orchestrator.plugins.builtin.event_log_publisher.get_bus",
+                    return_value=bus,
+                ),
+            ):
+                publisher = EventLogPublisher()
+                await publisher.on_post_create_terminal(
+                    PostCreateTerminalEvent(terminal_id="t1", provider="kiro_cli")
+                )
+
+        # CAO_AGUI_ENABLED alone must feed both the ring buffer and the SSE bus.
+        history = log.history()
+        assert len(history) == 1
+        assert history[0]["kind"] == "launch"
+        assert history[0]["terminal_id"] == "t1"
+        assert relayed == history

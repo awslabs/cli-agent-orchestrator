@@ -337,7 +337,7 @@ def _migrate_add_related_keys() -> None:
 
 
 def _migrate_workflow_index() -> None:
-    """Create the derived ``workflow_index`` table if missing (issue #312, N2).
+    """Create/upgrade the derived ``workflow_index`` table (issue #312, N2).
 
     The table is a **derived, non-authoritative** projection of the workflow
     spec YAML files on disk (B2-BR-2): it can be dropped and rebuilt
@@ -348,6 +348,15 @@ def _migrate_workflow_index() -> None:
     mirrors the existing ``_migrate_memory_indexes`` pattern. Failure is logged
     at debug and never propagated (a missing index table is recoverable: the
     next ``list`` rebuilds it).
+
+    U5 additively widens ``step_count`` to nullable: script-tier rows carry
+    NULL (step count is run-time-determined, unknowable at index time), while
+    YAML rows keep populating an int. ``CREATE TABLE IF NOT EXISTS`` only
+    covers fresh DBs — on a pre-U5 DB the column already exists as NOT NULL,
+    and SQLite cannot ``ALTER COLUMN`` to relax a NOT NULL constraint in
+    place. Same drop/rebuild precedent as ``_migrate_project_aliases_schema``:
+    the table is fully derived, so dropping it is safe — the next ``list``
+    rebuilds it from the workflow files on disk.
     """
     import sqlite3
 
@@ -355,12 +364,26 @@ def _migrate_workflow_index() -> None:
 
     try:
         with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='workflow_index'"
+            ).fetchone()
+            if row is not None:
+                cols = conn.execute("PRAGMA table_info(workflow_index)").fetchall()
+                # PRAGMA row: (cid, name, type, notnull, dflt_value, pk).
+                step_count_col = next((c for c in cols if c[1] == "step_count"), None)
+                if step_count_col is not None and step_count_col[3]:  # notnull flag set
+                    conn.execute("DROP TABLE workflow_index")
+                    conn.commit()
+                    logger.info(
+                        "Migration: rebuilt workflow_index with nullable step_count "
+                        "(dropped legacy table; rebuilt from workflow files on next list)"
+                    )
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_index ("
                 "name TEXT PRIMARY KEY, "
                 "source_path TEXT NOT NULL, "
                 "mode TEXT NOT NULL, "
-                "step_count INTEGER NOT NULL, "
+                "step_count INTEGER, "  # nullable: script-tier rows carry NULL
                 "description TEXT NOT NULL DEFAULT '', "
                 "indexed_at TEXT NOT NULL"
                 ")"

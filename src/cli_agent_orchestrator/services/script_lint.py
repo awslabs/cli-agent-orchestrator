@@ -20,8 +20,9 @@ Rule catalogue (U1 business-rules.md):
   literal ERROR path, and aliased importlib (``import importlib as il``) is
   not tracked at all.
 - ``nondeterminism`` (WARNING) — import of a module in
-  ``SCRIPT_LINT_NONDETERMINISM_MODULES``; resume replays journaled calls and
-  requires deterministic re-execution (FR-1.7 — a warning never blocks).
+  ``SCRIPT_LINT_NONDETERMINISM_MODULES``; resume re-executes the frozen script,
+  so deterministic control flow keeps repeated work predictable (FR-1.7 — a
+  warning never blocks).
 
 ``status == "fail"`` iff at least one ERROR finding (U1-BR-1); ERRORs are
 mirrored into the legacy ``errors`` list as ``"line N: [rule_id] message"``
@@ -166,10 +167,9 @@ def _check_module(dotted: str, lineno: int, findings: List[LintFinding]) -> None
                 severity="warning",
                 line=lineno,
                 message=(
-                    f"importing '{first}' may make this script non-resumable; "
-                    "resume replays journaled calls and requires deterministic "
-                    "re-execution (see the determinism obligation in the "
-                    "authoring guide)"
+                    f"importing '{first}' may make resumed behavior unpredictable; "
+                    "resume re-executes the frozen script, so repeated calls may "
+                    "differ (see the determinism obligation in the authoring guide)"
                 ),
             )
         )

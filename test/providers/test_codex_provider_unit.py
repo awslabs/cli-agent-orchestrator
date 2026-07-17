@@ -596,7 +596,7 @@ class TestTomlOverride:
         assert _toml_override("features.fast_mode", True) == "features.fast_mode=true"
         assert _toml_override("model_reasoning_effort", "xhigh") == 'model_reasoning_effort="xhigh"'
 
-    @pytest.mark.parametrize("key", ["bad key", "a=b", 'k"x', "key\ninjected", "", "a/b"])
+    @pytest.mark.parametrize("key", ["bad key", "a=b", 'k"x', "key\ninjected", "key\n", "", "a/b"])
     def test_rejects_unsafe_key(self, key):
         # Unsafe keys would produce a malformed -c override or split the tmux
         # command across lines; fail fast instead.
@@ -606,6 +606,53 @@ class TestTomlOverride:
     def test_non_scalar_value_error_names_offending_key(self):
         with pytest.raises(TypeError, match="codexConfig key 'features.x'"):
             _toml_override("features.x", {"nested": 1})
+
+
+class TestMcpKeyValidation:
+    """MCP server names and env keys are validated before interpolation into
+    the ``-c mcp_servers.<name>.<field>`` override path — a quote or newline
+    in the KEY half would corrupt the TOML the same way an unescaped value
+    would."""
+
+    @staticmethod
+    def _profile_with(servers):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = servers
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = None
+        return mock_profile
+
+    @pytest.mark.parametrize(
+        "name", ['srv"x', "srv\ninjected", "srv\n", "bad name", "a=b", "", "srv.dotted"]
+    )
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_rejects_unsafe_server_name(self, mock_load, name):
+        mock_load.return_value = self._profile_with({name: {"command": "cmd", "args": []}})
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        with pytest.raises(ValueError, match="Invalid mcpServers name key"):
+            provider._build_codex_command()
+
+    @pytest.mark.parametrize("env_key", ['K"X', "K\nY", "K\n", "BAD KEY", "a=b", "", "K.DOTTED"])
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_rejects_unsafe_env_key(self, mock_load, env_key):
+        mock_load.return_value = self._profile_with(
+            {"srv": {"command": "cmd", "args": [], "env": {env_key: "value"}}}
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        with pytest.raises(ValueError, match="Invalid mcpServers env key"):
+            provider._build_codex_command()
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_accepts_normal_names_and_env_keys(self, mock_load):
+        mock_load.return_value = self._profile_with(
+            {"cao-mcp-server": {"command": "cmd", "args": [], "env": {"API_KEY": "v"}}}
+        )
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+        assert "mcp_servers.cao-mcp-server.command=" in command
+        assert "mcp_servers.cao-mcp-server.env.API_KEY=" in command
 
 
 class TestCodexProviderCodexConfig:
@@ -747,6 +794,9 @@ class TestCodexProviderStatusDetection:
         assert status == TerminalStatus.ERROR
 
     def test_get_status_empty_output(self):
+        # native=None always falls through (no dispatch-timing guess); on tmux
+        # the live-read fallback is a pass-through, so an empty buffer hits
+        # Codex's own no-output default directly.
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status("")
 

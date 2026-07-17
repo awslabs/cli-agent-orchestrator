@@ -137,7 +137,20 @@ def test_get_run_status_unknown_404(client, monkeypatch):
     assert resp.status_code == 404
 
 
+def _seed_yaml_record(monkeypatch, run_id="run1"):
+    """Seed a live YAML-tier record so U5's cancel dispatch (BR-15, registry-first)
+    routes into the (mocked) base ``cancel_run`` — the same call the pre-U5 route
+    made unconditionally. Without a live record, U5 dispatches through the
+    journal-fallback arm (BR-16) instead of the live-registry arm."""
+    import types
+
+    monkeypatch.setattr(
+        workflow_service, "run_registry", {run_id: types.SimpleNamespace(tier="yaml")}
+    )
+
+
 def test_cancel_run_200(client, monkeypatch):
+    _seed_yaml_record(monkeypatch, "run1")
     monkeypatch.setattr(workflow_service, "cancel_run", lambda rid: None)
     resp = client.post("/workflows/runs/run1/cancel")
     assert resp.status_code == 200
@@ -148,15 +161,123 @@ def test_cancel_run_unknown_404(client, monkeypatch):
     def _raise(rid):
         raise KeyError(rid)
 
+    # "ghost" has no live record AND no journal row -> the journal-fallback
+    # arm (BR-16) raises 404 before ever calling cancel_run.
     monkeypatch.setattr(workflow_service, "cancel_run", _raise)
     resp = client.post("/workflows/runs/ghost/cancel")
     assert resp.status_code == 404
 
 
 def test_cancel_finished_run_409(client, monkeypatch):
+    _seed_yaml_record(monkeypatch, "run1")
+
     def _raise(rid):
         raise ValueError("run 'run1' is already completed; cannot cancel")
 
     monkeypatch.setattr(workflow_service, "cancel_run", _raise)
     resp = client.post("/workflows/runs/run1/cancel")
     assert resp.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# Unit A — script-run input validation + cap, BEFORE any journal row (BR-A3)
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def script_run_env(client, monkeypatch, tmp_path):
+    """A ScriptSpec-returning resolver + a fresh journal DB.
+
+    ``run_script_workflow`` is patched to a spy that would ONLY be reached if
+    validation/cap passed — the tests assert it is NOT called on rejection AND
+    that no ``workflow_run`` row was written (the run route validates + caps the
+    inputs BEFORE any journal write or registry entry, BR-A3 / ADR-6)."""
+    from cli_agent_orchestrator.clients.database import _migrate_workflow_run
+    from cli_agent_orchestrator.models.workflow import InputDecl, ScriptSpec
+    from cli_agent_orchestrator.services import script_runner, workflow_journal
+
+    db_path = tmp_path / "wf.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+    _migrate_workflow_run()
+
+    spec = ScriptSpec(
+        name="scr",
+        path="/tmp/scr.py",
+        source="print('x')\n",
+        content_hash="deadbeef",
+        inputs={
+            "topic": InputDecl(type="string", required=True),
+            "note": InputDecl(type="string", required=False),
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+        lambda name_or_path, scan_dir=None: spec,
+    )
+
+    spy = {"called": False, "inputs": None}
+
+    async def _fake_run(spec_arg, inputs, run_id):
+        spy["called"] = True
+        spy["inputs"] = inputs
+        return _result(state=RunState.COMPLETED)
+
+    monkeypatch.setattr(script_runner, "run_script_workflow", _fake_run)
+    return {"spy": spy, "journal": workflow_journal}
+
+
+def test_script_run_undeclared_input_400_no_journal_row(client, script_run_env):
+    resp = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {"topic": "t", "bogus": 1}, "run_id": "runA"},
+    )
+    assert resp.status_code == 400
+    assert "bogus" in resp.json()["detail"]
+    assert script_run_env["spy"]["called"] is False
+    assert script_run_env["journal"].get_run("runA") is None  # BR-A3: no orphan row
+
+
+def test_script_run_missing_required_400_no_journal_row(client, script_run_env):
+    resp = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "runB"},
+    )
+    assert resp.status_code == 400
+    assert "topic" in resp.json()["detail"]
+    assert script_run_env["spy"]["called"] is False
+    assert script_run_env["journal"].get_run("runB") is None
+
+
+def test_script_run_wrong_type_400_no_journal_row(client, script_run_env):
+    resp = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {"topic": 123}, "run_id": "runC"},
+    )
+    assert resp.status_code == 400
+    assert script_run_env["spy"]["called"] is False
+    assert script_run_env["journal"].get_run("runC") is None
+
+
+def test_script_run_oversized_inputs_400_pre_journal(client, script_run_env):
+    # A value pushing the compact-JSON payload past 32768 bytes is rejected at
+    # the route BEFORE any journal write (ADR-5 cap, pre-journal).
+    big = "x" * 40000
+    resp = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {"topic": "t", "note": big}, "run_id": "runD"},
+    )
+    assert resp.status_code == 400
+    assert "exceed" in resp.json()["detail"]
+    assert script_run_env["spy"]["called"] is False
+    assert script_run_env["journal"].get_run("runD") is None
+
+
+def test_script_run_resolved_inputs_passed_to_runner(client, script_run_env):
+    # A valid run reaches the runner with the RESOLVED map (defaults filled),
+    # not the raw request body.
+    resp = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {"topic": "birds"}, "run_id": "runE"},
+    )
+    assert resp.status_code == 200
+    assert script_run_env["spy"]["called"] is True
+    # ``note`` is optional with no default -> omitted; ``topic`` kept.
+    assert script_run_env["spy"]["inputs"] == {"topic": "birds"}

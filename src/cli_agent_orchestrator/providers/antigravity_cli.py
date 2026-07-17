@@ -220,6 +220,24 @@ class AntigravityCliProvider(BaseProvider):
     # Launch
     # ------------------------------------------------------------------ #
 
+    def _try_load_profile(self):
+        """Best-effort profile load for timeout resolution only.
+
+        Returns None on any load failure instead of raising -- unlike
+        ``_build_agy_command``'s inline load, which legitimately raises
+        ``ProviderError`` on a broken profile. This helper only feeds
+        ``BaseProvider.get_init_timeout``, so a missing/unloadable profile
+        should fall back to the server default here, not abort init before
+        the real (error-raising) load in ``_build_agy_command`` gets a chance
+        to report the actual problem.
+        """
+        if self._agent_profile is None:
+            return None
+        try:
+            return load_agent_profile(self._agent_profile)
+        except Exception:
+            return None
+
     def _mcp_config_path(self) -> Path:
         """Path to agy's MCP config file (shared ~/.gemini/config/mcp_config.json)."""
         return Path.home() / ".gemini" / "config" / "mcp_config.json"
@@ -382,7 +400,9 @@ class AntigravityCliProvider(BaseProvider):
             # names behind and block terminal teardown.
             self._mcp_server_names = []
 
-    def _handle_startup_dialog(self, timeout: Optional[float] = None) -> None:
+    def _handle_startup_dialog(
+        self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
+    ) -> None:
         """Dismiss agy's blocking startup dialogs (workspace-trust, survey).
 
         Mirrors ClaudeCodeProvider._handle_startup_prompts / KimiCliProvider.
@@ -393,14 +413,48 @@ class AntigravityCliProvider(BaseProvider):
         dismissal continues the loop rather than returning. Exits once agy is
         at its ready footer with no dialog on screen — the survey renders ON
         TOP of the footer, so the survey check must run before the idle exit.
+
+        Idle-gap semantics (see issue #400): a cold or containerized start can
+        render these dialogs LATE and in sequence, past the old fixed ~20s
+        window. Rather than a total-window budget, ``idle_gap`` is the maximum
+        quiet stretch tolerated BETWEEN prompts: answering a dialog resets the
+        idle timer, and the loop exits once no new prompt appears for
+        ``idle_gap`` seconds (or agy reaches its ready footer). Total runtime is
+        hard-capped by ``outer_timeout``.
+
+        The idle-gap exit only starts counting once the first dialog has been
+        handled -- until then, a first dialog arriving later than ``idle_gap``
+        (the scenario issue #400 itself reports) would otherwise be missed: the
+        loop would exit at the idle-gap boundary having never seen it. Before
+        any dialog is observed, only ``outer_timeout`` can end the loop.
+
+        Args:
+            idle_gap: Seconds of no-new-prompt quiet that ends the loop. Defaults
+                to the ``startup_prompt_handler_timeout`` setting.
+            outer_timeout: Hard cap (seconds) on total handler runtime. Defaults
+                to the ``provider_init_timeout`` setting; initialize() passes the
+                per-profile-resolved value so a containerized profile's longer
+                init budget also governs this handler (mirrors ClaudeCodeProvider).
         """
-        if timeout is None:
-            timeout = get_server_settings()["startup_prompt_handler_timeout"]
+        if idle_gap is None:
+            idle_gap = get_server_settings()["startup_prompt_handler_timeout"]
+        if outer_timeout is None:
+            outer_timeout = get_server_settings()["provider_init_timeout"]
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-        start_time = time.time()
+        outer_deadline = time.monotonic() + outer_timeout
+        last_prompt_time = time.monotonic()
+        any_prompt_handled = False
         trust_done = survey_done = False
-        while time.time() - start_time < timeout:
+        while True:
+            now = time.monotonic()
+            if now >= outer_deadline:
+                logger.warning(
+                    "Antigravity startup dialog handler hit provider_init_timeout outer cap"
+                )
+                return
+            if any_prompt_handled and now - last_prompt_time >= idle_gap:
+                return  # no new prompt within the idle gap — startup settled
             output = get_backend().get_history(self.session_name, self.window_name)
             if output:
                 clean = strip_terminal_escapes(output)
@@ -409,6 +463,8 @@ class AntigravityCliProvider(BaseProvider):
                     status_monitor.notify_input_sent(self.terminal_id)
                     get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                     trust_done = True
+                    any_prompt_handled = True
+                    last_prompt_time = time.monotonic()  # reset idle timer — survey may follow
                     time.sleep(1.0)
                     continue
                 if not survey_done and re.search(SURVEY_PROMPT_PATTERN, clean):
@@ -418,6 +474,8 @@ class AntigravityCliProvider(BaseProvider):
                     time.sleep(0.5)
                     get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                     survey_done = True
+                    any_prompt_handled = True
+                    last_prompt_time = time.monotonic()  # reset idle timer
                     time.sleep(1.0)
                     continue
                 # At the ready footer with no dialog pending → done.
@@ -448,18 +506,30 @@ class AntigravityCliProvider(BaseProvider):
         status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, command)
 
+        # Resolve the per-profile provider_init_timeout override (if any) so it
+        # governs both the startup-dialog handler's outer cap and the readiness
+        # wait below, mirroring ClaudeCodeProvider. Best-effort: a missing/
+        # unloadable profile falls back to the 180s default here;
+        # _build_agy_command above already raised its own ProviderError on a
+        # genuine load failure before this point.
+        init_timeout = self.get_init_timeout(self._try_load_profile())
+        default_ready_timeout = 180.0
+
         # Accept the workspace-trust dialog if agy shows one (first launch in an
         # untrusted cwd). Unanswered it blocks init — the picker never reads IDLE.
-        self._handle_startup_dialog()
+        self._handle_startup_dialog(outer_timeout=max(default_ready_timeout, init_timeout))
 
         # agy startup + first MCP connection + the -i acknowledgment can take
         # a while.
+        ready_timeout = max(default_ready_timeout, init_timeout)
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=180.0,
+            timeout=ready_timeout,
         ):
-            raise TimeoutError("Antigravity CLI initialization timed out after 180 seconds")
+            raise TimeoutError(
+                f"Antigravity CLI initialization timed out after {ready_timeout} seconds"
+            )
 
         self._initialized = True
         return True
@@ -483,10 +553,13 @@ class AntigravityCliProvider(BaseProvider):
         """
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
         if not output:
             return TerminalStatus.UNKNOWN
 

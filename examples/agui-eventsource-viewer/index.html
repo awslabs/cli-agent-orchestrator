@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<!--
+  ABOUTME: Zero-dependency browser client for CAO's AG-UI SSE stream.
+  ABOUTME: Renders fleet state + the 6 allow-listed generative-UI components using DOM APIs only.
+
+  This single file is the "a stock browser client renders CAO's stream with zero
+  custom code" demonstration for issue #386 / PR #436. No npm, no framework, no
+  build step. It consumes GET /agui/v1/stream (Server-Sent Events) and:
+    - hydrates a fleet projection from STATE_SNAPSHOT, then applies RFC-6902
+      STATE_DELTA patches via a tiny inline JSON-Patch applier;
+    - renders GENERATIVE_UI components from JSON props ONLY, through a
+      client-side mirror of the server's frozen allow-list. Rendering uses
+      textContent / createElement exclusively — never innerHTML, eval, or
+      dangerouslySetInnerHTML. An unknown component becomes an inert labeled
+      placeholder and is never executed;
+    - shows a live scrolling event log.
+
+  Security note: everything on the AG-UI wire is a named component + JSON props
+  (no HTML/script). This viewer preserves that boundary on the client side.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CAO AG-UI EventSource Viewer</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a21; --panel-2: #1e222b; --border: #2a2f3a;
+    --text: #e6e9ef; --muted: #9aa4b2; --accent: #6ea8fe; --ok: #4ec9a5;
+    --warn: #e6b450; --err: #f07178; --chip: #232833;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+    padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+  header label { color: var(--muted); font-size: 12px; }
+  header input[type="text"] {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; min-width: 260px; font: inherit;
+  }
+  button {
+    background: var(--accent); color: #0b0e14; border: 0; border-radius: 6px;
+    padding: 6px 12px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button.secondary { background: var(--chip); color: var(--text); border: 1px solid var(--border); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #status {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+    padding: 4px 10px; border-radius: 999px; background: var(--chip); color: var(--muted);
+  }
+  #status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  #status.connected .dot { background: var(--ok); }
+  #status.connecting .dot { background: var(--warn); }
+  #status.error .dot { background: var(--err); }
+  main { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; padding: 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+  section > h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 12px; }
+  .fleet-session { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 10px; background: var(--panel-2); }
+  .fleet-session .sname { font-weight: 600; }
+  .terminals { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .terminal-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 13px; padding: 6px 8px; background: var(--chip); border-radius: 6px; }
+  .chip { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--chip); border: 1px solid var(--border); color: var(--muted); }
+  .status-idle { color: var(--ok); } .status-processing { color: var(--warn); }
+  .status-completed { color: var(--accent); } .status-error { color: var(--err); }
+  .empty { color: var(--muted); font-style: italic; }
+  /* Generative-UI components */
+  #components { display: flex; flex-direction: column; gap: 10px; }
+  .gcard { border: 1px solid var(--border); border-radius: 8px; padding: 12px; background: var(--panel-2); }
+  .gcard .ghead { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .gcard .gtype { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .gcard .gtitle { font-weight: 600; }
+  .risk-high { color: var(--err); } .risk-medium { color: var(--warn); } .risk-low { color: var(--ok); }
+  .choices { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .bar { height: 8px; background: var(--chip); border-radius: 999px; overflow: hidden; margin-top: 6px; }
+  .bar > span { display: block; height: 100%; background: var(--accent); }
+  .bar.indeterminate > span { width: 40% !important; animation: slide 1.2s infinite ease-in-out; }
+  @keyframes slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+  .metric-value { font-size: 22px; font-weight: 700; }
+  .difffile { display: flex; justify-content: space-between; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .add { color: var(--ok); } .del { color: var(--err); }
+  .placeholder { border: 1px dashed var(--err); border-radius: 8px; padding: 12px; background: rgba(240,113,120,0.06); }
+  .placeholder .gtype { color: var(--err); }
+  /* Event log */
+  #log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; max-height: 340px; overflow-y: auto; display: flex; flex-direction: column-reverse; gap: 2px; }
+  .logline { display: flex; gap: 8px; padding: 2px 0; border-bottom: 1px solid var(--border); }
+  .logline .lt { color: var(--muted); flex: 0 0 84px; }
+  .logline .le { flex: 0 0 168px; color: var(--accent); }
+  .logline .ld { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .counts { display: flex; gap: 8px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CAO AG-UI Viewer</h1>
+  <label for="base">Server base URL</label>
+  <input id="base" type="text" value="http://localhost:9889" spellcheck="false" />
+  <label for="token">Access token</label>
+  <input id="token" type="password" placeholder="optional (auth-enabled servers)"
+         autocomplete="off" spellcheck="false" />
+  <button id="connect">Connect</button>
+  <button id="disconnect" class="secondary" disabled>Disconnect</button>
+  <span id="status"><span class="dot"></span><span id="statusText">disconnected</span></span>
+</header>
+
+<main>
+  <section>
+    <h2>Fleet (projected from STATE_SNAPSHOT + STATE_DELTA)</h2>
+    <div id="fleet"><p class="empty">Not connected.</p></div>
+  </section>
+
+  <section>
+    <h2>Generative UI</h2>
+    <div id="components"><p class="empty">No components emitted yet.</p></div>
+  </section>
+
+  <section style="grid-column: 1 / -1;">
+    <h2>Event log <span id="eventCounts" class="counts"></span></h2>
+    <div id="log" aria-live="polite"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+(function () {
+  // -----------------------------------------------------------------------
+  // Client-side mirror of the server's FROZEN generative-UI allow-list.
+  // (services/agui_stream.py :: GENERATIVE_UI_COMPONENTS). Anything not in
+  // this set renders as an inert placeholder and is NEVER executed.
+  // -----------------------------------------------------------------------
+  var ALLOWED_COMPONENTS = Object.freeze({
+    approval_card: true, choice_prompt: true, diff_summary: true,
+    progress: true, metric: true, agent_card: true,
+  });
+
+  // The named AG-UI events this viewer listens for.
+  var AGUI_EVENTS = [
+    "STATE_SNAPSHOT", "STATE_DELTA", "GENERATIVE_UI",
+    "RUN_STARTED", "RUN_FINISHED", "STEP_STARTED", "STEP_FINISHED",
+    "TOOL_CALL_START", "TOOL_CALL_END", "TEXT_MESSAGE_CONTENT", "RUN_ERROR",
+  ];
+
+  var els = {
+    base: document.getElementById("base"),
+    token: document.getElementById("token"),
+    connect: document.getElementById("connect"),
+    disconnect: document.getElementById("disconnect"),
+    status: document.getElementById("status"),
+    statusText: document.getElementById("statusText"),
+    fleet: document.getElementById("fleet"),
+    components: document.getElementById("components"),
+    log: document.getElementById("log"),
+    counts: document.getElementById("eventCounts"),
+  };
+
+  var es = null;                 // active EventSource
+  var fleetState = null;         // projected DashboardSnapshot
+  var seenIds = new Set();       // dedup by event id (for ?since= replay overlap)
+  var counts = {};               // per-event-type counters
+
+  // -----------------------------------------------------------------------
+  // Tiny inline RFC-6902 JSON-Patch applier (add / replace / remove only).
+  // Deliberately dependency-free. Mutates and returns `doc`.
+  // -----------------------------------------------------------------------
+  function jsonPointerParse(path) {
+    if (path === "") return [];
+    if (path[0] !== "/") throw new Error("invalid JSON pointer: " + path);
+    return path.substring(1).split("/").map(function (tok) {
+      return tok.replace(/~1/g, "/").replace(/~0/g, "~");
+    });
+  }
+  function applyPatch(doc, ops) {
+    if (!Array.isArray(ops)) return doc;
+    ops.forEach(function (op) {
+      if (!op || typeof op !== "object") return;
+      var tokens = jsonPointerParse(op.path || "");
+      if (tokens.length === 0) {
+        // whole-document replace/add
+        if (op.op === "add" || op.op === "replace") {
+          if (op.value && typeof op.value === "object") doc = op.value;
+        }
+        return;
+      }
+      var parent = doc;
+      for (var i = 0; i < tokens.length - 1; i++) {
+        var key = tokens[i];
+        if (parent == null || typeof parent !== "object") return;
+        if (!(key in parent)) {
+          if (op.op === "add") parent[key] = {}; else return;
+        }
+        parent = parent[key];
+      }
+      var last = tokens[tokens.length - 1];
+      if (parent == null || typeof parent !== "object") return;
+      if (op.op === "remove") {
+        if (Array.isArray(parent)) parent.splice(parseInt(last, 10), 1);
+        else delete parent[last];
+      } else if (op.op === "add" || op.op === "replace") {
+        if (Array.isArray(parent) && last === "-") parent.push(op.value);
+        else if (Array.isArray(parent)) parent.splice(parseInt(last, 10), op.op === "add" ? 0 : 1, op.value);
+        else parent[last] = op.value;
+      }
+    });
+    return doc;
+  }
+
+  // -----------------------------------------------------------------------
+  // DOM helpers — text/attribute only, never innerHTML.
+  // -----------------------------------------------------------------------
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = String(text);
+    return n;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  // -----------------------------------------------------------------------
+  // Fleet rendering (from the projected state)
+  // -----------------------------------------------------------------------
+  function statusClass(s) {
+    s = (s || "").toLowerCase();
+    if (s.indexOf("idle") >= 0) return "status-idle";
+    if (s.indexOf("process") >= 0) return "status-processing";
+    if (s.indexOf("complet") >= 0) return "status-completed";
+    if (s.indexOf("error") >= 0) return "status-error";
+    return "";
+  }
+  function renderFleet() {
+    clear(els.fleet);
+    if (!fleetState || !Array.isArray(fleetState.sessions) || fleetState.sessions.length === 0) {
+      els.fleet.appendChild(el("p", "empty", "No sessions in current snapshot."));
+      return;
+    }
+    var terminals = Array.isArray(fleetState.terminals) ? fleetState.terminals : [];
+    fleetState.sessions.forEach(function (s) {
+      var box = el("div", "fleet-session");
+      var head = el("div");
+      head.appendChild(el("span", "sname", s.name || s.id || "(unnamed)"));
+      head.appendChild(document.createTextNode("  "));
+      head.appendChild(el("span", "chip " + statusClass(s.status), s.status || "unknown"));
+      box.appendChild(head);
+
+      var mine = terminals.filter(function (t) { return (t.session_name || "") === (s.name || s.id); });
+      var twrap = el("div", "terminals");
+      if (mine.length === 0) {
+        twrap.appendChild(el("span", "empty", "no terminals"));
+      } else {
+        mine.forEach(function (t) {
+          var row = el("div", "terminal-row");
+          row.appendChild(el("span", "", t.agent_profile || t.provider || t.id));
+          if (t.provider) row.appendChild(el("span", "chip", t.provider));
+          row.appendChild(el("span", "chip " + statusClass(t.status), t.status || "unknown"));
+          row.appendChild(el("span", "chip", (t.id || "").slice(0, 8)));
+          twrap.appendChild(row);
+        });
+      }
+      box.appendChild(twrap);
+      els.fleet.appendChild(box);
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // Generative-UI rendering — allow-list gated, JSON props only.
+  // -----------------------------------------------------------------------
+  function renderComponent(component, props) {
+    props = (props && typeof props === "object") ? props : {};
+    var card = el("div", "gcard");
+    var head = el("div", "ghead");
+    head.appendChild(el("span", "gtype", component));
+    card.appendChild(head);
+
+    if (component === "approval_card") {
+      head.appendChild(el("span", "gtitle", props.title || "Approval requested"));
+      if (props.detail) card.appendChild(el("div", "", props.detail));
+      if (props.risk) card.appendChild(el("div", "risk-" + String(props.risk).toLowerCase(), "risk: " + props.risk));
+    } else if (component === "choice_prompt") {
+      head.appendChild(el("span", "gtitle", props.question || "Choose"));
+      var choices = Array.isArray(props.choices) ? props.choices : [];
+      var cwrap = el("div", "choices");
+      choices.forEach(function (c) {
+        var label = (c && typeof c === "object") ? (c.label != null ? c.label : c.value) : c;
+        cwrap.appendChild(el("span", "chip", label));
+      });
+      card.appendChild(cwrap);
+    } else if (component === "diff_summary") {
+      head.appendChild(el("span", "gtitle", props.title || "Changes"));
+      var files = Array.isArray(props.files) ? props.files : [];
+      files.forEach(function (f) {
+        f = f || {};
+        var row = el("div", "difffile");
+        row.appendChild(el("span", "", f.path || "(file)"));
+        var counts = el("span");
+        counts.appendChild(el("span", "add", "+" + (f.additions || 0)));
+        counts.appendChild(document.createTextNode(" "));
+        counts.appendChild(el("span", "del", "-" + (f.deletions || 0)));
+        row.appendChild(counts);
+        card.appendChild(row);
+      });
+    } else if (component === "progress") {
+      head.appendChild(el("span", "gtitle", props.label || "Progress"));
+      var hasValue = typeof props.value === "number";
+      var bar = el("div", "bar" + (hasValue ? "" : " indeterminate"));
+      var fill = el("span");
+      if (hasValue) fill.style.width = Math.max(0, Math.min(1, props.value)) * 100 + "%";
+      bar.appendChild(fill);
+      card.appendChild(bar);
+      if (hasValue) card.appendChild(el("div", "gtype", Math.round(props.value * 100) + "%"));
+    } else if (component === "metric") {
+      head.appendChild(el("span", "gtitle", props.label || "Metric"));
+      var v = el("div", "metric-value", (props.value != null ? props.value : "—") + (props.unit ? " " + props.unit : ""));
+      card.appendChild(v);
+    } else if (component === "agent_card") {
+      head.appendChild(el("span", "gtitle", props.name || "agent"));
+      if (props.provider) card.appendChild(el("span", "chip", props.provider));
+      if (props.status) card.appendChild(el("span", "chip " + statusClass(props.status), props.status));
+    }
+    return card;
+  }
+
+  function renderInertPlaceholder(component) {
+    var card = el("div", "placeholder");
+    var head = el("div", "ghead");
+    head.appendChild(el("span", "gtype", "refused component"));
+    card.appendChild(head);
+    card.appendChild(el("div", "", "Component \"" + String(component) +
+      "\" is not on the allow-list. Rendered as an inert placeholder — not executed."));
+    return card;
+  }
+
+  function addComponent(component, props) {
+    // Remove the "empty" hint on first real component.
+    var empty = els.components.querySelector(".empty");
+    if (empty) els.components.removeChild(empty);
+    var node = Object.prototype.hasOwnProperty.call(ALLOWED_COMPONENTS, component)
+      ? renderComponent(component, props)
+      : renderInertPlaceholder(component);
+    els.components.insertBefore(node, els.components.firstChild);
+    // Cap the rendered list to keep the DOM light.
+    while (els.components.children.length > 40) els.components.removeChild(els.components.lastChild);
+  }
+
+  // -----------------------------------------------------------------------
+  // Event log
+  // -----------------------------------------------------------------------
+  function bumpCount(type) {
+    counts[type] = (counts[type] || 0) + 1;
+    clear(els.counts);
+    Object.keys(counts).sort().forEach(function (k) {
+      els.counts.appendChild(el("span", "chip", k + " " + counts[k]));
+    });
+  }
+  function logEvent(type, data) {
+    var line = el("div", "logline");
+    var t = new Date().toLocaleTimeString();
+    line.appendChild(el("span", "lt", t));
+    line.appendChild(el("span", "le", type));
+    var desc = "";
+    try {
+      if (type === "GENERATIVE_UI") desc = data.component + (data.rejected_component ? " (rejected)" : "");
+      else if (type === "STATE_SNAPSHOT") desc = "snapshot: " + ((data.snapshot && data.snapshot.sessions || []).length) + " session(s)";
+      else if (type === "STATE_DELTA") desc = (data.delta || []).length + " patch op(s)";
+      else desc = data.session_name || data.step_name || data.message || data.run_id || "";
+    } catch (e) { desc = ""; }
+    line.appendChild(el("span", "ld", desc));
+    els.log.insertBefore(line, els.log.firstChild);
+    while (els.log.children.length > 300) els.log.removeChild(els.log.lastChild);
+  }
+
+  // -----------------------------------------------------------------------
+  // Event handling
+  // -----------------------------------------------------------------------
+  function handle(type, ev) {
+    var data;
+    try { data = JSON.parse(ev.data); } catch (e) { data = {}; }
+
+    // Dedup by event id (the SSE `id:` line, surfaced as ev.lastEventId, or
+    // event_id inside the payload). Guards the ?since= replay->live overlap.
+    var id = ev.lastEventId || data.event_id;
+    if (id) {
+      if (seenIds.has(id)) return;
+      seenIds.add(id);
+    }
+
+    bumpCount(type);
+    logEvent(type, data);
+
+    if (type === "STATE_SNAPSHOT") {
+      fleetState = data.snapshot && typeof data.snapshot === "object" ? data.snapshot : {};
+      renderFleet();
+    } else if (type === "STATE_DELTA") {
+      if (fleetState) { fleetState = applyPatch(fleetState, data.delta); renderFleet(); }
+    } else if (type === "GENERATIVE_UI") {
+      // A server-side refusal arrives as RAW with rejected_component; but if a
+      // component name reaches us here, still gate it against our own mirror.
+      addComponent(data.component, data.props);
+    }
+  }
+
+  function setStatus(state, text) {
+    els.status.className = state;
+    els.statusText.textContent = text;
+  }
+
+  // Build the stream URL, attaching the access token as a query parameter when
+  // present. Native EventSource cannot set an Authorization header, so an
+  // auth-enabled server takes a `cao:read` JWT as `?access_token=`. The token is
+  // read from the in-memory input on each connect and is NEVER persisted
+  // (no localStorage / sessionStorage) or logged. Exposed on `window` purely so
+  // the shift-left recorder can assert the URL-construction contract.
+  function buildStreamUrl(base, token) {
+    var trimmed = (base || "").trim().replace(/\/+$/, "");
+    var url = new URL(trimmed + "/agui/v1/stream");
+    if (token) url.searchParams.set("access_token", token);
+    return url.toString();
+  }
+  window.__caoBuildStreamUrl = buildStreamUrl;
+
+  function connect() {
+    disconnect();
+    var base = (els.base.value || "").trim().replace(/\/+$/, "");
+    if (!base) { setStatus("error", "enter a base URL"); return; }
+    var token = (els.token.value || "").trim();  // in-memory only
+    var url;
+    try {
+      url = buildStreamUrl(base, token);
+    } catch (e) {
+      setStatus("error", "bad URL: " + e.message);
+      return;
+    }
+    setStatus("connecting", "connecting…");
+    try {
+      es = new EventSource(url);
+    } catch (e) {
+      setStatus("error", "bad URL: " + e.message);
+      return;
+    }
+    els.connect.disabled = true;
+    els.disconnect.disabled = false;
+
+    // Redact the token from anything shown in the UI (it lives only in the
+    // in-memory EventSource URL, never in the visible status text).
+    var shownUrl = base + "/agui/v1/stream" + (token ? " (+token)" : "");
+    es.onopen = function () { setStatus("connected", "connected → " + shownUrl); };
+    es.onerror = function () {
+      // EventSource auto-reconnects; reflect the transient state.
+      setStatus(es && es.readyState === 1 ? "connected" : "error",
+        es && es.readyState === 1 ? "connected" : "reconnecting…");
+    };
+    // Register a listener per named AG-UI event.
+    AGUI_EVENTS.forEach(function (type) {
+      es.addEventListener(type, function (ev) { handle(type, ev); });
+    });
+    // Also surface any unnamed/default messages in the log.
+    es.onmessage = function (ev) { logEvent("message", (function () { try { return JSON.parse(ev.data); } catch (e) { return {}; } })()); };
+  }
+
+  function disconnect() {
+    if (es) { es.close(); es = null; }
+    els.connect.disabled = false;
+    els.disconnect.disabled = true;
+    setStatus("disconnected", "disconnected");
+  }
+
+  els.connect.addEventListener("click", connect);
+  els.disconnect.addEventListener("click", disconnect);
+
+  // Convenience: seed the token from the page's own query string
+  // (?access_token=… or ?token=…) so an operator can hand the viewer a token by
+  // URL without editing source. It is copied into the in-memory input only —
+  // not persisted — and scrubbed from the visible address bar via history
+  // replaceState so it does not linger in the URL.
+  try {
+    var pageParams = new URL(window.location.href).searchParams;
+    var seeded = pageParams.get("access_token") || pageParams.get("token");
+    if (seeded) {
+      els.token.value = seeded;
+      if (window.history && window.history.replaceState) {
+        pageParams.delete("access_token");
+        pageParams.delete("token");
+        var clean = window.location.pathname +
+          (pageParams.toString() ? "?" + pageParams.toString() : "") + window.location.hash;
+        window.history.replaceState(null, "", clean);
+      }
+    }
+  } catch (e) { /* location not a valid URL (e.g. some test envs) — ignore */ }
+
+  // Auto-connect on load for convenience.
+  connect();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "name": "cao-agui-eventsource-viewer-recorder",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Dev/CI tooling: shift-left demo recorder for the dependency-free AG-UI EventSource viewer. Not required to run the viewer (../index.html has zero dependencies).",
+  "scripts": {
+    "record": "node record-demo.mjs",
+    "playwright:install": "playwright install --with-deps chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1"
+  }
+}
