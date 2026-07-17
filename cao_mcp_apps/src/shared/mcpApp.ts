@@ -70,15 +70,25 @@ export class McpApp {
   // ---- handler registration (call BEFORE connect) ------------------------
 
   /** Register a notification handler. MUST be called before `connect()`. */
-  on(method: string, handler: NotificationHandler): void {
+  on(method: string, handler: NotificationHandler): () => void {
     const list = this.notificationHandlers.get(method) ?? [];
     list.push(handler);
     this.notificationHandlers.set(method, list);
+    return () => {
+      const updated = (this.notificationHandlers.get(method) ?? []).filter(
+        (h) => h !== handler,
+      );
+      if (updated.length) {
+        this.notificationHandlers.set(method, updated);
+      } else {
+        this.notificationHandlers.delete(method);
+      }
+    };
   }
 
   /** Convenience: the tool result that instantiated/refreshed the View. */
-  onToolResult(handler: (result: any) => void): void {
-    this.on("ui/notifications/tool-result", handler);
+  onToolResult(handler: (result: any) => void): () => void {
+    return this.on("ui/notifications/tool-result", handler);
   }
 
   /** Convenience: the tool input (arguments) for the current tool call. */

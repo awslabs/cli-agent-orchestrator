@@ -71,21 +71,25 @@ export function Dashboard({
   useEffect(() => {
     if (!app) return;
     let stop: (() => void) | undefined;
+    let mounted = true;
 
     // Register handlers BEFORE connect (lifecycle invariant).
-    app.onToolResult((result) => {
+    const unsubscribe = app.onToolResult((result) => {
+      if (!mounted) return;
       const snap = (result?.structuredContent ?? result) as
         DashboardSnapshot | undefined;
       if (snap && Array.isArray(snap.terminals)) applyDelta(snap);
     });
 
     void app.connect().then(() => {
+      if (!mounted) return;
       // Surface the host-delegated Web UI link only when the host can open links.
       setCanOpenWebUi(app.canOpenLinks());
       stop = app.startPolling(
         "render_dashboard",
         POLL_INTERVAL_MS,
         (snap) => {
+          if (!mounted) return;
           if (snap && Array.isArray(snap.terminals)) {
             setUnreachable(false);
             applyDelta(snap as DashboardSnapshot);
@@ -93,11 +97,15 @@ export function Dashboard({
         },
         {},
         // A failed poll surfaces the retry control.
-        () => setUnreachable(true),
+        () => {
+          if (mounted) setUnreachable(true);
+        },
       );
     });
 
     return () => {
+      mounted = false;
+      unsubscribe();
       if (stop) stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

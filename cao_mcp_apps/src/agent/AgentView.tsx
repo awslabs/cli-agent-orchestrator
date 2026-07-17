@@ -31,11 +31,12 @@ export function AgentView({
   useEffect(() => {
     if (!app) return;
     let stop: (() => void) | undefined;
+    let mounted = true;
 
-    app.onToolResult((result) => {
+    const unsubscribe = app.onToolResult((result) => {
+      if (!mounted) return;
       const snap = (result?.structuredContent ?? result) as
-        | AgentDetailSnapshot
-        | undefined;
+        AgentDetailSnapshot | undefined;
       if (snap && snap.terminal_id) {
         tidRef.current = snap.terminal_id;
         setSnapshot(snap);
@@ -43,12 +44,14 @@ export function AgentView({
     });
 
     void app.connect().then(() => {
+      if (!mounted) return;
       const tid = tidRef.current;
       if (!tid) return;
       stop = app.startPolling(
         "render_agent_view",
         POLL_INTERVAL_MS,
         (snap) => {
+          if (!mounted) return;
           if (snap && (snap as AgentDetailSnapshot).terminal_id) {
             setSnapshot(snap as AgentDetailSnapshot);
           }
@@ -58,6 +61,8 @@ export function AgentView({
     });
 
     return () => {
+      mounted = false;
+      unsubscribe();
       if (stop) stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
