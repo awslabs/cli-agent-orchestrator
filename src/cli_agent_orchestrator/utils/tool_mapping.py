@@ -51,6 +51,13 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_list": ["list", "grep"],
         "fs_*": ["read", "write", "list", "grep"],
     },
+    "devin_cli": {
+        "execute_bash": ["Bash"],
+        "fs_read": ["Read"],
+        "fs_write": ["Write"],
+        "fs_list": ["list", "grep"],
+        "fs_*": ["Read", "Write", "list", "grep"],
+    },
     # Antigravity CLI (agy) shares Google's gemini-style tool vocabulary
     # (write_file/read_file/run_shell_command/...). Restrictions are enforced
     # softly via the injected security prompt (see SOFT_ENFORCEMENT_PROVIDERS).
