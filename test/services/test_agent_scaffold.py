@@ -232,15 +232,25 @@ class TestAutoescapeBehavior:
     def test_selector_engages_for_html_and_xml_templates(self):
         """The advertised safety net is real: a future ``template.html.j2`` /
         ``template.xml.j2`` would be escaped despite the trailing ``.j2``."""
+        from jinja2 import select_autoescape
+
         from cli_agent_orchestrator.services.agent_scaffold import (
-            _autoescape_for_template,
+            _AUTOESCAPE_EXTENSIONS,
+        )
+
+        selector = select_autoescape(
+            enabled_extensions=_AUTOESCAPE_EXTENSIONS,
+            default_for_string=False,
         )
 
         # Escaping engages for HTML/XML under the *.ext.j2 naming convention.
-        assert _autoescape_for_template("template.html.j2") is True
-        assert _autoescape_for_template("template.htm.j2") is True
-        assert _autoescape_for_template("template.xml.j2") is True
+        assert selector("template.html.j2") is True
+        assert selector("template.htm.j2") is True
+        assert selector("template.xml.j2") is True
+        # ... and for bare HTML/XML extensions.
+        assert selector("template.html") is True
+        assert selector("template.xml") is True
         # ... and stays off for markdown and unknown inputs (byte-identical).
-        assert _autoescape_for_template("template.md.j2") is False
-        assert _autoescape_for_template("template.md") is False
-        assert _autoescape_for_template(None) is False
+        assert selector("template.md.j2") is False
+        assert selector("template.md") is False
+        assert selector(None) is False
