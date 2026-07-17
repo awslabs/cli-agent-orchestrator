@@ -234,8 +234,13 @@ def _contained_spec_file(path: Union[str, Path], base_dir: Optional[str] = None)
     """
     safe_base = _safe_dir(base_dir)
     real_path = _resolve_contained_spec_path(path, safe_base)
-    # SafeAccessCheck colocated with the isfile sink below.
-    if real_path != safe_base and not real_path.startswith(safe_base + os.sep):
+    # SafeAccessCheck — single positive containment guard, colocated with the
+    # isfile sink below. Must match the ``_read_contained_spec_bytes`` form: a
+    # COMPOUND ``!= base and not startswith`` guard leaves the ``real_path ==
+    # base`` branch reaching the sink un-guarded, which CodeQL (correctly) will
+    # not treat as a barrier. A candidate that resolves exactly to the base dir
+    # is not a spec file, so rejecting it here is the right behavior anyway.
+    if not real_path.startswith(safe_base + os.sep):
         raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
     return real_path if os.path.isfile(real_path) else None
 
