@@ -284,9 +284,7 @@ class HerdrBackend(TerminalBackend):
             session_name, window_name, terminal_id, pane_id=new_pane_id, extra_env=extra_env
         )
 
-        logger.info(
-            f"Created herdr workspace: {session_name} in {working_directory}"
-        )  # NOSONAR - identifiers are validated before use
+        logger.info("Created herdr workspace")
         return window_name
 
     def session_exists(self, session_name: str) -> bool:
@@ -325,16 +323,12 @@ class HerdrBackend(TerminalBackend):
         try:
             workspace_id = self._resolve_workspace_id(session_name)
         except TerminalBackendError:
-            logger.warning(
-                f"kill_session: workspace '{session_name}' not found"
-            )  # NOSONAR - identifiers are validated before use
+            logger.warning("kill_session: workspace not found")
             return False
         result = self._run_herdr(["workspace", "close", workspace_id], check=False)
         if result.returncode == 0:
             self._workspace_cache.pop(session_name, None)
-            logger.info(
-                f"Killed herdr workspace: {session_name}"
-            )  # NOSONAR - identifiers are validated before use
+            logger.info("Killed herdr workspace")
             return True
         return False
 
@@ -379,9 +373,7 @@ class HerdrBackend(TerminalBackend):
             except TerminalBackendError as e:
                 logger.warning(f"create_window: pane run failed for {new_pane_id} (non-fatal): {e}")
 
-        logger.info(
-            f"Created herdr tab in workspace {session_name}"
-        )  # NOSONAR - identifiers are validated before use
+        logger.info("Created herdr tab")
         return window_name
 
     def kill_window(self, session_name: str, window_name: str) -> bool:
@@ -389,17 +381,13 @@ class HerdrBackend(TerminalBackend):
         try:
             pane_id = self._resolve_pane_id_from_window(session_name, window_name)
         except TerminalBackendError:
-            logger.warning(
-                f"kill_window: could not resolve pane for {session_name}:{window_name}"
-            )  # NOSONAR - identifiers are validated before use
+            logger.warning("kill_window: could not resolve pane")
             return False
 
         result = self._run_herdr(["pane", "close", pane_id], check=False)
 
         if result.returncode == 0:
-            logger.info(
-                f"Killed herdr pane {pane_id} for {session_name}:{window_name}"
-            )  # NOSONAR - identifiers are validated before use
+            logger.info("Killed herdr pane")
             return True
         return False
 
