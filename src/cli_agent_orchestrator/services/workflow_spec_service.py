@@ -579,7 +579,7 @@ def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> S
     # check here — rather than trusting _safe_spec_path across a helper
     # boundary — satisfies py/path-injection while preserving the same
     # security semantics.
-    safe_base = _safe_dir(base_dir)
+    safe_base = os.path.realpath(os.path.abspath(_safe_dir(base_dir)))
     user_path = os.fspath(path)
     candidate = user_path if os.path.isabs(user_path) else os.path.join(safe_base, user_path)
     real_path = os.path.realpath(os.path.abspath(candidate))

@@ -1954,7 +1954,7 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
             # os.path.realpath + str.startswith against the safe base). This
             # mirrors workflow_spec_service._safe_spec_path without crossing a
             # helper boundary, so py/path-injection sees the sanitizer.
-            base_dir = workflow_spec_service._safe_dir(None)
+            base_dir = os.path.realpath(os.path.abspath(workflow_spec_service._safe_dir(None)))
             user_path = body.path
             candidate = user_path if os.path.isabs(user_path) else os.path.join(base_dir, user_path)
             real_path = os.path.realpath(os.path.abspath(candidate))
