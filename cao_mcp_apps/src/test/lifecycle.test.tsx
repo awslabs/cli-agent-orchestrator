@@ -52,19 +52,21 @@ function buildHost(opts: MockHostOptions = {}): MockHost {
 }
 
 describe("McpApp convenience notification handlers", () => {
-  it("returns an unsubscribe that removes a notification handler", async () => {
+  it("returns an unsubscribe that removes only its handler", async () => {
     const host = buildHost({ tools: {} });
     const app = makeApp(host);
 
-    const handler = vi.fn();
-    const off = app.on("ui/notifications/tool-result", handler);
-    off();
+    const shared = vi.fn();
+    const offFirst = app.on("ui/notifications/tool-result", shared);
+    app.on("ui/notifications/tool-result", shared);
+
+    offFirst();
 
     await app.connect();
     host.pushNotification("ui/notifications/tool-result", {
       structuredContent: { nodes: [] },
     });
-    expect(handler).not.toHaveBeenCalled();
+    expect(shared).toHaveBeenCalledOnce();
   });
 
   it("delivers tool-input arguments, host-context changes, and teardown reason", async () => {

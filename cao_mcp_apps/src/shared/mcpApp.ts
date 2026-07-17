@@ -46,8 +46,12 @@ export class McpApp {
   private target: Window;
   private scope: Window;
   private nextId: JsonRpcId = 1;
+  private nextHandlerId = 0;
   private pending = new Map<JsonRpcId, PendingRequest>();
-  private notificationHandlers = new Map<string, NotificationHandler[]>();
+  private notificationHandlers = new Map<
+    string,
+    { id: number; handler: NotificationHandler }[]
+  >();
   private listener?: (event: MessageEvent) => void;
   private connected = false;
   /** Host context (theme, container dimensions, etc.) from initialize. */
@@ -71,12 +75,13 @@ export class McpApp {
 
   /** Register a notification handler. MUST be called before `connect()`. */
   on(method: string, handler: NotificationHandler): () => void {
+    const id = ++this.nextHandlerId;
     const list = this.notificationHandlers.get(method) ?? [];
-    list.push(handler);
+    list.push({ id, handler });
     this.notificationHandlers.set(method, list);
     return () => {
       const updated = (this.notificationHandlers.get(method) ?? []).filter(
-        (h) => h !== handler,
+        (entry) => entry.id !== id,
       );
       if (updated.length) {
         this.notificationHandlers.set(method, updated);
@@ -350,7 +355,7 @@ export class McpApp {
       }
       const handlers = this.notificationHandlers.get(data.method);
       if (handlers) {
-        for (const handler of handlers) handler(data.params);
+        for (const { handler } of handlers) handler(data.params);
       }
     }
   }
