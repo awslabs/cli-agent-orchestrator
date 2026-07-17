@@ -1961,8 +1961,7 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
             # real_path is sanitized by _safe_spec_path (resolve + containment).
             # CodeQL's py/path-injection query does not track this custom
             # sanitizer across the helper boundary; suppress the false positive.
-            # codeql[py/path-injection]
-            with open(real_path, "rb") as fh:
+            with open(real_path, "rb") as fh:  # lgtm[py/path-injection]
                 # Capped read: an oversized file is rejected without ever
                 # being fully read into memory.
                 raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
