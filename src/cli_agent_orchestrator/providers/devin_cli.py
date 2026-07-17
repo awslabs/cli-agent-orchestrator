@@ -59,7 +59,7 @@ ERROR_PATTERNS = [
     r"^Error:",
     r"^Traceback \(most recent call last\):",
     r"^panic:",
-    r"(?:authentication|login|credentials?|auth).{0,40}(?:failed|invalid|error|denied)",
+    r"^(?:\s*)?(?:Devin CLI )?(?:authentication|login|credentials?|auth).{0,20}(?:failed|invalid|error|denied)",
     r"Devin CLI (?:crashed|exited|failed|error)",
 ]
 
@@ -265,7 +265,7 @@ class DevinCliProvider(BaseProvider):
                 self.session_name,
                 self.window_name,
                 command,
-                use_paste_buffer=True,  # Use paste-buffer for shell commands
+                use_paste_buffer=self.use_paste_buffer,
             )
 
             if not await wait_until_status(
@@ -274,6 +274,10 @@ class DevinCliProvider(BaseProvider):
                 raise TimeoutError("Devin CLI initialization timed out after 60 seconds")
 
             self._initialized = True
+            # Prompt/config temp files have been consumed by the Devin CLI on
+            # successful initialization; remove them to avoid leaving security
+            # constraints or MCP server credentials on disk.
+            self._cleanup_temp_files()
             return True
         except Exception:
             # Clean up temp files on failure to prevent credential residue
@@ -333,6 +337,14 @@ class DevinCliProvider(BaseProvider):
         Returns:
             TerminalStatus based on pattern matching
         """
+        native = self._resolve_native_status(buffer)
+        if native is not None:
+            return native
+
+        # herdr never pushes a buffer (pipe-pane is a no-op); read live pane
+        # content so pattern matching runs against real output instead of
+        # returning UNKNOWN on an empty pushed buffer.
+        buffer = self._resolve_buffer(buffer)
         if not buffer:
             return TerminalStatus.UNKNOWN
 
