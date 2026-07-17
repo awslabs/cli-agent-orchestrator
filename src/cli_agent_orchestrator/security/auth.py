@@ -266,6 +266,14 @@ def extract_scopes_from_token(token: str) -> List[str]:
     if not uri:  # pragma: no cover - guarded by is_auth_enabled
         return list(FULL_SCOPE_SET)
 
+    # Reject structurally invalid JWTs before any JWKS network I/O.  Besides
+    # making malformed-token failures deterministic, this avoids letting an
+    # unauthenticated caller trigger a potentially slow IdP lookup with input
+    # that can never be verified.  The header is parsed only for shape here;
+    # signature, algorithm, issuer, audience, and expiry are still validated
+    # below with the configured JWKS key.
+    jwt.get_unverified_header(token)
+
     client = _jwks_cache.get_client(uri)
     try:
         signing_key = client.get_signing_key_from_jwt(token)
