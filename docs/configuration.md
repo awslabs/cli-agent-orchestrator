@@ -10,6 +10,20 @@ CLI flag  >  CAO_* environment variable  >  settings.json  >  built-in default
 
 > `.env` file handling (`utils/env.py`, forwarded provider env vars) is a separate, out-of-scope surface — unaffected by this doc.
 
+## Data directory (`CAO_HOME_DIR`)
+
+All CAO state lives under a single base directory, `~/.aws/cli-agent-orchestrator` by default: the SQLite DB, logs, FIFOs, memory, the `agent-store` / `agent-context` profile dirs, skills, workflow scratch, and `settings.json` itself.
+
+Set the `CAO_HOME_DIR` environment variable to relocate that entire tree:
+
+```bash
+export CAO_HOME_DIR="$HOME/.cli-agent-orchestrator"
+```
+
+Every derived path resolves from this value, so one override moves everything. `CAO_HOME_DIR` is read once, when CAO's `constants` module is first imported (the same convention as `CAO_AGENTS_DIR`), so export it **before** starting `cao-server`, the MCP servers, or any `cao` command. All CAO processes must resolve the same location.
+
+**When to use it.** Some environments restrict or sandbox access to `~/.aws` at the OS level to protect AWS credentials. Because CAO otherwise stores its data there, including the agent profiles it reads during a `handoff`, a locked-down `~/.aws` can leave CAO unable to read its own data (a handoff then fails with `Permission denied`). Relocating `CAO_HOME_DIR` outside `~/.aws` keeps CAO working while leaving those credential protections in place.
+
 ## settings.json schema
 
 ```json

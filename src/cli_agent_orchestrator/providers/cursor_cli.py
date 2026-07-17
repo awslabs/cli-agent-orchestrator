@@ -71,6 +71,7 @@ from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -531,16 +532,13 @@ class CursorCliProvider(BaseProvider):
 
         Honours the ``CAO_TMP_DIR`` env var so tests can redirect
         temp output to ``/tmp/cao_test`` instead of polluting the
-        user's ``~/.aws/cli-agent-orchestrator/tmp``. Defaults to
-        ``~/.aws/cli-agent-orchestrator/tmp`` for production.
+        user's CAO data dir. Defaults to ``<CAO_HOME_DIR>/tmp`` (i.e.
+        ``~/.aws/cli-agent-orchestrator/tmp`` unless ``CAO_HOME_DIR`` is
+        overridden), matching where the other providers write temp files.
         """
         import os
 
-        cao_tmp = Path(
-            os.environ.get(
-                "CAO_TMP_DIR", str(Path.home() / ".aws" / "cli-agent-orchestrator" / "tmp")
-            )
-        )
+        cao_tmp = Path(os.environ.get("CAO_TMP_DIR", str(CAO_HOME_DIR / "tmp")))
         cao_tmp.mkdir(parents=True, exist_ok=True)
         return cao_tmp
 
