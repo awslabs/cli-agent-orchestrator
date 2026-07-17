@@ -581,9 +581,9 @@ def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> S
     # security semantics.
     safe_base = os.path.realpath(os.path.abspath(_safe_dir(base_dir)))
     user_path = os.fspath(path)
-    candidate = user_path if os.path.isabs(user_path) else os.path.join(safe_base, user_path)
+    candidate = os.path.join(safe_base, user_path)
     real_path = os.path.realpath(os.path.abspath(candidate))
-    if real_path != safe_base and not real_path.startswith(safe_base + os.sep):
+    if not real_path.startswith(safe_base + os.sep):
         raise ValueError(f"script spec path '{path}' escapes its validated directory")
     with open(real_path, "rb") as fh:
         raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)

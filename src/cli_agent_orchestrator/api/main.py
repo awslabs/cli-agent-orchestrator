@@ -1956,9 +1956,9 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
             # helper boundary, so py/path-injection sees the sanitizer.
             base_dir = os.path.realpath(os.path.abspath(workflow_spec_service._safe_dir(None)))
             user_path = body.path
-            candidate = user_path if os.path.isabs(user_path) else os.path.join(base_dir, user_path)
+            candidate = os.path.join(base_dir, user_path)
             real_path = os.path.realpath(os.path.abspath(candidate))
-            if real_path != base_dir and not real_path.startswith(base_dir + os.sep):
+            if not real_path.startswith(base_dir + os.sep):
                 raise ValueError(
                     f"workflow spec path '{user_path}' escapes its validated directory"
                 )
