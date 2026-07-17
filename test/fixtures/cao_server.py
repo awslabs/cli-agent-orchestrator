@@ -50,6 +50,7 @@ import importlib
 import json
 import os
 import pkgutil
+import shutil
 import signal
 import socket
 import socketserver
@@ -540,12 +541,34 @@ def cao_terminal(
             indirect=True,
         )
 
-    Default is ``("kiro_cli", "developer")``. Tests are responsible for
-    skipping if the chosen provider CLI is not available on ``PATH``.
+    Default is ``("kiro_cli", "developer")``. The fixture skips before the
+    POST when the chosen provider CLI is not available on ``PATH``.
     """
     params = getattr(request, "param", None) or {}
     provider = params.get("provider", "kiro_cli")
     profile = params.get("agent_profile", "developer")
+
+    # The fixture runs before the test body, so a provider availability check
+    # inside the test cannot protect the POST below.  Skip before starting a
+    # real terminal; otherwise an absent CLI waits for the provider-init
+    # timeout and may leave a tmux session behind when the test run is aborted.
+    provider_commands = {
+        "kiro_cli": "kiro-cli",
+        "claude_code": "claude",
+        "codex": "codex",
+        "kimi_cli": "kimi",
+        "copilot_cli": "copilot",
+        "opencode_cli": "opencode",
+        "hermes": "hermes",
+        "cursor_cli": "agent",
+        "antigravity_cli": "agy",
+    }
+    provider_command = provider_commands.get(provider)
+    if provider_command and shutil.which(provider_command) is None:
+        pytest.skip(
+            f"provider {provider!r} unavailable: command {provider_command!r} not found"
+        )
+
     session_name = f"caotest-{uuid.uuid4().hex[:12]}"
 
     resp = requests.post(

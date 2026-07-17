@@ -529,6 +529,7 @@ class TestOpencodeAgentListIntegration:
 
         local_store.mkdir(parents=True)
         context_dir.mkdir(parents=True)
+        agents_dir.parent.mkdir(parents=True)
 
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR", local_store
@@ -552,21 +553,44 @@ class TestOpencodeAgentListIntegration:
             "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
         )
 
+        env = {
+            "OPENCODE_CONFIG_DIR": str(tmp_path / "opencode_cli"),
+            "OPENCODE_DISABLE_AUTOUPDATE": "1",
+            "OPENCODE_DISABLE_CLAUDE_CODE_PROMPT": "1",
+            "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "1",
+            # OpenCode merges its global XDG config before a custom config
+            # directory.  Keep this smoke test independent from the developer's
+            # real agents/plugins and from first-run package bootstrapping there.
+            "XDG_CONFIG_HOME": str(tmp_path / "xdg-config"),
+            "XDG_DATA_HOME": str(tmp_path / "xdg-data"),
+            "XDG_CACHE_HOME": str(tmp_path / "xdg-cache"),
+            "XDG_STATE_HOME": str(tmp_path / "xdg-state"),
+        }
+        isolated_env = {**os.environ, **env}
+
+        # OpenCode 1.14+ performs a one-time SQLite migration on the first
+        # command and does not expose custom-directory agents until the next
+        # invocation.  Bootstrap the external runtime before exercising CAO's
+        # installer so the smoke assertion measures discovery, not migration.
+        subprocess.run(
+            ["opencode", "agent", "list", "--pure"],
+            capture_output=True,
+            text=True,
+            env=isolated_env,
+            timeout=60,
+            check=True,
+        )
+
         _write_profile(local_store / "smoke-test-agent.md", name="smoke-test-agent")
 
         result = runner.invoke(install, ["smoke-test-agent", "--provider", "opencode_cli"])
         assert result.exit_code == 0
 
-        env = {
-            "OPENCODE_CONFIG": str(config_file),
-            "OPENCODE_CONFIG_DIR": str(tmp_path / "opencode_cli"),
-            "OPENCODE_DISABLE_AUTOUPDATE": "1",
-        }
         proc = subprocess.run(
-            ["opencode", "agent", "list"],
+            ["opencode", "agent", "list", "--pure"],
             capture_output=True,
             text=True,
-            env={**os.environ, **env},
+            env=isolated_env,
             timeout=60,
         )
         assert "smoke-test-agent" in proc.stdout or "smoke-test-agent" in proc.stderr
