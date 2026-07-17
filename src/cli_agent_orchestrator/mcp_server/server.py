@@ -757,8 +757,10 @@ async def _handoff_impl(
             # The MCP transport timed out, but the step may still be running
             # (or may have already completed) server-side. The server persists
             # the result in handoff_results under job_id before sending the
-            # HTTP response, so the caller can retrieve it via
-            # GET /handoff-results/{job_id} (issue #447).
+            # HTTP response, so the caller can retrieve it via the
+            # get_handoff_result MCP tool (issue #447 / PR #453 review finding
+            # 3 — a raw "GET /handoff-results/{job_id}" instruction gives the
+            # supervisor LLM no callable path: no base URL, no auth).
             return HandoffResult(
                 success=False,
                 pending=True,
@@ -766,7 +768,7 @@ async def _handoff_impl(
                 message=(
                     f"Handoff transport timed out after {timeout + _CLIENT_TIMEOUT_HEADROOM} seconds. "
                     f"The job may still be running server-side. "
-                    f"Retrieve the result with: GET /handoff-results/{job_id}"
+                    f"Retrieve the result with the get_handoff_result tool, job_id={job_id}"
                 ),
                 output=None,
                 terminal_id=None,
@@ -1278,6 +1280,50 @@ def delete_terminal(
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
     except Exception as e:
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
+
+
+@mcp.tool()
+def get_handoff_result(
+    job_id: str = Field(
+        description=(
+            "The job_id returned by handoff when pending=True (transport timed "
+            "out but the job may still be running or already finished server-side)."
+        )
+    ),
+) -> Dict[str, Any]:
+    """Retrieve a durably persisted handoff result by job_id (issue #447).
+
+    Call this when a prior ``handoff`` call returned ``pending=True`` — the
+    transport timed out before the result arrived, but the work continues
+    server-side under ``job_id``. Poll this tool until ``state`` is no longer
+    ``"running"``.
+
+    Args:
+        job_id: The job_id from the pending handoff result.
+
+    Returns:
+        Dict with ``success``, ``state`` ("running"|"completed"|"error"),
+        ``terminal_id``, ``last_message`` (populated when completed), and
+        ``error_message`` (populated when errored). ``success=False`` with a
+        ``message`` when the job_id is unknown or the request failed.
+    """
+    try:
+        response = requests.get(f"{API_BASE_URL}/handoff-results/{job_id}", timeout=_mcp_timeout())
+        response.raise_for_status()
+        data = response.json()
+        return {
+            "success": True,
+            "state": data.get("state"),
+            "terminal_id": data.get("terminal_id"),
+            "last_message": data.get("last_message"),
+            "error_message": data.get("error_message"),
+        }
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return {"success": False, "message": f"No handoff result found for job_id {job_id}"}
+        return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
+    except Exception as e:
+        return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
 
 
 # =============================================================================

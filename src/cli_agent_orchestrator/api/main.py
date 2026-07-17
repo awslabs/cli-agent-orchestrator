@@ -1502,10 +1502,14 @@ async def run_step(
     fire (parity with the DELETE endpoint).
 
     Durability (issue #447): when the caller supplies a ``job_id``, the handler
-    records state="running" at request start and state="completed"/"error"
-    BEFORE sending the HTTP response.  A caller that misses the response due to
-    an MCP-transport timeout can retrieve the result via
-    ``GET /handoff-results/{job_id}`` at any point thereafter.  Requests without
+    records state="running" at request start. On success, ``run_agent_step``
+    itself persists state="completed" BETWEEN extraction and teardown (not
+    here, and not after it returns) — the terminal being torn down is the only
+    other place the result lives, so persistence must land before that
+    happens, not merely before the HTTP response. On failure, this handler
+    persists state="error". A caller that misses the response due to an
+    MCP-transport timeout can retrieve the result via
+    ``GET /handoff-results/{job_id}`` at any point thereafter. Requests without
     a ``job_id`` behave exactly as before (no persistence overhead).
     """
     job_id = body.job_id  # None when the caller omits it (backward-compatible)
@@ -1586,27 +1590,18 @@ async def run_step(
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,
+            job_id=job_id,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
         # is logged, not raised.
         _settle_step(result.terminal_id, None)
 
-        # Persist the result BEFORE sending the response (issue #447).
-        # If the transport closes after this write but before the response
-        # arrives, the caller retrieves the result from the DB instead of
-        # losing it.  Best-effort: a write failure must not turn a successful
-        # step into a reported failure.
-        if job_id:
-            try:
-                upsert_handoff_result(
-                    job_id,
-                    "completed",
-                    terminal_id=result.terminal_id,
-                    last_message=result.last_message,
-                )
-            except Exception:
-                logger.warning("run_step: failed to persist completed result for job_id=%s", job_id)
+        # NOTE (issue #447 / PR #453 review): the "completed" persist happens
+        # INSIDE run_agent_step, between extraction and teardown — not here.
+        # Persisting only after this call returns would run after the terminal
+        # (the only other copy of the result) has already been torn down,
+        # contradicting the "persist result, then tear down" requirement.
 
         return RunStepResponse(
             terminal_id=result.terminal_id,
@@ -2180,12 +2175,20 @@ async def export_graph_endpoint(
         "``completed`` (result in ``last_message``), ``error`` (failure in ``error_message``)."
     ),
 )
-async def get_handoff_result_endpoint(job_id: str) -> Dict:
+async def get_handoff_result_endpoint(
+    job_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Retrieve a durable handoff step result by job_id (issue #447).
 
     Returns the persisted record when found; 404 when the job_id is unknown
     (either the caller never sent a job_id, or the record has been purged by
-    the retention sweep).
+    the retention sweep). Scope-gated (PR #453 review finding 4): ``last_message``
+    can carry worker output (prompts/secrets), so this follows the same
+    ``require_any_scope`` posture as other content-serving GETs (``/events``,
+    ``/memory/export``) rather than staying open. A no-op when auth is
+    disabled (the default) — ``require_any_scope`` only enforces when an IdP
+    is configured.
     """
     record = get_handoff_result(job_id)
     if record is None:

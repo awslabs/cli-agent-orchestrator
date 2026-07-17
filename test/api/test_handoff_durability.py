@@ -24,8 +24,11 @@ def _body(**overrides):
 
 
 class TestRunStepDurability:
-    def test_success_upserts_running_then_completed(self, client):
-        """Happy path: handler writes running then completed, in that order."""
+    def test_success_upserts_running_and_passes_job_id_through(self, client):
+        """Happy path: handler writes 'running' at request start and forwards
+        job_id into run_agent_step, which persists 'completed' itself BEFORE
+        teardown (issue #447 / PR #453 review finding 2) — not here after
+        run_agent_step has already returned (and torn the terminal down)."""
         result = AgentStepResult(
             terminal_id="abc12345",
             last_message="all done",
@@ -33,18 +36,16 @@ class TestRunStepDurability:
         )
         calls = []
         with (
-            patch(_RUN_STEP, new=AsyncMock(return_value=result)),
+            patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run_step,
             patch(_UPSERT, side_effect=lambda *a, **kw: calls.append((a, kw))),
         ):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(job_id="cafe1234" * 4))
 
         assert resp.status_code == 200
-        # Two upserts: running (start) and completed (before response).
-        assert len(calls) == 2
+        # Only "running" is written here; "completed" is run_agent_step's job.
+        assert len(calls) == 1
         assert calls[0][0][1] == "running"
-        assert calls[1][0][1] == "completed"
-        assert calls[1][1]["last_message"] == "all done"
-        assert calls[1][1]["terminal_id"] == "abc12345"
+        assert m_run_step.await_args.kwargs["job_id"] == "cafe1234" * 4
 
     def test_no_job_id_skips_upsert(self, client):
         """Without job_id, nothing is persisted (backward-compat)."""
