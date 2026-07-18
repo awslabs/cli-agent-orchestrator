@@ -144,11 +144,13 @@ uv run cao-server
 cao install examples/assign/analysis_supervisor.md --provider devin_cli
 cao install examples/assign/data_analyst.md --provider devin_cli
 cao install examples/assign/report_generator.md --provider devin_cli
+```
 
 > These install commands overwrite any existing `analysis_supervisor`,
 > `data_analyst`, or `report_generator` profiles.  Use an isolated `CAO_HOME`
 > (e.g. `export CAO_HOME=/tmp/cao-devin-e2e`) if you want to keep local profiles.
 
+```bash
 # Run all Devin CLI E2E tests
 uv run pytest -m e2e test/e2e/ -v -k devin
 
