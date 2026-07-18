@@ -140,7 +140,6 @@ CAO drives existing CLI agent tools — it does not replace them. Before using C
 | **Cursor CLI** | [Provider docs](docs/cursor-cli.md) · [Installation](https://cursor.com/cli) | Cursor subscription / API key |
 | **Antigravity CLI** | [Provider docs](docs/antigravity-cli.md) · [Installation](https://antigravity.google) | Google account (shared with the Antigravity IDE login) |
 | **Devin CLI** | [Provider docs](docs/devin-cli.md) · [Installation](https://docs.devin.ai/cli) | Devin CLI auth |
-| **Devin CLI** | [Provider docs](docs/devin-cli.md) · [Installation](https://docs.devin.ai/cli) | Devin CLI auth |
 
 ## Quick Start
 
