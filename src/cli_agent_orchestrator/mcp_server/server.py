@@ -1331,7 +1331,10 @@ def find_profiles(
 
     Returns:
         List of matches sorted by descending relevance, each with:
-        name, description, capabilities, tags, role, source, score.
+        name, description, capabilities, tags, role, source, coverage, score.
+        ``coverage`` is the number of distinct query terms matched. ``score``
+        is coverage plus a fractional BM25 tie-break, so the highest score is
+        always the top-ranked (most relevant) profile.
     """
     from cli_agent_orchestrator.services.profile_search import search_profiles
 

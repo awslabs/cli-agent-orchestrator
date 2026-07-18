@@ -278,8 +278,12 @@ class TestFindProfilesMcpTool:
                 "tags",
                 "role",
                 "source",
+                "coverage",
                 "score",
             }
+            assert isinstance(r["coverage"], int) and r["coverage"] >= 1
+            # score = coverage + tie-break fraction in [0, 1)
+            assert r["coverage"] <= r["score"] < r["coverage"] + 1
 
     def test_tool_returns_empty_on_backend_exception(self, monkeypatch):
         from cli_agent_orchestrator.mcp_server import server
@@ -346,39 +350,175 @@ class TestCoverageFirstRanking:
         assert results[0]["name"] == "focused"
 
 
-class TestParseFailedExclusion:
-    """Regression (#438 re-review): parse-failed profiles were indexed by
-    filename and could be recommended, then fail to load on handoff."""
+class TestScoreOrderConsistency:
+    """Regression (#438 re-review): the returned score must agree with the
+    relevance ordering -- a caller taking max(score) must get the top result.
+    Previously the raw BM25 tie-breaker was returned, so a long full-match
+    document could rank first with a lower score than a focused partial
+    match."""
 
-    def test_parse_failed_excluded_from_results(self):
+    def _adversarial_profiles(self):
+        filler = "filler words here that make this document quite long " * 8
+        return [
+            {
+                "name": "full",
+                "description": "rare common " + filler,
+                "tags": [],
+                "capabilities": [],
+            },
+            {
+                "name": "partial",
+                "description": "rare rare rare focused",
+                "tags": [],
+                "capabilities": [],
+            },
+            {"name": "c1", "description": "common", "tags": [], "capabilities": []},
+            {"name": "c2", "description": "common stuff", "tags": [], "capabilities": []},
+            {"name": "c3", "description": "common things", "tags": [], "capabilities": []},
+        ]
+
+    def test_scores_monotonic_with_rank(self):
+        results = search_profiles("rare common", profiles=self._adversarial_profiles())
+        assert results[0]["name"] == "full"
+        scores = [r["score"] for r in results]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_max_score_selects_top_ranked(self):
+        results = search_profiles("rare common", profiles=self._adversarial_profiles())
+        assert max(results, key=lambda r: r["score"])["name"] == results[0]["name"] == "full"
+
+    def test_score_encodes_coverage_integer_part(self):
+        results = search_profiles("rare common", profiles=self._adversarial_profiles())
+        for r in results:
+            assert r["coverage"] <= r["score"] < r["coverage"] + 1
+        by_name = {r["name"]: r for r in results}
+        assert by_name["full"]["coverage"] == 2
+        assert by_name["partial"]["coverage"] == 1
+
+    def test_fallback_scorer_scores_also_monotonic(self, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def no_bm25(name, *args, **kwargs):
+            if name == "rank_bm25":
+                raise ImportError("forced")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", no_bm25)
+        results = search_profiles("rare common", profiles=self._adversarial_profiles())
+        assert results[0]["name"] == "full"
+        scores = [r["score"] for r in results]
+        assert scores == sorted(scores, reverse=True)
+
+
+class TestLoadabilityExclusion:
+    """Regression (#438 re-review): search must only recommend profiles that
+    load_agent_profile() can actually load -- not merely ones whose YAML
+    parses. Covers parse failures, model-invalid metadata, and profile
+    directories without agent.md."""
+
+    def test_unloadable_excluded_from_results(self):
         profiles = [
             {
                 "name": "broken-monitor",
                 "description": "",
                 "tags": [],
                 "capabilities": [],
-                "parse_ok": False,
+                "loadable": False,
             },
             {
                 "name": "monitor-ok",
                 "description": "monitor",
                 "tags": [],
                 "capabilities": [],
-                "parse_ok": True,
+                "loadable": True,
             },
         ]
         names = [r["name"] for r in search_profiles("monitor", profiles=profiles)]
         assert names == ["monitor-ok"]
 
-    def test_missing_parse_ok_treated_as_valid(self):
+    def test_missing_loadable_treated_as_valid(self):
         # Backwards compatibility: dicts without the flag are searchable.
         profiles = [
             {"name": "legacy-monitor", "description": "monitor", "tags": [], "capabilities": []}
         ]
         assert search_profiles("monitor", profiles=profiles)
 
+    def test_valid_yaml_invalid_model_marked_unloadable(self, tmp_path):
+        """Reviewer repro: provider as a list parses as YAML but fails
+        AgentProfile validation, so load_agent_profile() would raise."""
+        import cli_agent_orchestrator.utils.agent_profiles as ap
+
+        (tmp_path / "bad-monitor.md").write_text(
+            "---\nname: bad-monitor\ndescription: monitor things\n"
+            "provider: [not, a, string]\n---\nbody\n"
+        )
+        profiles: dict = {}
+        ap._scan_directory(tmp_path, "local", profiles)
+        assert profiles["bad-monitor"]["loadable"] is False
+        assert not search_profiles("monitor", profiles=list(profiles.values()))
+
+    def test_directory_without_agent_md_marked_unloadable(self, tmp_path):
+        """Reviewer repro: a bare directory is listable by name, but
+        load_agent_profile() raises FileNotFoundError for it."""
+        import cli_agent_orchestrator.utils.agent_profiles as ap
+
+        (tmp_path / "empty-monitor").mkdir()
+        profiles: dict = {}
+        ap._scan_directory(tmp_path, "local", profiles)
+        assert profiles["empty-monitor"]["loadable"] is False
+        assert not search_profiles("monitor", profiles=list(profiles.values()))
+
+    def test_dir_style_profile_follows_source_rules(self, tmp_path, monkeypatch):
+        """Source rules, not just content, decide loadability: a valid
+        <name>/agent.md is resolvable from provider/extra dirs but NOT from
+        the local store (which _read_agent_profile_source treats as
+        flat-file only). Search must never recommend the local-store one."""
+        import cli_agent_orchestrator.utils.agent_profiles as ap
+
+        local_store = tmp_path / "store"
+        local_store.mkdir()
+        d = local_store / "dirstyle-monitor"
+        d.mkdir()
+        (d / "agent.md").write_text(
+            "---\nname: dirstyle-monitor\ndescription: monitor queues\n---\nbody\n"
+        )
+        provider_dir = tmp_path / "provider"
+        p = provider_dir / "provider-monitor"
+        p.mkdir(parents=True)
+        (p / "agent.md").write_text(
+            "---\nname: provider-monitor\ndescription: monitor queues\n---\nbody\n"
+        )
+        monkeypatch.setattr(ap, "LOCAL_AGENT_STORE_DIR", local_store)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            lambda: {"testprov": str(provider_dir)},
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs", lambda: []
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+        profiles = ap.list_agent_profiles()
+        by_name = {p["name"]: p for p in profiles}
+        # both listed; only the provider-dir one is loadable
+        assert by_name["dirstyle-monitor"]["loadable"] is False
+        assert by_name["provider-monitor"]["loadable"] is True
+        results = search_profiles("monitor", profiles=profiles)
+        assert [r["name"] for r in results] == ["provider-monitor"]
+        # and the recommendation is honoured by the real load path
+        loaded = ap.load_agent_profile("provider-monitor")
+        assert loaded.name == "provider-monitor"
+
     def test_broken_yaml_on_disk_listed_but_not_searchable(self, tmp_path, monkeypatch):
-        """End-to-end: discover-then-load consistency."""
+        """End-to-end discover-then-load consistency: every profile that
+        search recommends must actually load via load_agent_profile().
+
+        Store contains all three unloadable shapes from the #438 re-review:
+        broken YAML, valid-YAML/invalid-model metadata, and a profile
+        directory without agent.md."""
         import cli_agent_orchestrator.utils.agent_profiles as ap
 
         store = tmp_path / "store"
@@ -386,6 +526,11 @@ class TestParseFailedExclusion:
         (store / "broken-monitor.md").write_text(
             "---\nname: [unclosed\ndescription: {bad\n---\nbody\n"
         )
+        (store / "bad-model-monitor.md").write_text(
+            "---\nname: bad-model-monitor\ndescription: monitor things\n"
+            "provider: [not, a, string]\n---\nbody\n"
+        )
+        (store / "empty-monitor").mkdir()
         (store / "good-monitor.md").write_text(
             "---\nname: good-monitor\ndescription: monitor queues\n---\nbody\n"
         )
@@ -400,8 +545,17 @@ class TestParseFailedExclusion:
             "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
         )
         local = [p for p in ap.list_agent_profiles() if p["source"] == "local"]
-        # list still shows both (existing behavior preserved)
-        assert {p["name"] for p in local} == {"broken-monitor", "good-monitor"}
-        # search only recommends the loadable one
-        names = [r["name"] for r in search_profiles("monitor", profiles=local)]
-        assert names == ["good-monitor"]
+        # list still shows all four (existing behavior preserved)
+        assert {p["name"] for p in local} == {
+            "broken-monitor",
+            "bad-model-monitor",
+            "empty-monitor",
+            "good-monitor",
+        }
+        # search only recommends the loadable one...
+        results = search_profiles("monitor", profiles=local)
+        assert [r["name"] for r in results] == ["good-monitor"]
+        # ...and every recommendation is honoured by the load path.
+        for r in results:
+            profile = ap.load_agent_profile(r["name"])
+            assert profile.name == r["name"]

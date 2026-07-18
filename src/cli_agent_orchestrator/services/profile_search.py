@@ -51,12 +51,16 @@ def _searchable_text(profile: Dict) -> str:
     return " ".join(p for p in parts if p)
 
 
-def _result(profile: Dict, score: float) -> Dict:
+def _result(profile: Dict, score: float, coverage: int = 0) -> Dict:
     """Shape a profile into the shared CLI/MCP result contract.
 
     ``tags``/``capabilities`` are always lists of strings in the contract,
     even if a raw caller passed malformed values (the real pipeline already
     normalizes via ``_discovery_fields``).
+
+    ``coverage`` is the number of distinct query terms the profile matched.
+    ``score`` is ``coverage`` plus a BM25 tie-break fraction in [0, 1), so
+    descending score always agrees with the relevance ordering.
     """
     out = {field: profile.get(field, "") for field in RESULT_FIELDS}
     desc = profile.get("description")
@@ -65,6 +69,7 @@ def _result(profile: Dict, score: float) -> Dict:
     capabilities = profile.get("capabilities")
     out["tags"] = [str(t) for t in tags] if isinstance(tags, list) else []
     out["capabilities"] = [str(c) for c in capabilities] if isinstance(capabilities, list) else []
+    out["coverage"] = int(coverage)
     out["score"] = round(float(score), 4)
     return out
 
@@ -90,8 +95,11 @@ def search_profiles(
 
     Returns:
         Metadata-only result dicts sorted by descending relevance. Profiles
-        with no token in common with the query are excluded. Never includes
-        the profile prompt body.
+        with no token in common with the query are excluded, as are profiles
+        that ``load_agent_profile()`` would reject. Each result carries
+        ``coverage`` (distinct query terms matched) and ``score`` (coverage
+        plus a BM25 tie-break fraction below 1, so descending score matches
+        the result order). Never includes the profile prompt body.
     """
     query_tokens = _tokenize(query)
     if not query_tokens or limit <= 0:
@@ -101,9 +109,11 @@ def search_profiles(
         from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
 
         profiles = list_agent_profiles()
-    # Exclude profiles whose frontmatter failed to parse: they cannot be
-    # loaded by handoff/assign, so recommending them would be misleading.
-    profiles = [p for p in profiles if p.get("parse_ok", True)]
+    # Exclude profiles that load_agent_profile() would reject: frontmatter
+    # parse failures, metadata that fails AgentProfile model validation, or a
+    # profile directory without agent.md. Recommending any of these would
+    # break discover-then-load consistency for handoff/assign.
+    profiles = [p for p in profiles if p.get("loadable", True)]
     if not profiles:
         return []
 
@@ -136,4 +146,17 @@ def search_profiles(
         if query_set & set(doc_tokens)
     ]
     matched.sort(key=lambda item: (-item[1], -item[2], item[0].get("name", "")))
-    return [_result(profile, score) for profile, _coverage, score in matched[:limit]]
+    if not matched:
+        return []
+    # The returned score must agree with this ordering (a caller taking the
+    # max score must pick the top-ranked profile), so encode coverage as the
+    # integer part and the BM25 tie-break as a fraction strictly below 1:
+    #     score = coverage + bm25 / (1 + max_bm25)
+    # A profile matching more query terms therefore always scores above any
+    # narrower match, and within equal coverage the BM25 order is preserved.
+    # Like raw BM25, scores are relative to the result set, not absolute.
+    max_bm25 = max(item[2] for item in matched)
+    return [
+        _result(profile, coverage + bm25 / (1.0 + max_bm25), coverage)
+        for profile, coverage, bm25 in matched[:limit]
+    ]
