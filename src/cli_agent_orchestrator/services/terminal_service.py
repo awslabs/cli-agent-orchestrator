@@ -251,7 +251,7 @@ async def create_terminal(
                 yolo=True,
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
-            probe(resolved_engine, requested)
+            await asyncio.to_thread(probe, resolved_engine, requested)
             if resolved_engine == KiroEngine.KAS:
                 raise KiroPhase0KASError(
                     bool(profile and (profile.allowedTools or profile.toolsSettings))

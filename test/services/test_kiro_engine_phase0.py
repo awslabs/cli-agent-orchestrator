@@ -1,6 +1,8 @@
 """Fail-closed terminal-service coverage for Kiro Phase 0."""
 
+import asyncio
 import subprocess
+import threading
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -17,6 +19,65 @@ from cli_agent_orchestrator.services.agent_step import run_agent_step
 from cli_agent_orchestrator.services.terminal_service import create_terminal
 
 _MODULE = "cli_agent_orchestrator.services.terminal_service"
+
+
+@pytest.mark.asyncio
+async def test_capability_probe_does_not_block_event_loop():
+    """A synchronous capability probe runs in a worker while async work advances."""
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    heartbeat_ticks = 0
+
+    def blocking_probe(engine: KiroEngine, requested: set[str]) -> KiroCapabilities:
+        probe_started.set()
+        assert release_probe.wait(timeout=2)
+        return KiroCapabilities(version="3.0.0", flags=frozenset({"--v3", "--agent"}))
+
+    async def heartbeat() -> None:
+        nonlocal heartbeat_ticks
+        while not release_probe.is_set():
+            heartbeat_ticks += 1
+            await asyncio.sleep(0)
+
+    with (
+        patch(
+            f"{_MODULE}.load_agent_profile",
+            return_value=AgentProfile(
+                name="kas-profile",
+                description="KAS profile",
+                engine=KiroEngine.KAS,
+            ),
+        ),
+        patch(f"{_MODULE}.get_backend") as backend,
+        patch(f"{_MODULE}.db_create_terminal") as db_create,
+        patch(f"{_MODULE}.fifo_manager") as fifo,
+        patch(f"{_MODULE}.provider_manager") as providers,
+    ):
+        create_task = asyncio.create_task(
+            create_terminal(
+                provider="kiro_cli",
+                agent_profile="kas-profile",
+                new_session=True,
+                kiro_capability_probe=blocking_probe,
+            )
+        )
+        heartbeat_task = asyncio.create_task(heartbeat())
+        while not probe_started.is_set():
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
+        ticks_while_blocked = heartbeat_ticks
+        release_probe.set()
+
+        with pytest.raises(KiroPhase0KASError):
+            await create_task
+        await heartbeat_task
+
+    assert ticks_while_blocked > 0
+    backend.return_value.create_session.assert_not_called()
+    backend.return_value.create_window.assert_not_called()
+    db_create.assert_not_called()
+    fifo.create_reader.assert_not_called()
+    providers.create_provider.assert_not_called()
 
 
 @pytest.mark.asyncio
