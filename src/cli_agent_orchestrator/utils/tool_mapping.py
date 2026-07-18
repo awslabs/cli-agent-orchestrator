@@ -59,7 +59,7 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_read": ["read"],
         "fs_write": ["edit"],
         "fs_list": ["glob", "grep"],
-        "fs_*": ["read", "edit", "grep", "glob", "exec"],
+        "fs_*": ["read", "edit", "grep", "glob"],
     },
     # Antigravity CLI (agy) shares Google's gemini-style tool vocabulary
     # (write_file/read_file/run_shell_command/...). Restrictions are enforced

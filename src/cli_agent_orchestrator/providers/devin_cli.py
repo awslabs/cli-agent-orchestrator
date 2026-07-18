@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shlex
 import tempfile
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.constants import SECURITY_PROMPT
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
@@ -82,6 +84,34 @@ class DevinCliProvider(BaseProvider):
         self._agent_profile = agent_profile
         self._temp_prompt_file: Optional[str] = None
         self._temp_config_file: Optional[str] = None
+        self._cached_profile: Optional[AgentProfile] = None
+
+    def _load_profile(self) -> Optional[AgentProfile]:
+        """Load and cache the agent profile, logging failures clearly.
+
+        The profile is needed by both ``_build_command()`` (path maps,
+        prompt/config) and ``initialize()`` (init timeout), so it is cached
+        after the first successful load.
+        """
+        if self._agent_profile is None:
+            return None
+        if self._cached_profile is not None:
+            return self._cached_profile
+
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+        try:
+            self._cached_profile = load_agent_profile(self._agent_profile)
+        except Exception as e:
+            logger.warning(
+                "Failed to load agent profile '%s': %s",
+                self._agent_profile,
+                e,
+            )
+            raise RuntimeError(
+                f"Failed to load agent profile '{self._agent_profile}': {e}"
+            ) from e
+        return self._cached_profile
 
     @property
     def paste_enter_count(self) -> int:
@@ -126,17 +156,47 @@ class DevinCliProvider(BaseProvider):
             f"You are restricted to only use the following tools: {tools_list}\n"
         )
 
+    def _write_config_file(self, base_config: dict) -> None:
+        """Write the merged Devin config to a temporary file and store the path."""
+        fd: Optional[int] = None
+        path: Optional[str] = None
+        try:
+            fd, path = tempfile.mkstemp(prefix="cao_devin_config_", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(base_config, indent=2))
+            self._temp_config_file = path
+            fd = None
+        except Exception:
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if fd is not None:
+                os.close(fd)
+
     def _write_prompt_file(self, content: str) -> None:
         """Write prompt content to a temporary file and store the path."""
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            prefix="cao_devin_prompt_",
-            suffix=".md",
-            delete=False,
-            encoding="utf-8",
-        ) as f:
-            self._temp_prompt_file = f.name
-            f.write(content)
+        fd: Optional[int] = None
+        path: Optional[str] = None
+        try:
+            fd, path = tempfile.mkstemp(prefix="cao_devin_prompt_", suffix=".md")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            self._temp_prompt_file = path
+            fd = None
+        except Exception:
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def _load_user_config(self) -> dict:
         """Load the user's existing Devin config or create a minimal one."""
@@ -213,16 +273,9 @@ class DevinCliProvider(BaseProvider):
 
         command_parts = ["devin"]
 
-        # Load the agent profile once, if provided, so we can use it for path
-        # translation and prompt/config construction below.
-        profile = None
-        if self._agent_profile is not None:
-            from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-
-            try:
-                profile = load_agent_profile(self._agent_profile)
-            except Exception:
-                pass
+        # Load the agent profile (cached) so we can use it for path translation
+        # and prompt/config construction below.
+        profile = self._load_profile()
 
         # Only use dangerous permission mode when allowed_tools is unrestricted
         # This follows the pattern of other providers (e.g., kiro_cli.py:250)
@@ -266,15 +319,7 @@ class DevinCliProvider(BaseProvider):
                 base_config = self._load_user_config()
                 self._merge_mcp_servers(base_config, profile.mcpServers)
 
-                with tempfile.NamedTemporaryFile(
-                    mode="w",
-                    prefix="cao_devin_config_",
-                    suffix=".json",
-                    delete=False,
-                    encoding="utf-8",
-                ) as f:
-                    self._temp_config_file = f.name
-                    f.write(json.dumps(base_config, indent=2))
+                self._write_config_file(base_config)
                 command_parts.extend(["--config", self._temp_config_file])
 
         # For containerized profiles, translate host temp-file paths to guest paths.
@@ -313,14 +358,7 @@ class DevinCliProvider(BaseProvider):
             )
 
             # Resolve the initialization timeout from the profile or server settings.
-            profile = None
-            if self._agent_profile is not None:
-                from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-
-                try:
-                    profile = load_agent_profile(self._agent_profile)
-                except Exception:
-                    pass
+            profile = self._load_profile()
             init_timeout = float(self.get_init_timeout(profile))
 
             if not await wait_until_status(
