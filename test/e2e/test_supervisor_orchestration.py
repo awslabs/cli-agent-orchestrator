@@ -825,6 +825,7 @@ class TestDevinCliSupervisorOrchestration:
             resp = requests.post(
                 f"{API_BASE_URL}/terminals/{terminal_id}/input",
                 params={"message": task_message},
+                timeout=10,
             )
             assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 

@@ -104,18 +104,16 @@ class DevinCliProvider(BaseProvider):
 
     def _cleanup_temp_files(self) -> None:
         """Clean up any existing temporary files before creating new ones."""
-        if self._temp_prompt_file:
-            try:
-                Path(self._temp_prompt_file).unlink(missing_ok=True)
-            except OSError:
-                pass
-            self._temp_prompt_file = None
-        if self._temp_config_file:
-            try:
-                Path(self._temp_config_file).unlink(missing_ok=True)
-            except OSError:
-                pass
-            self._temp_config_file = None
+        for attr in ("_temp_prompt_file", "_temp_config_file"):
+            path = getattr(self, attr)
+            if path:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except OSError as e:
+                    logger.warning("Failed to delete temp file %s: %s", path, e)
+                    # Keep the path recorded so a later cleanup can retry.
+                    continue
+                setattr(self, attr, None)
 
     def _build_security_constraint(self) -> str:
         """Build security constraint prompt for allowed tools."""
@@ -156,6 +154,41 @@ class DevinCliProvider(BaseProvider):
             "theme_mode": "dark",
         }
 
+    def _normalize_mcp_server_for_devin(self, resolved: dict) -> dict:
+        """Translate a CAO MCP server config into Devin CLI's config-file schema.
+
+        Devin CLI config files (``~/.config/devin/config.json`` / ``--config``)
+        expect ``command``/``args``/``env`` for stdio servers and ``url``/
+        ``transport`` for remote servers.  CAO-specific keys such as ``type``
+        and ``timeout`` are dropped to avoid confusing the CLI.
+        """
+        normalized: dict = {}
+        if resolved.get("url"):
+            normalized["url"] = resolved["url"]
+            transport = resolved.get("transport") or resolved.get("type") or "http"
+            normalized["transport"] = transport
+            if resolved.get("headers"):
+                normalized["headers"] = dict(resolved["headers"])
+        else:
+            command = resolved.get("command")
+            if command:
+                normalized["command"] = command
+            if resolved.get("args"):
+                normalized["args"] = list(resolved["args"])
+
+        env = resolved.get("env") or {}
+        if not isinstance(env, dict):
+            env = {}
+        if "CAO_TERMINAL_ID" not in env:
+            env["CAO_TERMINAL_ID"] = self.terminal_id
+        if env:
+            normalized["env"] = env
+
+        if resolved.get("disabled"):
+            normalized["disabled"] = True
+
+        return normalized
+
     def _merge_mcp_servers(self, base_config: dict, mcp_servers: dict) -> None:
         """Merge profile MCP servers into existing config."""
         # Ensure mcpServers is a dict in base_config
@@ -168,14 +201,7 @@ class DevinCliProvider(BaseProvider):
                 resolved = resolve_mcp_server_config(dict(server_config))
             else:
                 resolved = resolve_mcp_server_config(server_config.model_dump(exclude_none=True))
-            existing_mcp[server_name] = resolved
-            # Safely handle env dict - ensure it's never None
-            env = existing_mcp[server_name].get("env") or {}
-            if not isinstance(env, dict):
-                env = {}
-            if "CAO_TERMINAL_ID" not in env:
-                env["CAO_TERMINAL_ID"] = self.terminal_id
-                existing_mcp[server_name]["env"] = env
+            existing_mcp[server_name] = self._normalize_mcp_server_for_devin(resolved)
         base_config["mcpServers"] = existing_mcp
 
     def _build_command(self) -> str:
@@ -303,23 +329,27 @@ class DevinCliProvider(BaseProvider):
                 raise TimeoutError(f"Devin CLI initialization timed out after {init_timeout} seconds")
 
             self._initialized = True
-            # Prompt/config temp files have been consumed by the Devin CLI on
-            # successful initialization; remove them to avoid leaving security
-            # constraints or MCP server credentials on disk.
-            self._cleanup_temp_files()
             return True
-        except Exception:
-            # Clean up temp files on failure to prevent credential residue
-            self.cleanup()
-            raise
+        finally:
+            # Prompt/config temp files have been consumed by the Devin CLI on
+            # successful initialization (or the launch was aborted); remove them
+            # to avoid leaving security constraints or MCP server credentials on disk.
+            self._cleanup_temp_files()
 
     @staticmethod
     def _is_processing(lines: list[str]) -> bool:
-        """Return True if any processing pattern is visible in the recent output."""
-        combined = "\n".join(lines[-50:])
-        for pattern in PROCESSING_PATTERNS:
-            if re.search(pattern, combined, re.IGNORECASE):
-                return True
+        """Return True if an active processing spinner/status is visible.
+
+        Only the most recent viewport lines are checked, and each pattern must
+        appear at the start of a line.  This prevents a completed response that
+        happens to contain phrases like "Reading file" from keeping the state
+        stuck in PROCESSING.
+        """
+        for line in lines[-10:]:
+            stripped = line.strip()
+            for pattern in PROCESSING_PATTERNS:
+                if re.match(pattern, stripped, re.IGNORECASE):
+                    return True
         return False
 
     @staticmethod
@@ -400,7 +430,13 @@ class DevinCliProvider(BaseProvider):
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 
-        # 3. Initial Devin CLI welcome screen (before first # prompt)
+        # 3. Explicit Devin CLI / runtime crashes are reported as ERROR.
+        # Evaluate errors before the welcome banner so an authentication failure
+        # that still contains welcome text is not misreported as IDLE.
+        if self._is_error(lines):
+            return TerminalStatus.ERROR
+
+        # 4. Initial Devin CLI welcome screen (before first # prompt)
         # Look for "Ask Devin to build features", "I'm ready to help", or "SWE-1.6"
         if (
             "Ask Devin to build features" in clean_output
@@ -408,10 +444,6 @@ class DevinCliProvider(BaseProvider):
             or "SWE-1.6" in clean_output
         ):
             return TerminalStatus.IDLE
-
-        # 4. Explicit Devin CLI / runtime crashes are reported as ERROR.
-        if self._is_error(lines):
-            return TerminalStatus.ERROR
 
         # 5. Ambiguous output (no prompt, no processing, no error): keep polling.
         return TerminalStatus.UNKNOWN
@@ -433,17 +465,19 @@ class DevinCliProvider(BaseProvider):
         if last_user_idx < 0:
             raise ValueError("No user input found")
 
-        # Collect lines between the last user input and the next horizontal rule.
-        # NOTE: do NOT break on the `#` pattern here — it would incorrectly truncate
-        # responses that begin with a Markdown heading (e.g. "# Overview").
-        # The horizontal rule (always present before the `#` prompt) is the safe
-        # terminator. The status bar is an additional fallback.
+        # Collect lines between the last user input and the next horizontal rule
+        # that is immediately followed by the standalone `#` input prompt.
+        # A box-drawing separator inside the response is not a terminator.
+        # The status bar is an additional fallback terminator.
         response_lines = []
-        for line in lines[last_user_idx + 1 :]:
-            if re.match(HORIZONTAL_RULE_PATTERN, line.strip()):
-                break
+        remaining = lines[last_user_idx + 1 :]
+        for i, line in enumerate(remaining):
             if re.search(STATUS_BAR_PATTERN, line):
                 break
+            if re.match(HORIZONTAL_RULE_PATTERN, line.strip()):
+                following = [ln for ln in remaining[i + 1 :] if ln.strip()]
+                if following and re.match(IDLE_PROMPT_PATTERN, following[0]):
+                    break
             # Preserve all lines including empty ones for paragraph formatting
             response_lines.append(line)
 
