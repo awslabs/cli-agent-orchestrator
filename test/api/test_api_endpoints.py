@@ -180,6 +180,7 @@ class TestAgentProviders:
         assert providers_dict["copilot_cli"]["binary"] == "copilot"
         assert providers_dict["opencode_cli"]["binary"] == "opencode"
         assert providers_dict["antigravity_cli"]["binary"] == "agy"
+        assert providers_dict["devin_cli"]["binary"] == "devin"
 
 
 # ── Skills endpoint ──────────────────────────────────────────────────

@@ -52,11 +52,14 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_*": ["read", "write", "list", "grep"],
     },
     "devin_cli": {
-        "execute_bash": ["Bash"],
-        "fs_read": ["Read"],
-        "fs_write": ["Write"],
-        "fs_list": ["list", "grep"],
-        "fs_*": ["Read", "Write", "list", "grep"],
+        # Devin's publicly documented core tool names are lowercase:
+        # read, edit, grep, glob, exec.  The CLI treats --allowed-tools as an
+        # auto-approval list, so we map CAO vocabulary to these canonical names.
+        "execute_bash": ["exec"],
+        "fs_read": ["read"],
+        "fs_write": ["edit"],
+        "fs_list": ["glob", "grep"],
+        "fs_*": ["read", "edit", "grep", "glob", "exec"],
     },
     # Antigravity CLI (agy) shares Google's gemini-style tool vocabulary
     # (write_file/read_file/run_shell_command/...). Restrictions are enforced

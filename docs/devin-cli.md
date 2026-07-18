@@ -140,6 +140,11 @@ The E2E test suite validates handoff, assign, and send_message flows for Devin C
 # Start CAO server
 uv run cao-server
 
+# Install the required agent profiles
+cao install examples/assign/analysis_supervisor.md --provider devin_cli
+cao install examples/assign/data_analyst.md --provider devin_cli
+cao install examples/assign/report_generator.md --provider devin_cli
+
 # Run all Devin CLI E2E tests
 uv run pytest -m e2e test/e2e/ -v -k devin
 

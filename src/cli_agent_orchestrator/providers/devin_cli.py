@@ -187,6 +187,17 @@ class DevinCliProvider(BaseProvider):
 
         command_parts = ["devin"]
 
+        # Load the agent profile once, if provided, so we can use it for path
+        # translation and prompt/config construction below.
+        profile = None
+        if self._agent_profile is not None:
+            from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+            try:
+                profile = load_agent_profile(self._agent_profile)
+            except Exception:
+                pass
+
         # Only use dangerous permission mode when allowed_tools is unrestricted
         # This follows the pattern of other providers (e.g., kiro_cli.py:250)
         if self._allowed_tools is not None and "*" in self._allowed_tools:
@@ -206,11 +217,7 @@ class DevinCliProvider(BaseProvider):
             assert self._temp_prompt_file is not None
             command_parts.extend(["--prompt-file", self._temp_prompt_file])
 
-        if self._agent_profile is not None:
-            from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-
-            profile = load_agent_profile(self._agent_profile)
-
+        if profile is not None:
             # Devin supports --prompt-file for system prompt injection
             system_prompt = profile.system_prompt if profile.system_prompt else ""
             # Apply skill prompt if provided
@@ -244,6 +251,17 @@ class DevinCliProvider(BaseProvider):
                     f.write(json.dumps(base_config, indent=2))
                 command_parts.extend(["--config", self._temp_config_file])
 
+        # For containerized profiles, translate host temp-file paths to guest paths.
+        if (
+            profile is not None
+            and getattr(profile, "container", None) is not None
+            and isinstance(profile.container.path_maps, list)
+            and profile.container.path_maps
+        ):
+            for i, part in enumerate(command_parts):
+                if i > 0 and command_parts[i - 1] in ("--prompt-file", "--config"):
+                    command_parts[i] = self._translate_path(part, profile)
+
         return shlex.join(command_parts)
 
     async def initialize(self) -> bool:
@@ -268,10 +286,21 @@ class DevinCliProvider(BaseProvider):
                 use_paste_buffer=self.use_paste_buffer,
             )
 
+            # Resolve the initialization timeout from the profile or server settings.
+            profile = None
+            if self._agent_profile is not None:
+                from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+                try:
+                    profile = load_agent_profile(self._agent_profile)
+                except Exception:
+                    pass
+            init_timeout = float(self.get_init_timeout(profile))
+
             if not await wait_until_status(
-                self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=60.0
+                self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=init_timeout
             ):
-                raise TimeoutError("Devin CLI initialization timed out after 60 seconds")
+                raise TimeoutError(f"Devin CLI initialization timed out after {init_timeout} seconds")
 
             self._initialized = True
             # Prompt/config temp files have been consumed by the Devin CLI on

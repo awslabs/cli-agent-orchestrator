@@ -314,13 +314,14 @@ class ProviderManager:
         if not metadata:
             raise ValueError(f"Terminal {terminal_id} not found in database")
 
-        # Create provider on-demand
+        # Create provider on-demand, restoring the persisted tool restrictions.
         provider = self.create_provider(
             metadata["provider"],
             terminal_id,
             metadata["tmux_session"],
             metadata["tmux_window"],
             metadata["agent_profile"],
+            allowed_tools=metadata.get("allowed_tools"),
         )
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since

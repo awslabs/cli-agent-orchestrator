@@ -154,9 +154,9 @@ class TestSendKeys:
         assert mock_subprocess.run.call_count == 2
         calls = mock_subprocess.run.call_args_list
 
-        # send-keys -l (literal send)
+        # send-keys -l (literal send); '--' prevents payloads starting with '-' being parsed as options.
         assert calls[0] == call(
-            ["tmux", "send-keys", "-l", "-t", "sess:win", "hello"],
+            ["tmux", "send-keys", "-l", "-t", "sess:win", "--", "hello"],
             check=True,
         )
         # send-keys Enter
