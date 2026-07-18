@@ -29,13 +29,13 @@ Run:
 import re
 import time
 import uuid
-from typing import Optional
 from test.e2e.conftest import (
     cleanup_terminal,
     create_terminal,
     extract_output,
     get_terminal_status,
 )
+from typing import Optional
 
 import pytest
 import requests
