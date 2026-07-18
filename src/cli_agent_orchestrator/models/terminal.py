@@ -4,6 +4,7 @@ from typing import Annotated, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.provider import ProviderType
 
 # Terminal ID validation (8 character hex string)
@@ -35,6 +36,7 @@ class Terminal(BaseModel):
         None, description="Terminal that created this one via handoff/assign (callback target)"
     )
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
+    engine: Optional[KiroEngine] = Field(None, description="Resolved Kiro engine")
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"
     )

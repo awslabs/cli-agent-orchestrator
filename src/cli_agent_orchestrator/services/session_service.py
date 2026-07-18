@@ -25,6 +25,7 @@ from typing import Dict, List
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.constants import SESSION_PREFIX
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
@@ -47,6 +48,7 @@ async def create_session(
     allowed_tools: list[str] | None = None,
     registry: PluginRegistry | None = None,
     env_vars: dict[str, str] | None = None,
+    engine: KiroEngine | str | None = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -68,6 +70,7 @@ async def create_session(
         allowed_tools=allowed_tools,
         registry=registry,
         env_vars=env_vars,
+        engine=engine,
     )
     dispatch_plugin_event(
         registry,

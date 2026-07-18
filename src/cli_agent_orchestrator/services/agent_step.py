@@ -26,6 +26,7 @@ import logging
 import time
 from typing import Callable, Optional
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services import terminal_service
@@ -213,6 +214,7 @@ async def run_agent_step(
     env_vars: Optional[dict[str, str]] = None,
     on_terminal_created: Optional[Callable[[str], None]] = None,
     cancel_event: Optional[asyncio.Event] = None,
+    engine: Optional[KiroEngine | str] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -288,6 +290,8 @@ async def run_agent_step(
             provider never emits a completion signal is exactly the run that could
             not otherwise be killed. Default None = no cancellation seam (the
             handoff caller passes nothing) — behavior unchanged.
+        engine: Explicit Kiro engine for this child step. This is never inferred
+            from a parent terminal.
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -354,6 +358,7 @@ async def run_agent_step(
             allowed_tools=allowed_tools,
             caller_id=caller_id,
             env_vars=env_vars,
+            engine=engine,
         )
         terminal_id = terminal.id
 

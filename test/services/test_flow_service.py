@@ -7,8 +7,10 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from cli_agent_orchestrator.models.flow import Flow
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.flow_service import (
     _get_next_run_time,
@@ -101,6 +103,78 @@ Prompt with [[variable]].
 
             assert metadata["script"] == "./check.sh"
             assert "[[variable]]" in content
+
+    @patch("cli_agent_orchestrator.services.flow_service.db_create_flow")
+    def test_add_flow_validates_explicit_engine_during_model_construction(self, mock_db_create):
+        mock_db_create.return_value = Flow(
+            name="kas-flow",
+            file_path="/path/to/flow.md",
+            schedule="0 * * * *",
+            agent_profile="developer",
+            provider="kiro_cli",
+            next_run=datetime.now(),
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write("""---
+name: kas-flow
+schedule: "0 * * * *"
+agent_profile: developer
+engine: kas
+---
+
+Prompt.
+""")
+            f.flush()
+
+            flow = add_flow(f.name)
+
+        assert flow.engine == KiroEngine.KAS
+        mock_db_create.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.flow_service.db_create_flow")
+    def test_add_flow_omitted_engine_remains_none(self, mock_db_create):
+        mock_db_create.return_value = Flow(
+            name="v2-default-flow",
+            file_path="/path/to/flow.md",
+            schedule="0 * * * *",
+            agent_profile="developer",
+            provider="kiro_cli",
+            next_run=datetime.now(),
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write("""---
+name: v2-default-flow
+schedule: "0 * * * *"
+agent_profile: developer
+---
+
+Prompt.
+""")
+            f.flush()
+
+            flow = add_flow(f.name)
+
+        assert flow.engine is None
+        mock_db_create.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.flow_service.db_create_flow")
+    def test_add_flow_rejects_invalid_engine_before_registration(self, mock_db_create):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write("""---
+name: invalid-engine-flow
+schedule: "0 * * * *"
+agent_profile: developer
+engine: v3
+---
+
+Prompt.
+""")
+            f.flush()
+
+            with pytest.raises(ValidationError, match="engine"):
+                add_flow(f.name)
+
+        mock_db_create.assert_not_called()
 
 
 class TestAddFlow:

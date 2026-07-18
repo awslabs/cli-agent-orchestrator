@@ -93,6 +93,22 @@ def add_flow(file_path: str) -> Flow:
         except Exception as e:
             raise ValueError(f"Invalid cron expression '{schedule}': {e}")
 
+        # Construct the model before persisting the registration so front-matter
+        # engine values receive Pydantic's canonical v2/kas validation.
+        validated_flow = Flow(
+            name=name,
+            file_path=str(path),
+            schedule=schedule,
+            agent_profile=agent_profile,
+            provider=provider,
+            engine=metadata.get("engine"),
+            script=script,
+            last_run=None,
+            next_run=next_run,
+            enabled=True,
+            prompt_template=None,
+        )
+
         # Create flow in database
         flow = db_create_flow(
             name=name,
@@ -103,6 +119,7 @@ def add_flow(file_path: str) -> Flow:
             script=script,
             next_run=next_run,
         )
+        flow = Flow.model_validate({**flow.model_dump(), "engine": validated_flow.engine})
 
         logger.info(f"Added flow: {name}")
         return flow
@@ -115,11 +132,16 @@ def add_flow(file_path: str) -> Flow:
 def _enrich_flow_with_prompt(flow: Flow) -> Flow:
     """Read the prompt template from the flow file and attach it."""
     try:
-        _, prompt = _parse_flow_file(Path(flow.file_path))
-        flow.prompt_template = prompt.strip()
+        metadata, prompt = _parse_flow_file(Path(flow.file_path))
     except Exception:
-        flow.prompt_template = None
-    return flow
+        return Flow.model_validate({**flow.model_dump(), "prompt_template": None})
+    return Flow.model_validate(
+        {
+            **flow.model_dump(),
+            "engine": metadata.get("engine"),
+            "prompt_template": prompt.strip(),
+        }
+    )
 
 
 def list_flows() -> List[Flow]:
@@ -264,6 +286,7 @@ async def execute_flow(name: str) -> bool:
             provider=flow.provider,
             agent_profile=flow.agent_profile,
             new_session=True,
+            engine=flow.engine,
         )
 
         # Send rendered prompt to terminal

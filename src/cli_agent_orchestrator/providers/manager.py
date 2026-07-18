@@ -4,6 +4,7 @@ import logging
 from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -13,6 +14,7 @@ from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
@@ -36,6 +38,7 @@ class ProviderManager:
         allowed_tools: Optional[List[str]] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        engine: Optional[KiroEngine] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
@@ -43,12 +46,16 @@ class ProviderManager:
             if provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
+                resolved_engine = resolve_kiro_engine(persisted=engine)
+                if resolved_engine == KiroEngine.KAS:
+                    raise KiroPhase0KASError(profile_has_v2_policy=False)
                 provider = KiroCliProvider(
                     terminal_id,
                     tmux_session,
                     tmux_window,
                     agent_profile,
                     allowed_tools,
+                    engine=resolved_engine,
                 )
             elif provider_type == ProviderType.CLAUDE_CODE.value:
                 provider = ClaudeCodeProvider(
@@ -161,12 +168,25 @@ class ProviderManager:
         # Check if already exists
         provider = self._providers.get(terminal_id)
         if provider:
+            if (
+                isinstance(provider, KiroCliProvider)
+                and getattr(provider, "_engine", None) == KiroEngine.KAS
+            ):
+                raise KiroPhase0KASError(profile_has_v2_policy=False)
             return provider
 
         # Try to create on-demand from database metadata
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal {terminal_id} not found in database")
+
+        persisted_engine = (
+            resolve_kiro_engine(persisted=metadata.get("engine"))
+            if metadata["provider"] == ProviderType.KIRO_CLI.value
+            else None
+        )
+        if persisted_engine == KiroEngine.KAS:
+            raise KiroPhase0KASError(profile_has_v2_policy=False)
 
         # Create provider on-demand
         provider = self.create_provider(
@@ -175,6 +195,7 @@ class ProviderManager:
             metadata["tmux_session"],
             metadata["tmux_window"],
             metadata["agent_profile"],
+            engine=persisted_engine,
         )
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since

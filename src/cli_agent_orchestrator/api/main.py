@@ -72,6 +72,7 @@ from cli_agent_orchestrator.graph.providers import get_provider
 from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.memory import (
     MemoryKey,
     MemoryScope,
@@ -312,6 +313,10 @@ class RunStepRequest(BaseModel):
                 "(env injection only applies to freshly created terminals)"
             )
         return self
+
+    engine: Optional[KiroEngine] = Field(
+        default=None, description="Explicit Kiro engine for this child step"
+    )
 
 
 class RunStepResponse(BaseModel):
@@ -1332,6 +1337,7 @@ async def create_session(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
     memory_manager: Optional[str] = None,
+    engine: Optional[KiroEngine] = None,
     env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -1375,6 +1381,7 @@ async def create_session(
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
             env_vars=env_vars,
+            engine=engine,
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
@@ -1480,6 +1487,7 @@ async def create_terminal_in_session(
     provider: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
+    engine: Optional[KiroEngine] = None,
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
     body: Optional[CreateTerminalBody] = None,
@@ -1563,6 +1571,7 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            engine=engine,
         )
         return result
     except HTTPException:
@@ -1869,6 +1878,7 @@ async def run_step(
             working_directory=body.working_directory,
             caller_id=body.caller_id,
             allowed_tools=body.allowed_tools,
+            engine=body.engine,
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,

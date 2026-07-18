@@ -136,6 +136,27 @@ async def test_trace_a_clean_run(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_workflow_step_forwards_explicit_engine(monkeypatch):
+    mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+    spec = _spec(
+        steps=[
+            WorkflowStep(
+                id="s1",
+                provider="kiro_cli",
+                agent="dev",
+                prompt="go",
+                engine="kas",
+            )
+        ]
+    )
+
+    await ws.start_run(spec, {}, "engine-run")
+
+    assert mock.await_args.kwargs["engine"] == "kas"
+
+
+@pytest.mark.asyncio
 async def test_trace_b_worker_crashes_twice_then_succeeds(monkeypatch):
     """Trace B: two StepExecutionErrors, third attempt COMPLETED -> attempts=3."""
     calls = {"n": 0}

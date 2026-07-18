@@ -41,7 +41,9 @@ class TestKiroCliProviderInitialization:
         assert result is True
         mock_wait_shell.assert_called_once()
         mock_tmux.return_value.send_keys.assert_called_once_with(
-            "test-session", "window-0", "kiro-cli chat --trust-all-tools --agent developer"
+            "test-session",
+            "window-0",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer",
         )
         mock_wait_status.assert_called_once()
 
@@ -99,13 +101,13 @@ class TestKiroCliProviderInitialization:
         assert calls[0].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools --agent developer",
         )
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --legacy-ui --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -133,7 +135,7 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --legacy-ui --trust-all-tools --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -157,7 +159,8 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --trust-all-tools --model claude-opus-4-6 --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools "
+            "--model claude-opus-4-6 --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -183,7 +186,7 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -236,13 +239,15 @@ class TestKiroCliProviderInitialization:
         assert calls[0].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --trust-all-tools --model claude-opus-4.6 --agent developer",
+            "kiro-cli chat --agent-engine v2 --trust-all-tools "
+            "--model claude-opus-4.6 --agent developer",
         )
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent developer",
+            "kiro-cli chat --agent-engine v2 --legacy-ui --trust-all-tools "
+            "--model claude-opus-4.6 --agent developer",
         )
 
     def test_initialization_with_different_agent_profiles(self):
