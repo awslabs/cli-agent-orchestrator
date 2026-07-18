@@ -108,9 +108,7 @@ class DevinCliProvider(BaseProvider):
                 self._agent_profile,
                 e,
             )
-            raise RuntimeError(
-                f"Failed to load agent profile '{self._agent_profile}': {e}"
-            ) from e
+            raise RuntimeError(f"Failed to load agent profile '{self._agent_profile}': {e}") from e
         return self._cached_profile
 
     @property
@@ -362,9 +360,13 @@ class DevinCliProvider(BaseProvider):
             init_timeout = float(self.get_init_timeout(profile))
 
             if not await wait_until_status(
-                self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=init_timeout
+                self.terminal_id,
+                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+                timeout=init_timeout,
             ):
-                raise TimeoutError(f"Devin CLI initialization timed out after {init_timeout} seconds")
+                raise TimeoutError(
+                    f"Devin CLI initialization timed out after {init_timeout} seconds"
+                )
 
             self._initialized = True
             return True

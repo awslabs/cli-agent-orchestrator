@@ -284,9 +284,7 @@ class TmuxClient:
             logger.info(
                 f"send_keys (via send-keys): {session_name}:{window_name} - keys length: {len(keys)}"
             )
-            logger.debug(
-                f"send_keys (via send-keys): {session_name}:{window_name} - keys: {keys}"
-            )
+            logger.debug(f"send_keys (via send-keys): {session_name}:{window_name} - keys: {keys}")
             # Validate session and window names to prevent command injection
             validated_session = validate_tmux_name(session_name, "session_name")
             validated_window = validate_tmux_name(window_name, "window_name")
