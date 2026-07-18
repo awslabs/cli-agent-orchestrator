@@ -147,8 +147,8 @@ cao install examples/assign/report_generator.md --provider devin_cli
 ```
 
 > These install commands overwrite any existing `analysis_supervisor`,
-> `data_analyst`, or `report_generator` profiles.  Use an isolated `CAO_HOME`
-> (e.g. `export CAO_HOME=/tmp/cao-devin-e2e`) if you want to keep local profiles.
+> `data_analyst`, or `report_generator` profiles.  Back up your CAO
+> `agent-store` directory first if you have customized profiles you want to keep.
 
 ```bash
 # Run all Devin CLI E2E tests
