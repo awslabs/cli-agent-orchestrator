@@ -51,7 +51,25 @@ RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between
 # describes a line that IS ENTIRELY this shape; a genuine response that merely
 # mentions "/effort" in prose (e.g. "Run /effort to change settings") does not
 # end the line with "<word> · /effort" and is unaffected.
-_EFFORT_FOOTER_TAIL = r"\w+[ \t]*·[ \t]*/effort[ \t]*$"
+#
+# _ANSI_OPT is spliced between every token: real capture-pane -e output (used
+# by extraction, per this module's docstring guidance) re-renders the pane's
+# SGR color state, so this exact chrome line arrives wrapped in color codes,
+# e.g. "\x1b[38;5;246m● high · /effort\x1b[39m" — a trailing reset directly
+# after "/effort" (GH #459 follow-up). Without this, the reset defeats the
+# "[ \t]*$" end anchor and the exclusion silently stops firing on styled
+# output, even though it passes on the plain-text unit fixtures.
+_ANSI_OPT = r"(?:\x1b\[[0-9;]*m)*"
+_EFFORT_FOOTER_TAIL = (
+    _ANSI_OPT
+    + r"\w+"
+    + _ANSI_OPT
+    + r"[ \t]*·[ \t]*"
+    + _ANSI_OPT
+    + r"/effort"
+    + _ANSI_OPT
+    + r"[ \t]*$"
+)
 # Response marker at the START of a line, for message EXTRACTION only (not
 # status detection). Matches the legacy "⏺" (U+23FA) and the newest TUI's
 # "●" (U+25CF) response glyphs. Anchored to line start (MULTILINE) so a
@@ -965,6 +983,16 @@ class ClaudeCodeProvider(BaseProvider):
             if re.search(r"─{20,}", clean_line) and not re.search("[━-╿]", clean_line):
                 break
             if re.search(COMPLETION_SUMMARY_PATTERN, clean_line):
+                break
+            # GH #459 follow-up: the exclusion lookahead in
+            # EXTRACTION_RESPONSE_PATTERN stops the own-line effort footer from
+            # being mistaken for a SECOND response marker, but does nothing
+            # about the footer's own text once collection has started from an
+            # earlier, real marker — that footer line would otherwise be
+            # appended verbatim as trailing garbage on the extracted answer.
+            # clean_line is already ANSI-stripped, so this matches on the
+            # footer's plain-text shape regardless of surrounding SGR codes.
+            if EFFORT_FOOTER_LINE_PATTERN.match(clean_line):
                 break
 
             response_lines.append(clean_line)

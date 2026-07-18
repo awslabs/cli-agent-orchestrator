@@ -1114,6 +1114,45 @@ Map<String, List<Integer>> nested = getMap();
         with pytest.raises(ValueError, match="No Claude Code response found"):
             provider.extract_last_message_from_script(output)
 
+    def test_extract_message_styled_own_line_effort_footer_not_a_marker(self):
+        """GH #459 follow-up: real ``tmux capture-pane -e`` output re-renders
+        the pane's SGR color state, so the own-line effort footer arrives
+        wrapped in ANSI codes with a trailing reset directly after "/effort"
+        (e.g. "\\x1b[38;5;246m● high · /effort\\x1b[39m"). That reset must not
+        defeat the exclusion lookahead in EXTRACTION_RESPONSE_PATTERN — a real
+        answer followed by this styled footer must still extract the answer,
+        not the footer's own text."""
+        output = (
+            "● def greet(name):\n"
+            '    return f"Hello, {name}!"\n\n'
+            "\x1b[38;5;246m●  high  ·  /effort\x1b[39m\n"
+            "❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "def greet(name):" in result
+        assert 'return f"Hello, {name}!"' in result
+        assert "effort" not in result
+        assert "high" not in result
+
+    def test_extract_message_own_line_effort_footer_not_leaked_into_response(self):
+        """GH #459 follow-up: the own-line effort footer can render directly
+        below a real response, before the idle prompt or any other stop
+        condition. The line-collection loop must treat it as a stop boundary
+        like the separator and completion-summary lines — not append its text
+        onto the extracted answer as trailing garbage."""
+        output = (
+            "● def greet(name):\n" '    return f"Hello, {name}!"\n\n' "● high · /effort\n" "❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "def greet(name):" in result
+        assert 'return f"Hello, {name}!"' in result
+        assert "effort" not in result
+        assert "high" not in result
+
     def test_extract_message_with_table_not_truncated(self):
         """Extraction must NOT stop at table borders containing ─ runs inside │ box chars."""
         output = (
