@@ -305,6 +305,12 @@ async def create_terminal(
             caller_id=caller_id,
         )
 
+        # Establish the monitor lifecycle barrier before the FIFO can publish
+        # output. A prior failed/deleted incarnation of the same ID may have a
+        # tombstone; registration starts a new generation and makes only this
+        # runtime eligible for status detection.
+        status_monitor.register_terminal(terminal_id)
+
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
         # socket events and their pipe_pane is a no-op, so skip the FIFO there and

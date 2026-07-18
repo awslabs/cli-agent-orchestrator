@@ -7,6 +7,7 @@ Publisher: terminal.{id}.status
 import asyncio
 import logging
 import threading
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
@@ -44,6 +45,12 @@ _STICKY_READY_STATUSES = frozenset(
         TerminalStatus.ERROR,
     }
 )
+
+# Deleted terminal IDs are retained long enough to reject output that was
+# already queued in EventBus or still in flight in a detection worker.  IDs are
+# random and are not normally reused; bounding the registry avoids turning the
+# lifecycle guard itself into an unbounded server-lifetime allocation.
+_MAX_TERMINAL_TOMBSTONES = 4096
 
 
 class StatusMonitor:
@@ -91,6 +98,35 @@ class StatusMonitor:
         # this a detection task can be garbage-collected mid-run and silently drop
         # a status transition. Tasks remove themselves on completion.
         self._detect_tasks: set = set()
+        # A generation identifies one runtime incarnation of a terminal ID.
+        # clear_terminal() advances it and installs a tombstone before resources
+        # are removed; callbacks that captured an older generation then become
+        # harmless no-ops.  register_terminal() starts a fresh incarnation and
+        # removes the tombstone (supporting deterministic ID reuse in tests and
+        # future restore paths).
+        self._generations: Dict[str, int] = {}
+        self._tombstones: OrderedDict[str, int] = OrderedDict()
+
+    def register_terminal(self, terminal_id: str) -> int:
+        """Start a new monitored runtime generation for ``terminal_id``."""
+        with self._lock:
+            generation = self._generations.get(terminal_id, 0) + 1
+            self._generations[terminal_id] = generation
+            self._tombstones.pop(terminal_id, None)
+            return generation
+
+    def _is_current_generation_locked(
+        self, terminal_id: str, generation: Optional[int] = None
+    ) -> bool:
+        """Return whether work still belongs to a live terminal generation.
+
+        The caller must hold ``_lock``.  ``generation=None`` is used by legacy
+        direct/unit paths and means "any live generation", while still honoring
+        a teardown tombstone.
+        """
+        if terminal_id in self._tombstones:
+            return False
+        return generation is None or self._generations.get(terminal_id, 0) == generation
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -134,7 +170,24 @@ class StatusMonitor:
           resumed) and at quiescence (output stopped) — see
           _schedule_screen_detection.
         """
-        provider = provider_manager.get_provider(terminal_id)
+        with self._lock:
+            if not self._is_current_generation_locked(terminal_id):
+                logger.debug("Ignoring output for stopped terminal %s", terminal_id)
+                return
+            generation = self._generations.get(terminal_id, 0)
+
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except ValueError:
+            # Teardown may win after the first generation check but before the
+            # provider lookup reaches the database.  Suppress only that proven
+            # stale-generation case; real lookup failures still propagate to
+            # run(), where they remain visible in logs.
+            with self._lock:
+                if not self._is_current_generation_locked(terminal_id, generation):
+                    logger.debug("Ignoring provider lookup for stopped terminal %s", terminal_id)
+                    return
+            raise
         use_screen = (
             CAO_PYTE_STATUS
             and provider is not None
@@ -142,6 +195,9 @@ class StatusMonitor:
         )
 
         with self._lock:
+            if not self._is_current_generation_locked(terminal_id, generation):
+                logger.debug("Ignoring in-flight output for stopped terminal %s", terminal_id)
+                return
             buffer = self._buffers.get(terminal_id, "") + chunk
             if len(buffer) > STATE_BUFFER_MAX:
                 buffer = buffer[-STATE_BUFFER_MAX:]
@@ -155,12 +211,17 @@ class StatusMonitor:
             # (catches PROCESSING transition), then waits for output to settle
             # before re-detecting (catches IDLE/COMPLETED without running costly
             # regex on every single chunk during bursts).
-            self._schedule_raw_detection(terminal_id, buffer)
+            self._schedule_raw_detection(terminal_id, buffer, generation)
             return
 
-        self._schedule_screen_detection(terminal_id, provider)
+        self._schedule_screen_detection(terminal_id, provider, generation)
 
-    def _apply_detection(self, terminal_id: str, detected: TerminalStatus) -> None:
+    def _apply_detection(
+        self,
+        terminal_id: str,
+        detected: TerminalStatus,
+        generation: Optional[int] = None,
+    ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
 
@@ -174,6 +235,9 @@ class StatusMonitor:
         paste into a busy agent).
         """
         with self._lock:
+            if not self._is_current_generation_locked(terminal_id, generation):
+                logger.debug("Ignoring stale status detection for terminal %s", terminal_id)
+                return
             last = self._last_status.get(terminal_id)
 
             # UNKNOWN is "no signal", not a state: never let it overwrite a known
@@ -276,7 +340,9 @@ class StatusMonitor:
             logger.exception(f"Error detecting screen status for {terminal_id}")
             return TerminalStatus.UNKNOWN
 
-    def _schedule_screen_detection(self, terminal_id: str, provider) -> None:
+    def _schedule_screen_detection(
+        self, terminal_id: str, provider, generation: Optional[int] = None
+    ) -> None:
         """Edge-debounce detection on the pyte screen.
 
         Rising edge (first chunk after quiet) → detect immediately (catches the
@@ -290,41 +356,59 @@ class StatusMonitor:
         if loop is None:
             # No event loop (unit tests / offline replay): detect immediately
             # on the current screen — deterministic, no timing.
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+            self._apply_detection(
+                terminal_id,
+                self._detect_screen(terminal_id, provider),
+                generation=generation,
+            )
             return
 
         with self._lock:
+            if not self._is_current_generation_locked(terminal_id, generation):
+                return
             was_bursting = self._bursting.get(terminal_id, False)
             self._bursting[terminal_id] = True
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
         if not was_bursting:
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+            self._apply_detection(
+                terminal_id,
+                self._detect_screen(terminal_id, provider),
+                generation=generation,
+            )
 
-        self._arm_quiesce_timer(loop, terminal_id, self._on_screen_quiescent, provider)
+        self._arm_quiesce_timer(loop, terminal_id, generation, self._on_screen_quiescent, provider)
 
-    def _on_screen_quiescent(self, terminal_id: str, provider) -> None:
+    def _on_screen_quiescent(self, terminal_id: str, generation: Optional[int], provider) -> None:
         """Quiescence timer fired: output stopped, so the screen has settled.
 
         Fires on the loop; offload the (potentially blocking) screen detection
         to a worker thread so the loop stays free.
         """
         with self._lock:
+            if not self._is_current_generation_locked(terminal_id, generation):
+                return
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
 
         async def _detect_and_apply() -> None:
             detected = await asyncio.to_thread(self._detect_screen, terminal_id, provider)
-            self._apply_detection(terminal_id, detected)
+            self._apply_detection(terminal_id, detected, generation=generation)
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+            self._apply_detection(
+                terminal_id,
+                self._detect_screen(terminal_id, provider),
+                generation=generation,
+            )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
-    def _schedule_raw_detection(self, terminal_id: str, buffer: str) -> None:
+    def _schedule_raw_detection(
+        self, terminal_id: str, buffer: str, generation: Optional[int] = None
+    ) -> None:
         """Edge-debounce detection on the raw rolling buffer.
 
         Detects on every chunk while the terminal is in a ready/armed state
@@ -345,10 +429,16 @@ class StatusMonitor:
         if loop is None:
             # No loop ever captured (unit tests / offline replay): detect
             # inline and skip the debounce timer.
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            self._apply_detection(
+                terminal_id,
+                self._detect_status(terminal_id, buffer, generation=generation),
+                generation=generation,
+            )
             return
 
         with self._lock:
+            if not self._is_current_generation_locked(terminal_id, generation):
+                return
             was_bursting = self._bursting.get(terminal_id, False)
             self._bursting[terminal_id] = True
             handle = self._quiesce_handle.pop(terminal_id, None)
@@ -359,12 +449,19 @@ class StatusMonitor:
         # IDLE→PROCESSING transition is never missed (prevents stale-IDLE
         # delivery by InboxService). Once PROCESSING is observed, debounce.
         if not was_bursting or last_status in _STICKY_READY_STATUSES or last_status is None:
-            detected = self._detect_status(terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            detected = self._detect_status(terminal_id, buffer, generation=generation)
+            self._apply_detection(terminal_id, detected, generation=generation)
 
-        self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent)
+        self._arm_quiesce_timer(loop, terminal_id, generation, self._on_raw_quiescent)
 
-    def _arm_quiesce_timer(self, loop, terminal_id: str, callback, *cb_args) -> None:
+    def _arm_quiesce_timer(
+        self,
+        loop,
+        terminal_id: str,
+        generation: Optional[int],
+        callback,
+        *cb_args,
+    ) -> None:
         """Schedule the quiescence timer on ``loop`` from any thread.
 
         ``loop.call_later`` is not thread-safe and this may run on a worker
@@ -372,7 +469,8 @@ class StatusMonitor:
         ``call_soon_threadsafe``. The resulting TimerHandle is stored from
         inside the marshaled closure (still on the loop thread) so cancel
         marshaling in ``_cancel_quiesce_handle`` stays correct. ``cb_args``
-        are extra positional args passed to ``callback`` after ``terminal_id``.
+        are extra positional args passed after ``terminal_id`` and its captured
+        runtime generation.
         """
 
         def _arm() -> None:
@@ -386,10 +484,18 @@ class StatusMonitor:
             # quiescence detections and status flaps. One outstanding timer per
             # terminal, always the latest.
             with self._lock:
+                if not self._is_current_generation_locked(terminal_id, generation):
+                    return
                 prior = self._quiesce_handle.get(terminal_id)
                 if prior is not None:
                     prior.cancel()
-                handle = loop.call_later(PYTE_QUIESCENCE_DELAY_S, callback, terminal_id, *cb_args)
+                handle = loop.call_later(
+                    PYTE_QUIESCENCE_DELAY_S,
+                    callback,
+                    terminal_id,
+                    generation,
+                    *cb_args,
+                )
                 self._quiesce_handle[terminal_id] = handle
 
         try:
@@ -398,7 +504,7 @@ class StatusMonitor:
             # Loop closed during shutdown — quiescence re-detect is moot.
             pass
 
-    def _on_raw_quiescent(self, terminal_id: str) -> None:
+    def _on_raw_quiescent(self, terminal_id: str, generation: Optional[int]) -> None:
         """Quiescence timer fired for raw path: re-detect from current buffer.
 
         Fires on the event loop (via call_later), so the blocking
@@ -407,17 +513,23 @@ class StatusMonitor:
         on the loop.
         """
         with self._lock:
+            if not self._is_current_generation_locked(terminal_id, generation):
+                return
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
             buffer = self._buffers.get(terminal_id, "")
 
         async def _detect_and_apply() -> None:
-            detected = await asyncio.to_thread(self._detect_status, terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            detected = await asyncio.to_thread(self._detect_status, terminal_id, buffer, generation)
+            self._apply_detection(terminal_id, detected, generation=generation)
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            self._apply_detection(
+                terminal_id,
+                self._detect_status(terminal_id, buffer, generation=generation),
+                generation=generation,
+            )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
@@ -472,6 +584,8 @@ class StatusMonitor:
         IDLE/COMPLETED would block the genuine PROCESSING transition.
         """
         with self._lock:
+            if not self._is_current_generation_locked(terminal_id):
+                return
             self._allow_processing_revert[terminal_id] = True
 
     def clear_rolling_buffer(self, terminal_id: str) -> None:
@@ -486,11 +600,27 @@ class StatusMonitor:
         survives and the subsequent IDLE→PROCESSING transition is honored.
         """
         with self._lock:
+            if not self._is_current_generation_locked(terminal_id):
+                return
             self._buffers[terminal_id] = ""
 
-    def _detect_status(self, terminal_id: str, buffer: str) -> TerminalStatus:
+    def _detect_status(
+        self,
+        terminal_id: str,
+        buffer: str,
+        generation: Optional[int] = None,
+    ) -> TerminalStatus:
         """Detect status: provider-specific patterns or UNKNOWN if no provider."""
-        provider = provider_manager.get_provider(terminal_id)
+        with self._lock:
+            if not self._is_current_generation_locked(terminal_id, generation):
+                return TerminalStatus.UNKNOWN
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except ValueError:
+            with self._lock:
+                if not self._is_current_generation_locked(terminal_id, generation):
+                    return TerminalStatus.UNKNOWN
+            raise
         if provider is None:
             return TerminalStatus.UNKNOWN
 
@@ -501,8 +631,22 @@ class StatusMonitor:
             return TerminalStatus.UNKNOWN
 
     def clear_terminal(self, terminal_id: str) -> None:
-        """Free buffer and status for a deleted terminal."""
+        """Stop a runtime generation and free its monitor state.
+
+        The tombstone is installed before timers are cancelled or other state
+        is removed, making queued chunks and in-flight detection results stale
+        immediately. terminal_service removes the provider/database only after
+        this lifecycle barrier is in place.
+        """
         with self._lock:
+            generation = self._generations.get(terminal_id, 0) + 1
+            self._generations[terminal_id] = generation
+            self._tombstones[terminal_id] = generation
+            self._tombstones.move_to_end(terminal_id)
+            while len(self._tombstones) > _MAX_TERMINAL_TOMBSTONES:
+                evicted_id, evicted_generation = self._tombstones.popitem(last=False)
+                if self._generations.get(evicted_id) == evicted_generation:
+                    self._generations.pop(evicted_id, None)
             self._buffers.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
@@ -521,6 +665,8 @@ class StatusMonitor:
         from the failed first attempt and can spuriously time out.
         """
         with self._lock:
+            if not self._is_current_generation_locked(terminal_id):
+                return
             self._buffers[terminal_id] = ""
             self._last_status.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
@@ -543,6 +689,10 @@ class StatusMonitor:
         liveness) works on herdr without each having to special-case the backend.
         """
         from cli_agent_orchestrator.backends.registry import get_backend
+
+        with self._lock:
+            if not self._is_current_generation_locked(terminal_id):
+                return TerminalStatus.UNKNOWN
 
         if get_backend().supports_event_inbox():
             try:

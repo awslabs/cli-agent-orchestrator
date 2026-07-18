@@ -665,6 +665,7 @@ class TestCreateTerminal:
         result = await create_terminal("kiro_cli", "my-agent", new_session=True)
 
         assert result.id == "test1234"
+        mock_status_monitor.register_terminal.assert_called_once_with("test1234")
         mock_provider.initialize.assert_called_once()
         # allowed_tools should be None since profile was not found
         assert mock_provider_manager.create_provider.call_args.kwargs.get("allowed_tools") is None

@@ -108,6 +108,76 @@ class TestScreenDetection:
         mock_pm.get_provider.assert_not_called()
 
 
+class TestLifecycleGeneration:
+    """Late output and detection results must not resurrect a deleted runtime."""
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_late_chunk_after_clear_skips_provider_lookup(self, mock_pm):
+        sm = StatusMonitor()
+        sm.register_terminal("t1")
+        sm.clear_terminal("t1")
+
+        sm._process_chunk("t1", "late output")
+
+        mock_pm.get_provider.assert_not_called()
+        assert sm.get_buffer("t1") == ""
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_inflight_chunk_is_dropped_when_clear_wins_race(self, mock_pm, mock_bus):
+        sm = StatusMonitor()
+        sm.register_terminal("t1")
+        lookup_started = threading.Event()
+        release_lookup = threading.Event()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.get_status.return_value = TerminalStatus.IDLE
+
+        def _blocking_lookup(_terminal_id):
+            lookup_started.set()
+            assert release_lookup.wait(timeout=1)
+            return provider
+
+        mock_pm.get_provider.side_effect = _blocking_lookup
+        worker = threading.Thread(target=sm._process_chunk, args=("t1", "late output"))
+        worker.start()
+        assert lookup_started.wait(timeout=1)
+
+        sm.clear_terminal("t1")
+        release_lookup.set()
+        worker.join(timeout=1)
+
+        assert not worker.is_alive()
+        provider.get_status.assert_not_called()
+        mock_bus.publish.assert_not_called()
+        assert sm.get_buffer("t1") == ""
+
+    @patch("cli_agent_orchestrator.services.status_monitor.bus")
+    def test_old_generation_result_ignored_after_terminal_id_reuse(self, mock_bus):
+        sm = StatusMonitor()
+        first_generation = sm.register_terminal("t1")
+        sm.clear_terminal("t1")
+        second_generation = sm.register_terminal("t1")
+
+        sm._apply_detection("t1", TerminalStatus.ERROR, generation=first_generation)
+        sm._apply_detection("t1", TerminalStatus.IDLE, generation=second_generation)
+
+        assert second_generation > first_generation
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+        mock_bus.publish.assert_called_once_with("terminal.t1.status", {"status": "idle"})
+
+    @patch("cli_agent_orchestrator.services.status_monitor._MAX_TERMINAL_TOMBSTONES", 2)
+    def test_tombstone_and_generation_history_are_bounded(self):
+        sm = StatusMonitor()
+
+        for terminal_id in ("t1", "t2", "t3"):
+            sm.register_terminal(terminal_id)
+            sm.clear_terminal(terminal_id)
+
+        assert list(sm._tombstones) == ["t2", "t3"]
+        assert "t1" not in sm._generations
+
+
 class _SequencedMonitor:
     """Drive _process_chunk with a scripted sequence of detected statuses.
 
@@ -389,7 +459,7 @@ class TestRawDebounceArmedDetection:
 
         # Mock _detect_status: first call returns UNKNOWN, second returns PROCESSING
         detect_results = iter([TerminalStatus.UNKNOWN, TerminalStatus.PROCESSING])
-        sm._detect_status = lambda tid, buf: next(detect_results)
+        sm._detect_status = lambda tid, buf, generation=None: next(detect_results)
 
         # Chunk 1: UNKNOWN — should still attempt detection (terminal is ready)
         sm._process_chunk("t1", "neutral output")
