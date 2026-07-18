@@ -161,9 +161,9 @@ class DevinCliProvider(BaseProvider):
         try:
             fd, path = tempfile.mkstemp(prefix="cao_devin_config_", suffix=".json")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = None
                 f.write(json.dumps(base_config, indent=2))
             self._temp_config_file = path
-            fd = None
         except Exception:
             if path:
                 try:
@@ -182,9 +182,9 @@ class DevinCliProvider(BaseProvider):
         try:
             fd, path = tempfile.mkstemp(prefix="cao_devin_prompt_", suffix=".md")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = None
                 f.write(content)
             self._temp_prompt_file = path
-            fd = None
         except Exception:
             if path:
                 try:
@@ -227,6 +227,9 @@ class DevinCliProvider(BaseProvider):
             normalized["transport"] = transport
             if resolved.get("headers"):
                 normalized["headers"] = dict(resolved["headers"])
+            for key in ("oauthClientId", "oauthClientSecret", "oauthResource"):
+                if key in resolved and resolved[key] is not None:
+                    normalized[key] = resolved[key]
         else:
             command = resolved.get("command")
             if command:
