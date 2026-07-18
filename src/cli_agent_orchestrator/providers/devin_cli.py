@@ -391,22 +391,23 @@ class DevinCliProvider(BaseProvider):
         return False
 
     @staticmethod
-    def _has_input_prompt(lines: list[str]) -> bool:
-        """Return True if the `#` input prompt preceded by a horizontal rule is visible.
+    def _find_last_input_prompt(lines: list[str]) -> Optional[int]:
+        """Return the index of the last active `#` prompt, or None.
 
         The Devin TUI always places a horizontal rule immediately before the `#`
         prompt.  Requiring this context avoids false positives from Markdown
         headings (e.g. ``# Title``) that appear inside agent responses.
         """
         tail = lines[-20:]
-        for idx, line in enumerate(tail):
+        for idx in range(len(tail) - 1, -1, -1):
+            line = tail[idx]
             if not re.match(IDLE_PROMPT_PATTERN, line):
                 continue
             # Verify the closest preceding non-empty line is a horizontal rule.
             preceding = [line for line in tail[:idx] if line.strip()]
             if preceding and re.match(HORIZONTAL_RULE_PATTERN, preceding[-1].strip()):
-                return True
-        return False
+                return len(lines) - len(tail) + idx
+        return None
 
     @staticmethod
     def _has_user_input(lines: list[str]) -> bool:
@@ -459,11 +460,13 @@ class DevinCliProvider(BaseProvider):
         if self._is_processing(lines):
             return TerminalStatus.PROCESSING
 
-        # 2. Check for the # prompt using horizontal-rule-aware detector.
-        # This also rules out completed responses that quote error text before
-        # the prompt: the active prompt means the turn succeeded.
-        has_prompt = self._has_input_prompt(lines)
-        if has_prompt:
+        # 2. Find the active # prompt.  If a crash or explicit error appears
+        # after it, the prompt is stale from an earlier turn and the current
+        # state is ERROR.  Otherwise the prompt means the turn finished.
+        prompt_idx = self._find_last_input_prompt(lines)
+        if prompt_idx is not None:
+            if self._is_error(lines[prompt_idx + 1 :]):
+                return TerminalStatus.ERROR
             # Check for user input to distinguish IDLE from COMPLETED.
             # If a task was dispatched and the user-input line has scrolled out
             # of the buffer, the visible prompt means completion.
@@ -472,9 +475,7 @@ class DevinCliProvider(BaseProvider):
             return TerminalStatus.IDLE
 
         # 3. With no active prompt and no active spinner, explicit Devin CLI /
-        # runtime crashes are reported as ERROR.  Completed responses that
-        # merely mention an error still show the prompt, so they are handled
-        # above.
+        # runtime crashes are reported as ERROR.
         if self._is_error(lines):
             return TerminalStatus.ERROR
 
