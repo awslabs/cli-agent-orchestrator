@@ -29,6 +29,7 @@ Run:
 import re
 import time
 import uuid
+from typing import Optional
 from test.e2e.conftest import (
     cleanup_terminal,
     create_terminal,
@@ -121,13 +122,14 @@ def _wait_for_status_change(
     excluded_statuses: set[str],
     timeout: float = 15.0,
     poll: float = 1.0,
+    initial_output: Optional[str] = None,
 ) -> bool:
-    """Wait until the terminal status is no longer one of the excluded statuses.
+    """Wait until the terminal has actually started processing the task.
 
-    This is used after sending input to ensure the provider has actually started
-    processing before polling for completion again.  A fast provider may still be
-    in a ready state for a moment after the message is delivered, so we wait for
-    any transition away from those initial states.
+    A fast provider may still report a ready state for a moment after the message
+    is delivered, so we require either a status transition to PROCESSING (or any
+    non-ready state) or a visible output change from the pre-task baseline.  This
+    avoids accepting stale IDLE/COMPLETED states as evidence of work.
     """
     start = time.time()
     while time.time() - start < timeout:
@@ -135,7 +137,10 @@ def _wait_for_status_change(
         if status == "error":
             return False
         if status not in excluded_statuses:
-            return True
+            if initial_output is None:
+                return True
+            if extract_output(terminal_id) != initial_output:
+                return True
         time.sleep(poll)
     return False
 
@@ -847,6 +852,7 @@ class TestDevinCliSupervisorOrchestration:
             # Send a simple task
             task_message = "echo hello world"
             initial_status = get_terminal_status(terminal_id)
+            initial_output = extract_output(terminal_id)
             resp = requests.post(
                 f"{API_BASE_URL}/terminals/{terminal_id}/input",
                 params={"message": task_message},
@@ -854,10 +860,13 @@ class TestDevinCliSupervisorOrchestration:
             )
             assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 
-            # Make sure the provider has started processing the input before
-            # polling for completion, so we don't read stale output.
+            # Make sure the provider has actually started processing the input
+            # before polling for completion, so we don't read stale output.
             assert _wait_for_status_change(
-                terminal_id, {initial_status}, timeout=15
+                terminal_id,
+                {initial_status},
+                timeout=15,
+                initial_output=initial_output,
             ), "Devin CLI did not start processing the task"
 
             # Wait for task completion

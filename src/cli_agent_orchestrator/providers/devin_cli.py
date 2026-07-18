@@ -458,11 +458,17 @@ class DevinCliProvider(BaseProvider):
 
         lines = clean_output.splitlines()
 
-        # 1. Processing spinner patterns take priority
+        # 1. Explicit Devin CLI / runtime crashes are reported as ERROR first,
+        # so a crash that retains an earlier prompt or spinner line is not
+        # misreported as COMPLETED/PROCESSING.
+        if self._is_error(lines):
+            return TerminalStatus.ERROR
+
+        # 2. Processing spinner patterns take priority
         if self._is_processing(lines):
             return TerminalStatus.PROCESSING
 
-        # 2. Check for the # prompt using horizontal-rule-aware detector
+        # 3. Check for the # prompt using horizontal-rule-aware detector
         has_prompt = self._has_input_prompt(lines)
 
         if has_prompt:
@@ -472,12 +478,6 @@ class DevinCliProvider(BaseProvider):
             if self._has_user_input(lines) or self._task_dispatched:
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
-
-        # 3. Explicit Devin CLI / runtime crashes are reported as ERROR.
-        # Evaluate errors before the welcome banner so an authentication failure
-        # that still contains welcome text is not misreported as IDLE.
-        if self._is_error(lines):
-            return TerminalStatus.ERROR
 
         # 4. Initial Devin CLI welcome screen (before first # prompt)
         # Look for "Ask Devin to build features", "I'm ready to help", or "SWE-1.6"
