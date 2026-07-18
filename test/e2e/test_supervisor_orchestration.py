@@ -116,6 +116,30 @@ def _wait_for_ready(terminal_id: str, timeout: float = 120.0, poll: float = 3.0)
     return False
 
 
+def _wait_for_status_change(
+    terminal_id: str,
+    excluded_statuses: set[str],
+    timeout: float = 15.0,
+    poll: float = 1.0,
+) -> bool:
+    """Wait until the terminal status is no longer one of the excluded statuses.
+
+    This is used after sending input to ensure the provider has actually started
+    processing before polling for completion again.  A fast provider may still be
+    in a ready state for a moment after the message is delivered, so we wait for
+    any transition away from those initial states.
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        status = get_terminal_status(terminal_id)
+        if status == "error":
+            return False
+        if status not in excluded_statuses:
+            return True
+        time.sleep(poll)
+    return False
+
+
 # A supervisor is "done" when it is in a ready state (COMPLETED or IDLE). Both
 # are accepted because kiro 2.11 legitimately finishes a turn at IDLE with no
 # Credits marker (the marker is intermittent in TUI mode; verified by a run
@@ -822,12 +846,19 @@ class TestDevinCliSupervisorOrchestration:
 
             # Send a simple task
             task_message = "echo hello world"
+            initial_status = get_terminal_status(terminal_id)
             resp = requests.post(
                 f"{API_BASE_URL}/terminals/{terminal_id}/input",
                 params={"message": task_message},
                 timeout=10,
             )
             assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
+
+            # Make sure the provider has started processing the input before
+            # polling for completion, so we don't read stale output.
+            assert _wait_for_status_change(
+                terminal_id, {initial_status}, timeout=15
+            ), "Devin CLI did not start processing the task"
 
             # Wait for task completion
             assert _wait_for_ready(

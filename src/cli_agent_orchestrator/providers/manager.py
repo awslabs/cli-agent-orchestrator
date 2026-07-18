@@ -1,7 +1,7 @@
 """Provider manager as module singleton with direct terminal_id → provider mapping."""
 
 import logging
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -55,7 +55,7 @@ class ProviderManager:
         tmux_window: str,
         agent_profile: Optional[str],
         allowed_tools: Optional[List[str]],
-        **kwargs,
+        **kwargs: Any,
     ) -> KiroCliProvider:
         if not agent_profile:
             raise ValueError("Kiro CLI provider requires agent_profile parameter")
@@ -75,7 +75,7 @@ class ProviderManager:
         agent_profile: Optional[str],
         allowed_tools: Optional[List[str]],
         skill_prompt: Optional[str],
-        **kwargs,
+        **kwargs: Any,
     ) -> ClaudeCodeProvider:
         return ClaudeCodeProvider(
             terminal_id,
@@ -94,7 +94,7 @@ class ProviderManager:
         agent_profile: Optional[str],
         allowed_tools: Optional[List[str]],
         skill_prompt: Optional[str],
-        **kwargs,
+        **kwargs: Any,
     ) -> CodexProvider:
         return CodexProvider(
             terminal_id,
@@ -113,7 +113,7 @@ class ProviderManager:
         agent_profile: Optional[str],
         allowed_tools: Optional[List[str]],
         model: Optional[str],
-        **kwargs,
+        **kwargs: Any,
     ) -> CopilotCliProvider:
         return CopilotCliProvider(
             terminal_id,
@@ -132,7 +132,7 @@ class ProviderManager:
         agent_profile: Optional[str],
         allowed_tools: Optional[List[str]],
         skill_prompt: Optional[str],
-        **kwargs,
+        **kwargs: Any,
     ) -> KimiCliProvider:
         return KimiCliProvider(
             terminal_id,
@@ -151,7 +151,7 @@ class ProviderManager:
         agent_profile: Optional[str],
         allowed_tools: Optional[List[str]],
         model: Optional[str],
-        **kwargs,
+        **kwargs: Any,
     ) -> OpenCodeCliProvider:
         return OpenCodeCliProvider(
             terminal_id,
@@ -170,7 +170,7 @@ class ProviderManager:
         agent_profile: Optional[str],
         allowed_tools: Optional[List[str]],
         skill_prompt: Optional[str],
-        **kwargs,
+        **kwargs: Any,
     ) -> HermesProvider:
         return HermesProvider(
             terminal_id,
@@ -190,7 +190,7 @@ class ProviderManager:
         allowed_tools: Optional[List[str]],
         model: Optional[str],
         skill_prompt: Optional[str],
-        **kwargs,
+        **kwargs: Any,
     ) -> CursorCliProvider:
         return CursorCliProvider(
             terminal_id,
@@ -211,7 +211,7 @@ class ProviderManager:
         allowed_tools: Optional[List[str]],
         model: Optional[str],
         skill_prompt: Optional[str],
-        **kwargs,
+        **kwargs: Any,
     ) -> AntigravityCliProvider:
         return AntigravityCliProvider(
             terminal_id,
@@ -231,7 +231,7 @@ class ProviderManager:
         agent_profile: Optional[str],
         allowed_tools: Optional[List[str]],
         skill_prompt: Optional[str],
-        **kwargs,
+        **kwargs: Any,
     ) -> DevinCliProvider:
         return DevinCliProvider(
             terminal_id,
@@ -248,7 +248,7 @@ class ProviderManager:
         tmux_session: str,
         tmux_window: str,
         allowed_tools: Optional[List[str]],
-        **kwargs,
+        **kwargs: Any,
     ) -> MockCliProvider:
         return MockCliProvider(
             terminal_id,
