@@ -154,16 +154,16 @@ class DevinCliProvider(BaseProvider):
             f"You are restricted to only use the following tools: {tools_list}\n"
         )
 
-    def _write_config_file(self, base_config: dict) -> None:
-        """Write the merged Devin config to a temporary file and store the path."""
+    def _write_temp_file(self, content: str, prefix: str, suffix: str) -> str:
+        """Write ``content`` to a securely created temporary file and return its path."""
         fd: Optional[int] = None
         path: Optional[str] = None
         try:
-            fd, path = tempfile.mkstemp(prefix="cao_devin_config_", suffix=".json")
+            fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 fd = None
-                f.write(json.dumps(base_config, indent=2))
-            self._temp_config_file = path
+                f.write(content)
+            return path
         except Exception:
             if path:
                 try:
@@ -175,26 +175,21 @@ class DevinCliProvider(BaseProvider):
             if fd is not None:
                 os.close(fd)
 
+    def _write_config_file(self, base_config: dict) -> None:
+        """Write the merged Devin config to a temporary file and store the path."""
+        self._temp_config_file = self._write_temp_file(
+            json.dumps(base_config, indent=2),
+            prefix="cao_devin_config_",
+            suffix=".json",
+        )
+
     def _write_prompt_file(self, content: str) -> None:
         """Write prompt content to a temporary file and store the path."""
-        fd: Optional[int] = None
-        path: Optional[str] = None
-        try:
-            fd, path = tempfile.mkstemp(prefix="cao_devin_prompt_", suffix=".md")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                fd = None
-                f.write(content)
-            self._temp_prompt_file = path
-        except Exception:
-            if path:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-            raise
-        finally:
-            if fd is not None:
-                os.close(fd)
+        self._temp_prompt_file = self._write_temp_file(
+            content,
+            prefix="cao_devin_prompt_",
+            suffix=".md",
+        )
 
     def _load_user_config(self) -> dict:
         """Load the user's existing Devin config or create a minimal one."""
@@ -458,19 +453,16 @@ class DevinCliProvider(BaseProvider):
 
         lines = clean_output.splitlines()
 
-        # 1. Explicit Devin CLI / runtime crashes are reported as ERROR first,
-        # so a crash that retains an earlier prompt or spinner line is not
-        # misreported as COMPLETED/PROCESSING.
-        if self._is_error(lines):
-            return TerminalStatus.ERROR
-
-        # 2. Processing spinner patterns take priority
+        # 1. Active spinner / status indicators take priority over the fixed
+        # input prompt.  Devin can display a prompt line while a "Running tools"
+        # spinner is still visible above it.
         if self._is_processing(lines):
             return TerminalStatus.PROCESSING
 
-        # 3. Check for the # prompt using horizontal-rule-aware detector
+        # 2. Check for the # prompt using horizontal-rule-aware detector.
+        # This also rules out completed responses that quote error text before
+        # the prompt: the active prompt means the turn succeeded.
         has_prompt = self._has_input_prompt(lines)
-
         if has_prompt:
             # Check for user input to distinguish IDLE from COMPLETED.
             # If a task was dispatched and the user-input line has scrolled out
@@ -478,6 +470,13 @@ class DevinCliProvider(BaseProvider):
             if self._has_user_input(lines) or self._task_dispatched:
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
+
+        # 3. With no active prompt and no active spinner, explicit Devin CLI /
+        # runtime crashes are reported as ERROR.  Completed responses that
+        # merely mention an error still show the prompt, so they are handled
+        # above.
+        if self._is_error(lines):
+            return TerminalStatus.ERROR
 
         # 4. Initial Devin CLI welcome screen (before first # prompt)
         # Look for "Ask Devin to build features", "I'm ready to help", or "SWE-1.6"

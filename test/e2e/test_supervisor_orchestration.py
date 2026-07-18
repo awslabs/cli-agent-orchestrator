@@ -136,11 +136,14 @@ def _wait_for_status_change(
         status = get_terminal_status(terminal_id)
         if status == "error":
             return False
-        if status not in excluded_statuses:
-            if initial_output is None:
-                return True
+        # Fast providers may flash PROCESSING and return to a ready state between
+        # our 1s polls.  Detect a real task by a visible output change even when
+        # the status has settled back into the excluded ready states.
+        if initial_output is not None:
             if extract_output(terminal_id) != initial_output:
                 return True
+        if status not in excluded_statuses:
+            return True
         time.sleep(poll)
     return False
 
