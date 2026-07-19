@@ -6,7 +6,7 @@ import re
 import subprocess
 import unicodedata
 from dataclasses import dataclass
-from html import unescape as unescape_html
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable, Sequence
 from urllib.parse import unquote, urlsplit
@@ -30,24 +30,6 @@ _EXCLUDED_FILES = (
 )
 _PUNCTUATION_RE = re.compile(r"[^\w\-\s]", flags=re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s")
-_HTML_TAG_RE = re.compile(r"<\s*(?P<tag>a|img)\b(?P<attributes>[^>]*)>", re.IGNORECASE | re.DOTALL)
-_HTML_ATTRIBUTE_RE = re.compile(
-    r"""(?<![\w:-])(?P<name>href|src)\s*=\s*(?:"(?P<double>[^"]*)"|'(?P<single>[^']*)'|(?P<bare>[^\s"'=<>`]+))""",
-    re.IGNORECASE,
-)
-_HTML_NON_TAG_CONTENT_RE = re.compile(
-    r"<!--.*?-->|<(?:script|style|textarea|title)\b[^>]*>.*?</(?:script|style|textarea|title)\s*>",
-    re.IGNORECASE | re.DOTALL,
-)
-_MARKDOWN_LINK_SYNTAX_RE = re.compile(
-    r"""(?<!\\)!?\[(?:\\.|[^\]\\])*\](?:\s*\((?:\\.|[^)])*\)|\[(?:\\.|[^\]\\])*\])""",
-    re.DOTALL,
-)
-_MARKDOWN_SHORTCUT_REFERENCE_RE = re.compile(
-    r"""(?<!\\)!?\[(?P<label>(?:\\.|[^\]\\])*)\](?!\s*(?:\(|\[))""",
-    re.DOTALL,
-)
-_MARKDOWN_AUTOLINK_RE = re.compile(r"<[^>\n]+>")
 
 
 @dataclass(frozen=True)
@@ -130,6 +112,7 @@ def _links(path: Path, parser: MarkdownIt) -> Iterable[tuple[str, int]]:
 
         inline_start_line = _token_start_line(token)
         inline_cursor = 0
+        scanner = _MarkdownLinkScanner(token.content, reference_labels)
         for child in token.children:
             if child.type == "html_inline":
                 offset = token.content.find(child.content, inline_cursor)
@@ -149,8 +132,10 @@ def _links(path: Path, parser: MarkdownIt) -> Iterable[tuple[str, int]]:
                 continue
             destination = child.attrGet(attribute)
             if isinstance(destination, str):
-                syntax_offset = _markdown_link_syntax_offset(
-                    token.content, inline_cursor, reference_labels
+                syntax_offset = scanner.next_link_offset(
+                    inline_cursor,
+                    autolink_text=child.content if child.markup == "autolink" else None,
+                    image=child.type == "image",
                 )
                 yield (
                     destination,
@@ -165,74 +150,262 @@ def _token_start_line(token: Token) -> int:
     return token.map[0] + 1 if token.map is not None else 1
 
 
-def _markdown_link_syntax_offset(
-    content: str, cursor: int, reference_labels: frozenset[str]
-) -> int:
-    """Locate the next raw Markdown link or image construct in inline source.
+class _MarkdownLinkScanner:
+    """Locate raw Markdown links with precomputed delimiter relationships.
 
     Parser destinations are normalized, so reference-style links and escaped
     direct destinations cannot be reliably located by searching for them.
     Tracking the syntax itself preserves the link's source line. Shortcut
     references need their parser-resolved labels to avoid treating ordinary
-    bracket text as a link.
+    bracket text as a link. Delimiter pairs are built once so a run of
+    unmatched opening brackets cannot repeatedly rescan the same suffix.
     """
 
-    matches = (
-        match
-        for expression in (_MARKDOWN_LINK_SYNTAX_RE, _MARKDOWN_AUTOLINK_RE)
-        if (match := expression.search(content, cursor)) is not None
-    )
-    offsets = [match.start() for match in matches]
-    shortcut_offset = _shortcut_reference_offset(content, cursor, reference_labels)
-    if shortcut_offset is not None:
-        offsets.append(shortcut_offset)
-    return min(offsets, default=cursor)
+    def __init__(self, content: str, reference_labels: frozenset[str]) -> None:
+        self._content = content
+        self._reference_labels = reference_labels
+        self._brackets = _matching_delimiters(content, "[", "]")
+        self._bracket_delimiters = _unescaped_delimiter_prefix(content, "[", "]")
+        self._parentheses = _matching_delimiters(content, "(", ")")
+
+    def next_link_offset(self, cursor: int, *, autolink_text: str | None, image: bool) -> int:
+        """Return the next parsed link's source offset at or after ``cursor``."""
+
+        position = cursor
+        while position < len(self._content):
+            character = self._content[position]
+            if character == "`":
+                position = _skip_code_span(self._content, position)
+                continue
+            if autolink_text is not None and character == "<":
+                autolink_end = _autolink_end(self._content, position)
+                if (
+                    autolink_end is not None
+                    and self._content[position + 1 : autolink_end] == autolink_text
+                ):
+                    return position
+            is_image = (
+                character == "!"
+                and position + 1 < len(self._content)
+                and self._content[position + 1] == "["
+            )
+            is_link = character == "[" and (position == 0 or self._content[position - 1] != "!")
+            if autolink_text is None and is_image == image and (is_link or is_image):
+                link_start = position
+                label_start = position + (2 if character == "!" else 1)
+                label_end = self._brackets[label_start - 1]
+                if (
+                    label_end is not None
+                    and self._link_syntax_end(label_start, label_end) is not None
+                    and (image or not self._has_nested_link(label_start, label_end))
+                ):
+                    return link_start
+            position += 1
+        return cursor
+
+    def _link_syntax_end(self, label_start: int, label_end: int) -> int | None:
+        """Recognize direct, full/collapsed, and defined shortcut link forms."""
+
+        position = label_end + 1
+        while position < len(self._content) and self._content[position] in " \t":
+            position += 1
+        if position < len(self._content) and self._content[position] == "(":
+            return self._parentheses[position]
+        if position < len(self._content) and self._content[position] == "[":
+            reference_end = self._brackets[position]
+            if reference_end is None:
+                return None
+            reference_label = self._content[position + 1 : reference_end]
+            if reference_label:
+                label = self._normalized_reference_label(position + 1, reference_end)
+            else:
+                label = self._normalized_reference_label(label_start, label_end)
+            if label is None:
+                return None
+            return reference_end if label in self._reference_labels else None
+        label = self._normalized_reference_label(label_start, label_end)
+        if label is None:
+            return None
+        return label_end if label in self._reference_labels else None
+
+    def _normalized_reference_label(self, start: int, end: int) -> str | None:
+        """Normalize a label only when it can be a CommonMark reference label."""
+
+        if not self._reference_labels or self._has_unescaped_bracket(start, end):
+            return None
+        return normalizeReference(unescapeAll(self._content[start:end]))
+
+    def _has_unescaped_bracket(self, start: int, end: int) -> bool:
+        """Return whether a label contains an unescaped bracket delimiter."""
+
+        return self._bracket_delimiters[end] != self._bracket_delimiters[start]
+
+    def _has_nested_link(self, start: int, end: int) -> bool:
+        """Return whether a non-image link candidate appears inside a label."""
+
+        position = start
+        while position < end:
+            if self._content[position] == "`":
+                position = _skip_code_span(self._content, position)
+                continue
+            if self._content[position] == "[" and (
+                position == 0 or self._content[position - 1] != "!"
+            ):
+                nested_end = self._brackets[position]
+                if (
+                    nested_end is not None
+                    and nested_end < end
+                    and self._link_syntax_end(position + 1, nested_end) is not None
+                ):
+                    return True
+            position += 1
+        return False
 
 
-def _shortcut_reference_offset(
-    content: str, cursor: int, reference_labels: frozenset[str]
-) -> int | None:
-    """Return the first defined shortcut reference at or after ``cursor``."""
+def _skip_code_span(content: str, start: int) -> int:
+    """Skip an inline code span so link-looking code is not treated as syntax."""
 
-    for match in _MARKDOWN_SHORTCUT_REFERENCE_RE.finditer(content, cursor):
-        label = normalizeReference(unescapeAll(match.group("label")))
-        if label in reference_labels:
-            return match.start()
-    return None
+    delimiter_end = start
+    while delimiter_end < len(content) and content[delimiter_end] == "`":
+        delimiter_end += 1
+    delimiter = content[start:delimiter_end]
+    closing = content.find(delimiter, delimiter_end)
+    return len(content) if closing < 0 else closing + len(delimiter)
+
+
+def _autolink_end(content: str, start: int) -> int | None:
+    """Return an autolink's closing angle bracket, without crossing lines."""
+
+    position = start + 1
+    while position < len(content) and content[position] not in ">\n":
+        position += 1
+    return position if position < len(content) and content[position] == ">" else None
+
+
+def _matching_delimiters(content: str, opening: str, closing: str) -> list[int | None]:
+    """Return each opening delimiter's matching close, ignoring escaped delimiters."""
+
+    matches: list[int | None] = [None] * len(content)
+    openings: list[int] = []
+    position = 0
+    while position < len(content):
+        character = content[position]
+        if character == "\\":
+            position += 2
+            continue
+        if character == opening:
+            openings.append(position)
+        elif character == closing and openings:
+            matches[openings.pop()] = position
+        position += 1
+    return matches
+
+
+def _unescaped_delimiter_prefix(content: str, opening: str, closing: str) -> list[int]:
+    """Count unescaped delimiters before each source position."""
+
+    delimiters = [0]
+    position = 0
+    while position < len(content):
+        character = content[position]
+        if character == "\\":
+            delimiters.append(delimiters[-1])
+            position += 1
+            if position < len(content):
+                delimiters.append(delimiters[-1])
+                position += 1
+            continue
+        delimiters.append(delimiters[-1] + (character == opening or character == closing))
+        position += 1
+    return delimiters
 
 
 def _html_destinations(content: str, start_line: int) -> Iterable[tuple[str, int]]:
-    """Yield quoted or bare href/src values from static anchor and image tags."""
+    """Yield href/src values from static HTML, retaining parser source lines."""
 
-    static_content = _HTML_NON_TAG_CONTENT_RE.sub(_preserve_newlines, content)
-    for tag_match in _HTML_TAG_RE.finditer(static_content):
-        tag = tag_match.group("tag").lower()
-        attribute_name = "href" if tag == "a" else "src"
-        attributes = tag_match.group("attributes")
-        for attribute_match in _HTML_ATTRIBUTE_RE.finditer(attributes):
-            if attribute_match.group("name").lower() != attribute_name:
+    parser = _HTMLLinkParser(start_line)
+    parser.feed(content)
+    parser.close()
+    yield from parser.destinations
+
+
+class _HTMLLinkParser(HTMLParser):
+    """Extract static link attributes while HTMLParser handles raw-text elements."""
+
+    def __init__(self, start_line: int) -> None:
+        super().__init__(convert_charrefs=True)
+        self._start_line = start_line
+        self.destinations: list[tuple[str, int]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attribute_name = "href" if tag.lower() == "a" else "src" if tag.lower() == "img" else None
+        if attribute_name is None:
+            return
+        attribute_occurrence = 0
+        for name, value in attrs:
+            if name.lower() != attribute_name or value is None:
                 continue
-            destination, offset = _html_attribute_value(attribute_match)
-            yield (
-                unescape_html(destination),
-                start_line + content.count("\n", 0, tag_match.start("attributes") + offset),
+            self.destinations.append(
+                (
+                    value,
+                    self._start_line
+                    + self.getpos()[0]
+                    - 1
+                    + _html_attribute_line_offset(
+                        self.get_starttag_text() or "", attribute_name, attribute_occurrence
+                    ),
+                )
             )
+            attribute_occurrence += 1
 
 
-def _html_attribute_value(match: re.Match[str]) -> tuple[str, int]:
-    """Return an HTML attribute's value and its offset within the attributes."""
+def _html_attribute_line_offset(tag_text: str, attribute_name: str, occurrence: int) -> int:
+    """Return one matching attribute value's zero-based line within a start tag."""
 
-    for name in ("double", "single", "bare"):
-        value = match.group(name)
-        if value is not None:
-            return value, match.start(name)
-    raise ValueError("HTML attribute value is missing")
-
-
-def _preserve_newlines(match: re.Match[str]) -> str:
-    """Mask non-tag HTML content without changing subsequent source line offsets."""
-
-    return re.sub(r"[^\n]", " ", match.group(0))
+    position = 1
+    while (
+        position < len(tag_text) and not tag_text[position].isspace() and tag_text[position] != ">"
+    ):
+        position += 1
+    while position < len(tag_text):
+        while position < len(tag_text) and tag_text[position].isspace():
+            position += 1
+        name_start = position
+        while (
+            position < len(tag_text)
+            and not tag_text[position].isspace()
+            and tag_text[position] not in "=>"
+        ):
+            position += 1
+        name = tag_text[name_start:position]
+        while position < len(tag_text) and tag_text[position].isspace():
+            position += 1
+        if position >= len(tag_text) or tag_text[position] != "=":
+            position += 1
+            continue
+        position += 1
+        while position < len(tag_text) and tag_text[position].isspace():
+            position += 1
+        value_start = position
+        if position < len(tag_text) and tag_text[position] in "\"'":
+            quote = tag_text[position]
+            position += 1
+            value_start = position
+            while position < len(tag_text) and tag_text[position] != quote:
+                position += 1
+            position += 1
+        else:
+            while (
+                position < len(tag_text)
+                and not tag_text[position].isspace()
+                and tag_text[position] != ">"
+            ):
+                position += 1
+        if name.lower() == attribute_name:
+            if occurrence == 0:
+                return tag_text.count("\n", 0, value_start)
+            occurrence -= 1
+    return 0
 
 
 def _heading_slugs(path: Path, parser: MarkdownIt) -> set[str]:

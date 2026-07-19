@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from cli_agent_orchestrator.utils import markdown_links
 from cli_agent_orchestrator.utils.markdown_links import (
     discover_markdown_files,
     validate_markdown_links,
@@ -105,6 +106,46 @@ def test_reports_static_html_anchor_and_image_destinations(tmp_path: Path) -> No
     ]
 
 
+def test_ignores_links_inside_malformed_html_raw_text_end_tag(tmp_path: Path) -> None:
+    source = _write(
+        tmp_path / "README.md",
+        "<script>const fake = '<a href=\"not-a-link.html\">';</script\t\n bar>\n",
+    )
+
+    assert validate_markdown_links(tmp_path, [source]) == []
+
+
+@pytest.mark.parametrize(
+    ("tag", "attribute", "first_destination", "second_destination"),
+    (
+        ("a", "href", "first-anchor.html", "second-anchor.html"),
+        ("img", "src", "first-image.png", "second-image.png"),
+    ),
+)
+def test_reports_multiline_duplicate_html_attribute_lines(
+    tmp_path: Path,
+    tag: str,
+    attribute: str,
+    first_destination: str,
+    second_destination: str,
+) -> None:
+    source = _write(
+        tmp_path / "README.md",
+        (
+            f'<{tag} {attribute}="{first_destination}"\n'
+            f'  {attribute}="{second_destination}">'
+            f'{"content</a>" if tag == "a" else "content"}\n'
+        ),
+    )
+
+    errors = validate_markdown_links(tmp_path, [source])
+
+    assert [(error.line, error.destination) for error in errors] == [
+        (1, first_destination),
+        (2, second_destination),
+    ]
+
+
 def test_heading_fragments_use_rendered_heading_text(tmp_path: Path) -> None:
     source = _write(
         tmp_path / "README.md",
@@ -199,6 +240,94 @@ def test_reports_escaped_destination_line_inside_multiline_paragraph(
     assert len(errors) == 1
     assert errors[0].line == 2
     assert errors[0].destination == "missing(file).md"
+
+
+def test_reports_nested_link_at_the_parser_recognized_source_line(tmp_path: Path) -> None:
+    source = _write(
+        tmp_path / "README.md",
+        "[outer label\n[inner](missing.md)](outer.md)\n",
+    )
+
+    errors = validate_markdown_links(tmp_path, [source])
+
+    assert [(error.line, error.destination) for error in errors] == [(2, "missing.md")]
+
+
+def test_reports_nested_link_after_an_adjacent_image_at_its_source_line(tmp_path: Path) -> None:
+    source = _write(
+        tmp_path / "README.md",
+        "![existing image](image.png)\n[outer label\n[inner](missing.md)](outer.md)\n",
+    )
+    _write(tmp_path / "image.png", "image\n")
+
+    errors = validate_markdown_links(tmp_path, [source])
+
+    assert [(error.line, error.destination) for error in errors] == [(3, "missing.md")]
+
+
+@pytest.mark.parametrize("autolink", ("<https://example.com>", "<docs@example.com>"))
+def test_reports_collapsed_reference_and_autolink_source_lines(
+    tmp_path: Path, autolink: str
+) -> None:
+    source = _write(
+        tmp_path / "README.md",
+        f"Paragraph start\n[missing][]\nx <foo@bar baz> {autolink}\n[local](missing.html)\n\n"
+        "[missing]: missing.md\n",
+    )
+
+    errors = validate_markdown_links(tmp_path, [source])
+
+    assert [(error.line, error.destination) for error in errors] == [
+        (2, "missing.md"),
+        (4, "missing.html"),
+    ]
+
+
+def test_non_autolink_angle_text_does_not_shift_later_link_diagnostic(tmp_path: Path) -> None:
+    source = _write(
+        tmp_path / "README.md",
+        "x <foo@bar baz>\n[real](missing.md)\n",
+    )
+
+    errors = validate_markdown_links(tmp_path, [source])
+
+    assert [(error.line, error.destination) for error in errors] == [(2, "missing.md")]
+
+
+@pytest.mark.parametrize("reference", ("[unknown]", "[]"))
+def test_undefined_reference_does_not_shift_later_link_diagnostic(
+    tmp_path: Path, reference: str
+) -> None:
+    source = _write(
+        tmp_path / "README.md",
+        f"[not a link]{reference}\ncontinued paragraph\n[real](missing.md)\n",
+    )
+
+    errors = validate_markdown_links(tmp_path, [source])
+
+    assert [(error.line, error.destination) for error in errors] == [(3, "missing.md")]
+
+
+def test_balanced_rejected_brackets_do_not_normalize_overlapping_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write(
+        tmp_path / "README.md",
+        "[" * 10_000 + "]" * 10_000 + "\n[real](missing.md)\n\n[known]: existing.md\n",
+    )
+    normalized_labels: list[str] = []
+    original = markdown_links.normalizeReference
+
+    def counted_normalization(label: str) -> str:
+        normalized_labels.append(label)
+        return original(label)
+
+    monkeypatch.setattr(markdown_links, "normalizeReference", counted_normalization)
+
+    errors = validate_markdown_links(tmp_path, [source])
+
+    assert [(error.line, error.destination) for error in errors] == [(2, "missing.md")]
+    assert normalized_labels == [""]
 
 
 def test_ignores_external_and_non_local_schemes(tmp_path: Path) -> None:
