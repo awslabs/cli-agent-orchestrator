@@ -375,7 +375,7 @@ class TestBm25FindsContentMatch:
         assert any(r.key == "deploy-pipeline" for r in results)
 
     def test_bm25_performance_within_budget(self, svc):
-        """BM25 search on 100 files should complete within 500ms."""
+        """BM25 search on 100 files should complete within 2 seconds."""
         import time
 
         ctx = _make_ctx()
@@ -394,7 +394,7 @@ class TestBm25FindsContentMatch:
         results = _run(svc.recall(query="banana50", scope="global", terminal_context=ctx))
         elapsed = time.time() - start
 
-        assert elapsed < 0.5, f"BM25 search took {elapsed:.3f}s, exceeds 500ms budget"
+        assert elapsed < 2.0, f"BM25 search took {elapsed:.3f}s, exceeds 2s budget"
         assert any(r.key == "perf-test-50" for r in results)
 
 

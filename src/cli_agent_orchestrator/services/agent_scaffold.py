@@ -16,28 +16,13 @@ from jsonschema import Draft202012Validator
 # Templates live under src/cli_agent_orchestrator/templates/
 _TEMPLATES_ROOT = Path(__file__).resolve().parent.parent / "templates"
 
-# Base Jinja2 autoescape selector: escape only HTML/XML template extensions.
-_autoescape_selector = select_autoescape(
-    enabled_extensions=("html", "htm", "xml"),
-    default_for_string=False,
-)
-
-
-def _autoescape_for_template(template_name: Optional[str]) -> bool:
-    """Autoescape selector that understands the ``*.<ext>.j2`` naming convention.
-
-    CAO scaffold templates are named ``template.<ext>.j2`` (e.g.
-    ``template.md.j2``). Jinja2's stock ``select_autoescape`` matches on the
-    *final* filename suffix, which is always ``.j2`` here, so it would never
-    enable escaping for a future ``template.html.j2`` / ``template.xml.j2``.
-    Strip a single trailing ``.j2`` before delegating so an HTML/XML template
-    is treated as HTML/XML and its output is escaped (XSS-safe). The existing
-    ``template.md.j2`` still resolves to ``md`` (not in the enabled set), so
-    markdown/bash output stays byte-identical.
-    """
-    if template_name and template_name.endswith(".j2"):
-        template_name = template_name[: -len(".j2")]
-    return _autoescape_selector(template_name)
+# Extensions that enable Jinja2 autoescape. CAO scaffold templates are named
+# ``template.<ext>.j2`` (e.g. ``template.md.j2``), and ``select_autoescape``
+# matches on the *final* filename suffix, so the compound ``<ext>.j2`` forms
+# are listed alongside the bare extensions: a future ``template.html.j2`` /
+# ``template.xml.j2`` is escaped (XSS-safe), while ``template.md.j2`` stays
+# unescaped so markdown/bash output is byte-identical.
+_AUTOESCAPE_EXTENSIONS = ("html", "htm", "xml", "html.j2", "htm.j2", "xml.j2")
 
 
 def _check_containment(path: Path, root: Path) -> None:
@@ -145,17 +130,17 @@ def render_template(template_name: str, config: dict) -> str:
         )
 
     # Templates use {{ config.x }} for values and bash ${VAR} passes through
-    # unchanged (not Jinja2 syntax). Autoescape is enabled via a custom
-    # selector so it is never off by default (Jinja2's own default is
-    # autoescape=False, flagged by security scanners as an XSS risk). The
-    # scaffold renders markdown/bash profile files, so escaping does not engage
-    # for the current template.md.j2 (byte-identical output). The selector
-    # strips a trailing .j2 before matching, so a future template.html.j2 /
-    # template.xml.j2 would be treated as HTML/XML and escaped (XSS-safe).
+    # unchanged (not Jinja2 syntax). select_autoescape must be called inline
+    # here — bandit B701 (ACAT) only recognizes autoescape=True or a literal
+    # select_autoescape(...) at the Environment() call site, not a reference
+    # to a custom selector function.
     env = Environment(
         loader=FileSystemLoader(str(template_dir)),
         keep_trailing_newline=True,
-        autoescape=_autoescape_for_template,
+        autoescape=select_autoescape(
+            enabled_extensions=_AUTOESCAPE_EXTENSIONS,
+            default_for_string=False,
+        ),
     )
     template = env.get_template("template.md.j2")
 

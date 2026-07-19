@@ -23,6 +23,7 @@ The service raises only NARROW exceptions (``ValueError`` / ``FileNotFoundError`
 
 from __future__ import annotations
 
+import ast
 import glob
 import hashlib
 import logging
@@ -30,23 +31,26 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union, cast
 
 import yaml
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import (
+    WORKFLOW_INPUT_TYPES,
     WORKFLOW_MAX_SPEC_BYTES,
     WORKFLOW_NAME_RE,
     WORKFLOW_SPEC_DIR,
 )
 from cli_agent_orchestrator.models.workflow import (
+    InputDecl,
     LintFinding,
     ScriptSpec,
     TierCollisionError,
     ValidationResult,
     WorkflowIndexRow,
     WorkflowSpec,
+    _default_matches_type,
 )
 from cli_agent_orchestrator.models.workflow import validate_only as _model_validate_only
 from cli_agent_orchestrator.services.script_lint import lint_script
@@ -156,6 +160,92 @@ def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> s
 
 
 # ---------------------------------------------------------------------------
+# Colocated resolve-contain-AND-access helpers (CodeQL py/path-injection)
+# ---------------------------------------------------------------------------
+# ``_safe_spec_path`` above resolves+contains a path and then RETURNS it. That
+# is a genuine traversal defence, but CodeQL's ``py/path-injection`` barrier for
+# ``str.startswith`` is *flow-sensitive and function-local*: the "contained"
+# state a guard establishes inside ``_safe_spec_path`` is NOT carried across the
+# ``return`` to the caller, so an ``open()``/``os.path.isfile()`` sink in the
+# CALLER still sees a normalized-but-unchecked path and is (correctly, from the
+# query's point of view) flagged — alerts 166/167/168.
+#
+# The fix is to colocate the containment SafeAccessCheck with the filesystem
+# sink in the SAME function, so the guard dominates the sink and the query's
+# barrier applies. These helpers own every taint-reachable ``open``/``isfile``
+# on a user-supplied spec path; callers receive the *result* (bytes / a bool-ish
+# path), never a bare path they must re-open. The guard uses the single positive
+# ``startswith(base + os.sep)`` idiom from CodeQL's own "GOOD" example (the
+# trailing separator also closes the ``/base`` vs ``/base-evil`` prefix hole).
+
+
+def _resolve_contained_spec_path(path: Union[str, Path], safe_base: str) -> str:
+    """Canonicalize ``path`` and return it ONLY if it resolves under ``safe_base``.
+
+    Pure path math (no filesystem access): mirrors ``_safe_spec_path``'s
+    resolution so the two ``open``/``isfile`` helpers below share identical
+    semantics. The containment guard itself is intentionally NOT here — it is
+    re-asserted inline next to each sink so CodeQL's function-local barrier
+    covers the sink.
+    """
+    if not path or (isinstance(path, str) and not path.strip()):
+        raise ValueError("workflow spec path is required")
+    user_path = os.fspath(path)
+    candidate = user_path if os.path.isabs(user_path) else os.path.join(safe_base, user_path)
+    return os.path.realpath(os.path.abspath(candidate))
+
+
+def _read_contained_spec_bytes(
+    path: Union[str, Path], base_dir: Optional[str] = None
+) -> tuple[str, bytes]:
+    """Resolve + contain + READ a spec file, guard colocated with the sinks.
+
+    Returns ``(real_path, raw)`` where ``raw`` is capped at
+    ``WORKFLOW_MAX_SPEC_BYTES + 1`` bytes (callers own the over-cap message and
+    the decode). The ``os.path.isfile`` and ``open`` sinks live HERE, right
+    after the ``startswith`` containment SafeAccessCheck, so the check dominates
+    them within one function (unlike a returned path, whose checked state CodeQL
+    drops at the call boundary — the cause of alerts 166/167).
+
+    Raises:
+        ValueError: the base directory is blocked or the resolved path escapes it.
+        FileNotFoundError: the resolved path is not an existing regular file.
+    """
+    safe_base = _safe_dir(base_dir)
+    real_path = _resolve_contained_spec_path(path, safe_base)
+    # SafeAccessCheck — single positive containment guard, colocated with the
+    # open() sink below (a spec FILE is always strictly UNDER its base dir).
+    if not real_path.startswith(safe_base + os.sep):
+        raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
+    if not os.path.isfile(real_path):
+        raise FileNotFoundError(f"workflow spec not found: {path}")
+    with open(real_path, "rb") as fh:
+        return real_path, fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
+
+
+def _contained_spec_file(path: Union[str, Path], base_dir: Optional[str] = None) -> Optional[str]:
+    """Resolve + contain a candidate path; return its realpath IFF it is a file.
+
+    Used by ``get_workflow`` to decide "path vs bare name" without leaking an
+    unchecked path to the ``os.path.isfile`` sink (alert 168). The containment
+    guard is colocated with the ``isfile`` sink; an escaping path is a
+    ``ValueError`` (matching the previous ``_safe_spec_path`` behavior), an
+    in-base non-file returns ``None`` (caller falls through to the index lookup).
+    """
+    safe_base = _safe_dir(base_dir)
+    real_path = _resolve_contained_spec_path(path, safe_base)
+    # SafeAccessCheck — single positive containment guard, colocated with the
+    # isfile sink below. Must match the ``_read_contained_spec_bytes`` form: a
+    # COMPOUND ``!= base and not startswith`` guard leaves the ``real_path ==
+    # base`` branch reaching the sink un-guarded, which CodeQL (correctly) will
+    # not treat as a barrier. A candidate that resolves exactly to the base dir
+    # is not a spec file, so rejecting it here is the right behavior anyway.
+    if not real_path.startswith(safe_base + os.sep):
+        raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
+    return real_path if os.path.isfile(real_path) else None
+
+
+# ---------------------------------------------------------------------------
 # Read path
 # ---------------------------------------------------------------------------
 def load_and_validate(path: str, base_dir: Optional[str] = None) -> WorkflowSpec:
@@ -178,19 +268,11 @@ def load_and_validate(path: str, base_dir: Optional[str] = None) -> WorkflowSpec
         ValueError: the directory is blocked, the file is unreadable, or the
             spec fails grammar validation.
     """
-    # Canonicalize + bind the file to its configured base directory (rejects a
-    # blocked base or a path that escapes it) before any stat/open.
-    real_path = _safe_spec_path(path, base_dir)
-
-    if not os.path.isfile(real_path):
-        raise FileNotFoundError(f"workflow spec not found: {path}")
-
-    # Single read: byte-cap, decode, then reuse the text for BOTH validation and
-    # construction so they see byte-identical content (closes the TOCTOU window).
-    # The read itself is capped at MAX+1 bytes — an oversized file is rejected
-    # without ever being fully read into memory.
-    with open(real_path, "rb") as fh:
-        raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
+    # Resolve + contain + read behind ONE guarded helper: the containment
+    # SafeAccessCheck is colocated with the open() sink inside the helper, so no
+    # unchecked path reaches a filesystem op here (clears alert 166). The file is
+    # read EXACTLY ONCE; the capped bytes feed BOTH validation and construction.
+    _real_path, raw = _read_contained_spec_bytes(path, base_dir)
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
         raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)")
     try:
@@ -224,14 +306,16 @@ def validate_only(path: str, base_dir: Optional[str] = None) -> ValidationResult
     Raises:
         ValueError: the base directory is blocked or the path escapes it.
     """
-    real_path = _safe_spec_path(path, base_dir)
+    # Resolve + contain + read behind the guarded helper (open sink colocated
+    # with the containment check — clears alert 167). An escaping/blocked path is
+    # a ValueError (-> 400); a missing/unreadable file degrades to a ``fail``
+    # result so the surface still NEVER raises for a well-formed-but-absent spec.
     try:
-        with open(real_path, "rb") as fh:
-            # Capped read: an oversized file is rejected without ever being
-            # fully read into memory.
-            raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
+        _real_path, raw = _read_contained_spec_bytes(path, base_dir)
     except OSError as exc:
-        logger.debug("validate_only: could not read spec %s: %s", real_path, exc)
+        # FileNotFoundError (missing spec) and any other read error degrade to a
+        # ``fail`` result — validate_only NEVER raises for an absent spec.
+        logger.debug("validate_only: could not read spec %s: %s", path, exc)
         return ValidationResult(status="fail", errors=[f"could not read spec: {exc}"])
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
         return ValidationResult(
@@ -444,6 +528,98 @@ def _check_tier_collision(stem: str, safe_dir: str) -> None:
         raise TierCollisionError(stem)
 
 
+def _extract_inputs(source: str) -> Dict[str, InputDecl]:
+    """AST-parse a script's module-level ``INPUTS`` declaration (Unit A, FR-A1).
+
+    Finds the FIRST module-level assignment to the name ``INPUTS`` and builds the
+    typed ``InputDecl`` map the run-path validator (``_validate_inputs``) consumes.
+    NEVER executes or imports the module — this is a pure ``ast`` walk (M2, the
+    no-execution + HTTP-only guarantee), so a script with import-time side effects
+    is parsed, not run.
+
+    Rules (BR-A1/BR-A2):
+    - Unparseable source (``SyntaxError``) -> ``ValueError`` (mapped to 400 at the
+      run route; caught by ``rebuild_index_from_files``). ``SyntaxError`` is NOT a
+      ``ValueError`` subclass, so it is re-raised as one explicitly.
+    - No module-level ``INPUTS`` -> ``{}`` (INPUTS is OPTIONAL).
+    - ``INPUTS`` must be a dict literal; each key a string; each value a dict
+      literal with keys ``⊆ {type, required, default}``; ``type`` one of
+      ``WORKFLOW_INPUT_TYPES``; a default whose type disagrees with ``type`` is a
+      ``ValueError`` (reuses the shared author-time ``_default_matches_type``).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        # SyntaxError is not a ValueError subclass; map it so the run-route
+        # boundary (ValueError -> 400) and rebuild's ``except ValueError`` catch it.
+        raise ValueError(f"malformed workflow script: {e}") from e
+
+    inputs_node: Optional[ast.expr] = None
+    for stmt in tree.body:  # module-level statements only (no nested scopes)
+        if isinstance(stmt, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == "INPUTS" for t in stmt.targets):
+                inputs_node = stmt.value
+                break
+        elif isinstance(stmt, ast.AnnAssign):
+            target = stmt.target
+            if isinstance(target, ast.Name) and target.id == "INPUTS" and stmt.value is not None:
+                inputs_node = stmt.value
+                break
+
+    if inputs_node is None:
+        return {}  # INPUTS is optional (BR-A1)
+
+    if not isinstance(inputs_node, ast.Dict):
+        raise ValueError("INPUTS must be a dict literal")
+
+    result: Dict[str, InputDecl] = {}
+    for key_node, value_node in zip(inputs_node.keys, inputs_node.values):
+        if key_node is None:  # ``{**spread}`` has a None key — not a literal entry
+            raise ValueError("INPUTS must be a dict literal (no ** unpacking)")
+        try:
+            key = ast.literal_eval(key_node)
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(f"INPUTS key is not a literal: {e}") from e
+        if not isinstance(key, str):
+            raise ValueError(f"INPUTS key {key!r} must be a string")
+        if not isinstance(value_node, ast.Dict):
+            raise ValueError(f"INPUTS['{key}'] must be a dict literal")
+
+        fields: Dict[str, object] = {}
+        for fk_node, fv_node in zip(value_node.keys, value_node.values):
+            if fk_node is None:
+                raise ValueError(f"INPUTS['{key}'] must be a dict literal (no ** unpacking)")
+            try:
+                fk = ast.literal_eval(fk_node)
+            except (ValueError, SyntaxError) as e:
+                raise ValueError(f"INPUTS['{key}'] has a non-literal key: {e}") from e
+            if fk not in ("type", "required", "default"):
+                raise ValueError(
+                    f"INPUTS['{key}'] has unexpected key '{fk}' "
+                    "(allowed: type, required, default)"
+                )
+            try:
+                fields[fk] = ast.literal_eval(fv_node)
+            except (ValueError, SyntaxError) as e:
+                raise ValueError(f"INPUTS['{key}']['{fk}'] is not a literal: {e}") from e
+
+        declared_type = fields.get("type")
+        if declared_type not in WORKFLOW_INPUT_TYPES:
+            raise ValueError(
+                f"INPUTS['{key}'] type {declared_type!r} is invalid "
+                f"(allowed: {', '.join(WORKFLOW_INPUT_TYPES)})"
+            )
+        default = cast(Union[str, int, bool, None], fields.get("default"))
+        if default is not None and not _default_matches_type(default, str(declared_type)):
+            raise ValueError(
+                f"INPUTS['{key}'] default {default!r} does not match declared "
+                f"type '{declared_type}'"
+            )
+        result[key] = InputDecl(**fields)  # type: ignore[arg-type]
+
+    return result
+
+
 def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> ScriptSpec:
     """Read + lint a ``.py`` spec file into a ``ScriptSpec`` (A1, E1).
 
@@ -460,9 +636,12 @@ def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> S
     ``list``/``get`` rendering (BR-6); it is a SEPARATE call from U4's
     run-path defensive re-check.
     """
-    real_path = _safe_spec_path(path, base_dir)
-    with open(real_path, "rb") as fh:
-        raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
+    # Read behind the guarded helper: the containment SafeAccessCheck is
+    # colocated with the open() sink inside ``_read_contained_spec_bytes`` (never
+    # trust the caller to have validated ``path`` — the bare-name arm hands back
+    # a raw string read out of SQLite). This is the ONLY entry that opens a
+    # ``.py`` spec file.
+    real_path, raw = _read_contained_spec_bytes(path, base_dir)
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
         raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (short-circuited read)")
     display_path = real_path
@@ -472,12 +651,29 @@ def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> S
         raise ValueError(f"spec is not valid UTF-8: {e}") from e
     content_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
     result = lint_script(source, display_path)
+    # Unit A: extract the typed INPUTS declaration (AST-only, never executed).
+    # A malformed INPUTS raises ValueError, propagating exactly as a bad YAML
+    # spec does (-> 400 at the run route / skipped in rebuild).
+    #
+    # LOAD-PATH graceful degradation: if the lint pass already recorded a
+    # ``syntax`` finding, the source has no parseable AST — there is nothing for
+    # ``_extract_inputs`` to walk, and re-raising here would abort the load and
+    # DROP that informational finding (BR-6). So we SKIP extraction and let the
+    # syntax finding stand (spec.inputs = {}). A syntactically VALID script with
+    # a bad INPUTS literal has no syntax finding, so ``_extract_inputs`` still
+    # runs and still raises ValueError — the real author error the load path
+    # must surface. The run path stays fail-closed via ``_validate_inputs``.
+    if any(f.rule_id == "syntax" for f in result.findings):
+        inputs: Dict[str, InputDecl] = {}
+    else:
+        inputs = _extract_inputs(source)
     return ScriptSpec(
         name=stem,
         path=display_path,
         source=source,
         content_hash=content_hash,
         findings=result.findings,
+        inputs=inputs,
     )
 
 
@@ -497,10 +693,13 @@ def get_workflow(
     """
     # A path-like argument is canonicalized + bound to its configured base
     # directory BEFORE the stat (never stat raw user input); a bare name falls
-    # through to the index lookup. A blocked/escaping path raises ValueError.
+    # through to the index lookup. ``_contained_spec_file`` colocates the
+    # containment guard with its ``os.path.isfile`` sink (clears alert 168) and
+    # returns the contained realpath only when it names an existing file; a
+    # blocked/escaping path raises ValueError.
     if os.sep in name_or_path or (os.altsep and os.altsep in name_or_path):
-        safe_path = _safe_spec_path(name_or_path, scan_dir)
-        if os.path.isfile(safe_path):
+        safe_path = _contained_spec_file(name_or_path, scan_dir)
+        if safe_path is not None:
             return _load_by_extension(safe_path, scan_dir)
     # The resolved source_path lives under scan_dir (the index was rebuilt from
     # it), so bind containment to that same dir on load.

@@ -50,6 +50,52 @@ def memory():
     """Manage CAO memories."""
 
 
+@memory.command(name="repair")
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    default=False,
+    help="Apply metadata and index repairs. The default is a pure-read dry-run.",
+)
+def repair_cmd(do_apply):
+    """Reconcile surviving canonical topics into SQLite and index.md."""
+    from cli_agent_orchestrator.services.memory_reconciliation import (
+        MemoryReconciliationError,
+        MemoryReconciliationService,
+    )
+
+    service = MemoryReconciliationService()
+
+    def render_report(report):
+        click.echo(report.summary_text())
+        for record in report.records:
+            identity = record.identity
+            label = (
+                f"{identity.scope}:{identity.scope_id or '-'}:{identity.key}"
+                if identity is not None
+                else record.file_path
+            )
+            actions = ",".join(action.value for action in record.actions)
+            detail = f": {record.finding.message}" if record.finding is not None else ""
+            click.echo(f"{record.status} {label} [{actions}]{detail}")
+
+    try:
+        report = service.reconcile(apply=do_apply)
+    except MemoryReconciliationError as exc:
+        report = exc.report
+        render_report(report)
+        raise click.ClickException(str(exc))
+    except Exception as exc:
+        raise click.ClickException(
+            f"memory repair failed: {type(exc).__name__}; run `cao memory repair --apply`"
+        ) from exc
+
+    render_report(report)
+    if report.has_unresolved:
+        raise click.exceptions.Exit(1)
+
+
 @memory.command(name="list")
 @click.option(
     "--scope",

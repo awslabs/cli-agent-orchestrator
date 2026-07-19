@@ -223,6 +223,36 @@ def test_bump_non_integer_anchors_to_two():
 
 
 # ---------------------------------------------------------------------------
+# Unit A — _build_env delivers CAO_WORKFLOW_INPUTS (FR-A3, BR-A5)
+# ---------------------------------------------------------------------------
+def test_build_env_exact_six_keys_with_inputs():
+    env = script_runner._build_env("run-x", "1", {"topic": "birds", "count": 3})
+    assert set(env) == {
+        "CAO_WORKFLOW_RUN_ID",
+        "CAO_WORKFLOW_GENERATION",
+        "CAO_API_BASE_URL",
+        "CAO_WORKFLOW_INPUTS",
+        "PATH",
+        "HOME",
+    }
+    # Compact JSON, deterministic separators.
+    assert env["CAO_WORKFLOW_INPUTS"] == '{"topic":"birds","count":3}'
+
+
+def test_build_env_two_arg_call_defaults_empty_inputs():
+    """The legacy 2-arg call site still works; inputs default to ``{}``."""
+    env = script_runner._build_env("run-x", "1")
+    assert env["CAO_WORKFLOW_INPUTS"] == "{}"
+    assert "CAO_WORKFLOW_RESUME" not in env
+
+
+def test_build_env_resume_adds_flag_and_keeps_inputs():
+    env = script_runner._build_env("run-x", "4", {"a": 1}, resume=True)
+    assert env["CAO_WORKFLOW_RESUME"] == "1"
+    assert env["CAO_WORKFLOW_INPUTS"] == '{"a":1}'
+
+
+# ---------------------------------------------------------------------------
 # A1 — run_script_workflow lifecycle
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
@@ -267,12 +297,13 @@ async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.Mon
     # F3: the journaled started_at is the SAME timestamp as the record's, not a
     # second independent _now() call.
     assert row.started_at == result.started_at
-    # Constructed env is the exact 5-key allowlist (INV-2), no resume flag.
+    # Constructed env is the exact 6-key allowlist (INV-2 + BR-A5), no resume flag.
     env = captured["env"]
     assert set(env) == {
         "CAO_WORKFLOW_RUN_ID",
         "CAO_WORKFLOW_GENERATION",
         "CAO_API_BASE_URL",
+        "CAO_WORKFLOW_INPUTS",
         "PATH",
         "HOME",
     }
@@ -708,6 +739,58 @@ async def test_resume_happy_materializes_and_deletes_temp(monkeypatch: pytest.Mo
     exec_path = captured["args"][1]
     assert exec_path.endswith("resume-run-resume.py")
     assert not Path(exec_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_resume_reads_inputs_json_and_delivers_verbatim(monkeypatch: pytest.MonkeyPatch):
+    """FR-A6/REL-A1: resume reads the journaled inputs_json and delivers it to
+    _build_env VERBATIM (byte-identical replay), with NO re-validation."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    # The journaled RESOLVED map from the original run.
+    journaled = {"topic": "birds", "count": 3}
+    workflow_journal.insert_run(
+        run_id="run-inputs",
+        workflow_name="wf",
+        spec_snapshot=json.dumps({"source": "print('x')\n", "path": "/tmp/wf.py"}),
+        inputs_json=json.dumps(journaled),
+        state="failed",
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+        generation="1",
+    )
+    proc = _FakeProcess(exit_rc=0, stdout=b"CAO_WORKFLOW_OUTPUT:null\n")
+    captured = _install_fake_spawn(monkeypatch, proc)
+
+    result = await resume_script_run("run-inputs")
+    assert result.state == RunState.COMPLETED
+    # The re-delivered CAO_WORKFLOW_INPUTS is the SAME bytes _build_env would emit
+    # for the journaled map — deterministic replay (compact json.dumps).
+    env = captured["env"]
+    assert env["CAO_WORKFLOW_INPUTS"] == json.dumps(journaled, separators=(",", ":"))
+    assert env["CAO_WORKFLOW_RESUME"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_resume_malformed_inputs_json_degrades_to_empty(monkeypatch: pytest.MonkeyPatch):
+    """A corrupt inputs_json degrades to {} on resume (delivers what it can),
+    never aborting the resume — the snapshot source is still valid."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    workflow_journal.insert_run(
+        run_id="run-badinputs",
+        workflow_name="wf",
+        spec_snapshot=json.dumps({"source": "print('x')\n", "path": "/tmp/wf.py"}),
+        inputs_json="[not, a, dict]",  # non-object -> degrade to {}
+        state="failed",
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+        generation="1",
+    )
+    proc = _FakeProcess(exit_rc=0, stdout=b"CAO_WORKFLOW_OUTPUT:null\n")
+    captured = _install_fake_spawn(monkeypatch, proc)
+
+    result = await resume_script_run("run-badinputs")
+    assert result.state == RunState.COMPLETED
+    assert captured["env"]["CAO_WORKFLOW_INPUTS"] == "{}"
 
 
 # ---------------------------------------------------------------------------

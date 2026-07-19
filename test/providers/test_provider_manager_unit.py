@@ -266,3 +266,21 @@ def test_get_provider_no_shell_baseline_when_metadata_missing_shell_command():
         provider = manager.get_provider("t1")
 
     assert provider.shell_baseline is None
+
+
+def test_create_provider_mock_cli_stores_mapping():
+    """The credentials-free mock_cli provider branch (test/CI infra) is wired
+    through create_provider and stored in the terminal->provider mapping."""
+    from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.MOCK_CLI.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+    )
+
+    assert isinstance(provider, MockCliProvider)
+    assert manager.get_provider("t1") is provider

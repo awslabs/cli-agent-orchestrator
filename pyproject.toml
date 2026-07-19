@@ -49,6 +49,21 @@ dependencies = [
     # Obsidian graph sink (Issue #348) imports yaml at module top; declare it
     # directly instead of relying on a transitive dep so the import can't break.
     "pyyaml>=6.0",
+    # `cao update` reads uv's install receipt (TOML). tomllib is stdlib on 3.11+;
+    # on 3.10 the fallback `import tomli` runs. cli/main.py imports the update
+    # command unconditionally, so tomli must be a RUNTIME dependency on 3.10 —
+    # not just a dev dependency — or every `cao` command would fail to import.
+    "tomli>=2.0.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+# Opt-in OpenTelemetry GenAI telemetry (telemetry/). The base install stays
+# lean: telemetry/otel.py no-ops when the SDK is absent, matching the
+# default-off posture of the feature itself.
+otel = [
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
 ]
 
 [project.scripts]
@@ -101,6 +116,9 @@ dev = [
     "hypothesis>=6.0",
     "networkx>=3.0",
     "tomli>=2.0.0; python_version < '3.11'",
+    # JWT/JWKS test fixtures (test/fixtures/jwt_factory.py) mint RS256 tokens
+    # with authlib; runtime verification needs only pyjwt[crypto].
+    "authlib>=1.7.1",
 ]
 
 [tool.black]

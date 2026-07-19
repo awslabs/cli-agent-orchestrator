@@ -140,6 +140,13 @@ class TestValidateTmuxName:
 class TestWaitForShell:
     """Tests for wait_for_shell function."""
 
+    @pytest.fixture(autouse=True)
+    def _use_pipe_pane_backend(self):
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        with patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend):
+            yield
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
     async def test_wait_for_shell_success(self, mock_monitor):

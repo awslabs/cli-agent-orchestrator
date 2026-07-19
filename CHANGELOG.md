@@ -12,9 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - self-healing pipe-pane liveness watchdog for silently-stalled FIFO forwarding (fixes #388) (#397), including detection of a stall that settles into a new static frame before the next poll and of a pipe that never delivers a single byte from terminal creation (cold start, harness-control#93) — see `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` / `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` in `docs/configuration.md`
 - web: attach web terminals through the configured backend so herdr-backed terminals no longer fail to attach (#417)
 - honor profile frontmatter `provider:` during install (flag > frontmatter > default) (#414)
-
+- handoff workers now inherit the supervisor's working directory server-side in run_agent_step (#423)
 ### Security
 
+- clear three `py/path-injection` CodeQL alerts (code-scanning alerts #166/#167/#168) in `workflow_spec_service` by colocating the path-containment `SafeAccessCheck` with each filesystem sink. `_safe_spec_path` resolved + contained a spec path and then *returned* it, but CodeQL's `str.startswith` barrier is flow-sensitive and function-local, so the "contained" state was dropped at the call boundary and the caller's `open()` / `os.path.isfile()` sink still saw an unchecked path. The read/probe now happen inside guarded helpers (`_read_contained_spec_bytes`, `_contained_spec_file`) where a single positive `startswith(base + os.sep)` guard dominates the sink. Containment semantics are unchanged (a spec whose realpath escapes its validated base still raises `ValueError`); the byte-cap, single-read TOCTOU guarantee, and never-raise `validate_only` contract are all preserved
 - clear the `py/clear-text-storage-sensitive-data` CodeQL false positive (code-scanning alert #142) by renaming the local `secret` fixture variable in two `memory_service` secret-gate tests to `gated_content`. CodeQL's name-based heuristic classified the variable named `secret` as a sensitive-data source and traced it into the memory-wiki write (an intentionally plaintext, by-design markdown sink). The literal is the canonical AWS documentation example key, not a real credential; the value and all assertions are unchanged, so the federated secret-gate rejection and global-scope allow paths are still exercised exactly. No production behavior change
 
 ## [2.3.0] - 2026-07-12
@@ -27,6 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add script-tier workflows: a `.py` workflow spec is now runnable via `cao workflow run` (and the `workflow_run`/`workflow_cancel` MCP tools), with the same `resume`/`cancel`/`status` support as YAML workflows — tier is detected automatically from the file extension (#312)
 - add optional `skills` field to `AgentProfile` to scope the per-agent skill catalog via an fnmatch allowlist; runtime-prompt providers only, `load_skill` resolution unchanged (#351)
+
+- **AG-UI typed-event stream** — new `/agui/v1/stream` Server-Sent Events endpoint that maps CAO's normalized fleet events to [AG-UI](https://github.com/ag-ui-protocol/ag-ui) typed events (`RUN_*`, `STEP_*`, `TEXT_MESSAGE_CONTENT`, `TOOL_CALL_START`, `STATE_SNAPSHOT`, `STATE_DELTA`, `GENERATIVE_UI`, `RUN_ERROR`), so any AG-UI-compatible client renders CAO with no custom adapter. Default-off via `CAO_AGUI_ENABLED`; supports `?since=` history replay and, when auth is enabled, a `?access_token=` query-parameter JWT for browser `EventSource` clients. Message bodies are never carried (metadata-only by construction).
+
+- **Generative UI** — agents author allow-listed UI components (approval cards, choice prompts, diff summaries, progress/metrics, agent cards) via the `emit_ui` MCP tool / `POST /agui/v1/emit_ui`. Intents are validated **server-side** against a frozen allow-list (no arbitrary markup) and rendered uniformly across heterogeneous providers. See [docs/agui.md](docs/agui.md#generative-ui).
+
+- **OpenTelemetry GenAI instrumentation** — opt-in, shipped as the `[otel]` optional extra (`pip install cli-agent-orchestrator[otel]`); the base install degrades to no-ops. The inter-agent dispatch seam (`send_message` / `handoff` / `assign`) emits a GenAI `execute_tool` span and a `cao.orchestration.dispatches` counter over OTLP, and propagates W3C trace context (`traceparent`) into plugin events. GenAI `invoke_agent` / `chat` span helpers ship for instrumenting agent- and model-level calls. See [docs/otel-deployment.md](docs/otel-deployment.md).
+
+- **Native multi-agent workflow spec** — a trusted-author YAML workflow grammar with authoring/validation endpoints, a run-engine seam, and `workflow_run` / `workflow_return` / `workflow_cancel` MCP tools (#312).
+
+- **`mock_cli` provider** — a credentials-free mock agent for deterministic CI of orchestration logic without real CLI binaries or secrets. See [docs/mock-cli-provider.md](docs/mock-cli-provider.md).
+
+- add Antigravity CLI (`agy`) provider — Google's terminal-native coding agent and the successor to the Gemini CLI after the free "Login with Google" path was retired (#323)
+
 - add herdr terminal backend with event-driven inbox delivery (#271)
 
 - bundle built-in memory plugins for Claude Code, Kiro, and Codex (#269)

@@ -212,21 +212,36 @@ def _scan_sentinel(stdout_text: str) -> Tuple[Optional[Any], List[str]]:
 # ---------------------------------------------------------------------------
 # Env construction (INV-2) — constructed allowlist, nothing inherited-and-extended
 # ---------------------------------------------------------------------------
-def _build_env(run_id: str, generation: str, *, resume: bool = False) -> Dict[str, str]:
-    """Build the exact 5-key constructed spawn env (INV-2, NFR-SEC-2, BR-26).
+def _build_env(
+    run_id: str,
+    generation: str,
+    inputs: Optional[Dict[str, Any]] = None,
+    *,
+    resume: bool = False,
+) -> Dict[str, str]:
+    """Build the exact 6-key constructed spawn env (INV-2, NFR-SEC-2, BR-26, BR-A5).
 
     The spawn env is CONSTRUCTED, never ``os.environ`` inherited-and-extended:
     exactly ``{CAO_WORKFLOW_RUN_ID, CAO_WORKFLOW_GENERATION, CAO_API_BASE_URL,
-    PATH, HOME}`` (+ ``CAO_WORKFLOW_RESUME=1`` on resume). No secret in the API
-    process environment can leak into the child. ``PATH``/``HOME`` are the OS
-    floor a Python subprocess needs to exec + resolve its interpreter/home; they
-    are deliberately NOT in U2's forwarded allowlist (a script that tries to
-    forward them on a run-step call is 422'd — the two-clause fence, B1).
+    CAO_WORKFLOW_INPUTS, PATH, HOME}`` (+ ``CAO_WORKFLOW_RESUME=1`` on resume). No
+    secret in the API process environment can leak into the child. ``PATH``/
+    ``HOME`` are the OS floor a Python subprocess needs to exec + resolve its
+    interpreter/home; they are deliberately NOT in U2's forwarded allowlist (a
+    script that tries to forward them on a run-step call is 422'd — the two-clause
+    fence, B1).
+
+    Unit A (FR-A3, ADR-2): ``CAO_WORKFLOW_INPUTS`` carries the compact-JSON
+    RESOLVED inputs map (defaults filled, types checked at the route). ``inputs``
+    defaults to ``{}`` so the two-arg legacy call site (no inputs) still yields
+    ``"{}"``. NO cap check here — the 32KiB cap is enforced at the run route
+    BEFORE any journal write (ADR-5), not on this delivery seam.
     """
+    inputs = inputs or {}
     env = {
         "CAO_WORKFLOW_RUN_ID": run_id,
         "CAO_WORKFLOW_GENERATION": generation,
         "CAO_API_BASE_URL": API_BASE_URL,
+        "CAO_WORKFLOW_INPUTS": json.dumps(inputs, separators=(",", ":")),
         "PATH": os.environ.get("PATH", ""),
         "HOME": os.environ.get("HOME", ""),
     }
@@ -836,7 +851,9 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     # concurrent resume sees this run as executing (b4c1 liveness truth, mirrors
     # base start_run at workflow_service.py:755). The ``finally`` clears it on
     # EVERY exit path (complete, fail, timeout) so a settled run stays resumable.
-    env = _build_env(run_id, "1", resume=False)
+    # Deliver the RESOLVED inputs (already validated + capped at the route, and
+    # journaled above as json.dumps(inputs)) to the child via CAO_WORKFLOW_INPUTS.
+    env = _build_env(run_id, "1", inputs, resume=False)
     _active_drives.add(run_id)
     try:
         return await _drive_process(record, spec.path, env)
@@ -912,6 +929,24 @@ async def resume_script_run(run_id: str) -> WorkflowRunResult:
         except (ValueError, TypeError, KeyError) as e:
             raise ResumeCorruptError(f"run '{run_id}' snapshot is corrupt: {e}") from e
 
+        # Unit A (FR-A6, ADR-3, REL-A1): re-deliver the RESOLVED inputs journaled
+        # at the original run VERBATIM — read row.inputs_json and hand it to
+        # _build_env unchanged. NO re-validation against the (possibly edited)
+        # INPUTS declaration; the frozen-contract-per-run is what makes resume a
+        # deterministic replay (BR-A7). A corrupt/non-object inputs_json degrades
+        # to {} rather than aborting the resume (resume delivers what it can).
+        journaled_inputs: Dict[str, Any] = {}
+        try:
+            parsed_inputs = json.loads(row.inputs_json)
+            if isinstance(parsed_inputs, dict):
+                journaled_inputs = parsed_inputs
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                "resume: run '%s' inputs_json unparseable; delivering empty inputs: %s",
+                run_id,
+                e,
+            )
+
         # Script-tier record reconstruction (CONTRADICTION #3): minimal, from RunRow.
         # Does NOT reuse the YAML _rebuild_record_from_journal (which YAML-validates
         # spec_snapshot and would degrade a ScriptSpec snapshot to corrupt).
@@ -946,7 +981,7 @@ async def resume_script_run(run_id: str) -> WorkflowRunResult:
         ) as e:  # noqa: BLE001 — journal reopen write is best-effort; live floor serves (INV-4)
             logger.warning("journal: resume reopen state write for '%s' failed: %s", run_id, e)
 
-        env = _build_env(run_id, record.generation, resume=True)
+        env = _build_env(run_id, record.generation, journaled_inputs, resume=True)
         snapshot_path = _materialize_snapshot(run_id, source)
         return await _drive_process(record, snapshot_path, env)
     finally:
