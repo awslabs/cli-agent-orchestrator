@@ -76,8 +76,14 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
 TUI_PROGRESS_PATTERN = r"•.*\(\d+s\s*•\s*esc to interrupt\)"
 
-# Workspace trust/approval prompt shown when Codex opens a new directory
+# Workspace trust/approval prompt shown when Codex opens a new directory.
+# Two known variants:
+#   v0.98+: "allow Codex to work in this folder"
+#   v0.130+ (git worktree): "Do you trust the contents of this directory?"
+# Both indicate the TUI is blocked waiting for user input.
 TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
+TRUST_PROMPT_PATTERN_V2 = r"Do you trust the contents of this directory\?"
+TRUST_PROMPT_FOOTER = r"Press enter to continue"
 # Codex welcome banner indicating normal startup (no trust prompt)
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 
@@ -373,6 +379,10 @@ class CodexProvider(BaseProvider):
         This sends Enter to accept the default option (allow Codex to work).
         CAO assumes the user trusts the working directory since they confirmed
         workspace access during the launch command.
+
+        Two known dialog variants:
+          v0.98+: "allow Codex to work in this folder"
+          v0.130+ (git worktree): "Do you trust the contents of this directory?"
         """
         start_time = time.time()
         while time.time() - start_time < timeout:
@@ -387,7 +397,17 @@ class CodexProvider(BaseProvider):
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-                logger.info("Codex workspace trust prompt detected, auto-accepting")
+                logger.info("Codex workspace trust prompt (v1) detected, auto-accepting")
+                status_monitor.notify_input_sent(self.terminal_id)
+                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                return
+
+            if re.search(TRUST_PROMPT_PATTERN_V2, clean_output) and re.search(
+                TRUST_PROMPT_FOOTER, clean_output
+            ):
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                logger.info("Codex workspace trust prompt (v2) detected, auto-accepting")
                 status_monitor.notify_input_sent(self.terminal_id)
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
@@ -398,7 +418,19 @@ class CodexProvider(BaseProvider):
                 return
 
             await asyncio.sleep(1.0)
-        logger.warning("Codex trust prompt handler timed out")
+
+        pane_tail = ""
+        try:
+            output = get_backend().get_history(self.session_name, self.window_name)
+            if output:
+                pane_tail = "\n".join(output.splitlines()[-10:])
+        except Exception:
+            pass
+        logger.error(
+            "Codex trust prompt handler timed out — no trust dialog or welcome banner detected. "
+            "Pane tail:\n%s",
+            pane_tail,
+        )
 
     async def initialize(self) -> bool:
         """Initialize Codex provider by starting codex command."""
@@ -407,6 +439,12 @@ class CodexProvider(BaseProvider):
         init_timeout = get_server_settings()["provider_init_timeout"]
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
+
+        # Capture the shell process name before launching codex — used later to
+        # detect when codex has exited and the pane is back to a bare shell.
+        self.shell_baseline = get_backend().get_pane_current_command(
+            self.session_name, self.window_name
+        )
 
         # Send a warm-up command before launching codex.
         # Codex exits immediately in freshly-created tmux sessions where the shell
@@ -454,6 +492,18 @@ class CodexProvider(BaseProvider):
         if not output:
             return TerminalStatus.UNKNOWN
 
+        # Detect when the codex process has exited and the pane is back to a
+        # bare shell. The pane's current command will revert to the shell
+        # (e.g. "zsh") that was running before we launched codex. Returning
+        # ERROR prevents the inbox service from typing a queued message into
+        # the shell — which would execute it as arbitrary commands.
+        if self._initialized and self.shell_baseline:
+            current_cmd = get_backend().get_pane_current_command(
+                self.session_name, self.window_name
+            )
+            if current_cmd == self.shell_baseline:
+                return TerminalStatus.ERROR
+
         # Strip the RAW pipe-pane escapes (cursor positioning, in-place redraws),
         # not just SGR colour codes — otherwise cursor sequences survive and the
         # idle ``›`` prompt / structural checks below misfire on the raw stream.
@@ -491,6 +541,16 @@ class CodexProvider(BaseProvider):
         # Check trust prompt early — the trust menu uses › which matches the idle prompt
         # pattern, and PROCESSING_PATTERN matches "running" in "You are running Codex in..."
         if re.search(TRUST_PROMPT_PATTERN, clean_output):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # V2 trust dialog ("Do you trust the contents of this directory?" / "Press enter
+        # to continue"). Only classify as WAITING when BOTH the question AND the footer
+        # appear in the bottom region — avoids false positives if the question text
+        # appears in scrollback from a previous model response.
+        bottom_region = "\n".join(clean_output.splitlines()[-15:])
+        if re.search(TRUST_PROMPT_PATTERN_V2, bottom_region) and re.search(
+            TRUST_PROMPT_FOOTER, bottom_region
+        ):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Check bottom of captured output for idle prompt.

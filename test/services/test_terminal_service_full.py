@@ -1150,6 +1150,29 @@ class TestSendInput:
         )
         mock_update.assert_called_once_with("test1234")
 
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_blocks_delivery_into_error_terminal(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
+    ):
+        """Delivery into a terminal in ERROR state must be refused (dead-terminal guard)."""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "codex-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.blocks_orchestrated_input_while_waiting_user_answer = False
+        mock_status_monitor.get_status.return_value = TerminalStatus.ERROR
+
+        with pytest.raises(TerminalInputBlockedError, match="ERROR state"):
+            send_input("test1234", "hello worker")
+
+        mock_tmux.send_keys.assert_not_called()
+        mock_update.assert_not_called()
+
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_not_found(self, mock_get_metadata):
         """Test sending input to non-existent terminal."""

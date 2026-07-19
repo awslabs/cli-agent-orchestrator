@@ -722,18 +722,30 @@ def send_input(
             if isinstance(orchestration_type, OrchestrationType)
             else str(orchestration_type or "")
         )
-        if (
-            provider
-            and provider.blocks_orchestrated_input_while_waiting_user_answer is True
-            and orchestration_value
-            in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
-            and status_monitor.get_status(terminal_id) == TerminalStatus.WAITING_USER_ANSWER
-        ):
-            raise TerminalInputBlockedError(
-                f"Terminal {terminal_id} is waiting for a user answer. "
-                "Use answer_user_prompt to submit a selection or approval before "
-                f"sending {orchestration_value} input."
-            )
+
+        if provider:
+            current_status = status_monitor.get_status(terminal_id)
+
+            # Guard: refuse to type into a terminal whose provider process has
+            # exited. Without this check, queued messages would be pasted into
+            # a bare shell and executed as arbitrary commands.
+            if current_status == TerminalStatus.ERROR:
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} provider is in ERROR state "
+                    "(provider process may have exited). Refusing to deliver input."
+                )
+
+            if (
+                provider.blocks_orchestrated_input_while_waiting_user_answer is True
+                and orchestration_value
+                in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
+                and current_status == TerminalStatus.WAITING_USER_ANSWER
+            ):
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} is waiting for a user answer. "
+                    "Use answer_user_prompt to submit a selection or approval before "
+                    f"sending {orchestration_value} input."
+                )
 
         # Inject memory context into the very first user message after init.
         # Phase 1 wires injection inline for every provider. The Kiro
