@@ -979,6 +979,8 @@ class TestClaudeCodeProviderNativeStatus:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_mark_input_received_resets_detection_flags(self, mock_backend):
         """mark_input_received() sets _task_dispatched=True and resets detection flags."""
+        mock_backend.get_history.return_value = "❯ "
+
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._done_first_detected = 999.0
         provider._idle_first_detected = 999.0

@@ -106,6 +106,9 @@ class TestSharedNativeStatus:
     def test_native_idle_dispatched_flushes_then_completed(self, mock_backend, provider_cls, _flag):
         """herdr 'idle' after dispatch: PROCESSING within 10s flush, COMPLETED after."""
         mock_backend.get_native_status.return_value = TerminalStatus.IDLE
+        # claude_code's mark_input_received snapshots get_history() for the
+        # staleness guard (#407); stub it so the hash sees a string.
+        mock_backend.get_history.return_value = ""
         provider = _make(provider_cls)
         provider.mark_input_received()
 
@@ -119,6 +122,7 @@ class TestSharedNativeStatus:
     def test_native_done_dispatched_flushes_then_completed(self, mock_backend, provider_cls, _flag):
         """herdr 'done' after dispatch: PROCESSING within 10s flush, COMPLETED after."""
         mock_backend.get_native_status.return_value = TerminalStatus.COMPLETED
+        mock_backend.get_history.return_value = ""
         provider = _make(provider_cls)
         provider.mark_input_received()
 
@@ -175,8 +179,10 @@ class TestSharedNativeStatus:
         provider._last_dispatch_time = time.time() - 300.0  # would have been "stale" pre-fix
         assert provider.get_status("") == self._empty_output_default(provider_cls)
 
-    def test_mark_input_received_sets_dispatch_flags(self, provider_cls, _flag):
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_mark_input_received_sets_dispatch_flags(self, mock_backend, provider_cls, _flag):
         """mark_input_received() sets shared _task_dispatched AND the provider's own flag."""
+        mock_backend.get_history.return_value = ""
         provider = _make(provider_cls)
         assert provider._task_dispatched is False
         provider.mark_input_received()
