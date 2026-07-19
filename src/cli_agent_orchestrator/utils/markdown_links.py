@@ -30,9 +30,7 @@ _EXCLUDED_FILES = (
 )
 _PUNCTUATION_RE = re.compile(r"[^\w\-\s]", flags=re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s")
-_HTML_TAG_RE = re.compile(
-    r"<\s*(?P<tag>a|img)\b(?P<attributes>[^>]*)>", re.IGNORECASE | re.DOTALL
-)
+_HTML_TAG_RE = re.compile(r"<\s*(?P<tag>a|img)\b(?P<attributes>[^>]*)>", re.IGNORECASE | re.DOTALL)
 _HTML_ATTRIBUTE_RE = re.compile(
     r"""(?<![\w:-])(?P<name>href|src)\s*=\s*(?:"(?P<double>[^"]*)"|'(?P<single>[^']*)'|(?P<bare>[^\s"'=<>`]+))""",
     re.IGNORECASE,
@@ -96,10 +94,7 @@ def validate_markdown_links(
 
     root = repo_root.resolve()
     markdown_files = sorted(
-        (
-            path.resolve()
-            for path in (discover_markdown_files(root) if files is None else files)
-        ),
+        (path.resolve() for path in (discover_markdown_files(root) if files is None else files)),
         key=lambda path: path.relative_to(root).as_posix(),
     )
     parser = MarkdownIt("commonmark")
@@ -108,9 +103,7 @@ def validate_markdown_links(
 
     for source in markdown_files:
         for destination, line in _links(source, parser):
-            error = _validate_destination(
-                root, source, destination, line, headings, parser
-            )
+            error = _validate_destination(root, source, destination, line, headings, parser)
             if error is not None:
                 errors.append(error)
     return errors
@@ -150,11 +143,7 @@ def _links(path: Path, parser: MarkdownIt) -> Iterable[tuple[str, int]]:
                 continue
 
             attribute = (
-                "href"
-                if child.type == "link_open"
-                else "src"
-                if child.type == "image"
-                else None
+                "href" if child.type == "link_open" else "src" if child.type == "image" else None
             )
             if attribute is None:
                 continue
@@ -226,8 +215,7 @@ def _html_destinations(content: str, start_line: int) -> Iterable[tuple[str, int
             destination, offset = _html_attribute_value(attribute_match)
             yield (
                 unescape_html(destination),
-                start_line
-                + content.count("\n", 0, tag_match.start("attributes") + offset),
+                start_line + content.count("\n", 0, tag_match.start("attributes") + offset),
             )
 
 
@@ -321,9 +309,7 @@ def _validate_destination(
     resolved = candidate.resolve()
 
     if not resolved.is_relative_to(repo_root):
-        return MarkdownLinkError(
-            source, line, destination, "path escapes the repository"
-        )
+        return MarkdownLinkError(source, line, destination, "path escapes the repository")
     if not resolved.exists():
         return MarkdownLinkError(source, line, destination, "target does not exist")
     if resolved.is_dir():

@@ -38,10 +38,7 @@ def test_valid_paths_fragments_duplicate_headings_and_directory_indexes(
     )
     _write(tmp_path / "docs" / "README.md", "# Index\n")
 
-    assert (
-        validate_markdown_links(tmp_path, [source, tmp_path / "docs" / "guide file.md"])
-        == []
-    )
+    assert validate_markdown_links(tmp_path, [source, tmp_path / "docs" / "guide file.md"]) == []
 
 
 def test_reports_missing_target_and_heading_fragment(tmp_path: Path) -> None:
@@ -158,8 +155,10 @@ def test_reports_shortcut_reference_link_line_inside_multiline_paragraph(
 ) -> None:
     source = _write(
         tmp_path / "README.md",
-        "Paragraph start\n[ordinary bracket text]\n[missing]\n\n"
-        "[missing]: missing-link.md\n",
+        (
+            "Paragraph start\n[ordinary bracket text]\n[missing]\n\n"
+            + "[missing]: missing-link.md\n"
+        ),
     )
 
     errors = validate_markdown_links(tmp_path, [source])
@@ -174,8 +173,10 @@ def test_reports_shortcut_reference_image_line_inside_multiline_paragraph(
 ) -> None:
     source = _write(
         tmp_path / "README.md",
-        "Paragraph start\n![ordinary bracket text]\n![missing]\n\n"
-        "[missing]: missing-image.png\n",
+        (
+            "Paragraph start\n![ordinary bracket text]\n![missing]\n\n"
+            + "[missing]: missing-image.png\n"
+        ),
     )
 
     errors = validate_markdown_links(tmp_path, [source])
@@ -234,9 +235,7 @@ def test_discovers_tracked_markdown_and_excludes_vendored_and_fixture_trees(
     )
     _write(tmp_path / "test" / "fixtures" / "README.md", "# Fixture\n")
     _write(tmp_path / "test" / "providers" / "fixtures" / "README.md", "# Fixture\n")
-    _write(
-        tmp_path / "examples" / "codex-basic" / "codex_documenter.md", "# Template\n"
-    )
+    _write(tmp_path / "examples" / "codex-basic" / "codex_documenter.md", "# Template\n")
     monkeypatch.setattr(
         "cli_agent_orchestrator.utils.markdown_links.subprocess.run",
         lambda *args, **kwargs: type(
