@@ -478,3 +478,85 @@ class TestRenderMissingTemplates:
         assert "MyDLQ" in result
         assert "grp" in result
         assert "{{" not in result
+
+
+class TestFindCmd:
+    """CLI surface for profile discovery (cao profile find). Ref #340."""
+
+    _SAMPLE = [
+        {
+            "name": "sqs-dlq-check",
+            "description": "Checks SQS dead-letter queues for stuck messages",
+            "tags": ["sqs", "monitoring"],
+            "capabilities": ["inspect sqs queues"],
+            "role": "developer",
+            "source": "local",
+        },
+        {
+            "name": "cloudwatch-logs",
+            "description": "Searches CloudWatch logs for error patterns",
+            "tags": ["cloudwatch", "monitoring"],
+            "capabilities": [],
+            "role": "developer",
+            "source": "local",
+        },
+    ]
+
+    def _invoke(self, runner, args):
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",
+            return_value=self._SAMPLE,
+        ):
+            return runner.invoke(profile, args)
+
+    def test_find_table_output(self, runner):
+        result = self._invoke(runner, ["find", "sqs"])
+        assert result.exit_code == 0
+        assert "sqs-dlq-check" in result.output
+        assert "SCORE" in result.output
+
+    def test_find_json_output(self, runner):
+        result = self._invoke(runner, ["find", "sqs", "--json"])
+        assert result.exit_code == 0
+        assert json.loads(result.output)[0]["name"] == "sqs-dlq-check"
+
+    def test_find_no_match_message(self, runner):
+        result = self._invoke(runner, ["find", "kubernetes"])
+        assert result.exit_code == 0
+        assert "No profiles matched" in result.output
+
+    def test_find_limit_option(self, runner):
+        result = self._invoke(runner, ["find", "monitoring", "--limit", "1", "--json"])
+        assert result.exit_code == 0
+        assert len(json.loads(result.output)) == 1
+
+    def test_find_backend_error_is_clean_click_error(self, runner):
+        with patch(
+            "cli_agent_orchestrator.services.profile_search.search_profiles",
+            side_effect=RuntimeError("backend down"),
+        ):
+            result = runner.invoke(profile, ["find", "sqs"])
+        assert result.exit_code != 0
+        assert "Profile search failed" in result.output
+        assert "Traceback" not in result.output
+
+    def test_find_survives_mapping_description(self, runner):
+        """Regression (#438 re-review): a YAML mapping description reached
+        description[:108] and crashed with KeyError: slice(None, 108, None)."""
+        weird = [
+            {
+                "name": "weird-agent",
+                "description": {"a": "b"},
+                "tags": [],
+                "capabilities": [],
+                "role": "",
+                "source": "local",
+            }
+        ]
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",
+            return_value=weird,
+        ):
+            result = runner.invoke(profile, ["find", "weird"])
+        assert result.exit_code == 0
+        assert "weird-agent" in result.output

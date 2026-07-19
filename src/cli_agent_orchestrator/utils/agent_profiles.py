@@ -1,6 +1,7 @@
 """Agent profile utilities."""
 
 import logging
+import re
 from importlib import resources
 from pathlib import Path
 from typing import Dict, List, Set
@@ -44,11 +45,85 @@ def _safe_join(root: Path, *parts: str) -> Path | None:
     return candidate
 
 
+# Read-time bounds for discovery metadata, mirroring agent_profile.schema.json.
+# The schema is only enforced at install/validate time; profiles can reach the
+# stores without passing through it (manual copy, git checkout), so the read
+# path re-enforces the limits before the values feed search corpora and the
+# find_profiles MCP surface. (The full file is read to parse frontmatter, but
+# the prompt body is never indexed or returned by discovery.)
+_DISCOVERY_MAX_ITEMS = 32
+_CAPABILITY_MAX_LEN = 128
+_DESCRIPTION_MAX_LEN = 1024
+_TAG_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _discovery_fields(metadata: dict) -> Dict:
+    """Extract discovery metadata (description/capabilities/tags/role) from frontmatter.
+
+    Non-string descriptions and non-list tag/capability values are coerced to
+    empty, and schema limits (item counts, lengths, tag charset) are enforced
+    here so downstream search code can rely on bounded, well-shaped values
+    even for profiles that never went through ``cao install`` validation.
+    """
+    desc_raw = metadata.get("description")
+    caps_raw = metadata.get("capabilities")
+    tags_raw = metadata.get("tags")
+    role = metadata.get("role")
+
+    description = desc_raw[:_DESCRIPTION_MAX_LEN] if isinstance(desc_raw, str) else ""
+    capabilities = (
+        [str(c)[:_CAPABILITY_MAX_LEN] for c in caps_raw[:_DISCOVERY_MAX_ITEMS]]
+        if isinstance(caps_raw, list)
+        else []
+    )
+    tags = (
+        [str(t) for t in tags_raw[:_DISCOVERY_MAX_ITEMS] if _TAG_PATTERN.fullmatch(str(t))]
+        if isinstance(tags_raw, list)
+        else []
+    )
+    return {
+        "description": description,
+        "capabilities": capabilities,
+        "tags": tags,
+        "role": str(role) if isinstance(role, str) else "",
+    }
+
+
+def _scan_profile_source(source, profile_name: str) -> "tuple[Dict, bool]":
+    """Extract discovery fields and loadability for a scanned profile source.
+
+    ``loadable`` mirrors what ``load_agent_profile()`` will accept: the text
+    must read, the frontmatter must parse, and the metadata must validate
+    against the ``AgentProfile`` model (with the same name/description
+    defaults ``parse_agent_profile_text`` applies). Environment-variable
+    resolution is intentionally not applied here: it is runtime-dependent
+    and does not affect structural validity.
+
+    ``source`` is anything with ``read_text()`` (a ``Path`` or an
+    ``importlib.resources`` traversable).
+    """
+    try:
+        data = frontmatter.loads(source.read_text())
+    except Exception:
+        return _discovery_fields({}), False
+    discovery = _discovery_fields(data.metadata)
+    try:
+        meta = dict(data.metadata)
+        meta["system_prompt"] = data.content.strip()
+        meta.setdefault("name", profile_name)
+        meta.setdefault("description", "")
+        AgentProfile(**meta)
+    except Exception:
+        return discovery, False
+    return discovery, True
+
+
 def _scan_directory(
     directory: Path,
     source_label: str,
     profiles: Dict[str, Dict],
     name_sources: Dict[str, List[str]] | None = None,
+    dir_profiles_loadable: bool = True,
 ) -> None:
     """Scan a directory for agent profiles (.md files, .json files, or subdirectories).
 
@@ -57,6 +132,12 @@ def _scan_directory(
     found in (winner first, once per directory — a dir holding both
     ``<name>.md`` and ``<name>/`` counts once), so callers can surface
     same-named profiles defined in more than one enabled directory (GH #280).
+
+    ``dir_profiles_loadable`` mirrors ``_read_agent_profile_source``'s source
+    rules: directory-style profiles (``<name>/agent.md``) are only resolvable
+    from provider and extra directories, not from the local store, so the
+    local-store scan passes ``False`` to keep such entries listable but never
+    recommendable.
     """
     if not directory.exists():
         return
@@ -70,36 +151,38 @@ def _scan_directory(
     for item in directory.iterdir():
         if item.is_dir():
             profile_name = item.name
-            desc = ""
-            # Check for agent.md inside directory
             agent_md = item / "agent.md"
-            if agent_md.exists():
-                try:
-                    data = frontmatter.loads(agent_md.read_text())
-                    desc = data.metadata.get("description", "")
-                except Exception:
-                    pass
+            if agent_md.exists() and dir_profiles_loadable:
+                discovery, loadable = _scan_profile_source(agent_md, profile_name)
+            elif agent_md.exists():
+                # Content may be fine, but _read_agent_profile_source() does
+                # not resolve directory-style profiles from this store, so
+                # load_agent_profile() would raise FileNotFoundError.
+                discovery, _ = _scan_profile_source(agent_md, profile_name)
+                loadable = False
+            else:
+                # A directory without agent.md is listable, but
+                # load_agent_profile() raises FileNotFoundError for it, so it
+                # must never be recommended by search.
+                discovery, loadable = _discovery_fields({}), False
             _record(profile_name)
             if profile_name not in profiles:
                 profiles[profile_name] = {
                     "name": profile_name,
-                    "description": desc,
                     "source": source_label,
+                    "loadable": loadable,
+                    **discovery,
                 }
         elif item.suffix == ".md" and item.is_file():
             profile_name = item.stem
-            desc = ""
-            try:
-                data = frontmatter.loads(item.read_text())
-                desc = data.metadata.get("description", "")
-            except Exception:
-                pass
+            discovery, loadable = _scan_profile_source(item, profile_name)
             _record(profile_name)
             if profile_name not in profiles:
                 profiles[profile_name] = {
                     "name": profile_name,
-                    "description": desc,
                     "source": source_label,
+                    "loadable": loadable,
+                    **discovery,
                 }
 
 
@@ -128,7 +211,13 @@ def list_agent_profiles() -> List[Dict]:
     # its profiles.
     local_norm = normalized_path(LOCAL_AGENT_STORE_DIR)
     if local_norm not in disabled:
-        _scan_directory(LOCAL_AGENT_STORE_DIR, "local", profiles, name_sources)
+        _scan_directory(
+            LOCAL_AGENT_STORE_DIR,
+            "local",
+            profiles,
+            name_sources,
+            dir_profiles_loadable=False,
+        )
         scanned_paths.add(local_norm)
 
     # 2. Provider-specific directories (from settings)
@@ -166,19 +255,13 @@ def list_agent_profiles() -> List[Dict]:
                 name_sources.setdefault(profile_name, []).append("built-in")
                 if profile_name in profiles:
                     continue
-                try:
-                    data = frontmatter.loads(item.read_text())
-                    profiles[profile_name] = {
-                        "name": profile_name,
-                        "description": data.metadata.get("description", ""),
-                        "source": "built-in",
-                    }
-                except Exception:
-                    profiles[profile_name] = {
-                        "name": profile_name,
-                        "description": "",
-                        "source": "built-in",
-                    }
+                discovery, loadable = _scan_profile_source(item, profile_name)
+                profiles[profile_name] = {
+                    "name": profile_name,
+                    "source": "built-in",
+                    "loadable": loadable,
+                    **discovery,
+                }
     except Exception as e:
         logger.debug(f"Could not scan built-in agent store: {e}")
 

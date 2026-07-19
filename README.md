@@ -163,6 +163,7 @@ For creating custom agent profiles, see [docs/agent-profile.md](docs/agent-profi
 
 ```bash
 cao profile list                                    # List all installed profiles
+cao profile find "monitor sqs"                      # Keyword search across name/description/tags/capabilities
 cao profile show <name|file>                        # Inspect frontmatter details
 cao profile validate <name|file>                    # Schema + deprecation checks
 cao profile templates                               # List scaffolding templates

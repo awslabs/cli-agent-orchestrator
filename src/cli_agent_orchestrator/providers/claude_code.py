@@ -45,17 +45,60 @@ class ProviderError(Exception):
 # Regex patterns for Claude Code output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between marker and text
+# Shared shape of the reasoning-effort footer's tail, e.g. "high · /effort" or
+# "xhigh · /effort". "\w+" matches the effort level generically (any name, not
+# just "high") rather than enumerating known levels. End-anchored so it only
+# describes a line that IS ENTIRELY this shape; a genuine response that merely
+# mentions "/effort" in prose (e.g. "Run /effort to change settings") does not
+# end the line with "<word> · /effort" and is unaffected.
+#
+# _ANSI_OPT is spliced between every token: real capture-pane -e output (used
+# by extraction, per this module's docstring guidance) re-renders the pane's
+# SGR color state, so this exact chrome line arrives wrapped in color codes,
+# e.g. "\x1b[38;5;246m● high · /effort\x1b[39m" — a trailing reset directly
+# after "/effort" (GH #459 follow-up). Without this, the reset defeats the
+# "[ \t]*$" end anchor and the exclusion silently stops firing on styled
+# output, even though it passes on the plain-text unit fixtures.
+_ANSI_OPT = r"(?:\x1b\[[0-9;]*m)*"
+_EFFORT_FOOTER_TAIL = (
+    _ANSI_OPT
+    + r"\w+"
+    + _ANSI_OPT
+    + r"[ \t]*·[ \t]*"
+    + _ANSI_OPT
+    + r"/effort"
+    + _ANSI_OPT
+    + r"[ \t]*$"
+)
 # Response marker at the START of a line, for message EXTRACTION only (not
 # status detection). Matches the legacy "⏺" (U+23FA) and the newest TUI's
 # "●" (U+25CF) response glyphs. Anchored to line start (MULTILINE) so a
 # mid-line "●" — e.g. the footer effort indicator "… esc to interrupt ● high
-# · /effort" — is NOT mistaken for a response marker. Kept separate from
-# RESPONSE_PATTERN so get_status's legacy ⏺-COMPLETED check is unaffected (adding
-# "●" there could fire COMPLETED mid-stream while a response is still rendering).
+# · /effort" — is NOT mistaken for a response marker.
+#
+# On Claude Code v2.1.212+ the same footer can instead render on its OWN line
+# at column 0 — "● high · /effort" — where the line-start anchor no longer
+# protects against it (GH #459: this false-matched as a response marker, so
+# get_status() reported COMPLETED while the worker was still processing,
+# causing handoff to paste a premature "/exit"). The negative lookahead below
+# guards that exact shape. It sits right after the glyph (+ optional ANSI),
+# BEFORE the trailing "\s+" — placing it AFTER "\s+" instead lets that greedy
+# "\s+" backtrack by one space to dodge the lookahead whenever the footer has
+# more than one space after the glyph, silently reopening the false match.
+#
+# Kept separate from RESPONSE_PATTERN so get_status's legacy ⏺-COMPLETED check
+# is unaffected (adding "●" there could fire COMPLETED mid-stream while a
+# response is still rendering).
 EXTRACTION_RESPONSE_PATTERN = re.compile(
-    r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*\s+",
+    r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*(?![ \t]*" + _EFFORT_FOOTER_TAIL + r")\s+",
     re.MULTILINE,
 )
+# Own-line effort-footer, e.g. "● high · /effort" (glyph + the tail shape
+# above). Standalone (not a lookahead) so get_status()'s box-walk can skip past
+# this exact chrome line while searching for a live spinner (GH #459). Shares
+# _EFFORT_FOOTER_TAIL with EXTRACTION_RESPONSE_PATTERN instead of duplicating
+# the shape.
+EFFORT_FOOTER_LINE_PATTERN = re.compile(r"^[ \t]*[⏺●][ \t]*" + _EFFORT_FOOTER_TAIL, re.MULTILINE)
 # Match Claude Code processing spinners:
 # - Old format: "✽ Cooking… (esc to interrupt)" / "✶ Thinking… (esc to interrupt)"
 # - New format: "✽ Cooking… (6s · ↓ 174 tokens · thinking)"
@@ -708,13 +751,20 @@ class ClaudeCodeProvider(BaseProvider):
                 if m.start() <= last_idle.start() < m.end():
                     input_box = m
         if input_box is not None:
-            # Walk up from the box past footer chrome — "⎿ Tip: …" hint lines
-            # and blanks render BETWEEN the live spinner and the box's top
+            # Walk up from the box past footer chrome — "⎿ Tip: …" hint lines,
+            # blanks, and (GH #459) an own-line effort footer ("● high ·
+            # /effort") — render BETWEEN the live spinner and the box's top
             # border, so checking only the single line above the box misses
-            # an active spinner (false COMPLETED during MCP calls).
+            # an active spinner (false COMPLETED during MCP calls, or IDLE
+            # once fix #1 above stops the footer from false-matching COMPLETED
+            # via EXTRACTION_RESPONSE_PATTERN).
             above_lines = output[: input_box.start()].rstrip("\n").split("\n")
             for line in reversed(above_lines[-4:]):
-                if not line.strip() or line.lstrip().startswith("⎿"):
+                if (
+                    not line.strip()
+                    or line.lstrip().startswith("⎿")
+                    or EFFORT_FOOTER_LINE_PATTERN.match(line)
+                ):
                     continue
                 if NEW_TUI_BOX_SPINNER_PATTERN.search(line):
                     return TerminalStatus.PROCESSING
@@ -729,8 +779,12 @@ class ClaudeCodeProvider(BaseProvider):
         # IDLE when the newest TUI clipped the completion summary's duration —
         # "✻ Crunched for " — or rendered the summary on a · / * glyph frame that
         # COMPLETION_SUMMARY_PATTERN excludes; the ● response marker is the robust
-        # fallback.) The ● is matched at line start only, so the footer effort
-        # indicator "… esc to interrupt ● high · /effort" is never counted.
+        # fallback.) The ● is matched at line start only, so the mid-line
+        # footer indicator "… esc to interrupt ● high · /effort" is never
+        # counted. The footer's own-line variant ("● high · /effort" at
+        # column 0) starts at line start too — that case is excluded by the
+        # negative lookahead in EXTRACTION_RESPONSE_PATTERN, not by the
+        # line-start anchor (GH #459).
         last_sol_response = None
         for m in re.finditer(EXTRACTION_RESPONSE_PATTERN, output):
             last_sol_response = m
@@ -929,6 +983,16 @@ class ClaudeCodeProvider(BaseProvider):
             if re.search(r"─{20,}", clean_line) and not re.search("[━-╿]", clean_line):
                 break
             if re.search(COMPLETION_SUMMARY_PATTERN, clean_line):
+                break
+            # GH #459 follow-up: the exclusion lookahead in
+            # EXTRACTION_RESPONSE_PATTERN stops the own-line effort footer from
+            # being mistaken for a SECOND response marker, but does nothing
+            # about the footer's own text once collection has started from an
+            # earlier, real marker — that footer line would otherwise be
+            # appended verbatim as trailing garbage on the extracted answer.
+            # clean_line is already ANSI-stripped, so this matches on the
+            # footer's plain-text shape regardless of surrounding SGR codes.
+            if EFFORT_FOOTER_LINE_PATTERN.match(clean_line):
                 break
 
             response_lines.append(clean_line)
