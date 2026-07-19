@@ -47,14 +47,27 @@ ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true")
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 MAX_USER_PROMPT_ANSWER_LENGTH = 4000
+_TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
+
+
+def _current_terminal_id() -> Optional[str]:
+    """Return a valid CAO terminal ID from the MCP environment, if configured."""
+    terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if terminal_id is None:
+        return None
+    if not _TERMINAL_ID_PATTERN.fullmatch(terminal_id):
+        raise ValueError(
+            "Invalid CAO_TERMINAL_ID: expected an 8-character lowercase hexadecimal terminal ID"
+        )
+    return terminal_id
 
 
 def _get_cleanup_nudge() -> str:
     """Return a cleanup nudge string if the session has too many terminals, else empty string."""
-    current_terminal_id = os.environ.get("CAO_TERMINAL_ID")
-    if not current_terminal_id:
-        return ""
     try:
+        current_terminal_id = _current_terminal_id()
+        if not current_terminal_id:
+            return ""
         resp = requests.get(
             f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
         )
@@ -188,7 +201,7 @@ def _create_terminal(
     parent_allowed_tools = None
 
     # Get current terminal ID from environment
-    current_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    current_terminal_id = _current_terminal_id()
     if current_terminal_id:
         # Get terminal metadata via API
         response = requests.get(
@@ -466,7 +479,7 @@ def _shape_handoff_message(provider: str, message: str) -> str:
     if provider != "codex":
         return message
 
-    supervisor_id = os.environ.get("CAO_TERMINAL_ID")
+    supervisor_id = _current_terminal_id()
     if not supervisor_id:
         raise ValueError(
             "CAO_TERMINAL_ID not set - cannot identify the supervisor terminal "
@@ -522,7 +535,7 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     the single combined run-step call, while preserving the same-session /
     caller_id / allowed_tools behavior the old six-call path had.
     """
-    current_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    current_terminal_id = _current_terminal_id()
     if not current_terminal_id:
         return HandoffContext(
             provider=resolve_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER),
@@ -605,7 +618,7 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         ValueError: If CAO_TERMINAL_ID not set
         Exception: If API call fails
     """
-    sender_id = os.getenv("CAO_TERMINAL_ID")
+    sender_id = _current_terminal_id()
     if not sender_id:
         raise ValueError("CAO_TERMINAL_ID not set - cannot determine sender")
 
@@ -693,7 +706,7 @@ async def _handoff_impl(
 
         # Fail fast for codex: its handoff banner requires CAO_TERMINAL_ID. We
         # check before any terminal is created (no terminal_id to surface yet).
-        if provider == "codex" and not os.environ.get("CAO_TERMINAL_ID"):
+        if provider == "codex" and not _current_terminal_id():
             return HandoffResult(
                 success=False,
                 message=(
@@ -925,7 +938,8 @@ def _assign_impl(
         # which cannot honor defer_init/initial_message — assign would create a
         # worker, never deliver the task, and still return success. Guarding
         # here also avoids leaving an orphan window behind (issue #284).
-        if not os.environ.get("CAO_TERMINAL_ID"):
+        current_terminal_id = _current_terminal_id()
+        if not current_terminal_id:
             return {
                 "success": False,
                 "terminal_id": None,
@@ -942,7 +956,7 @@ def _assign_impl(
         # subprocess's env (the supervisor-owned instance), not on the
         # cao-server side.
         if ENABLE_SENDER_ID_INJECTION:
-            sender_id = os.environ.get("CAO_TERMINAL_ID")
+            sender_id = current_terminal_id
             if not sender_id:
                 # Redundant with the earlier check but preserves the same
                 # error contract on the injection path.
@@ -1081,7 +1095,7 @@ else:
 def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
-        own_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+        own_terminal_id = _current_terminal_id()
 
         # Default the receiver to the recorded caller (issue #284): handoff/
         # assign persist the creating terminal's ID on the worker's row, so a
@@ -1308,7 +1322,7 @@ def delete_terminal(
 
 def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
     """Build terminal context dict from the calling terminal's CAO_TERMINAL_ID."""
-    terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    terminal_id = _current_terminal_id()
     if not terminal_id:
         return None
 
