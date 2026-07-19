@@ -13,7 +13,7 @@ This guide explains what each surface is for, when to use it, and how they fit t
 | **`cao-ops-mcp` server** | Inbound | Any external agent that speaks MCP | MCP (stdio) → HTTP | A primary agent managing CAO from inside its own chat loop |
 | **Plugins** (e.g. `cao-discord`) | **Outbound** (CAO → outside) | `cao-server` itself, fire-and-forget | Python hooks → whatever the plugin chooses (webhook, log, metric) | Forwarding events to chat apps, observability, audit logging |
 
-Separately, the in-session MCP server (`cao-mcp-server`) handles agent-to-agent orchestration *within* a CAO session. That is orthogonal to this document — see [MCP Server Tools and Orchestration Modes](../README.md#mcp-server-tools-and-orchestration-modes) in the README for `handoff` / `assign` / `send_message`.
+Separately, the in-session MCP server (`cao-mcp-server`) handles agent-to-agent orchestration *within* a CAO session. That is orthogonal to this document — see [Multi-Agent Orchestration](../README.md#multi-agent-orchestration) in the README for `handoff` / `assign` / `send_message`.
 
 ## Inbound vs outbound
 
@@ -47,7 +47,7 @@ A set of `cao session <verb>` commands (`list`, `status`, `send`, plus `cao laun
   - An external AI assistant that does not speak MCP — e.g. [OpenClaw](https://github.com/openclaw/openclaw) or [Hermes Agent](https://github.com/NousResearch/hermes-agent). Any assistant that supports shell-callable skills should work.
   - Quick one-shots where spinning up an MCP client is overkill.
 
-See [Session Management](../README.md#session-management) in the README for the command reference.
+See [Session Management CLI](../README.md#session-management-cli) in the README for the command reference.
 
 ### `cao-ops-mcp` server
 
@@ -117,7 +117,7 @@ Each component is small. The surface split keeps each one focused on a single di
 
 ## Related reading
 
-- [Session Management](../README.md#session-management) in the README — command reference for `cao session` / `cao launch` / `cao shutdown`.
+- [Session Management CLI](../README.md#session-management-cli) in the README — command reference for `cao session` / `cao launch` / `cao shutdown`.
 - [CAO Ops MCP Server](../README.md#cao-ops-mcp-server) in the README — setup and tool catalog for `cao-ops-mcp`.
 - [docs/plugins.md](plugins.md) — plugin installation, event catalog, troubleshooting.
 - [docs/api.md](api.md) — the underlying HTTP API that every inbound surface calls.
