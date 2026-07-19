@@ -146,6 +146,31 @@ class FlowModel(Base):
     enabled = Column(Boolean, default=True)
 
 
+class HandoffResultModel(Base):
+    """Durable record of a handoff step result (issue #447).
+
+    Written by the run-step handler BEFORE returning the HTTP response, so the
+    result survives an MCP-transport timeout.  The caller supplies a ``job_id``
+    (generated client-side so retries use the same key); the server upserts on
+    that key.
+
+    ``state``:
+      - ``"running"`` — step in progress (written at request start)
+      - ``"completed"`` — step finished successfully; ``last_message`` populated
+      - ``"error"`` — step failed; ``error_message`` populated
+    """
+
+    __tablename__ = "handoff_results"
+
+    job_id = Column(String, primary_key=True)
+    state = Column(String, nullable=False)  # "running" | "completed" | "error"
+    terminal_id = Column(String, nullable=True)
+    last_message = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 
@@ -181,6 +206,7 @@ def init_db() -> None:
     _migrate_workflow_index()
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    _migrate_add_handoff_results()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -204,6 +230,36 @@ def _restrict_db_file_permissions() -> None:
             os.chmod(path, 0o600)
         except OSError as e:
             logger.warning(f"Could not restrict DB file permissions on {path}: {e}")
+
+
+def _migrate_add_handoff_results() -> None:
+    """Create the handoff_results table on existing databases (issue #447).
+
+    ``Base.metadata.create_all`` already handles fresh databases; this
+    idempotent migration handles existing ones where the table does not
+    exist yet.  SQLite supports ``CREATE TABLE IF NOT EXISTS``, so we
+    delegate to raw SQL rather than a full schema rebuild.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS handoff_results (
+                    job_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    terminal_id TEXT,
+                    last_message TEXT,
+                    error_message TEXT,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """)
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration check for handoff_results failed: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -825,6 +881,86 @@ def list_aliases_for_project(project_id: str) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.debug(f"list_aliases_for_project failed (non-fatal): {e}")
         return []
+
+
+# ---------------------------------------------------------------------------
+# Handoff result durability helpers (issue #447)
+# ---------------------------------------------------------------------------
+
+
+def upsert_handoff_result(
+    job_id: str,
+    state: str,
+    *,
+    terminal_id: Optional[str] = None,
+    last_message: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    """Create or update the durable record for a handoff step (issue #447).
+
+    Called at two points in the run-step handler:
+    1. Request start — ``state="running"`` (marks the job as in-progress so a
+       concurrent duplicate knows to wait rather than start a second worker).
+    2. Before sending the HTTP response — ``state="completed"`` or ``"error"``
+       (makes the result retrievable even if the transport closes before the
+       response arrives).
+
+    Idempotent: a second call for the same ``job_id`` updates the existing row.
+    """
+    now = _utcnow()
+    with SessionLocal() as db:
+        row = db.query(HandoffResultModel).filter(HandoffResultModel.job_id == job_id).first()
+        if row is None:
+            row = HandoffResultModel(
+                job_id=job_id,
+                state=state,
+                terminal_id=terminal_id,
+                last_message=last_message,
+                error_message=error_message,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(row)
+        else:
+            row.state = state
+            if terminal_id is not None:
+                row.terminal_id = terminal_id
+            if last_message is not None:
+                row.last_message = last_message
+            if error_message is not None:
+                row.error_message = error_message
+            row.updated_at = now
+        db.commit()
+
+
+def get_handoff_result(job_id: str) -> Optional[dict]:
+    """Return the handoff result record for ``job_id``, or None if not found."""
+    with SessionLocal() as db:
+        row = db.query(HandoffResultModel).filter(HandoffResultModel.job_id == job_id).first()
+        if row is None:
+            return None
+        return {
+            "job_id": row.job_id,
+            "state": row.state,
+            "terminal_id": row.terminal_id,
+            "last_message": row.last_message,
+            "error_message": row.error_message,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
+
+
+def delete_old_handoff_results(cutoff: datetime) -> int:
+    """Delete handoff result rows older than ``cutoff`` (retention sweep).
+
+    Returns the number of rows deleted.
+    """
+    with SessionLocal() as db:
+        deleted = (
+            db.query(HandoffResultModel).filter(HandoffResultModel.created_at < cutoff).delete()
+        )
+        db.commit()
+        return deleted
 
 
 def update_message_status(message_id: int, status: MessageStatus) -> bool:

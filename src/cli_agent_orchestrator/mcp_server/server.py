@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from typing import Any, Dict, NamedTuple, Optional, Tuple, Union
 
 import requests
@@ -47,6 +48,11 @@ ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true")
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 MAX_USER_PROMPT_ANSWER_LENGTH = 4000
+
+# Extra seconds added on top of the caller's ``timeout`` for the HTTP client
+# deadline.  Covers the server-side ready-wait (up to DEFAULT_READY_TIMEOUT=120s)
+# plus a small scheduling margin (issue #447: also used in the Timeout message).
+_CLIENT_TIMEOUT_HEADROOM = 180
 
 
 def _get_cleanup_nudge() -> str:
@@ -709,6 +715,15 @@ async def _handoff_impl(
         # when provider == codex; otherwise returns the message unchanged).
         shaped_message = _shape_handoff_message(provider, message)
 
+        # Generate a durable job_id BEFORE posting. The server records this in
+        # handoff_results so the result is retrievable even when the MCP
+        # transport closes before the response arrives (issue #447). Client-side
+        # generation means the job_id is available for the Timeout catch block.
+        # Note: the DB record is idempotent on this key (upsert), but the server
+        # does NOT deduplicate execution — a retry with the same job_id would
+        # launch a second worker and race on the final upsert.
+        job_id = uuid.uuid4().hex
+
         # Single combined call: create -> ready-wait -> input -> complete-wait ->
         # extract -> teardown, all server-side via run_agent_step. session_name
         # places the worker in the supervisor's session; caller_id/allowed_tools
@@ -719,6 +734,7 @@ async def _handoff_impl(
             "prompt": shaped_message,
             "teardown": True,
             "timeout": float(timeout),
+            "job_id": job_id,
         }
         if ctx.session_name:
             payload["session_name"] = ctx.session_name
@@ -731,7 +747,7 @@ async def _handoff_impl(
 
         # Allow the full step time plus the server-side ready-wait (up to 120s)
         # plus headroom; the server enforces the per-step timeout internally.
-        client_timeout = float(timeout) + 180.0
+        client_timeout = float(timeout) + _CLIENT_TIMEOUT_HEADROOM
         try:
             response = requests.post(
                 f"{API_BASE_URL}/terminals/run-step",
@@ -739,9 +755,22 @@ async def _handoff_impl(
                 timeout=client_timeout,
             )
         except requests.Timeout:
+            # The MCP transport timed out, but the step may still be running
+            # (or may have already completed) server-side. The server persists
+            # the result in handoff_results under job_id before sending the
+            # HTTP response, so the caller can retrieve it via the
+            # get_handoff_result MCP tool (issue #447 / PR #453 review finding
+            # 3 — a raw "GET /handoff-results/{job_id}" instruction gives the
+            # supervisor LLM no callable path: no base URL, no auth).
             return HandoffResult(
                 success=False,
-                message=f"Handoff timed out after {timeout} seconds",
+                pending=True,
+                job_id=job_id,
+                message=(
+                    f"Handoff transport timed out after {timeout + _CLIENT_TIMEOUT_HEADROOM} seconds. "
+                    f"The job may still be running server-side. "
+                    f"Retrieve the result with the get_handoff_result tool, job_id={job_id}"
+                ),
                 output=None,
                 terminal_id=None,
             )
@@ -1299,6 +1328,50 @@ def delete_terminal(
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
     except Exception as e:
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
+
+
+@mcp.tool()
+def get_handoff_result(
+    job_id: str = Field(
+        description=(
+            "The job_id returned by handoff when pending=True (transport timed "
+            "out but the job may still be running or already finished server-side)."
+        )
+    ),
+) -> Dict[str, Any]:
+    """Retrieve a durably persisted handoff result by job_id (issue #447).
+
+    Call this when a prior ``handoff`` call returned ``pending=True`` — the
+    transport timed out before the result arrived, but the work continues
+    server-side under ``job_id``. Poll this tool until ``state`` is no longer
+    ``"running"``.
+
+    Args:
+        job_id: The job_id from the pending handoff result.
+
+    Returns:
+        Dict with ``success``, ``state`` ("running"|"completed"|"error"),
+        ``terminal_id``, ``last_message`` (populated when completed), and
+        ``error_message`` (populated when errored). ``success=False`` with a
+        ``message`` when the job_id is unknown or the request failed.
+    """
+    try:
+        response = requests.get(f"{API_BASE_URL}/handoff-results/{job_id}", timeout=_mcp_timeout())
+        response.raise_for_status()
+        data = response.json()
+        return {
+            "success": True,
+            "state": data.get("state"),
+            "terminal_id": data.get("terminal_id"),
+            "last_message": data.get("last_message"),
+            "error_message": data.get("error_message"),
+        }
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return {"success": False, "message": f"No handoff result found for job_id {job_id}"}
+        return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
+    except Exception as e:
+        return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
 
 
 # =============================================================================

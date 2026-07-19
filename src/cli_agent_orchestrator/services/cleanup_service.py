@@ -4,7 +4,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
+from cli_agent_orchestrator.clients.database import (
+    InboxModel,
+    SessionLocal,
+    TerminalModel,
+    delete_old_handoff_results,
+)
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
     MEMORY_BASE_DIR,
@@ -66,6 +71,14 @@ def cleanup_old_data():
                     log_file.unlink()
                     server_logs_deleted += 1
         logger.info(f"Deleted {server_logs_deleted} old server log files")
+
+        # Clean up old handoff result records (issue #447).
+        # Same cutoff as terminals/messages: RETENTION_DAYS.
+        try:
+            deleted_handoff = delete_old_handoff_results(cutoff_date)
+            logger.info(f"Deleted {deleted_handoff} old handoff result records")
+        except Exception as e:
+            logger.warning(f"Failed to clean up old handoff results: {e}")
 
         logger.info("Cleanup completed successfully")
 
