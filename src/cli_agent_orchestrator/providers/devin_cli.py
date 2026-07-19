@@ -163,6 +163,9 @@ class DevinCliProvider(BaseProvider):
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 fd = None
                 f.write(content)
+            # mkstemp creates the file with a restrictive mode on POSIX, but
+            # enforce 0o600 explicitly for portability (including Windows).
+            os.chmod(path, 0o600)
             return path
         except Exception:
             if path:
