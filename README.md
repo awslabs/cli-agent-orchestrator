@@ -45,8 +45,15 @@ cao --help
 
 For a tagged release, install
 [`cli-agent-orchestrator` from PyPI](https://pypi.org/project/cli-agent-orchestrator/).
-See [DEVELOPMENT.md](DEVELOPMENT.md) for a source checkout and
-[Updating CAO](docs/updating.md) for upgrade behavior.
+See [DEVELOPMENT.md](DEVELOPMENT.md) for a source checkout.
+
+To update an existing CAO installation:
+
+```bash
+cao update
+```
+
+See [Updating CAO](docs/updating.md) for source-aware behavior and edge cases.
 
 ## First supervisor launch
 
