@@ -3,6 +3,7 @@
 import logging
 import os
 import subprocess
+import threading
 import time
 import uuid
 from typing import Dict, List, Optional
@@ -22,8 +23,83 @@ logger = logging.getLogger(__name__)
 class TmuxClient:
     """Simplified tmux client for basic operations."""
 
+    _LOGICAL_WINDOW_OPTION = "@cao_logical_window"
+
     def __init__(self) -> None:
         self.server = libtmux.Server()
+        # Window names are presentation labels, not stable identifiers. Shells
+        # and TUIs (notably zsh + Claude Code) can rename a tmux window while
+        # they start. Keep the immutable tmux window id behind the adapter so
+        # application code can continue using its logical CAO window name.
+        self._window_ids: dict[tuple[str, str], str] = {}
+        self._window_ids_lock = threading.Lock()
+
+    def _remember_window(self, session_name: str, logical_name: str, window) -> None:
+        window_id = getattr(window, "window_id", None)
+        if isinstance(window_id, str) and window_id.startswith("@"):
+            with self._window_ids_lock:
+                self._window_ids[(session_name, logical_name)] = window_id
+            try:
+                window.set_option(self._LOGICAL_WINDOW_OPTION, logical_name)
+            except Exception as exc:
+                # The in-memory id still protects the active server process.
+                # Metadata is best-effort compatibility for CAO restarts.
+                logger.warning(
+                    "Could not persist logical tmux window identity for %s:%s: %s",
+                    session_name,
+                    logical_name,
+                    exc,
+                )
+
+    def _window_id(self, session_name: str, logical_name: str) -> Optional[str]:
+        with self._window_ids_lock:
+            return self._window_ids.get((session_name, logical_name))
+
+    def _get_window(self, session, session_name: str, logical_name: str):
+        """Resolve a logical CAO window name to the stable tmux window object."""
+        window_id = self._window_id(session_name, logical_name)
+        if window_id:
+            try:
+                return session.windows.get(window_id=window_id)
+            except libtmux.exc.ObjectDoesNotExist:
+                # The id may be stale after an external tmux teardown. Fall
+                # through to metadata/name recovery.
+                pass
+
+        # User options live in tmux itself, so they survive a CAO process
+        # restart even when a shell or TUI has changed the display name.
+        for candidate in session.windows:
+            try:
+                persisted_name = candidate.show_option(
+                    self._LOGICAL_WINDOW_OPTION,
+                    ignore_errors=True,
+                )
+            except Exception:
+                continue
+            if persisted_name == logical_name:
+                self._remember_window(session_name, logical_name, candidate)
+                return candidate
+
+        # Compatibility path for windows created before identity metadata was
+        # introduced. If the display name still matches, migrate it in place.
+        window = session.windows.get(window_name=logical_name)
+        if window:
+            self._remember_window(session_name, logical_name, window)
+        return window
+
+    def _target(self, session_name: str, logical_name: str) -> str:
+        """Return a tmux CLI target, preferring immutable ``@window_id``."""
+        window_id = self._window_id(session_name, logical_name)
+        if window_id:
+            return window_id
+
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if session:
+                self._get_window(session, session_name, logical_name)
+        except libtmux.exc.ObjectDoesNotExist:
+            pass
+        return self._window_id(session_name, logical_name) or f"{session_name}:{logical_name}"
 
     # Kept as an alias so existing callers/tests referencing the class
     # attribute keep working; the canonical set lives in
@@ -188,10 +264,11 @@ class TmuxClient:
             logger.info(
                 f"Created tmux session: {session_name} with window: {window_name} in directory: {working_directory}"
             )
-            window_name_result = session.windows[0].name
-            if window_name_result is None:
+            window = session.windows[0]
+            self._remember_window(session_name, window_name, window)
+            if window.name is None:
                 raise ValueError(f"Window name is None for session {session_name}")
-            return window_name_result
+            return window_name
         except Exception as e:
             logger.error(f"Failed to create session {session_name}: {e}")
             raise
@@ -231,14 +308,14 @@ class TmuxClient:
                 kwargs["window_shell"] = window_shell
 
             window = session.new_window(**kwargs)
+            self._remember_window(session_name, window_name, window)
 
             logger.info(
                 f"Created window '{window.name}' in session '{session_name}' in directory: {working_directory}"
             )
-            window_name_result = window.name
-            if window_name_result is None:
+            if window.name is None:
                 raise ValueError(f"Window name is None for session {session_name}")
-            return window_name_result
+            return window_name
         except Exception as e:
             logger.error(f"Failed to create window in session {session_name}: {e}")
             raise
@@ -281,7 +358,7 @@ class TmuxClient:
         # also clears the CodeQL py/command-line-injection data flow.
         validated_session = validate_tmux_name(session_name, "session_name")
         validated_window = validate_tmux_name(window_name, "window_name")
-        target = f"{validated_session}:{validated_window}"
+        target = self._target(validated_session, validated_window)
         buf_name = f"cao_{uuid.uuid4().hex[:8]}"
         try:
             # Log metadata only at INFO: the payload is the full launch
@@ -360,7 +437,7 @@ class TmuxClient:
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.windows.get(window_name=window_name)
+            window = self._get_window(session, session_name, window_name)
             if not window:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
@@ -410,7 +487,7 @@ class TmuxClient:
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.windows.get(window_name=window_name)
+            window = self._get_window(session, session_name, window_name)
             if not window:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
@@ -444,7 +521,7 @@ class TmuxClient:
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.windows.get(window_name=window_name)
+            window = self._get_window(session, session_name, window_name)
             if not window:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
@@ -510,6 +587,10 @@ class TmuxClient:
             session = self.server.sessions.get(session_name=session_name)
             if session:
                 session.kill()
+                with self._window_ids_lock:
+                    stale = [key for key in self._window_ids if key[0] == session_name]
+                    for key in stale:
+                        self._window_ids.pop(key, None)
                 logger.info(f"Killed tmux session: {session_name}")
                 return True
             return False
@@ -523,9 +604,11 @@ class TmuxClient:
             session = self.server.sessions.get(session_name=session_name)
             if not session:
                 return False
-            window = session.windows.get(window_name=window_name)
+            window = self._get_window(session, session_name, window_name)
             if window:
                 window.kill()
+                with self._window_ids_lock:
+                    self._window_ids.pop((session_name, window_name), None)
                 logger.info(f"Killed tmux window: {session_name}:{window_name}")
                 return True
             return False
@@ -548,7 +631,7 @@ class TmuxClient:
             if not session:
                 return None
 
-            window = session.windows.get(window_name=window_name)
+            window = self._get_window(session, session_name, window_name)
             if not window:
                 return None
 
@@ -557,7 +640,7 @@ class TmuxClient:
                 # Get pane_current_path from tmux
                 result = pane.cmd("display-message", "-p", "#{pane_current_path}")
                 if result.stdout:
-                    return result.stdout[0].strip()
+                    return str(result.stdout[0]).strip()
             return None
         except Exception as e:
             logger.error(f"Failed to get working directory for {session_name}:{window_name}: {e}")
@@ -569,14 +652,14 @@ class TmuxClient:
             session = self.server.sessions.get(session_name=session_name)
             if not session:
                 return None
-            window = session.windows.get(window_name=window_name)
+            window = self._get_window(session, session_name, window_name)
             if not window:
                 return None
             pane = window.active_pane
             if pane:
                 result = pane.cmd("display-message", "-p", "#{pane_current_command}")
                 if result.stdout:
-                    return result.stdout[0].strip()
+                    return str(result.stdout[0]).strip()
             return None
         except Exception as e:
             logger.error(f"Failed to get pane command for {session_name}:{window_name}: {e}")
@@ -595,7 +678,7 @@ class TmuxClient:
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.windows.get(window_name=window_name)
+            window = self._get_window(session, session_name, window_name)
             if not window:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
@@ -619,7 +702,7 @@ class TmuxClient:
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.windows.get(window_name=window_name)
+            window = self._get_window(session, session_name, window_name)
             if not window:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 

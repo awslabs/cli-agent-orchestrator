@@ -53,6 +53,7 @@ class TestCreateSession:
     def test_create_session_success(self, tmux, tmp_path):
         mock_window = MagicMock()
         mock_window.name = "my-window"
+        mock_window.window_id = "@1"
         mock_session = MagicMock()
         mock_session.windows = [mock_window]
         tmux.server.new_session.return_value = mock_session
@@ -61,6 +62,8 @@ class TestCreateSession:
 
         assert result == "my-window"
         tmux.server.new_session.assert_called_once()
+        assert tmux._window_ids[("ses", "my-window")] == "@1"
+        mock_window.set_option.assert_called_once_with("@cao_logical_window", "my-window")
 
     def test_create_session_window_name_none(self, tmux, tmp_path):
         mock_window = MagicMock()
@@ -298,6 +301,43 @@ class TestSendKeys:
         with pytest.raises(Exception, match="tmux send failed"):
             tmux.send_keys("ses", "win", "hello")
 
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_targets_stable_window_id_after_application_rename(
+        self, mock_subprocess, mock_time, tmux
+    ):
+        """Claude/zsh changing the window title must not break later input."""
+        mock_subprocess.run.return_value = MagicMock(returncode=0)
+        tmux._window_ids[("ses", "logical-win")] = "@7"
+
+        tmux.send_keys("ses", "logical-win", "hello")
+
+        paste_call = mock_subprocess.run.call_args_list[1]
+        enter_call = mock_subprocess.run.call_args_list[2]
+        assert paste_call.args[0][-1] == "@7"
+        assert enter_call.args[0][-2:] == ["@7", "Enter"]
+
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_recovers_stable_id_from_tmux_metadata_after_restart(
+        self, mock_subprocess, mock_time, tmux
+    ):
+        mock_subprocess.run.return_value = MagicMock(returncode=0)
+        renamed_window = MagicMock()
+        renamed_window.window_id = "@12"
+        renamed_window.show_option.return_value = "logical-win"
+        mock_session = MagicMock()
+        mock_session.windows = [renamed_window]
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.send_keys("ses", "logical-win", "hello")
+
+        paste_call = mock_subprocess.run.call_args_list[1]
+        enter_call = mock_subprocess.run.call_args_list[2]
+        assert paste_call.args[0][-1] == "@12"
+        assert enter_call.args[0][-2:] == ["@12", "Enter"]
+        assert tmux._window_ids[("ses", "logical-win")] == "@12"
+
 
 # ── send_keys_via_paste ──────────────────────────────────────────────
 
@@ -384,6 +424,38 @@ class TestGetHistory:
         result = tmux.get_history("ses", "win")
 
         assert result == "line1\nline2\nline3"
+
+    def test_get_history_resolves_stable_window_id_after_application_rename(self, tmux):
+        mock_pane = MagicMock()
+        mock_pane.cmd.return_value.stdout = ["Claude is alive"]
+        renamed_window = MagicMock()
+        renamed_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = renamed_window
+        tmux.server.sessions.get.return_value = mock_session
+        tmux._window_ids[("ses", "logical-win")] = "@9"
+
+        result = tmux.get_history("ses", "logical-win")
+
+        assert result == "Claude is alive"
+        mock_session.windows.get.assert_called_once_with(window_id="@9")
+
+    def test_get_history_recovers_renamed_window_from_tmux_metadata_after_restart(self, tmux):
+        mock_pane = MagicMock()
+        mock_pane.cmd.return_value.stdout = ["Claude survived restart"]
+        renamed_window = MagicMock()
+        renamed_window.window_id = "@15"
+        renamed_window.show_option.return_value = "logical-win"
+        renamed_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows = [renamed_window]
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_history("ses", "logical-win")
+
+        assert result == "Claude survived restart"
+        assert tmux._window_ids[("ses", "logical-win")] == "@15"
+        renamed_window.set_option.assert_called_once_with("@cao_logical_window", "logical-win")
 
     def test_get_history_empty_output(self, tmux):
         mock_pane = MagicMock()
