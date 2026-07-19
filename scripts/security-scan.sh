@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Local mirror of the `security` and `codeql` CI jobs so contributors can catch
-# SSRF/path-injection/SCA findings before pushing. Exits non-zero on any
+# SSRF/path-injection/SCA/secret findings before pushing. Exits non-zero on any
 # scanner failure so it's safe to wire into pre-push hooks or Makefile targets.
 #
 # Usage:
 #   scripts/security-scan.sh                 # run all available scanners
 #   scripts/security-scan.sh trivy           # just Trivy
 #   scripts/security-scan.sh codeql          # just CodeQL (python)
+#   scripts/security-scan.sh gitleaks        # just gitleaks (secret scan, #457)
 #
 # CodeQL installs from Homebrew (macOS) are often broken by Apple's Gatekeeper
 # quarantine (xattr errors followed by silent exit 1). If that's happening,
@@ -83,11 +84,39 @@ run_codeql() {
     fi
 }
 
+# CI pins this gitleaks version; the config's custom rules and the built-in
+# ruleset are validated against it. Older local builds may behave differently
+# (e.g. the private-key rule's key-length threshold changed), so warn on a
+# mismatch rather than trusting whatever is installed.
+GITLEAKS_EXPECTED_VERSION="8.30.1"
+
+run_gitleaks() {
+    echo "==> gitleaks secret scan (git history; config .gitleaks.toml)"
+    if ! command -v gitleaks >/dev/null 2>&1; then
+        echo "  SKIP: gitleaks not on PATH (brew install gitleaks, or see"
+        echo "        https://github.com/gitleaks/gitleaks/releases)"
+        return 0
+    fi
+    local have
+    have="$(gitleaks version 2>/dev/null | tr -d '[:space:]')"
+    if [[ "$have" != "$GITLEAKS_EXPECTED_VERSION" ]]; then
+        echo "  NOTE: local gitleaks $have != CI-pinned $GITLEAKS_EXPECTED_VERSION;"
+        echo "        results may differ from CI. Match the pinned version for parity."
+    fi
+    gitleaks detect \
+        --source "$ROOT_DIR" \
+        --config "$ROOT_DIR/.gitleaks.toml" \
+        --redact \
+        --verbose \
+        --exit-code 1 || exit_code=1
+}
+
 case "$target" in
-    trivy)  run_trivy ;;
-    codeql) run_codeql ;;
-    all)    run_trivy; run_codeql ;;
-    *)      echo "Unknown target: $target (use trivy|codeql|all)"; exit 2 ;;
+    trivy)    run_trivy ;;
+    codeql)   run_codeql ;;
+    gitleaks) run_gitleaks ;;
+    all)      run_trivy; run_codeql; run_gitleaks ;;
+    *)        echo "Unknown target: $target (use trivy|codeql|gitleaks|all)"; exit 2 ;;
 esac
 
 exit "$exit_code"
