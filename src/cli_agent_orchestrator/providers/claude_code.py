@@ -123,8 +123,10 @@ IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" pro
 WAITING_USER_ANSWER_PATTERN = (
     r"↑/↓ to navigate"  # Ink TUI footer shown only while a selection widget is active
 )
+PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
+_DIALOG_BOTTOM_LINES = 15
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # New Claude Code TUI completion summary, e.g. "✻ Sautéed for 1s" /
 # "✶ Cultivated for 12s". Unlike the active spinner (PROCESSING_PATTERN, which
@@ -778,13 +780,51 @@ class ClaudeCodeProvider(BaseProvider):
             if last_idle is None or last_processing.start() > last_idle.start():
                 return TerminalStatus.PROCESSING
 
-        # Check for waiting user answer via the active Ink selection footer.
-        if (
-            re.search(WAITING_USER_ANSWER_PATTERN, output)
-            and not re.search(TRUST_PROMPT_PATTERN, output)
-            and not re.search(BYPASS_PROMPT_PATTERN, output)
+        # Anchor dialog detection to the bottom region only. Dialog chrome is
+        # always rendered at the bottom; matching the full buffer false-positives
+        # on stale scrollback containing "↑/↓ to navigate" (issue #405).
+        lines = output.split("\n")
+        bottom_region = "\n".join(lines[-_DIALOG_BOTTOM_LINES:])
+        # AskUserQuestion footer can be pushed down by notes-hint, error banner,
+        # or IDE status line — use a 6-line anchor.
+        bottom_chrome = "\n".join(lines[-6:])
+
+        if not re.search(TRUST_PROMPT_PATTERN, bottom_region) and not re.search(
+            BYPASS_PROMPT_PATTERN, bottom_region
         ):
-            return TerminalStatus.WAITING_USER_ANSWER
+            # AskUserQuestion: "↑/↓ to navigate" in bottom chrome (last 6 lines).
+            # Known residual: agent prose containing this exact string in the
+            # 6-line footer window of an idle prompt will false-positive as
+            # WAITING. Full fix needs structural composer detection (out of scope).
+            if re.search(WAITING_USER_ANSWER_PATTERN, bottom_chrome):
+                return TerminalStatus.WAITING_USER_ANSWER
+            # Plan-approval: "Would you like to proceed?" with no nav footer.
+            # Guard against dismissed dialog in scrollback: only classify as
+            # WAITING if option markers appear AFTER the plan text AND neither
+            # a separator (────) nor a response marker (⏺/●) follows them —
+            # either indicates the agent proceeded past the dialog.
+            plan_match = re.search(PLAN_APPROVAL_PATTERN, bottom_region)
+            if plan_match:
+                after_plan = bottom_region[plan_match.end() :]
+                has_option_markers = re.search(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE)
+                sep_after_plan = re.search(r"─{20,}", after_plan)
+                response_after_options = False
+                if has_option_markers:
+                    last_option = None
+                    for m in re.finditer(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE):
+                        last_option = m
+                    if last_option:
+                        after_options = after_plan[last_option.end() :]
+                        # EXTRACTION_RESPONSE_PATTERN (not RESPONSE_PATTERN):
+                        # the newest TUI's response marker is ● which
+                        # RESPONSE_PATTERN deliberately excludes, and its
+                        # effort-footer lookahead keeps a "● high · /effort"
+                        # line from counting as dismissal evidence.
+                        response_after_options = bool(
+                            EXTRACTION_RESPONSE_PATTERN.search(after_options)
+                        )
+                if has_option_markers and not sep_after_plan and not response_after_options:
+                    return TerminalStatus.WAITING_USER_ANSWER
 
         # New Claude Code TUI PROCESSING: the input prompt is BOXED between two
         # separators, and the live spinner renders on the line DIRECTLY ABOVE the
