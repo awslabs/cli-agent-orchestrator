@@ -54,6 +54,21 @@ List available providers with installation status.
     "name": "copilot_cli",
     "binary": "copilot",
     "installed": false
+  },
+  {
+    "name": "opencode_cli",
+    "binary": "opencode",
+    "installed": false
+  },
+  {
+    "name": "cursor_cli",
+    "binary": "agent",
+    "installed": false
+  },
+  {
+    "name": "antigravity_cli",
+    "binary": "agy",
+    "installed": true
   }
 ]
 ```
@@ -213,10 +228,12 @@ Send provider-specific exit command to terminal.
 | kiro_cli | `/exit` | Text |
 | claude_code | `/exit` | Text |
 | codex | `/exit` | Text |
-| antigravity_cli | `/exit` | Text |
+| antigravity_cli | `/quit` | Text |
 | hermes | `/exit` | Text |
 | kimi_cli | `/exit` | Text |
 | copilot_cli | `/exit` | Text |
+| opencode_cli | `/exit` | Text |
+| cursor_cli | `/exit` | Text |
 
 **Response:**
 ```json

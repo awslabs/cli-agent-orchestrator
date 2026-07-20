@@ -2,7 +2,7 @@
 
 ## Why this exists
 
-The other CAO providers (`claude_code`, `kiro_cli`, `codex`, `kimi_cli`, `copilot_cli`, `opencode_cli`) all wrap real coding-CLI binaries that need real authentication — Anthropic API keys, Google OAuth, AWS SSO, etc. That auth model is right for production but blocks two classes of work in CI:
+The other CAO providers (`claude_code`, `kiro_cli`, `codex`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `hermes`, `cursor_cli`, `antigravity_cli`) all wrap real coding-CLI binaries that need real authentication — Anthropic API keys, Google OAuth, AWS SSO, etc. That auth model is right for production but blocks two classes of work in CI:
 
 1. **Fork CI cannot access secrets.** GitHub Actions running in a fork can't read `secrets.ANTHROPIC_API_KEY` or equivalent. Any test that hits a real CLI needs credentials plus tmux, so it's marked `integration`/`e2e` and excluded from the default CI run (`pyproject.toml`'s `addopts = -m 'not e2e'`; the per-provider workflows such as `.github/workflows/test-claude-code-provider.yml` run only unit tests). Contributors opening a PR from a fork get no end-to-end signal on their orchestration-layer changes.
 2. **Real CLIs are slow, non-deterministic, and expensive.** Even with credentials, running a real model in CI burns real dollars, varies between runs, and adds 10–60s per terminal lifecycle. Orchestration logic — handoffs, the inbox watchdog, multi-provider sessions — doesn't need a real model; it just needs *something* that behaves like a CLI agent on the terminal-state contract.
