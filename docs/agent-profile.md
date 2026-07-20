@@ -26,6 +26,7 @@ Define the agent's role, responsibilities, and behavior here.
 
 - `role` (string): Agent role that determines default tool access. One of `"supervisor"`, `"developer"`, `"reviewer"`, or a custom role. See [Tool Restrictions](tool-restrictions.md).
 - `provider` (string): Provider to run this agent on (e.g., `"claude_code"`, `"kiro_cli"`). See [Cross-Provider Orchestration](#cross-provider-orchestration).
+- `engine` (string, `kiro_cli` only): Optional Kiro engine selection: `"v2"` or `"kas"`. Omit it to use the default `"v2"` engine. Phase 0 capability-probes and fail-closes `"kas"` before terminal allocation; it does not provide runtime KAS support.
 - `allowedTools` (array): CAO tool vocabulary allowlist. Overrides role-based defaults. Can be used with or without `role`. See [Tool Restrictions](tool-restrictions.md).
 - `skills` (array): Restrict this agent's injected skill catalog to skills whose name matches these patterns (exact names or case-sensitive [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) globs, e.g. `"ads-*"`). Omit for the full catalog; `[]` advertises none. Applies only to runtime-prompt providers (Claude Code, Codex, Antigravity, Kimi). See [Skills](skills.md#scoping-the-catalog-per-agent-skills).
 - `mcpServers` (object): MCP server configurations for additional tools

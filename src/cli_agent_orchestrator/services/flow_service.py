@@ -135,13 +135,23 @@ def _enrich_flow_with_prompt(flow: Flow) -> Flow:
         metadata, prompt = _parse_flow_file(Path(flow.file_path))
     except Exception:
         return Flow.model_validate({**flow.model_dump(), "prompt_template": None})
-    return Flow.model_validate(
-        {
-            **flow.model_dump(),
-            "engine": metadata.get("engine"),
-            "prompt_template": prompt.strip(),
-        }
-    )
+
+    enriched_flow = {
+        **flow.model_dump(),
+        "engine": metadata.get("engine"),
+        "prompt_template": prompt.strip(),
+    }
+    try:
+        return Flow.model_validate(enriched_flow)
+    except ValueError:
+        # Flow files can be edited after registration. Do not let an invalid
+        # engine value in one file prevent callers from reading other flows.
+        logger.warning(
+            "Ignoring invalid engine metadata for flow %s in %s",
+            flow.name,
+            flow.file_path,
+        )
+        return Flow.model_validate({**enriched_flow, "engine": None})
 
 
 def list_flows() -> List[Flow]:

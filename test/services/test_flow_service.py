@@ -324,6 +324,38 @@ class TestListFlows:
 
         assert result == []
 
+    @patch("cli_agent_orchestrator.services.flow_service.db_list_flows")
+    def test_list_flows_isolates_invalid_engine_metadata(self, mock_db_list, tmp_path, caplog):
+        """Invalid engine metadata must not prevent other flows from loading."""
+        flows = []
+        for name, engine in (
+            ("v2-flow", "v2"),
+            ("invalid-flow", "v3"),
+            ("kas-flow", "kas"),
+        ):
+            file_path = tmp_path / f"{name}.md"
+            file_path.write_text(f"---\nname: {name}\nengine: {engine}\n---\nPrompt for {name}.\n")
+            flows.append(
+                Flow(
+                    name=name,
+                    file_path=str(file_path),
+                    schedule="0 * * * *",
+                    agent_profile="developer",
+                    provider="kiro_cli",
+                    next_run=datetime.now(),
+                )
+            )
+        mock_db_list.return_value = flows
+
+        result = list_flows()
+
+        assert [(flow.name, flow.engine) for flow in result] == [
+            ("v2-flow", KiroEngine.V2),
+            ("invalid-flow", None),
+            ("kas-flow", KiroEngine.KAS),
+        ]
+        assert "Ignoring invalid engine metadata for flow invalid-flow" in caplog.text
+
 
 class TestGetFlow:
     """Tests for get_flow function."""

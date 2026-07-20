@@ -72,6 +72,7 @@ Create a new session with one terminal.
 - `agent_profile` (string, required): Agent profile name
 - `session_name` (string, optional): Custom session name
 - `working_directory` (string, optional): Working directory for the agent session
+- `engine` (string, optional): Kiro engine selection (`v2` or `kas`). Omit for the v2 default; Phase 0 rejects KAS before terminal allocation.
 
 **Response:** Terminal object (201 Created)
 
@@ -108,6 +109,7 @@ Create an additional terminal in an existing session.
 - `provider` (string, required): Provider type
 - `agent_profile` (string, required): Agent profile name
 - `working_directory` (string, optional): Working directory for the terminal
+- `engine` (string, optional): Kiro engine selection (`v2` or `kas`). Omit for the v2 default; Phase 0 rejects KAS before terminal allocation.
 - `allowed_tools` (string, optional): Comma-separated list of allowed CAO tools for the worker.
 - `caller_id` (string, optional): Terminal ID of the creating terminal (8-character hexadecimal). Recorded so `send_message` can default replies to the caller (issue #284).
 - `defer_init` (bool, optional, default `false`): When `true`, return as soon as the tmux window and DB record exist, without waiting for `provider.initialize()` to finish. The provider is still created and initialized — but on a background asyncio task on cao-server, so the HTTP round-trip stays under ~2s regardless of provider startup latency. Used by the MCP `assign` tool to keep tool-call latency well under kiro-cli 2.11's ~60s per-tool client timeout, and to allow multiple concurrent assigns to run their init phases in parallel.

@@ -187,6 +187,9 @@ cao launch --agents code_supervisor
 cao launch --agents code_supervisor --provider claude_code
 # Valid: kiro_cli | claude_code | codex | antigravity_cli | hermes | kimi_cli | copilot_cli | opencode_cli | cursor_cli
 
+# Optionally select the explicit Kiro v2 engine (v2 is the default)
+cao launch --agents code_supervisor --provider kiro_cli --engine v2
+
 # Unrestricted access, skip confirmation (DANGEROUS)
 cao launch --agents code_supervisor --yolo
 ```
