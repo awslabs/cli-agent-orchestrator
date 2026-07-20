@@ -12,7 +12,20 @@
     },
     "description": {
       "type": "string",
+      "maxLength": 1024,
       "description": "Brief description of the agent's purpose."
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {"type": "string", "maxLength": 128},
+      "maxItems": 32,
+      "description": "Short capability statements used by profile discovery (e.g. 'query dynamodb tables')."
+    },
+    "tags": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+      "maxItems": 32,
+      "description": "Keyword tags used by profile discovery (e.g. 'sqs', 'monitoring')."
     },
     "role": {
       "type": "string",

@@ -775,6 +775,49 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
+    def test_get_status_own_line_effort_footer_only_is_idle(self):
+        """GH #459: on Claude Code v2.1.212 the effort footer can render on its
+        OWN line at column 0 ("● high · /effort"), not just mid-line after
+        "esc to interrupt". A fresh terminal whose only "●" content is this
+        footer must read IDLE, not COMPLETED — there is no response yet.
+        """
+        output = "● high · /effort\n❯ \n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
+    def test_get_status_post_paste_stale_own_line_effort_footer_not_completed(self):
+        """GH #459 exact premature-exit trigger: a task was just pasted (echoed
+        by the ❯ line), the worker has not produced a spinner or response yet,
+        and the only "●" content is a stale own-line effort footer. This must
+        NOT read COMPLETED — a false COMPLETED here is what drove `handoff` to
+        paste `/exit` into a still-running worker.
+        """
+        box = "─" * 24
+        output = (
+            "❯ Delegate to developer: create fizzbuzz.py\n"
+            "● high · /effort\n" + box + "\n❯ \n" + box + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) != TerminalStatus.COMPLETED
+
+    def test_get_status_live_spinner_above_own_line_effort_footer_is_processing(self):
+        """GH #459 box-walk: a live spinner renders above the input box with an
+        own-line effort footer sitting BETWEEN the spinner and the box's top
+        border. The box-walk must skip the footer line (like it already skips
+        blank lines and "⎿" hints) to still see the spinner → PROCESSING.
+        """
+        box = "─" * 30
+        output = "✢ Cultivating…\n● high · /effort\n" + box + "\n\n❯ \n\n" + box + "\n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_get_status_own_line_effort_footer_medium_level_is_idle(self):
+        """The effort footer's level varies by setting ("medium", "low", etc.),
+        not just "high" — the exclusion must not be hardcoded to one level."""
+        output = "● medium · /effort\n❯ \n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
 
 class TestClaudeCodeProviderNativeStatus:
     """Tests for get_status() native-first path (herdr backend)."""
@@ -1059,6 +1102,56 @@ Map<String, List<Integer>> nested = getMap();
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         with pytest.raises(ValueError, match="No Claude Code response found"):
             provider.extract_last_message_from_script(output)
+
+    def test_extract_message_own_line_effort_footer_not_a_marker(self):
+        """GH #459: on v2.1.212 the effort footer can render on its OWN line at
+        column 0 ("● high · /effort"), where the start-of-line anchor alone no
+        longer excludes it. A buffer whose only "●"-prefixed line is this
+        footer must still yield no response, not the footer text itself
+        mistaken for a message."""
+        output = "● high · /effort\n❯ \n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        with pytest.raises(ValueError, match="No Claude Code response found"):
+            provider.extract_last_message_from_script(output)
+
+    def test_extract_message_styled_own_line_effort_footer_not_a_marker(self):
+        """GH #459 follow-up: real ``tmux capture-pane -e`` output re-renders
+        the pane's SGR color state, so the own-line effort footer arrives
+        wrapped in ANSI codes with a trailing reset directly after "/effort"
+        (e.g. "\\x1b[38;5;246m● high · /effort\\x1b[39m"). That reset must not
+        defeat the exclusion lookahead in EXTRACTION_RESPONSE_PATTERN — a real
+        answer followed by this styled footer must still extract the answer,
+        not the footer's own text."""
+        output = (
+            "● def greet(name):\n"
+            '    return f"Hello, {name}!"\n\n'
+            "\x1b[38;5;246m●  high  ·  /effort\x1b[39m\n"
+            "❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "def greet(name):" in result
+        assert 'return f"Hello, {name}!"' in result
+        assert "effort" not in result
+        assert "high" not in result
+
+    def test_extract_message_own_line_effort_footer_not_leaked_into_response(self):
+        """GH #459 follow-up: the own-line effort footer can render directly
+        below a real response, before the idle prompt or any other stop
+        condition. The line-collection loop must treat it as a stop boundary
+        like the separator and completion-summary lines — not append its text
+        onto the extracted answer as trailing garbage."""
+        output = (
+            "● def greet(name):\n" '    return f"Hello, {name}!"\n\n' "● high · /effort\n" "❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "def greet(name):" in result
+        assert 'return f"Hello, {name}!"' in result
+        assert "effort" not in result
+        assert "high" not in result
 
     def test_extract_message_with_table_not_truncated(self):
         """Extraction must NOT stop at table borders containing ─ runs inside │ box chars."""

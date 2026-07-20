@@ -25,6 +25,8 @@ Define the agent's role, responsibilities, and behavior here.
 ## Optional Fields
 
 - `role` (string): Agent role that determines default tool access. One of `"supervisor"`, `"developer"`, `"reviewer"`, or a custom role. See [Tool Restrictions](tool-restrictions.md).
+- `capabilities` (array): Short free-text capability statements (max 32 items, 128 chars each) used by profile discovery — `cao profile find` and the `find_profiles` MCP tool rank profiles by matching query keywords against name, description, tags, and capabilities. Example: `["inspect dead letter queues"]`.
+- `tags` (array): Keyword tags (max 32 items; `A-Za-z0-9_-`, 64 chars each) used by profile discovery. Useful for synonyms the description doesn't contain (e.g. `["dlq", "dead-letter", "sqs"]`).
 - `provider` (string): Provider to run this agent on (e.g., `"claude_code"`, `"kiro_cli"`). See [Cross-Provider Orchestration](#cross-provider-orchestration).
 - `engine` (string, `kiro_cli` only): Optional Kiro engine selection: `"v2"` or `"kas"`. Omit it to use the default `"v2"` engine. Phase 0 capability-probes and fail-closes `"kas"` before terminal allocation; it does not provide runtime KAS support.
 - `allowedTools` (array): CAO tool vocabulary allowlist. Overrides role-based defaults. Can be used with or without `role`. See [Tool Restrictions](tool-restrictions.md).
