@@ -189,6 +189,14 @@ uv run mypy src/
 uv run pytest -v
 ```
 
+### Validate Markdown Links
+
+Validate maintained local Markdown paths and heading fragments:
+
+```bash
+uv run python scripts/validate_markdown_links.py
+```
+
 ## Development Workflow
 
 ### 1. Create a Feature Branch

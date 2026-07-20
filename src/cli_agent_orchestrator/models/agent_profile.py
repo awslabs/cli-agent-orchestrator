@@ -46,6 +46,11 @@ class AgentProfile(BaseModel):
     # by CAO when composing the prompt, not passed through to provider JSON.
     skills: Optional[List[str]] = None
 
+    # Discovery metadata used by `cao profile find` / the find_profiles MCP
+    # tool (#340). Declared here so parse paths built on this model keep the
+    # fields (pydantic silently drops undeclared keys).
+    capabilities: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
     # CAO-native. Host->guest path maps for container-backed agents. Consumed by
     # the provider layer to translate host paths (e.g. temp prompt/MCP files)
     # into the guest paths the containerized CLI sees; not passed to provider JSON.
