@@ -175,10 +175,18 @@ PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS = _env_int("CAO_PIPE_LIVENESS_MAX_COLD_STA
 # unaffected. Set CAO_PYTE_STATUS=false to fall back to the raw-stream path.
 CAO_PYTE_STATUS = os.environ.get("CAO_PYTE_STATUS", "true").lower() == "true"
 
-# pyte screen geometry — mirror the tmux pane size (clients/tmux.py x=220 y=50)
-# so the rendered viewport matches what the agent's TUI actually drew.
-PYTE_SCREEN_COLS = 220
-PYTE_SCREEN_ROWS = 50
+# pyte screen geometry. CAO's tmux client creates panes at 220x50, but when a
+# user ATTACHES a terminal larger than that, tmux resizes the panes to the
+# client size and the agent's TUI redraws to fill it. The pyte composite must be
+# at least as large as any attached terminal, or the bottom-anchored input box
+# (────/❯/────) renders BELOW the composite and get_status_from_screen never
+# sees the idle/ready prompt → init/turn detection times out (observed live with
+# a 215x62 terminal: the ❯ box landed on row ~60, off a 50-row pyte screen).
+# Oversize generously so no realistic terminal clips; extra blank rows/cols are
+# harmless (get_status_from_screen filters blank lines and anchors on the bottom
+# non-blank rows). See also clients/tmux.py default pane size.
+PYTE_SCREEN_COLS = 400
+PYTE_SCREEN_ROWS = 200
 
 # Quiescence debounce for rendered-screen detection (seconds). Detection runs on
 # two edges: the RISING edge (output resumes after quiet → likely PROCESSING)
