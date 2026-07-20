@@ -1643,6 +1643,32 @@ class TestCodexProviderTrustPrompt:
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_detected_and_accepted_new_wording(self, mock_tmux):
+        """codex-cli reworded the trust dialog (observed on 0.144.1): "Do you
+        trust the contents of this directory? … › 1. Yes, continue / 2. No,
+        quit". The handler must still detect it and auto-accept, otherwise the
+        worker hangs on the unanswered prompt until it times out.
+        """
+        mock_tmux.return_value.get_history.return_value = (
+            "> You are in /Users/test/project\n"
+            "\n"
+            "  Do you trust the contents of this directory? Working with "
+            "untrusted contents comes with higher risk of prompt injection. "
+            "Trusting the directory allows project-local config, hooks, and "
+            "exec policies to load.\n"
+            "› 1. Yes, continue\n"
+            "  2. No, quit\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=2.0)
+
+        mock_tmux.return_value.send_special_key.assert_called_once_with(
+            "test-session", "window-0", "Enter"
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_handle_trust_prompt_not_needed(self, mock_tmux):
         """Test early return when Codex starts without trust prompt."""
         mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)\n› "
@@ -1664,6 +1690,20 @@ class TestCodexProviderTrustPrompt:
         status = provider.get_status(output)
 
         # Should be WAITING_USER_ANSWER (not PROCESSING despite "running" in text)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_trust_prompt_new_wording_is_waiting_user_answer(self):
+        """The reworded trust dialog (codex-cli 0.144.1) must also report
+        WAITING_USER_ANSWER so the terminal isn't mistaken for PROCESSING."""
+        output = (
+            "> You are in /Users/test/project\n"
+            "Do you trust the contents of this directory?\n"
+            "› 1. Yes, continue\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
     @pytest.mark.asyncio
