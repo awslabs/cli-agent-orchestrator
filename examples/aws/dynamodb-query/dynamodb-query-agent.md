@@ -1,6 +1,14 @@
 ---
 name: dynamodb-query-agent
 description: Query DynamoDB tables by partition key
+tags:
+  - aws
+  - dynamodb
+  - query
+  - read
+capabilities:
+  - "query DynamoDB tables by partition key"
+  - "inspect item attributes and counts"
 allowedTools:
   - execute_bash
   - fs_read

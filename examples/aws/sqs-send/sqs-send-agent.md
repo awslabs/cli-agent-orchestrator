@@ -1,6 +1,14 @@
 ---
 name: sqs-send-agent
 description: Send a message to an SQS queue
+tags:
+  - aws
+  - sqs
+  - send
+  - message
+capabilities:
+  - "send messages to an SQS queue"
+  - "set message attributes and group IDs"
 allowedTools:
   - execute_bash
   - fs_read
