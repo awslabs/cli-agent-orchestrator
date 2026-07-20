@@ -16,3 +16,11 @@ body {
   outline-offset: 2px;
 }
 
+/* The terminal translates finger swipes into wheel events itself (see
+   TerminalView). Opt out of the browser's native pan/zoom gestures so they
+   don't hijack the swipe before it reaches our handler. */
+.xterm,
+.xterm .xterm-screen {
+  touch-action: none;
+}
+

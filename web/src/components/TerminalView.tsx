@@ -11,6 +11,12 @@ interface TerminalViewProps {
   onClose: () => void
 }
 
+const TERMINAL_FONT_SIZE = 14
+
+// Fallback row height (px) used only when the container has not been laid out
+// yet, so a touch delta can still be turned into whole wheel notches.
+const DEFAULT_LINE_HEIGHT = Math.round(TERMINAL_FONT_SIZE * 1.2)
+
 export function TerminalView({ terminalId, provider, agentProfile, onClose }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
 
@@ -20,7 +26,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
 
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 14,
+      fontSize: TERMINAL_FONT_SIZE,
       fontFamily: 'JetBrains Mono, Menlo, Monaco, Consolas, monospace',
       scrollback: 10000,
       theme: {
@@ -42,6 +48,93 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     const fitAddon = new FitAddon()
     term.loadAddon(fitAddon)
     term.open(el)
+
+    // Touch-scroll support. xterm.js core forwards DOM `wheel` events as
+    // mouse-wheel escape sequences whenever the attached app is in
+    // mouse-tracking mode (here: tmux with `mouse on`), which is why a desktop
+    // mouse wheel scrolls the terminal. xterm has no touch handling, so a finger
+    // swipe on a phone produces no wheel event and nothing scrolls. Translate a
+    // single-finger vertical swipe into synthetic `wheel` events dispatched onto
+    // xterm's root element, driving that same already-working path so the swipe
+    // produces the same kind of mouse-wheel report the server already acts on.
+    // (Equivalent in effect to a desktop wheel — not necessarily byte-identical,
+    // since coordinates and delta encoding differ; see the caveats below.)
+    //
+    // Emit line-mode deltas (DOM_DELTA_LINE, one notch per row of travel) rather
+    // than pixel deltas: xterm 6 treats a small pixel-mode wheel delta as a
+    // trackpad and damps it to ~0.3 of a line, which would make touch scrolling
+    // roughly 3x too slow. The line-mode path bypasses that damping, so one row
+    // of finger travel scrolls one line.
+    //
+    // Scope/caveats (kept deliberately minimal; both worth noting upstream):
+    //   - Mouse-tracking only. This scrolls when the attached app is in
+    //     mouse-tracking mode (tmux `mouse on`, or alt-buffer apps that report
+    //     the wheel). In a plain shell the synthetic event reaches no listener —
+    //     xterm's own scrollback viewport listens on a descendant element, not
+    //     term.element — so a swipe does nothing there.
+    //   - Single pane. The synthetic wheel carries default coordinates (col 1,
+    //     row 1), so a multi-pane tmux layout routes every swipe to the
+    //     top-left pane rather than the pane under the finger.
+    // Desktop behavior is untouched (touch-only listeners).
+    const wheelTarget = term.element ?? el
+
+    // Row height in px, so a swipe distance maps to a matching number of wheel
+    // notches. Derived from the live geometry (no private xterm internals);
+    // falls back to a font-size estimate before the first layout.
+    const rowHeight = (): number => {
+      const rows = term.rows
+      const height = el.clientHeight
+      return rows > 0 && height > 0 ? height / rows : DEFAULT_LINE_HEIGHT
+    }
+
+    let touchY: number | null = null
+    let scrollAcc = 0
+
+    const onTouchStart = (ev: TouchEvent) => {
+      if (ev.touches.length !== 1) {
+        touchY = null
+        return
+      }
+      touchY = ev.touches[0].clientY
+      scrollAcc = 0
+    }
+
+    const onTouchMove = (ev: TouchEvent) => {
+      if (touchY === null || ev.touches.length !== 1) return
+      const y = ev.touches[0].clientY
+      // Finger moving up (clientY decreasing) scrolls toward newer output,
+      // matching a downward mouse-wheel notch.
+      scrollAcc += touchY - y
+      touchY = y
+      const lineH = rowHeight()
+      while (Math.abs(scrollAcc) >= lineH) {
+        const dir = scrollAcc > 0 ? 1 : -1
+        // One line-mode notch per row of accumulated travel. The pixel
+        // accumulator (lineH per notch) sets the cadence; DOM_DELTA_LINE keeps
+        // xterm 6 from damping the delta as a trackpad gesture.
+        wheelTarget.dispatchEvent(
+          new WheelEvent('wheel', {
+            deltaY: dir,
+            deltaMode: WheelEvent.DOM_DELTA_LINE,
+            bubbles: true,
+            cancelable: true,
+          })
+        )
+        scrollAcc -= dir * lineH
+      }
+      // Stop the browser from panning the page / rubber-banding instead.
+      ev.preventDefault()
+    }
+
+    const endTouch = () => {
+      touchY = null
+      scrollAcc = 0
+    }
+
+    el.addEventListener('touchstart', onTouchStart, { passive: true })
+    el.addEventListener('touchmove', onTouchMove, { passive: false })
+    el.addEventListener('touchend', endTouch, { passive: true })
+    el.addEventListener('touchcancel', endTouch, { passive: true })
 
     // Connect WebSocket
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -114,6 +207,10 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       cancelAnimationFrame(initialFit)
       clearTimeout(resizeTimer)
       resizeObserver.disconnect()
+      el.removeEventListener('touchstart', onTouchStart)
+      el.removeEventListener('touchmove', onTouchMove)
+      el.removeEventListener('touchend', endTouch)
+      el.removeEventListener('touchcancel', endTouch)
       ws.close()
       term.dispose()
     }
