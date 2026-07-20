@@ -46,6 +46,8 @@ cao --help
 For a tagged release, install
 [`cli-agent-orchestrator` from PyPI](https://pypi.org/project/cli-agent-orchestrator/).
 See [DEVELOPMENT.md](DEVELOPMENT.md) for a source checkout.
+For container-based installation, see the
+[devcontainer feature](docs/devcontainer-feature.md).
 
 To update an existing CAO installation:
 
@@ -110,8 +112,8 @@ provider override while keeping the same sequence.
 
 ### Configure and integrate
 
-- [Agent profiles](docs/agent-profile.md): profile schema, provider selection,
-  and overrides.
+- [Agent profiles](docs/agent-profile.md): profile schema, discovery, provider
+  selection, and overrides.
 - [HTTP API and PTY WebSocket](docs/api.md): route-family overview and terminal
   streaming contract.
 - [Plugins](docs/plugins.md): outbound events, installation, and authoring.

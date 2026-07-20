@@ -52,6 +52,45 @@ CAO already speaks MCP and benefits from tool discovery and structured
 arguments. The server forwards operations to a running `cao-server`; it does
 not replace the in-session `cao-mcp-server`.
 
+Start `cao-server` before the MCP server. By default, both use
+`http://localhost:9889`; when CAO uses a custom endpoint, set `CAO_API_HOST` and
+`CAO_API_PORT` in the MCP server environment to match it.
+
+For Claude Code, add this stdio server to `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "cao-ops-mcp": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+        "cao-ops-mcp-server"
+      ]
+    }
+  }
+}
+```
+
+For other MCP clients, configure the equivalent stdio command:
+
+```bash
+uvx --from git+https://github.com/awslabs/cli-agent-orchestrator.git@main cao-ops-mcp-server
+```
+
+The current tools are grouped by purpose:
+
+- Profiles: `list_profiles`, `get_profile_details`, `install_profile`
+- Launch and messaging: `launch_session`, `send_session_message`
+- Terminal inspection: `read_session_output`, `get_terminal_status`,
+  `get_terminal_output`
+- Session lifecycle: `list_sessions`, `get_session_info`, `shutdown_session`
+
+MCP tool discovery is authoritative for clients. The declarations in
+[`ops_mcp_server/server.py`](../src/cli_agent_orchestrator/ops_mcp_server/server.py)
+are the source of truth when the server surface changes.
+
 Choose the surface by caller:
 
 | Caller | Preferred surface |

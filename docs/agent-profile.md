@@ -35,6 +35,10 @@ portable and make profile listings useful.
   or `reviewer`.
 - `allowedTools` (array of strings): explicit CAO tool allowlist; when present,
   it overrides the role defaults.
+- `capabilities` (array of strings): profile-discovery statements, with at most
+  32 strings and 128 characters per string.
+- `tags` (array of strings): profile-discovery keywords, with at most 32 values;
+  each value must match `A-Za-z0-9_-` and contain at most 64 characters.
 - `skills` (array of strings): exact names or case-sensitive
   [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) patterns limiting
   the advertised skill catalog. Omit it for the full catalog; use `[]` for
@@ -123,3 +127,17 @@ cao install https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/mai
 
 Packaged examples are available in the
 [agent store](https://github.com/awslabs/cli-agent-orchestrator/tree/main/src/cli_agent_orchestrator/agent_store).
+
+### Profile discovery
+
+Search installed profiles by capability when the profile name is not known:
+
+```bash
+cao profile find "monitor sqs"
+cao profile find "monitor sqs" --limit 3 --json
+```
+
+The CLI and the read-only `find_profiles` MCP tool search profile names,
+descriptions, tags, and capabilities. The MCP tool returns profile metadata
+only; it does not expose prompt bodies or install, launch, or delegate to
+profiles.

@@ -49,6 +49,8 @@ dependencies = [
     # Obsidian graph sink (Issue #348) imports yaml at module top; declare it
     # directly instead of relying on a transitive dep so the import can't break.
     "pyyaml>=6.0",
+    # Markdown parser used by the repository-local link validator.
+    "markdown-it-py>=4.0.0",
     # `cao update` reads uv's install receipt (TOML). tomllib is stdlib on 3.11+;
     # on 3.10 the fallback `import tomli` runs. cli/main.py imports the update
     # command unconditionally, so tomli must be a RUNTIME dependency on 3.10 —
