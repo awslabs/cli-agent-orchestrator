@@ -285,6 +285,88 @@ jobs:
           if-no-files-found: warn
         continue-on-error: true
 
+  agui-construct-demos:
+    name: AG-UI construct demos (shift-left recordings)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (constructs + examples run under uv)
+        run: uv sync --all-extras --dev
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install recorder deps
+        # ffmpeg is provided by the ffmpeg-static npm package (gif-capable), so
+        # no apt install is needed here.
+        run: npm install
+        working-directory: examples/agui-construct-demos/tools
+
+      - name: Install Playwright browser (chromium)
+        run: npm run playwright:install
+        working-directory: examples/agui-construct-demos/tools
+
+      - name: Record per-feature demos (asserts each construct; gates on drift)
+        # For each of the four L2 constructs, runs its asserting example in
+        # offline/synthetic mode and exports docs/media/agui-<slug>-demo.gif.
+        # A non-zero example exit (a construct regressed) fails this job —
+        # this is the shift-left gate.
+        run: npm run record
+        working-directory: examples/agui-construct-demos/tools
+
+      - name: Upload construct demo GIFs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agui-construct-demos
+          path: docs/media/agui-*-demo.gif
+          if-no-files-found: warn
+        continue-on-error: true
+
+  agui-stock-client-live:
+    name: AG-UI stock-client live (AC3)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (cao-server + agui run plane)
+        run: uv sync --all-extras --dev
+
+      - name: Set up Node.js (for the @ag-ui/client stock SDK)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run stock-client live demo (asserts >=1 post-connect frame)
+        # Boots a CAO_AGUI_ENABLED cao-server with a keyless mock_cli fleet,
+        # POSTs a RunAgentInput to /agui/v1/run with the pinned @ag-ui/client
+        # HttpAgent, and asserts a live frame is received (AC3 / spec task 17.2).
+        # Non-zero exit fails the job; the script cleans up the server on exit.
+        run: ./examples/agui-stock-client-live/run.sh
+
   security:
     name: Security Scan
     runs-on: ubuntu-latest
