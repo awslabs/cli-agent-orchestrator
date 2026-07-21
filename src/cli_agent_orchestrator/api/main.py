@@ -520,6 +520,14 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("output-pipeline reattach failed", exc_info=True)
 
+    # Restart recovery: drop persisted session-env rows whose tmux session no
+    # longer exists (torn down while the server was dead); live-session rows
+    # are retained so post-restart windows keep receiving the forwarded env.
+    try:
+        await asyncio.to_thread(terminal_service.reconcile_session_env)
+    except Exception:
+        logger.warning("session-env reconcile failed", exc_info=True)
+
     # Start temporary OpenCode inbox poller. GH #115 tracks replacing this
     # provider-specific wakeup path with a unified delivery engine.
     opencode_inbox_task = asyncio.create_task(opencode_inbox_delivery_daemon(registry))

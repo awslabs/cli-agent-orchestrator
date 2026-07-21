@@ -130,6 +130,28 @@ class ProjectAliasModel(Base):
     created_at = Column(DateTime(timezone=True), default=_utcnow)
 
 
+class SessionEnvModel(Base):
+    """SQLAlchemy model for persisted per-session forwarded env vars (issue #248).
+
+    One row per tmux session holding the ``cao launch --env KEY=VALUE`` mapping
+    as a JSON object, so the forwarded env survives a cao-server restart and
+    windows created post-restart pick it up again. The in-memory map in
+    ``services/session_env.py`` is only a cache over this table. Columns are
+    TEXT (not VARCHAR) so the ``create_all`` schema matches the raw
+    ``_migrate_session_env`` DDL byte-for-byte.
+
+    Values are stored PLAINTEXT. The DB file is already 0600 in a 0700 dir,
+    and forwarded values are expected to be non-secret path/routing data —
+    do not forward secrets through ``--env``.
+    """
+
+    __tablename__ = "session_env"
+
+    session_name = Column(Text, primary_key=True)
+    env_vars = Column(Text, nullable=False)  # JSON object: {str: str}
+    updated_at = Column(Text, nullable=False)  # ISO-8601 UTC timestamp
+
+
 class FlowModel(Base):
     """SQLAlchemy model for flow metadata."""
 
@@ -181,6 +203,7 @@ def init_db() -> None:
     _migrate_workflow_index()
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    _migrate_session_env()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -492,6 +515,34 @@ def _migrate_workflow_run_step() -> None:
                 logger.info("Migration: added call_fingerprint column to workflow_run_step")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run_step migration skipped: {e}")
+
+
+def _migrate_session_env() -> None:
+    """Create the durable ``session_env`` table if missing (issue #248 durability).
+
+    Persists the per-session forwarded env (``cao launch --env``) so it
+    survives a cao-server restart. Idempotent (``CREATE TABLE IF NOT EXISTS``),
+    zero-arg and self-connecting — mirrors ``_migrate_workflow_run``. Fresh DBs
+    get the same DDL from ``Base.metadata.create_all`` via ``SessionEnvModel``;
+    this covers DBs created before the model existed. Failure is logged at
+    debug and never propagated — a missing table here is fail-closed at read
+    time in ``services/session_env.get_session_env`` instead.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS session_env ("
+                "session_name TEXT PRIMARY KEY, "
+                "env_vars TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 — read path fails closed instead
+        logger.debug(f"session_env migration skipped: {e}")
 
 
 def _migrate_terminals_schema() -> None:

@@ -1339,3 +1339,17 @@ def reattach_existing_output_pipelines() -> dict:
             skipped.append(terminal_id)
     logger.info("Re-attached output pipelines: %d re-attached, %d skipped", len(reattached), len(skipped))
     return {"reattached": reattached, "skipped": skipped}
+
+
+def reconcile_session_env() -> dict:
+    """Drop persisted session-env rows whose tmux session no longer exists.
+
+    Restart recovery companion to ``reattach_existing_output_pipelines``:
+    sessions torn down while the server was dead leave ``session_env`` rows
+    behind, and a later same-named session must not inherit stale forwarded
+    env. Live-session rows are retained so windows created post-restart still
+    receive the persisted env (issue #248 durability).
+    """
+    from cli_agent_orchestrator.services import session_env
+
+    return session_env.reconcile_session_env(get_backend().session_exists)
