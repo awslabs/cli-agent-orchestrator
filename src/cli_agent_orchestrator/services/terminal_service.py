@@ -1289,3 +1289,53 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")
         raise
+
+
+def reattach_existing_output_pipelines() -> dict:
+    """Re-attach the FIFO -> EventBus output pipeline for terminals that already
+    exist in the database (server restart recovery).
+
+    FIFO readers and ``pipe-pane`` are normally wired only in create_terminal, so
+    a restarted server leaves pre-existing terminals with no output feed: their
+    status sticks at UNKNOWN forever and idle-gated inbox delivery to them never
+    fires. For each DB terminal whose tmux window still exists, recreate the
+    reader and stop/start pipe-pane (stop-then-start, not a bare toggle — a
+    stale pane still reports pane_pipe=1). Terminals whose window is gone are
+    skipped (stale rows; deletion is left to normal lifecycle paths).
+    """
+    from cli_agent_orchestrator.clients.database import list_all_terminals
+
+    backend = get_backend()
+    reattached, skipped = [], []
+    if backend.supports_event_inbox():
+        return {"reattached": reattached, "skipped": skipped}
+    for row in list_all_terminals():
+        terminal_id = row["id"]
+        session_name, window_name = row["tmux_session"], row["tmux_window"]
+        try:
+            backend.get_history(session_name, window_name, tail_lines=1)
+        except Exception:
+            skipped.append(terminal_id)
+            continue
+        try:
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+            def _probe_pane(s=session_name, w=window_name) -> str:
+                return backend.get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+                backend.stop_pipe_pane(s, w)
+                backend.pipe_pane(s, w, p)
+
+            fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
+            backend.stop_pipe_pane(session_name, window_name)
+            backend.pipe_pane(session_name, window_name, str(fifo_path))
+            # Nudge a fresh prompt line through the new pipe so StatusMonitor
+            # leaves UNKNOWN promptly (same rationale as the create path).
+            backend.send_special_key(session_name, window_name, "Enter")
+            reattached.append(terminal_id)
+        except Exception:
+            logger.warning("could not re-attach output pipeline for %s", terminal_id, exc_info=True)
+            skipped.append(terminal_id)
+    logger.info("Re-attached output pipelines: %d re-attached, %d skipped", len(reattached), len(skipped))
+    return {"reattached": reattached, "skipped": skipped}

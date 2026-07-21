@@ -512,6 +512,14 @@ async def lifespan(app: FastAPI):
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
+    # Restart recovery: re-attach output pipelines for terminals created by a
+    # previous server process, else their status sticks at UNKNOWN and
+    # idle-gated inbox delivery to them never fires.
+    try:
+        await asyncio.to_thread(terminal_service.reattach_existing_output_pipelines)
+    except Exception:
+        logger.warning("output-pipeline reattach failed", exc_info=True)
+
     # Start temporary OpenCode inbox poller. GH #115 tracks replacing this
     # provider-specific wakeup path with a unified delivery engine.
     opencode_inbox_task = asyncio.create_task(opencode_inbox_delivery_daemon(registry))
