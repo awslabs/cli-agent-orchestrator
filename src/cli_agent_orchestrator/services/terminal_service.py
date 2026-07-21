@@ -163,6 +163,9 @@ async def create_terminal(
     """Create a new terminal with an initialized CLI agent.
 
     This function orchestrates the complete terminal creation workflow:
+    0. (new sessions only) Preflight: strictly pre-clear any stale persisted
+       session env BEFORE any resource exists — a failure aborts with zero
+       cleanup actions
     1. Generate unique terminal ID and window name
     2. Create tmux session/window (new or existing)
     3. Save terminal metadata to database
@@ -195,6 +198,35 @@ async def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    # cond-0067: the no-env/new-session strict pre-clear is a TRUE PREFLIGHT.
+    # It runs BEFORE terminal-ID generation and OUTSIDE the resource-owning
+    # try/except below, so if it fails, creation aborts with ZERO cleanup
+    # actions: at this point the invocation has acquired nothing, and cleanup
+    # may only ever touch resources this invocation itself acquired. (When
+    # this pre-clear sat inside the broad cleanup try, a failure still drove
+    # FIFO stop/unlink, status clear, provider cleanup, and terminal-row
+    # delete against the freshly generated — possibly 32-bit-colliding —
+    # terminal ID, destroying an unrelated live terminal's state.)
+    if new_session:
+        if not session_name:
+            session_name = generate_session_name()
+
+        # Ensure session name has the CAO prefix for identification
+        if not session_name.startswith(SESSION_PREFIX):
+            session_name = f"{SESSION_PREFIX}{session_name}"
+
+        # Prevent duplicate sessions
+        if get_backend().session_exists(session_name):
+            raise ValueError(f"Session '{session_name}' already exists")
+
+        # Wipe any stale mapping a prior aborted lifecycle for this name
+        # may have left behind, so a no-env relaunch can't inherit them.
+        # Strict (cond-0050): if the durable delete cannot complete, this
+        # raises and creation aborts BEFORE any tmux session/provider/
+        # window/terminal side effect — a session name may never be
+        # reused over an unconfirmed stale row.
+        clear_session_env(session_name)
+
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
     # already-existing session (the `new_session=False` branch below — what
@@ -215,22 +247,6 @@ async def create_terminal(
 
         # Step 2: Create tmux session or window
         if new_session:
-            # Ensure session name has the CAO prefix for identification
-            if not session_name.startswith(SESSION_PREFIX):
-                session_name = f"{SESSION_PREFIX}{session_name}"
-
-            # Prevent duplicate sessions
-            if get_backend().session_exists(session_name):
-                raise ValueError(f"Session '{session_name}' already exists")
-
-            # Wipe any stale mapping a prior aborted lifecycle for this name
-            # may have left behind, so a no-env relaunch can't inherit them.
-            # Strict (cond-0050): if the durable delete cannot complete, this
-            # raises and creation aborts BEFORE any tmux session/provider/
-            # window/terminal side effect — a session name may never be
-            # reused over an unconfirmed stale row.
-            clear_session_env(session_name)
-
             # Create new tmux session with initial window
             get_backend().create_session(
                 session_name,

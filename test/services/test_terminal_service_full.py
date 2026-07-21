@@ -1259,6 +1259,183 @@ class TestCreateTerminalSessionEnvStore:
         fast_engine.dispose()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    async def test_failed_preclear_preserves_colliding_live_terminal_state(
+        self,
+        mock_gen_id,
+        mock_tmux,
+        mock_db_delete,
+        real_store,
+        monkeypatch,
+        tmp_path,
+    ):
+        """cond-0067 forced-collision regression: generated terminal IDs carry
+        only 32 bits, so force the would-be generated ID to collide with an
+        unrelated LIVE terminal, inject durable pre-clear exhaustion, and prove
+        the abort touches nothing — the unrelated terminal's DB row, FIFO
+        bytes, status entry, and provider state are preserved byte-for-byte,
+        every cleanup seam records ZERO calls, the stale session-env row is
+        retained, and creation aborts before any terminal-ID-dependent work."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+        from cli_agent_orchestrator.services import fifo_reader, session_env, terminal_service
+        from cli_agent_orchestrator.services.fifo_reader import FifoManager
+        from cli_agent_orchestrator.services.session_env import SessionEnvStoreError
+
+        collision_id = "deadbeef"
+        db_path = real_store.url.database
+
+        # Seed the unrelated live terminal's full state under the exact ID the
+        # generator would have been forced to return: durable DB row, on-disk
+        # FIFO, status entry, and provider state.
+        database.create_terminal(
+            collision_id, "cao-unrelated-live", "unrelated-window", "kiro_cli", "developer"
+        )
+
+        def terminal_row_state():
+            with database.SessionLocal() as db:
+                row = db.query(database.TerminalModel).filter_by(id=collision_id).first()
+                return (
+                    None
+                    if row is None
+                    else tuple(
+                        (column.name, getattr(row, column.name))
+                        for column in database.TerminalModel.__table__.columns
+                    )
+                )
+
+        row_before = terminal_row_state()
+        assert row_before is not None
+
+        collateral_dir = tmp_path / "fifos"
+        collateral_dir.mkdir()
+        collateral_fifo = collateral_dir / f"{collision_id}.fifo"
+        sentinel_bytes = b"unrelated live terminal sentinel\x00\xffbytes"
+        collateral_fifo.write_bytes(sentinel_bytes)
+        monkeypatch.setattr(fifo_reader, "FIFO_DIR", collateral_dir)
+        # Real managers wrapped in spies: if any cleanup seam fired, the
+        # destruction would be REAL (unlink/row-delete/provider removal) and
+        # the spy would record it.
+        fifo = FifoManager()
+        fifo_stop_spy = MagicMock(wraps=fifo.stop_reader)
+        monkeypatch.setattr(fifo, "stop_reader", fifo_stop_spy)
+        monkeypatch.setattr(terminal_service, "fifo_manager", fifo)
+
+        provider_cleaned = []
+
+        class ExistingProvider:
+            def cleanup(self):
+                provider_cleaned.append(collision_id)
+
+        manager = ProviderManager()
+        manager._providers[collision_id] = ExistingProvider()
+        provider_cleanup_spy = MagicMock(wraps=manager.cleanup_provider)
+        monkeypatch.setattr(manager, "cleanup_provider", provider_cleanup_spy)
+        monkeypatch.setattr(terminal_service, "provider_manager", manager)
+
+        status_spy = MagicMock()
+        monkeypatch.setattr(terminal_service, "status_monitor", status_spy)
+
+        # The stale routing row for the reused name, and injected exhaustion of
+        # its durable pre-clear delete.
+        session_env.set_session_env("cao-reused", {"PATH": "/old/shim"})
+        monkeypatch.setattr(
+            session_env,
+            "_delete_row",
+            lambda _: (_ for _ in ()).throw(sqlite3.OperationalError("injected delete exhaustion")),
+        )
+        monkeypatch.setattr(session_env, "_RETRY_DELAY_SECONDS", 0)
+
+        mock_gen_id.return_value = collision_id  # the forced 32-bit collision
+        mock_tmux.session_exists.return_value = False
+
+        with pytest.raises(SessionEnvStoreError):
+            await create_terminal(
+                "kiro_cli", "developer", session_name="cao-reused", new_session=True
+            )
+
+        # Creation aborted before terminal-ID-dependent work: the ID generator
+        # itself was never reached.
+        mock_gen_id.assert_not_called()
+        mock_tmux.create_session.assert_not_called()
+        # Every cleanup seam recorded ZERO calls.
+        fifo_stop_spy.assert_not_called()
+        status_spy.clear_terminal.assert_not_called()
+        provider_cleanup_spy.assert_not_called()
+        mock_db_delete.assert_not_called()
+        # The unrelated live terminal's state is byte-for-byte preserved.
+        assert terminal_row_state() == row_before
+        assert collateral_fifo.read_bytes() == sentinel_bytes
+        assert collision_id in manager._providers
+        assert provider_cleaned == []
+        # The stale session-env row is retained — nothing claimed it was cleared.
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT env_vars FROM session_env WHERE session_name = 'cao-reused'"
+            ).fetchall()
+        assert rows == [('{"PATH": "/old/shim"}',)]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.clear_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    async def test_preclear_runs_before_id_generation_outside_cleanup_scope(
+        self,
+        mock_gen_id,
+        mock_tmux,
+        mock_provider_manager,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_db_delete,
+        mock_clear_session_env,
+    ):
+        """cond-0067 ordering contract: the strict pre-clear is a true
+        preflight — it executes BEFORE terminal-ID generation and OUTSIDE the
+        resource-owning try/except, so its failure propagates with zero
+        cleanup actions for resources this invocation never acquired."""
+        import inspect
+
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.session_env import SessionEnvStoreError
+
+        mock_tmux.session_exists.return_value = False
+        mock_clear_session_env.side_effect = SessionEnvStoreError("durable delete refused")
+
+        with pytest.raises(SessionEnvStoreError, match="durable delete refused"):
+            await create_terminal(
+                "kiro_cli", "developer", session_name="cao-reused", new_session=True
+            )
+
+        # Runtime ordering: the pre-clear ran; terminal-ID generation never did.
+        mock_clear_session_env.assert_called_once_with("cao-reused")
+        mock_gen_id.assert_not_called()
+        # Outside the cleanup scope: zero cleanup calls despite the propagating
+        # exception, because nothing had been acquired.
+        mock_fifo_manager.stop_reader.assert_not_called()
+        mock_status_monitor.clear_terminal.assert_not_called()
+        mock_provider_manager.cleanup_provider.assert_not_called()
+        mock_db_delete.assert_not_called()
+        mock_tmux.create_session.assert_not_called()
+        mock_tmux.kill_session.assert_not_called()
+
+        # Structural pin: the pre-clear call site precedes both the
+        # resource-owning try and terminal-ID generation in the source.
+        source, _ = inspect.getsourcelines(terminal_service.create_terminal)
+        joined = "".join(source)
+        preclear_at = joined.index("clear_session_env(session_name)")
+        cleanup_try_at = joined.index("    try:")
+        id_generation_at = joined.index("terminal_id = generate_terminal_id()")
+        assert preclear_at < cleanup_try_at < id_generation_at
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.clear_session_env")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
