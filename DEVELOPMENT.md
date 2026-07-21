@@ -74,6 +74,12 @@ The Vite dev server proxies API calls to the backend at `localhost:9889`. Make s
 
 ## Running Tests
 
+> **Recording test fixtures?** Provider fixtures are captured from live CLI
+> output and can embed secrets/PII (including in ANSI escape streams). Record on
+> a synthetic account and scrub identity/banner lines before committing — see
+> [CONTRIBUTING.md](CONTRIBUTING.md#recording-test-fixtures-safely). A gitleaks
+> scan gates every PR; run it locally with `scripts/security-scan.sh gitleaks`.
+
 ### Unit Tests
 
 Unit tests are fast and use mocked dependencies:
