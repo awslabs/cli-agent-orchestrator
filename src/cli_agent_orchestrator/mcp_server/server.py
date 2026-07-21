@@ -54,7 +54,7 @@ _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 def _current_terminal_id() -> Optional[str]:
     """Return a valid CAO terminal ID from the MCP environment, if configured."""
     terminal_id = os.environ.get("CAO_TERMINAL_ID")
-    if terminal_id is None:
+    if not terminal_id:
         return None
     if not _TERMINAL_ID_PATTERN.fullmatch(terminal_id):
         raise ValueError(
@@ -957,15 +957,10 @@ def _assign_impl(
         # subprocess's env (the supervisor-owned instance), not on the
         # cao-server side.
         if ENABLE_SENDER_ID_INJECTION:
-            sender_id = current_terminal_id
-            if not sender_id:
-                # Redundant with the earlier check but preserves the same
-                # error contract on the injection path.
-                raise ValueError("CAO_TERMINAL_ID not set - cannot inject callback instructions")
             worker_message = (
                 message
-                + f"\n\n[Assigned by terminal {sender_id}. "
-                + f"When done, send results back to terminal {sender_id} using send_message]"
+                + f"\n\n[Assigned by terminal {current_terminal_id}. "
+                + f"When done, send results back to terminal {current_terminal_id} using send_message]"
             )
         else:
             worker_message = message
@@ -1366,7 +1361,12 @@ def find_profiles(
 
 def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
     """Build terminal context dict from the calling terminal's CAO_TERMINAL_ID."""
-    terminal_id = _current_terminal_id()
+    try:
+        terminal_id = _current_terminal_id()
+    except ValueError as e:
+        logger.warning(f"Failed to get terminal context for memory tools: {e}")
+        return None
+
     if not terminal_id:
         return None
 
