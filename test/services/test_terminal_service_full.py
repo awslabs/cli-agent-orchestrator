@@ -906,6 +906,227 @@ class TestCreateTerminalEnvVars:
         mock_tmux.create_window.assert_not_called()
 
 
+class TestCreateTerminalSessionEnvStore:
+    """create_terminal against the REAL write-through session-env store (no
+    get_session_env mock): post-restart durability, merge precedence, and
+    fail-closed behavior at the window-creation seam (issue #248)."""
+
+    @pytest.fixture
+    def real_store(self, tmp_path, monkeypatch):
+        """Point the store at an isolated tmp DB with a cold in-memory cache."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import session_env
+
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'session-env.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        database.Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(
+            database,
+            "SessionLocal",
+            sessionmaker(autocommit=False, autoflush=False, bind=engine),
+        )
+        with session_env._lock:
+            session_env._session_forwarded_env.clear()
+        yield engine
+        with session_env._lock:
+            session_env._session_forwarded_env.clear()
+        engine.dispose()
+
+    def _wire_happy_mocks(
+        self,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_provider_manager,
+        mock_fifo_dir,
+        *,
+        session_exists,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = session_exists
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_post_restart_window_gets_persisted_env_with_precedence(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        real_store,
+    ):
+        """Simulated restart (cold cache, seeded DB row): a window joining the
+        session receives the persisted env, and per-step env still wins on
+        conflict — {**get_session_env(session), **env_vars} unchanged."""
+        import sqlite3
+
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=True,
+        )
+        with sqlite3.connect(real_store.url.database) as conn:
+            conn.execute(
+                "INSERT INTO session_env (session_name, env_vars, updated_at) "
+                "VALUES ('cao-existing', ?, '2026-07-21T00:00:00Z')",
+                ('{"SHARED_KEY": "session-value", "KEEP": "kept"}',),
+            )
+
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            new_session=False,
+            env_vars={"SHARED_KEY": "per-step-value"},
+        )
+
+        extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        assert extra_env == {"SHARED_KEY": "per-step-value", "KEEP": "kept"}
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_missing_row_proceeds_with_per_step_env_only(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        real_store,
+    ):
+        """The legitimate no-forwarded-env case: no row, working DB — window
+        creation proceeds and gets exactly the per-step env."""
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=True,
+        )
+
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            new_session=False,
+            env_vars={"CAO_WORKFLOW_RUN_ID": "run-1"},
+        )
+
+        extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        assert extra_env == {"CAO_WORKFLOW_RUN_ID": "run-1"}
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_corrupt_session_env_aborts_before_any_tmux_launch(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        real_store,
+    ):
+        """Fail closed: corrupt persisted env raises, and NO tmux window,
+        provider, FIFO, or DB row is created — zero launch side effects."""
+        import sqlite3
+
+        from cli_agent_orchestrator.services.session_env import SessionEnvStoreError
+
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=True,
+        )
+        with sqlite3.connect(real_store.url.database) as conn:
+            conn.execute(
+                "INSERT INTO session_env (session_name, env_vars, updated_at) "
+                "VALUES ('cao-existing', 'not json{', '2026-07-21T00:00:00Z')"
+            )
+
+        with pytest.raises(SessionEnvStoreError):
+            await create_terminal(
+                "kiro_cli",
+                "developer",
+                session_name="cao-existing",
+                new_session=False,
+            )
+
+        mock_tmux.create_window.assert_not_called()
+        mock_tmux.create_session.assert_not_called()
+        mock_provider_manager.create_provider.assert_not_called()
+        mock_db_create.assert_not_called()
+        mock_fifo_manager.create_reader.assert_not_called()
+
+
 class TestGetTerminal:
     """Tests for get_terminal function."""
 
