@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shlex
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -24,6 +25,13 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_sta
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+# Serializes concurrent _ensure_skip_bypass_prompt_setting() read-modify-writes to
+# ~/.claude/settings.json -- after the async conversion, N concurrent inits can run this
+# in N threads (via asyncio.to_thread), and an unlocked read-modify-write can race: one
+# thread reads while another is mid-write, decodes a truncated file, falls back to {}, and
+# clobbers the user's global settings with just the one key.
+_SETTINGS_WRITE_LOCK = threading.Lock()
 
 # Sentinel so _build_claude_command can tell "caller passed no profile, load it"
 # from "caller explicitly passed None" (native/missing profile). initialize()
@@ -348,23 +356,31 @@ class ClaudeCodeProvider(BaseProvider):
         ``skipDangerousModePermissionPrompt: true`` is persisted in
         ``~/.claude/settings.json``.  CAO already uses the flag intentionally,
         so the confirmation is redundant and blocks initialization.
+
+        After the async conversion, N concurrent inits may run this
+        read-modify-write in N threads. ``_SETTINGS_WRITE_LOCK`` serializes
+        our own threads; ``os.replace`` makes the write atomic so nothing
+        outside CAO ever sees a half-written file.
         """
         settings_path = Path.home() / ".claude" / "settings.json"
-        settings: dict = {}
-        if settings_path.exists():
-            try:
-                with open(settings_path) as f:
-                    settings = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
+        with _SETTINGS_WRITE_LOCK:
+            settings: dict = {}
+            if settings_path.exists():
+                try:
+                    with open(settings_path) as f:
+                        settings = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-        if settings.get("skipDangerousModePermissionPrompt") is True:
-            return
+            if settings.get("skipDangerousModePermissionPrompt") is True:
+                return
 
-        settings["skipDangerousModePermissionPrompt"] = True
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(settings_path, "w") as f:
-            json.dump(settings, f, indent=2)
+            settings["skipDangerousModePermissionPrompt"] = True
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = settings_path.with_suffix(".json.tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(settings, f, indent=2)
+            os.replace(tmp_path, settings_path)
         logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
 
     async def _handle_startup_prompts(
