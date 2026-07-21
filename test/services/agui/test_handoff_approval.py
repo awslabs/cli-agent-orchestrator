@@ -579,28 +579,120 @@ class TestDeliveryFailureRetryable:
         assert result.outcome == "approve"
 
     @pytest.mark.asyncio
-    async def test_delivery_timeout_is_retryable(self, monkeypatch):
-        """A delivery that exceeds the timeout raises DeliveryError (retryable),
-        leaving the interrupt unresolved."""
+    async def test_slow_delivery_completes_and_commits(self, monkeypatch):
+        """A slow delivery runs to completion and commits (no hard timeout, so
+        no orphaned worker); the slow-path warning threshold is exercised."""
         import time as _time
 
         from cli_agent_orchestrator.services.agui import handoff_approval as _mod
-        from cli_agent_orchestrator.services.agui.handoff_approval import DeliveryError
 
-        monkeypatch.setattr(_mod, "_DELIVERY_TIMEOUT_SECONDS", 0.05)
+        # Warn threshold below the delivery duration so the slow-warn branch fires.
+        monkeypatch.setattr(_mod, "_DELIVERY_SLOW_WARN_SECONDS", 0.01)
 
         class _SlowDelivery:
             def send_input(self, terminal_id, text, **kwargs):
-                _time.sleep(0.5)
+                _time.sleep(0.05)
 
             def send_special_key(self, terminal_id, key):
-                _time.sleep(0.5)
+                _time.sleep(0.05)
 
         construct = AgentHandoffWithApproval(
             emitter=RecordingUiEmitter(), answer_delivery=_SlowDelivery()
         )
         interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
 
-        with pytest.raises(DeliveryError):
-            await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
-        assert not interrupt.resolved
+        result = await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+        # No DeliveryError: the delivery completed and the decision committed.
+        assert result.resolved
+        assert result.outcome == "approve"
+
+    @pytest.mark.asyncio
+    async def test_expire_during_failed_delivery_honors_expiry(self):
+        """If expire() races in while a delivery is in flight and that delivery
+        then FAILS, expiry wins: the failure is NOT advertised as retryable
+        (no DeliveryError) — resume returns the expired interrupt. Regression
+        for the 'retryable contract vs concurrent expiry' race."""
+        import threading
+
+        from cli_agent_orchestrator.services.agui.handoff_approval import DeliveryError
+
+        construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=None)
+        interrupt = construct.on_provider_waiting("t-x", "codex", "Approve execution? (y/n)")
+
+        class _ControlledFailure:
+            def __init__(self):
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def send_input(self, terminal_id, text, **kwargs):
+                self.started.set()
+                self.release.wait()
+                raise RuntimeError("backend down")
+
+            def send_special_key(self, terminal_id, key):
+                return self.send_input(terminal_id, key)
+
+        delivery = _ControlledFailure()
+        construct._answer_delivery = delivery
+
+        task = asyncio.create_task(construct.resume(interrupt.id, ApprovalDecision.APPROVE))
+        await asyncio.to_thread(delivery.started.wait)
+        # Expire mid-flight, then let the delivery fail.
+        construct.expire("t-x")
+        delivery.release.set()
+
+        # No DeliveryError surfaces — expiry is reconciled.
+        result = await task
+        assert result.resolved
+        assert result.outcome == "expired"
+
+        # A subsequent resume is idempotent on the expired state (not retryable).
+        retry = await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+        assert retry.outcome == "expired"
+
+    @pytest.mark.asyncio
+    async def test_in_flight_delivery_serializes_next_resume(self):
+        """Regression for the [C-u, C-u, n, y] timeout race: delivery runs to
+        completion under the lock, so a second resume cannot start its delivery
+        until the first finishes — no stale paste can land after a later resume."""
+        import threading
+
+        order: List[str] = []
+        first_in_delivery = threading.Event()
+        release_first = threading.Event()
+
+        class _SeqDelivery:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def send_input(self, terminal_id, text, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    order.append("first-start")
+                    first_in_delivery.set()
+                    release_first.wait()
+                    order.append("first-end")
+                else:
+                    order.append("second")
+
+            def send_special_key(self, terminal_id, key):
+                return True
+
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=_SeqDelivery()
+        )
+        i1 = construct.on_provider_waiting("t-a", "kiro_cli", "Allow this action? [y/n/t]:")
+        i2 = construct.on_provider_waiting("t-b", "kiro_cli", "Allow this action? [y/n/t]:")
+
+        t1 = asyncio.create_task(construct.resume(i1.id, ApprovalDecision.APPROVE))
+        await asyncio.to_thread(first_in_delivery.wait)
+        t2 = asyncio.create_task(construct.resume(i2.id, ApprovalDecision.APPROVE))
+        await asyncio.sleep(0.05)  # give t2 a chance to (wrongly) interleave
+
+        # t2 must NOT have started delivery while t1 holds the lock mid-delivery.
+        assert "second" not in order
+
+        release_first.set()
+        await asyncio.gather(t1, t2)
+        # Strict ordering: the first delivery fully completes before the second.
+        assert order == ["first-start", "first-end", "second"]

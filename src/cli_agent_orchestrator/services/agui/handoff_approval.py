@@ -149,10 +149,12 @@ class DeliveryError(RuntimeError):
     """
 
 
-# Upper bound on a single delivery attempt. Comfortably above the backend's
-# deliberate paste waits (~0.3s tmux, ~2s Herdr) so it only trips on a hung
-# backend — which would otherwise hold the resume lock indefinitely.
-_DELIVERY_TIMEOUT_SECONDS = 15.0
+# Deliveries run to completion (no hard timeout): asyncio.wait_for would cancel
+# only the awaiter, leaving the to_thread worker alive to paste LATE — after a
+# retry has already delivered a different decision (a record/side-effect skew).
+# We instead measure duration and warn if a delivery is pathologically slow,
+# keeping the diagnostic signal without orphaning the worker.
+_DELIVERY_SLOW_WARN_SECONDS = 15.0
 
 
 # ---------------------------------------------------------------------------
@@ -482,39 +484,47 @@ class AgentHandoffWithApproval(AguiConstruct):
 
             # Deliver the answer to the terminal BEFORE committing resolution.
             # Off-loop via to_thread (P2) so blocking tmux/Herdr I/O never stalls
-            # the event loop; wrapped in wait_for so a hung backend cannot hold
-            # the lock indefinitely and stall every later resume. The lock is
-            # held across the await, which serializes other resume() calls
-            # (approvals are low-frequency) and keeps delivery exactly-once
-            # without a separate in-flight guard.
-            #
-            # NB (wait_for caveat): a timeout cancels the awaiter, not the worker
-            # thread, so a slow paste may still land after we raise. That is the
-            # partial-delivery case, mitigated by the delivery adapter clearing
-            # the input line before re-pasting on a retry.
+            # the event loop. The delivery runs to COMPLETION under the lock (no
+            # asyncio.wait_for): a timeout would cancel only the awaiter while the
+            # worker thread kept running, letting a stale paste land after a retry
+            # delivered a different decision. Running to completion keeps the
+            # record and the terminal's side effect in lockstep and serializes
+            # other resume() calls (approvals are low-frequency). A pathologically
+            # slow delivery is surfaced via a warning, not a silent orphan.
             if self._answer_delivery and terminal_id:
+                _delivery_start = time.monotonic()
                 try:
                     if action["type"] == "text":
-                        await asyncio.wait_for(
-                            asyncio.to_thread(
-                                self._answer_delivery.send_input, terminal_id, action["value"]
-                            ),
-                            timeout=_DELIVERY_TIMEOUT_SECONDS,
+                        await asyncio.to_thread(
+                            self._answer_delivery.send_input, terminal_id, action["value"]
                         )
                     elif action["type"] == "key":
-                        await asyncio.wait_for(
-                            asyncio.to_thread(
-                                self._answer_delivery.send_special_key,
-                                terminal_id,
-                                action["value"],
-                            ),
-                            timeout=_DELIVERY_TIMEOUT_SECONDS,
+                        await asyncio.to_thread(
+                            self._answer_delivery.send_special_key, terminal_id, action["value"]
                         )
                 except Exception as e:
+                    # Reconcile a concurrent expire() (unlocked sync path) that
+                    # resolved this interrupt while the FAILED delivery was in
+                    # flight: nothing was delivered, so expiry wins and the
+                    # failure is NOT advertised as retryable.
+                    if interrupt.resolved:
+                        logger.info(
+                            "delivery failed but interrupt %s expired mid-flight; "
+                            "honoring expiry",
+                            interrupt_id,
+                        )
+                        return interrupt
                     # Retryable: leave the interrupt UNRESOLVED so a later resume
                     # can re-attempt; surface the failure to the caller.
                     logger.warning("Failed to deliver answer for interrupt %s: %s", interrupt_id, e)
                     raise DeliveryError(str(e)) from e
+                _elapsed = time.monotonic() - _delivery_start
+                if _elapsed > _DELIVERY_SLOW_WARN_SECONDS:
+                    logger.warning(
+                        "Slow answer delivery for interrupt %s: %.1fs (backend may be degraded)",
+                        interrupt_id,
+                        _elapsed,
+                    )
 
             # Delivery-beats-expire: reaching here means delivery succeeded (or
             # was not applicable), so the terminal already received the input.
