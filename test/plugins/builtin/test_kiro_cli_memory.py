@@ -1,5 +1,6 @@
 """Tests for the Kiro CLI memory-injection plugin."""
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from cli_agent_orchestrator.plugins.builtin.kiro_cli_memory import (
     STEERING_SUBDIR,
     KiroCliMemoryPlugin,
 )
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
 
 
 def _event(provider: str = "kiro_cli", terminal_id: str = "t1") -> PostCreateTerminalEvent:
@@ -346,5 +348,53 @@ async def test_steering_write_is_atomic_no_tmp_left_behind(
     target = tmp_path / STEERING_SUBDIR / MEMORY_FILENAME
     assert target.exists()
     assert "<cao-memory>X</cao-memory>" in target.read_text(encoding="utf-8")
+    leftovers = [p for p in target.parent.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []
+
+
+def test_concurrent_steering_writes_never_collide_on_temp_file(tmp_path: Path) -> None:
+    """caom-47e defect A for the whole-file overwrite path.
+
+    Kiro's steering target is a FIXED path per working directory
+    (``<cwd>/.kiro/steering/cao-memory.md``), so two terminals sharing a cwd
+    write the same file. The lost-update race (defect B) does not apply — the
+    file is overwritten whole — but the old fixed ``target + ".tmp"`` idiom
+    was still exposed to defect A: one writer's ``finally``-unlink could
+    delete the other's live temp file, surfacing as ``FileNotFoundError`` on
+    ``os.replace``. Now that the plugin routes through ``locked_atomic_rewrite``
+    (unique per-call temp + inter-process lock) many concurrent overwrites
+    must complete without any writer raising, and the final file must be one
+    intact block (never a truncated/interleaved temp).
+    """
+    target = tmp_path / STEERING_SUBDIR / MEMORY_FILENAME
+
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def overwrite(i: int) -> None:
+        try:
+            # Mirrors the plugin's write path: whole-file overwrite via the
+            # shared locked helper, ignoring existing content by design.
+            locked_atomic_rewrite(
+                target, lambda _existing, i=i: f"<cao-memory>writer-{i}</cao-memory>\n"
+            )
+        except BaseException as exc:  # noqa: BLE001 - captured for the assertion
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=overwrite, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    file_not_found = [e for e in errors if isinstance(e, FileNotFoundError)]
+    assert file_not_found == [], f"defect A shape reproduced: {file_not_found}"
+    assert errors == [], f"no writer should raise at all: {errors}"
+
+    # Exactly one intact writer's content survives — no interleaving/truncation.
+    final = target.read_text(encoding="utf-8")
+    assert final.count("<cao-memory>") == 1
+    assert final.count("</cao-memory>") == 1
     leftovers = [p for p in target.parent.iterdir() if p.suffix == ".tmp"]
     assert leftovers == []

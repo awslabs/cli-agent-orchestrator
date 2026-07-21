@@ -89,6 +89,16 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
 FIFO_DIR.mkdir(parents=True, exist_ok=True)
 
+# Sidecar lock directory for utils/atomic_file.locked_atomic_rewrite. The
+# targets it serializes (AGENTS.md / .claude/CLAUDE.md / dev.agent.md) live in
+# the USER's working tree, so a lock file placed beside each target would leave
+# permanent untracked ``*.lock`` files polluting the user's repo. Keeping the
+# lock files here — under CAO's own home dir, keyed by a hash of the target's
+# resolved absolute path — means every process (CLI and cao-server) that locks
+# the same target agrees on the same lock file while the user's tree gains ZERO
+# new files. Created lazily (0o700) on first use by the lock helper.
+LOCK_DIR = CAO_HOME_DIR / "locks"
+
 # =============================================================================
 # Event-Driven State Detection Configuration
 # =============================================================================

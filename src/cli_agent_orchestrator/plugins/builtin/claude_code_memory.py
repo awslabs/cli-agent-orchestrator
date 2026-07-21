@@ -11,8 +11,8 @@ rather than crashing ``cao-server``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
 from pathlib import Path
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
@@ -20,6 +20,7 @@ from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.plugins import PostCreateTerminalEvent, hook
 from cli_agent_orchestrator.plugins.base import CaoPlugin
 from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,10 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
             return
 
         try:
-            self._write_block(target, context_block)
+            # locked_atomic_rewrite polls with time.sleep up to the lock
+            # timeout; run it off the event loop so a contended lock cannot
+            # stall cao-server for other terminals.
+            await asyncio.to_thread(self._write_block, target, context_block)
         except Exception as exc:
             logger.warning(
                 "claude_code_memory: write failed for %s: %s",
@@ -146,24 +150,21 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
         return target
 
     def _write_block(self, target: Path, context_block: str) -> None:
-        """Write or replace the delimited memory section in CLAUDE.md."""
+        """Write or replace the delimited memory section in CLAUDE.md.
 
-        target.parent.mkdir(parents=True, exist_ok=True)
+        Concurrent writers (multiple terminals, or the CLI and cao-server
+        touching the same working directory) must never lose each other's
+        memory block. ``locked_atomic_rewrite`` holds an inter-process lock
+        for the whole read-strip-append-replace cycle so
+        ``compute_new_content`` always sees the latest published content.
+        """
 
-        existing = target.read_text(encoding="utf-8") if target.exists() else ""
-        stripped = self._strip_existing_block(existing)
+        def compute_new_content(existing: str) -> str:
+            stripped = self._strip_existing_block(existing)
+            separator = "" if not stripped or stripped.endswith("\n") else "\n"
+            return f"{stripped}{separator}{BEGIN_MARKER}\n{context_block}\n{END_MARKER}\n"
 
-        separator = "" if not stripped or stripped.endswith("\n") else "\n"
-        new_content = f"{stripped}{separator}{BEGIN_MARKER}\n{context_block}\n{END_MARKER}\n"
-        # Atomic temp-file + replace: an interrupted write must never leave a
-        # truncated CLAUDE.md behind (same idiom as utils/skill_injection.py).
-        temp_path = target.with_suffix(target.suffix + ".tmp")
-        try:
-            temp_path.write_text(new_content, encoding="utf-8")
-            os.replace(temp_path, target)
-        finally:
-            if temp_path.exists():
-                temp_path.unlink()
+        locked_atomic_rewrite(target, compute_new_content)
 
     @staticmethod
     def _strip_existing_block(content: str) -> str:
