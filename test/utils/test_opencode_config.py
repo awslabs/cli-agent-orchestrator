@@ -8,9 +8,11 @@ import pytest
 
 import cli_agent_orchestrator.utils.opencode_config as cfg_module
 from cli_agent_orchestrator.utils.opencode_config import (
+    OpenCodeAgentIdCollisionError,
     ensure_skills_symlink,
     read_config,
     remove_agent_tools,
+    to_opencode_agent_id,
     translate_mcp_server_config,
     upsert_agent_tools,
     upsert_mcp_server,
@@ -24,6 +26,33 @@ def tmp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     config_file = tmp_path / "opencode_cli" / "opencode.json"
     monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_FILE", config_file)
     return config_file
+
+
+class TestToOpencodeAgentId:
+    """to_opencode_agent_id rewrites '/' -> '__' and nothing else."""
+
+    def test_slash_replaced_with_double_underscore(self):
+        assert to_opencode_agent_id("a/b") == "a__b"
+
+    def test_no_slash_unchanged(self):
+        assert to_opencode_agent_id("developer") == "developer"
+
+    def test_spaces_and_punctuation_untouched(self):
+        # Documents that spaces/dashes are NOT rewritten (only '/'), so they
+        # cannot cause a collision in this scheme.
+        assert to_opencode_agent_id("foo bar") == "foo bar"
+        assert to_opencode_agent_id("foo-bar") == "foo-bar"
+
+
+class TestOpenCodeAgentIdCollisionError:
+    """The collision error type contract the install guard relies on."""
+
+    def test_collision_is_valueerror_subclass(self):
+        # _guard_opencode_agent_id_collision raises this; install_agent()'s
+        # broad `except Exception` turns it into a clean CLI "Error:" message.
+        # (The end-to-end collision behaviour is covered in
+        # test/cli/commands/test_install_opencode.py against the real CLI.)
+        assert issubclass(OpenCodeAgentIdCollisionError, ValueError)
 
 
 class TestEnsureSkillsSymlink:
