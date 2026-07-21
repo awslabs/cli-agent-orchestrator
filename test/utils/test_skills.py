@@ -373,7 +373,12 @@ class TestDefaultBundledSkills:
         return Path(__file__).resolve().parents[2] / "src" / "cli_agent_orchestrator" / "skills"
 
     def test_default_skill_folders_exist_with_valid_metadata(self):
-        skill_names = ["cao-memory", "cao-supervisor-protocols", "cao-worker-protocols"]
+        skill_names = [
+            "cao-agent-routing",
+            "cao-memory",
+            "cao-supervisor-protocols",
+            "cao-worker-protocols",
+        ]
 
         for skill_name in skill_names:
             metadata = validate_skill_folder(self.bundled_skills_dir / skill_name)
@@ -400,6 +405,16 @@ class TestDefaultBundledSkills:
         assert "memory_store" in memory_content
         assert "memory_recall" in memory_content
         assert "memory_forget" in memory_content
+
+    def test_agent_routing_skill_covers_discovery_and_delegation(self):
+        routing_content = (self.bundled_skills_dir / "cao-agent-routing" / "SKILL.md").read_text()
+
+        assert "find_profiles" in routing_content
+        assert "cao profile find" in routing_content
+        assert "--json" in routing_content
+        assert "agent_profile" in routing_content
+        assert "assign" in routing_content
+        assert "handoff" in routing_content
 
 
 class TestBuildSkillCatalog:

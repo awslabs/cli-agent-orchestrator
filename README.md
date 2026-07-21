@@ -394,7 +394,7 @@ For the full guide — flow file format, the conditional-execution pattern, and 
 
 Skills are portable, structured guides (following the universal [SKILL.md](https://github.com/anthropics/skills) format) that encode domain knowledge for agents. They work across coding assistants (Claude Code, Kiro CLI, Codex CLI, Kimi CLI, GitHub Copilot, Cursor, OpenCode, LobeHub) and frameworks ([Strands Agents SDK](https://strandsagents.com/docs/user-guide/concepts/plugins/skills/), [Microsoft Agent Framework](https://devblogs.microsoft.com/agent-framework/give-your-agents-domain-expertise-with-agent-skills-in-microsoft-agent-framework/)).
 
-CAO ships built-in skills and also manages "managed skills" shared across all agent sessions. Built-ins (`cao-supervisor-protocols`, `cao-worker-protocols`) are auto-seeded at server startup. You can add your own:
+CAO ships built-in skills and also manages "managed skills" shared across all agent sessions. Built-ins such as `cao-agent-routing`, `cao-supervisor-protocols`, and `cao-worker-protocols` are auto-seeded at server startup. You can add your own:
 
 ```bash
 cao skills list

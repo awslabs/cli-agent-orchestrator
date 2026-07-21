@@ -91,10 +91,11 @@ After removal, all providers pick up the change automatically — Copilot CLI ag
 
 Builtin skills are auto-seeded when `cao-server` starts — no manual step required. If a skill with the same name already exists, it is skipped — preserving any edits you've made. After a CAO upgrade, restarting the server will seed any new builtin skills without overwriting your changes. You can also run `cao init` to seed them manually.
 
-CAO ships with two builtin skills:
+CAO ships with built-in skills including:
 
 | Skill | Description |
 |-------|-------------|
+| `cao-agent-routing` | Finds the best installed profile for specialist work before delegation |
 | `cao-supervisor-protocols` | Multi-agent orchestration patterns for supervisors: `assign`, `handoff`, idle-based message delivery |
 | `cao-worker-protocols` | Worker-side callback and completion rules for assigned and handed-off tasks |
 
