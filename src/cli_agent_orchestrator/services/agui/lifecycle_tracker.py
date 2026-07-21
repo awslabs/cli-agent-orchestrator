@@ -99,7 +99,7 @@ class ToolCallLifecycleTracker:
         frames: List[Frame] = []
         # Iterate over a copy of keys since we modify the dict.
         for receiver_id in list(self._open.keys()):
-            closers = self._synthesize_close(receiver_id, timestamp=None)
+            closers = self._synthesize_close(receiver_id, timestamp=None, closed_by="session_end")
             frames.extend(closers)
         return frames
 
@@ -123,7 +123,10 @@ class ToolCallLifecycleTracker:
         # If there is already an open call for this receiver, close it first.
         if receiver in self._open:
             superseded_frames = self._synthesize_close(
-                receiver, timestamp=record.get("timestamp"), disposition="superseded"
+                receiver,
+                timestamp=record.get("timestamp"),
+                closed_by="superseded",
+                disposition="superseded",
             )
 
         # Evict oldest entries if at capacity.
@@ -147,15 +150,24 @@ class ToolCallLifecycleTracker:
         return self._synthesize_close(terminal_id, timestamp=record.get("timestamp"))
 
     def _synthesize_close(
-        self, receiver_id: str, timestamp: Optional[str] = None, disposition: Optional[str] = None
+        self,
+        receiver_id: str,
+        timestamp: Optional[str] = None,
+        closed_by: str = "completion",
+        disposition: Optional[str] = None,
     ) -> List[Frame]:
         """Synthesize TOOL_CALL_END (and optionally TOOL_CALL_RESULT) for a receiver.
 
         Args:
             receiver_id: The terminal_id of the receiver to close.
             timestamp: Optional timestamp for the synthesized frames.
-            disposition: Optional disposition string (e.g. "superseded") added to
-                metadata when the close is not a normal completion.
+            closed_by: Why the call was closed — ``"completion"`` (receiver
+                finished its turn), ``"session_end"`` (close_all at teardown),
+                or ``"superseded"`` (a new open replaced it). Recorded on the
+                closer metadata so clients can distinguish a real completion
+                from a lifecycle-forced close (R6.3).
+            disposition: Optional legacy disposition string (kept for
+                back-compat; set alongside ``closed_by`` for superseded closes).
         """
         open_info = self._open.pop(receiver_id, None)
         if open_info is None:  # pragma: no cover - callers guard membership first
@@ -163,6 +175,7 @@ class ToolCallLifecycleTracker:
 
         tool_call_id = open_info["tool_call_id"]
         metadata = dict(open_info["metadata"])
+        metadata["closed_by"] = closed_by
         if disposition:
             metadata["disposition"] = disposition
         frames: List[Frame] = []

@@ -1219,6 +1219,7 @@ class ResumeInterruptRequest(BaseModel):
 async def agui_resume_interrupt(
     interrupt_id: str,
     body: ResumeInterruptRequest,
+    _enabled: None = Depends(_require_agui_enabled),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """Resume a pending approval interrupt with the user's decision.
@@ -1232,8 +1233,6 @@ async def agui_resume_interrupt(
     - 422 for invalid decision or edit validation failure
     - Requires cao:write or cao:admin when auth is enabled
     """
-    _require_agui_enabled()
-
     from cli_agent_orchestrator.services.agui.handoff_approval import (
         ApprovalDecision,
         DeliveryError,

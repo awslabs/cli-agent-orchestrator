@@ -273,14 +273,37 @@ async def run_plane_stream(
                 except Exception:
                     logger.warning("run_plane: snapshot failed for interrupt state", exc_info=True)
 
-            # Convert CAO Interrupts to ag-ui Interrupts
+            # Convert CAO Interrupts to ag-ui Interrupts. The interior metadata
+            # is camelCased (terminalId/sessionName) to match the stock ag-ui
+            # wire dialect, and response_schema advertises the accepted resume[]
+            # payload shape so a client knows how to answer (approve/deny/edit).
             ag_interrupts = []
             for p in pending:
+                meta = p.metadata or {}
+                ag_meta = {
+                    "provider": meta.get("provider"),
+                    "terminalId": meta.get("terminal_id"),
+                    "sessionName": meta.get("session_name"),
+                    "options": list(p.options),
+                }
                 ag_intr = AgUiInterrupt(
                     id=p.id,
                     reason=p.reason,
                     message=p.message,
-                    metadata=p.metadata,
+                    metadata=ag_meta,
+                    response_schema={
+                        "type": "object",
+                        "properties": {
+                            "approved": {
+                                "type": "boolean",
+                                "description": "true=approve, false=deny",
+                            },
+                            "editedArgs": {
+                                "type": "object",
+                                "description": "edited answer (only if 'edit' is offered)",
+                            },
+                        },
+                    },
                 )
                 ag_interrupts.append(ag_intr)
 

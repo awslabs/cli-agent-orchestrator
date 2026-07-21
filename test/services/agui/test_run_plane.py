@@ -176,7 +176,13 @@ async def test_run_plane_interrupt_outcome():
     assert parsed[2]["type"] == "RUN_FINISHED"
     assert parsed[2]["outcome"]["type"] == "interrupt"
     assert len(parsed[2]["outcome"]["interrupts"]) == 1
-    assert parsed[2]["outcome"]["interrupts"][0]["reason"] == "claude-code:permission_request"
+    intr = parsed[2]["outcome"]["interrupts"][0]
+    assert intr["reason"] == "claude-code:permission_request"
+    # WS-3 wire shape: response_schema advertises the resume payload contract,
+    # and interior metadata is camelCased (terminalId/sessionName).
+    assert "approved" in intr["responseSchema"]["properties"]
+    assert intr["metadata"]["terminalId"] == "t-1"
+    assert intr["metadata"]["sessionName"] == "s-1"
 
 
 @pytest.mark.asyncio

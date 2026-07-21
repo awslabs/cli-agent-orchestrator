@@ -561,3 +561,44 @@ class TestSameReceiverCollision:
         assert len(end_frames) == 1
         assert end_frames[0][1]["tool_call_id"] == "open-3"
         assert tracker.open_count == 0
+
+
+class TestCloseDisposition:
+    """TOOL_CALL_END carries a ``closed_by`` disposition so clients can tell a
+    real completion from a lifecycle-forced close (R6.3)."""
+
+    def _open(self, tracker: ToolCallLifecycleTracker, receiver: str) -> None:
+        rec = _record(
+            "handoff",
+            terminal_id=receiver,
+            detail={"sender": "s", "receiver": receiver, "orchestration_type": "handoff"},
+        )
+        tracker.feed(rec, to_agui_event(rec))
+
+    def _ends(self, frames):
+        return [d for (ft, d) in frames if ft == AGUI_TOOL_CALL_END]
+
+    def test_completion_close_tagged_completion(self) -> None:
+        tracker = ToolCallLifecycleTracker()
+        self._open(tracker, "r1")
+        done = _record("completion", terminal_id="r1")
+        ends = self._ends(tracker.feed(done, to_agui_event(done)))
+        assert ends and ends[0]["metadata"]["closed_by"] == "completion"
+
+    def test_session_end_close_tagged_session_end(self) -> None:
+        tracker = ToolCallLifecycleTracker()
+        self._open(tracker, "r1")
+        ends = self._ends(tracker.close_all())
+        assert ends and ends[0]["metadata"]["closed_by"] == "session_end"
+
+    def test_superseded_close_tagged_superseded(self) -> None:
+        tracker = ToolCallLifecycleTracker()
+        self._open(tracker, "r1")
+        rec2 = _record(
+            "handoff",
+            terminal_id="r1",
+            detail={"sender": "s", "receiver": "r1", "orchestration_type": "handoff"},
+        )
+        ends = self._ends(tracker.feed(rec2, to_agui_event(rec2)))
+        assert ends and ends[0]["metadata"]["closed_by"] == "superseded"
+        assert ends[0]["metadata"]["disposition"] == "superseded"
