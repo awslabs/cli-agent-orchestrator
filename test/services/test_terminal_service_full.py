@@ -23,6 +23,15 @@ from cli_agent_orchestrator.services.terminal_service import (
 class TestCreateTerminal:
     """Tests for create_terminal function."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_clear_session_env(self):
+        """These tests exercise create_terminal orchestration, not the env
+        store; stub the (strict, cond-0050) new-session pre-clear so they do
+        not depend on a migrated DB. The store's own behavior is covered in
+        test_session_env.py and TestCreateTerminalSessionEnvStore."""
+        with patch("cli_agent_orchestrator.services.terminal_service.clear_session_env"):
+            yield
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
@@ -679,6 +688,14 @@ class TestCreateTerminalEnvVars:
     (CAO_WORKFLOW_RUN_ID/STEP_ID) never reached the terminal.
     """
 
+    @pytest.fixture(autouse=True)
+    def _patch_clear_session_env(self):
+        """The store functions are mocked per-test here; stub the (strict,
+        cond-0050) new-session pre-clear likewise so these orchestration tests
+        do not depend on a migrated DB."""
+        with patch("cli_agent_orchestrator.services.terminal_service.clear_session_env"):
+            yield
+
     def _wire_happy_mocks(
         self,
         mock_gen_id,
@@ -1125,6 +1142,179 @@ class TestCreateTerminalSessionEnvStore:
         mock_provider_manager.create_provider.assert_not_called()
         mock_db_create.assert_not_called()
         mock_fifo_manager.create_reader.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_failed_preclear_aborts_before_any_launch_side_effect(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        real_store,
+        monkeypatch,
+    ):
+        """cond-0050: a no-env new session reusing a name whose stale-row
+        pre-clear cannot complete durably (real SQLite IMMEDIATE lock) must
+        abort BEFORE any tmux/provider/window/terminal side effect. Once the
+        lock clears, the retried pre-clear deletes the row durably, so no
+        later window of the reused name can receive the prior routing env."""
+        import sqlite3
+
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import session_env
+        from cli_agent_orchestrator.services.session_env import SessionEnvStoreError
+
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=False,
+        )
+        with sqlite3.connect(real_store.url.database) as conn:
+            conn.execute(
+                "INSERT INTO session_env (session_name, env_vars, updated_at) "
+                "VALUES ('cao-reused', ?, '2026-07-21T00:00:00Z')",
+                ('{"PATH": "/old/shim", "ZDOTDIR": "/old/zsh"}',),
+            )
+
+        # Store operations go through a short-busy-timeout engine so the real
+        # lock refuses fast; the lock itself is a genuine second connection.
+        fast_engine = create_engine(
+            f"sqlite:///{real_store.url.database}",
+            connect_args={"check_same_thread": False, "timeout": 0.1},
+        )
+        monkeypatch.setattr(
+            database,
+            "SessionLocal",
+            sessionmaker(autocommit=False, autoflush=False, bind=fast_engine),
+        )
+        monkeypatch.setattr(session_env, "_RETRY_DELAY_SECONDS", 0)
+
+        lock_conn = sqlite3.connect(real_store.url.database)
+        lock_conn.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(SessionEnvStoreError):
+                await create_terminal(
+                    "kiro_cli",
+                    "developer",
+                    session_name="cao-reused",
+                    new_session=True,
+                )
+        finally:
+            lock_conn.rollback()
+            lock_conn.close()
+
+        # Zero launch side effects: no tmux session/window, no provider, no
+        # terminal DB row, no FIFO reader.
+        mock_tmux.create_session.assert_not_called()
+        mock_tmux.create_window.assert_not_called()
+        mock_provider_manager.create_provider.assert_not_called()
+        mock_db_create.assert_not_called()
+        mock_fifo_manager.create_reader.assert_not_called()
+        # The stale row survived — nothing claimed it was cleared.
+        with sqlite3.connect(real_store.url.database) as conn:
+            rows = conn.execute(
+                "SELECT env_vars FROM session_env WHERE session_name = 'cao-reused'"
+            ).fetchall()
+        assert len(rows) == 1
+
+        # Retry with the lock released: the pre-clear now completes durably
+        # BEFORE tmux creation, so the reused name starts clean — no later
+        # window can inherit the prior routing env.
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-reused",
+            new_session=True,
+        )
+        assert mock_tmux.create_session.call_args.kwargs["extra_env"] is None
+        with sqlite3.connect(real_store.url.database) as conn:
+            rows = conn.execute(
+                "SELECT env_vars FROM session_env WHERE session_name = 'cao-reused'"
+            ).fetchall()
+        assert rows == []
+        fast_engine.dispose()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.clear_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_teardown_clear_failure_preserves_primary_exception(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_clear_session_env,
+        caplog,
+    ):
+        """cond-0050's single sanctioned softening: the create-terminal
+        exception-teardown path catches and logs a strict-clear failure so
+        the earlier, primary exception is preserved for the caller."""
+        from cli_agent_orchestrator.services.session_env import SessionEnvStoreError
+
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=False,
+        )
+        # Pre-clear succeeds; the teardown clear fails.
+        mock_clear_session_env.side_effect = [None, SessionEnvStoreError("delete failed")]
+        mock_provider_manager.create_provider.side_effect = RuntimeError("provider boom")
+
+        with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.terminal_service"):
+            with pytest.raises(RuntimeError, match="provider boom"):
+                await create_terminal(
+                    "kiro_cli",
+                    "developer",
+                    session_name="cao-session",
+                    new_session=True,
+                )
+
+        assert mock_clear_session_env.call_count == 2
+        assert "could not clear session env for cao-session" in caplog.text
 
 
 class TestGetTerminal:

@@ -225,6 +225,10 @@ async def create_terminal(
 
             # Wipe any stale mapping a prior aborted lifecycle for this name
             # may have left behind, so a no-env relaunch can't inherit them.
+            # Strict (cond-0050): if the durable delete cannot complete, this
+            # raises and creation aborts BEFORE any tmux session/provider/
+            # window/terminal side effect — a session name may never be
+            # reused over an unconfirmed stale row.
             clear_session_env(session_name)
 
             # Create new tmux session with initial window
@@ -463,8 +467,20 @@ async def create_terminal(
                 pass  # Ignore cleanup errors
             # Session is gone, drop any forwarded env we stashed for it so
             # secrets don't linger in memory or bleed into a future reuse
-            # of the same name.
-            clear_session_env(session_name)
+            # of the same name. The store's clear is strict (cond-0050);
+            # this exception-teardown path must preserve the primary failure
+            # being handled above, so a failed delete is caught and logged
+            # HERE — the one sanctioned softening call site — and the
+            # retained row is left for the startup reconcile to retry and
+            # report truthfully.
+            try:
+                clear_session_env(session_name)
+            except Exception:
+                logger.warning(
+                    "could not clear session env for %s during create-terminal teardown",
+                    session_name,
+                    exc_info=True,
+                )
         elif window_created and session_name and window_name:
             # harness-control#186: a window added to an ALREADY-EXISTING session
             # (new_session=False -- every MCP spawn/assign-into-existing-session
@@ -1348,7 +1364,9 @@ def reconcile_session_env() -> dict:
     sessions torn down while the server was dead leave ``session_env`` rows
     behind, and a later same-named session must not inherit stale forwarded
     env. Live-session rows are retained so windows created post-restart still
-    receive the persisted env (issue #248 durability).
+    receive the persisted env (issue #248 durability). Rows are recorded as
+    removed only after their durable deletion is confirmed; failed deletions
+    are retained and reported under ``failed`` (cond-0050).
     """
     from cli_agent_orchestrator.services import session_env
 

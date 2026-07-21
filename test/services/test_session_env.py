@@ -212,9 +212,11 @@ class TestFailClosed:
         with session_env._lock:
             assert "cao-nowrite" not in session_env._session_forwarded_env
 
-    def test_clear_warns_but_does_not_raise_on_db_failure(self, store, monkeypatch, caplog):
-        """clear runs on teardown paths where raising would mask the real error;
-        it logs, still evicts the cache, and never raises."""
+    def test_clear_raises_on_db_failure_and_keeps_row_and_cache(self, store, monkeypatch):
+        """Strict clear (cond-0050): a DB failure past the bounded retry must
+        raise — never be swallowed — and the cache entry must stay in place so
+        cache and DB never disagree in the dangerous direction (evicted cache
+        over a surviving row is the cold-read resurrection path)."""
         set_session_env("cao-clearfail", {"X": "1"})
 
         class _BrokenSession:
@@ -223,11 +225,12 @@ class TestFailClosed:
 
         monkeypatch.setattr(database, "SessionLocal", _BrokenSession)
         monkeypatch.setattr(session_env, "_RETRY_DELAY_SECONDS", 0)
-        with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.session_env"):
-            clear_session_env("cao-clearfail")  # must not raise
-        assert "cao-clearfail" in caplog.text
+        with pytest.raises(SessionEnvStoreError):
+            clear_session_env("cao-clearfail")
+        # Durable row survives and the cache entry is NOT evicted.
+        assert [r[0] for r in _db_rows(store)] == ["cao-clearfail"]
         with session_env._lock:
-            assert "cao-clearfail" not in session_env._session_forwarded_env
+            assert session_env._session_forwarded_env["cao-clearfail"] == {"X": "1"}
 
     def test_missing_row_is_legitimate_empty(self, store):
         """No row + working DB = the no-forwarded-env case; proceeds with {}."""
@@ -263,4 +266,104 @@ class TestReconcile:
         assert len(_db_rows(store)) == 1
 
     def test_empty_store_is_noop(self, store):
-        assert reconcile_session_env(lambda name: False) == {"removed": [], "kept": []}
+        assert reconcile_session_env(lambda name: False) == {
+            "removed": [],
+            "kept": [],
+            "failed": [],
+        }
+
+
+class TestStrictClear:
+    """cond-0050: deletion failures fail closed. The durable delete must
+    complete before cache eviction; exhaustion raises SessionEnvStoreError;
+    a reported-successful clear can never resurrect a stale row on a cold
+    store; reconcile reports failed deletions truthfully."""
+
+    def _fast_locked_store(self, store, monkeypatch):
+        """Rebind the store to the same DB file via an engine with a short
+        SQLite busy timeout so real-lock contention fails fast (the lock
+        itself is real, held by a second raw connection)."""
+        engine = create_engine(
+            f"sqlite:///{store.url.database}",
+            connect_args={"check_same_thread": False, "timeout": 0.1},
+        )
+        monkeypatch.setattr(
+            database,
+            "SessionLocal",
+            sessionmaker(autocommit=False, autoflush=False, bind=engine),
+        )
+        monkeypatch.setattr(session_env, "_RETRY_DELAY_SECONDS", 0)
+        return engine
+
+    def test_empty_set_inherits_strict_clear(self, store, monkeypatch):
+        """set_session_env({}) is the same strict clear: an injected delete
+        failure raises instead of being swallowed, and row/cache survive."""
+        set_session_env("cao-emptyfail", {"PATH": "/shim/bin"})
+
+        class _BrokenSession:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(database, "SessionLocal", _BrokenSession)
+        monkeypatch.setattr(session_env, "_RETRY_DELAY_SECONDS", 0)
+        with pytest.raises(SessionEnvStoreError):
+            set_session_env("cao-emptyfail", {})
+        assert [r[0] for r in _db_rows(store)] == ["cao-emptyfail"]
+        with session_env._lock:
+            assert session_env._session_forwarded_env["cao-emptyfail"] == {"PATH": "/shim/bin"}
+
+    def test_clear_raises_under_real_sqlite_exclusive_lock(self, store, monkeypatch):
+        """The validator's reproduction, not a mock: a second connection holds
+        a real EXCLUSIVE lock; the clear must raise, and the valid stale row
+        plus its cache entry must both survive."""
+        set_session_env("cao-locked-clear", {"ZDOTDIR": "/zsh"})
+        fast_engine = self._fast_locked_store(store, monkeypatch)
+        lock_conn = sqlite3.connect(store.url.database)
+        lock_conn.execute("BEGIN EXCLUSIVE")
+        try:
+            with pytest.raises(SessionEnvStoreError):
+                clear_session_env("cao-locked-clear")
+        finally:
+            lock_conn.rollback()
+            lock_conn.close()
+            fast_engine.dispose()
+        # Lock released: the row is still durable and valid, and the cache
+        # entry was never evicted — no resurrection-via-cache-loss is possible.
+        rows = _db_rows(store)
+        assert len(rows) == 1
+        assert json.loads(rows[0][1]) == {"ZDOTDIR": "/zsh"}
+        with session_env._lock:
+            assert session_env._session_forwarded_env["cao-locked-clear"] == {"ZDOTDIR": "/zsh"}
+
+    def test_successful_clear_never_resurrects_on_cold_store(self, store):
+        """A clear that reported success must be durable: a fresh/cold store
+        (cache wiped, simulating a restart) can never serve the cleared row."""
+        set_session_env("cao-gone", {"PATH": "/shim/bin"})
+        clear_session_env("cao-gone")  # returned normally ⇒ deletion is durable
+        assert _db_rows(store) == []
+        _reset_cache()  # fresh store instance / cold cache
+        assert get_session_env("cao-gone") == {}
+        assert _db_rows(store) == []
+
+    def test_reconcile_reports_failed_delete_never_removed(self, store, monkeypatch, caplog):
+        """Reconciliation truthfulness: a dead-session row whose deletion
+        fails (real IMMEDIATE lock blocks the write while the liveness listing
+        read succeeds) is retained and named in ``failed`` — never counted as
+        ``removed``."""
+        set_session_env("cao-dead", {"STALE": "1"})
+        _reset_cache()
+        fast_engine = self._fast_locked_store(store, monkeypatch)
+        lock_conn = sqlite3.connect(store.url.database)
+        lock_conn.execute("BEGIN IMMEDIATE")
+        try:
+            with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.session_env"):
+                result = reconcile_session_env(lambda name: False)
+        finally:
+            lock_conn.rollback()
+            lock_conn.close()
+            fast_engine.dispose()
+        assert result["removed"] == []
+        assert result["failed"] == ["cao-dead"]
+        assert "cao-dead" in caplog.text
+        # Row retained — a later reconcile (or operator) can retry.
+        assert [r[0] for r in _db_rows(store)] == ["cao-dead"]

@@ -21,10 +21,16 @@ case and returns ``{}``. An *unreadable* state — corrupt ``env_vars`` JSON, a
 locked/unreadable DB past a short bounded retry, or a missing ``session_env``
 table — raises :class:`SessionEnvStoreError` so window/provider creation
 aborts before any tmux launch, instead of silently launching a terminal on
-ambient (empty) env. ``clear_session_env`` is the exception: it is called on
-teardown paths where raising would mask the original error, so a failed row
-delete is logged as a warning and the cache is still evicted — the startup
-reconcile and the fail-closed read path bound the residue.
+ambient (empty) env.
+
+Deletes **fail closed too** (cond-0050). ``clear_session_env`` is strict: the
+bounded durable delete must succeed *before* the cache entry is evicted, and
+retry exhaustion raises :class:`SessionEnvStoreError` with the cache entry
+left in place. An evicted cache over a surviving row is exactly the cold-read
+resurrection path for stale routing env, so cache and DB must never disagree
+in that direction. Callers that genuinely cannot propagate — a teardown path
+preserving an earlier, more primary exception — catch and log at their own
+call site; the shared store never swallows.
 
 Security note: env values are stored PLAINTEXT in the CAO SQLite DB (0600 file
 in a 0700 dir). Forwarded values are non-secret path/routing data by
@@ -114,9 +120,11 @@ def _read_row(session_name: str) -> Optional[str]:
 def set_session_env(session_name: str, env_vars: dict[str, str]) -> None:
     """Register the forwarded env vars for ``session_name``.
 
-    Overwrites any prior mapping. Passing an empty dict clears it (the row is
-    deleted, never stored empty). The DB upsert happens first — the cache is
-    only updated after the write is durable, and a failed write raises
+    Overwrites any prior mapping. Passing an empty dict clears it via the
+    strict :func:`clear_session_env` (the row is deleted, never stored empty;
+    a delete that cannot complete durably raises instead of being swallowed).
+    The DB upsert happens first — the cache is only updated after the write is
+    durable, and a failed write raises
     :class:`SessionEnvStoreError` rather than caching state a restart would
     silently lose.
     """
@@ -163,18 +171,19 @@ def get_session_env(session_name: str) -> dict[str, str]:
 
 
 def clear_session_env(session_name: str) -> None:
-    """Drop the mapping for ``session_name``. Called on session teardown.
+    """Drop the mapping for ``session_name``. Called on session teardown and
+    on the no-env new-session pre-clear.
 
-    Best-effort on the row delete: this runs on teardown paths where raising
-    would mask the original error, so a DB failure past the bounded retry is
-    logged as a warning and the cache is still evicted. A leftover row is
-    removed by the startup reconcile once the tmux session is gone, and the
-    fail-closed read path bounds a genuinely broken DB.
+    Strict (cond-0050): the bounded durable row delete must succeed before
+    the cache entry is evicted. On retry exhaustion this raises
+    :class:`SessionEnvStoreError` and the cache entry is left in place — an
+    evicted cache over a surviving durable row is precisely how a valid stale
+    mapping gets resurrected by a later cold read and injected into a reused
+    session name. Callers on exception-teardown paths that must preserve an
+    earlier, more primary exception catch and log this failure at their own
+    call site; this function itself never swallows it.
     """
-    try:
-        _with_bounded_retry(lambda: _delete_row(session_name), f"clear {session_name}")
-    except SessionEnvStoreError as e:
-        logger.warning("could not delete persisted session env for %s: %s", session_name, e)
+    _with_bounded_retry(lambda: _delete_row(session_name), f"clear {session_name}")
     with _lock:
         _session_forwarded_env.pop(session_name, None)
 
@@ -185,11 +194,14 @@ def reconcile_session_env(session_exists: Callable[[str], bool]) -> dict:
     Sessions torn down while the server was dead leave rows behind; without
     this sweep a later same-named session could inherit stale env. Rows whose
     liveness cannot be determined are kept (fail toward retention — a live
-    session's row must never be dropped on a probe error). ``session_exists``
+    session's row must never be dropped on a probe error). Deletion uses the
+    strict clear: a row is recorded as ``removed`` only after its durable
+    deletion is confirmed; a row whose deletion fails is retained and named
+    in ``failed`` (cond-0050 — never falsely reported removed). ``session_exists``
     is injectable so the lifespan passes the active backend's check and tests
-    can stub it. Returns ``{"removed": [...], "kept": [...]}``.
+    can stub it. Returns ``{"removed": [...], "kept": [...], "failed": [...]}``.
     """
-    removed, kept = [], []
+    removed, kept, failed = [], [], []
     with database.SessionLocal() as db:
         names = [cast(str, row.session_name) for row in db.query(SessionEnvModel).all()]
     for name in names:
@@ -202,9 +214,19 @@ def reconcile_session_env(session_exists: Callable[[str], bool]) -> dict:
         if alive:
             kept.append(name)
         else:
-            clear_session_env(name)
-            removed.append(name)
+            try:
+                clear_session_env(name)
+            except SessionEnvStoreError as e:
+                logger.warning(
+                    "session-env reconcile: could not delete row for dead session %s: %s", name, e
+                )
+                failed.append(name)
+            else:
+                removed.append(name)
     logger.info(
-        "session-env reconcile: %d removed (dead sessions), %d kept", len(removed), len(kept)
+        "session-env reconcile: %d removed (dead sessions), %d kept, %d failed deletions",
+        len(removed),
+        len(kept),
+        len(failed),
     )
-    return {"removed": removed, "kept": kept}
+    return {"removed": removed, "kept": kept, "failed": failed}
