@@ -236,21 +236,27 @@ _ANSI_ESCAPE_RE = re.compile(
     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC ... BEL or ST
     r"|\x1b[@-Z\\-_]"  # two-char escapes
 )
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 
 def _sanitize_edited_text(text: str) -> str:
     """Strip ANSI/VT escape sequences and control bytes (incl. NUL) from
     operator-supplied edit text before it is written to a terminal via
-    ``send_input``.
+    ``send_input``, and collapse it to a SINGLE line.
 
-    Preserves tab / newline / carriage-return. Prevents terminal
-    escape-sequence injection through the approval edit path (P1-4). Any bare
-    ESC left after escape-sequence removal is caught by the control-byte pass
-    (0x1b is within \\x0e-\\x1f).
+    An edited answer is a single line. Now that delivery is wired to a live PTY,
+    a bare CR/LF in the edit text would submit (Enter) mid-answer and could
+    inject a follow-on command line (e.g. ``"y\\rrm -rf ~"``). So carriage
+    returns are removed and the text is truncated at the first newline, in
+    addition to stripping ANSI/VT sequences and C0/C1 control bytes. Horizontal
+    tab is preserved. Any bare ESC left after escape-sequence removal is caught
+    by the control-byte pass (0x1b is within \\x0e-\\x1f). (P1-4 + WS-2.)
     """
     without_ansi = _ANSI_ESCAPE_RE.sub("", text)
-    return _CONTROL_CHARS_RE.sub("", without_ansi)
+    stripped = _CONTROL_CHARS_RE.sub("", without_ansi)
+    # Single-line only: drop CR, then keep everything before the first LF so an
+    # edited answer can neither submit itself nor smuggle a second line.
+    return stripped.replace("\r", "").split("\n", 1)[0]
 
 
 def _translate_decision(
@@ -336,15 +342,19 @@ class AgentHandoffWithApproval(AguiConstruct):
     - Bounded registry with TTL eviction for resolved entries.
 
     Concurrency invariant (single event loop):
-        ``resume()`` guards mutations with an ``asyncio.Lock``, but the sync
-        methods ``on_provider_waiting()`` and ``expire()`` mutate the same
-        shared registries (``_interrupts``, ``_terminal_to_interrupt``,
-        ``_resolved_at``) WITHOUT that lock. This is safe ONLY when every
-        caller runs on the one asyncio event loop (the CAO server model): a
-        sync method and the async ``resume`` critical section can never truly
-        interleave because control yields only at ``await`` points. Do NOT call
-        these methods from a separate OS thread or a second event loop — doing
-        so reintroduces the check-then-act races the lock exists to prevent.
+        ``resume()`` holds an ``asyncio.Lock`` only for the check-then-register
+        step (idempotency check, decision validation, and creating the single
+        authoritative per-interrupt delivery task). Actual delivery + state
+        commit run in ``_deliver_and_commit`` as a SHIELDED task OUTSIDE the
+        lock, so (a) a stuck backend delivery cannot block approvals for other
+        interrupts (P2), and (b) a cancelled awaiter cannot abort the
+        delivery+commit and let a retry deliver a contrary decision (P1) —
+        concurrent resumes of the same interrupt join the one in-flight task.
+        The sync methods ``on_provider_waiting()`` and ``expire()`` mutate the
+        same shared registries WITHOUT the lock; this is safe ONLY when every
+        caller runs on the one asyncio event loop (the CAO server model),
+        because control yields only at ``await`` points. Do NOT call these
+        methods from a separate OS thread or a second event loop.
     """
 
     def __init__(
@@ -360,6 +370,21 @@ class AgentHandoffWithApproval(AguiConstruct):
         self._lock = asyncio.Lock()
         # Track resolution timestamps for TTL eviction
         self._resolved_at: Dict[str, float] = {}
+        # Authoritative per-interrupt delivery+commit task. A concurrent resume
+        # JOINS the in-flight task instead of starting a second delivery, and
+        # the task is SHIELDED from awaiter cancellation, so an aborted
+        # /agui/v1/run stream cannot let a retry deliver a contrary decision (P1).
+        self._inflight: Dict[str, "asyncio.Future[Interrupt]"] = {}
+        # Per-terminal delivery locks. A delivery worker OUTLIVES its interrupt's
+        # registry state (a status flap can expire interrupt A and open a new
+        # interrupt B on the SAME terminal while A's worker is still pasting), and
+        # _inflight is keyed by interrupt id — so per-interrupt join alone does
+        # NOT serialize two workers that target the same terminal. This lock
+        # (acquired INSIDE the shielded delivery task, so awaiter cancellation
+        # cannot skip it) serializes physical delivery per terminal without the
+        # construct-wide blast radius. Bounded by the count of distinct terminals
+        # that ever received an approval delivery.
+        self._delivery_locks: Dict[str, asyncio.Lock] = {}
 
     def handle_frame(
         self, agui_type: str, data: Dict[str, Any], event_id: Optional[str] = None
@@ -387,8 +412,12 @@ class AgentHandoffWithApproval(AguiConstruct):
         approval_card UI intent, and returns the interrupt.
         """
         reason = classify_reason(provider, raw_prompt)
-        # Redact message to <= 256 chars
-        message = raw_prompt[:256] if raw_prompt else ""
+        # Metadata-only contract (docs/agui.md, "privacy tests"): the raw prompt
+        # is terminal-stdout BODY and must never reach the AG-UI wire. The
+        # classified category is carried by `reason`; the human-readable body is
+        # dropped here so it is absent from the approval_card props, the
+        # Interrupt record, and any run-plane snapshot. (WS-2 privacy.)
+        message = ""
 
         options = _options_for_reason(reason)
 
@@ -460,38 +489,97 @@ class AgentHandoffWithApproval(AguiConstruct):
             if interrupt is None:
                 raise KeyError(f"Unknown interrupt: {interrupt_id}")
 
-            # Idempotent: already resolved -> return recorded outcome
+            # Idempotent: already resolved -> return recorded outcome.
             if interrupt.resolved:
                 return interrupt
 
-            # Validate decision is in supported options
-            if decision.value not in interrupt.options:
-                raise ValueError(
-                    f"Decision '{decision.value}' not supported for this interrupt. "
-                    f"Allowed: {interrupt.options}"
+            # If an authoritative delivery+commit is already in flight for THIS
+            # interrupt, JOIN it rather than starting a second one (P1): a retry
+            # (possibly with a contrary decision) must never overtake a delivery
+            # already under way. The first decision to reach here wins.
+            task = self._inflight.get(interrupt_id)
+            if task is None:
+                # First resume: validate THIS decision under the lock so an
+                # invalid decision is rejected without starting any delivery.
+                if decision.value not in interrupt.options:
+                    raise ValueError(
+                        f"Decision '{decision.value}' not supported for this interrupt. "
+                        f"Allowed: {interrupt.options}"
+                    )
+                if decision == ApprovalDecision.EDIT:
+                    if not edited_text or not edited_text.strip():
+                        raise ValueError("Edit decision requires non-empty edited_text")
+                    if len(edited_text) > 4000:
+                        raise ValueError(
+                            f"edited_text too long ({len(edited_text)} chars, max 4000)"
+                        )
+
+                terminal_id = interrupt.metadata.get("terminal_id")
+                provider = interrupt.metadata.get("provider", "")
+                action = _translate_decision(provider, decision, edited_text)
+
+                task = asyncio.ensure_future(
+                    self._deliver_and_commit(interrupt, decision, terminal_id, provider, action)
                 )
+                self._inflight[interrupt_id] = task
 
-            # Validate edit text
-            if decision == ApprovalDecision.EDIT:
-                if not edited_text or not edited_text.strip():
-                    raise ValueError("Edit decision requires non-empty edited_text")
-                if len(edited_text) > 4000:
-                    raise ValueError(f"edited_text too long ({len(edited_text)} chars, max 4000)")
+                def _cleanup(_t: "asyncio.Future[Interrupt]", _iid: str = interrupt_id) -> None:
+                    # Remove from the in-flight registry only AFTER delivery +
+                    # state reconciliation finish (success OR DeliveryError), so a
+                    # retry after a genuine failure can re-attempt.
+                    self._inflight.pop(_iid, None)
+                    # Retrieve any exception so that, if every awaiter was
+                    # cancelled and no retry ever joins, asyncio does not log a
+                    # spurious "Task exception was never retrieved".
+                    if not _t.cancelled():
+                        _t.exception()
 
-            terminal_id = interrupt.metadata.get("terminal_id")
-            provider = interrupt.metadata.get("provider", "")
-            action = _translate_decision(provider, decision, edited_text)
+                task.add_done_callback(_cleanup)
 
-            # Deliver the answer to the terminal BEFORE committing resolution.
-            # Off-loop via to_thread (P2) so blocking tmux/Herdr I/O never stalls
-            # the event loop. The delivery runs to COMPLETION under the lock (no
-            # asyncio.wait_for): a timeout would cancel only the awaiter while the
-            # worker thread kept running, letting a stale paste land after a retry
-            # delivered a different decision. Running to completion keeps the
-            # record and the terminal's side effect in lockstep and serializes
-            # other resume() calls (approvals are low-frequency). A pathologically
-            # slow delivery is surfaced via a warning, not a silent orphan.
-            if self._answer_delivery and terminal_id:
+        # Await the authoritative task OUTSIDE the construct lock, SHIELDED from
+        # our own cancellation. Holding the lock only for check+register (never
+        # across the unbounded backend delivery) bounds a stuck delivery's blast
+        # radius to its own interrupt (P2). Shielding means a cancelled awaiter
+        # (e.g. an aborted /agui/v1/run stream) cannot abort the delivery+commit
+        # and let a retry deliver a contrary decision (P1); the task runs to
+        # completion regardless of the awaiter's fate.
+        return await asyncio.shield(task)
+
+    async def _deliver_and_commit(
+        self,
+        interrupt: Interrupt,
+        decision: ApprovalDecision,
+        terminal_id: Optional[str],
+        provider: str,
+        action: Dict[str, Any],
+    ) -> Interrupt:
+        """Authoritative delivery + state commit for a single interrupt.
+
+        Runs as a shielded task (see ``resume``). Delivers the decision to the
+        terminal off the event loop via ``asyncio.to_thread`` (blocking tmux /
+        Herdr I/O must never stall the loop), then commits resolution. On
+        delivery failure the interrupt is left UNRESOLVED and ``DeliveryError``
+        is raised (retryable) — unless a concurrent ``expire()`` already
+        resolved it mid-flight, in which case expiry wins (nothing was
+        delivered) and the failure is not advertised as retryable.
+        """
+        interrupt_id = interrupt.id
+        if self._answer_delivery and terminal_id:
+            # Serialize physical delivery PER TERMINAL: two workers must never
+            # interleave keystrokes on the same terminal, even across different
+            # interrupts (a status flap can expire this interrupt and open a new
+            # one on the same terminal while this worker is still pasting). The
+            # lock lives inside this shielded task, so awaiter cancellation cannot
+            # skip it; per-terminal (not construct-wide) keeps P2 blast radius
+            # bounded.
+            async with self._delivery_locks.setdefault(terminal_id, asyncio.Lock()):
+                # Expiry-before-send: this interrupt may have expired while its
+                # delivery was QUEUED behind a stuck sibling delivery on the same
+                # terminal. Nothing has been sent for it yet, so expiry wins with
+                # ZERO keystrokes (delivery-beats-expire below applies only once
+                # keystrokes are actually in flight).
+                if interrupt.resolved:
+                    return interrupt
                 _delivery_start = time.monotonic()
                 try:
                     if action["type"] == "text":
@@ -509,8 +597,7 @@ class AgentHandoffWithApproval(AguiConstruct):
                     # failure is NOT advertised as retryable.
                     if interrupt.resolved:
                         logger.info(
-                            "delivery failed but interrupt %s expired mid-flight; "
-                            "honoring expiry",
+                            "delivery failed but interrupt %s expired mid-flight; honoring expiry",
                             interrupt_id,
                         )
                         return interrupt
@@ -526,36 +613,36 @@ class AgentHandoffWithApproval(AguiConstruct):
                         _elapsed,
                     )
 
-            # Delivery-beats-expire: reaching here means delivery succeeded (or
-            # was not applicable), so the terminal already received the input.
-            # Commit the decision even if a concurrent expire() raced in during
-            # the await — the record must reflect ground truth (delivered), not
-            # a mid-flight expiry. (Committing overwrites any "expired" outcome
-            # expire() set; the terminal-map guard tolerates its removal.)
-            interrupt.resolved = True
-            interrupt.outcome = decision.value
-            self._resolved_at[interrupt_id] = time.monotonic()
-            if terminal_id and self._terminal_to_interrupt.get(terminal_id) == interrupt_id:
-                del self._terminal_to_interrupt[terminal_id]
+        # Delivery-beats-expire: reaching here means delivery succeeded (or was
+        # not applicable), so the terminal already received the input. Commit the
+        # decision even if a concurrent expire() raced in during the await — the
+        # record must reflect ground truth (delivered), not a mid-flight expiry.
+        # (Committing overwrites any "expired" outcome expire() set; the
+        # terminal-map guard tolerates its removal.)
+        interrupt.resolved = True
+        interrupt.outcome = decision.value
+        self._resolved_at[interrupt_id] = time.monotonic()
+        if terminal_id and self._terminal_to_interrupt.get(terminal_id) == interrupt_id:
+            del self._terminal_to_interrupt[terminal_id]
 
-            # Emit resolution intent
-            try:
-                self.emit(
-                    "approval_card",
-                    {
-                        "interrupt_id": interrupt_id,
-                        "resolved": True,
-                        "outcome": decision.value,
-                        "provider": provider,
-                        "terminal_id": terminal_id,
-                    },
-                    terminal_id=terminal_id,
-                    session_name=interrupt.metadata.get("session_name"),
-                )
-            except (ValueError, RuntimeError):
-                logger.debug("Failed to emit resolution for interrupt %s", interrupt_id)
+        # Emit resolution intent
+        try:
+            self.emit(
+                "approval_card",
+                {
+                    "interrupt_id": interrupt_id,
+                    "resolved": True,
+                    "outcome": decision.value,
+                    "provider": provider,
+                    "terminal_id": terminal_id,
+                },
+                terminal_id=terminal_id,
+                session_name=interrupt.metadata.get("session_name"),
+            )
+        except (ValueError, RuntimeError):
+            logger.debug("Failed to emit resolution for interrupt %s", interrupt_id)
 
-            return interrupt
+        return interrupt
 
     def expire(self, terminal_id: str) -> Optional[Interrupt]:
         """Expire the open interrupt for a terminal (zero keystrokes).

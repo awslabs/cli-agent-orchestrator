@@ -82,14 +82,23 @@ class TestInterruptCreation:
         assert "approve" in interrupt.options
         assert "deny" in interrupt.options
 
-    def test_message_redacted_to_256(self, construct):
-        long_prompt = "x" * 500
+    def test_message_redacts_raw_prompt(self, construct, emitter):
+        # Metadata-only (docs/agui.md, "privacy tests"): the raw terminal prompt
+        # body must not be retained on the Interrupt nor emitted in the
+        # approval_card props. Only the classified category (reason) survives.
+        raw = "\u2191/\u2193 to navigate SECRET-TOKEN-abc123"
         interrupt = construct.on_provider_waiting(
             terminal_id="t-1",
             provider="claude_code",
-            raw_prompt=long_prompt,
+            raw_prompt=raw,
         )
-        assert len(interrupt.message) <= 256
+        assert interrupt.message == ""
+        assert "SECRET-TOKEN-abc123" not in interrupt.message
+        assert interrupt.reason == "claude-code:permission_request"
+        # The raw body is absent from the emitted approval_card props too.
+        card_props = emitter.intents[0]["props"]
+        assert card_props["message"] == ""
+        assert "SECRET-TOKEN-abc123" not in str(card_props)
 
     def test_emits_approval_card(self, construct, emitter):
         construct.on_provider_waiting(
@@ -222,6 +231,27 @@ class TestEditDecision:
         )
         assert result.outcome == "edit"
         assert ("send_input", "t-1", "custom response") in delivery.calls
+
+    def test_sanitize_edit_strips_cr_and_truncates_at_newline(self):
+        # WS-2: an edited answer is a single line. CR is dropped and everything
+        # after the first LF is discarded so it cannot auto-submit or smuggle a
+        # follow-on command line into the live PTY.
+        from cli_agent_orchestrator.services.agui.handoff_approval import _sanitize_edited_text
+
+        assert _sanitize_edited_text("answer\nrm -rf ~") == "answer"
+        assert _sanitize_edited_text("a\r\nb") == "a"
+        assert _sanitize_edited_text("y\rrm -rf ~") == "yrm -rf ~"
+
+    @pytest.mark.asyncio
+    async def test_edit_cr_lf_neutralized_before_delivery(self, construct, delivery):
+        # WS-2 (positive injection test): "y\rrm -rf ~" must reach the terminal
+        # as a single CR/LF-free line — no separate Enter between "y" and the
+        # command tail, so the picker cannot be made to submit + inject.
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
+        await construct.resume(interrupt.id, ApprovalDecision.EDIT, edited_text="y\rrm -rf ~")
+        sent = [c for c in delivery.calls if c[0] == "send_input"]
+        assert sent == [("send_input", "t-1", "yrm -rf ~")]
+        assert "\r" not in sent[0][2] and "\n" not in sent[0][2]
 
     @pytest.mark.asyncio
     async def test_edit_without_text_rejects(self, construct):
@@ -651,17 +681,177 @@ class TestDeliveryFailureRetryable:
         assert retry.outcome == "expired"
 
     @pytest.mark.asyncio
-    async def test_in_flight_delivery_serializes_next_resume(self):
-        """Regression for the [C-u, C-u, n, y] timeout race: delivery runs to
-        completion under the lock, so a second resume cannot start its delivery
-        until the first finishes — no stale paste can land after a later resume."""
+    async def test_concurrent_resume_same_interrupt_joins_single_delivery(self):
+        """Two concurrent resumes of the SAME interrupt share one authoritative
+        delivery: the second JOINS the in-flight task rather than starting a
+        second (contrary) delivery. Both callers observe the same outcome, and
+        exactly one keystroke reaches the terminal.
+
+        (Replaces the old cross-interrupt serialization test: per-interrupt —
+        not construct-wide — scoping is now the contract, so different terminals
+        no longer block each other; see test_stuck_delivery_does_not_block_
+        other_terminal for P2.)
+        """
+        import threading
+
+        first_in_delivery = threading.Event()
+        release_first = threading.Event()
+
+        class _SeqDelivery:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def send_input(self, terminal_id, text, **kwargs):
+                self.calls += 1
+                first_in_delivery.set()
+                release_first.wait()
+
+            def send_special_key(self, terminal_id, key):
+                return True
+
+        delivery = _SeqDelivery()
+        construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=delivery)
+        i1 = construct.on_provider_waiting("t-a", "kiro_cli", "Allow this action? [y/n/t]:")
+
+        t1 = asyncio.create_task(construct.resume(i1.id, ApprovalDecision.APPROVE))
+        await asyncio.to_thread(first_in_delivery.wait)
+        # Contrary decision arrives while the first delivery is still in flight.
+        t2 = asyncio.create_task(construct.resume(i1.id, ApprovalDecision.DENY))
+        await asyncio.sleep(0.05)  # give t2 a chance to (wrongly) start its own delivery
+
+        release_first.set()
+        r1, r2 = await asyncio.gather(t1, t2)
+        # Exactly one delivery; both observe the first (approve) outcome.
+        assert delivery.calls == 1
+        assert r1.outcome == "approve"
+        assert r2.outcome == "approve"
+
+
+# ---------------------------------------------------------------------------
+# Cancellation & blast-radius safety (fanhongy P1 + P2)
+# ---------------------------------------------------------------------------
+
+
+class TestCancellationSafety:
+    """P1: a cancelled awaiter must not let a contrary retry overtake the
+    shielded in-flight delivery. P2: a stuck delivery for one interrupt must not
+    block approvals for a different terminal."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_then_contrary_retry_does_not_overtake_delivery(self):
+        """P1 (blocking): cancelling an awaiting ``resume()`` — e.g. when an
+        ``/agui/v1/run`` stream disconnects — must NOT let a contrary retry
+        deliver and commit before the shielded in-flight delivery lands.
+
+        Reproduces the reviewer's ``[C-u, C-u, n, y]`` sequence: without the
+        cancellation shield, the cancelled approve worker pastes ``y`` AFTER the
+        retry committed ``deny`` and pasted ``n``. With the shield the first
+        (authoritative) decision wins, the retry joins it, and no opposite
+        keystroke is ever sent.
+        """
         import threading
 
         order: List[str] = []
         first_in_delivery = threading.Event()
         release_first = threading.Event()
 
-        class _SeqDelivery:
+        class _PausingDelivery:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def send_input(self, terminal_id, text, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    first_in_delivery.set()
+                    release_first.wait()
+                order.append(text)
+
+            def send_special_key(self, terminal_id, key):
+                return True
+
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=_PausingDelivery()
+        )
+        interrupt = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
+
+        approve = asyncio.create_task(construct.resume(interrupt.id, ApprovalDecision.APPROVE))
+        await asyncio.to_thread(first_in_delivery.wait)
+
+        # The awaiting resume() is cancelled (stream disconnect). The shielded
+        # delivery+commit task must survive.
+        approve.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await approve
+
+        # A contrary retry arrives while the shielded approve delivery is still
+        # in flight; it must JOIN it, not start a second (deny) delivery.
+        retry = asyncio.create_task(construct.resume(interrupt.id, ApprovalDecision.DENY))
+        await asyncio.sleep(0.05)  # give the retry a chance to (wrongly) deliver "n"
+
+        # Release the original (shielded) delivery; let everything settle.
+        release_first.set()
+        result = await retry
+
+        # Exactly one delivery, and it was the approve ("y"); the contrary deny
+        # ("n") never reached the terminal, and the committed outcome is approve.
+        assert order == ["y"]
+        assert result.resolved
+        assert result.outcome == "approve"
+        assert construct.get_interrupt(interrupt.id).outcome == "approve"
+
+    @pytest.mark.asyncio
+    async def test_stuck_delivery_does_not_block_other_terminal(self):
+        """P2: a stuck delivery for one interrupt must not block approvals for a
+        different terminal. The construct lock is held only for check+register,
+        not across the unbounded backend delivery, so the blast radius of a hung
+        backend is bounded to its own interrupt."""
+        import threading
+
+        release_a = threading.Event()
+
+        class _StuckForA:
+            def send_input(self, terminal_id, text, **kwargs):
+                if terminal_id == "t-a":
+                    release_a.wait()
+
+            def send_special_key(self, terminal_id, key):
+                return True
+
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=_StuckForA()
+        )
+        ia = construct.on_provider_waiting("t-a", "kiro_cli", "Allow this action? [y/n/t]:")
+        ib = construct.on_provider_waiting("t-b", "kiro_cli", "Allow this action? [y/n/t]:")
+
+        a = asyncio.create_task(construct.resume(ia.id, ApprovalDecision.APPROVE))
+        await asyncio.sleep(0.02)  # let A get stuck in delivery
+
+        # B must resolve even though A's delivery is stuck. On the pre-fix
+        # construct-wide lock this wait_for times out (P2 reproduction).
+        b = await asyncio.wait_for(construct.resume(ib.id, ApprovalDecision.APPROVE), timeout=2.0)
+        assert b.resolved and b.outcome == "approve"
+        # A is still in flight / unresolved until released.
+        assert not construct.get_interrupt(ia.id).resolved
+
+        release_a.set()
+        await a
+        assert construct.get_interrupt(ia.id).resolved
+
+    @pytest.mark.asyncio
+    async def test_same_terminal_cross_interrupt_deliveries_serialize(self):
+        """A delivery worker outlives its interrupt's registry state: a status
+        flap can expire the original interrupt mid-delivery and create a
+        REPLACEMENT interrupt for the same terminal. Per-interrupt join does
+        not cover that pair, so without per-terminal serialization the two
+        workers would interleave keystrokes on one PTY ([C-u, C-u, n, y]).
+        The replacement's delivery must WAIT for the stuck worker to finish."""
+        import threading
+
+        order: List[str] = []
+        first_in_delivery = threading.Event()
+        release_first = threading.Event()
+
+        class _StickyFirst:
             def __init__(self) -> None:
                 self.calls = 0
 
@@ -673,26 +863,83 @@ class TestDeliveryFailureRetryable:
                     release_first.wait()
                     order.append("first-end")
                 else:
-                    order.append("second")
+                    order.append(f"second:{text}")
 
             def send_special_key(self, terminal_id, key):
                 return True
 
-        construct = AgentHandoffWithApproval(
-            emitter=RecordingUiEmitter(), answer_delivery=_SeqDelivery()
-        )
-        i1 = construct.on_provider_waiting("t-a", "kiro_cli", "Allow this action? [y/n/t]:")
-        i2 = construct.on_provider_waiting("t-b", "kiro_cli", "Allow this action? [y/n/t]:")
+        delivery = _StickyFirst()
+        construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=delivery)
+        ia = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
 
-        t1 = asyncio.create_task(construct.resume(i1.id, ApprovalDecision.APPROVE))
+        a = asyncio.create_task(construct.resume(ia.id, ApprovalDecision.APPROVE))
         await asyncio.to_thread(first_in_delivery.wait)
-        t2 = asyncio.create_task(construct.resume(i2.id, ApprovalDecision.APPROVE))
-        await asyncio.sleep(0.05)  # give t2 a chance to (wrongly) interleave
 
-        # t2 must NOT have started delivery while t1 holds the lock mid-delivery.
-        assert "second" not in order
+        # Status flap while A's worker is stuck mid-delivery: the terminal
+        # blips out of WAITING (expire) and back in (replacement interrupt).
+        construct.expire("t-1")
+        ib = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
+        assert ib.id != ia.id
+
+        b = asyncio.create_task(construct.resume(ib.id, ApprovalDecision.DENY))
+        await asyncio.sleep(0.05)  # give B a chance to (wrongly) deliver concurrently
+
+        # B must NOT have delivered while A's worker is still in flight.
+        assert order == ["first-start"]
 
         release_first.set()
-        await asyncio.gather(t1, t2)
-        # Strict ordering: the first delivery fully completes before the second.
-        assert order == ["first-start", "first-end", "second"]
+        ra, rb = await asyncio.gather(a, b)
+
+        # Strict serialization: A's worker fully completes before B delivers.
+        assert order == ["first-start", "first-end", "second:n"]
+        # Records reflect delivered reality: A's successful delivery overwrote
+        # the flap expiry (delivery-beats-expire); B delivered deny afterwards.
+        assert ra.outcome == "approve"
+        assert rb.outcome == "deny"
+
+    @pytest.mark.asyncio
+    async def test_queued_delivery_honors_expiry_before_sending(self):
+        """If an interrupt expires while its delivery is QUEUED behind a stuck
+        sibling delivery on the same terminal, nothing has been sent for it, so
+        expiry wins with zero keystrokes (symmetric with the failed-delivery
+        expiry rule)."""
+        import threading
+
+        first_in_delivery = threading.Event()
+        release_first = threading.Event()
+
+        class _StickyFirst:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def send_input(self, terminal_id, text, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    first_in_delivery.set()
+                    release_first.wait()
+
+            def send_special_key(self, terminal_id, key):
+                return True
+
+        delivery = _StickyFirst()
+        construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=delivery)
+        ia = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
+
+        a = asyncio.create_task(construct.resume(ia.id, ApprovalDecision.APPROVE))
+        await asyncio.to_thread(first_in_delivery.wait)
+
+        construct.expire("t-1")
+        ib = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
+        b = asyncio.create_task(construct.resume(ib.id, ApprovalDecision.DENY))
+        await asyncio.sleep(0.05)  # let B queue behind A's stuck delivery
+
+        # B expires while queued (second flap) — before anything was sent for it.
+        construct.expire("t-1")
+
+        release_first.set()
+        ra, rb = await asyncio.gather(a, b)
+
+        assert ra.outcome == "approve"
+        # Zero keystrokes for B: expiry won while it was still queued.
+        assert rb.outcome == "expired"
+        assert delivery.calls == 1
