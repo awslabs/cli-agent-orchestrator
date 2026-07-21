@@ -521,12 +521,16 @@ async def lifespan(app: FastAPI):
         from cli_agent_orchestrator.services.agui.base import InProcessUiEmitter
         from cli_agent_orchestrator.services.agui.handoff_approval import (
             AgentHandoffWithApproval,
+            TerminalServiceAnswerDelivery,
         )
 
         approval_emitter = InProcessUiEmitter()
         approval_construct = AgentHandoffWithApproval(
             emitter=approval_emitter,
-            answer_delivery=None,  # Will use terminal_service directly in bridge
+            # Deliver resolved decisions to the waiting CLI via the tmux input
+            # path so approve/deny/edit actually reach the terminal (not just
+            # mark the interrupt resolved).
+            answer_delivery=TerminalServiceAnswerDelivery(),
         )
         approval_bridge = ApprovalBridge(construct=approval_construct)
         app.state.approval_bridge = approval_bridge

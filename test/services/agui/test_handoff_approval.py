@@ -410,3 +410,44 @@ class TestHandoffApprovalProperty:
         # Idempotent second resume
         second = await construct.resume(interrupt.id, ApprovalDecision.DENY)
         assert second.outcome == "approve"  # First resolution wins
+
+
+# ---------------------------------------------------------------------------
+# TerminalServiceAnswerDelivery: production adapter delegates to terminal_service
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalServiceAnswerDelivery:
+    """The production AnswerDelivery adapter delegates to terminal_service."""
+
+    def test_send_input_delegates_once(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.agui.handoff_approval import (
+            TerminalServiceAnswerDelivery,
+        )
+
+        calls: List[Tuple[str, str]] = []
+        monkeypatch.setattr(
+            terminal_service, "send_input", lambda tid, text: calls.append((tid, text)) or True
+        )
+
+        TerminalServiceAnswerDelivery().send_input("t-9", "hello")
+        assert calls == [("t-9", "hello")]
+
+    def test_send_special_key_delegates_and_returns(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.agui.handoff_approval import (
+            TerminalServiceAnswerDelivery,
+        )
+
+        calls: List[Tuple[str, str]] = []
+
+        def _fake(tid, key):
+            calls.append((tid, key))
+            return True
+
+        monkeypatch.setattr(terminal_service, "send_special_key", _fake)
+
+        result = TerminalServiceAnswerDelivery().send_special_key("t-9", "Enter")
+        assert result is True
+        assert calls == [("t-9", "Enter")]

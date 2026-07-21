@@ -175,6 +175,30 @@ class AnswerDelivery(Protocol):
     def send_special_key(self, terminal_id: str, key: str) -> bool: ...  # pragma: no cover
 
 
+class TerminalServiceAnswerDelivery:
+    """Production ``AnswerDelivery`` backed by ``terminal_service``.
+
+    Delivers a resolved approval decision to the waiting CLI by driving the same
+    tmux input path the rest of CAO uses. ``terminal_service`` is imported lazily
+    (mirroring ``approval_bridge``) so the metadata-only ``services/agui`` package
+    keeps its import graph free of the heavy terminal layer at module load.
+
+    Must only be invoked from the CAO server event loop (the construct's
+    ``resume`` critical section calls it); ``terminal_service.send_input`` is
+    blocking tmux I/O, so a single delivery briefly runs on the loop thread.
+    """
+
+    def send_input(self, terminal_id: str, text: str, **kwargs: Any) -> None:
+        from cli_agent_orchestrator.services import terminal_service
+
+        terminal_service.send_input(terminal_id, text)
+
+    def send_special_key(self, terminal_id: str, key: str) -> bool:
+        from cli_agent_orchestrator.services import terminal_service
+
+        return terminal_service.send_special_key(terminal_id, key)
+
+
 # ---------------------------------------------------------------------------
 # Per-provider answer translation
 # ---------------------------------------------------------------------------

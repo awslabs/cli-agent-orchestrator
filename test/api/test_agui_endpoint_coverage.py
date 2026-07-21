@@ -48,9 +48,18 @@ class _TerminatingBus:
 def test_lifespan_starts_and_stops_approval_bridge():
     # Entering the context runs lifespan startup (wires the ApprovalBridge under
     # CAO_AGUI_ENABLED); exiting runs shutdown (cancels the bridge task).
+    from cli_agent_orchestrator.services.agui.handoff_approval import (
+        TerminalServiceAnswerDelivery,
+    )
+
     with TestClient(main.app, base_url="http://localhost") as client:
         assert client.get("/health").status_code == 200
         assert hasattr(main.app.state, "approval_bridge")
+        # Regression guard (P1): the production construct must be wired with a
+        # real terminal-service-backed delivery so resume actually reaches the
+        # CLI, not answer_delivery=None.
+        construct = main.app.state.approval_bridge.construct
+        assert isinstance(construct._answer_delivery, TerminalServiceAnswerDelivery)
 
 
 def test_resume_returns_422_on_edit_validation_error():

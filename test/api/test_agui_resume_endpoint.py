@@ -230,3 +230,90 @@ class TestBridgeNotInitialized:
         )
         assert resp.status_code == 404
         assert "not initialized" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Delivery: resume must actually reach the waiting terminal (exactly once)
+# ---------------------------------------------------------------------------
+
+
+class TestDeliveryOnResume:
+    """Resolving an interrupt delivers the decision to the CLI exactly once.
+
+    Regression guard for the P1 bug where the production construct was wired
+    with ``answer_delivery=None``, so resume reported success without ever
+    sending approve/deny/edit to the terminal.
+    """
+
+    @pytest.fixture
+    def delivery_bridge(self, monkeypatch):
+        """Bridge whose construct uses the real terminal-service-backed delivery,
+        with terminal_service patched to count deliveries."""
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.agui.handoff_approval import (
+            TerminalServiceAnswerDelivery,
+        )
+
+        deliveries: list = []
+        monkeypatch.setattr(
+            terminal_service,
+            "send_input",
+            lambda tid, text: deliveries.append(("input", tid, text)) or True,
+        )
+        monkeypatch.setattr(
+            terminal_service,
+            "send_special_key",
+            lambda tid, key: deliveries.append(("key", tid, key)) or True,
+        )
+
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(),
+            answer_delivery=TerminalServiceAnswerDelivery(),
+        )
+        bridge = ApprovalBridge(construct=construct)
+        app.state.approval_bridge = bridge
+        yield bridge, deliveries
+        if hasattr(app.state, "approval_bridge"):
+            del app.state.approval_bridge
+
+    def test_approve_delivers_exactly_once(self, delivery_bridge):
+        bridge, deliveries = delivery_bridge
+        interrupt = bridge.construct.on_provider_waiting(
+            "t-deliver", "claude_code", "\u2191/\u2193 to navigate"
+        )
+
+        resp = client.post(
+            f"/agui/v1/interrupts/{interrupt.id}/resume",
+            json={"decision": "approve"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["outcome"] == "approve"
+
+        # Exactly one delivery reached the waiting terminal.
+        assert len(deliveries) == 1
+        assert deliveries[0][1] == "t-deliver"
+
+        # Idempotent re-resume must NOT deliver again.
+        resp2 = client.post(
+            f"/agui/v1/interrupts/{interrupt.id}/resume",
+            json={"decision": "deny"},
+        )
+        assert resp2.status_code == 200
+        assert len(deliveries) == 1
+
+    def test_edit_delivers_translated_text_once(self, delivery_bridge):
+        bridge, deliveries = delivery_bridge
+        interrupt = bridge.construct.on_provider_waiting(
+            "t-edit", "claude_code", "\u2191/\u2193 to navigate"
+        )
+
+        resp = client.post(
+            f"/agui/v1/interrupts/{interrupt.id}/resume",
+            json={"decision": "edit", "edited_text": "custom command"},
+        )
+        assert resp.status_code == 200
+        assert len(deliveries) == 1
+        # Edit resolves to typed text carrying the (sanitized) edited command.
+        kind, tid, payload = deliveries[0]
+        assert tid == "t-edit"
+        assert "custom command" in payload
