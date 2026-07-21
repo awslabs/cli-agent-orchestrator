@@ -300,3 +300,59 @@ class TestMalformedLineTolerance:
             list(reader.frames())
             headers = mock_get.call_args[1]["headers"]
             assert headers["Authorization"] == "Bearer my-secret-token"
+
+
+# ---------------------------------------------------------------------------
+# Item 2 — Connect/read timeout tests
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutNegotiation:
+    """Tests for the (connect, read) timeout tuple in AguiStreamReader."""
+
+    def test_tuple_timeout_passed_to_requests(self):
+        """A (connect, read) tuple is passed through to requests.get."""
+        reader = AguiStreamReader("http://localhost:8420", timeout=(5.0, 30.0))
+        lines = ["id: e1", "event: A", "data: {}", ""]
+        fake_resp = _FakeResponse(lines)
+        with patch("cli_agent_orchestrator.services.agui.stream_reader.requests.get") as mock_get:
+            mock_get.return_value = fake_resp
+            list(reader.frames())
+            kwargs = mock_get.call_args[1]
+            assert kwargs["timeout"] == (5.0, 30.0)
+
+    def test_float_compat_uses_default_connect(self):
+        """A single float is interpreted as read timeout with 10s connect default."""
+        from cli_agent_orchestrator.services.agui.stream_reader import _DEFAULT_CONNECT_TIMEOUT
+
+        reader = AguiStreamReader("http://localhost:8420", timeout=45.0)
+        lines = ["id: e1", "event: A", "data: {}", ""]
+        fake_resp = _FakeResponse(lines)
+        with patch("cli_agent_orchestrator.services.agui.stream_reader.requests.get") as mock_get:
+            mock_get.return_value = fake_resp
+            list(reader.frames())
+            kwargs = mock_get.call_args[1]
+            assert kwargs["timeout"] == (_DEFAULT_CONNECT_TIMEOUT, 45.0)
+
+    def test_none_timeout_uses_defaults(self):
+        """None/absent timeout uses the module defaults (10s connect, 60s read)."""
+        from cli_agent_orchestrator.services.agui.stream_reader import (
+            _DEFAULT_CONNECT_TIMEOUT,
+            _DEFAULT_READ_TIMEOUT,
+        )
+
+        reader = AguiStreamReader("http://localhost:8420")
+        lines = ["id: e1", "event: A", "data: {}", ""]
+        fake_resp = _FakeResponse(lines)
+        with patch("cli_agent_orchestrator.services.agui.stream_reader.requests.get") as mock_get:
+            mock_get.return_value = fake_resp
+            list(reader.frames())
+            kwargs = mock_get.call_args[1]
+            assert kwargs["timeout"] == (_DEFAULT_CONNECT_TIMEOUT, _DEFAULT_READ_TIMEOUT)
+
+    def test_default_read_exceeds_heartbeat(self):
+        """The default read timeout (60s) must exceed the server heartbeat (15s)."""
+        from cli_agent_orchestrator.services.agui.stream_reader import _DEFAULT_READ_TIMEOUT
+
+        # Server heartbeat is 15s (CAO_AGUI_HEARTBEAT_SECONDS default)
+        assert _DEFAULT_READ_TIMEOUT > 15.0, "Read timeout must exceed 15s heartbeat"

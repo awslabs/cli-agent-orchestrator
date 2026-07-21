@@ -200,9 +200,11 @@ class TerminalServiceAnswerDelivery:
     (mirroring ``approval_bridge``) so the metadata-only ``services/agui`` package
     keeps its import graph free of the heavy terminal layer at module load.
 
-    Must only be invoked from the CAO server event loop (the construct's
-    ``resume`` critical section calls it); ``terminal_service.send_input`` is
-    blocking tmux I/O, so a single delivery briefly runs on the loop thread.
+    Methods are blocking and are invoked from a **worker thread** (via
+    ``asyncio.to_thread`` inside the shielded ``_deliver_and_commit`` task).
+    They must stay thread-safe and must not assume an event loop is running in
+    the current thread. The per-terminal lock that serializes deliveries is held
+    by the async construct above — these methods just perform the I/O.
     """
 
     def send_input(self, terminal_id: str, text: str, **kwargs: Any) -> None:
@@ -581,6 +583,19 @@ class AgentHandoffWithApproval(AguiConstruct):
                 if interrupt.resolved:
                     return interrupt
                 _delivery_start = time.monotonic()
+                # In-flight watchdog: emit a WARNING while the worker is still
+                # running if it exceeds the threshold. Never cancels the worker.
+                _loop = asyncio.get_running_loop()
+                _watchdog_handle = _loop.call_later(
+                    _DELIVERY_SLOW_WARN_SECONDS,
+                    lambda: logger.warning(
+                        "Approval delivery in-flight for interrupt %s on terminal %s "
+                        "has exceeded %.1fs (still running)",
+                        interrupt_id,
+                        terminal_id,
+                        _DELIVERY_SLOW_WARN_SECONDS,
+                    ),
+                )
                 try:
                     if action["type"] == "text":
                         await asyncio.to_thread(
@@ -605,6 +620,8 @@ class AgentHandoffWithApproval(AguiConstruct):
                     # can re-attempt; surface the failure to the caller.
                     logger.warning("Failed to deliver answer for interrupt %s: %s", interrupt_id, e)
                     raise DeliveryError(str(e)) from e
+                finally:
+                    _watchdog_handle.cancel()
                 _elapsed = time.monotonic() - _delivery_start
                 if _elapsed > _DELIVERY_SLOW_WARN_SECONDS:
                     logger.warning(

@@ -758,3 +758,73 @@ async def test_run_plane_resume_cancelled_status_still_works_with_empty_payload(
     assert construct.get_interrupt(interrupt.id).outcome == "deny"
     assert parsed[-1]["type"] == "RUN_FINISHED"
     assert parsed[-1]["outcome"]["type"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# Item 4 — Accept negotiation / get_content_type
+# ---------------------------------------------------------------------------
+
+
+class TestAcceptNegotiation:
+    """Tests for the accept parameter and content-type negotiation."""
+
+    @pytest.mark.asyncio
+    async def test_accept_text_event_stream_unchanged(self):
+        """Accept: text/event-stream produces the same frames as today."""
+        from cli_agent_orchestrator.services.agui.run_plane import run_plane_stream
+
+        input_data = _minimal_run_input()
+        frames_with_accept = await _collect_stream(
+            run_plane_stream(input_data=input_data, accept="text/event-stream")
+        )
+        frames_without = await _collect_stream(run_plane_stream(input_data=input_data, accept=None))
+        # Same frames content (both are data: lines)
+        assert len(frames_with_accept) == len(frames_without)
+        for a, b in zip(frames_with_accept, frames_without):
+            assert a.startswith("data: ") == b.startswith("data: ")
+
+    @pytest.mark.asyncio
+    async def test_absent_accept_identical_to_today(self):
+        """Absent Accept header (None) produces standard SSE frames."""
+        from cli_agent_orchestrator.services.agui.run_plane import run_plane_stream
+
+        input_data = _minimal_run_input()
+        frames = await _collect_stream(run_plane_stream(input_data=input_data, accept=None))
+        assert len(frames) >= 2
+        # All meaningful frames are data: lines
+        data_frames = [f for f in frames if f.startswith("data: ")]
+        assert len(data_frames) >= 2
+
+    def test_get_content_type_with_sse_accept(self):
+        """get_run_plane_content_type returns text/event-stream for SSE accept."""
+        from cli_agent_orchestrator.services.agui.run_plane import get_run_plane_content_type
+
+        assert get_run_plane_content_type("text/event-stream") == "text/event-stream"
+
+    def test_get_content_type_with_none(self):
+        """get_run_plane_content_type returns text/event-stream for None."""
+        from cli_agent_orchestrator.services.agui.run_plane import get_run_plane_content_type
+
+        assert get_run_plane_content_type(None) == "text/event-stream"
+
+    def test_get_content_type_fallback(self):
+        """get_run_plane_content_type always returns a valid content type."""
+        from cli_agent_orchestrator.services.agui.run_plane import get_run_plane_content_type
+
+        result = get_run_plane_content_type("application/json")
+        assert result  # non-empty
+        assert "text/event-stream" in result  # SDK currently defaults to SSE
+
+    def test_get_content_type_without_agui_extra(self):
+        """get_run_plane_content_type returns text/event-stream when AG_UI_AVAILABLE is False."""
+        import cli_agent_orchestrator.services.agui.run_plane as run_plane_mod
+
+        original = run_plane_mod.AG_UI_AVAILABLE
+        try:
+            run_plane_mod.AG_UI_AVAILABLE = False
+            assert run_plane_mod.get_run_plane_content_type() == "text/event-stream"
+            assert (
+                run_plane_mod.get_run_plane_content_type("application/json") == "text/event-stream"
+            )
+        finally:
+            run_plane_mod.AG_UI_AVAILABLE = original

@@ -1375,7 +1375,13 @@ async def agui_run(
 
     from fastapi.responses import StreamingResponse
 
-    from cli_agent_orchestrator.services.agui.run_plane import run_plane_stream
+    from cli_agent_orchestrator.services.agui.run_plane import (
+        get_run_plane_content_type,
+        run_plane_stream,
+    )
+
+    accept_header = request.headers.get("accept")
+    content_type = get_run_plane_content_type(accept_header)
 
     return StreamingResponse(
         run_plane_stream(
@@ -1383,8 +1389,9 @@ async def agui_run(
             approval_construct=approval_construct,
             snapshot_fn=_fleet_snapshot,
             bus_subscribe_fn=_bus_events,
+            accept=accept_header,
         ),
-        media_type="text/event-stream",
+        media_type=content_type,
     )
 
 

@@ -943,3 +943,145 @@ class TestCancellationSafety:
         # Zero keystrokes for B: expiry won while it was still queued.
         assert rb.outcome == "expired"
         assert delivery.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Item 1 — In-flight watchdog tests
+# ---------------------------------------------------------------------------
+
+
+class TestInFlightWatchdog:
+    """Tests for the active-hang watchdog (loop.call_later while delivery runs)."""
+
+    @pytest.mark.asyncio
+    async def test_slow_delivery_fires_inflight_warning_before_completion(
+        self, monkeypatch, caplog
+    ):
+        """A slow delivery triggers the in-flight watchdog WARNING BEFORE the
+        worker completes — not just the post-hoc duration warning."""
+        import logging
+        import threading
+        import time as _time
+
+        from cli_agent_orchestrator.services.agui import handoff_approval as _mod
+
+        # Tiny threshold so the watchdog fires quickly.
+        monkeypatch.setattr(_mod, "_DELIVERY_SLOW_WARN_SECONDS", 0.02)
+
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        watchdog_fired_before_completion = False
+
+        class _ControlledSlow:
+            def send_input(self, terminal_id, text, **kwargs):
+                worker_started.set()
+                release_worker.wait()
+
+            def send_special_key(self, terminal_id, key):
+                worker_started.set()
+                release_worker.wait()
+                return True
+
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=_ControlledSlow()
+        )
+        interrupt = construct.on_provider_waiting("t-wd1", "claude_code", "Allow? [y/n]")
+
+        async def _drive():
+            nonlocal watchdog_fired_before_completion
+            task = asyncio.create_task(construct.resume(interrupt.id, ApprovalDecision.APPROVE))
+            # Wait for worker to start
+            await asyncio.to_thread(worker_started.wait)
+            # Give the watchdog time to fire (threshold is 0.02s)
+            await asyncio.sleep(0.08)
+            # Check logs for in-flight warning BEFORE releasing the worker
+            watchdog_fired_before_completion = any(
+                "in-flight" in r.message and "t-wd1" in r.message
+                for r in caplog.records
+                if r.levelno >= logging.WARNING
+            )
+            release_worker.set()
+            return await task
+
+        with caplog.at_level(
+            logging.WARNING, logger="cli_agent_orchestrator.services.agui.handoff_approval"
+        ):
+            result = await _drive()
+
+        assert watchdog_fired_before_completion, "Watchdog should fire BEFORE worker completes"
+        assert result.resolved
+        assert result.outcome == "approve"
+
+    @pytest.mark.asyncio
+    async def test_fast_delivery_no_watchdog_warning(self, monkeypatch, caplog):
+        """A fast delivery does not trigger the in-flight watchdog — the timer
+        is cancelled before it fires."""
+        import logging
+
+        from cli_agent_orchestrator.services.agui import handoff_approval as _mod
+
+        # Threshold well above the delivery time
+        monkeypatch.setattr(_mod, "_DELIVERY_SLOW_WARN_SECONDS", 10.0)
+
+        class _FastDelivery:
+            def send_input(self, terminal_id, text, **kwargs):
+                pass
+
+            def send_special_key(self, terminal_id, key):
+                return True
+
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=_FastDelivery()
+        )
+        interrupt = construct.on_provider_waiting("t-wd2", "claude_code", "Allow? [y/n]")
+
+        with caplog.at_level(
+            logging.WARNING, logger="cli_agent_orchestrator.services.agui.handoff_approval"
+        ):
+            result = await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+
+        # No in-flight warning should have been emitted
+        inflight_warnings = [
+            r for r in caplog.records if "in-flight" in r.message and r.levelno >= logging.WARNING
+        ]
+        assert not inflight_warnings, "Fast delivery should not trigger watchdog"
+        assert result.resolved
+        assert result.outcome == "approve"
+
+    @pytest.mark.asyncio
+    async def test_watchdog_fires_but_delivery_succeeds(self, monkeypatch, caplog):
+        """The watchdog fires but delivery then completes normally — outcome
+        still commits correctly (watchdog is observability-only)."""
+        import logging
+        import time as _time
+
+        from cli_agent_orchestrator.services.agui import handoff_approval as _mod
+
+        monkeypatch.setattr(_mod, "_DELIVERY_SLOW_WARN_SECONDS", 0.01)
+
+        class _SlowButSucceeds:
+            def send_input(self, terminal_id, text, **kwargs):
+                _time.sleep(0.05)
+
+            def send_special_key(self, terminal_id, key):
+                _time.sleep(0.05)
+                return True
+
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=_SlowButSucceeds()
+        )
+        interrupt = construct.on_provider_waiting("t-wd3", "claude_code", "Allow? [y/n]")
+
+        with caplog.at_level(
+            logging.WARNING, logger="cli_agent_orchestrator.services.agui.handoff_approval"
+        ):
+            result = await construct.resume(interrupt.id, ApprovalDecision.DENY)
+
+        # Watchdog fired (in-flight warning present)
+        inflight_warnings = [
+            r for r in caplog.records if "in-flight" in r.message and r.levelno >= logging.WARNING
+        ]
+        assert inflight_warnings, "Watchdog should fire for slow delivery"
+        # But delivery still succeeded
+        assert result.resolved
+        assert result.outcome == "deny"

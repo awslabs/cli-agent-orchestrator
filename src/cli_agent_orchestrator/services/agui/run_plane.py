@@ -132,12 +132,26 @@ def _extract_edited_text(payload: Any) -> Optional[str]:
 RUN_PLANE_HEARTBEAT_SECONDS = float(os.environ.get("CAO_AGUI_HEARTBEAT_SECONDS", "15.0"))
 
 
+def get_run_plane_content_type(accept: Optional[str] = None) -> str:
+    """Return the negotiated content type for the run plane response.
+
+    Mirrors the ``EventEncoder(accept=...)`` negotiation used inside
+    ``run_plane_stream``. Falls back to ``text/event-stream`` when the SDK
+    is unavailable or ``accept`` is None.
+    """
+    if not AG_UI_AVAILABLE:
+        return "text/event-stream"
+    encoder = EventEncoder(accept=accept)
+    return encoder.get_content_type() or "text/event-stream"
+
+
 async def run_plane_stream(
     input_data: Dict[str, Any],
     approval_construct: Optional[Any] = None,
     snapshot_fn: Optional[Any] = None,
     bus_subscribe_fn: Optional[Any] = None,
     heartbeat_interval: Optional[float] = None,
+    accept: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """Stream lifecycle-legal AG-UI SSE frames for a single run.
 
@@ -146,6 +160,11 @@ async def run_plane_stream(
         approval_construct: The AgentHandoffWithApproval instance (or None).
         snapshot_fn: Callable returning the current fleet snapshot dict.
         bus_subscribe_fn: Async callable that yields live CAO events from SseBus.
+        heartbeat_interval: Override for the SSE heartbeat interval (seconds).
+        accept: The request Accept header value for content-type negotiation.
+            Passed to ``EventEncoder(accept=...)``; the negotiated type is
+            available via ``get_content_type()``. When None or absent, defaults
+            to ``text/event-stream`` (standard SSE).
 
     Yields:
         SSE-formatted strings (``data: {...}\\n\\n``).
@@ -160,7 +179,13 @@ async def run_plane_stream(
     thread_id = run_input.thread_id
     run_id = run_input.run_id
 
-    encoder = EventEncoder()
+    encoder = EventEncoder(accept=accept)
+
+    # Guard: heartbeat comment frames are SSE-specific. If content negotiation
+    # ever yields a non-SSE type, fall back to text/event-stream to avoid
+    # emitting invalid `:keep-alive` comments into a non-SSE format.
+    _content_type = encoder.get_content_type()
+    _is_sse = "text/event-stream" in (_content_type or "text/event-stream")
 
     # Helper to emit one event.
     def _emit(event: Any) -> str:
@@ -360,7 +385,8 @@ async def run_plane_stream(
                 # Idle for `interval` seconds: emit a proxy-friendly SSE comment
                 # keep-alive so intermediaries don't drop the stream (P1-2). The
                 # shielded read stays pending across the timeout.
-                yield ":keep-alive\n\n"
+                if _is_sse:
+                    yield ":keep-alive\n\n"
                 continue
             except StopAsyncIteration:
                 next_task = None

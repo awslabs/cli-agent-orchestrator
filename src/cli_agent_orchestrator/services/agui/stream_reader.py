@@ -3,17 +3,29 @@
 Connects to ``GET /agui/v1/stream`` and parses the named SSE fields
 (``id:``, ``event:``, ``data:``) into typed tuples that a construct can
 consume via :meth:`frames`.
+
+Timeout behaviour: the reader uses a ``(connect, read)`` timeout tuple
+passed to ``requests.get``. The read timeout must comfortably exceed the
+server's SSE heartbeat interval (default 15s, ``CAO_AGUI_HEARTBEAT_SECONDS``)
+to avoid premature disconnection during idle periods — the default 60s read
+timeout provides a 4× margin. A single float is accepted for backward
+compatibility (interpreted as the read timeout, with a 10s connect default).
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Generator, Optional, Tuple
+from typing import Any, Dict, Generator, Optional, Tuple, Union
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+# Default connect/read timeouts (seconds). Read must exceed the server's 15s
+# SSE heartbeat (CAO_AGUI_HEARTBEAT_SECONDS) to avoid spurious timeouts.
+_DEFAULT_CONNECT_TIMEOUT = 10.0
+_DEFAULT_READ_TIMEOUT = 60.0
 
 
 class AguiStreamReader:
@@ -28,11 +40,19 @@ class AguiStreamReader:
     On reconnect the reader sends the ``Last-Event-ID`` header set to the
     last successfully yielded event id, so the server replays missed events.
 
+    Timeout interplay with the server heartbeat:
+        The server emits ``:keep-alive`` SSE comments every 15s (configurable
+        via ``CAO_AGUI_HEARTBEAT_SECONDS``). The read timeout must exceed this
+        interval — otherwise a quiet fleet triggers a read timeout before the
+        next heartbeat arrives. The default (connect=10s, read=60s) is safe for
+        heartbeat intervals up to ~55s.
+
     Args:
         base_url: The CAO server base URL (e.g. ``http://localhost:8420``).
         since: Optional ISO-8601 timestamp for the ``since`` query param.
         access_token: Optional bearer token for authentication.
-        timeout: Read timeout in seconds for the streaming connection.
+        timeout: Connect/read timeout. Accepts a ``(connect, read)`` tuple or a
+            single float (interpreted as read timeout with a 10s connect default).
     """
 
     def __init__(
@@ -40,12 +60,19 @@ class AguiStreamReader:
         base_url: str,
         since: Optional[str] = None,
         access_token: Optional[str] = None,
-        timeout: float = 60.0,
+        timeout: Union[float, Tuple[float, float], None] = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._since = since
         self._access_token = access_token
-        self._timeout = timeout
+        # Normalize timeout to a (connect, read) tuple.
+        if timeout is None:
+            self._timeout: Tuple[float, float] = (_DEFAULT_CONNECT_TIMEOUT, _DEFAULT_READ_TIMEOUT)
+        elif isinstance(timeout, tuple):
+            self._timeout = timeout
+        else:
+            # Single float: backward compat — use as read timeout.
+            self._timeout = (_DEFAULT_CONNECT_TIMEOUT, timeout)
         self._last_event_id: Optional[str] = None
 
     @property

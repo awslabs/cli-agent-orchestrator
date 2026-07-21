@@ -493,3 +493,35 @@ def test_run_resume_retry_reachable_after_delivery_failure(monkeypatch):
     finally:
         if hasattr(app.state, "approval_bridge"):
             del app.state.approval_bridge
+
+
+# ---------------------------------------------------------------------------
+# Item 4 — Accept header negotiation
+# ---------------------------------------------------------------------------
+
+
+def test_accept_text_event_stream_content_type(client, monkeypatch):
+    """Accept: text/event-stream returns negotiated content type from encoder."""
+    monkeypatch.setattr(main, "is_auth_enabled", lambda: False)
+    monkeypatch.setattr("cli_agent_orchestrator.security.auth.is_auth_enabled", lambda: False)
+
+    body = _minimal_body()
+    resp = client.post(
+        "/agui/v1/run",
+        json=body,
+        headers={"Accept": "text/event-stream"},
+    )
+    assert resp.status_code == 200
+    # Content type comes from EventEncoder.get_content_type()
+    assert "text/event-stream" in resp.headers["content-type"]
+
+
+def test_absent_accept_header_defaults_to_sse(client, monkeypatch):
+    """Absent Accept header defaults to text/event-stream (unchanged from today)."""
+    monkeypatch.setattr(main, "is_auth_enabled", lambda: False)
+    monkeypatch.setattr("cli_agent_orchestrator.security.auth.is_auth_enabled", lambda: False)
+
+    body = _minimal_body()
+    resp = client.post("/agui/v1/run", json=body)
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
