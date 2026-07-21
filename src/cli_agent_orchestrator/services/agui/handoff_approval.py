@@ -140,6 +140,21 @@ class ApprovalDecision(str, Enum):
     EDIT = "edit"
 
 
+class DeliveryError(RuntimeError):
+    """Raised when delivering a resolved decision to the terminal fails.
+
+    The interrupt is left UNRESOLVED (retryable): the caller should surface a
+    non-success result so a later resume can re-attempt delivery rather than
+    stranding the terminal on a silent failure.
+    """
+
+
+# Upper bound on a single delivery attempt. Comfortably above the backend's
+# deliberate paste waits (~0.3s tmux, ~2s Herdr) so it only trips on a hung
+# backend — which would otherwise hold the resume lock indefinitely.
+_DELIVERY_TIMEOUT_SECONDS = 15.0
+
+
 # ---------------------------------------------------------------------------
 # Interrupt dataclass
 # ---------------------------------------------------------------------------
@@ -191,6 +206,14 @@ class TerminalServiceAnswerDelivery:
     def send_input(self, terminal_id: str, text: str, **kwargs: Any) -> None:
         from cli_agent_orchestrator.services import terminal_service
 
+        # Clear any partially-entered input before pasting so a retry REPLACES
+        # rather than APPENDS. Idempotent on an empty prompt line; corrective if
+        # a prior attempt pasted text but failed before Enter. Best-effort: a
+        # failed clear must not fail the delivery itself.
+        try:
+            terminal_service.send_special_key(terminal_id, "C-u")
+        except Exception:
+            logger.debug("line-clear before paste failed for terminal %s", terminal_id)
         terminal_service.send_input(terminal_id, text)
 
     def send_special_key(self, terminal_id: str, key: str) -> bool:
@@ -418,9 +441,17 @@ class AgentHandoffWithApproval(AguiConstruct):
         (with outcome set). If already resolved, returns the recorded outcome
         with no side effects (idempotent).
 
+        Delivery ordering (P1): the decision is delivered to the terminal
+        BEFORE the interrupt is committed as resolved. Delivery runs off the
+        event loop via ``asyncio.to_thread`` (P2) so blocking backend I/O never
+        stalls the loop. On delivery failure the interrupt is left UNRESOLVED
+        and ``DeliveryError`` is raised, so the caller reports a non-success
+        result and a later resume can re-attempt (retryable policy).
+
         Raises:
             KeyError: if interrupt_id is unknown
             ValueError: if decision is invalid for this interrupt
+            DeliveryError: if delivering the decision to the terminal failed
         """
         async with self._lock:
             interrupt = self._interrupts.get(interrupt_id)
@@ -445,32 +476,57 @@ class AgentHandoffWithApproval(AguiConstruct):
                 if len(edited_text) > 4000:
                     raise ValueError(f"edited_text too long ({len(edited_text)} chars, max 4000)")
 
-            # Resolve the interrupt
-            interrupt.resolved = True
-            interrupt.outcome = decision.value
-            self._resolved_at[interrupt_id] = time.monotonic()
-
-            # Remove from terminal map
             terminal_id = interrupt.metadata.get("terminal_id")
-            if terminal_id and self._terminal_to_interrupt.get(terminal_id) == interrupt_id:
-                del self._terminal_to_interrupt[terminal_id]
-
-            # Deliver the answer to the terminal
             provider = interrupt.metadata.get("provider", "")
             action = _translate_decision(provider, decision, edited_text)
 
+            # Deliver the answer to the terminal BEFORE committing resolution.
+            # Off-loop via to_thread (P2) so blocking tmux/Herdr I/O never stalls
+            # the event loop; wrapped in wait_for so a hung backend cannot hold
+            # the lock indefinitely and stall every later resume. The lock is
+            # held across the await, which serializes other resume() calls
+            # (approvals are low-frequency) and keeps delivery exactly-once
+            # without a separate in-flight guard.
+            #
+            # NB (wait_for caveat): a timeout cancels the awaiter, not the worker
+            # thread, so a slow paste may still land after we raise. That is the
+            # partial-delivery case, mitigated by the delivery adapter clearing
+            # the input line before re-pasting on a retry.
             if self._answer_delivery and terminal_id:
                 try:
                     if action["type"] == "text":
-                        self._answer_delivery.send_input(terminal_id, action["value"])
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self._answer_delivery.send_input, terminal_id, action["value"]
+                            ),
+                            timeout=_DELIVERY_TIMEOUT_SECONDS,
+                        )
                     elif action["type"] == "key":
-                        self._answer_delivery.send_special_key(terminal_id, action["value"])
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self._answer_delivery.send_special_key,
+                                terminal_id,
+                                action["value"],
+                            ),
+                            timeout=_DELIVERY_TIMEOUT_SECONDS,
+                        )
                 except Exception as e:
-                    logger.warning(
-                        "Failed to deliver answer for interrupt %s: %s",
-                        interrupt_id,
-                        e,
-                    )
+                    # Retryable: leave the interrupt UNRESOLVED so a later resume
+                    # can re-attempt; surface the failure to the caller.
+                    logger.warning("Failed to deliver answer for interrupt %s: %s", interrupt_id, e)
+                    raise DeliveryError(str(e)) from e
+
+            # Delivery-beats-expire: reaching here means delivery succeeded (or
+            # was not applicable), so the terminal already received the input.
+            # Commit the decision even if a concurrent expire() raced in during
+            # the await — the record must reflect ground truth (delivered), not
+            # a mid-flight expiry. (Committing overwrites any "expired" outcome
+            # expire() set; the terminal-map guard tolerates its removal.)
+            interrupt.resolved = True
+            interrupt.outcome = decision.value
+            self._resolved_at[interrupt_id] = time.monotonic()
+            if terminal_id and self._terminal_to_interrupt.get(terminal_id) == interrupt_id:
+                del self._terminal_to_interrupt[terminal_id]
 
             # Emit resolution intent
             try:

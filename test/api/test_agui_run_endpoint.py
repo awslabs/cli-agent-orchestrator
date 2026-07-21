@@ -406,3 +406,90 @@ def test_run_frames_are_camel_case():
             assert frame["threadId"] == "thread-1"
         if "runId" in frame:
             assert frame["runId"] == "run-1"
+
+
+# ---------------------------------------------------------------------------
+# Delivery failure (P1): run plane emits RUN_ERROR, not a success RUN_FINISHED
+# ---------------------------------------------------------------------------
+
+
+class _FailingDelivery:
+    def send_input(self, terminal_id, text, **kwargs):
+        raise RuntimeError("backend down")
+
+    def send_special_key(self, terminal_id, key):
+        raise RuntimeError("backend down")
+
+
+def test_run_resume_delivery_failure_emits_run_error(monkeypatch):
+    """A delivery failure during run-plane resume ends with RUN_ERROR, and the
+    interrupt is left unresolved (retryable) rather than finishing as success."""
+    monkeypatch.setattr(main, "is_auth_enabled", lambda: False)
+    monkeypatch.setattr("cli_agent_orchestrator.security.auth.is_auth_enabled", lambda: False)
+
+    construct = AgentHandoffWithApproval(
+        emitter=RecordingUiEmitter(), answer_delivery=_FailingDelivery()
+    )
+    interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+    app.state.approval_bridge = _FakeBridge(construct)
+
+    body = _minimal_body(
+        resume=[
+            {
+                "interruptId": interrupt.id,
+                "status": "resolved",
+                "payload": {"approved": True},
+            }
+        ]
+    )
+    try:
+        resp = client.post("/agui/v1/run", json=body)
+        assert resp.status_code == 200
+        frames = _parse_sse_frames(resp.text)
+        types = [f["type"] for f in frames]
+        assert "RUN_ERROR" in types
+        # No success RUN_FINISHED.
+        success = [
+            f
+            for f in frames
+            if f["type"] == "RUN_FINISHED" and f.get("outcome", {}).get("type") == "success"
+        ]
+        assert not success
+        # Interrupt left unresolved (retryable).
+        assert not interrupt.resolved
+    finally:
+        if hasattr(app.state, "approval_bridge"):
+            del app.state.approval_bridge
+
+
+def test_run_resume_retry_reachable_after_delivery_failure(monkeypatch):
+    """After a delivery-failure RUN_ERROR, the interrupt is still open and a
+    FRESH run carrying the same resume[] can retry and succeed (A's core value)."""
+    monkeypatch.setattr(main, "is_auth_enabled", lambda: False)
+    monkeypatch.setattr("cli_agent_orchestrator.security.auth.is_auth_enabled", lambda: False)
+
+    construct = AgentHandoffWithApproval(
+        emitter=RecordingUiEmitter(), answer_delivery=_FailingDelivery()
+    )
+    interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+    app.state.approval_bridge = _FakeBridge(construct)
+
+    body = _minimal_body(
+        resume=[{"interruptId": interrupt.id, "status": "resolved", "payload": {"approved": True}}]
+    )
+    try:
+        # First run fails to deliver -> RUN_ERROR, interrupt stays open.
+        resp1 = client.post("/agui/v1/run", json=body)
+        assert resp1.status_code == 200
+        assert "RUN_ERROR" in [f["type"] for f in _parse_sse_frames(resp1.text)]
+        assert not interrupt.resolved
+
+        # Recover: delivery now works. A fresh run with the same resume[] resolves.
+        construct._answer_delivery = None  # no-op delivery => commit succeeds
+        resp2 = client.post("/agui/v1/run", json=body)
+        assert resp2.status_code == 200
+        assert interrupt.resolved
+        assert interrupt.outcome == "approve"
+    finally:
+        if hasattr(app.state, "approval_bridge"):
+            del app.state.approval_bridge

@@ -1236,6 +1236,7 @@ async def agui_resume_interrupt(
 
     from cli_agent_orchestrator.services.agui.handoff_approval import (
         ApprovalDecision,
+        DeliveryError,
     )
 
     bridge = getattr(app.state, "approval_bridge", None)
@@ -1271,6 +1272,17 @@ async def agui_resume_interrupt(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(e),
+        )
+    except DeliveryError as e:
+        # Delivery to the terminal failed; the interrupt is left unresolved and
+        # retryable. Surface a non-success status with a machine-readable
+        # retryable flag rather than reporting the resolution as successful (P1).
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "message": f"Failed to deliver decision to terminal: {e}",
+                "retryable": True,
+            },
         )
 
     return {

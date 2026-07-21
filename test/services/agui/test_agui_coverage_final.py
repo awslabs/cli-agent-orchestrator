@@ -220,13 +220,17 @@ async def test_handoff_resume_isolates_delivery_failure():
     from cli_agent_orchestrator.services.agui.handoff_approval import (
         AgentHandoffWithApproval,
         ApprovalDecision,
+        DeliveryError,
     )
 
     c = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=_RaisingDelivery())
     it = c.on_provider_waiting("t1", "kiro_cli", "Allow? (y/n)", session_name="s")
-    await c.resume(
-        interrupt_id=it.id, decision=ApprovalDecision.APPROVE
-    )  # delivery raises → swallowed
+    # Delivery failure is surfaced (retryable), NOT reported as a successful
+    # resolution: the interrupt stays open so a later resume can re-attempt.
+    with pytest.raises(DeliveryError):
+        await c.resume(interrupt_id=it.id, decision=ApprovalDecision.APPROVE)
+    assert not it.resolved
+    assert c.get_interrupt(it.id) is not None
 
 
 @pytest.mark.asyncio

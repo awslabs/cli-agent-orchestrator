@@ -420,19 +420,47 @@ class TestHandoffApprovalProperty:
 class TestTerminalServiceAnswerDelivery:
     """The production AnswerDelivery adapter delegates to terminal_service."""
 
-    def test_send_input_delegates_once(self, monkeypatch):
+    def test_send_input_clears_line_then_delegates(self, monkeypatch):
         from cli_agent_orchestrator.services import terminal_service
         from cli_agent_orchestrator.services.agui.handoff_approval import (
             TerminalServiceAnswerDelivery,
         )
 
-        calls: List[Tuple[str, str]] = []
+        events: List[Tuple[str, str, str]] = []
         monkeypatch.setattr(
-            terminal_service, "send_input", lambda tid, text: calls.append((tid, text)) or True
+            terminal_service,
+            "send_special_key",
+            lambda tid, key: events.append(("key", tid, key)) or True,
+        )
+        monkeypatch.setattr(
+            terminal_service,
+            "send_input",
+            lambda tid, text: events.append(("input", tid, text)) or True,
         )
 
         TerminalServiceAnswerDelivery().send_input("t-9", "hello")
-        assert calls == [("t-9", "hello")]
+        # A line-clear (C-u) precedes the paste so a retry replaces, not appends.
+        assert events == [("key", "t-9", "C-u"), ("input", "t-9", "hello")]
+
+    def test_send_input_delivers_even_if_clear_fails(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.agui.handoff_approval import (
+            TerminalServiceAnswerDelivery,
+        )
+
+        inputs: List[Tuple[str, str]] = []
+
+        def _clear_fails(tid, key):
+            raise RuntimeError("clear failed")
+
+        monkeypatch.setattr(terminal_service, "send_special_key", _clear_fails)
+        monkeypatch.setattr(
+            terminal_service, "send_input", lambda tid, text: inputs.append((tid, text)) or True
+        )
+
+        # Best-effort clear: a failed clear must not block the actual delivery.
+        TerminalServiceAnswerDelivery().send_input("t-9", "hello")
+        assert inputs == [("t-9", "hello")]
 
     def test_send_special_key_delegates_and_returns(self, monkeypatch):
         from cli_agent_orchestrator.services import terminal_service
@@ -451,3 +479,128 @@ class TestTerminalServiceAnswerDelivery:
         result = TerminalServiceAnswerDelivery().send_special_key("t-9", "Enter")
         assert result is True
         assert calls == [("t-9", "Enter")]
+
+
+# ---------------------------------------------------------------------------
+# Variant A: delivery failure is retryable (P1) + off-loop delivery (P2)
+# ---------------------------------------------------------------------------
+
+
+class _FailingDelivery:
+    def send_input(self, terminal_id: str, text: str, **kwargs: Any) -> None:
+        raise RuntimeError("backend down")
+
+    def send_special_key(self, terminal_id: str, key: str) -> bool:
+        raise RuntimeError("backend down")
+
+
+class TestDeliveryFailureRetryable:
+    """A delivery failure leaves the interrupt unresolved and retryable (P1)."""
+
+    @pytest.mark.asyncio
+    async def test_failure_raises_and_leaves_unresolved(self):
+        from cli_agent_orchestrator.services.agui.handoff_approval import DeliveryError
+
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=_FailingDelivery()
+        )
+        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+
+        with pytest.raises(DeliveryError):
+            await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+
+        # Retryable: not resolved, still open and mapped.
+        assert not interrupt.resolved
+        assert interrupt.outcome is None
+        assert construct.get_interrupt(interrupt.id) is not None
+        assert any(i.id == interrupt.id for i in construct.pending())
+
+    @pytest.mark.asyncio
+    async def test_retry_after_failure_succeeds(self):
+        from cli_agent_orchestrator.services.agui.handoff_approval import DeliveryError
+
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=_FailingDelivery()
+        )
+        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        with pytest.raises(DeliveryError):
+            await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+
+        # Swap in a working delivery; the retry now resolves.
+        working = MockAnswerDelivery()
+        construct._answer_delivery = working
+        result = await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+        assert result.resolved
+        assert result.outcome == "approve"
+        assert len(working.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_delivery_runs_off_loop_via_to_thread(self, monkeypatch):
+        import asyncio as _asyncio
+
+        calls = {"n": 0}
+        real_to_thread = _asyncio.to_thread
+
+        async def _spy(fn, *args, **kwargs):
+            calls["n"] += 1
+            return await real_to_thread(fn, *args, **kwargs)
+
+        monkeypatch.setattr(_asyncio, "to_thread", _spy)
+
+        delivery = MockAnswerDelivery()
+        construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=delivery)
+        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+
+        # Delivery was dispatched off the event loop exactly once.
+        assert calls["n"] == 1
+        assert len(delivery.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_delivery_beats_concurrent_expire(self):
+        """If expire() races in while delivery is in flight but delivery
+        SUCCEEDS, the delivered decision wins (the terminal received the input);
+        the raced expiry does not overwrite the recorded outcome."""
+
+        construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=None)
+        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+
+        class _ExpiringDelivery:
+            def send_input(self, terminal_id, text, **kwargs):
+                construct.expire(terminal_id)
+
+            def send_special_key(self, terminal_id, key):
+                construct.expire(terminal_id)
+
+        construct._answer_delivery = _ExpiringDelivery()
+        result = await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+        # Delivery wins: the decision outcome is committed, not "expired".
+        assert result.resolved
+        assert result.outcome == "approve"
+
+    @pytest.mark.asyncio
+    async def test_delivery_timeout_is_retryable(self, monkeypatch):
+        """A delivery that exceeds the timeout raises DeliveryError (retryable),
+        leaving the interrupt unresolved."""
+        import time as _time
+
+        from cli_agent_orchestrator.services.agui import handoff_approval as _mod
+        from cli_agent_orchestrator.services.agui.handoff_approval import DeliveryError
+
+        monkeypatch.setattr(_mod, "_DELIVERY_TIMEOUT_SECONDS", 0.05)
+
+        class _SlowDelivery:
+            def send_input(self, terminal_id, text, **kwargs):
+                _time.sleep(0.5)
+
+            def send_special_key(self, terminal_id, key):
+                _time.sleep(0.5)
+
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=_SlowDelivery()
+        )
+        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+
+        with pytest.raises(DeliveryError):
+            await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+        assert not interrupt.resolved

@@ -312,8 +312,54 @@ class TestDeliveryOnResume:
             json={"decision": "edit", "edited_text": "custom command"},
         )
         assert resp.status_code == 200
-        assert len(deliveries) == 1
-        # Edit resolves to typed text carrying the (sanitized) edited command.
-        kind, tid, payload = deliveries[0]
+        # Text delivery is preceded by a line-clear (C-u) so a retry replaces
+        # rather than appends; the command itself is delivered exactly once.
+        inputs = [d for d in deliveries if d[0] == "input"]
+        assert len(inputs) == 1
+        _, tid, payload = inputs[0]
         assert tid == "t-edit"
         assert "custom command" in payload
+        # The clear precedes the paste.
+        assert deliveries[0] == ("key", "t-edit", "C-u")
+
+
+# ---------------------------------------------------------------------------
+# Delivery failure (P1): failure must NOT be reported as a successful resolution
+# ---------------------------------------------------------------------------
+
+
+class _FailingDelivery:
+    def send_input(self, terminal_id, text, **kwargs):
+        raise RuntimeError("backend down")
+
+    def send_special_key(self, terminal_id, key):
+        raise RuntimeError("backend down")
+
+
+class TestDeliveryFailureRest:
+    """REST resume returns a non-success status when delivery fails (retryable)."""
+
+    def test_delivery_failure_returns_502_and_stays_unresolved(self):
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=_FailingDelivery()
+        )
+        bridge = ApprovalBridge(construct=construct)
+        app.state.approval_bridge = bridge
+        try:
+            interrupt = construct.on_provider_waiting(
+                "t-1", "claude_code", "\u2191/\u2193 to navigate"
+            )
+            resp = client.post(
+                f"/agui/v1/interrupts/{interrupt.id}/resume",
+                json={"decision": "approve"},
+            )
+            # Failure surfaced, not reported as success.
+            assert resp.status_code == 502
+            # Machine-readable retryable flag in the body.
+            assert resp.json()["detail"]["retryable"] is True
+            # Interrupt left unresolved / retryable.
+            assert not interrupt.resolved
+            assert construct.get_interrupt(interrupt.id) is not None
+        finally:
+            if hasattr(app.state, "approval_bridge"):
+                del app.state.approval_bridge
