@@ -592,3 +592,17 @@ WORKFLOW_SCRIPT_TERM_GRACE = 5.0  # SIGTERM->SIGKILL grace (BR-10/11, NFR-REL-1)
 WORKFLOW_SCRIPT_TIMEOUT = 8700.0
 WORKFLOW_SCRIPT_LOG_CAP = 256 * 1024  # per-stream tail cap, bytes (BR-24/25, Q7=A)
 WORKFLOW_SCRIPT_SCRATCH_DIR = CAO_HOME_DIR / "workflow-script-scratch"  # 0o700 (BR-30)
+
+# =============================================================================
+# Terminal group/metadata caps (#432 follow-up review, PR #433)
+# =============================================================================
+# ``group`` and (especially) ``metadata`` are written by the terminal's own
+# running agent via the ``update_metadata``/``update_group`` MCP tools, with
+# no operator review in the loop. Left unbounded, a worker could grow the
+# terminals.metadata/group TEXT columns arbitrarily, and that growth is
+# amplified into every sibling's ``list_siblings`` response (call-me-ram, PR
+# #433 review). Same shape as ``WORKFLOW_MAX_SPEC_BYTES``: a structural cap
+# enforced at the request boundary, fail-closed with 422.
+TERMINAL_METADATA_MAX_BYTES = 16 * 1024  # encoded (json.dumps) size cap
+TERMINAL_GROUP_MAX_ELEMENTS = 16
+TERMINAL_GROUP_ELEMENT_MAX_LEN = 128

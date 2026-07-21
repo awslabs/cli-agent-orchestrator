@@ -291,6 +291,8 @@ class TestCreateSession:
             allowed_tools=None,
             registry=ANY,
             env_vars=None,
+            group=None,
+            metadata=None,
         )
 
     def test_create_session_with_session_name(self, client):

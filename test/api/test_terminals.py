@@ -7,6 +7,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.constants import (
+    TERMINAL_GROUP_ELEMENT_MAX_LEN,
+    TERMINAL_GROUP_MAX_ELEMENTS,
+    TERMINAL_METADATA_MAX_BYTES,
+)
 from cli_agent_orchestrator.models.terminal import Terminal
 
 
@@ -830,3 +835,369 @@ class TestCrossProviderResolution:
 
             assert response.status_code == 500
             assert "Failed to create terminal" in response.json()["detail"]
+
+
+def _terminal_dict(**overrides: Dict) -> Dict:
+    base = {
+        "id": "abcd1234",
+        "name": "test-window",
+        "provider": "kiro_cli",
+        "session_name": "test-session",
+        "agent_profile": "developer",
+        "caller_id": None,
+        "allowed_tools": None,
+        "shell_command": None,
+        "group": None,
+        "metadata": None,
+        "status": "idle",
+        "last_active": None,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestCreateSessionWithGroupAndMetadata:
+    """#432: POST /sessions accepts group/metadata in the JSON body."""
+
+    def test_group_and_metadata_forwarded_to_session_service(self, client):
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                return_value=Terminal(**_terminal_dict(group=["tenant_1", "project_5"]))
+            )
+
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                json={"group": ["tenant_1", "project_5"], "metadata": {"task": "bootstrap"}},
+            )
+
+            assert response.status_code == 201
+            assert response.json()["group"] == ["tenant_1", "project_5"]
+            call_kwargs = mock_svc.create_session.call_args.kwargs
+            assert call_kwargs["group"] == ["tenant_1", "project_5"]
+            assert call_kwargs["metadata"] == {"task": "bootstrap"}
+
+    def test_omitted_group_and_metadata_default_to_none(self, client):
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=Terminal(**_terminal_dict()))
+
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_session.call_args.kwargs
+            assert call_kwargs["group"] is None
+            assert call_kwargs["metadata"] is None
+
+
+class TestUpdateTerminalGroupEndpoint:
+    """#432: PATCH /terminals/{id}/group."""
+
+    def test_update_group_success(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1", "project_9"])
+
+            response = client.patch(
+                "/terminals/abcd1234/group", json={"group": ["tenant_1", "project_9"]}
+            )
+
+            assert response.status_code == 200
+            assert response.json()["group"] == ["tenant_1", "project_9"]
+            mock_svc.update_group.assert_called_once_with("abcd1234", ["tenant_1", "project_9"])
+
+    def test_update_group_clears_with_empty_list(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": []})
+
+            assert response.status_code == 200
+            mock_svc.update_group.assert_called_once_with("abcd1234", [])
+
+    def test_update_group_terminal_not_found(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = False
+
+            response = client.patch(
+                "/terminals/deadbeef/group", json={"group": ["tenant_1"]}
+            )
+
+            assert response.status_code == 404
+
+    def test_update_group_server_error(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.side_effect = Exception("db exploded")
+
+            response = client.patch(
+                "/terminals/abcd1234/group", json={"group": ["tenant_1"]}
+            )
+
+            assert response.status_code == 500
+            assert "Failed to update terminal group" in response.json()["detail"]
+
+    def test_update_group_omitted_field_rejected_not_treated_as_clear(self, client):
+        """Copilot review, PR #433: an omitted ``group`` field must be
+        rejected (422) rather than silently treated the same as an explicit
+        ``null`` (which clears the group) -- a partial/empty body must never
+        accidentally clear data."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.patch("/terminals/abcd1234/group", json={})
+
+            assert response.status_code == 422
+            mock_svc.update_group.assert_not_called()
+
+    def test_update_group_explicit_null_still_clears(self, client):
+        """The omitted-field fix must not break the pre-existing explicit-null
+        clearing path."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": None})
+
+            assert response.status_code == 200
+            mock_svc.update_group.assert_called_once_with("abcd1234", None)
+
+
+class TestUpdateTerminalMetadataEndpoint:
+    """#432: PATCH /terminals/{id}/metadata (also called by the update_metadata MCP tool)."""
+
+    def test_update_metadata_success(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(metadata={"task": "writing tests"})
+
+            response = client.patch(
+                "/terminals/abcd1234/metadata", json={"metadata": {"task": "writing tests"}}
+            )
+
+            assert response.status_code == 200
+            assert response.json()["metadata"] == {"task": "writing tests"}
+            mock_svc.update_metadata.assert_called_once_with(
+                "abcd1234", {"task": "writing tests"}
+            )
+
+    def test_update_metadata_terminal_not_found(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = False
+
+            response = client.patch(
+                "/terminals/deadbeef/metadata", json={"metadata": {"task": "x"}}
+            )
+
+            assert response.status_code == 404
+
+    def test_update_metadata_omitted_field_rejected_not_treated_as_clear(self, client):
+        """Copilot review, PR #433: same omitted-vs-null fix as ``group`` --
+        an omitted ``metadata`` field must be rejected (422), not silently
+        treated as an explicit clearing ``null``."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.patch("/terminals/abcd1234/metadata", json={})
+
+            assert response.status_code == 422
+            mock_svc.update_metadata.assert_not_called()
+
+    def test_update_metadata_explicit_null_still_clears(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(metadata=None)
+
+            response = client.patch("/terminals/abcd1234/metadata", json={"metadata": None})
+
+            assert response.status_code == 200
+            mock_svc.update_metadata.assert_called_once_with("abcd1234", None)
+
+
+class TestListSiblingsEndpoint:
+    """#432: GET /terminals/{id}/siblings.
+
+    ``terminal_id`` in the URL is the caller's own resolved identity (the MCP
+    ``list_siblings`` tool passes its own CAO_TERMINAL_ID here) -- this
+    endpoint only ever compares against that terminal's own persisted group.
+    """
+
+    def test_list_siblings_success(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
+            mock_svc.list_siblings.return_value = [
+                {"id": "sib-1", "group": ["tenant_1"], "metadata": {"task": "x"}}
+            ]
+
+            response = client.get("/terminals/abcd1234/siblings")
+
+            assert response.status_code == 200
+            assert response.json() == [
+                {"id": "sib-1", "group": ["tenant_1"], "metadata": {"task": "x"}}
+            ]
+            mock_svc.list_siblings.assert_called_once_with("abcd1234", depth=None)
+
+    def test_list_siblings_passes_depth_through(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1", "project_5"])
+            mock_svc.list_siblings.return_value = []
+
+            response = client.get("/terminals/abcd1234/siblings", params={"depth": 2})
+
+            assert response.status_code == 200
+            mock_svc.list_siblings.assert_called_once_with("abcd1234", depth=2)
+
+    def test_list_siblings_depth_zero_rejected(self, client):
+        """#432: depth can never be 0 (an unscoped, all-terminals query) --
+        rejected at the API boundary rather than silently reinterpreted."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
+
+            response = client.get("/terminals/abcd1234/siblings", params={"depth": 0})
+
+            assert response.status_code == 422
+            mock_svc.list_siblings.assert_not_called()
+
+    def test_list_siblings_negative_depth_rejected(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
+
+            response = client.get("/terminals/abcd1234/siblings", params={"depth": -1})
+
+            assert response.status_code == 422
+            mock_svc.list_siblings.assert_not_called()
+
+    def test_list_siblings_terminal_not_found(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.side_effect = ValueError("Terminal 'deadbeef' not found")
+
+            response = client.get("/terminals/deadbeef/siblings")
+
+            assert response.status_code == 404
+            mock_svc.list_siblings.assert_not_called()
+
+    def test_list_siblings_no_group_returns_empty_not_error(self, client):
+        """A terminal that exists but has no group set finds no siblings --
+        this is a 200 with an empty list, not an error (#432)."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=None)
+            mock_svc.list_siblings.return_value = []
+
+            response = client.get("/terminals/abcd1234/siblings")
+
+            assert response.status_code == 200
+            assert response.json() == []
+
+
+class TestGroupSizeCap:
+    """call-me-ram, PR #433 review: group elements/count are agent-writable
+    (via update_group) and must be capped -- an uncapped array lets a worker
+    grow the terminals.group TEXT column arbitrarily, amplified into every
+    sibling's list_siblings response."""
+
+    def test_group_at_cap_accepted(self, client):
+        group = [f"g{i}" for i in range(TERMINAL_GROUP_MAX_ELEMENTS)]
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=group)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": group})
+
+            assert response.status_code == 200
+            mock_svc.update_group.assert_called_once_with("abcd1234", group)
+
+    def test_group_over_element_count_cap_rejected(self, client):
+        group = [f"g{i}" for i in range(TERMINAL_GROUP_MAX_ELEMENTS + 1)]
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.patch("/terminals/abcd1234/group", json={"group": group})
+
+            assert response.status_code == 422
+            mock_svc.update_group.assert_not_called()
+
+    def test_group_element_at_length_cap_accepted(self, client):
+        element = "x" * TERMINAL_GROUP_ELEMENT_MAX_LEN
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=[element])
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": [element]})
+
+            assert response.status_code == 200
+
+    def test_group_element_over_length_cap_rejected(self, client):
+        element = "x" * (TERMINAL_GROUP_ELEMENT_MAX_LEN + 1)
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.patch("/terminals/abcd1234/group", json={"group": [element]})
+
+            assert response.status_code == 422
+            mock_svc.update_group.assert_not_called()
+
+    def test_empty_group_not_subject_to_caps(self, client):
+        """Clearing the group ([]/null) must never be rejected by the caps
+        meant for growth, not clearing."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": []})
+
+            assert response.status_code == 200
+
+    def test_create_session_group_over_cap_rejected_with_422(self, client):
+        group = [f"g{i}" for i in range(TERMINAL_GROUP_MAX_ELEMENTS + 1)]
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                json={"group": group},
+            )
+
+            assert response.status_code == 422
+            mock_svc.create_session.assert_not_called()
+
+
+class TestMetadataSizeCap:
+    """call-me-ram, PR #433 review: metadata is a raw agent-writable
+    Dict[str, Any] (via update_metadata) and must be capped by encoded
+    bytes, following the WORKFLOW_MAX_SPEC_BYTES precedent."""
+
+    def test_metadata_at_byte_cap_accepted(self, client):
+        # Reserve room for the JSON envelope (quotes, braces, key) so the
+        # encoded dict lands at (not under) the cap.
+        padding = "x" * (TERMINAL_METADATA_MAX_BYTES - len('{"k": ""}'))
+        metadata = {"k": padding}
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(metadata=metadata)
+
+            response = client.patch("/terminals/abcd1234/metadata", json={"metadata": metadata})
+
+            assert response.status_code == 200
+
+    def test_metadata_over_byte_cap_rejected(self, client):
+        padding = "x" * TERMINAL_METADATA_MAX_BYTES
+        metadata = {"k": padding}
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.patch("/terminals/abcd1234/metadata", json={"metadata": metadata})
+
+            assert response.status_code == 422
+            mock_svc.update_metadata.assert_not_called()
+
+    def test_empty_metadata_not_subject_to_cap(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(metadata=None)
+
+            response = client.patch("/terminals/abcd1234/metadata", json={"metadata": {}})
+
+            assert response.status_code == 200
+
+    def test_create_session_metadata_over_cap_rejected_with_422(self, client):
+        metadata = {"k": "x" * TERMINAL_METADATA_MAX_BYTES}
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                json={"metadata": metadata},
+            )
+
+            assert response.status_code == 422
+            mock_svc.create_session.assert_not_called()

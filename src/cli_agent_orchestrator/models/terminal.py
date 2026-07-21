@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
@@ -37,6 +37,19 @@ class Terminal(BaseModel):
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"
+    )
+    group: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Ordered, general-to-specific grouping array (e.g. "
+            '["tenant_1", "project_5", "folder_12"]). CAO does ordered-prefix '
+            "matching only; consumers own what the levels mean. None = this "
+            "terminal participates in no group-based discovery (see "
+            "list_siblings)."
+        ),
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        None, description="Free-form, consumer-defined JSON describing what this terminal is doing"
     )
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
