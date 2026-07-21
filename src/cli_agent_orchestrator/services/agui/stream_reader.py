@@ -54,10 +54,17 @@ class AguiStreamReader:
         return self._last_event_id
 
     def _build_url(self) -> str:
-        url = f"{self._base_url}/agui/v1/stream"
+        return f"{self._base_url}/agui/v1/stream"
+
+    def _build_params(self) -> Dict[str, str]:
+        # Pass ``since`` via ``params`` so requests URL-encodes it. ISO-8601
+        # timestamps commonly contain ``+00:00``; a raw ``?since=`` string
+        # would send ``+`` as a literal space, which the server-side ISO-8601
+        # validation then rejects with HTTP 400.
+        params: Dict[str, str] = {}
         if self._since:
-            url = f"{url}?since={self._since}"
-        return url
+            params["since"] = self._since
+        return params
 
     def _build_headers(self) -> Dict[str, str]:
         headers: Dict[str, str] = {"Accept": "text/event-stream"}
@@ -76,9 +83,10 @@ class AguiStreamReader:
         the reader.
         """
         url = self._build_url()
+        params = self._build_params()
         headers = self._build_headers()
 
-        resp = requests.get(url, headers=headers, stream=True, timeout=self._timeout)
+        resp = requests.get(url, params=params, headers=headers, stream=True, timeout=self._timeout)
         resp.raise_for_status()
 
         # Accumulate fields for the current event.

@@ -14,7 +14,7 @@ import termios
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional, cast
+from typing import Annotated, Any, Dict, List, Optional, Tuple, cast
 
 from fastapi import (
     BackgroundTasks,
@@ -1013,6 +1013,37 @@ async def agui_stream(
         prefix = f"id: {event_id}\n" if event_id is not None else ""
         return f"{prefix}event: {agui_type}\ndata: {json.dumps(data)}\n\n"
 
+    def _sse_frames(event_id: Optional[str], frames: List[Tuple[str, Dict]]) -> List[str]:
+        """Format the (possibly multiple) SSE frames produced by one record.
+
+        A single event-log record can expand into more than one AG-UI frame
+        (e.g. a primary frame plus a synthesized ``TOOL_CALL_END``/``RESULT``).
+        Emitting them all under the same SSE ``id:`` (the record id) makes it
+        impossible for clients to dedupe/process the later frames and breaks
+        reconnects: a client that dropped mid-record and reconnects with
+        ``Last-Event-ID=<rid>`` would never receive the frames that shared it.
+
+        So we give the intermediate frames unique derived ids (``<rid>.<i>``)
+        and keep the canonical record id on the *last* frame. A normal
+        end-of-record reconnect therefore still sends a real event-log id and
+        resumes precisely via ``after_id``; a mid-record drop reconnects with a
+        derived id that ``after_id`` won't find, which safely replays every
+        fresh record (the client dedupes) rather than silently skipping frames.
+        Single-frame records are unchanged -- they keep the bare record id.
+        """
+
+        last = len(frames) - 1
+        out: List[str] = []
+        for i, (ftype, fdata) in enumerate(frames):
+            if event_id is None:
+                frame_id: Optional[str] = None
+            elif i == last:
+                frame_id = event_id
+            else:
+                frame_id = f"{event_id}.{i}"
+            out.append(_sse(frame_id, ftype, fdata))
+        return out
+
     async def event_generator():
         # Register the live subscription BEFORE replaying history / taking the
         # snapshot, so an event published during the replay->live handoff is
@@ -1048,8 +1079,8 @@ async def agui_stream(
                         if rid is not None:
                             replayed_ids.add(rid)
                         rtype, rdata = to_agui_event(record)
-                        for ftype, fdata in tracker.feed(record, (rtype, rdata)):
-                            yield _sse(rid, ftype, fdata)
+                        for frame in _sse_frames(rid, list(tracker.feed(record, (rtype, rdata)))):
+                            yield frame
             except Exception:
                 logger.warning("agui_stream: history replay failed", exc_info=True)
 
@@ -1077,8 +1108,8 @@ async def agui_stream(
                     replayed_ids.discard(rid)
                     continue
                 agui_type, data = to_agui_event(event)
-                for ftype, fdata in tracker.feed(event, (agui_type, data)):
-                    yield _sse(rid, ftype, fdata)
+                for frame in _sse_frames(rid, list(tracker.feed(event, (agui_type, data)))):
+                    yield frame
 
                 # Recompute the fleet snapshot and emit a STATE_DELTA when it
                 # moved. NB: recomputes on every event; a debounce/cache is a

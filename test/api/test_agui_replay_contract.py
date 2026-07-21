@@ -166,3 +166,126 @@ class TestSnapshotBeforeDelta:
         delta_pos = body.find("event: STATE_DELTA")
         if delta_pos != -1:
             assert snap_pos < delta_pos, "STATE_SNAPSHOT must precede STATE_DELTA"
+
+
+def _parse_sse(body: str):
+    """Parse an SSE body into a list of ``(id_or_None, event_type)`` tuples."""
+
+    frames = []
+    for chunk in body.split("\n\n"):
+        if not chunk.strip():
+            continue
+        frame_id = None
+        event_type = None
+        for line in chunk.split("\n"):
+            if line.startswith("id: "):
+                frame_id = line[len("id: ") :]
+            elif line.startswith("event: "):
+                event_type = line[len("event: ") :]
+        if event_type is not None:
+            frames.append((frame_id, event_type))
+    return frames
+
+
+class TestMultiFramePerRecordIds:
+    """A single record that expands into multiple AG-UI frames must give each
+    frame a distinct SSE ``id:``, with the canonical record id on the *last*
+    frame (PR #485 review). Emitting them all under the same id lets clients
+    drop/skip the synthesized closers and breaks mid-record reconnects.
+    """
+
+    def test_synthesized_closers_get_unique_ids(self, monkeypatch) -> None:
+        # Event 1 opens a tool call (handoff -> TOOL_CALL_START, receiver t-recv).
+        open_event = {
+            "id": "evt-open",
+            "kind": "handoff",
+            "terminal_id": "t-sup",
+            "session_name": "s",
+            "timestamp": "2026-07-04T00:00:01Z",
+            "detail": {"orchestration_type": "handoff", "receiver": "t-recv"},
+        }
+        # Event 2 completes t-recv -> STEP_FINISHED, which the lifecycle tracker
+        # expands into [STEP_FINISHED, synthesized TOOL_CALL_END] (two frames).
+        done_event = {
+            "id": "evt-done",
+            "kind": "completion",
+            "terminal_id": "t-recv",
+            "session_name": "s",
+            "timestamp": "2026-07-04T00:00:02Z",
+            "detail": {},
+        }
+
+        class _Log:
+            def history(self, since=None, **kwargs):
+                return []
+
+            def after_id(self, event_id, **kwargs):
+                return []
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.sse_bus.get_bus",
+            lambda: _FakeBus([open_event, done_event]),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.event_log_service.get_event_log", lambda: _Log()
+        )
+
+        with client.stream(
+            "GET", "/agui/v1/stream", params={"since": "2026-07-04T00:00:00Z"}
+        ) as resp:
+            assert resp.status_code == 200
+            body = "".join(resp.iter_text())
+
+        frames = _parse_sse(body)
+        step = [(fid, t) for fid, t in frames if t == "STEP_FINISHED"]
+        end = [(fid, t) for fid, t in frames if t == "TOOL_CALL_END"]
+
+        assert step, "expected a STEP_FINISHED frame from the completion record"
+        assert end, "expected a synthesized TOOL_CALL_END frame"
+
+        step_id = step[0][0]
+        end_id = end[0][0]
+
+        # Both derive from the record id but must NOT be identical.
+        assert step_id == "evt-done.0", "intermediate frame should get a unique derived id"
+        assert end_id == "evt-done", "the last frame keeps the canonical record id"
+        assert step_id != end_id
+
+    def test_record_without_id_emits_frames_without_id(self, monkeypatch) -> None:
+        # An event lacking an ``id`` must still stream (defensive path): the
+        # derived-id scheme falls back to no ``id:`` line rather than emitting a
+        # bogus ``None.<i>`` cursor.
+        no_id_event = {
+            "kind": "completion",
+            "terminal_id": "t-orphan",
+            "session_name": "s",
+            "timestamp": "2026-07-04T00:00:03Z",
+            "detail": {},
+        }
+
+        class _Log:
+            def history(self, since=None, **kwargs):
+                return []
+
+            def after_id(self, event_id, **kwargs):
+                return []
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.sse_bus.get_bus",
+            lambda: _FakeBus([no_id_event]),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.event_log_service.get_event_log", lambda: _Log()
+        )
+
+        with client.stream(
+            "GET", "/agui/v1/stream", params={"since": "2026-07-04T00:00:00Z"}
+        ) as resp:
+            assert resp.status_code == 200
+            body = "".join(resp.iter_text())
+
+        frames = _parse_sse(body)
+        step = [(fid, t) for fid, t in frames if t == "STEP_FINISHED"]
+        assert step, "expected a STEP_FINISHED frame from the id-less completion record"
+        assert step[0][0] is None, "a record without an id must emit no SSE id:"
+        assert "None." not in body, "must never emit a bogus 'None.<i>' cursor"

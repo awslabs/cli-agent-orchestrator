@@ -6,6 +6,7 @@ from typing import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from cli_agent_orchestrator.services.agui.stream_reader import AguiStreamReader
 
@@ -168,7 +169,7 @@ class TestReconnectResume:
             call_kwargs = mock_get.call_args[1]
             assert call_kwargs["headers"]["Last-Event-ID"] == "evt-5"
 
-    def test_since_param_in_url(self):
+    def test_since_passed_as_param_not_in_url(self):
         reader = AguiStreamReader("http://localhost:8420", since="2024-01-01T00:00:00Z")
         lines = ["id: e1", "event: A", "data: {}", ""]
         fake_resp = _FakeResponse(lines)
@@ -176,7 +177,33 @@ class TestReconnectResume:
             mock_get.return_value = fake_resp
             list(reader.frames())
             url_called = mock_get.call_args[0][0]
-            assert "since=2024-01-01T00:00:00Z" in url_called
+            params = mock_get.call_args[1]["params"]
+            # ``since`` is delegated to requests via ``params`` (which URL-encodes
+            # it) rather than hand-concatenated into the URL string.
+            assert "since" not in url_called
+            assert params == {"since": "2024-01-01T00:00:00Z"}
+
+    def test_since_offset_timestamp_is_url_encoded(self):
+        # ISO-8601 offsets contain ``+00:00``; a raw ``?since=`` string sends
+        # ``+`` as a literal space and the server rejects it (HTTP 400). Passing
+        # via ``params`` lets requests percent-encode ``+`` to ``%2B``.
+        since = "2024-01-01T00:00:00+00:00"
+        reader = AguiStreamReader("http://localhost:8420", since=since)
+        lines = ["id: e1", "event: A", "data: {}", ""]
+        fake_resp = _FakeResponse(lines)
+        with patch("cli_agent_orchestrator.services.agui.stream_reader.requests.get") as mock_get:
+            mock_get.return_value = fake_resp
+            list(reader.frames())
+            url_called = mock_get.call_args[0][0]
+            params = mock_get.call_args[1]["params"]
+            assert params == {"since": since}
+
+        # Prove requests encodes the offset correctly (no server needed): the
+        # prepared URL must carry ``%2B`` and never a raw ``+`` or space.
+        prepared = requests.models.PreparedRequest()
+        prepared.prepare_url(url_called, params)
+        assert "since=2024-01-01T00%3A00%3A00%2B00%3A00" in prepared.url
+        assert "+00:00" not in prepared.url
 
 
 class TestMalformedLineTolerance:
