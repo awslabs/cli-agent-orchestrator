@@ -258,6 +258,7 @@ async def run_agent_step(
     cancel_event: Optional[asyncio.Event] = None,
     engine: Optional[KiroEngine | str] = None,
     model: Optional[str] = None,
+    use_worktree: bool = False,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -341,6 +342,13 @@ async def run_agent_step(
             a specific model for this one worker without a dedicated agent
             profile. Default None = behavior unchanged (profile.model, if
             any, still applies).
+        use_worktree: Issue #100 Phase 1. When True and a terminal is created
+            here (``reuse_terminal_id`` is None), the freshly created terminal
+            gets an isolated ``git worktree`` instead of sharing
+            ``working_directory`` as given — see
+            ``terminal_service.create_terminal``'s own docstring for the
+            resolution/teardown mechanics. Ignored when reusing a terminal.
+            Default False = behavior unchanged.
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -409,6 +417,7 @@ async def run_agent_step(
             env_vars=env_vars,
             engine=engine,
             model=model,
+            use_worktree=use_worktree,
         )
         terminal_id = terminal.id
 

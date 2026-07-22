@@ -77,6 +77,14 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   server setting, 32KB by default, see [Configuration](configuration.md)),
   not unbounded scrollback. Long sessions are truncated to the tail; use the
   on-disk terminal log for complete history.
+- Terminal creation accepts `use_worktree` (bool, default `false`, issue #100
+  Phase 1): provisions an isolated `git worktree` on its own branch instead of
+  sharing `working_directory` as given, requiring the resolved directory to be
+  inside a git repository. At deletion, the worktree's working-tree contents
+  are always discarded, but the branch is only deleted if it has no unmerged
+  commits — commit and merge/push results before the terminal is deleted if
+  they need to be kept. See the MCP `handoff`/`assign` tool descriptions for
+  the full behavior.
 
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.
