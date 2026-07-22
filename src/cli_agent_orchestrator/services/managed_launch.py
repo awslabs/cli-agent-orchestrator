@@ -22,8 +22,10 @@ from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.managed_launch import (
     PROTOCOL_VERSION,
     ManagedLaunchAdmitRequest,
+    ManagedLaunchCleanupRequest,
     ManagedLaunchObservationRequest,
     ManagedLaunchReserveRequest,
+    ManagedLaunchRouteAttestRequest,
 )
 from cli_agent_orchestrator.utils.terminal import generate_terminal_id
 
@@ -530,8 +532,24 @@ def complete_admission(reservation_id: str, delivery_id: str) -> dict[str, Any]:
                 return _row_dict(row)
             if row.state != "admitting" or admission.get("status") != "io-attempted":
                 raise ManagedLaunchConflict(f"admission cannot complete from state {row.state!r}")
+            request = _parse_json(row.request_json, {})
+            admitted_at = _now()
+            admission["provider_submission_receipt"] = {
+                "receipt_id": str(uuid.uuid4()),
+                "reservation_id": reservation_id,
+                "delivery_id": delivery_id,
+                "terminal_id": row.terminal_id,
+                "generation": row.generation,
+                "provider": row.provider,
+                "agent_profile": row.agent_profile,
+                "model": request.get("expected_model"),
+                "effort": request.get("expected_effort"),
+                "message_sha256": admission["message_sha256"],
+                "sender_id": admission["sender_id"],
+                "submitted_at": admitted_at,
+            }
             admission["status"] = "admitted"
-            admission["admitted_at"] = _now()
+            admission["admitted_at"] = admitted_at
             row.admission_json = _canonical_json(admission)
             row.state = "admitted"
             row.updated_at = _now()
@@ -568,6 +586,164 @@ def mark_admission_ambiguous(reservation_id: str, delivery_id: str, detail: str)
         raise
     except Exception as exc:  # noqa: BLE001
         raise ManagedLaunchUnavailable(f"ambiguous admission persistence failed: {exc}") from exc
+
+
+def attest_route(request: ManagedLaunchRouteAttestRequest) -> dict[str, Any]:
+    """Produce a zero-task, provider-native route receipt.
+
+    This is intentionally independent of reservations and terminal creation so
+    an external launch breaker can prove that a failed route is healthy before
+    permitting exactly one new launch attempt.
+    """
+    from cli_agent_orchestrator.services.codex_trust import (
+        CodexTrustProbeError,
+        attest_trusted_project,
+    )
+    from cli_agent_orchestrator.services.kimi_route import (
+        KimiRouteProbeError,
+        attest_kimi_route,
+    )
+
+    worktree = os.path.realpath(request.working_directory)
+    if worktree != request.working_directory or not os.path.isdir(worktree):
+        raise ManagedLaunchConflict(
+            "working_directory must be an existing canonical absolute directory"
+        )
+    if request.provider == "codex":
+        if request.trusted_project_root != worktree:
+            raise ManagedLaunchConflict(
+                "Codex route attestation requires trusted_project_root to equal working_directory"
+            )
+        try:
+            provider_receipt = attest_trusted_project(
+                worktree,
+                expected_model=request.expected_model,
+                expected_effort=request.expected_effort,
+            )
+        except CodexTrustProbeError as exc:
+            raise ManagedLaunchConflict(str(exc)) from exc
+    else:
+        if request.trusted_project_root is not None:
+            raise ManagedLaunchConflict("trusted_project_root is valid only for provider=codex")
+        try:
+            provider_receipt = attest_kimi_route(
+                worktree,
+                expected_model=request.expected_model,
+                expected_effort=request.expected_effort,
+            )
+        except KimiRouteProbeError as exc:
+            raise ManagedLaunchConflict(str(exc)) from exc
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "attestation_id": str(uuid.uuid4()),
+        "provider": request.provider,
+        "agent_profile": request.agent_profile,
+        "working_directory": worktree,
+        "trusted_project_root": request.trusted_project_root,
+        "model": request.expected_model,
+        "effort": request.expected_effort,
+        "no_task_admitted": True,
+        "provider_route_receipt": provider_receipt,
+        "attested_at": _now(),
+    }
+
+
+def cleanup_reserved(
+    reservation_id: str,
+    request: ManagedLaunchCleanupRequest,
+    *,
+    registry=None,
+) -> dict[str, Any]:
+    """Delete only the exact non-admitted reservation generation.
+
+    The durable ``cleanup_intended`` intermediate state makes a lost HTTP
+    response recoverable. A retry checks the same terminal id and generation;
+    it never selects a terminal by a mutable label or launches a replacement.
+    """
+    from cli_agent_orchestrator.services import terminal_service
+
+    try:
+        with database.SessionLocal() as db:
+            row = _query(db, reservation_id)
+            if row is None:
+                raise ManagedLaunchNotFound(f"reservation not found: {reservation_id}")
+            if row.terminal_id != request.terminal_id or row.generation != request.generation:
+                raise ManagedLaunchConflict("cleanup identity does not match the reservation")
+            observations = _parse_json(row.observations_json, [])
+            existing = next(
+                (
+                    item
+                    for item in observations
+                    if item.get("kind") == "cleanup"
+                    and item.get("cleanup_id") == request.cleanup_id
+                ),
+                None,
+            )
+            if row.state == "cleaned":
+                if existing is None:
+                    raise ManagedLaunchUnavailable("cleaned reservation lacks cleanup proof")
+                return _row_dict(row)
+            if row.state not in {
+                "preflight_blocked",
+                "negative",
+                "cancelled",
+                "cleanup_intended",
+            }:
+                raise ManagedLaunchConflict(
+                    f"cleanup requires terminal negative evidence, not state {row.state!r}"
+                )
+            if row.state != "cleanup_intended":
+                row.state = "cleanup_intended"
+                row.updated_at = _now()
+                db.commit()
+
+        # delete_terminal is idempotent for a missing DB record. It also owns
+        # provider and tmux cleanup for this exact reserved terminal id.
+        terminal_service.delete_terminal(request.terminal_id, registry=registry)
+
+        with database.SessionLocal() as db:
+            row = _query(db, reservation_id)
+            if row is None:
+                raise ManagedLaunchNotFound(f"reservation not found: {reservation_id}")
+            terminal_present = (
+                db.query(database.TerminalModel)
+                .filter(database.TerminalModel.id == request.terminal_id)
+                .first()
+                is not None
+            )
+            if terminal_present:
+                raise ManagedLaunchUnavailable("exact terminal still exists after cleanup")
+            observations = _parse_json(row.observations_json, [])
+            existing = next(
+                (
+                    item
+                    for item in observations
+                    if item.get("kind") == "cleanup"
+                    and item.get("cleanup_id") == request.cleanup_id
+                ),
+                None,
+            )
+            if existing is None:
+                existing = {
+                    "kind": "cleanup",
+                    "cleanup_id": request.cleanup_id,
+                    "reservation_id": reservation_id,
+                    "terminal_id": row.terminal_id,
+                    "generation": row.generation,
+                    "terminal_record_present": False,
+                    "cleaned_at": _now(),
+                }
+                observations.append(existing)
+                row.observations_json = _canonical_json(observations)
+            row.state = "cleaned"
+            row.updated_at = _now()
+            db.commit()
+            db.refresh(row)
+            return {**_row_dict(row), "cleanup": existing}
+    except ManagedLaunchError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ManagedLaunchUnavailable(f"managed-launch cleanup failed: {exc}") from exc
 
 
 async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, Any]:

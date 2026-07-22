@@ -77,8 +77,10 @@ from cli_agent_orchestrator.models.managed_launch import (
 )
 from cli_agent_orchestrator.models.managed_launch import (
     ManagedLaunchAdmitRequest,
+    ManagedLaunchCleanupRequest,
     ManagedLaunchObservationRequest,
     ManagedLaunchReserveRequest,
+    ManagedLaunchRouteAttestRequest,
 )
 from cli_agent_orchestrator.models.memory import (
     MemoryKey,
@@ -1515,6 +1517,9 @@ async def managed_launch_capabilities(
         "idempotent_task_admission": True,
         "generation_bound_negative": True,
         "generation_bound_cancel": True,
+        "generation_bound_cleanup": True,
+        "provider_submission_receipt": True,
+        "zero_task_route_attestation": True,
         "trusted_project_root_providers": ["codex"],
         "readiness_providers": ["codex", "kimi_cli"],
     }
@@ -1528,6 +1533,17 @@ async def reserve_managed_launch(
     try:
         record, created = await asyncio.to_thread(managed_launch.reserve, body)
         return {"created": created, **record}
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/attest-route")
+async def attest_managed_launch_route(
+    body: ManagedLaunchRouteAttestRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(managed_launch.attest_route, body)
     except managed_launch.ManagedLaunchError as exc:
         raise _managed_launch_http_error(exc)
 
@@ -1626,6 +1642,24 @@ async def admit_managed_task(
     try:
         return await managed_launch.admit_reserved(
             reservation_id, body, registry=get_plugin_registry(request)
+        )
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/cleanup")
+async def cleanup_managed_generation(
+    request: Request,
+    reservation_id: str,
+    body: ManagedLaunchCleanupRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            managed_launch.cleanup_reserved,
+            reservation_id,
+            body,
+            registry=get_plugin_registry(request),
         )
     except managed_launch.ManagedLaunchError as exc:
         raise _managed_launch_http_error(exc)

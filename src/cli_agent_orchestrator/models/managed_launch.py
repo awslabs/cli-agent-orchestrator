@@ -93,3 +93,25 @@ class ManagedLaunchObservationRequest(BaseModel):
         if not _SHA256_RE.fullmatch(value):
             raise ValueError("evidence_digest must be 64 lowercase hex characters")
         return value
+
+
+class ManagedLaunchCleanupRequest(BaseModel):
+    protocol_version: ProtocolVersion
+    cleanup_id: str
+    terminal_id: str = Field(pattern=r"^[a-f0-9]{8}$")
+    generation: str
+
+    @field_validator("cleanup_id", "generation")
+    @classmethod
+    def _validate_uuid_fields(cls, value: str, info) -> str:
+        return _uuid_text(value, info.field_name)
+
+
+class ManagedLaunchRouteAttestRequest(BaseModel):
+    protocol_version: ProtocolVersion
+    provider: Literal["codex", "kimi_cli"]
+    agent_profile: str = Field(min_length=1)
+    working_directory: str = Field(min_length=1)
+    trusted_project_root: Optional[str] = None
+    expected_model: str = Field(min_length=1)
+    expected_effort: str = Field(min_length=1)

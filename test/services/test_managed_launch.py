@@ -10,8 +10,10 @@ import pytest
 from cli_agent_orchestrator.models.managed_launch import (
     PROTOCOL_VERSION,
     ManagedLaunchAdmitRequest,
+    ManagedLaunchCleanupRequest,
     ManagedLaunchObservationRequest,
     ManagedLaunchReserveRequest,
+    ManagedLaunchRouteAttestRequest,
 )
 from cli_agent_orchestrator.services import managed_launch
 
@@ -144,6 +146,13 @@ def test_admission_requires_readiness_and_is_idempotent(isolated_memory_db, tmp_
         request.reservation_id, admission.delivery_id
     )
     assert completed["state"] == completed_again["state"] == "admitted"
+    receipt = completed["admission"]["provider_submission_receipt"]
+    assert receipt == completed_again["admission"]["provider_submission_receipt"]
+    assert receipt["reservation_id"] == request.reservation_id
+    assert receipt["delivery_id"] == admission.delivery_id
+    assert receipt["terminal_id"] == completed["terminal_id"]
+    assert receipt["generation"] == completed["generation"]
+    assert receipt["message_sha256"] == admission.message_sha256
 
 
 def test_concurrent_admission_claim_has_exactly_one_sender(isolated_memory_db, tmp_path):
@@ -396,3 +405,79 @@ async def test_send_failure_is_preserved_and_never_retried(
     assert ambiguous["admission"]["status"] == "ambiguous_preserved"
     assert duplicate["admission"]["status"] == "ambiguous_preserved"
     assert len(calls) == 1
+
+
+def test_zero_task_route_attestation_is_provider_bound(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_attest(root, *, expected_model, expected_effort):
+        calls.append((root, expected_model, expected_effort))
+        return {
+            "model": expected_model,
+            "reasoning_effort": expected_effort,
+            "no_prompt_sent": True,
+        }
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.kimi_route.attest_kimi_route",
+        fake_attest,
+    )
+    request = ManagedLaunchRouteAttestRequest(
+        protocol_version=PROTOCOL_VERSION,
+        provider="kimi_cli",
+        agent_profile="kimi-k3-max-fix",
+        working_directory=str(tmp_path),
+        expected_model="kimi-code/k3",
+        expected_effort="max",
+    )
+    receipt = managed_launch.attest_route(request)
+
+    assert receipt["no_task_admitted"] is True
+    assert receipt["model"] == "kimi-code/k3"
+    assert receipt["effort"] == "max"
+    assert calls == [(str(tmp_path), "kimi-code/k3", "max")]
+
+
+def test_cleanup_is_exact_idempotent_and_refuses_admitted_generation(
+    isolated_memory_db, tmp_path, monkeypatch
+):
+    request = _reserve_request(tmp_path)
+    record, _ = managed_launch.reserve(request)
+    record = managed_launch.mark_preflight_blocked(
+        request.reservation_id,
+        preflight_class="trust-preauthorization",
+        detail="blocked before task admission",
+    )
+    calls = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal",
+        lambda terminal_id, registry=None: calls.append(terminal_id) or False,
+    )
+    cleanup = ManagedLaunchCleanupRequest(
+        protocol_version=PROTOCOL_VERSION,
+        cleanup_id=str(uuid.uuid4()),
+        terminal_id=record["terminal_id"],
+        generation=record["generation"],
+    )
+
+    first = managed_launch.cleanup_reserved(request.reservation_id, cleanup)
+    second = managed_launch.cleanup_reserved(request.reservation_id, cleanup)
+    assert first["state"] == second["state"] == "cleaned"
+    assert first["cleanup"]["generation"] == record["generation"]
+    assert calls == [record["terminal_id"]]
+
+    admitted_request = _reserve_request(tmp_path)
+    _ready_record(admitted_request)
+    admission = _admit_request()
+    managed_launch.claim_admission(admitted_request.reservation_id, admission)
+    managed_launch.complete_admission(admitted_request.reservation_id, admission.delivery_id)
+    admitted = managed_launch.get(admitted_request.reservation_id)
+    wrong = cleanup.model_copy(
+        update={
+            "cleanup_id": str(uuid.uuid4()),
+            "terminal_id": admitted["terminal_id"],
+            "generation": admitted["generation"],
+        }
+    )
+    with pytest.raises(managed_launch.ManagedLaunchConflict):
+        managed_launch.cleanup_reserved(admitted_request.reservation_id, wrong)

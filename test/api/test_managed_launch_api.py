@@ -48,6 +48,9 @@ def test_capability_handshake_is_exact_and_versioned(client):
         "idempotent_task_admission": True,
         "generation_bound_negative": True,
         "generation_bound_cancel": True,
+        "generation_bound_cleanup": True,
+        "provider_submission_receipt": True,
+        "zero_task_route_attestation": True,
         "trusted_project_root_providers": ["codex"],
         "readiness_providers": ["codex", "kimi_cli"],
     }

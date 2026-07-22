@@ -21,8 +21,21 @@ or the version differs.
    once. The delivery UUID and message digest are immutable. A response lost
    after the I/O-attempt record is recovery-only and is never blindly resent.
 
+Successful admission includes a fork-authored provider submission receipt
+bound to the reservation, delivery, terminal generation, route, sender, and
+message digest. A conductor must persist that receipt rather than manufacture
+its own acknowledgement.
+
 `POST .../reconcile` is read-only. `POST .../negative` and `POST .../cancel`
 accept identity-bound evidence and cannot supersede an admission attempt.
+`POST .../cleanup` is the only destructive recovery operation: it accepts the
+exact terminal id and generation, persists `cleanup_intended`, deletes that
+terminal, verifies its database record is absent, and returns durable cleanup
+proof. It is rejected for ready, admitting, or admitted reservations.
+
+`POST /managed-launch/attest-route` performs the same provider-native Codex or
+Kimi probe without reserving a terminal or carrying task bytes. It exists for
+bounded launch-breaker recovery and cannot submit work.
 
 ## Durable states
 
@@ -30,7 +43,8 @@ accept identity-bound evidence and cannot supersede an admission attempt.
 means provider launch may have happened and is therefore recovery-only. `ready`
 contains the authoritative receipt. `admitting` means task I/O may have crossed
 the boundary; `admitted` confirms completion. `preflight_blocked`, `negative`,
-and `cancelled` prohibit admission. Unknown or corrupt state fails closed.
+and `cancelled` prohibit admission. `cleanup_intended` and `cleaned` are
+recovery-only. Unknown or corrupt state fails closed.
 
 All launch and admission claims use conditional database updates, so concurrent
 server requests have exactly one I/O owner. Observations use compare-and-swap
