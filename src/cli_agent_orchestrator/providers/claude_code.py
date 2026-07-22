@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shlex
+import stat
 import threading
 import time
 from pathlib import Path
@@ -359,13 +360,17 @@ class ClaudeCodeProvider(BaseProvider):
 
         After the async conversion, N concurrent inits may run this
         read-modify-write in N threads. ``_SETTINGS_WRITE_LOCK`` serializes
-        our own threads; ``os.replace`` makes the write atomic so nothing
-        outside CAO ever sees a half-written file.
+        our own threads (in-process only: a second cao-server process, or
+        Claude Code itself, writing between our read and ``os.replace`` is
+        still a last-writer-wins lost update); ``os.replace`` only guarantees
+        no torn reads for anything outside CAO.
         """
         settings_path = Path.home() / ".claude" / "settings.json"
         with _SETTINGS_WRITE_LOCK:
             settings: dict = {}
+            existing_mode: Optional[int] = None
             if settings_path.exists():
+                existing_mode = stat.S_IMODE(os.stat(settings_path).st_mode)
                 try:
                     with open(settings_path) as f:
                         settings = json.load(f)
@@ -378,8 +383,14 @@ class ClaudeCodeProvider(BaseProvider):
             settings["skipDangerousModePermissionPrompt"] = True
             settings_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = settings_path.with_suffix(".json.tmp")
+            # Preserve the existing file's mode (or default to 0600 for a
+            # freshly-created settings file, since it may carry `env`/
+            # `apiKeyHelper` secrets) -- the tmp file would otherwise pick up
+            # the process umask (typically 0644) and os.replace would make
+            # the target adopt that on every launch that toggles this flag.
             with open(tmp_path, "w") as f:
                 json.dump(settings, f, indent=2)
+            os.chmod(tmp_path, existing_mode if existing_mode is not None else 0o600)
             os.replace(tmp_path, settings_path)
         logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
 

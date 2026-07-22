@@ -1,7 +1,10 @@
 """Unit tests for Claude Code provider."""
 
 import json
+import os
 import shlex
+import stat
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
@@ -1662,6 +1665,100 @@ class TestClaudeCodeProviderSettings:
 
         result = json.loads(settings_file.read_text())
         assert result["skipDangerousModePermissionPrompt"] is True
+
+    def test_ensure_skip_bypass_prompt_preserves_file_mode(self, tmp_path):
+        """Regression test (review finding on PR #451): the atomic
+        tmp-file + os.replace write must not downgrade an existing
+        settings.json's permissions to the process umask."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text(json.dumps({"permissions": {"allow": []}}))
+        settings_file.chmod(0o600)
+
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+
+        assert stat.S_IMODE(settings_file.stat().st_mode) == 0o600
+
+    def test_ensure_skip_bypass_prompt_new_file_defaults_to_0600(self, tmp_path):
+        """A freshly-created settings.json (no prior file to inherit a mode
+        from) should default to 0600, not the process umask -- it may carry
+        `env`/`apiKeyHelper` secrets."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+
+        assert stat.S_IMODE(settings_file.stat().st_mode) == 0o600
+
+    def test_ensure_skip_bypass_prompt_concurrent_writes_preserve_keys(self, tmp_path):
+        """Regression test (review finding on PR #451): N concurrent
+        initializers must not race the settings.json read-modify-write and
+        drop pre-existing keys. Pre-lock, a thread reading mid-write would
+        JSON-decode-fail, fall back to {}, and clobber every other key."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        seed = {f"key{i}": f"value{i}" for i in range(6)}
+        settings_file.write_text(json.dumps(seed))
+
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            threads = [
+                threading.Thread(target=ClaudeCodeProvider._ensure_skip_bypass_prompt_setting)
+                for _ in range(32)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        result = json.loads(settings_file.read_text())
+        for key, value in seed.items():
+            assert result[key] == value
+        assert result["skipDangerousModePermissionPrompt"] is True
+        assert not settings_file.with_suffix(".json.tmp").exists()
+
+    def test_ensure_skip_bypass_prompt_uses_atomic_replace(self, tmp_path):
+        """Pin the atomic-write mechanics: os.replace must be the mechanism
+        that lands the tmp file onto settings.json (contrast
+        test_skill_injection.py:158, which pins its own atomic write the
+        same way)."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+
+        with (
+            patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls,
+            patch(
+                "cli_agent_orchestrator.providers.claude_code.os.replace", wraps=os.replace
+            ) as mock_replace,
+        ):
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+
+        mock_replace.assert_called_once()
+        tmp_arg = mock_replace.call_args[0][0]
+        assert str(tmp_arg).endswith(".json.tmp")
 
 
 class TestClaudeCodeMcpCallNotCompleted:

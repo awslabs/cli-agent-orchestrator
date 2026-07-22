@@ -19,7 +19,7 @@ a longer per-profile override -- see ``TestKimiInitTimeoutWiring`` /
 ``TestAntigravityInitTimeoutWiring`` below.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
