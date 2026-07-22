@@ -39,6 +39,7 @@ class TerminalModel(Base):
     tmux_window = Column(String, nullable=False)  # "window-name"
     provider = Column(String, nullable=False)  # "kiro_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
+    working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
@@ -1015,6 +1016,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute('ALTER TABLE terminals ADD COLUMN "metadata" TEXT')
             conn.commit()
             logger.info("Migration: added metadata column to terminals table")
+        if "working_directory" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN working_directory TEXT")
+            conn.commit()
+            logger.info("Migration: added working_directory column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -1032,6 +1037,7 @@ def create_terminal(
     engine: Optional[str] = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    working_directory: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -1043,6 +1049,7 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
+            working_directory=working_directory,
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
             caller_id=caller_id,
@@ -1058,6 +1065,7 @@ def create_terminal(
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
@@ -1094,6 +1102,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
@@ -1262,6 +1271,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "last_active": t.last_active,
             }
@@ -1302,6 +1312,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "last_active": t.last_active,
             }

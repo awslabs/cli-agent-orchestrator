@@ -182,6 +182,7 @@ class TestCreateTerminal:
             engine="v2",
             group=None,
             metadata=None,
+            working_directory=None,
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
