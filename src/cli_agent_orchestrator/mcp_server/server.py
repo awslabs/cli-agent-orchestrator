@@ -160,6 +160,7 @@ def _create_terminal(
     defer_init: bool = False,
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    use_worktree: bool = False,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -178,6 +179,11 @@ def _create_terminal(
             initializing. Ignored otherwise.
         initial_message_orchestration_type: Passed through to send_input for
             plugin event emission (assign/handoff).
+        use_worktree: If True, the created terminal gets an isolated git
+            worktree (issue #100 Phase 1) instead of sharing
+            ``working_directory`` as given. Only meaningful on the
+            existing-session (assign) branch below -- the new-session branch
+            has no live caller today.
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -235,6 +241,8 @@ def _create_terminal(
             params["working_directory"] = working_directory
         if child_allowed_tools:
             params["allowed_tools"] = child_allowed_tools
+        if use_worktree:
+            params["use_worktree"] = "true"
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
@@ -657,7 +665,11 @@ def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
 
 # Implementation functions
 async def _handoff_impl(
-    agent_profile: str, message: str, timeout: int = 600, working_directory: Optional[str] = None
+    agent_profile: str,
+    message: str,
+    timeout: int = 600,
+    working_directory: Optional[str] = None,
+    use_worktree: bool = False,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -720,6 +732,7 @@ async def _handoff_impl(
             "prompt": shaped_message,
             "teardown": True,
             "timeout": float(timeout),
+            "use_worktree": use_worktree,
         }
         if ctx.session_name:
             payload["session_name"] = ctx.session_name
@@ -816,6 +829,16 @@ if ENABLE_WORKING_DIRECTORY:
             default=None,
             description='Optional working directory where the agent should execute (e.g., "/path/to/workspace/src/Package")',
         ),
+        use_worktree: bool = Field(
+            default=False,
+            description=(
+                "If true, provision an isolated git worktree for this handoff instead of "
+                "sharing the supervisor's working directory -- the worktree checkout is "
+                "created on its own branch from the target repo's current HEAD and removed "
+                "automatically when the handoff completes. Requires the resolved working "
+                "directory (explicit or inherited) to be inside a git repository."
+            ),
+        ),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -839,6 +862,17 @@ if ENABLE_WORKING_DIRECTORY:
         - You can specify a custom directory via working_directory parameter
         - Directory must exist and be accessible
 
+        ## Isolated worktrees (use_worktree)
+
+        - Set use_worktree=true to give this handoff its own git worktree instead of
+          sharing the supervisor's (or working_directory's) checkout -- closes the
+          "parallel agents editing the same branch/files" race.
+        - The worktree is created from the resolved directory's repo, on its own
+          branch, and is automatically removed when the handoff's terminal is torn
+          down (success or failure).
+        - Requires the resolved working directory to actually be inside a git
+          repository; otherwise the handoff fails with a clear error.
+
         ## Requirements
 
         - Must be called from within a CAO terminal (CAO_TERMINAL_ID environment variable)
@@ -850,11 +884,12 @@ if ENABLE_WORKING_DIRECTORY:
             message: The task/message to send
             timeout: Maximum wait time in seconds
             working_directory: Optional directory path where agent should execute
+            use_worktree: If true, isolate this handoff in its own git worktree
 
         Returns:
             HandoffResult with success status, message, and agent output
         """
-        return await _handoff_impl(agent_profile, message, timeout, working_directory)
+        return await _handoff_impl(agent_profile, message, timeout, working_directory, use_worktree)
 
 else:
 
@@ -869,6 +904,16 @@ else:
             description="Maximum time to wait for the agent to complete the task (in seconds)",
             ge=1,
             le=3600,
+        ),
+        use_worktree: bool = Field(
+            default=False,
+            description=(
+                "If true, provision an isolated git worktree for this handoff instead of "
+                "sharing the supervisor's working directory -- the worktree checkout is "
+                "created on its own branch from the target repo's current HEAD and removed "
+                "automatically when the handoff completes. Requires the supervisor's "
+                "current directory to be inside a git repository."
+            ),
         ),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
@@ -886,6 +931,14 @@ else:
         4. Return the agent's response
         5. Clean up the terminal with /exit
 
+        ## Isolated worktrees (use_worktree)
+
+        - Set use_worktree=true to give this handoff its own git worktree instead of
+          sharing the supervisor's checkout -- closes the "parallel agents editing the
+          same branch/files" race.
+        - Automatically removed when the handoff's terminal is torn down.
+        - Requires the supervisor's current directory to be inside a git repository.
+
         ## Requirements
 
         - Must be called from within a CAO terminal (CAO_TERMINAL_ID environment variable)
@@ -895,16 +948,20 @@ else:
             agent_profile: The agent profile for the new terminal
             message: The task/message to send
             timeout: Maximum wait time in seconds
+            use_worktree: If true, isolate this handoff in its own git worktree
 
         Returns:
             HandoffResult with success status, message, and agent output
         """
-        return await _handoff_impl(agent_profile, message, timeout, None)
+        return await _handoff_impl(agent_profile, message, timeout, None, use_worktree)
 
 
 # Implementation function for assign
 def _assign_impl(
-    agent_profile: str, message: str, working_directory: Optional[str] = None
+    agent_profile: str,
+    message: str,
+    working_directory: Optional[str] = None,
+    use_worktree: bool = False,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -967,6 +1024,7 @@ def _assign_impl(
             defer_init=True,
             initial_message=worker_message,
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
+            use_worktree=use_worktree,
         )
 
         return {
@@ -1022,6 +1080,15 @@ Example message: "Analyze the logs. When done, send results back to terminal ee3
 
     desc += """
 
+## Isolated worktrees (use_worktree)
+
+- Set use_worktree=true to give this worker its own git worktree instead of sharing
+  the supervisor's checkout -- closes the "parallel agents editing the same
+  branch/files" race.
+- The worktree is created on its own branch and removed automatically when you
+  call delete_terminal on the worker.
+- Requires the resolved working directory to be inside a git repository.
+
 ## Cleanup
 
 When you are done with an assigned terminal (received results or no longer need it),
@@ -1036,6 +1103,7 @@ Args:
     working_directory: Optional working directory where the agent should execute"""
 
     desc += """
+    use_worktree: If true, isolate this worker in its own git worktree
 
 Returns:
     Dict with success status, worker terminal_id, and message"""
@@ -1063,8 +1131,16 @@ if ENABLE_WORKING_DIRECTORY:
         working_directory: Optional[str] = Field(
             default=None, description="Optional working directory where the agent should execute"
         ),
+        use_worktree: bool = Field(
+            default=False,
+            description=(
+                "If true, provision an isolated git worktree for this worker instead of "
+                "sharing the supervisor's working directory. Requires the resolved working "
+                "directory to be inside a git repository."
+            ),
+        ),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, working_directory)
+        return _assign_impl(agent_profile, message, working_directory, use_worktree)
 
 else:
 
@@ -1074,8 +1150,16 @@ else:
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),
         message: str = Field(description=_assign_message_field_desc),
+        use_worktree: bool = Field(
+            default=False,
+            description=(
+                "If true, provision an isolated git worktree for this worker instead of "
+                "sharing the supervisor's working directory. Requires the supervisor's "
+                "current directory to be inside a git repository."
+            ),
+        ),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, None)
+        return _assign_impl(agent_profile, message, None, use_worktree)
 
 
 # Implementation function for send_message

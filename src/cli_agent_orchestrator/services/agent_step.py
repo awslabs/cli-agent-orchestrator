@@ -213,6 +213,7 @@ async def run_agent_step(
     env_vars: Optional[dict[str, str]] = None,
     on_terminal_created: Optional[Callable[[str], None]] = None,
     cancel_event: Optional[asyncio.Event] = None,
+    use_worktree: bool = False,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -288,6 +289,13 @@ async def run_agent_step(
             provider never emits a completion signal is exactly the run that could
             not otherwise be killed. Default None = no cancellation seam (the
             handoff caller passes nothing) — behavior unchanged.
+        use_worktree: Issue #100 Phase 1. When True and a terminal is created
+            here (``reuse_terminal_id`` is None), the freshly created terminal
+            gets an isolated ``git worktree`` instead of sharing
+            ``working_directory`` as given — see
+            ``terminal_service.create_terminal``'s own docstring for the
+            resolution/teardown mechanics. Ignored when reusing a terminal.
+            Default False = behavior unchanged.
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -354,6 +362,7 @@ async def run_agent_step(
             allowed_tools=allowed_tools,
             caller_id=caller_id,
             env_vars=env_vars,
+            use_worktree=use_worktree,
         )
         terminal_id = terminal.id
 

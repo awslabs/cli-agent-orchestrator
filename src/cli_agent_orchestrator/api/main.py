@@ -115,6 +115,7 @@ from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
+from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -230,6 +231,14 @@ class RunStepRequest(BaseModel):
     allowed_tools: Optional[list[str]] = Field(
         default=None,
         description="Resolved allowed-tools list for a freshly created terminal (handoff inheritance)",
+    )
+    use_worktree: bool = Field(
+        default=False,
+        description=(
+            "Issue #100 Phase 1: provision an isolated git worktree for a freshly "
+            "created terminal instead of sharing working_directory as given. "
+            "Requires the resolved directory to be inside a git repository."
+        ),
     )
     env_vars: Optional[Dict[str, str]] = Field(
         default=None,
@@ -1766,6 +1775,7 @@ async def create_terminal_in_session(
     allowed_tools: Optional[str] = None,
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
+    use_worktree: bool = False,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -1784,6 +1794,13 @@ async def create_terminal_in_session(
     ``initial_message_orchestration_type``) rather than query params so prompt
     content isn't exposed in HTTP access logs and isn't subject to URL-length
     limits.
+
+    ``use_worktree`` (issue #100 Phase 1): provision an isolated git worktree
+    for this terminal instead of sharing ``working_directory`` as given. A
+    plain boolean routing flag, so it stays a query param alongside
+    ``defer_init`` rather than moving into the JSON body. Runs synchronously
+    before the deferred-init background task (if any) is scheduled, so it
+    applies the same way regardless of ``defer_init``.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -1847,6 +1864,7 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            use_worktree=use_worktree,
         )
         return result
     except HTTPException:
@@ -1855,6 +1873,11 @@ async def create_terminal_in_session(
         raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except WorktreeError as e:
+        # use_worktree=true against a working_directory that isn't a git repo,
+        # or the 'git worktree add' itself failed -- a client-input problem,
+        # not a server crash.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2156,6 +2179,7 @@ async def run_step(
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,
+            use_worktree=body.use_worktree,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -2189,6 +2213,12 @@ async def run_step(
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except WorktreeError as e:
+        # use_worktree=true against a working_directory that isn't a git repo,
+        # or the 'git worktree add' itself failed -- a client-input problem
+        # (bad/missing repo), not a server crash.
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         _settle_step(None, str(e))
         raise HTTPException(

@@ -164,6 +164,91 @@ class TestCreateTerminalProviderResolution:
         mock_requests.post.assert_not_called()
 
 
+class TestCreateTerminalUseWorktree:
+    """issue #100 Phase 1: use_worktree is a routing flag, same shape as
+    defer_init -- stays in query params (not the JSON body), and is only
+    included when True (matching defer_init's own conditional-inclusion, not
+    unconditional like run-step's JSON field -- a plain query string has no
+    natural way to distinguish 'absent' from 'false' anyway)."""
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_use_worktree_true_is_included_in_params(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-1"}):
+            _create_terminal("reviewer", "/repo", use_worktree=True)
+
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["params"]["use_worktree"] == "true"
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_use_worktree_false_is_omitted_from_params(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """Default False = today's exact behavior unchanged -- no new query
+        param reaches the server for a caller that never mentions it."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-1"}):
+            _create_terminal("reviewer", "/repo")
+
+        _, kwargs = mock_requests.post.call_args
+        assert "use_worktree" not in kwargs["params"]
+
+    @patch("cli_agent_orchestrator.mcp_server.server._assign_impl")
+    def test_assign_tool_forwards_use_worktree_to_impl(self, mock_impl):
+        """The public `assign` MCP tool itself threads use_worktree through to
+        _assign_impl -- both the workdir-enabled and disabled variants."""
+        from cli_agent_orchestrator.mcp_server import server as server_module
+
+        mock_impl.return_value = {"success": True, "terminal_id": "w1", "message": "ok"}
+
+        import asyncio
+
+        asyncio.run(
+            server_module.assign(agent_profile="reviewer", message="do it", use_worktree=True)
+        )
+
+        args = mock_impl.call_args.args
+        assert args[-1] is True  # use_worktree is always the last positional
+
+
 class TestAssignSenderIdInjection:
     """Tests for sender ID injection in _assign_impl.
 
