@@ -1,6 +1,15 @@
 ---
 name: dynamodb-delete-agent
 description: Delete all items matching a partition key from a DynamoDB table
+tags:
+  - aws
+  - dynamodb
+  - delete
+  - cleanup
+  - destructive
+capabilities:
+  - "delete items matching a partition key from a DynamoDB table"
+  - "query and confirm before destructive deletes"
 allowedTools:
   - execute_bash
   - fs_read
