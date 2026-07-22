@@ -49,6 +49,7 @@ class ManagedLaunchAdmitRequest(BaseModel):
     message_sha256: str
     sender_id: str = Field(pattern=r"^[a-f0-9]{8}$")
     orchestration_type: Literal["assign", "handoff"]
+    context: "ManagedLaunchAdmissionContext"
 
     @field_validator("delivery_id")
     @classmethod
@@ -60,6 +61,38 @@ class ManagedLaunchAdmitRequest(BaseModel):
     def _validate_digest(cls, value: str) -> str:
         if not _SHA256_RE.fullmatch(value):
             raise ValueError("message_sha256 must be 64 lowercase hex characters")
+        return value
+
+
+class ManagedLaunchAdmissionContext(BaseModel):
+    boot_id: str
+    project: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    task_sha256: str
+    plan_sha256: str
+    dossier_sha256: str
+    lease_sha256: str
+    command_packet_sha256: str
+    source_chain_sha256: str
+
+    @field_validator("boot_id")
+    @classmethod
+    def _validate_boot_id(cls, value: str) -> str:
+        return _uuid_text(value, "boot_id")
+
+    @field_validator(
+        "task_sha256",
+        "plan_sha256",
+        "dossier_sha256",
+        "lease_sha256",
+        "command_packet_sha256",
+        "source_chain_sha256",
+    )
+    @classmethod
+    def _validate_context_digest(cls, value: str) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError("admission context digests must be 64 lowercase hex characters")
         return value
 
 

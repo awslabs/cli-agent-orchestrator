@@ -469,6 +469,7 @@ def claim_admission(
         "message_sha256": request.message_sha256,
         "sender_id": request.sender_id,
         "orchestration_type": request.orchestration_type,
+        "context": request.context.model_dump(mode="json"),
     }
     try:
         with database.SessionLocal() as db:
@@ -546,6 +547,7 @@ def complete_admission(reservation_id: str, delivery_id: str) -> dict[str, Any]:
                 "effort": request.get("expected_effort"),
                 "message_sha256": admission["message_sha256"],
                 "sender_id": admission["sender_id"],
+                "context": admission["context"],
                 "submitted_at": admitted_at,
             }
             admission["status"] = "admitted"

@@ -43,6 +43,18 @@ def _admit_request(message="review the exact head", **changes):
         "message_sha256": hashlib.sha256(message.encode()).hexdigest(),
         "sender_id": "deadbeef",
         "orchestration_type": "assign",
+        "context": {
+            "boot_id": "11111111-1111-4111-8111-111111111111",
+            "project": "test-project",
+            "task_id": "test-task",
+            "run_id": "test-task",
+            "task_sha256": "1" * 64,
+            "plan_sha256": "2" * 64,
+            "dossier_sha256": "3" * 64,
+            "lease_sha256": "4" * 64,
+            "command_packet_sha256": "5" * 64,
+            "source_chain_sha256": "6" * 64,
+        },
     }
     payload.update(changes)
     return ManagedLaunchAdmitRequest(**payload)
@@ -153,6 +165,7 @@ def test_admission_requires_readiness_and_is_idempotent(isolated_memory_db, tmp_
     assert receipt["terminal_id"] == completed["terminal_id"]
     assert receipt["generation"] == completed["generation"]
     assert receipt["message_sha256"] == admission.message_sha256
+    assert receipt["context"] == admission.context.model_dump(mode="json")
 
 
 def test_concurrent_admission_claim_has_exactly_one_sender(isolated_memory_db, tmp_path):

@@ -23,8 +23,9 @@ or the version differs.
 
 Successful admission includes a fork-authored provider submission receipt
 bound to the reservation, delivery, terminal generation, route, sender, and
-message digest. A conductor must persist that receipt rather than manufacture
-its own acknowledgement.
+message digest, plus the BOOT/project/task/run and exact task/plan/dossier/
+lease/command-packet/source-chain digests supplied at admission. A conductor
+must persist that receipt rather than manufacture its own acknowledgement.
 
 `POST .../reconcile` is read-only. `POST .../negative` and `POST .../cancel`
 accept identity-bound evidence and cannot supersede an admission attempt.
