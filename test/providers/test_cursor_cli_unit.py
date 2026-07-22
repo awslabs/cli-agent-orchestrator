@@ -1223,6 +1223,39 @@ class TestMiscInterface:
         assert provider._tmp_paths == []
         provider.cleanup()  # should not raise
 
+    def test_cao_tmp_dir_fallback_follows_cao_home_dir(self, tmp_path, monkeypatch):
+        # When CAO_TMP_DIR is unset, _cao_tmp_dir() must fall back to
+        # <CAO_HOME_DIR>/tmp. Since cursor_cli binds CAO_HOME_DIR at its own
+        # import time, we must reload both constants and cursor_cli.
+        import importlib
+
+        override = tmp_path / "cao-home"
+        monkeypatch.setenv("CAO_HOME_DIR", str(override))
+        monkeypatch.delenv("CAO_TMP_DIR", raising=False)
+
+        import cli_agent_orchestrator.constants as constants_module
+
+        importlib.reload(constants_module)
+
+        import cli_agent_orchestrator.providers.cursor_cli as cursor_module
+
+        importlib.reload(cursor_module)
+
+        provider = make_provider()
+        result = provider._cao_tmp_dir()
+        resolved_override = override.resolve()
+        assert result == resolved_override / "tmp"
+        assert result.is_dir()
+
+    def test_cao_tmp_dir_env_override_wins(self, tmp_path, monkeypatch):
+        # CAO_TMP_DIR takes precedence over the CAO_HOME_DIR-derived fallback.
+        explicit_tmp = tmp_path / "explicit-tmp"
+        monkeypatch.setenv("CAO_TMP_DIR", str(explicit_tmp))
+        provider = make_provider()
+        result = provider._cao_tmp_dir()
+        assert result == explicit_tmp
+        assert result.is_dir()
+
     def test_paste_enter_count_is_one(self):
         assert make_provider().paste_enter_count == 1
 
