@@ -369,6 +369,7 @@ async def create_terminal(
             allowed_tools,
             caller_id=caller_id,
             engine=resolved_engine.value if resolved_engine is not None else None,
+            working_directory=working_directory,
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane

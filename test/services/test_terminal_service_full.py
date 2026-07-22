@@ -180,6 +180,7 @@ class TestCreateTerminal:
             ["fs_read"],
             caller_id=None,
             engine="v2",
+            working_directory=None,
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
