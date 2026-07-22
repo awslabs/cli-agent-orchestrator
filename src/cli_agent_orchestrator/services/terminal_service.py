@@ -912,13 +912,22 @@ def send_input(
         # latch-block the IDLE→PROCESSING transition for the whole turn.
         status_monitor.clear_rolling_buffer(terminal_id)
 
+        use_paste_buffer = bool(getattr(provider, "use_paste_buffer", True)) if provider else True
+        send_keys_kwargs = {
+            "enter_count": enter_count,
+            "force_bracketed_paste": use_paste_buffer,
+            "submit_delay": provider.paste_submit_delay if provider else 0.3,
+        }
+        # Only pass use_paste_buffer when it is False; the backend default is
+        # True, and omitting it keeps existing call sites/tests unchanged while
+        # still letting Devin CLI opt out of paste-buffer delivery.
+        if not use_paste_buffer:
+            send_keys_kwargs["use_paste_buffer"] = False
         get_backend().send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
             message,
-            enter_count=enter_count,
-            force_bracketed_paste=True,
-            submit_delay=provider.paste_submit_delay if provider else 0.3,
+            **send_keys_kwargs,
         )
 
         # Notify the provider that external input was received.

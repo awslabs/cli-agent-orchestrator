@@ -541,7 +541,7 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
-            allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
+            allowed_tools=_json.dumps(allowed_tools) if allowed_tools is not None else None,
             shell_command=shell_command,
             caller_id=caller_id,
         )

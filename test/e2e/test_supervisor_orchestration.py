@@ -35,6 +35,7 @@ from test.e2e.conftest import (
     extract_output,
     get_terminal_status,
 )
+from typing import Optional
 
 import pytest
 import requests
@@ -112,6 +113,37 @@ def _wait_for_ready(terminal_id: str, timeout: float = 120.0, poll: float = 3.0)
             return True
         if status == "error":
             return False
+        time.sleep(poll)
+    return False
+
+
+def _wait_for_status_change(
+    terminal_id: str,
+    excluded_statuses: set[str],
+    timeout: float = 15.0,
+    poll: float = 1.0,
+    initial_output: Optional[str] = None,
+) -> bool:
+    """Wait until the terminal has actually started processing the task.
+
+    A fast provider may still report a ready state for a moment after the message
+    is delivered, so we require either a status transition to PROCESSING (or any
+    non-ready state) or a visible output change from the pre-task baseline.  This
+    avoids accepting stale IDLE/COMPLETED states as evidence of work.
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        status = get_terminal_status(terminal_id)
+        if status == "error":
+            return False
+        # Fast providers may flash PROCESSING and return to a ready state between
+        # our 1s polls.  Detect a real task by a visible output change even when
+        # the status has settled back into the excluded ready states.
+        if initial_output is not None:
+            if extract_output(terminal_id) != initial_output:
+                return True
+        if status not in excluded_statuses:
+            return True
         time.sleep(poll)
     return False
 
@@ -759,3 +791,97 @@ class TestAntigravityCliSupervisorOrchestration:
     def test_supervisor_assign_and_handoff(self, require_antigravity):
         """Supervisor uses assign + handoff to orchestrate multi-agent workflow."""
         _run_supervisor_assign_test(provider="antigravity_cli")
+
+
+# ---------------------------------------------------------------------------
+# Devin CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestDevinCliSupervisorOrchestration:
+    """E2E supervisor orchestration tests for the Devin CLI provider.
+
+    Validates that a Devin CLI supervisor agent can autonomously drive
+    the assign + handoff + send_message flow via the cao-mcp-server
+    tools — the canonical multi-agent e2e test from the
+    ``examples/assign/`` scenario.
+
+    Requires the ``devin`` binary on PATH
+    and the agent profiles installed for devin_cli::
+
+        cao install examples/assign/analysis_supervisor.md --provider devin_cli
+        cao install examples/assign/data_analyst.md --provider devin_cli
+        cao install examples/assign/report_generator.md --provider devin_cli
+    """
+
+    def test_supervisor_handoff(self, require_devin):
+        """Devin CLI supervisor uses handoff MCP tool to delegate to report_generator."""
+        _run_supervisor_handoff_test(provider="devin_cli")
+
+    def test_supervisor_assign_and_handoff(self, require_devin):
+        """Devin CLI supervisor uses assign + handoff to orchestrate multi-agent workflow."""
+        _run_supervisor_assign_test(provider="devin_cli")
+
+    def test_supervisor_assign_three_analysts(self, require_devin):
+        """Devin CLI supervisor assigns 3 analysts, receives callbacks, finalizes report.
+
+        The canonical ``examples/assign/`` smoke test: parallel assign
+        """
+        _run_supervisor_assign_three_analysts_test(provider="devin_cli")
+
+    def test_simple_task_execution(self, require_devin):
+        """Devin CLI executes a simple task end-to-end.
+
+        Basic smoke test:
+        1. Spawn Devin CLI with developer profile
+        2. Send a simple task (echo command)
+        3. Verify Devin CLI executes and responds
+        """
+        session_name = f"test-simple-{uuid.uuid4().hex[:8]}"
+        terminal_id = None
+        actual_session = None
+        try:
+            terminal_id, actual_session = create_terminal(
+                provider="devin_cli",
+                agent_profile="developer",
+                session_name=session_name,
+            )
+            # Wait for terminal to be ready
+            assert _wait_for_ready(
+                terminal_id, timeout=30
+            ), "Devin CLI did not become ready within 30s"
+
+            # Send a simple task
+            task_message = "echo hello world"
+            initial_status = get_terminal_status(terminal_id)
+            initial_output = extract_output(terminal_id)
+            resp = requests.post(
+                f"{API_BASE_URL}/terminals/{terminal_id}/input",
+                params={"message": task_message},
+                timeout=10,
+            )
+            assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
+
+            # Make sure the provider has actually started processing the input
+            # before polling for completion, so we don't read stale output.
+            assert _wait_for_status_change(
+                terminal_id,
+                {initial_status},
+                timeout=15,
+                initial_output=initial_output,
+            ), "Devin CLI did not start processing the task"
+
+            # Wait for task completion
+            assert _wait_for_ready(
+                terminal_id, timeout=30
+            ), "Devin CLI did not complete task within 30s"
+
+            # Extract and verify output
+            output = extract_output(terminal_id)
+            assert len(output.strip()) > 0, "Devin CLI output should not be empty"
+            assert "hello" in output.lower(), f"Expected 'hello' in output, got: {output[:200]}"
+
+        finally:
+            if terminal_id is not None:
+                cleanup_terminal(terminal_id, actual_session)

@@ -89,15 +89,17 @@ class TmuxBackend(TerminalBackend):
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        use_paste_buffer: bool = True,
     ) -> None:
-        self._client.send_keys(
-            session_name,
-            window_name,
-            keys,
-            enter_count=enter_count,
-            force_bracketed_paste=force_bracketed_paste,
-            submit_delay=submit_delay,
-        )
+        kwargs = {
+            "enter_count": enter_count,
+            "force_bracketed_paste": force_bracketed_paste,
+            "submit_delay": submit_delay,
+        }
+        # Only forward when opting out of paste-buffer; the client default is True.
+        if not use_paste_buffer:
+            kwargs["use_paste_buffer"] = False
+        self._client.send_keys(session_name, window_name, keys, **kwargs)
 
     def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
         self._client.send_special_key(session_name, window_name, key)
