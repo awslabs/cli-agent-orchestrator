@@ -670,6 +670,193 @@ class TestCreateTerminal:
         assert mock_provider_manager.create_provider.call_args.kwargs.get("allowed_tools") is None
 
 
+class TestCreateTerminalWorktree:
+    """issue #100 Phase 1: use_worktree wiring in create_terminal.
+
+    worktree_service itself is real-git-tested in test_worktree_service.py;
+    these tests mock it to verify create_terminal's OWN wiring (call order,
+    working_directory override, rollback-on-failure) without needing a real
+    git repo.
+    """
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
+    async def test_use_worktree_overrides_working_directory_for_the_new_window(
+        self,
+        mock_worktree_service,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        mock_worktree_service.find_repo_root.return_value = "/repo"
+        mock_worktree_service.create_worktree.return_value = "/repo/.cao/worktrees/test1234"
+
+        result = await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            working_directory="/repo/some/subdir",
+            use_worktree=True,
+        )
+
+        assert result.id == "test1234"
+        mock_worktree_service.find_repo_root.assert_called_once_with("/repo/some/subdir")
+        mock_worktree_service.create_worktree.assert_called_once_with("/repo", "test1234")
+        # The worktree path -- NOT the originally-given working_directory -- is
+        # what actually reaches the tmux window (create_window's 4th positional
+        # arg, per its own call site in terminal_service.py).
+        assert mock_tmux.create_window.call_args.args[3] == "/repo/.cao/worktrees/test1234"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
+    async def test_use_worktree_false_never_touches_worktree_service(
+        self,
+        mock_worktree_service,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        """Default False = today's exact behavior, unchanged."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("kiro_cli", "developer", session_name="cao-existing")
+
+        mock_worktree_service.find_repo_root.assert_not_called()
+        mock_worktree_service.create_worktree.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    async def test_use_worktree_propagates_a_repo_resolution_failure(
+        self,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_worktree_service,
+    ):
+        """A non-git working_directory must fail fast, before any tmux session/
+        window is touched -- not silently fall back to shared-directory
+        behavior, which would defeat the isolation use_worktree promises."""
+        from cli_agent_orchestrator.services.worktree_service import WorktreeError
+
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_worktree_service.WorktreeError = WorktreeError
+        mock_worktree_service.find_repo_root.side_effect = WorktreeError("not a git repo")
+
+        with pytest.raises(WorktreeError):
+            await create_terminal("kiro_cli", "developer", new_session=True, use_worktree=True)
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
+    async def test_use_worktree_rolls_back_the_worktree_on_a_later_failure(
+        self,
+        mock_worktree_service,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        """The worktree WAS created before provider.initialize() failed later --
+        the failure-cleanup path must roll it back too, or a provider-init
+        timeout on a worktree-backed terminal leaves an orphan worktree/branch
+        with no CAO-side record pointing at it."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.side_effect = TimeoutError("provider init timed out")
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        mock_worktree_service.find_repo_root.return_value = "/repo"
+        mock_worktree_service.create_worktree.return_value = "/repo/.cao/worktrees/test1234"
+
+        with pytest.raises(TimeoutError):
+            await create_terminal(
+                "kiro_cli",
+                "developer",
+                session_name="cao-existing",
+                use_worktree=True,
+            )
+
+        mock_worktree_service.remove_worktree.assert_called_once_with("/repo", "test1234")
+
+
 class TestCreateTerminalEnvVars:
     """Tests for env_vars handling on both session paths (issues #248/#408).
 
@@ -1496,6 +1683,122 @@ class TestDeleteTerminal:
         result = delete_terminal("test1234")
 
         assert result is True
+
+
+class TestDeleteTerminalWorktree:
+    """issue #100 Phase 1: delete_terminal recognizes and removes a
+    worktree-backed terminal's worktree from its own live pane cwd -- there
+    is no separate CAO-side record of which terminals are worktree-backed."""
+
+    @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_removes_the_worktree_when_the_live_cwd_matches_the_worktree_shape(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_delete,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_worktree_service,
+    ):
+        from cli_agent_orchestrator.services.worktree_service import (
+            parse_worktree_path as real_parse_worktree_path,
+        )
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_tmux.get_pane_working_directory.return_value = "/repo/.cao/worktrees/test1234"
+        mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
+        mock_db_delete.return_value = True
+
+        result = delete_terminal("test1234")
+
+        assert result is True
+        mock_worktree_service.remove_worktree.assert_called_once_with("/repo", "test1234")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_does_not_touch_worktree_service_for_an_ordinary_shared_directory(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_delete,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_worktree_service,
+    ):
+        from cli_agent_orchestrator.services.worktree_service import (
+            parse_worktree_path as real_parse_worktree_path,
+        )
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_tmux.get_pane_working_directory.return_value = "/home/user/some/ordinary/project"
+        mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
+        mock_db_delete.return_value = True
+
+        result = delete_terminal("test1234")
+
+        assert result is True
+        mock_worktree_service.remove_worktree.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_a_non_string_live_cwd_from_the_backend_does_not_raise(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_delete,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_worktree_service,
+    ):
+        """Regression: an unconfigured/misbehaving backend call returning
+        something other than str | None (e.g. a raw mock/object in a test
+        double, or a defensive future change elsewhere) must degrade to
+        'not a worktree', not propagate into a real subprocess call two
+        steps downstream. This is exactly the shape every OTHER
+        TestDeleteTerminal test above relies on implicitly (they never
+        configure get_pane_working_directory)."""
+        from cli_agent_orchestrator.services.worktree_service import (
+            parse_worktree_path as real_parse_worktree_path,
+        )
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        # Deliberately NOT a string -- mock_tmux.get_pane_working_directory()
+        # returns a bare MagicMock by default when unconfigured.
+        mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
+        mock_db_delete.return_value = True
+
+        result = delete_terminal("test1234")  # must not raise
+
+        assert result is True
+        mock_worktree_service.remove_worktree.assert_not_called()
 
 
 class TestDeferredInitFailureNotification:

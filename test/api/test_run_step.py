@@ -144,3 +144,42 @@ class TestRunStepEndpoint:
         # Pydantic request-model validation rejects a missing prompt.
         resp = client.post(TERMINALS_RUN_STEP_ROUTE, json={"provider": "p", "agent": "a"})
         assert resp.status_code == 422
+
+    def test_use_worktree_defaults_to_false_and_is_forwarded(self, client):
+        """issue #100 Phase 1: the field is unconditionally forwarded (not
+        omitted-when-falsy like the Optional fields above), so a caller that
+        never mentions it still gets an explicit False into run_agent_step --
+        no ambiguity between 'not set' and 'set to false'."""
+        result = AgentStepResult(
+            terminal_id="abc12345", last_message="done", status=TerminalStatus.COMPLETED
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+
+        assert resp.status_code == 200
+        assert m_run.await_args.kwargs["use_worktree"] is False
+
+    def test_use_worktree_true_is_forwarded(self, client):
+        result = AgentStepResult(
+            terminal_id="abc12345", last_message="done", status=TerminalStatus.COMPLETED
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(use_worktree=True))
+
+        assert resp.status_code == 200
+        assert m_run.await_args.kwargs["use_worktree"] is True
+
+    def test_worktree_error_maps_to_400_not_500(self, client):
+        """A working_directory that isn't a git repo (or a failed
+        'git worktree add') is a client-input problem, not a server crash --
+        distinct from the generic 500 fallback."""
+        from cli_agent_orchestrator.services.worktree_service import WorktreeError
+
+        with patch(
+            _RUN_STEP,
+            new=AsyncMock(side_effect=WorktreeError("'/tmp/x' is not inside a git repository")),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(use_worktree=True))
+
+        assert resp.status_code == 400
+        assert "not inside a git repository" in resp.json()["detail"]

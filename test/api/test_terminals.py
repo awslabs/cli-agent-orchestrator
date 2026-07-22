@@ -247,6 +247,94 @@ class TestTerminalCreationWithWorkingDirectory:
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
             assert call_kwargs.get("working_directory") == "/session/path"
 
+    def test_create_terminal_in_session_forwards_use_worktree_true(self, client):
+        """issue #100 Phase 1: the use_worktree query param reaches
+        terminal_service.create_terminal unchanged."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="kiro_cli",
+                    agent_profile="analyst",
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "use_worktree": "true",
+                },
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("use_worktree") is True
+
+    def test_create_terminal_in_session_defaults_use_worktree_false(self, client):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="kiro_cli",
+                    agent_profile="analyst",
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("use_worktree") is False
+
+    def test_create_terminal_in_session_worktree_error_maps_to_400(self, client):
+        """A working_directory that isn't a git repo is a client-input
+        problem, not a server crash."""
+        from cli_agent_orchestrator.services.worktree_service import WorktreeError
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=WorktreeError("'/tmp/x' is not inside a git repository")
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "use_worktree": "true",
+                },
+            )
+
+            assert response.status_code == 400
+            assert "not inside a git repository" in response.json()["detail"]
+
     def test_create_terminal_rejects_initial_message_without_defer_init(self, client):
         """initial_message is only delivered on the deferred-init path; sending
         it with defer_init=false must 400 rather than silently drop the payload."""
