@@ -163,6 +163,7 @@ def test_admission_requires_readiness_and_is_idempotent(isolated_memory_db, tmp_
     assert receipt["reservation_id"] == request.reservation_id
     assert receipt["delivery_id"] == admission.delivery_id
     assert receipt["terminal_id"] == completed["terminal_id"]
+    assert receipt["receiver_id"] == completed["terminal_id"]
     assert receipt["generation"] == completed["generation"]
     assert receipt["message_sha256"] == admission.message_sha256
     assert receipt["context"] == admission.context.model_dump(mode="json")

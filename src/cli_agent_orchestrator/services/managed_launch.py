@@ -540,6 +540,7 @@ def complete_admission(reservation_id: str, delivery_id: str) -> dict[str, Any]:
                 "reservation_id": reservation_id,
                 "delivery_id": delivery_id,
                 "terminal_id": row.terminal_id,
+                "receiver_id": row.terminal_id,
                 "generation": row.generation,
                 "provider": row.provider,
                 "agent_profile": row.agent_profile,
