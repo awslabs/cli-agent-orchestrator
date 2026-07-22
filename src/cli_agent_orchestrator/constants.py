@@ -75,11 +75,16 @@ TMUX_HISTORY_LINES = 200
 # overridable via the ``CAO_HOME_DIR`` env var (read at import, mirroring the
 # ``CAO_AGENTS_DIR`` / ``CAO_GRAPH_EXPORT_ROOT`` convention). Every path below
 # derives from it, so one override relocates the whole tree. Motivating case:
-# Kiro CLI Agent Sandboxing blocks reads under ``~/.aws`` at the OS level
-# (seccomp-bpf) to protect credentials; pointing this outside ``~/.aws`` keeps
-# the sandbox enabled. Must be set before this module is first imported.
-CAO_HOME_DIR = Path(
-    os.environ.get("CAO_HOME_DIR", str(Path.home() / ".aws" / "cli-agent-orchestrator"))
+# environments that restrict reads under ``~/.aws`` at the OS level (e.g.
+# seccomp-bpf sandboxing) to protect credentials; pointing this outside
+# ``~/.aws`` keeps the sandbox enabled. Must be set before this module is first
+# imported. Empty or whitespace-only values are treated as unset; tilde is
+# expanded and the result is resolved to an absolute path.
+_cao_home_raw = os.environ.get("CAO_HOME_DIR", "").strip()
+CAO_HOME_DIR = (
+    Path(_cao_home_raw).expanduser().resolve()
+    if _cao_home_raw
+    else Path.home() / ".aws" / "cli-agent-orchestrator"
 )
 
 # Managed environment variable file
@@ -91,11 +96,11 @@ DB_DIR = CAO_HOME_DIR / "db"
 # Log file directory structure
 LOG_DIR = CAO_HOME_DIR / "logs"
 TERMINAL_LOG_DIR = LOG_DIR / "terminal"  # Per-terminal log files for pipe-pane output
-TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 # FIFO directory for event-driven terminal output streaming
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
-FIFO_DIR.mkdir(parents=True, exist_ok=True)
+FIFO_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 # =============================================================================
 # Event-Driven State Detection Configuration

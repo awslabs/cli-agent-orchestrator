@@ -20,9 +20,16 @@ Set the `CAO_HOME_DIR` environment variable to relocate that entire tree:
 export CAO_HOME_DIR="$HOME/.cli-agent-orchestrator"
 ```
 
-Every derived path resolves from this value, so one override moves everything. `CAO_HOME_DIR` is read once, when CAO's `constants` module is first imported (the same convention as `CAO_AGENTS_DIR`), so export it **before** starting `cao-server`, the MCP servers, or any `cao` command. All CAO processes must resolve the same location.
+Every derived path resolves from this value, so one override moves everything — with two exceptions noted below. `CAO_HOME_DIR` is read once, when CAO's `constants` module is first imported (the same convention as `CAO_AGENTS_DIR`), so export it **before** starting `cao-server`, the MCP servers, or any `cao` command. All CAO processes must resolve the same location. Empty or whitespace-only values are treated as unset, and tilde (`~`) is expanded.
 
 **When to use it.** Some environments restrict or sandbox access to `~/.aws` at the OS level to protect AWS credentials. Because CAO otherwise stores its data there, including the agent profiles it reads during a `handoff`, a locked-down `~/.aws` can leave CAO unable to read its own data (a handoff then fails with `Permission denied`). Relocating `CAO_HOME_DIR` outside `~/.aws` keeps CAO working while leaving those credential protections in place.
+
+**Security note.** When relocating outside `~/.aws`, choose a dedicated directory that is not world-readable or shared with other users. CAO creates its log and FIFO directories with owner-only permissions (mode `0700`), but the chosen parent path should also be private since terminal logs can capture secrets and tokens.
+
+**Exceptions.** Two provider-specific config directories do **not** follow `CAO_HOME_DIR`:
+
+- `~/.aws/opencode` (OpenCode provider config, managed via `OPENCODE_CONFIG_DIR` in `constants.py`) — OpenCode is told its config location at launch via env vars; a follow-up can repoint this.
+- `~/.kiro/agents` (Kiro CLI agent directory) — intentionally separate since Kiro manages its own agent install path independently of CAO's data tree.
 
 ## settings.json schema
 
@@ -246,6 +253,10 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 ### Not yet routed through ConfigService
 
 A number of other `CAO_*` variables (runtime/process-identity vars like `CAO_TERMINAL_ID`, `CAO_SESSION_NAME`, `CAO_WORKFLOW_RUN_ID`; provider-tuning vars like `CAO_HERMES_*`, `CAO_AGENTS_DIR`, `CAO_API_HOST`/`CAO_API_PORT`, `CAO_PYTE_STATUS`, `CAO_EAGER_INBOX_DELIVERY`; and `CAO_AUTH_LOCAL_TOKEN`) are still read ad hoc via `os.getenv` at their call sites, mostly in `constants.py`, `mcp_server/server.py`, `security/auth.py`, and the `providers/*` modules. These were deliberately left out of this pass to keep the diff scoped to the two surfaces issue #357 named explicitly (`settings.json` + `config.json`); folding them into the registry is a natural follow-up but not required for config unification.
+
+| Env var | Default | Type | Purpose |
+|---|---|---|---|
+| `CAO_HOME_DIR` | `~/.aws/cli-agent-orchestrator` | str (path) | Base directory for all CAO state. See [Data directory](#data-directory-cao_home_dir) above. |
 
 The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` — they have no `settings.json` mapping like the rows in the table above:
 
