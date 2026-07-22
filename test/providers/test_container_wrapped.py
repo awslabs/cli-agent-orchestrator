@@ -23,7 +23,7 @@ All backends and subprocesses are mocked — no Docker/Podman/tmux required.
 """
 
 import shlex
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
