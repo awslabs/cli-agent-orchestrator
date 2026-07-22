@@ -363,3 +363,28 @@ class TestDeliveryFailureRest:
         finally:
             if hasattr(app.state, "approval_bridge"):
                 del app.state.approval_bridge
+
+
+def test_leading_newline_edit_returns_422(client, monkeypatch):
+    """An edit with leading newline that sanitizes to empty returns 422."""
+    import cli_agent_orchestrator.api.main as main_mod
+
+    monkeypatch.setattr(main_mod, "is_auth_enabled", lambda: False)
+    monkeypatch.setattr("cli_agent_orchestrator.security.auth.is_auth_enabled", lambda: False)
+
+    construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=None)
+    interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+    bridge = ApprovalBridge(construct=construct)
+    app.state.approval_bridge = bridge
+
+    try:
+        resp = client.post(
+            f"/agui/v1/interrupts/{interrupt.id}/resume",
+            json={"decision": "edit", "edited_text": "\nrm -rf ~"},
+        )
+        assert resp.status_code == 422
+        assert "empty after sanitization" in resp.json()["detail"]
+        assert not interrupt.resolved
+    finally:
+        if hasattr(app.state, "approval_bridge"):
+            del app.state.approval_bridge

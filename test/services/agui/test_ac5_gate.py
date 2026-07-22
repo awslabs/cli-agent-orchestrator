@@ -29,10 +29,10 @@ from cli_agent_orchestrator.services.agui.run_plane import run_plane_stream
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 _CONSTRUCT_EXAMPLES = [
-    "agui-supervisor-dashboard",
-    "agui-session-timeline",
-    "agui-handoff-approval",
-    "agui-cross-provider-sync",
+    "ag-ui-supervisor-dashboard",
+    "ag-ui-session-timeline",
+    "ag-ui-handoff-approval",
+    "ag-ui-cross-provider-sync",
 ]
 
 
@@ -60,7 +60,7 @@ async def _collect(gen):
 
 def test_ac5_each_construct_has_docs_and_example() -> None:
     for name in _CONSTRUCT_EXAMPLES:
-        d = _REPO_ROOT / "examples" / name
+        d = _REPO_ROOT / "examples" / "ag-ui" / name
         assert (d / "run.sh").is_file(), f"{name}: missing runnable example"
         assert (d / "README.md").is_file(), f"{name}: missing docs"
     assert (_REPO_ROOT / "docs" / "agui.md").is_file()

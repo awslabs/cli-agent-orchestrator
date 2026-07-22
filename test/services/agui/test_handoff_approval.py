@@ -943,6 +943,8 @@ class TestCancellationSafety:
         # Zero keystrokes for B: expiry won while it was still queued.
         assert rb.outcome == "expired"
         assert delivery.calls == 1
+        # Refcount cleanup: both A (delivered) and B (expiry-before-send) decremented.
+        assert "t-1" not in construct._delivery_locks
 
 
 # ---------------------------------------------------------------------------
@@ -1085,3 +1087,189 @@ class TestInFlightWatchdog:
         # But delivery still succeeded
         assert result.resolved
         assert result.outcome == "deny"
+
+
+# ---------------------------------------------------------------------------
+# Round 6 — P1: sanitized-empty edit rejection + P2: lock cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizedEmptyEditRejection:
+    """An edit that sanitizes to empty must be rejected, not delivered."""
+
+    @pytest.mark.asyncio
+    async def test_leading_newline_edit_rejected(self, construct):
+        """edited_text='\\nrm -rf ~' passes raw validation but sanitizes to
+        empty — must raise ValueError, not deliver."""
+        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        with pytest.raises(ValueError, match="empty after sanitization"):
+            await construct.resume(interrupt.id, ApprovalDecision.EDIT, edited_text="\nrm -rf ~")
+        assert not interrupt.resolved
+
+    @pytest.mark.asyncio
+    async def test_control_only_edit_rejected(self, construct):
+        """edited_text containing only control chars sanitizes to empty."""
+        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        with pytest.raises(ValueError, match="empty after sanitization"):
+            await construct.resume(interrupt.id, ApprovalDecision.EDIT, edited_text="\x01\x02\x03")
+        assert not interrupt.resolved
+
+    @pytest.mark.asyncio
+    async def test_valid_edit_after_sanitization_succeeds(self, construct):
+        """An edit with valid content after sanitization delivers normally."""
+        interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
+        result = await construct.resume(
+            interrupt.id, ApprovalDecision.EDIT, edited_text="valid command"
+        )
+        assert result.resolved
+        assert result.outcome == "edit"
+
+
+class TestDeliveryLockCleanup:
+    """Per-terminal delivery locks are cleaned up after delivery completes."""
+
+    @pytest.mark.asyncio
+    async def test_lock_removed_after_successful_delivery(self):
+        """A terminal's delivery lock is removed once no delivery is in flight."""
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=MockAnswerDelivery()
+        )
+        interrupt = construct.on_provider_waiting(
+            "t-cleanup", "claude_code", "\u2191/\u2193 to navigate"
+        )
+        await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+        # Lock should be cleaned up since no other delivery is queued
+        assert "t-cleanup" not in construct._delivery_locks
+
+    @pytest.mark.asyncio
+    async def test_lock_count_bounded_after_many_terminals(self):
+        """After approvals for many terminals, lock count stays bounded."""
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=MockAnswerDelivery()
+        )
+        for i in range(50):
+            interrupt = construct.on_provider_waiting(
+                f"t-{i}", "claude_code", "\u2191/\u2193 to navigate"
+            )
+            await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+        # All locks should be cleaned up (no concurrent deliveries)
+        assert len(construct._delivery_locks) == 0
+
+    @pytest.mark.asyncio
+    async def test_three_delivery_refcount_survives_queued_waiter(self):
+        """Regression for the waiter-pop race: A holding, B queued, A releases
+        (flawed cleanup popped the entry here), C arrives while B delivers.
+        With ref-counting, C must join the SAME entry and serialize behind B."""
+        import threading
+        from typing import List
+
+        order: List[str] = []
+        first_in, release_first = threading.Event(), threading.Event()
+        second_in, release_second = threading.Event(), threading.Event()
+
+        class _StickyFirstTwo:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def send_input(self, terminal_id, text, **kwargs):
+                self.calls += 1
+                n = self.calls
+                order.append(f"start:{n}")
+                if n == 1:
+                    first_in.set()
+                    release_first.wait()
+                elif n == 2:
+                    second_in.set()
+                    release_second.wait()
+                order.append(f"end:{n}")
+
+            def send_special_key(self, terminal_id, key):
+                self.calls += 1
+                n = self.calls
+                order.append(f"start:{n}")
+                if n == 1:
+                    first_in.set()
+                    release_first.wait()
+                elif n == 2:
+                    second_in.set()
+                    release_second.wait()
+                order.append(f"end:{n}")
+                return True
+
+        delivery = _StickyFirstTwo()
+        construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=delivery)
+
+        ia = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
+        a = asyncio.create_task(construct.resume(ia.id, ApprovalDecision.APPROVE))
+        await asyncio.to_thread(first_in.wait)  # A is mid-delivery
+
+        # Flap 1 while A is stuck: B becomes a QUEUED WAITER (refs now 2).
+        construct.expire("t-1")
+        ib = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
+        b = asyncio.create_task(construct.resume(ib.id, ApprovalDecision.DENY))
+        await asyncio.sleep(0.05)  # let B reach the lock queue
+
+        # A releases. The FLAWED cleanup popped the dict entry at this exact
+        # moment (locked() is False while B is only scheduled, not yet holding).
+        release_first.set()
+        await asyncio.to_thread(second_in.wait)  # B is now mid-delivery
+
+        # Flap 2 while B is stuck: C arrives. Old code: fresh lock -> C delivers
+        # CONCURRENTLY with B. Refcounted code: same entry, C queues behind B.
+        construct.expire("t-1")
+        ic = construct.on_provider_waiting("t-1", "kiro_cli", "Allow this action? [y/n/t]:")
+        c = asyncio.create_task(construct.resume(ic.id, ApprovalDecision.APPROVE))
+        await asyncio.sleep(0.05)  # give C the chance to (wrongly) interleave
+
+        # C must NOT have started while B is still in flight.
+        assert order == ["start:1", "end:1", "start:2"]
+
+        release_second.set()
+        ra, rb, rc = await asyncio.gather(a, b, c)
+
+        # Strict serialization, all THREE actually delivered.
+        assert order == ["start:1", "end:1", "start:2", "end:2", "start:3", "end:3"]
+        assert delivery.calls == 3
+        # Delivery-beats-expire: each flap expiry is overwritten by the delivery.
+        assert ra.outcome == "approve"
+        assert rb.outcome == "deny"
+        assert rc.outcome == "approve"
+        # Entry fully released and cleaned up.
+        assert "t-1" not in construct._delivery_locks
+
+    @pytest.mark.asyncio
+    async def test_failure_path_cleans_up_lock(self):
+        """DeliveryError propagates AND the terminal's lock entry is removed."""
+        from cli_agent_orchestrator.services.agui.handoff_approval import DeliveryError
+
+        class _FailDelivery:
+            def send_input(self, terminal_id, text, **kwargs):
+                raise RuntimeError("backend down")
+
+            def send_special_key(self, terminal_id, key):
+                raise RuntimeError("backend down")
+
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=_FailDelivery()
+        )
+        interrupt = construct.on_provider_waiting(
+            "t-fail", "claude_code", "\u2191/\u2193 to navigate"
+        )
+        with pytest.raises(DeliveryError):
+            await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+        assert "t-fail" not in construct._delivery_locks
+
+    @pytest.mark.asyncio
+    async def test_resolved_before_resume_creates_no_lock(self):
+        """An interrupt resolved (expired) before resume hits the idempotent
+        early-return — no lock entry is ever created."""
+        construct = AgentHandoffWithApproval(
+            emitter=RecordingUiEmitter(), answer_delivery=MockAnswerDelivery()
+        )
+        i1 = construct.on_provider_waiting("t-exp", "claude_code", "\u2191/\u2193 to navigate")
+        # Expire i1 before resuming — hits idempotent early-return in resume()
+        construct.expire("t-exp")
+
+        r1 = await construct.resume(i1.id, ApprovalDecision.APPROVE)
+        assert r1.outcome == "expired"
+        assert "t-exp" not in construct._delivery_locks

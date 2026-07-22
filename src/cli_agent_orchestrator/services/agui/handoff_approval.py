@@ -149,6 +149,18 @@ class DeliveryError(RuntimeError):
     """
 
 
+# Per-terminal delivery lock with reference counting. Incremented before any
+# await (loop-atomic with get/create) so queued waiters keep the entry alive;
+# popped only at zero refs (no holder AND no waiters); decrement→pop has no
+# await between them so nothing can interleave.
+class _RefCountedLock:
+    __slots__ = ("lock", "refs")
+
+    def __init__(self) -> None:
+        self.lock: asyncio.Lock = asyncio.Lock()
+        self.refs: int = 0
+
+
 # Deliveries run to completion (no hard timeout): asyncio.wait_for would cancel
 # only the awaiter, leaving the to_thread worker alive to paste LATE — after a
 # retry has already delivered a different decision (a record/side-effect skew).
@@ -275,7 +287,13 @@ def _translate_decision(
     if decision == ApprovalDecision.EDIT:
         # Edit always sends the edited text, sanitized against terminal escape
         # injection (ANSI/VT sequences + control bytes) before send_input.
-        return {"type": "text", "value": _sanitize_edited_text(edited_text or "")}
+        sanitized = _sanitize_edited_text(edited_text or "")
+        if not sanitized.strip():
+            raise ValueError(
+                "Edit text is empty after sanitization (control characters / "
+                "leading newlines stripped). Provide visible text content."
+            )
+        return {"type": "text", "value": sanitized}
 
     if provider == "claude_code":
         if decision == ApprovalDecision.APPROVE:
@@ -386,7 +404,7 @@ class AgentHandoffWithApproval(AguiConstruct):
         # cannot skip it) serializes physical delivery per terminal without the
         # construct-wide blast radius. Bounded by the count of distinct terminals
         # that ever received an approval delivery.
-        self._delivery_locks: Dict[str, asyncio.Lock] = {}
+        self._delivery_locks: Dict[str, _RefCountedLock] = {}
 
     def handle_frame(
         self, agui_type: str, data: Dict[str, Any], event_id: Optional[str] = None
@@ -574,61 +592,86 @@ class AgentHandoffWithApproval(AguiConstruct):
             # lock lives inside this shielded task, so awaiter cancellation cannot
             # skip it; per-terminal (not construct-wide) keeps P2 blast radius
             # bounded.
-            async with self._delivery_locks.setdefault(terminal_id, asyncio.Lock()):
-                # Expiry-before-send: this interrupt may have expired while its
-                # delivery was QUEUED behind a stuck sibling delivery on the same
-                # terminal. Nothing has been sent for it yet, so expiry wins with
-                # ZERO keystrokes (delivery-beats-expire below applies only once
-                # keystrokes are actually in flight).
-                if interrupt.resolved:
-                    return interrupt
-                _delivery_start = time.monotonic()
-                # In-flight watchdog: emit a WARNING while the worker is still
-                # running if it exceeds the threshold. Never cancels the worker.
-                _loop = asyncio.get_running_loop()
-                _watchdog_handle = _loop.call_later(
-                    _DELIVERY_SLOW_WARN_SECONDS,
-                    lambda: logger.warning(
-                        "Approval delivery in-flight for interrupt %s on terminal %s "
-                        "has exceeded %.1fs (still running)",
-                        interrupt_id,
-                        terminal_id,
-                        _DELIVERY_SLOW_WARN_SECONDS,
-                    ),
-                )
-                try:
-                    if action["type"] == "text":
-                        await asyncio.to_thread(
-                            self._answer_delivery.send_input, terminal_id, action["value"]
-                        )
-                    elif action["type"] == "key":
-                        await asyncio.to_thread(
-                            self._answer_delivery.send_special_key, terminal_id, action["value"]
-                        )
-                except Exception as e:
-                    # Reconcile a concurrent expire() (unlocked sync path) that
-                    # resolved this interrupt while the FAILED delivery was in
-                    # flight: nothing was delivered, so expiry wins and the
-                    # failure is NOT advertised as retryable.
+            #
+            # Ref-counted: refs increments before any await (loop-atomic with
+            # get/create) so a queued waiter always keeps the entry alive; pop
+            # happens only at zero (no holder AND no waiters); decrement→pop has
+            # no await between them so nothing can interleave; finally covers
+            # success, DeliveryError, and both expiry returns.
+            _entry = self._delivery_locks.get(terminal_id)
+            if _entry is None:
+                _entry = self._delivery_locks[terminal_id] = _RefCountedLock()
+            _entry.refs += 1
+            try:
+                async with _entry.lock:
+                    # Expiry-before-send: this interrupt may have expired while its
+                    # delivery was QUEUED behind a stuck sibling delivery on the same
+                    # terminal. Nothing has been sent for it yet, so expiry wins with
+                    # ZERO keystrokes (delivery-beats-expire below applies only once
+                    # keystrokes are actually in flight).
                     if interrupt.resolved:
-                        logger.info(
-                            "delivery failed but interrupt %s expired mid-flight; honoring expiry",
-                            interrupt_id,
-                        )
                         return interrupt
-                    # Retryable: leave the interrupt UNRESOLVED so a later resume
-                    # can re-attempt; surface the failure to the caller.
-                    logger.warning("Failed to deliver answer for interrupt %s: %s", interrupt_id, e)
-                    raise DeliveryError(str(e)) from e
-                finally:
-                    _watchdog_handle.cancel()
-                _elapsed = time.monotonic() - _delivery_start
-                if _elapsed > _DELIVERY_SLOW_WARN_SECONDS:
-                    logger.warning(
-                        "Slow answer delivery for interrupt %s: %.1fs (backend may be degraded)",
-                        interrupt_id,
-                        _elapsed,
+                    _delivery_start = time.monotonic()
+                    # In-flight watchdog: emit a WARNING while the worker is still
+                    # running if it exceeds the threshold. Never cancels the worker.
+                    _loop = asyncio.get_running_loop()
+                    _watchdog_handle = _loop.call_later(
+                        _DELIVERY_SLOW_WARN_SECONDS,
+                        lambda: logger.warning(
+                            "Approval delivery in-flight for interrupt %s on terminal %s "
+                            "has exceeded %.1fs (still running)",
+                            interrupt_id,
+                            terminal_id,
+                            _DELIVERY_SLOW_WARN_SECONDS,
+                        ),
                     )
+                    try:
+                        if action["type"] == "text":
+                            await asyncio.to_thread(
+                                self._answer_delivery.send_input,
+                                terminal_id,
+                                action["value"],
+                            )
+                        elif action["type"] == "key":
+                            await asyncio.to_thread(
+                                self._answer_delivery.send_special_key,
+                                terminal_id,
+                                action["value"],
+                            )
+                    except Exception as e:
+                        # Reconcile a concurrent expire() (unlocked sync path) that
+                        # resolved this interrupt while the FAILED delivery was in
+                        # flight: nothing was delivered, so expiry wins and the
+                        # failure is NOT advertised as retryable.
+                        if interrupt.resolved:
+                            logger.info(
+                                "delivery failed but interrupt %s expired mid-flight;"
+                                " honoring expiry",
+                                interrupt_id,
+                            )
+                            return interrupt
+                        # Retryable: leave the interrupt UNRESOLVED so a later resume
+                        # can re-attempt; surface the failure to the caller.
+                        logger.warning(
+                            "Failed to deliver answer for interrupt %s: %s",
+                            interrupt_id,
+                            e,
+                        )
+                        raise DeliveryError(str(e)) from e
+                    finally:
+                        _watchdog_handle.cancel()
+                    _elapsed = time.monotonic() - _delivery_start
+                    if _elapsed > _DELIVERY_SLOW_WARN_SECONDS:
+                        logger.warning(
+                            "Slow answer delivery for interrupt %s: %.1fs"
+                            " (backend may be degraded)",
+                            interrupt_id,
+                            _elapsed,
+                        )
+            finally:
+                _entry.refs -= 1
+                if _entry.refs == 0:
+                    self._delivery_locks.pop(terminal_id, None)
 
         # Delivery-beats-expire: reaching here means delivery succeeded (or was
         # not applicable), so the terminal already received the input. Commit the

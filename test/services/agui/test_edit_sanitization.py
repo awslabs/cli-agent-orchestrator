@@ -7,6 +7,8 @@ prevent terminal escape-sequence injection.
 
 from __future__ import annotations
 
+import pytest
+
 from cli_agent_orchestrator.services.agui.handoff_approval import (
     ApprovalDecision,
     _sanitize_edited_text,
@@ -80,5 +82,5 @@ def test_translate_decision_edit_is_sanitized() -> None:
 
 
 def test_translate_decision_edit_handles_none() -> None:
-    action = _translate_decision("kiro_cli", ApprovalDecision.EDIT, edited_text=None)
-    assert action == {"type": "text", "value": ""}
+    with pytest.raises(ValueError, match="empty after sanitization"):
+        _translate_decision("kiro_cli", ApprovalDecision.EDIT, edited_text=None)
