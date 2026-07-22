@@ -125,7 +125,11 @@ from cli_agent_orchestrator.services.install_service import InstallResult, insta
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
-from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
+from cli_agent_orchestrator.services.terminal_service import (
+    OutputMode,
+    TerminalGenerationMismatchError,
+    TerminalInputBlockedError,
+)
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -2628,21 +2632,35 @@ async def export_graph_endpoint(
 async def delete_terminal(
     request: Request,
     terminal_id: TerminalId,
+    expected_generation: Optional[str] = None,
+    expected_session: Optional[str] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
-    """Delete a terminal."""
+    """Delete a terminal, optionally only its exact reserved generation.
+
+    With ``expected_generation``/``expected_session`` the delete is a
+    compare-and-delete: a mismatched or replacement incarnation is preserved
+    and reported as 409 ambiguity, never deleted (spec §20.2d(2))."""
     try:
         # delete_terminal is fully synchronous: blocking tmux kills, a
         # full-history scrollback snapshot capture, and DB writes. Off the
         # loop so a stalled tmux/FIFO op bounds its blast radius to this one
         # request instead of wedging the whole server (issue #382 fixed this
         # for DELETE /sessions; the per-terminal path had the same hazard).
+        conditional = {}
+        if expected_generation is not None:
+            conditional["expected_generation"] = expected_generation
+        if expected_session is not None:
+            conditional["expected_session"] = expected_session
         success = await asyncio.to_thread(
             terminal_service.delete_terminal,
             terminal_id,
             registry=get_plugin_registry(request),
+            **conditional,
         )
         return {"success": success}
+    except TerminalGenerationMismatchError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:

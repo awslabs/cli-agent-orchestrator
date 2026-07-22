@@ -66,7 +66,7 @@ def _ready_receipt_for(record, request):
         "bridge_version": BRIDGE_VERSION,
         "receipt_id": "provider-session-ready-opaque",
         "provider_session_id": "provider-session-ready-opaque",
-        "provider_receipt_kind": "test-provider-session-start",
+        "provider_receipt_kind": "codex-thread-start",
         "provider_transcript_sha256": "a" * 64,
         "reservation_id": request.reservation_id,
         "terminal_id": record["terminal_id"],
@@ -98,7 +98,7 @@ def _submission_receipt(record, admission):
         "receipt_id": "provider-turn-opaque",
         "provider_session_id": "provider-session-ready-opaque",
         "provider_turn_id": "provider-turn-opaque",
-        "provider_receipt_kind": "test-provider-turn-start",
+        "provider_receipt_kind": "codex-turn-start",
         "provider_transcript_sha256": "b" * 64,
         "reservation_id": record["reservation_id"],
         "terminal_id": record["terminal_id"],
@@ -627,3 +627,78 @@ def test_cleanup_is_exact_idempotent_and_refuses_admitted_generation(
     )
     with pytest.raises(managed_launch.ManagedLaunchConflict):
         managed_launch.cleanup_reserved(admitted_request.reservation_id, wrong)
+
+
+# -- P1-5: provider-native allowlisted receipt kinds (spec §20.2e, §20.3 31(5))
+
+
+def test_pane_id_readiness_kind_rejected_before_state_advance(isolated_memory_db, tmp_path):
+    request = _reserve_request(tmp_path)
+    record, _ = managed_launch.reserve(request)
+    managed_launch.claim_launch(request.reservation_id)
+    receipt = _ready_receipt_for(record, request)
+    receipt["provider_receipt_kind"] = "pane-id"
+    with pytest.raises(managed_launch.ManagedLaunchConflict):
+        managed_launch.mark_ready(
+            request.reservation_id,
+            terminal_id=record["terminal_id"],
+            generation=record["generation"],
+            receipt=receipt,
+        )
+    assert managed_launch.get(request.reservation_id)["state"] == "launching"
+
+
+def test_wrong_kind_readiness_rejected(isolated_memory_db, tmp_path):
+    request = _reserve_request(tmp_path)
+    record, _ = managed_launch.reserve(request)
+    managed_launch.claim_launch(request.reservation_id)
+    receipt = _ready_receipt_for(record, request)
+    receipt["provider_receipt_kind"] = "codex-turn-start"  # turn kind, not session
+    with pytest.raises(managed_launch.ManagedLaunchConflict):
+        managed_launch.mark_ready(
+            request.reservation_id,
+            terminal_id=record["terminal_id"],
+            generation=record["generation"],
+            receipt=receipt,
+        )
+    assert managed_launch.get(request.reservation_id)["state"] == "launching"
+
+
+def test_readiness_receipt_id_must_be_provider_session(isolated_memory_db, tmp_path):
+    request = _reserve_request(tmp_path)
+    record, _ = managed_launch.reserve(request)
+    managed_launch.claim_launch(request.reservation_id)
+    receipt = _ready_receipt_for(record, request)
+    receipt["receipt_id"] = "locally-minted"
+    with pytest.raises(managed_launch.ManagedLaunchConflict):
+        managed_launch.mark_ready(
+            request.reservation_id,
+            terminal_id=record["terminal_id"],
+            generation=record["generation"],
+            receipt=receipt,
+        )
+    assert managed_launch.get(request.reservation_id)["state"] == "launching"
+
+
+def test_wrong_kind_submission_rejected_before_admitted(isolated_memory_db, tmp_path):
+    request = _reserve_request(tmp_path)
+    _ready_record(request)
+    admission = _admit_request()
+    admitting, _ = managed_launch.claim_admission(request.reservation_id, admission)
+    receipt = _submission_receipt(admitting, admission)
+    receipt["provider_receipt_kind"] = "kimi-session-update"  # wrong provider
+    with pytest.raises(managed_launch.ManagedLaunchConflict):
+        managed_launch.complete_admission(request.reservation_id, admission.delivery_id, receipt)
+    assert managed_launch.get(request.reservation_id)["state"] == "admitting"
+
+
+def test_submission_receipt_id_must_be_provider_turn(isolated_memory_db, tmp_path):
+    request = _reserve_request(tmp_path)
+    _ready_record(request)
+    admission = _admit_request()
+    admitting, _ = managed_launch.claim_admission(request.reservation_id, admission)
+    receipt = _submission_receipt(admitting, admission)
+    receipt["receipt_id"] = "conductor-fabricated-uuid"
+    with pytest.raises(managed_launch.ManagedLaunchConflict):
+        managed_launch.complete_admission(request.reservation_id, admission.delivery_id, receipt)
+    assert managed_launch.get(request.reservation_id)["state"] == "admitting"

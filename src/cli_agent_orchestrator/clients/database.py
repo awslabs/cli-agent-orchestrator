@@ -45,6 +45,12 @@ class TerminalModel(Base):
     # operations. Legacy/operator terminals may be NULL; managed terminals
     # always bind the reservation generation here before provider I/O.
     generation = Column(Text, nullable=True, unique=True)
+    # Server-owned immutable pane/window identity (cond-0069 attestation):
+    # tmux-assigned ids recorded at creation. Window NAMES are mutable (a
+    # worker can rename its own window), pane_id/window_id are not — they are
+    # the only tmux-side facts an attestation may bind a supervisor to.
+    pane_id = Column(Text, nullable=True)
+    window_id = Column(Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -651,6 +657,14 @@ def _migrate_terminals_schema() -> None:
             )
             conn.commit()
             logger.info("Migration: added generation column to terminals table")
+        if "pane_id" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN pane_id TEXT")
+            conn.commit()
+            logger.info("Migration: added pane_id column to terminals table")
+        if "window_id" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN window_id TEXT")
+            conn.commit()
+            logger.info("Migration: added window_id column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -666,6 +680,8 @@ def create_terminal(
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
     generation: Optional[str] = None,
+    pane_id: Optional[str] = None,
+    window_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -681,6 +697,8 @@ def create_terminal(
             shell_command=shell_command,
             caller_id=caller_id,
             generation=generation,
+            pane_id=pane_id,
+            window_id=window_id,
         )
         db.add(terminal)
         db.commit()
@@ -694,6 +712,8 @@ def create_terminal(
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "generation": terminal.generation,
+            "pane_id": terminal.pane_id,
+            "window_id": terminal.window_id,
         }
 
 
@@ -720,6 +740,8 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "generation": terminal.generation,
+            "pane_id": terminal.pane_id,
+            "window_id": terminal.window_id,
             "last_active": terminal.last_active,
         }
 

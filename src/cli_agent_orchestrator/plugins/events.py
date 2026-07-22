@@ -79,4 +79,5 @@ class PostKillTerminalEvent(CaoEvent):
 
     event_type: str = "post_kill_terminal"
     terminal_id: str = ""
+    generation: str | None = None
     agent_name: str | None = None

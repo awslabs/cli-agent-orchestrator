@@ -21,7 +21,6 @@ import asyncio
 import logging
 import os
 import re
-import shlex
 import threading
 import time
 from datetime import datetime
@@ -93,6 +92,47 @@ _deferred_init_tasks: set = set()
 
 class TerminalInputBlockedError(Exception):
     """Raised when orchestrated input would answer an active interactive prompt."""
+
+
+class TerminalGenerationMismatchError(ValueError):
+    """The terminal id now names a different incarnation than the caller's
+    bound generation/session. Destructive cleanup must preserve every resource
+    and report the ambiguity — never delete the replacement. Mapped to HTTP
+    409 at the API boundary (distinct from a plain 404 not-found)."""
+
+
+_SHELL_COMMANDS = frozenset({"sh", "bash", "zsh", "dash", "fish", "csh", "tcsh", "ksh", "login"})
+
+
+def _verify_managed_pane_process(session_name: str, window_name: str) -> None:
+    """Prove the managed window is NOT running a shell (fail-closed check).
+
+    The zero-keystroke contract: the pane's process must be the bridge argv
+    itself. If the pane reports a shell — or its process cannot be resolved —
+    the launch is unsafe: kill the window and raise so the reservation records
+    a preflight block instead of degrading to shell typing."""
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            command = get_backend().get_pane_current_command(session_name, window_name)
+        except Exception:
+            command = None
+        if command:
+            break
+        if time.monotonic() >= deadline:
+            command = None
+            break
+        time.sleep(0.05)
+    if command and command.strip().lower() not in _SHELL_COMMANDS:
+        return
+    try:
+        get_backend().kill_window(session_name, window_name)
+    finally:
+        raise RuntimeError(
+            f"managed window {session_name}:{window_name} did not start the "
+            f"bridge as its own process (pane command: {command!r}); refusing "
+            "to fall back to shell-typed startup"
+        )
 
 
 def inject_memory_context(first_message: str, terminal_id: str) -> str:
@@ -274,6 +314,11 @@ async def create_terminal(
                 raise ValueError("managed_native_command must be a non-empty argv list")
             if not os.path.isabs(managed_native_command[0]):
                 raise ValueError("managed_native_command executable must be absolute")
+            if new_session:
+                raise ValueError(
+                    "managed native launches require an existing session; atomic "
+                    "process creation is only defined for window creation"
+                )
 
         if not session_name:
             session_name = generate_session_name()
@@ -305,17 +350,32 @@ async def create_terminal(
             # Add window to existing session
             if not get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
-            # Merge explicit per-step env_vars over the persisted session env
-            # (per-step wins on conflict): workflow routing ids like
-            # CAO_WORKFLOW_RUN_ID must reach the window even when it joins an
-            # existing session (issue #408).
-            window_name = get_backend().create_window(
-                session_name,
-                window_name,
-                terminal_id,
-                working_directory,
-                extra_env={**get_session_env(session_name), **(env_vars or {})},
-            )
+            if managed_native_command is not None:
+                # ZERO-KEYSTROKE managed creation (spec §20.2d(3)/§20.2e P1-4):
+                # the bridge is the pane's OWN process/argv at window creation.
+                # Nothing is typed into a shell — no send_keys, no special key,
+                # no generic input — and the window env is the minimal managed
+                # identity, never ambient operator session env (P1-9).
+                window_name = get_backend().create_window_with_argv(
+                    session_name,
+                    window_name,
+                    terminal_id,
+                    managed_native_command,
+                    working_directory,
+                    extra_env={},
+                )
+            else:
+                # Merge explicit per-step env_vars over the persisted session env
+                # (per-step wins on conflict): workflow routing ids like
+                # CAO_WORKFLOW_RUN_ID must reach the window even when it joins an
+                # existing session (issue #408).
+                window_name = get_backend().create_window(
+                    session_name,
+                    window_name,
+                    terminal_id,
+                    working_directory,
+                    extra_env={**get_session_env(session_name), **(env_vars or {})},
+                )
             window_created = True  # only set after successful creation
 
         # Step 3: Load the profile once for allowed tool resolution before
@@ -356,6 +416,9 @@ async def create_terminal(
 
         # Step 3c: Persist terminal metadata to database after restrictions
         # are resolved so API reads and snapshots report the actual launch policy.
+        # Bind the server-owned immutable pane/window identity at creation:
+        # attestation binds supervisors by pane_id, never by mutable window name.
+        identity = get_backend().window_identity(session_name, window_name) or {}
         db_create_terminal(
             terminal_id,
             session_name,
@@ -365,6 +428,8 @@ async def create_terminal(
             allowed_tools,
             caller_id=caller_id,
             generation=terminal_generation,
+            pane_id=identity.get("pane_id"),
+            window_id=identity.get("window_id"),
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
@@ -401,17 +466,18 @@ async def create_terminal(
             # shell the initial prompt is drawn before the pipe attaches, leaving
             # the StatusMonitor buffer empty so wait_for_shell() times out. A bare
             # Enter produces a fresh prompt line that flows through the pipe.
-            get_backend().send_special_key(session_name, window_name, "Enter")
+            # Managed native windows run the bridge as their own process and
+            # receive ZERO keystrokes/special keys (spec §20.2d(3)).
+            if managed_native_command is None:
+                get_backend().send_special_key(session_name, window_name, "Enter")
 
         # Managed native sessions run a structured provider bridge in the
-        # reserved pane. The bridge, not pane scraping or tmux paste, owns
-        # readiness and task admission receipts for this exact generation.
+        # reserved pane. The bridge process was created ATOMICALLY as the
+        # window's own argv above — nothing is typed into a shell. The bridge,
+        # not pane scraping or tmux paste, owns readiness and task admission
+        # receipts for this exact generation.
         if managed_native_command is not None:
-            get_backend().send_keys(
-                session_name,
-                window_name,
-                shlex.join(managed_native_command),
-            )
+            _verify_managed_pane_process(session_name, window_name)
             terminal = Terminal(
                 id=terminal_id,
                 name=window_name,
@@ -923,6 +989,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "agent_profile": metadata["agent_profile"],
             "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
+            "pane_id": metadata.get("pane_id"),
+            "window_id": metadata.get("window_id"),
             "status": status,
             "last_active": metadata["last_active"],
         }
@@ -1341,13 +1409,13 @@ def delete_terminal(
         if expected_generation is not None:
             if metadata is None:
                 if not expected_session:
-                    raise ValueError(
+                    raise TerminalGenerationMismatchError(
                         "managed cleanup of a missing terminal record requires "
                         "the reserved session identity"
                     )
                 terminal_record_absent = True
             elif metadata.get("generation") != expected_generation:
-                raise ValueError(
+                raise TerminalGenerationMismatchError(
                     f"terminal {terminal_id} generation mismatch; expected "
                     f"{expected_generation!r}"
                 )
@@ -1356,7 +1424,7 @@ def delete_terminal(
                 metadata.get("tmux_session") != expected_session
                 or metadata.get("tmux_window") != expected_window
             ):
-                raise ValueError(
+                raise TerminalGenerationMismatchError(
                     f"terminal {terminal_id} route identity mismatch; expected "
                     f"{expected_session!r}:{expected_window!r}"
                 )
@@ -1463,7 +1531,7 @@ def delete_terminal(
                 if not deleted:
                     current = get_terminal_metadata(terminal_id)
                     if current is not None:
-                        raise ValueError(
+                        raise TerminalGenerationMismatchError(
                             f"terminal {terminal_id} changed generation during cleanup"
                         )
                     deleted = True
@@ -1477,6 +1545,7 @@ def delete_terminal(
                 PostKillTerminalEvent(
                     session_id=metadata["tmux_session"],
                     terminal_id=terminal_id,
+                    generation=metadata.get("generation"),
                     agent_name=metadata.get("agent_profile"),
                 ),
             )

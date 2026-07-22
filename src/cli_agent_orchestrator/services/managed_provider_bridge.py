@@ -46,6 +46,68 @@ from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 BRIDGE_VERSION = "cao-native-provider-bridge-v1"
 BRIDGE_ROOT = CAO_HOME_DIR / "managed-provider-sessions"
 
+# P1-9 (spec §20.2d(7)): provider/bridge child processes run under a MINIMAL
+# allowlisted environment built fresh — never the ambient server/tmux
+# environment. Protected conductor state, quota-bypass, and route-control
+# variables are rejected; PATH is a fixed minimal value, not inherited.
+_PROVIDER_ENV_ALLOWLIST = frozenset(
+    {
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "TERM_PROGRAM",
+        "COLORTERM",
+        "TMPDIR",
+        "SSH_AUTH_SOCK",
+        "DISPLAY",
+        "XDG_RUNTIME_DIR",
+        "DO_NOT_TRACK",
+        "KIMI_CODE_HOME",
+    }
+)
+_MINIMAL_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+
+# Variables that must never steer a managed provider from the ambient
+# environment: quota bypass, conductor control, and route control. Route
+# identity (model/effort/config home) comes ONLY from the reservation request.
+_PROTECTED_ENV_EXACT = frozenset(
+    {
+        "CAO_SETUP_SKIP_QUOTA_PREFLIGHT",
+        "CONDUCT_SKIP_QUOTA_PREFLIGHT",
+        "KIMI_MODEL_THINKING_EFFORT",
+    }
+)
+_PROTECTED_ENV_PREFIXES = ("CONDUCT_", "CHECK_AI_QUOTA", "CODEX_")
+
+
+def _assert_bridge_environment() -> None:
+    """Fail closed when the ambient environment carries protected control
+    variables into the managed bridge."""
+    leaked = sorted(
+        name
+        for name in os.environ
+        if name in _PROTECTED_ENV_EXACT
+        or any(name.startswith(prefix) for prefix in _PROTECTED_ENV_PREFIXES)
+    )
+    if leaked:
+        raise BridgeError(
+            "protected control variables leak into the managed bridge "
+            "environment: " + ", ".join(leaked)
+        )
+
+
+def _provider_env(overrides: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """The minimal allowlisted environment for provider child processes."""
+    env = {name: os.environ[name] for name in _PROVIDER_ENV_ALLOWLIST if name in os.environ}
+    env["PATH"] = _MINIMAL_PATH
+    env.update(overrides or {})
+    return env
+
 
 class BridgeError(RuntimeError):
     pass
@@ -465,7 +527,13 @@ class _ProviderSession:
             != self.request["provider_executable_sha256"]
         ):
             raise BridgeError("provider executable digest changed after reservation")
-        proc = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=5)
+        proc = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_provider_env(),
+        )
         actual = proc.stdout.strip()
         if proc.returncode != 0 or actual != expected:
             raise BridgeError(f"unsupported provider version {actual!r}; expected {expected!r}")
@@ -491,7 +559,7 @@ class _ProviderSession:
         argv.extend(["app-server", "--stdio"])
         config_path = pathlib.Path(os.path.expanduser("~/.codex/config.toml"))
         config_before = _file_digest_or_absent(config_path)
-        self.rpc = _RpcProcess(argv)
+        self.rpc = _RpcProcess(argv, env=_provider_env())
         initialize_request = {
             "clientInfo": {"name": "cao-managed-native", "version": BRIDGE_VERSION}
         }
@@ -554,8 +622,9 @@ class _ProviderSession:
     def _initialize_kimi(self) -> dict[str, Any]:
         kimi_bin = self.request["provider_executable"]
         version = self._version(kimi_bin, SUPPORTED_KIMI_VERSION)
-        env = dict(os.environ)
-        env["KIMI_MODEL_THINKING_EFFORT"] = self.request["effort"]
+        # Route control (thinking effort) comes ONLY from the reservation
+        # request, applied over the minimal allowlisted environment.
+        env = _provider_env({"KIMI_MODEL_THINKING_EFFORT": self.request["effort"]})
         self.rpc = _RpcProcess([kimi_bin, "acp"], env=env)
         initialize_request = {
             "protocolVersion": 1,
@@ -805,6 +874,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--reservation-id", required=True)
     args = parser.parse_args(argv)
+    _assert_bridge_environment()
     target = paths(args.reservation_id)
     request = json.loads(target["request"].read_text(encoding="utf-8"))
     if request.get("reservation_id") != args.reservation_id:

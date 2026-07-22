@@ -120,16 +120,21 @@ class TestCreateTerminal:
         result = await create_terminal("kiro_cli", "developer", new_session=True)
 
         assert result.allowed_tools == ["fs_read"]
-        mock_db_create.assert_called_once_with(
+        assert mock_db_create.call_count == 1
+        call = mock_db_create.call_args
+        assert call.args == (
             "test1234",
             "cao-session",
             "developer-abcd",
             "kiro_cli",
             "developer",
             ["fs_read"],
-            caller_id=None,
-            generation=None,
         )
+        assert call.kwargs["caller_id"] is None
+        assert call.kwargs["generation"] is None
+        # server-owned immutable pane identity is bound at creation
+        assert "pane_id" in call.kwargs
+        assert "window_id" in call.kwargs
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
     @pytest.mark.asyncio

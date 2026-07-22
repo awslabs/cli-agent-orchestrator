@@ -82,6 +82,33 @@ class TmuxBackend(TerminalBackend):
     def window_exists(self, session_name: str, window_name: str) -> bool:
         return self._client.window_exists(session_name, window_name)
 
+    def window_identity(self, session_name: str, window_name: str) -> Optional[Dict[str, str]]:
+        return self._client.window_identity(session_name, window_name)
+
+    def create_window_with_argv(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        argv: List[str],
+        working_directory: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+    ) -> str:
+        try:
+            return self._client.create_window_with_argv(
+                session_name,
+                window_name,
+                terminal_id,
+                argv,
+                working_directory,
+                extra_env=extra_env,
+            )
+        except Exception as e:
+            raise TerminalBackendError(
+                f"Failed to create managed process window '{window_name}' "
+                f"in session '{session_name}': {e}"
+            ) from e
+
     # --- Input ---
 
     def send_keys(

@@ -141,6 +141,28 @@ class TerminalBackend(ABC):
         """Return whether the exact window exists, raising on lookup failure."""
         ...
 
+    def window_identity(self, session_name: str, window_name: str) -> Optional[Dict[str, str]]:
+        """Server-owned immutable tmux identity (pane_id/window_id) of a
+        window, or None when the backend cannot resolve one."""
+        return None
+
+    def create_window_with_argv(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        argv: List[str],
+        working_directory: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Create a window running ``argv`` directly as the pane process (no
+        shell, zero keystrokes). Backends that cannot provide atomic process
+        creation MUST fail closed by raising — managed launch never degrades
+        to typing a command into a shell."""
+        raise TerminalBackendError(
+            f"{type(self).__name__} does not support atomic process window creation"
+        )
+
     # --- Input ---
 
     @abstractmethod

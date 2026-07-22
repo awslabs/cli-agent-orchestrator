@@ -119,6 +119,20 @@ def _assert_bound_evidence(row: Any, evidence: dict[str, Any]) -> None:
         )
 
 
+# P1-5 (spec §20.2d(1)/§20.2e): provider-specific allowlisted receipt schemas.
+# Readiness is the exact provider session/thread start; submission is the
+# exact provider turn start. Locally minted (`pane-id`), wrong-kind, and
+# unknown-provider provenance is rejected before any fork state advance.
+_READINESS_RECEIPT_KINDS = {
+    "codex": "codex-thread-start",
+    "kimi_cli": "kimi-acp-session-new",
+}
+_SUBMISSION_RECEIPT_KINDS = {
+    "codex": "codex-turn-start",
+    "kimi_cli": "kimi-session-update",
+}
+
+
 def _validate_native_receipt(
     row: Any,
     receipt: dict[str, Any],
@@ -129,6 +143,21 @@ def _validate_native_receipt(
     from cli_agent_orchestrator.services.managed_provider_bridge import BRIDGE_VERSION
 
     _assert_bound_evidence(row, receipt)
+    kinds = _SUBMISSION_RECEIPT_KINDS if admission is not None else _READINESS_RECEIPT_KINDS
+    expected_kind = kinds.get(row.provider)
+    if expected_kind is None or receipt.get("provider_receipt_kind") != expected_kind:
+        raise ManagedLaunchConflict(
+            "provider receipt kind is not the allowlisted provider-native kind "
+            f"for {row.provider!r}: {receipt.get('provider_receipt_kind')!r}"
+        )
+    if admission is not None and receipt.get("receipt_id") != receipt.get("provider_turn_id"):
+        raise ManagedLaunchConflict(
+            "provider submission receipt id is not the provider turn identity"
+        )
+    if admission is None and receipt.get("receipt_id") != receipt.get("provider_session_id"):
+        raise ManagedLaunchConflict(
+            "provider readiness receipt id is not the provider session identity"
+        )
     request = _parse_json(row.request_json, {})
     expected = {
         "bridge_version": BRIDGE_VERSION,
