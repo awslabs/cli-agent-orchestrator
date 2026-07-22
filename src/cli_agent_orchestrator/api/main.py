@@ -14,7 +14,7 @@ import termios
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional, cast
+from typing import Annotated, Any, Dict, List, Optional, Tuple, cast
 
 from fastapi import (
     BackgroundTasks,
@@ -512,6 +512,31 @@ async def lifespan(app: FastAPI):
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
+    # Start ApprovalBridge when AG-UI surface is enabled
+    approval_bridge_task: Optional[asyncio.Task] = None
+    from cli_agent_orchestrator.services.agui_enablement import agui_surface_enabled
+
+    if agui_surface_enabled():
+        from cli_agent_orchestrator.services.agui.approval_bridge import ApprovalBridge
+        from cli_agent_orchestrator.services.agui.base import InProcessUiEmitter
+        from cli_agent_orchestrator.services.agui.handoff_approval import (
+            AgentHandoffWithApproval,
+            TerminalServiceAnswerDelivery,
+        )
+
+        approval_emitter = InProcessUiEmitter()
+        approval_construct = AgentHandoffWithApproval(
+            emitter=approval_emitter,
+            # Deliver resolved decisions to the waiting CLI via the tmux input
+            # path so approve/deny/edit actually reach the terminal (not just
+            # mark the interrupt resolved).
+            answer_delivery=TerminalServiceAnswerDelivery(),
+        )
+        approval_bridge = ApprovalBridge(construct=approval_construct)
+        app.state.approval_bridge = approval_bridge
+        approval_bridge_task = asyncio.create_task(approval_bridge.run())
+        logger.info("ApprovalBridge started")
+
     # Start temporary OpenCode inbox poller. GH #115 tracks replacing this
     # provider-specific wakeup path with a unified delivery engine.
     opencode_inbox_task = asyncio.create_task(opencode_inbox_delivery_daemon(registry))
@@ -555,6 +580,13 @@ async def lifespan(app: FastAPI):
     status_monitor_task.cancel()
     log_writer_task.cancel()
     inbox_service_task.cancel()
+    # Cancel approval bridge on shutdown
+    if approval_bridge_task is not None:
+        approval_bridge_task.cancel()
+        try:
+            await approval_bridge_task
+        except asyncio.CancelledError:
+            pass
     # Cancel daemon on shutdown
     daemon_task.cancel()
 
@@ -934,10 +966,26 @@ async def agui_stream(
     else:
         scopes = [SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN]
 
+    # Validate ?since= as ISO-8601 before streaming starts (L1 Cleanup B).
+    # A malformed value must produce HTTP 400 immediately rather than being
+    # swallowed inside the failure-isolated replay block.
+    if since:
+        try:
+            # Python 3.10 fromisoformat() does not handle trailing 'Z';
+            # normalize it to '+00:00' for cross-version compatibility.
+            _since_normalized = since.replace("Z", "+00:00") if since.endswith("Z") else since
+            datetime.fromisoformat(_since_normalized)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid ISO-8601 timestamp for 'since': {since!r}",
+            )
+
     from fastapi.responses import StreamingResponse
 
     from cli_agent_orchestrator.clients.database import list_terminals_by_session
     from cli_agent_orchestrator.services import session_service
+    from cli_agent_orchestrator.services.agui.lifecycle_tracker import ToolCallLifecycleTracker
     from cli_agent_orchestrator.services.agui_stream import (
         state_delta_frame,
         state_snapshot_frame,
@@ -969,6 +1017,37 @@ async def agui_stream(
         prefix = f"id: {event_id}\n" if event_id is not None else ""
         return f"{prefix}event: {agui_type}\ndata: {json.dumps(data)}\n\n"
 
+    def _sse_frames(event_id: Optional[str], frames: List[Tuple[str, Dict]]) -> List[str]:
+        """Format the (possibly multiple) SSE frames produced by one record.
+
+        A single event-log record can expand into more than one AG-UI frame
+        (e.g. a primary frame plus a synthesized ``TOOL_CALL_END``/``RESULT``).
+        Emitting them all under the same SSE ``id:`` (the record id) makes it
+        impossible for clients to dedupe/process the later frames and breaks
+        reconnects: a client that dropped mid-record and reconnects with
+        ``Last-Event-ID=<rid>`` would never receive the frames that shared it.
+
+        So we give the intermediate frames unique derived ids (``<rid>.<i>``)
+        and keep the canonical record id on the *last* frame. A normal
+        end-of-record reconnect therefore still sends a real event-log id and
+        resumes precisely via ``after_id``; a mid-record drop reconnects with a
+        derived id that ``after_id`` won't find, which safely replays every
+        fresh record (the client dedupes) rather than silently skipping frames.
+        Single-frame records are unchanged -- they keep the bare record id.
+        """
+
+        last = len(frames) - 1
+        out: List[str] = []
+        for i, (ftype, fdata) in enumerate(frames):
+            if event_id is None:
+                frame_id: Optional[str] = None
+            elif i == last:
+                frame_id = event_id
+            else:
+                frame_id = f"{event_id}.{i}"
+            out.append(_sse(frame_id, ftype, fdata))
+        return out
+
     async def event_generator():
         # Register the live subscription BEFORE replaying history / taking the
         # snapshot, so an event published during the replay->live handoff is
@@ -982,6 +1061,7 @@ async def agui_stream(
         # events on an open connection) so the client reconnects with
         # Last-Event-ID and replays the dropped records exactly once (F2).
         sub = bus.register(overflow_close=True)
+        tracker = ToolCallLifecycleTracker()
         try:
             replayed_ids: set = set()
 
@@ -1003,7 +1083,8 @@ async def agui_stream(
                         if rid is not None:
                             replayed_ids.add(rid)
                         rtype, rdata = to_agui_event(record)
-                        yield _sse(rid, rtype, rdata)
+                        for frame in _sse_frames(rid, list(tracker.feed(record, (rtype, rdata)))):
+                            yield frame
             except Exception:
                 logger.warning("agui_stream: history replay failed", exc_info=True)
 
@@ -1031,7 +1112,8 @@ async def agui_stream(
                     replayed_ids.discard(rid)
                     continue
                 agui_type, data = to_agui_event(event)
-                yield _sse(rid, agui_type, data)
+                for frame in _sse_frames(rid, list(tracker.feed(event, (agui_type, data)))):
+                    yield frame
 
                 # Recompute the fleet snapshot and emit a STATE_DELTA when it
                 # moved. NB: recomputes on every event; a debounce/cache is a
@@ -1047,6 +1129,10 @@ async def agui_stream(
                     prev_snapshot = curr
                 except Exception:
                     logger.warning("agui_stream: STATE_DELTA computation failed", exc_info=True)
+
+            # Session end: synthesize closers for any remaining open tool calls.
+            for ftype, fdata in tracker.close_all():
+                yield _sse(None, ftype, fdata)
         finally:
             bus.unregister(sub)
 
@@ -1109,6 +1195,204 @@ async def agui_emit_ui(
     event = get_event_log().append("other", body.terminal_id, body.session_name, detail)
     get_bus().publish(event)
     return {"ok": True, "event_id": event.get("id"), "component": body.component}
+
+
+# ---------------------------------------------------------------------------
+# Interrupt resume endpoint (human-in-the-loop approval)
+# ---------------------------------------------------------------------------
+
+
+class ResumeInterruptRequest(BaseModel):
+    decision: str = Field(..., description="One of: approve, deny, edit")
+    edited_text: Optional[str] = Field(None, description="Required when decision is 'edit'")
+
+    @field_validator("decision")
+    @classmethod
+    def validate_decision(cls, v: str) -> str:
+        allowed = {"approve", "deny", "edit"}
+        if v not in allowed:
+            raise ValueError(f"decision must be one of {sorted(allowed)}")
+        return v
+
+
+@app.post("/agui/v1/interrupts/{interrupt_id}/resume")
+async def agui_resume_interrupt(
+    interrupt_id: str,
+    body: ResumeInterruptRequest,
+    _enabled: None = Depends(_require_agui_enabled),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Resume a pending approval interrupt with the user's decision.
+
+    Idempotent: re-resuming an already-resolved interrupt returns the recorded
+    outcome with no side effects (no keystrokes re-sent).
+
+    Guards:
+    - 404 when AG-UI surface disabled
+    - 404 for unknown interrupt_id
+    - 422 for invalid decision or edit validation failure
+    - Requires cao:write or cao:admin when auth is enabled
+    """
+    from cli_agent_orchestrator.services.agui.handoff_approval import (
+        ApprovalDecision,
+        DeliveryError,
+    )
+
+    bridge = getattr(app.state, "approval_bridge", None)
+    if bridge is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval bridge not initialized",
+        )
+
+    construct = bridge.construct
+    interrupt = construct.get_interrupt(interrupt_id)
+    if interrupt is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown interrupt: {interrupt_id}",
+        )
+
+    try:
+        decision_enum = ApprovalDecision(body.decision)
+    except ValueError:  # pragma: no cover - validate_decision 422s bad values first
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid decision: {body.decision}",
+        )
+
+    try:
+        result = await construct.resume(
+            interrupt_id=interrupt_id,
+            decision=decision_enum,
+            edited_text=body.edited_text,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(e),
+        )
+    except DeliveryError as e:
+        # Delivery to the terminal failed; the interrupt is left unresolved and
+        # retryable. Surface a non-success status with a machine-readable
+        # retryable flag rather than reporting the resolution as successful (P1).
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "message": f"Failed to deliver decision to terminal: {e}",
+                "retryable": True,
+            },
+        )
+
+    return {
+        "ok": True,
+        "interrupt_id": result.id,
+        "resolved": result.resolved,
+        "outcome": result.outcome,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Run plane endpoint (AG-UI stock wire dialect)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/agui/v1/run")
+async def agui_run(
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Stream AG-UI stock events for a run (POST /agui/v1/run).
+
+    Accepts a RunAgentInput body (camelCase) and streams lifecycle-legal SSE
+    frames using the official ag-ui-protocol EventEncoder. Each frame is a
+    ``data:`` line containing camelCase JSON with a ``type`` field.
+
+    When ``resume[]`` is non-empty, ``cao:write`` is required (the caller is
+    mutating interrupt state). Otherwise ``cao:read`` is the floor.
+
+    Returns 501 when the ``ag-ui-protocol`` package is not installed (the
+    [agui] optional extra was not included at install time).
+    Returns 404 when the AG-UI surface is disabled.
+    """
+    _require_agui_enabled()
+
+    from cli_agent_orchestrator.services.agui.run_plane import AG_UI_AVAILABLE
+
+    if not AG_UI_AVAILABLE:
+        return JSONResponse(
+            status_code=501,
+            content={
+                "detail": (
+                    "ag-ui-protocol is not installed. "
+                    "Install with: pip install cli-agent-orchestrator[agui]"
+                )
+            },
+        )
+
+    # Parse the body
+    body = await request.json()
+
+    # Scope escalation: if resume[] is non-empty, require cao:write
+    resume_entries = body.get("resume") or []
+    if resume_entries:
+        if not any(s in _scopes for s in (SCOPE_WRITE, SCOPE_ADMIN)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="cao:write required when resume[] is non-empty",
+            )
+
+    # Get approval construct from app state
+    bridge = getattr(app.state, "approval_bridge", None)
+    approval_construct = bridge.construct if bridge is not None else None
+
+    # Build the snapshot function
+    def _fleet_snapshot() -> Dict:
+        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.services import session_service
+        from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
+
+        sessions = session_service.list_sessions()
+        terminals: List[Dict] = []
+        for sess in sessions:
+            try:
+                terminals.extend(list_terminals_by_session(sess["id"]))
+            except Exception:
+                pass
+        return build_dashboard_snapshot(sessions, terminals, list(_scopes))
+
+    # Build the bus subscription function
+    async def _bus_events():
+        from cli_agent_orchestrator.services.sse_bus import get_bus
+
+        sse_bus = get_bus()
+        sub = sse_bus.register(overflow_close=True)
+        try:
+            async for event in sse_bus.drain(sub):
+                yield event
+        finally:
+            sse_bus.unregister(sub)
+
+    from fastapi.responses import StreamingResponse
+
+    from cli_agent_orchestrator.services.agui.run_plane import (
+        get_run_plane_content_type,
+        run_plane_stream,
+    )
+
+    accept_header = request.headers.get("accept")
+    content_type = get_run_plane_content_type(accept_header)
+
+    return StreamingResponse(
+        run_plane_stream(
+            input_data=body,
+            approval_construct=approval_construct,
+            snapshot_fn=_fleet_snapshot,
+            bus_subscribe_fn=_bus_events,
+            accept=accept_header,
+        ),
+        media_type=content_type,
+    )
 
 
 # Topology widget static bundle at /widgets/topology/ — the vanilla SSE-driven

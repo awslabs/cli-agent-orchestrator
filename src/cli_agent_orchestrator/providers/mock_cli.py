@@ -19,6 +19,7 @@ See ``docs/mock-cli-provider.md`` for the design and motivation.
 """
 
 import logging
+import os
 import re
 import shlex
 from typing import List, Optional
@@ -37,6 +38,17 @@ IDLE_PROMPT_PATTERN_LOG = r"❯\s"
 RESPONSE_INDICATOR_PATTERN = r"^>\s*MOCK:"
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 ERROR_INDICATOR = "ERROR: mock failure injected"
+
+# Scripted-prompt mode: when CAO_MOCK_CLI_SCRIPTED_PROMPTS=1, the presence of
+# this marker in the buffer causes get_status to return WAITING_USER_ANSWER.
+# When an answer is delivered (text appears after the marker on subsequent lines),
+# the status clears back to normal (IDLE/COMPLETED).
+SCRIPTED_PROMPT_MARKER = "APPROVAL_REQUIRED:"
+
+
+def _scripted_prompts_enabled() -> bool:
+    """Check if scripted-prompt mode is enabled via env var."""
+    return os.environ.get("CAO_MOCK_CLI_SCRIPTED_PROMPTS", "").strip() in ("1", "true", "yes")
 
 
 class MockCliProvider(BaseProvider):
@@ -85,6 +97,19 @@ class MockCliProvider(BaseProvider):
 
         if ERROR_INDICATOR in clean:
             return TerminalStatus.ERROR
+
+        # Scripted-prompt mode: check for APPROVAL_REQUIRED marker
+        if _scripted_prompts_enabled() and SCRIPTED_PROMPT_MARKER in clean:
+            # Find the marker position
+            marker_idx = clean.rfind(SCRIPTED_PROMPT_MARKER)
+            after_marker = clean[marker_idx + len(SCRIPTED_PROMPT_MARKER) :]
+            # The marker line may contain the prompt text (e.g. "APPROVAL_REQUIRED: Allow?")
+            # The answer is delivered when there is a SUBSEQUENT line with non-whitespace
+            # content after the marker line.
+            lines_after = after_marker.split("\n")[1:]  # Skip remainder of marker line
+            has_answer = any(line.strip() for line in lines_after)
+            if not has_answer:
+                return TerminalStatus.WAITING_USER_ANSWER
 
         has_idle = re.search(IDLE_PROMPT_PATTERN, clean, re.MULTILINE)
         if not has_idle:

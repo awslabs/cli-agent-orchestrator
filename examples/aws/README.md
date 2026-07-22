@@ -62,6 +62,22 @@ runtime.
 cao launch --agents sqs-monitor-agent --provider claude_code
 ```
 
+## Profile Discovery
+
+Each profile declares `tags` and `capabilities` in its frontmatter. These
+fields are indexed by `cao profile find` (and the `find_profiles` MCP tool),
+so installed agents can be discovered by what they do:
+
+```bash
+cao profile find "dead letter queue"
+cao profile find "query dynamodb"
+```
+
+Only `name`, `description`, `tags`, and `capabilities` are indexed; the
+profile body is never indexed or returned in search results. When you copy
+these examples for your own agents, keep tags as short keywords and
+capabilities as short verb phrases.
+
 ## Configuration Reference
 
 The `config.json` in each folder is **not** read at runtime. It exists as a
