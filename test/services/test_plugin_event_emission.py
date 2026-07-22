@@ -86,11 +86,12 @@ class TestSessionPluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_dispatches_post_kill_session_event_after_cleanup(
-        self, mock_tmux, mock_list_terminals, mock_delete_terminal
+        self, mock_tmux, mock_list_terminals, mock_delete_terminal, mock_sweep
     ):
         """Session kill should emit after per-terminal cleanup and the tmux kill succeed."""
         registry = _registry_mock()
@@ -99,7 +100,9 @@ class TestSessionPluginEvents:
         async def record_dispatch(*_args):
             call_order.append("dispatch")
 
-        mock_tmux.return_value.session_exists.return_value = True
+        # Post-loop liveness check sees it alive; the kill confirmation poll
+        # then sees it gone (kill_session took effect).
+        mock_tmux.return_value.session_exists.side_effect = [True, False]
         mock_tmux.return_value.kill_session.side_effect = lambda *_: call_order.append(
             "kill_session"
         )

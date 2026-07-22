@@ -171,8 +171,17 @@ class TestGetSession:
 
 
 class TestDeleteSession:
-    """Tests for delete_session function."""
+    """Tests for delete_session function.
 
+    delete_session now (caom-9k8) re-checks session liveness AFTER the terminal
+    loop, confirms the tmux kill actually took, and sweeps leftover registry
+    rows. ``session_exists`` is therefore consulted once for the post-loop
+    check and again (via ``_confirm_session_gone``) to confirm the kill; on the
+    happy path it reports alive-then-gone. Faithful-fake, real-DB reconciliation
+    tests live in test_session_teardown_atomic.py.
+    """
+
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -181,14 +190,17 @@ class TestDeleteSession:
         mock_get_backend,
         mock_list_terminals,
         mock_delete_terminal,
+        mock_delete_terminals_by_session,
     ):
         """Test deleting session successfully.
 
         delete_session delegates per-terminal teardown (FIFO reader, status
         buffer, provider, DB) to terminal_service.delete_terminal, then kills
-        the backend session and returns the Dict result shape.
+        the backend session, confirms it is gone, sweeps leftover rows, and
+        returns the Dict result shape.
         """
-        mock_get_backend.return_value.session_exists.return_value = True
+        # Post-loop check sees it alive; the kill confirmation sees it gone.
+        mock_get_backend.return_value.session_exists.side_effect = [True, False]
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
             {"id": "terminal2"},
@@ -198,19 +210,27 @@ class TestDeleteSession:
 
         assert result == {"deleted": ["cao-test"], "errors": []}
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
+        # Registry rows are reconciled after the tmux session is confirmed gone.
+        mock_delete_terminals_by_session.assert_called_once_with("cao-test")
         # Each terminal is torn down via the event-driven delete_terminal path.
         assert mock_delete_terminal.call_count == 2
         mock_delete_terminal.assert_any_call("terminal1", registry=ANY)
         mock_delete_terminal.assert_any_call("terminal2", registry=ANY)
 
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_when_backend_session_already_gone(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_delete_terminal,
+        mock_delete_terminals_by_session,
     ):
         """Backend session already gone — delete_session should not raise and not
-        call kill_session, but still tear down each terminal via delete_terminal."""
+        call kill_session, but still tear down each terminal via delete_terminal
+        and reconcile the registry."""
         mock_get_backend.return_value.session_exists.return_value = False
         mock_list_terminals.return_value = [{"id": "terminal1"}]
 
@@ -219,15 +239,21 @@ class TestDeleteSession:
         assert result == {"deleted": ["cao-test"], "errors": []}
         mock_get_backend.return_value.kill_session.assert_not_called()
         mock_delete_terminal.assert_called_once_with("terminal1", registry=ANY)
+        mock_delete_terminals_by_session.assert_called_once_with("cao-test")
 
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_no_terminals(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_delete_terminal,
+        mock_delete_terminals_by_session,
     ):
         """Test deleting session with no terminals."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.side_effect = [True, False]
         mock_list_terminals.return_value = []
 
         result = delete_session("cao-test")
@@ -246,14 +272,19 @@ class TestDeleteSession:
         with pytest.raises(Exception, match="Database error"):
             delete_session("cao-test")
 
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_continues_when_terminal_cleanup_fails(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_delete_terminal,
+        mock_delete_terminals_by_session,
     ):
         """Test that delete_session continues even when terminal teardown fails for some terminals."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.side_effect = [True, False]
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
             {"id": "terminal2"},
@@ -274,15 +305,23 @@ class TestDeleteSession:
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
         # All three terminal teardowns were attempted
         assert mock_delete_terminal.call_count == 3
+        # The registry sweep still runs so any row left behind by the failed
+        # terminal teardown does not outlive the dead session.
+        mock_delete_terminals_by_session.assert_called_once_with("cao-test")
 
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_cleans_up_each_terminal(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_delete_terminal,
+        mock_delete_terminals_by_session,
     ):
         """Test that delete_session tears down every terminal in the session via delete_terminal."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.side_effect = [True, False]
         mock_list_terminals.return_value = [
             {"id": "term-aaa"},
             {"id": "term-bbb"},
