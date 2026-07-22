@@ -152,6 +152,37 @@ class SessionEnvModel(Base):
     updated_at = Column(Text, nullable=False)  # ISO-8601 UTC timestamp
 
 
+class ManagedLaunchReservationModel(Base):
+    """Durable identity and evidence for two-phase managed task admission.
+
+    A reservation exists before a provider or terminal is started.  The
+    conductor-supplied reservation id is the idempotency key; ``terminal_id``
+    and ``generation`` are allocated once and never changed.  JSON payloads
+    intentionally remain opaque to the generic database layer so the managed
+    launch service owns schema validation and state transitions.
+    """
+
+    __tablename__ = "managed_launch_reservations"
+
+    reservation_id = Column(Text, primary_key=True)
+    terminal_id = Column(String, nullable=False, unique=True)
+    generation = Column(Text, nullable=False, unique=True)
+    session_name = Column(Text, nullable=False)
+    provider = Column(Text, nullable=False)
+    agent_profile = Column(Text, nullable=False)
+    caller_id = Column(Text, nullable=False)
+    working_directory = Column(Text, nullable=False)
+    trusted_project_root = Column(Text, nullable=True)
+    state = Column(Text, nullable=False)
+    request_json = Column(Text, nullable=False)
+    observations_json = Column(Text, nullable=False, default="[]")
+    readiness_json = Column(Text, nullable=True)
+    admission_json = Column(Text, nullable=True)
+    negative_json = Column(Text, nullable=True)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+
 class FlowModel(Base):
     """SQLAlchemy model for flow metadata."""
 
@@ -204,6 +235,7 @@ def init_db() -> None:
     _migrate_workflow_run()
     _migrate_workflow_run_step()
     _migrate_session_env()
+    _migrate_managed_launch_reservations()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -543,6 +575,46 @@ def _migrate_session_env() -> None:
             )
     except Exception as e:  # noqa: BLE001 — read path fails closed instead
         logger.debug(f"session_env migration skipped: {e}")
+
+
+def _migrate_managed_launch_reservations() -> None:
+    """Create the response-loss-safe managed-launch store on older databases.
+
+    ``Base.metadata.create_all`` covers fresh databases.  This explicit,
+    idempotent migration is kept for installations whose database predates the
+    companion protocol.  Unlike best-effort derived indexes, failure here is
+    surfaced by every managed-launch operation when the required table cannot
+    be read; callers never fall back to ordinary terminal creation.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS managed_launch_reservations ("
+                "reservation_id TEXT PRIMARY KEY, "
+                "terminal_id TEXT NOT NULL UNIQUE, "
+                "generation TEXT NOT NULL UNIQUE, "
+                "session_name TEXT NOT NULL, "
+                "provider TEXT NOT NULL, "
+                "agent_profile TEXT NOT NULL, "
+                "caller_id TEXT NOT NULL, "
+                "working_directory TEXT NOT NULL, "
+                "trusted_project_root TEXT, "
+                "state TEXT NOT NULL, "
+                "request_json TEXT NOT NULL, "
+                "observations_json TEXT NOT NULL DEFAULT '[]', "
+                "readiness_json TEXT, "
+                "admission_json TEXT, "
+                "negative_json TEXT, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 - the operation path fails closed
+        logger.warning(f"managed-launch migration failed: {e}")
 
 
 def _migrate_terminals_schema() -> None:

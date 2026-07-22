@@ -208,11 +208,15 @@ class KimiCliProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        expected_model: Optional[str] = None,
+        expected_effort: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        self._expected_model = expected_model
+        self._expected_effort = expected_effort
         # Track temp directory for cleanup (created when agent profile needs temp files)
         self._temp_dir: Optional[str] = None
         # Latching flag: set True when user input box (╭─) is detected in ANY
@@ -375,9 +379,17 @@ class KimiCliProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
+        # Managed launches force the provider-native route after profile-derived
+        # arguments so the attested values cannot be shadowed by profile drift.
+        if self._expected_model is not None:
+            command_parts.extend(["--model", self._expected_model])
+
         # cd to unique temp dir (per-directory lock) + set TERM for tmux compatibility
         kimi_cmd = shlex.join(command_parts)
-        return f"cd {shlex.quote(self._temp_dir)} && TERM=xterm-256color {kimi_cmd}"
+        environment = ["TERM=xterm-256color"]
+        if self._expected_effort is not None:
+            environment.append("KIMI_MODEL_THINKING_EFFORT=" + shlex.quote(self._expected_effort))
+        return f"cd {shlex.quote(self._temp_dir)} && {' '.join(environment)} {kimi_cmd}"
 
     @classmethod
     def _ensure_mcp_timeout(cls) -> None:

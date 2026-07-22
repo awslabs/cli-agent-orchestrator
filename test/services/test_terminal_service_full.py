@@ -1,5 +1,6 @@
 """Full tests for terminal service."""
 
+from contextlib import ExitStack
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1492,6 +1493,82 @@ class TestCreateTerminalSessionEnvStore:
 
         assert mock_clear_session_env.call_count == 2
         assert "could not clear session env for cao-session" in caplog.text
+
+
+class TestManagedCreatePreservation:
+    @pytest.mark.asyncio
+    async def test_persisted_reserved_generation_survives_provider_init_failure(self, tmp_path):
+        with ExitStack() as stack:
+            clear_env = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.clear_session_env")
+            )
+            status = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+            )
+            fifo = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+            )
+            fifo_dir = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+            )
+            manager = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+            )
+            db_create = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+            )
+            db_delete = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+            )
+            get_metadata = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+            )
+            backend = stack.enter_context(
+                patch("cli_agent_orchestrator.backends.registry._backend")
+            )
+            gen_window = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+            )
+            gen_terminal = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+            )
+            load_profile = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+            )
+
+            backend.session_exists.return_value = False
+            gen_window.return_value = "reviewer-abcd"
+            fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+            load_profile.return_value = AgentProfile(
+                name="reviewer-sol-max", description="Reviewer"
+            )
+            provider = AsyncMock()
+            provider.initialize.side_effect = RuntimeError("provider startup failed")
+            manager.create_provider.return_value = provider
+            get_metadata.return_value = {"id": "aabbccdd"}
+
+            with pytest.raises(RuntimeError, match="provider startup failed"):
+                await create_terminal(
+                    "codex",
+                    "reviewer-sol-max",
+                    session_name="cao-managed-test",
+                    new_session=True,
+                    working_directory=str(tmp_path),
+                    reserved_terminal_id="aabbccdd",
+                    trusted_project_root=str(tmp_path),
+                    preserve_on_init_failure=True,
+                )
+
+            gen_terminal.assert_not_called()
+            clear_env.assert_called_once_with("cao-managed-test")
+            db_create.assert_called_once()
+            manager.create_provider.assert_called_once()
+            assert manager.create_provider.call_args.kwargs["trusted_project_root"] == str(tmp_path)
+            fifo.stop_reader.assert_not_called()
+            status.clear_terminal.assert_not_called()
+            manager.cleanup_provider.assert_not_called()
+            db_delete.assert_not_called()
+            backend.kill_session.assert_not_called()
 
 
 class TestGetTerminal:

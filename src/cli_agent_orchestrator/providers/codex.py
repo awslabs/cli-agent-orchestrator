@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import re
 import shlex
 import time
@@ -9,7 +10,7 @@ from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import BaseProvider, ProviderPreflightBlocked
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
@@ -209,6 +210,22 @@ def _toml_override(key: str, value: Any) -> str:
         raise TypeError(f"codexConfig key '{key}': {exc}") from exc
 
 
+def render_trusted_project_override(project_root: str) -> str:
+    """Render the single-purpose invocation-only Codex trust override.
+
+    This is intentionally not exposed through the general ``codexConfig``
+    serializer: the absolute path is a quoted inline-table key, and treating it
+    as a dotted path would silently target a different configuration node.
+    """
+    if not isinstance(project_root, str) or not os.path.isabs(project_root):
+        raise ValueError("trusted_project_root must be an absolute path")
+    if os.path.realpath(project_root) != project_root:
+        raise ValueError("trusted_project_root must already be a canonical realpath")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in project_root):
+        raise ValueError("trusted_project_root must not contain control characters")
+    return f'projects={{{_toml_scalar(project_root)}={{trust_level="trusted"}}}}'
+
+
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
     """Find the first ASSISTANT_PREFIX_PATTERN match in ``text`` whose line
     is not an MCP tool-call marker.
@@ -247,11 +264,17 @@ class CodexProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        trusted_project_root: Optional[str] = None,
+        expected_model: Optional[str] = None,
+        expected_effort: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        self._trusted_project_root = trusted_project_root
+        self._expected_model = expected_model
+        self._expected_effort = expected_effort
 
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
@@ -370,6 +393,21 @@ class CodexProvider(BaseProvider):
                 for key, value in profile.codexConfig.items():
                     command_parts.extend(["-c", _toml_override(key, value)])
 
+        if self._trusted_project_root is not None:
+            command_parts.extend(
+                ["-c", render_trusted_project_override(self._trusted_project_root)]
+            )
+        # Managed launches bind the route request to the provider invocation.
+        # These are emitted last so a named profile or generic codexConfig
+        # cannot silently select a different model or reasoning effort than the
+        # provider-native pre-task receipt.
+        if self._expected_model is not None:
+            command_parts.extend(["-c", _toml_override("model", self._expected_model)])
+        if self._expected_effort is not None:
+            command_parts.extend(
+                ["-c", _toml_override("model_reasoning_effort", self._expected_effort)]
+            )
+
         return shlex.join(command_parts)
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
@@ -395,6 +433,12 @@ class CodexProvider(BaseProvider):
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
+                if self._trusted_project_root is not None:
+                    raise ProviderPreflightBlocked(
+                        "repository-trust",
+                        "Codex displayed a repository-trust prompt despite invocation-only "
+                        "trust pre-authorization; refusing all input",
+                    )
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                 logger.info("Codex workspace trust prompt (v1) detected, auto-accepting")
@@ -405,6 +449,12 @@ class CodexProvider(BaseProvider):
             if re.search(TRUST_PROMPT_PATTERN_V2, clean_output) and re.search(
                 TRUST_PROMPT_FOOTER, clean_output
             ):
+                if self._trusted_project_root is not None:
+                    raise ProviderPreflightBlocked(
+                        "repository-trust",
+                        "Codex displayed a repository-trust prompt despite invocation-only "
+                        "trust pre-authorization; refusing all input",
+                    )
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                 logger.info("Codex workspace trust prompt (v2) detected, auto-accepting")

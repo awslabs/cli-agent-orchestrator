@@ -1,0 +1,95 @@
+"""Typed request models for the managed-launch companion protocol."""
+
+from __future__ import annotations
+
+import re
+import uuid
+from typing import Literal, Optional, TypeAlias
+
+from pydantic import BaseModel, Field, field_validator
+
+PROTOCOL_VERSION = "cao-managed-launch-v1"
+ProtocolVersion: TypeAlias = Literal["cao-managed-launch-v1"]
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+
+
+def _uuid_text(value: str, field_name: str) -> str:
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError(f"{field_name} must be a canonical UUID") from exc
+    canonical = str(parsed)
+    if value != canonical:
+        raise ValueError(f"{field_name} must use canonical lowercase UUID text")
+    return canonical
+
+
+class ManagedLaunchReserveRequest(BaseModel):
+    protocol_version: ProtocolVersion
+    reservation_id: str
+    session_name: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
+    agent_profile: str = Field(min_length=1)
+    caller_id: str = Field(pattern=r"^[a-f0-9]{8}$")
+    working_directory: str = Field(min_length=1)
+    trusted_project_root: Optional[str] = None
+    expected_model: str = Field(min_length=1)
+    expected_effort: str = Field(min_length=1)
+
+    @field_validator("reservation_id")
+    @classmethod
+    def _validate_reservation_id(cls, value: str) -> str:
+        return _uuid_text(value, "reservation_id")
+
+
+class ManagedLaunchAdmitRequest(BaseModel):
+    protocol_version: ProtocolVersion
+    delivery_id: str
+    message: str = Field(min_length=1)
+    message_sha256: str
+    sender_id: str = Field(pattern=r"^[a-f0-9]{8}$")
+    orchestration_type: Literal["assign", "handoff"]
+
+    @field_validator("delivery_id")
+    @classmethod
+    def _validate_delivery_id(cls, value: str) -> str:
+        return _uuid_text(value, "delivery_id")
+
+    @field_validator("message_sha256")
+    @classmethod
+    def _validate_digest(cls, value: str) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError("message_sha256 must be 64 lowercase hex characters")
+        return value
+
+
+class ManagedLaunchObservationRequest(BaseModel):
+    protocol_version: ProtocolVersion
+    observation_id: str
+    kind: Literal["preflight", "negative", "cancelled"]
+    terminal_id: str = Field(pattern=r"^[a-f0-9]{8}$")
+    generation: str
+    provider: str = Field(min_length=1)
+    agent_profile: str = Field(min_length=1)
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    preflight_class: Optional[str] = None
+    evidence_digest: str
+    detail: Optional[str] = None
+
+    @field_validator("observation_id")
+    @classmethod
+    def _validate_observation_id(cls, value: str) -> str:
+        return _uuid_text(value, "observation_id")
+
+    @field_validator("generation")
+    @classmethod
+    def _validate_generation(cls, value: str) -> str:
+        return _uuid_text(value, "generation")
+
+    @field_validator("evidence_digest")
+    @classmethod
+    def _validate_evidence_digest(cls, value: str) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError("evidence_digest must be 64 lowercase hex characters")
+        return value

@@ -159,6 +159,11 @@ async def create_terminal(
     defer_init: bool = False,
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    reserved_terminal_id: Optional[str] = None,
+    trusted_project_root: Optional[str] = None,
+    expected_model: Optional[str] = None,
+    expected_effort: Optional[str] = None,
+    preserve_on_init_failure: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -237,8 +242,17 @@ async def create_terminal(
     # already existed — see the `except` block.
     window_created = False
     try:
-        # Step 1: Generate unique identifiers
-        terminal_id = generate_terminal_id()
+        # Step 1: Generate unique identifiers.  Managed launches allocate the
+        # terminal id durably before provider I/O and pass it back here; the
+        # ordinary path retains its existing local allocation.
+        if reserved_terminal_id is None:
+            terminal_id = generate_terminal_id()
+        else:
+            terminal_id = reserved_terminal_id
+        if reserved_terminal_id is not None and not re.fullmatch(r"[a-f0-9]{8}", terminal_id):
+            raise ValueError("reserved_terminal_id must be exactly 8 lowercase hex characters")
+        if trusted_project_root is not None and provider != ProviderType.CODEX.value:
+            raise ValueError("trusted_project_root is supported only by the Codex provider")
 
         if not session_name:
             session_name = generate_session_name()
@@ -378,6 +392,9 @@ async def create_terminal(
             allowed_tools,
             skill_prompt=skill_prompt,
             model=profile.model if profile else None,
+            trusted_project_root=trusted_project_root,
+            expected_model=expected_model,
+            expected_effort=expected_effort,
         )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
@@ -454,6 +471,30 @@ async def create_terminal(
     except Exception as e:
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+        # A managed no-task launch deliberately preserves a generation once
+        # its durable terminal row exists.  The reservation service records the
+        # structured preflight/negative evidence and owns later reconciliation;
+        # deleting here would turn response loss into an unfindable generation.
+        if preserve_on_init_failure:
+            try:
+                persisted_terminal = get_terminal_metadata(terminal_id)
+            except Exception:
+                # Metadata lookup itself failed.  Fail closed by leaving any
+                # resources untouched; the reservation remains queryable and
+                # explicit recovery must reconcile it.
+                logger.warning(
+                    "Could not prove whether managed terminal %s was persisted; "
+                    "preserving resources for reconciliation",
+                    terminal_id,
+                    exc_info=True,
+                )
+                raise e
+            if persisted_terminal is not None:
+                logger.warning(
+                    "Preserving managed terminal %s after initialization failure",
+                    terminal_id,
+                )
+                raise
         try:
             fifo_manager.stop_reader(terminal_id)
         except Exception:
@@ -1369,7 +1410,9 @@ def reattach_existing_output_pipelines() -> dict:
         except Exception:
             logger.warning("could not re-attach output pipeline for %s", terminal_id, exc_info=True)
             skipped.append(terminal_id)
-    logger.info("Re-attached output pipelines: %d re-attached, %d skipped", len(reattached), len(skipped))
+    logger.info(
+        "Re-attached output pipelines: %d re-attached, %d skipped", len(reattached), len(skipped)
+    )
     return {"reattached": reattached, "skipped": skipped}
 
 

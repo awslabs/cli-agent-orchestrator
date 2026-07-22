@@ -36,6 +36,9 @@ class ProviderManager:
         allowed_tools: Optional[List[str]] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        trusted_project_root: Optional[str] = None,
+        expected_model: Optional[str] = None,
+        expected_effort: Optional[str] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
@@ -67,6 +70,9 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     skill_prompt=skill_prompt,
+                    trusted_project_root=trusted_project_root,
+                    expected_model=expected_model,
+                    expected_effort=expected_effort,
                 )
             elif provider_type == ProviderType.COPILOT_CLI.value:
                 provider = CopilotCliProvider(
@@ -85,6 +91,8 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     skill_prompt=skill_prompt,
+                    expected_model=expected_model,
+                    expected_effort=expected_effort,
                 )
             elif provider_type == ProviderType.OPENCODE_CLI.value:
                 provider = OpenCodeCliProvider(

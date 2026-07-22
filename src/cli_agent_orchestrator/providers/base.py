@@ -33,6 +33,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class ProviderPreflightBlocked(RuntimeError):
+    """Provider startup reached a state where task input is not admissible.
+
+    Managed launches preserve the exact terminal generation when this is
+    raised.  The exception is deliberately structured so the server can emit
+    an append-only preflight observation without parsing prose or terminal
+    output in the conductor.
+    """
+
+    def __init__(self, preflight_class: str, message: str, *, evidence: Any = None):
+        super().__init__(message)
+        self.preflight_class = preflight_class
+        self.evidence = evidence
+
+
 class BaseProvider(ABC):
     """Abstract base class for CLI tool providers.
 

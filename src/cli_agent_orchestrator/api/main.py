@@ -72,6 +72,14 @@ from cli_agent_orchestrator.graph.providers import get_provider
 from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.managed_launch import (
+    PROTOCOL_VERSION as MANAGED_LAUNCH_PROTOCOL_VERSION,
+)
+from cli_agent_orchestrator.models.managed_launch import (
+    ManagedLaunchAdmitRequest,
+    ManagedLaunchObservationRequest,
+    ManagedLaunchReserveRequest,
+)
 from cli_agent_orchestrator.models.memory import (
     MemoryKey,
     MemoryScope,
@@ -93,6 +101,7 @@ from cli_agent_orchestrator.security.auth import (
 )
 from cli_agent_orchestrator.services import (
     flow_service,
+    managed_launch,
     secret_gate,
     session_service,
     terminal_service,
@@ -1482,6 +1491,144 @@ async def delete_session(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete session: {str(e)}",
         )
+
+
+def _managed_launch_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, managed_launch.ManagedLaunchNotFound):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if isinstance(exc, managed_launch.ManagedLaunchConflict):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+
+
+@app.get("/managed-launch/capabilities")
+async def managed_launch_capabilities(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Return the exact versioned companion surface; absence means fail closed."""
+    return {
+        "protocol_version": MANAGED_LAUNCH_PROTOCOL_VERSION,
+        "reservation_query": True,
+        "reservation_reconcile": True,
+        "no_task_launch": True,
+        "generation_bound_readiness": True,
+        "idempotent_task_admission": True,
+        "generation_bound_negative": True,
+        "generation_bound_cancel": True,
+        "trusted_project_root_providers": ["codex"],
+        "readiness_providers": ["codex", "kimi_cli"],
+    }
+
+
+@app.post("/managed-launch/reservations", status_code=status.HTTP_201_CREATED)
+async def reserve_managed_launch(
+    body: ManagedLaunchReserveRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        record, created = await asyncio.to_thread(managed_launch.reserve, body)
+        return {"created": created, **record}
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.get("/managed-launch/reservations/{reservation_id}")
+async def get_managed_launch(
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(managed_launch.get, reservation_id)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/reconcile")
+async def reconcile_managed_launch(
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(managed_launch.reconcile, reservation_id)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/launch")
+async def launch_managed_generation(
+    request: Request,
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await managed_launch.launch_reserved(
+            reservation_id, registry=get_plugin_registry(request)
+        )
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/observations")
+async def append_managed_launch_observation(
+    reservation_id: str,
+    body: ManagedLaunchObservationRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(managed_launch.append_observation, reservation_id, body)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+async def _append_managed_terminal_evidence(
+    reservation_id: str,
+    body: ManagedLaunchObservationRequest,
+    expected_kind: str,
+) -> Dict[str, Any]:
+    if body.kind != expected_kind:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"endpoint requires kind={expected_kind}",
+        )
+    try:
+        return await asyncio.to_thread(managed_launch.append_observation, reservation_id, body)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/negative")
+async def record_managed_launch_negative(
+    reservation_id: str,
+    body: ManagedLaunchObservationRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Record generation-bound proof that task delivery never started."""
+    return await _append_managed_terminal_evidence(reservation_id, body, "negative")
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/cancel")
+async def cancel_managed_launch(
+    reservation_id: str,
+    body: ManagedLaunchObservationRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Cancel a pre-admission generation by immutable reservation identity."""
+    return await _append_managed_terminal_evidence(reservation_id, body, "cancelled")
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/admit")
+async def admit_managed_task(
+    request: Request,
+    reservation_id: str,
+    body: ManagedLaunchAdmitRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await managed_launch.admit_reserved(
+            reservation_id, body, registry=get_plugin_registry(request)
+        )
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
 
 
 @app.post(
