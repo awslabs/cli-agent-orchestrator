@@ -4,6 +4,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 from cli_agent_orchestrator.services.session_service import (
     create_session,
     delete_session,
@@ -54,19 +55,39 @@ class TestCreateSession:
 class TestListSessions:
     """Tests for list_sessions function."""
 
+    class _FakeTmuxClient:
+        def __init__(self, sessions, working_directories):
+            self._sessions = sessions
+            self._working_directories = working_directories
+            self.cwd_calls = []
+
+        def list_sessions(self):
+            return self._sessions
+
+        def get_pane_working_directory(self, session_name, window_name):
+            self.cwd_calls.append((session_name, window_name))
+            value = self._working_directories[(session_name, window_name)]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_list_sessions_success(self, mock_get_backend):
+    def test_list_sessions_success(self, mock_get_backend, mock_list_terminals):
         """Test listing sessions successfully."""
         mock_get_backend.return_value.list_sessions.return_value = [
             {"id": "cao-session1", "name": "Session 1"},
             {"id": "cao-session2", "name": "Session 2"},
             {"id": "other-session", "name": "Other"},
         ]
+        mock_list_terminals.return_value = []
 
         result = list_sessions()
 
         assert len(result) == 2
         assert all(s["id"].startswith("cao-") for s in result)
+        assert all("working_directory" in s for s in result)
+        assert all("agent_profile" in s for s in result)
 
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_empty(self, mock_get_backend):
@@ -77,8 +98,9 @@ class TestListSessions:
 
         assert result == []
 
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_list_sessions_no_cao_sessions(self, mock_get_backend):
+    def test_list_sessions_no_cao_sessions(self, mock_get_backend, mock_list_terminals):
         """Test listing sessions when no CAO sessions exist."""
         mock_get_backend.return_value.list_sessions.return_value = [
             {"id": "other-session1", "name": "Other 1"},
@@ -88,6 +110,7 @@ class TestListSessions:
         result = list_sessions()
 
         assert result == []
+        mock_list_terminals.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_error(self, mock_get_backend):
@@ -97,6 +120,95 @@ class TestListSessions:
         result = list_sessions()
 
         assert result == []
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_prefers_persisted_working_directory(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        """Launch-time cwd from terminal metadata is the preferred ownership signal."""
+        fake_client = self._FakeTmuxClient(
+            [{"id": "cao-owned", "name": "cao-owned", "status": "detached"}],
+            {("cao-owned", "developer-abcd"): AssertionError("pane cwd should not be used")},
+        )
+        mock_get_backend.return_value = TmuxBackend(client=fake_client)
+        mock_list_terminals.return_value = [
+            {
+                "id": "term1",
+                "tmux_session": "cao-owned",
+                "tmux_window": "developer-abcd",
+                "agent_profile": "developer",
+                "working_directory": "/launch/project",
+            }
+        ]
+
+        result = list_sessions()
+
+        assert result == [
+            {
+                "id": "cao-owned",
+                "name": "cao-owned",
+                "status": "detached",
+                "agent_profile": "developer",
+                "working_directory": "/launch/project",
+            }
+        ]
+        assert fake_client.cwd_calls == []
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_falls_back_to_pane_working_directory(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        """When no launch cwd is stored, list_sessions resolves the pane cwd."""
+        fake_client = self._FakeTmuxClient(
+            [{"id": "cao-owned", "name": "cao-owned", "status": "detached"}],
+            {("cao-owned", "developer-abcd"): "/pane/project"},
+        )
+        mock_get_backend.return_value = TmuxBackend(client=fake_client)
+        mock_list_terminals.return_value = [
+            {
+                "id": "term1",
+                "tmux_session": "cao-owned",
+                "tmux_window": "developer-abcd",
+                "agent_profile": "developer",
+                "working_directory": None,
+            }
+        ]
+
+        result = list_sessions()
+
+        assert result[0]["working_directory"] == "/pane/project"
+        assert result[0]["agent_profile"] == "developer"
+        assert fake_client.cwd_calls == [("cao-owned", "developer-abcd")]
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_keeps_session_when_working_directory_unresolvable(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        """A cwd resolution failure affects only that field, not the session list."""
+        fake_client = self._FakeTmuxClient(
+            [{"id": "cao-owned", "name": "cao-owned", "status": "detached"}],
+            {("cao-owned", "developer-abcd"): RuntimeError("pane unavailable")},
+        )
+        mock_get_backend.return_value = TmuxBackend(client=fake_client)
+        mock_list_terminals.return_value = [
+            {
+                "id": "term1",
+                "tmux_session": "cao-owned",
+                "tmux_window": "developer-abcd",
+                "agent_profile": "developer",
+                "working_directory": None,
+            }
+        ]
+
+        result = list_sessions()
+
+        assert len(result) == 1
+        assert result[0]["id"] == "cao-owned"
+        assert result[0]["working_directory"] is None
+        assert result[0]["agent_profile"] == "developer"
 
 
 class TestGetSession:
