@@ -104,6 +104,13 @@ class OpenCodeCliProvider(BaseProvider):
         return 1
 
     @property
+    def paste_submit_delay(self) -> float:
+        """OpenCode's Ink-based input widget can swallow an Enter sent too soon after
+        the bracketed-paste end marker. 1.0s (matching kiro_cli) is conservative and
+        avoids the deferred-init "never started processing" race (see #479)."""
+        return 1.0
+
+    @property
     def extraction_tail_lines(self) -> int:
         """Capture extra scrollback for extraction (belt-and-braces).
 
