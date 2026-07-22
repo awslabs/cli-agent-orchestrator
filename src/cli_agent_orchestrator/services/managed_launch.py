@@ -12,6 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import sys
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -28,6 +30,7 @@ from cli_agent_orchestrator.models.managed_launch import (
     ManagedLaunchRouteAttestRequest,
 )
 from cli_agent_orchestrator.utils.terminal import generate_terminal_id
+from cli_agent_orchestrator.utils.terminal import managed_window_name
 
 
 class ManagedLaunchError(RuntimeError):
@@ -114,6 +117,82 @@ def _assert_bound_evidence(row: Any, evidence: dict[str, Any]) -> None:
         raise ManagedLaunchConflict(
             f"evidence identity does not match reservation: {_canonical_json(mismatches)}"
         )
+
+
+def _validate_native_receipt(
+    row: Any,
+    receipt: dict[str, Any],
+    *,
+    admission: Optional[dict[str, Any]] = None,
+) -> None:
+    """Accept only exact-session, opaque provider receipt identities."""
+    from cli_agent_orchestrator.services.managed_provider_bridge import BRIDGE_VERSION
+
+    _assert_bound_evidence(row, receipt)
+    request = _parse_json(row.request_json, {})
+    expected = {
+        "bridge_version": BRIDGE_VERSION,
+        "reservation_id": row.reservation_id,
+        "terminal_id": row.terminal_id,
+        "generation": row.generation,
+        "provider": row.provider,
+        "agent_profile": row.agent_profile,
+        "model": request.get("expected_model"),
+        "effort": request.get("expected_effort"),
+        "working_directory": row.working_directory,
+    }
+    if admission is not None:
+        expected.update(
+            {
+                "delivery_id": admission["delivery_id"],
+                "receiver_id": row.terminal_id,
+                "message_sha256": admission["message_sha256"],
+                "sender_id": admission["sender_id"],
+                "context": admission["context"],
+                "provider_accepted": True,
+            }
+        )
+    mismatches = {
+        key: {"expected": value, "observed": receipt.get(key)}
+        for key, value in expected.items()
+        if receipt.get(key) != value
+    }
+    required_strings = {
+        "receipt_id",
+        "provider_session_id",
+        "provider_receipt_kind",
+        "provider_transcript_sha256",
+    }
+    if admission is not None:
+        required_strings.update({"provider_turn_id", "submitted_at"})
+    missing = sorted(
+        key for key in required_strings if not isinstance(receipt.get(key), str) or not receipt[key]
+    )
+    transcript = receipt.get("provider_transcript_sha256")
+    if isinstance(transcript, str) and (
+        len(transcript) != 64 or any(ch not in "0123456789abcdef" for ch in transcript)
+    ):
+        missing.append("provider_transcript_sha256")
+    if mismatches or missing:
+        raise ManagedLaunchConflict(
+            "provider-native receipt is not bound to the exact reservation: "
+            + _canonical_json({"mismatches": mismatches, "invalid": sorted(set(missing))})
+        )
+
+
+def _executable_identity(name: str) -> tuple[str, str]:
+    resolved = shutil.which(name)
+    if not resolved:
+        raise ManagedLaunchConflict(f"provider executable is unavailable: {name}")
+    canonical = os.path.realpath(resolved)
+    if not os.path.isfile(canonical) or not os.access(canonical, os.X_OK):
+        raise ManagedLaunchConflict(f"provider executable is not executable: {canonical}")
+    try:
+        with open(canonical, "rb") as provider_file:
+            digest = hashlib.sha256(provider_file.read()).hexdigest()
+    except OSError as exc:
+        raise ManagedLaunchConflict(f"provider executable is unreadable: {exc}") from exc
+    return canonical, digest
 
 
 def _validate_request_identity(request: ManagedLaunchReserveRequest) -> dict[str, Any]:
@@ -270,7 +349,7 @@ def mark_ready(
                 raise ManagedLaunchNotFound(f"reservation not found: {reservation_id}")
             if row.terminal_id != terminal_id or row.generation != generation:
                 raise ManagedLaunchConflict("readiness identity does not match the reservation")
-            _assert_bound_evidence(row, receipt)
+            _validate_native_receipt(row, receipt)
             if row.state == "ready":
                 if _parse_json(row.readiness_json, None) != receipt:
                     raise ManagedLaunchConflict("readiness receipt changed after attestation")
@@ -438,9 +517,54 @@ def append_observation(
         raise ManagedLaunchUnavailable(f"observation persistence failed: {exc}") from exc
 
 
+def _adopt_durable_provider_fact(record: dict[str, Any]) -> dict[str, Any]:
+    """Persist an exact-generation provider fact after a lost CAO response.
+
+    This recovery path is deliberately read-only at the provider boundary: it
+    may adopt an already durable readiness/submission receipt, but it never
+    launches a provider, sends task bytes, or deletes a terminal.
+    """
+    from cli_agent_orchestrator.services.managed_provider_bridge import read_state
+
+    if record["state"] not in {"launching", "admitting"}:
+        return record
+    state = read_state(record["reservation_id"])
+    if not state:
+        return record
+
+    if record["state"] == "launching":
+        receipt = state.get("readiness")
+        if state.get("state") == "ready" and isinstance(receipt, dict):
+            return mark_ready(
+                record["reservation_id"],
+                terminal_id=record["terminal_id"],
+                generation=record["generation"],
+                receipt=receipt,
+            )
+        if state.get("state") == "preflight_blocked":
+            return mark_preflight_blocked(
+                record["reservation_id"],
+                preflight_class="provider-native-readiness",
+                detail=str(state.get("error") or "provider bridge blocked before readiness"),
+                evidence=state,
+            )
+        if state.get("state") == "admitted":
+            raise ManagedLaunchConflict(
+                "provider bridge admitted input before the fork recorded an admission claim"
+            )
+        return record
+
+    receipt = state.get("submission")
+    admission = record.get("admission") or {}
+    delivery_id = admission.get("delivery_id")
+    if state.get("state") == "admitted" and isinstance(receipt, dict) and delivery_id:
+        return complete_admission(record["reservation_id"], delivery_id, receipt)
+    return record
+
+
 def reconcile(reservation_id: str) -> dict[str, Any]:
-    """Return recovery facts without relaunching, sending, or deleting anything."""
-    record = get(reservation_id)
+    """Adopt durable facts without relaunching, sending, or deleting anything."""
+    record = _adopt_durable_provider_fact(get(reservation_id))
     try:
         with database.SessionLocal() as db:
             terminal_present = (
@@ -520,7 +644,11 @@ def claim_admission(
         raise ManagedLaunchUnavailable(f"task admission claim failed: {exc}") from exc
 
 
-def complete_admission(reservation_id: str, delivery_id: str) -> dict[str, Any]:
+def complete_admission(
+    reservation_id: str,
+    delivery_id: str,
+    provider_receipt: dict[str, Any],
+) -> dict[str, Any]:
     try:
         with database.SessionLocal() as db:
             row = _query(db, reservation_id)
@@ -530,27 +658,16 @@ def complete_admission(reservation_id: str, delivery_id: str) -> dict[str, Any]:
             if not admission or admission.get("delivery_id") != delivery_id:
                 raise ManagedLaunchConflict("delivery_id does not match the admission claim")
             if admission.get("status") == "admitted":
+                if admission.get("provider_submission_receipt") != provider_receipt:
+                    raise ManagedLaunchConflict(
+                        "provider submission receipt changed after admission"
+                    )
                 return _row_dict(row)
             if row.state != "admitting" or admission.get("status") != "io-attempted":
                 raise ManagedLaunchConflict(f"admission cannot complete from state {row.state!r}")
-            request = _parse_json(row.request_json, {})
+            _validate_native_receipt(row, provider_receipt, admission=admission)
             admitted_at = _now()
-            admission["provider_submission_receipt"] = {
-                "receipt_id": str(uuid.uuid4()),
-                "reservation_id": reservation_id,
-                "delivery_id": delivery_id,
-                "terminal_id": row.terminal_id,
-                "receiver_id": row.terminal_id,
-                "generation": row.generation,
-                "provider": row.provider,
-                "agent_profile": row.agent_profile,
-                "model": request.get("expected_model"),
-                "effort": request.get("expected_effort"),
-                "message_sha256": admission["message_sha256"],
-                "sender_id": admission["sender_id"],
-                "context": admission["context"],
-                "submitted_at": admitted_at,
-            }
+            admission["provider_submission_receipt"] = provider_receipt
             admission["status"] = "admitted"
             admission["admitted_at"] = admitted_at
             row.admission_json = _canonical_json(admission)
@@ -695,14 +812,65 @@ def cleanup_reserved(
                 raise ManagedLaunchConflict(
                     f"cleanup requires terminal negative evidence, not state {row.state!r}"
                 )
-            if row.state != "cleanup_intended":
-                row.state = "cleanup_intended"
-                row.updated_at = _now()
-                db.commit()
+            expected_window = managed_window_name(row.terminal_id, row.generation)
+            intent = next(
+                (
+                    item
+                    for item in observations
+                    if item.get("kind") == "cleanup-intent"
+                    and item.get("cleanup_id") == request.cleanup_id
+                ),
+                None,
+            )
+            expected_intent = {
+                "cleanup_id": request.cleanup_id,
+                "reservation_id": reservation_id,
+                "terminal_id": row.terminal_id,
+                "generation": row.generation,
+                "session_name": row.session_name,
+                "window_name": expected_window,
+            }
+            if intent is not None:
+                observed_intent = {key: intent.get(key) for key in expected_intent}
+                if observed_intent != expected_intent:
+                    raise ManagedLaunchConflict("cleanup intent changed after it was persisted")
+            else:
+                terminal = (
+                    db.query(database.TerminalModel)
+                    .filter(database.TerminalModel.id == request.terminal_id)
+                    .first()
+                )
+                if terminal is not None and (
+                    terminal.generation != request.generation
+                    or terminal.tmux_session != row.session_name
+                    or terminal.tmux_window != expected_window
+                ):
+                    raise ManagedLaunchConflict(
+                        "cleanup target is not the reserved terminal incarnation"
+                    )
+                intent = {
+                    "kind": "cleanup-intent",
+                    **expected_intent,
+                    "intended_at": _now(),
+                }
+                observations.append(intent)
+                row.observations_json = _canonical_json(observations)
+            row.state = "cleanup_intended"
+            row.updated_at = _now()
+            db.commit()
 
         # delete_terminal is idempotent for a missing DB record. It also owns
         # provider and tmux cleanup for this exact reserved terminal id.
-        terminal_service.delete_terminal(request.terminal_id, registry=registry)
+        deleted = terminal_service.delete_terminal(
+            request.terminal_id,
+            registry=registry,
+            expected_generation=request.generation,
+            expected_session=expected_intent["session_name"],
+        )
+        if not deleted:
+            raise ManagedLaunchUnavailable(
+                "exact terminal cleanup returned without a no-survivor proof"
+            )
 
         with database.SessionLocal() as db:
             row = _query(db, reservation_id)
@@ -716,6 +884,12 @@ def cleanup_reserved(
             )
             if terminal_present:
                 raise ManagedLaunchUnavailable("exact terminal still exists after cleanup")
+            from cli_agent_orchestrator.backends.registry import get_backend
+
+            if get_backend().window_exists(
+                expected_intent["session_name"], expected_intent["window_name"]
+            ):
+                raise ManagedLaunchUnavailable("exact terminal window still exists after cleanup")
             observations = _parse_json(row.observations_json, [])
             existing = next(
                 (
@@ -734,6 +908,7 @@ def cleanup_reserved(
                     "terminal_id": row.terminal_id,
                     "generation": row.generation,
                     "terminal_record_present": False,
+                    "terminal_window_present": False,
                     "cleaned_at": _now(),
                 }
                 observations.append(existing)
@@ -758,20 +933,18 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
     """
     import asyncio
 
-    from cli_agent_orchestrator.providers.base import ProviderPreflightBlocked
     from cli_agent_orchestrator.services import terminal_service
-    from cli_agent_orchestrator.services.codex_trust import (
-        CodexTrustProbeError,
-        attest_trusted_project,
-    )
-    from cli_agent_orchestrator.services.kimi_route import (
-        KimiRouteProbeError,
-        attest_kimi_route,
+    from cli_agent_orchestrator.services.managed_provider_bridge import (
+        BRIDGE_VERSION,
+        profile_digest,
+        read_state,
+        request_bridge,
+        write_request,
     )
 
     record, should_launch = claim_launch(reservation_id)
     if not should_launch:
-        return record
+        return _adopt_durable_provider_fact(record)
     request = record["request"]
     if record["provider"] not in {"codex", "kimi_cli"}:
         return mark_preflight_blocked(
@@ -780,38 +953,33 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             detail="managed-launch v1 has no authoritative readiness adapter for this provider",
         )
 
-    route_receipt: dict[str, Any]
-    if record["provider"] == "codex":
-        try:
-            route_receipt = await asyncio.to_thread(
-                attest_trusted_project,
-                record["trusted_project_root"],
-                expected_model=request["expected_model"],
-                expected_effort=request["expected_effort"],
-            )
-        except CodexTrustProbeError as exc:
-            return mark_preflight_blocked(
-                reservation_id,
-                preflight_class="trust-preauthorization",
-                detail=str(exc),
-            )
-    else:
-        try:
-            route_receipt = await asyncio.to_thread(
-                attest_kimi_route,
-                record["working_directory"],
-                expected_model=request["expected_model"],
-                expected_effort=request["expected_effort"],
-            )
-        except KimiRouteProbeError as exc:
-            return mark_preflight_blocked(
-                reservation_id,
-                preflight_class="provider-route-attestation",
-                detail=str(exc),
-            )
+    executable_name = "codex" if record["provider"] == "codex" else "kimi"
+    try:
+        provider_executable, provider_digest = _executable_identity(executable_name)
+        bridge_request = {
+            "bridge_version": BRIDGE_VERSION,
+            "reservation_id": reservation_id,
+            "terminal_id": record["terminal_id"],
+            "generation": record["generation"],
+            "provider": record["provider"],
+            "agent_profile": record["agent_profile"],
+            "profile_sha256": profile_digest(record["agent_profile"]),
+            "model": request["expected_model"],
+            "effort": request["expected_effort"],
+            "working_directory": record["working_directory"],
+            "provider_executable": provider_executable,
+            "provider_executable_sha256": provider_digest,
+        }
+        write_request(reservation_id, bridge_request)
+    except Exception as exc:  # noqa: BLE001 - no provider I/O occurred
+        return mark_preflight_blocked(
+            reservation_id,
+            preflight_class="provider-native-preparation",
+            detail=str(exc),
+        )
 
     try:
-        terminal = await terminal_service.create_terminal(
+        await terminal_service.create_terminal(
             provider=record["provider"],
             agent_profile=record["agent_profile"],
             session_name=record["session_name"],
@@ -822,17 +990,19 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             defer_init=False,
             initial_message=None,
             reserved_terminal_id=record["terminal_id"],
+            terminal_generation=record["generation"],
             trusted_project_root=record["trusted_project_root"],
             expected_model=request["expected_model"],
             expected_effort=request["expected_effort"],
             preserve_on_init_failure=True,
-        )
-    except ProviderPreflightBlocked as exc:
-        return mark_preflight_blocked(
-            reservation_id,
-            preflight_class=exc.preflight_class,
-            detail=str(exc),
-            evidence=exc.evidence,
+            managed_native_command=[
+                os.path.abspath(sys.executable),
+                "-I",
+                "-m",
+                "cli_agent_orchestrator.services.managed_provider_bridge",
+                "--reservation-id",
+                reservation_id,
+            ],
         )
     except Exception as exc:  # noqa: BLE001 - preserve and expose, never cleanup/retry
         return mark_preflight_blocked(
@@ -841,21 +1011,37 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             detail=str(exc),
         )
 
-    receipt = {
-        "receipt_id": str(uuid.uuid4()),
-        "reservation_id": reservation_id,
-        "terminal_id": record["terminal_id"],
-        "generation": record["generation"],
-        "provider": record["provider"],
-        "agent_profile": record["agent_profile"],
-        "model": route_receipt.get("model"),
-        "effort": route_receipt.get("reasoning_effort"),
-        "working_directory": record["working_directory"],
-        "provider_initialized": True,
-        "terminal_status": terminal.status,
-        "provider_route_receipt": route_receipt,
-        "attested_at": _now(),
-    }
+    try:
+        status = await asyncio.to_thread(
+            request_bridge,
+            reservation_id,
+            {"op": "status"},
+            timeout=120.0,
+        )
+    except Exception as exc:  # noqa: BLE001 - query durable state before classifying
+        try:
+            state = read_state(reservation_id)
+        except Exception as state_exc:  # noqa: BLE001 - preserve both failures
+            state = None
+            exc = ManagedLaunchUnavailable(f"{exc}; durable bridge state unreadable: {state_exc}")
+        if state and state.get("state") == "preflight_blocked":
+            detail = str(state.get("error") or exc)
+        else:
+            detail = f"exact provider readiness was not established: {exc}"
+        return mark_preflight_blocked(
+            reservation_id,
+            preflight_class="provider-native-readiness",
+            detail=detail,
+            evidence=state,
+        )
+    receipt = status.get("readiness")
+    if status.get("state") != "ready" or not isinstance(receipt, dict):
+        return mark_preflight_blocked(
+            reservation_id,
+            preflight_class="provider-native-readiness",
+            detail="exact provider session did not return a readiness receipt",
+            evidence=status,
+        )
     return mark_ready(
         reservation_id,
         terminal_id=record["terminal_id"],
@@ -873,21 +1059,53 @@ async def admit_reserved(
     """Admit one task after readiness, with no blind retry on ambiguity."""
     import asyncio
 
-    from cli_agent_orchestrator.models.inbox import OrchestrationType
-    from cli_agent_orchestrator.services import terminal_service
+    from cli_agent_orchestrator.services.managed_provider_bridge import (
+        read_state,
+        request_bridge,
+    )
 
     record, should_send = claim_admission(reservation_id, request)
     if not should_send:
+        if record["state"] == "admitting":
+            state = read_state(reservation_id)
+            receipt = state.get("submission") if state else None
+            if isinstance(receipt, dict):
+                return complete_admission(reservation_id, request.delivery_id, receipt)
         return record
+    command = {
+        "op": "admit",
+        "reservation_id": reservation_id,
+        "terminal_id": record["terminal_id"],
+        "generation": record["generation"],
+        "delivery_id": request.delivery_id,
+        "message": request.message,
+        "message_sha256": request.message_sha256,
+        "sender_id": request.sender_id,
+        "orchestration_type": request.orchestration_type,
+        "context": request.context.model_dump(mode="json"),
+    }
     try:
-        await asyncio.to_thread(
-            terminal_service.send_input,
-            record["terminal_id"],
-            request.message,
-            registry=registry,
-            sender_id=request.sender_id,
-            orchestration_type=OrchestrationType(request.orchestration_type),
+        response = await asyncio.to_thread(
+            request_bridge,
+            reservation_id,
+            command,
+            timeout=120.0,
         )
     except Exception as exc:  # noqa: BLE001 - delivery may have crossed the boundary
+        try:
+            state = read_state(reservation_id)
+        except Exception as state_exc:  # noqa: BLE001 - ambiguity must remain durable
+            state = None
+            exc = ManagedLaunchUnavailable(f"{exc}; durable bridge state unreadable: {state_exc}")
+        receipt = state.get("submission") if state else None
+        if isinstance(receipt, dict):
+            return complete_admission(reservation_id, request.delivery_id, receipt)
         return mark_admission_ambiguous(reservation_id, request.delivery_id, str(exc))
-    return complete_admission(reservation_id, request.delivery_id)
+    receipt = response.get("receipt")
+    if not isinstance(receipt, dict):
+        return mark_admission_ambiguous(
+            reservation_id,
+            request.delivery_id,
+            "provider bridge returned no structured submission receipt",
+        )
+    return complete_admission(reservation_id, request.delivery_id, receipt)

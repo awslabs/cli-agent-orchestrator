@@ -533,6 +533,13 @@ class TmuxClient:
             logger.error(f"Failed to kill window {session_name}:{window_name}: {e}")
             return False
 
+    def window_exists(self, session_name: str, window_name: str) -> bool:
+        """Check the exact tmux window without swallowing lookup failures."""
+        session = self.server.sessions.get(session_name=session_name)
+        if not session:
+            return False
+        return session.windows.get(window_name=window_name) is not None
+
     def session_exists(self, session_name: str) -> bool:
         """Check if session exists."""
         try:

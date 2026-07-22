@@ -16,6 +16,7 @@ from cli_agent_orchestrator.models.managed_launch import (
     ManagedLaunchRouteAttestRequest,
 )
 from cli_agent_orchestrator.services import managed_launch
+from cli_agent_orchestrator.services.managed_provider_bridge import BRIDGE_VERSION
 
 
 def _reserve_request(tmp_path, **changes):
@@ -60,25 +61,61 @@ def _admit_request(message="review the exact head", **changes):
     return ManagedLaunchAdmitRequest(**payload)
 
 
-def _ready_record(request):
-    record, _ = managed_launch.reserve(request)
-    record, should_launch = managed_launch.claim_launch(request.reservation_id)
-    assert should_launch
-    receipt = {
-        "receipt_id": str(uuid.uuid4()),
+def _ready_receipt_for(record, request):
+    return {
+        "bridge_version": BRIDGE_VERSION,
+        "receipt_id": "provider-session-ready-opaque",
+        "provider_session_id": "provider-session-ready-opaque",
+        "provider_receipt_kind": "test-provider-session-start",
+        "provider_transcript_sha256": "a" * 64,
+        "reservation_id": request.reservation_id,
         "terminal_id": record["terminal_id"],
         "generation": record["generation"],
         "provider": record["provider"],
         "agent_profile": record["agent_profile"],
         "model": request.expected_model,
         "effort": request.expected_effort,
+        "working_directory": request.working_directory,
     }
+
+
+def _ready_record(request):
+    record, _ = managed_launch.reserve(request)
+    record, should_launch = managed_launch.claim_launch(request.reservation_id)
+    assert should_launch
+    receipt = _ready_receipt_for(record, request)
     return managed_launch.mark_ready(
         request.reservation_id,
         terminal_id=record["terminal_id"],
         generation=record["generation"],
         receipt=receipt,
     )
+
+
+def _submission_receipt(record, admission):
+    return {
+        "bridge_version": BRIDGE_VERSION,
+        "receipt_id": "provider-turn-opaque",
+        "provider_session_id": "provider-session-ready-opaque",
+        "provider_turn_id": "provider-turn-opaque",
+        "provider_receipt_kind": "test-provider-turn-start",
+        "provider_transcript_sha256": "b" * 64,
+        "reservation_id": record["reservation_id"],
+        "terminal_id": record["terminal_id"],
+        "generation": record["generation"],
+        "provider": record["provider"],
+        "agent_profile": record["agent_profile"],
+        "model": record["request"]["expected_model"],
+        "effort": record["request"]["expected_effort"],
+        "working_directory": record["working_directory"],
+        "delivery_id": admission.delivery_id,
+        "receiver_id": record["terminal_id"],
+        "message_sha256": admission.message_sha256,
+        "sender_id": admission.sender_id,
+        "context": admission.context.model_dump(mode="json"),
+        "provider_accepted": True,
+        "submitted_at": "2026-07-22T00:00:00Z",
+    }
 
 
 def test_reserve_is_idempotent_and_queryable(isolated_memory_db, tmp_path):
@@ -153,9 +190,12 @@ def test_admission_requires_readiness_and_is_idempotent(isolated_memory_db, tmp_
     assert should_send_again is False
     assert claimed["state"] == duplicate["state"] == "admitting"
 
-    completed = managed_launch.complete_admission(request.reservation_id, admission.delivery_id)
+    provider_receipt = _submission_receipt(claimed, admission)
+    completed = managed_launch.complete_admission(
+        request.reservation_id, admission.delivery_id, provider_receipt
+    )
     completed_again = managed_launch.complete_admission(
-        request.reservation_id, admission.delivery_id
+        request.reservation_id, admission.delivery_id, provider_receipt
     )
     assert completed["state"] == completed_again["state"] == "admitted"
     receipt = completed["admission"]["provider_submission_receipt"]
@@ -308,21 +348,83 @@ def test_reconcile_never_mutates_or_relaunches(isolated_memory_db, tmp_path):
     assert reconciled["generation"] == reserved["generation"]
 
 
+def test_reconcile_adopts_durable_readiness_without_provider_io(
+    isolated_memory_db, tmp_path, monkeypatch
+):
+    request = _reserve_request(tmp_path)
+    record, _ = managed_launch.reserve(request)
+    record, should_launch = managed_launch.claim_launch(request.reservation_id)
+    assert should_launch is True
+    receipt = _ready_receipt_for(record, request)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+        lambda _: {"state": "ready", "readiness": receipt},
+    )
+
+    reconciled = managed_launch.reconcile(request.reservation_id)
+
+    assert reconciled["state"] == "ready"
+    assert reconciled["readiness"] == receipt
+
+
+def test_reconcile_adopts_durable_submission_without_replay(
+    isolated_memory_db, tmp_path, monkeypatch
+):
+    request = _reserve_request(tmp_path)
+    _ready_record(request)
+    admission = _admit_request()
+    admitting, should_send = managed_launch.claim_admission(request.reservation_id, admission)
+    assert should_send is True
+    receipt = _submission_receipt(admitting, admission)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+        lambda _: {"state": "admitted", "submission": receipt},
+    )
+
+    reconciled = managed_launch.reconcile(request.reservation_id)
+
+    assert reconciled["state"] == "admitted"
+    assert reconciled["admission"]["provider_submission_receipt"] == receipt
+
+
+def test_reconcile_adopts_durable_preflight_block_without_relaunch(
+    isolated_memory_db, tmp_path, monkeypatch
+):
+    request = _reserve_request(tmp_path)
+    managed_launch.reserve(request)
+    managed_launch.claim_launch(request.reservation_id)
+    bridge_state = {
+        "state": "preflight_blocked",
+        "error": "provider initialization failed",
+    }
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+        lambda _: bridge_state,
+    )
+
+    reconciled = managed_launch.reconcile(request.reservation_id)
+
+    assert reconciled["state"] == "preflight_blocked"
+    assert reconciled["observations"][0]["evidence"] == bridge_state
+
+
 @pytest.mark.asyncio
-async def test_launch_reserved_attests_before_no_task_terminal_start(
+async def test_launch_reserved_uses_exact_provider_bridge_before_readiness(
     isolated_memory_db, tmp_path, monkeypatch
 ):
     request = _reserve_request(tmp_path)
     record, _ = managed_launch.reserve(request)
     calls = []
 
-    def fake_attest(root, *, expected_model, expected_effort):
-        calls.append(("attest", root, expected_model, expected_effort))
-        return {
-            "model": expected_model,
-            "reasoning_effort": expected_effort,
-            "project_root": root,
-        }
+    monkeypatch.setattr(managed_launch, "_executable_identity", lambda _: ("/provider", "d" * 64))
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.profile_digest",
+        lambda _: "e" * 64,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.write_request",
+        lambda reservation_id, body: calls.append(("write", reservation_id, body)),
+    )
 
     async def fake_create_terminal(**kwargs):
         calls.append(("create", kwargs))
@@ -331,11 +433,18 @@ async def test_launch_reserved_attests_before_no_task_terminal_start(
         assert kwargs["preserve_on_init_failure"] is True
         assert kwargs["expected_model"] == "gpt-5.6-sol"
         assert kwargs["expected_effort"] == "xhigh"
+        assert kwargs["managed_native_command"][0]
         return SimpleNamespace(status="idle")
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.codex_trust.attest_trusted_project",
-        fake_attest,
+        "cli_agent_orchestrator.services.managed_provider_bridge.request_bridge",
+        lambda reservation_id, body, timeout: {
+            "state": "ready",
+            "readiness": {
+                **_ready_receipt_for(record, request),
+                "provider_receipt_kind": "codex-thread-start",
+            },
+        },
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.create_terminal",
@@ -345,11 +454,11 @@ async def test_launch_reserved_attests_before_no_task_terminal_start(
     ready = await managed_launch.launch_reserved(request.reservation_id)
     duplicate = await managed_launch.launch_reserved(request.reservation_id)
     assert ready["state"] == duplicate["state"] == "ready"
-    assert [call[0] for call in calls] == ["attest", "create"]
+    assert [call[0] for call in calls] == ["write", "create"]
 
 
 @pytest.mark.asyncio
-async def test_kimi_launch_attests_provider_route_before_no_task_terminal_start(
+async def test_kimi_launch_uses_exact_provider_bridge_route(
     isolated_memory_db, tmp_path, monkeypatch
 ):
     request = _reserve_request(
@@ -363,14 +472,15 @@ async def test_kimi_launch_attests_provider_route_before_no_task_terminal_start(
     record, _ = managed_launch.reserve(request)
     calls = []
 
-    def fake_attest(root, *, expected_model, expected_effort):
-        calls.append(("attest", root, expected_model, expected_effort))
-        return {
-            "model": expected_model,
-            "reasoning_effort": expected_effort,
-            "project_root": root,
-            "no_prompt_sent": True,
-        }
+    monkeypatch.setattr(managed_launch, "_executable_identity", lambda _: ("/provider", "d" * 64))
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.profile_digest",
+        lambda _: "e" * 64,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.write_request",
+        lambda reservation_id, body: calls.append(("write", reservation_id, body)),
+    )
 
     async def fake_create_terminal(**kwargs):
         calls.append(("create", kwargs))
@@ -378,11 +488,18 @@ async def test_kimi_launch_attests_provider_route_before_no_task_terminal_start(
         assert kwargs["reserved_terminal_id"] == record["terminal_id"]
         assert kwargs["expected_model"] == "kimi-code/k3"
         assert kwargs["expected_effort"] == "max"
+        assert kwargs["managed_native_command"][0]
         return SimpleNamespace(status="idle")
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.kimi_route.attest_kimi_route",
-        fake_attest,
+        "cli_agent_orchestrator.services.managed_provider_bridge.request_bridge",
+        lambda reservation_id, body, timeout: {
+            "state": "ready",
+            "readiness": {
+                **_ready_receipt_for(record, request),
+                "provider_receipt_kind": "kimi-acp-session-new",
+            },
+        },
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.create_terminal",
@@ -393,7 +510,7 @@ async def test_kimi_launch_attests_provider_route_before_no_task_terminal_start(
     assert ready["state"] == "ready"
     assert ready["readiness"]["model"] == "kimi-code/k3"
     assert ready["readiness"]["effort"] == "max"
-    assert [call[0] for call in calls] == ["attest", "create"]
+    assert [call[0] for call in calls] == ["write", "create"]
 
 
 @pytest.mark.asyncio
@@ -410,8 +527,12 @@ async def test_send_failure_is_preserved_and_never_retried(
         raise RuntimeError("response lost")
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.terminal_service.send_input",
+        "cli_agent_orchestrator.services.managed_provider_bridge.request_bridge",
         fail_after_possible_send,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+        lambda _: None,
     )
     ambiguous = await managed_launch.admit_reserved(request.reservation_id, admission)
     duplicate = await managed_launch.admit_reserved(request.reservation_id, admission)
@@ -465,7 +586,14 @@ def test_cleanup_is_exact_idempotent_and_refuses_admitted_generation(
     calls = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.delete_terminal",
-        lambda terminal_id, registry=None: calls.append(terminal_id) or False,
+        lambda terminal_id, registry=None, expected_generation=None, expected_session=None: (
+            calls.append((terminal_id, expected_generation, expected_session)) or True
+        ),
+    )
+    backend = SimpleNamespace(window_exists=lambda session, window: False)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.backends.registry.get_backend",
+        lambda: backend,
     )
     cleanup = ManagedLaunchCleanupRequest(
         protocol_version=PROTOCOL_VERSION,
@@ -478,13 +606,17 @@ def test_cleanup_is_exact_idempotent_and_refuses_admitted_generation(
     second = managed_launch.cleanup_reserved(request.reservation_id, cleanup)
     assert first["state"] == second["state"] == "cleaned"
     assert first["cleanup"]["generation"] == record["generation"]
-    assert calls == [record["terminal_id"]]
+    assert calls == [(record["terminal_id"], record["generation"], record["session_name"])]
 
     admitted_request = _reserve_request(tmp_path)
     _ready_record(admitted_request)
     admission = _admit_request()
-    managed_launch.claim_admission(admitted_request.reservation_id, admission)
-    managed_launch.complete_admission(admitted_request.reservation_id, admission.delivery_id)
+    admitting, _ = managed_launch.claim_admission(admitted_request.reservation_id, admission)
+    managed_launch.complete_admission(
+        admitted_request.reservation_id,
+        admission.delivery_id,
+        _submission_receipt(admitting, admission),
+    )
     admitted = managed_launch.get(admitted_request.reservation_id)
     wrong = cleanup.model_copy(
         update={

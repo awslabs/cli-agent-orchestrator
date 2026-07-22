@@ -41,6 +41,10 @@ class TerminalModel(Base):
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
+    # Durable, non-reusable incarnation for managed-launch destructive
+    # operations. Legacy/operator terminals may be NULL; managed terminals
+    # always bind the reservation generation here before provider I/O.
+    generation = Column(Text, nullable=True, unique=True)
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -639,6 +643,14 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
             conn.commit()
             logger.info("Migration: added caller_id column to terminals table")
+        if "generation" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN generation TEXT")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_terminals_generation "
+                "ON terminals(generation) WHERE generation IS NOT NULL"
+            )
+            conn.commit()
+            logger.info("Migration: added generation column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -653,6 +665,7 @@ def create_terminal(
     allowed_tools: Optional[List[str]] = None,
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
+    generation: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -667,6 +680,7 @@ def create_terminal(
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
             caller_id=caller_id,
+            generation=generation,
         )
         db.add(terminal)
         db.commit()
@@ -679,6 +693,7 @@ def create_terminal(
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "generation": terminal.generation,
         }
 
 
@@ -704,6 +719,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "generation": terminal.generation,
             "last_active": terminal.last_active,
         }
 
@@ -816,6 +832,21 @@ def delete_terminal(terminal_id: str) -> bool:
         deleted = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
         db.commit()
         return deleted > 0
+
+
+def delete_terminal_if_generation(terminal_id: str, generation: str) -> bool:
+    """Atomically delete terminal metadata only for the exact incarnation."""
+    with SessionLocal() as db:
+        deleted = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.generation == generation,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return deleted == 1
 
 
 def delete_terminals_by_session(tmux_session: str) -> int:

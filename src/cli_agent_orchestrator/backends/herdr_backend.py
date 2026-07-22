@@ -235,7 +235,7 @@ class HerdrBackend(TerminalBackend):
                 self._workspace_cache[session_name] = (ws_id, time.time())
                 return ws_id
 
-        raise TerminalBackendError(f"Workspace with label '{session_name}' not found")
+        raise TerminalNotFoundError(session_name)
 
     # --- Session lifecycle ---
 
@@ -390,6 +390,14 @@ class HerdrBackend(TerminalBackend):
             logger.info(f"Killed herdr pane {pane_id} for {session_name}:{window_name}")
             return True
         return False
+
+    def window_exists(self, session_name: str, window_name: str) -> bool:
+        """Check the exact live tab/pane identity, preserving lookup errors."""
+        try:
+            self._resolve_pane_id_from_window(session_name, window_name)
+            return True
+        except TerminalNotFoundError:
+            return False
 
     # --- Input ---
 
@@ -825,9 +833,7 @@ class HerdrBackend(TerminalBackend):
             if tab.get("workspace_id") == workspace_id and tab.get("label") == window_name:
                 return str(tab["tab_id"])
 
-        raise TerminalBackendError(
-            f"No tab labeled '{window_name}' found in workspace '{session_name}'"
-        )
+        raise TerminalNotFoundError(f"{session_name}:{window_name}")
 
     def _resolve_pane_id_from_window(self, session_name: str, window_name: str) -> str:
         """Resolve a pane_id given session_name and window_name.
@@ -857,8 +863,12 @@ class HerdrBackend(TerminalBackend):
                 panes = data.get("panes", []) if isinstance(data, dict) else data
             except json.JSONDecodeError as e:
                 raise TerminalBackendError(f"Failed to parse herdr pane list: {e}") from e
+        except TerminalNotFoundError:
+            raise
         except TerminalBackendError as e:
-            raise TerminalNotFoundError(f"{session_name}:{window_name}") from e
+            raise TerminalBackendError(
+                f"Could not resolve pane for {session_name}:{window_name}: {e}"
+            ) from e
 
         for pane in panes:
             if pane.get("tab_id") == tab_id:

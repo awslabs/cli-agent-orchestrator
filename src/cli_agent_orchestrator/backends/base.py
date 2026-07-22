@@ -136,6 +136,11 @@ class TerminalBackend(ABC):
         """
         ...
 
+    @abstractmethod
+    def window_exists(self, session_name: str, window_name: str) -> bool:
+        """Return whether the exact window exists, raising on lookup failure."""
+        ...
+
     # --- Input ---
 
     @abstractmethod

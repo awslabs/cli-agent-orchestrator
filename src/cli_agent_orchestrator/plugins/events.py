@@ -68,6 +68,7 @@ class PostCreateTerminalEvent(CaoEvent):
 
     event_type: str = "post_create_terminal"
     terminal_id: str = ""
+    generation: str | None = None
     agent_name: str | None = None
     provider: str = ""
 

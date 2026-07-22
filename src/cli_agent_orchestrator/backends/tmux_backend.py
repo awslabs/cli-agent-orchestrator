@@ -79,6 +79,9 @@ class TmuxBackend(TerminalBackend):
     def kill_window(self, session_name: str, window_name: str) -> bool:
         return self._client.kill_window(session_name, window_name)
 
+    def window_exists(self, session_name: str, window_name: str) -> bool:
+        return self._client.window_exists(session_name, window_name)
+
     # --- Input ---
 
     def send_keys(

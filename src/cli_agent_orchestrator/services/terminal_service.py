@@ -19,7 +19,9 @@ Terminal Workflow:
 
 import asyncio
 import logging
+import os
 import re
+import shlex
 import threading
 import time
 from datetime import datetime
@@ -32,6 +34,9 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
+from cli_agent_orchestrator.clients.database import (
+    delete_terminal_if_generation as db_delete_terminal_if_generation,
+)
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     update_last_active,
@@ -69,6 +74,7 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
+    managed_window_name,
     wait_until_status,
 )
 
@@ -160,10 +166,12 @@ async def create_terminal(
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     reserved_terminal_id: Optional[str] = None,
+    terminal_generation: Optional[str] = None,
     trusted_project_root: Optional[str] = None,
     expected_model: Optional[str] = None,
     expected_effort: Optional[str] = None,
     preserve_on_init_failure: bool = False,
+    managed_native_command: Optional[list[str]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -251,13 +259,30 @@ async def create_terminal(
             terminal_id = reserved_terminal_id
         if reserved_terminal_id is not None and not re.fullmatch(r"[a-f0-9]{8}", terminal_id):
             raise ValueError("reserved_terminal_id must be exactly 8 lowercase hex characters")
+        if reserved_terminal_id is not None and terminal_generation is None:
+            raise ValueError("managed reserved terminals require terminal_generation")
+        if reserved_terminal_id is None and terminal_generation is not None:
+            raise ValueError("terminal_generation is valid only with reserved_terminal_id")
         if trusted_project_root is not None and provider != ProviderType.CODEX.value:
             raise ValueError("trusted_project_root is supported only by the Codex provider")
+        if managed_native_command is not None:
+            if reserved_terminal_id is None or terminal_generation is None:
+                raise ValueError("managed_native_command requires a reserved terminal generation")
+            if not managed_native_command or not all(
+                isinstance(item, str) and "\x00" not in item for item in managed_native_command
+            ):
+                raise ValueError("managed_native_command must be a non-empty argv list")
+            if not os.path.isabs(managed_native_command[0]):
+                raise ValueError("managed_native_command executable must be absolute")
 
         if not session_name:
             session_name = generate_session_name()
 
-        window_name = generate_window_name(agent_profile)
+        window_name = (
+            managed_window_name(terminal_id, terminal_generation)
+            if managed_native_command is not None and terminal_generation is not None
+            else generate_window_name(agent_profile)
+        )
 
         # Step 2: Create tmux session or window
         if new_session:
@@ -339,6 +364,7 @@ async def create_terminal(
             agent_profile,
             allowed_tools,
             caller_id=caller_id,
+            generation=terminal_generation,
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
@@ -376,6 +402,40 @@ async def create_terminal(
             # the StatusMonitor buffer empty so wait_for_shell() times out. A bare
             # Enter produces a fresh prompt line that flows through the pipe.
             get_backend().send_special_key(session_name, window_name, "Enter")
+
+        # Managed native sessions run a structured provider bridge in the
+        # reserved pane. The bridge, not pane scraping or tmux paste, owns
+        # readiness and task admission receipts for this exact generation.
+        if managed_native_command is not None:
+            get_backend().send_keys(
+                session_name,
+                window_name,
+                shlex.join(managed_native_command),
+            )
+            terminal = Terminal(
+                id=terminal_id,
+                name=window_name,
+                provider=ProviderType(provider),
+                session_name=session_name,
+                agent_profile=agent_profile,
+                caller_id=caller_id,
+                allowed_tools=allowed_tools,
+                shell_command=None,
+                status=TerminalStatus.UNKNOWN,
+                last_active=datetime.now(),
+            )
+            dispatch_plugin_event(
+                registry,
+                "post_create_terminal",
+                PostCreateTerminalEvent(
+                    session_id=terminal.session_name,
+                    terminal_id=terminal.id,
+                    generation=terminal_generation,
+                    agent_name=terminal.agent_profile,
+                    provider=provider,
+                ),
+            )
+            return terminal
 
         # Step 6: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
@@ -1264,9 +1324,54 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         raise
 
 
-def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
+def delete_terminal(
+    terminal_id: str,
+    registry: PluginRegistry | None = None,
+    *,
+    expected_generation: str | None = None,
+    expected_session: str | None = None,
+) -> bool:
     """Delete terminal and kill its tmux window."""
     try:
+        # Managed cleanup claims the exact DB incarnation before any external
+        # destructive action. If the id now names a replacement generation,
+        # preserve every resource and report the mismatch.
+        metadata = get_terminal_metadata(terminal_id)
+        terminal_record_absent = False
+        if expected_generation is not None:
+            if metadata is None:
+                if not expected_session:
+                    raise ValueError(
+                        "managed cleanup of a missing terminal record requires "
+                        "the reserved session identity"
+                    )
+                terminal_record_absent = True
+            elif metadata.get("generation") != expected_generation:
+                raise ValueError(
+                    f"terminal {terminal_id} generation mismatch; expected "
+                    f"{expected_generation!r}"
+                )
+            expected_window = managed_window_name(terminal_id, expected_generation)
+            if metadata is not None and (
+                metadata.get("tmux_session") != expected_session
+                or metadata.get("tmux_window") != expected_window
+            ):
+                raise ValueError(
+                    f"terminal {terminal_id} route identity mismatch; expected "
+                    f"{expected_session!r}:{expected_window!r}"
+                )
+            if terminal_record_absent:
+                # The window name embeds the immutable generation, so recovery
+                # can finish a crash that occurred before the terminal row was
+                # persisted or after another cleanup removed it. A different
+                # generation has a different window identity.
+                get_backend().kill_window(expected_session, expected_window)
+                if get_backend().window_exists(expected_session, expected_window):
+                    raise RuntimeError(
+                        f"managed terminal window survived cleanup: "
+                        f"{expected_session}:{expected_window}"
+                    )
+
         # Unregister from herdr inbox service
         svc = get_herdr_inbox_service()
         if svc:
@@ -1274,9 +1379,6 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 svc.unregister_terminal(terminal_id)
             except Exception as e:
                 logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
-
-        # Get metadata before deletion
-        metadata = get_terminal_metadata(terminal_id)
 
         if metadata:
             # Snapshot scrollback + metadata before killing (for debugging/restore)
@@ -1331,10 +1433,18 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
 
             # Kill the tmux window (this terminates the agent process)
-            try:
+            if expected_generation is None:
+                try:
+                    get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
+                except Exception as e:
+                    logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+            else:
                 get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
-            except Exception as e:
-                logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+                if get_backend().window_exists(metadata["tmux_session"], metadata["tmux_window"]):
+                    raise RuntimeError(
+                        f"managed terminal window survived cleanup: "
+                        f"{metadata['tmux_session']}:{metadata['tmux_window']}"
+                    )
 
         # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)
@@ -1345,7 +1455,20 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         from cli_agent_orchestrator.services.memory_service import _curator_locks
 
         _curator_locks.pop(terminal_id, None)
-        deleted = db_delete_terminal(terminal_id)
+        if expected_generation is not None:
+            if terminal_record_absent:
+                deleted = True
+            else:
+                deleted = db_delete_terminal_if_generation(terminal_id, expected_generation)
+                if not deleted:
+                    current = get_terminal_metadata(terminal_id)
+                    if current is not None:
+                        raise ValueError(
+                            f"terminal {terminal_id} changed generation during cleanup"
+                        )
+                    deleted = True
+        else:
+            deleted = db_delete_terminal(terminal_id)
         logger.info(f"Deleted terminal: {terminal_id}")
         if deleted and metadata:
             dispatch_plugin_event(

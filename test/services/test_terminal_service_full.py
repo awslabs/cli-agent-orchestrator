@@ -19,6 +19,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     get_working_directory,
     send_input,
 )
+from cli_agent_orchestrator.utils.terminal import managed_window_name
 
 
 class TestCreateTerminal:
@@ -127,6 +128,7 @@ class TestCreateTerminal:
             "developer",
             ["fs_read"],
             caller_id=None,
+            generation=None,
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
@@ -1555,6 +1557,7 @@ class TestManagedCreatePreservation:
                     new_session=True,
                     working_directory=str(tmp_path),
                     reserved_terminal_id="aabbccdd",
+                    terminal_generation="11111111-1111-4111-8111-111111111111",
                     trusted_project_root=str(tmp_path),
                     preserve_on_init_failure=True,
                 )
@@ -2161,6 +2164,125 @@ class TestDeleteTerminal:
         result = delete_terminal("test1234")
 
         assert result is True
+
+    def test_managed_delete_refuses_stale_generation_before_external_cleanup(self):
+        metadata = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "generation": "replacement-generation",
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_terminal_if_generation",
+                return_value=False,
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager") as provider,
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+        ):
+            with pytest.raises(ValueError, match="generation mismatch"):
+                delete_terminal(
+                    "test1234",
+                    expected_generation="old-generation",
+                    expected_session="cao-session",
+                )
+
+        backend.kill_window.assert_not_called()
+        provider.cleanup_provider.assert_not_called()
+
+    def test_managed_delete_claims_exact_generation_once(self):
+        generation = "11111111-1111-4111-8111-111111111111"
+        metadata = {
+            "tmux_session": "cao-session",
+            "tmux_window": managed_window_name("deadbeef", generation),
+            "generation": generation,
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_terminal_if_generation",
+                return_value=True,
+            ) as conditional_delete,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_terminal"
+            ) as unconditional_delete,
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager"),
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+        ):
+            backend.window_exists.return_value = False
+            assert (
+                delete_terminal(
+                    "deadbeef",
+                    expected_generation=generation,
+                    expected_session="cao-session",
+                )
+                is True
+            )
+
+        conditional_delete.assert_called_once_with("deadbeef", generation)
+        unconditional_delete.assert_not_called()
+
+    def test_managed_delete_preserves_row_when_window_survives(self):
+        generation = "11111111-1111-4111-8111-111111111111"
+        metadata = {
+            "tmux_session": "cao-session",
+            "tmux_window": managed_window_name("deadbeef", generation),
+            "generation": generation,
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_terminal_if_generation"
+            ) as conditional_delete,
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+        ):
+            backend.kill_window.return_value = False
+            backend.window_exists.return_value = True
+            with pytest.raises(RuntimeError, match="survived cleanup"):
+                delete_terminal(
+                    "deadbeef",
+                    expected_generation=generation,
+                    expected_session="cao-session",
+                )
+
+        conditional_delete.assert_not_called()
+
+    def test_managed_delete_recovers_when_row_is_already_absent(self):
+        generation = "11111111-1111-4111-8111-111111111111"
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_terminal_if_generation"
+            ) as conditional_delete,
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+        ):
+            backend.kill_window.return_value = False
+            backend.window_exists.return_value = False
+            assert (
+                delete_terminal(
+                    "deadbeef",
+                    expected_generation=generation,
+                    expected_session="cao-session",
+                )
+                is True
+            )
+
+        backend.kill_window.assert_called_once_with(
+            "cao-session", managed_window_name("deadbeef", generation)
+        )
+        conditional_delete.assert_not_called()
 
 
 class TestDeferredInitFailureNotification:

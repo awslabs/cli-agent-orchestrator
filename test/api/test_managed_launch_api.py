@@ -50,6 +50,7 @@ def test_capability_handshake_is_exact_and_versioned(client):
         "generation_bound_cancel": True,
         "generation_bound_cleanup": True,
         "provider_submission_receipt": True,
+        "provider_native_exact_session_receipts": True,
         "zero_task_route_attestation": True,
         "trusted_project_root_providers": ["codex"],
         "readiness_providers": ["codex", "kimi_cli"],
