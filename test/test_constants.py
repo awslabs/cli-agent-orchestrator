@@ -445,14 +445,27 @@ class TestCaoHomeDirEnvOverride:
         assert "~" not in str(mod.CAO_HOME_DIR)
 
     def test_import_time_dirs_have_restricted_permissions(self, tmp_path):
-        # Directories created at import time must be owner-only (0o700) to
-        # protect secret-bearing terminal logs when relocated outside ~/.aws.
+        # Directories created at import time must have no group/other access
+        # to protect secret-bearing terminal logs when relocated outside ~/.aws.
         override = tmp_path / "cao-home"
         self._reload_constants({"CAO_HOME_DIR": str(override)})
-        terminal_log_dir = override / "logs" / "terminal"
-        fifo_dir = override / "fifos"
-        assert terminal_log_dir.stat().st_mode & 0o777 == 0o700
-        assert fifo_dir.stat().st_mode & 0o777 == 0o700
+        resolved = override.resolve()
+        # Base dir itself is hardened
+        assert resolved.stat().st_mode & 0o077 == 0
+        # Leaf dirs are hardened
+        terminal_log_dir = resolved / "logs" / "terminal"
+        fifo_dir = resolved / "fifos"
+        assert terminal_log_dir.stat().st_mode & 0o077 == 0
+        assert fifo_dir.stat().st_mode & 0o077 == 0
+
+    def test_pre_existing_base_dir_is_chmodded(self, tmp_path):
+        # If the base dir already exists with lax permissions, the import-time
+        # chmod tightens it to owner-only.
+        override = tmp_path / "cao-home"
+        override.mkdir(mode=0o755)
+        self._reload_constants({"CAO_HOME_DIR": str(override)})
+        resolved = override.resolve()
+        assert resolved.stat().st_mode & 0o077 == 0
 
 
 class TestSessionConstants:

@@ -24,12 +24,12 @@ Every derived path resolves from this value, so one override moves everything �
 
 **When to use it.** Some environments restrict or sandbox access to `~/.aws` at the OS level to protect AWS credentials. Because CAO otherwise stores its data there, including the agent profiles it reads during a `handoff`, a locked-down `~/.aws` can leave CAO unable to read its own data (a handoff then fails with `Permission denied`). Relocating `CAO_HOME_DIR` outside `~/.aws` keeps CAO working while leaving those credential protections in place.
 
-**Security note.** When relocating outside `~/.aws`, choose a dedicated directory that is not world-readable or shared with other users. CAO creates its log and FIFO directories with owner-only permissions (mode `0700`), but the chosen parent path should also be private since terminal logs can capture secrets and tokens.
+**Security note.** When relocating outside `~/.aws`, choose a dedicated directory that is not world-readable or shared with other users. CAO creates its base directory and log/FIFO subdirectories with owner-only permissions (mode `0700`), and applies a best-effort `chmod` to an existing base directory, but the chosen parent path should also be private since terminal logs can capture secrets and tokens.
 
-**Exceptions.** Two provider-specific config directories do **not** follow `CAO_HOME_DIR`:
+**Exceptions.** Two categories of provider-specific config directories do **not** follow `CAO_HOME_DIR`:
 
 - `~/.aws/opencode` (OpenCode provider config, managed via `OPENCODE_CONFIG_DIR` in `constants.py`) — OpenCode is told its config location at launch via env vars; a follow-up can repoint this.
-- `~/.kiro/agents` (Kiro CLI agent directory) — intentionally separate since Kiro manages its own agent install path independently of CAO's data tree.
+- Provider-native agent directories (`~/.kiro/agents`, `~/.copilot/agents`) — intentionally separate since each provider manages its own agent install path independently of CAO's data tree.
 
 ## settings.json schema
 
