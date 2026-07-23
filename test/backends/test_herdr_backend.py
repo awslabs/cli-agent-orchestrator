@@ -1057,3 +1057,15 @@ class TestSanitizeHerdrArgs:
         result = _sanitize_herdr_args(original)
         assert result == original
         assert result is not original
+
+    def test_sanitize_allows_env_flag(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        args = ["tab", "create", "--workspace", "w1", "--env", "CAO_TERMINAL_ID=term_x"]
+        assert _sanitize_herdr_args(args) == args
+
+    def test_sanitize_rejects_env_value_with_newline(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError):
+            _sanitize_herdr_args(["tab", "create", "--env", "K=line1\nline2"])

@@ -53,6 +53,7 @@ _SAFE_ARG_RE = re.compile(r"^[\w\-./: =,@(){}\[\]\"'\\~+#]+$", re.UNICODE)
 _HERDR_ALLOWED_FLAGS = frozenset(
     {
         "--cwd",
+        "--env",
         "--format",
         "--label",
         "--lines",
