@@ -7,7 +7,9 @@ idle or done.
 
 Design:
 - Maintains a pane_id → terminal_id map for managed panes
-- Subscribes once to a broadcast pane.updated (no pane_id) covering all panes
+- Subscribes once to a broadcast pane.updated (no pane_id) covering all panes,
+  so a newly registered pane's events already arrive — registration updates the
+  map only and never re-subscribes or forces a reconnect
 - Reconnects with exponential backoff on socket disconnect
 - Supplements with periodic pane read for kiro-cli (working >30s check)
 """
@@ -111,21 +113,6 @@ class HerdrInboxService:
             self._kiro_terminals.add(terminal_id)
 
         logger.info(f"Registered terminal {terminal_id} (pane={pane_id}, kiro={is_kiro})")
-
-        # Start streaming events for the new pane by forcing a reconnect.
-        #
-        # herdr (0.6.8) resets the entire connection when it receives a SECOND
-        # events.subscribe on a connection that already has an active
-        # subscription, and it exposes no incremental "add subscription" API.
-        # So we cannot subscribe the new pane on the live connection — instead we
-        # close the socket, and _socket_loop reconnects and rebuilds the single
-        # combined subscription (all panes + lifecycle) in one call.
-        #
-        # register_terminal() may be called from a synchronous/non-event-loop
-        # thread, so we schedule the reconnect onto the captured loop via
-        # run_coroutine_threadsafe instead of create_task.
-        if self._connected and self._loop is not None:
-            asyncio.run_coroutine_threadsafe(self._force_reconnect(), self._loop)
 
     def unregister_terminal(self, terminal_id: str) -> None:
         """Remove a terminal from managed set.
@@ -515,23 +502,6 @@ class HerdrInboxService:
             "in one events.subscribe call"
         )
 
-    async def _force_reconnect(self) -> None:
-        """Close the socket so _socket_loop reconnects and rebuilds the subscription.
-
-        This is how a newly registered pane starts streaming events: herdr has no
-        incremental subscribe, and a second events.subscribe on the live
-        connection would reset it. Closing the writer makes the blocked
-        readline() in _event_loop return EOF, which raises ConnectionError and
-        drives _socket_loop through a fresh connect + combined re-subscribe.
-        """
-        writer = self._writer
-        if writer is None:
-            return
-        try:
-            writer.close()
-        except Exception as e:
-            logger.debug(f"Force reconnect: writer close raised (ignored): {e}")
-
     async def _event_loop(self) -> None:
         """Listen for events and dispatch delivery."""
         assert self._reader is not None
@@ -676,10 +646,10 @@ class HerdrInboxService:
             #
             # herdr (0.6.8) reuses compact pane_ids when a tab is killed and a
             # new tab takes the same index, AND replays the ENTIRE pane_closed
-            # history on every fresh events.subscribe (which register_terminal
-            # triggers via _force_reconnect). So a replayed close for an OLD
-            # incarnation of this pane_id arrives mapped to the terminal that now
-            # occupies the reused index — deleting a live terminal.
+            # history on every fresh events.subscribe (e.g. after a reconnect on
+            # socket disconnect). So a replayed close for an OLD incarnation of
+            # this pane_id arrives mapped to the terminal that now occupies the
+            # reused index — deleting a live terminal.
             #
             # The tab label (tmux_window) is unique per incarnation, so confirm
             # the label is genuinely gone from herdr before deleting. If the

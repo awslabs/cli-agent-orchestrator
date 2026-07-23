@@ -3,7 +3,6 @@
 import asyncio
 import inspect
 import json
-import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -54,49 +53,30 @@ class TestHerdrInboxServiceRegistration:
 
 
 class TestHerdrInboxServiceRegisterReconnect:
-    """Registering a terminal on a live connection must force a reconnect, never
-    a second events.subscribe.
+    """Registering a terminal must NOT touch the socket.
 
-    herdr 0.6.8 resets the entire connection when it receives a second
-    events.subscribe on a connection that already has an active subscription.
-    Because herdr exposes no incremental "add subscription" API, the only safe
-    way to start streaming events for a newly registered pane is to drop the
-    socket and rebuild the single combined subscription on a fresh connection.
-
-    register_terminal may be called from a synchronous, non-event-loop thread,
-    so it must schedule the reconnect onto the captured loop via
-    run_coroutine_threadsafe rather than asyncio.create_task (which requires a
-    running loop in the calling thread and would raise RuntimeError).
+    The subscription is a single broadcast pane.updated (no pane_id) covering
+    every pane, so a newly registered pane's events already arrive on the live
+    connection. Registration therefore only updates the in-memory maps — it must
+    never close the socket or write a second events.subscribe (herdr 0.7.x resets
+    the connection on a second subscribe, which caused past reconnect storms).
     """
 
-    def test_register_while_connected_triggers_reconnect_not_second_subscribe(self):
-        """register from a non-loop thread, while connected, closes the socket to
-        force a reconnect and must NOT write a second events.subscribe."""
+    def test_register_while_connected_does_not_touch_socket(self):
+        """With broadcast subscription, a newly registered pane's events already
+        arrive — registration must NOT close the socket or write anything."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        writer = MagicMock()
+        service._writer = writer
+        service._connected = True
+        service._loop = asyncio.new_event_loop()
 
-        async def run():
-            service = HerdrInboxService(socket_path="/tmp/test.sock")
-            service._connected = True
-            service._loop = asyncio.get_running_loop()
-            # close() is synchronous; use a plain MagicMock so write/close are tracked.
-            writer = MagicMock()
-            service._writer = writer
+        service.register_terminal("tid1", "w1:p1", is_kiro=False)
 
-            # Call register from a separate thread that has no event loop of its own.
-            t = threading.Thread(target=service.register_terminal, args=("tid_cross", "pane-cross"))
-            t.start()
-            t.join()
-
-            # Give the cross-thread-scheduled coroutine time to run on this loop.
-            await asyncio.sleep(0.05)
-
-            # Mapping recorded.
-            assert service._pane_to_terminal["pane-cross"] == "tid_cross"
-            # Reconnect forced by closing the writer...
-            writer.close.assert_called_once()
-            # ...and NO second events.subscribe was written on the live connection.
-            writer.write.assert_not_called()
-
-        _run_async(run())
+        assert service._pane_to_terminal["w1:p1"] == "tid1"
+        writer.close.assert_not_called()
+        writer.write.assert_not_called()
+        service._loop.close()
 
     def test_register_before_start_does_not_reconnect(self):
         """register_terminal before start (no loop, not connected) must not touch the socket."""
@@ -113,7 +93,7 @@ class TestHerdrInboxServiceRegisterReconnect:
         # Mapping is still recorded...
         assert service._pane_to_terminal["pane-early"] == "tid_early"
         assert service._terminal_to_pane["tid_early"] == "pane-early"
-        # ...but the socket was left untouched (guarded by _connected and _loop).
+        # ...but the socket is left untouched — registration never writes to it.
         writer.close.assert_not_called()
         writer.write.assert_not_called()
 
