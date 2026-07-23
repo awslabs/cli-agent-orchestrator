@@ -181,7 +181,12 @@ class TestHerdrInboxServiceEventParsing:
     """Test that _event_loop correctly unwraps the 'data' wrapper in socket events."""
 
     def test_event_loop_parses_data_wrapper_and_delivers(self):
-        """Events with 'data' wrapper are correctly parsed and delivery is triggered."""
+        """Events with the nested data.pane wrapper are parsed and delivery is triggered.
+
+        Reflects the real subscribed wire shape (broadcast pane.updated with the
+        pane object under data.pane), not the retired top-level
+        pane.agent_status_changed shape.
+        """
         callback = MagicMock()
         service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
 
@@ -192,8 +197,8 @@ class TestHerdrInboxServiceEventParsing:
         idle_event = (
             json.dumps(
                 {
-                    "event": "pane.agent_status_changed",
-                    "data": {"pane_id": "pane-x", "agent_status": "idle"},
+                    "event": "pane_updated",
+                    "data": {"pane": {"pane_id": "pane-x", "agent_status": "idle"}},
                 }
             ).encode()
             + b"\n"
@@ -201,8 +206,8 @@ class TestHerdrInboxServiceEventParsing:
         done_event = (
             json.dumps(
                 {
-                    "event": "pane.agent_status_changed",
-                    "data": {"pane_id": "pane-x", "agent_status": "done"},
+                    "event": "pane_updated",
+                    "data": {"pane": {"pane_id": "pane-x", "agent_status": "done"}},
                 }
             ).encode()
             + b"\n"
@@ -211,8 +216,8 @@ class TestHerdrInboxServiceEventParsing:
         working_event = (
             json.dumps(
                 {
-                    "event": "pane.agent_status_changed",
-                    "data": {"pane_id": "pane-x", "agent_status": "working"},
+                    "event": "pane_updated",
+                    "data": {"pane": {"pane_id": "pane-x", "agent_status": "working"}},
                 }
             ).encode()
             + b"\n"
@@ -221,8 +226,8 @@ class TestHerdrInboxServiceEventParsing:
         other_event = (
             json.dumps(
                 {
-                    "event": "pane.agent_status_changed",
-                    "data": {"pane_id": "pane-other", "agent_status": "idle"},
+                    "event": "pane_updated",
+                    "data": {"pane": {"pane_id": "pane-other", "agent_status": "idle"}},
                 }
             ).encode()
             + b"\n"
@@ -275,6 +280,53 @@ class TestHerdrInboxServiceEventParsing:
         _run_async(run())
 
         # Flat format is not parsed — no delivery expected
+        callback.assert_not_called()
+
+    def test_event_loop_reads_pane_updated_nested_pane(self):
+        """pane.updated wraps the pane object under data.pane; extraction must
+        read pane_id/agent_status from there and deliver for a managed pane."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        callback = MagicMock()
+        service._delivery_callback = callback
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+
+        frame = {
+            "event": "pane_updated",
+            "data": {"pane": {"pane_id": "w1:p1", "agent_status": "idle"}},
+        }
+        reader = AsyncMock()
+        reader.readline.side_effect = [
+            (json.dumps(frame) + "\n").encode(),
+            b"",  # EOF ends the loop
+        ]
+        service._reader = reader
+        try:
+            _run_async(service._event_loop())
+        except ConnectionError:
+            pass  # EOF raises ConnectionError("Socket closed") — expected
+
+        callback.assert_called_once_with("tid1")
+
+    def test_event_loop_ignores_pane_updated_for_unmanaged_pane(self):
+        """Broadcast now delivers events for ALL panes; the managed-pane filter
+        must drop events for panes CAO does not track."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        callback = MagicMock()
+        service._delivery_callback = callback
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+
+        frame = {
+            "event": "pane_updated",
+            "data": {"pane": {"pane_id": "w9:p9", "agent_status": "idle"}},
+        }
+        reader = AsyncMock()
+        reader.readline.side_effect = [(json.dumps(frame) + "\n").encode(), b""]
+        service._reader = reader
+        try:
+            _run_async(service._event_loop())
+        except ConnectionError:
+            pass
+
         callback.assert_not_called()
 
 
@@ -981,7 +1033,7 @@ class TestHerdrInboxServiceLifecycleEvents:
         mock_delete.assert_called_once_with("tid-x")
 
     def test_event_loop_agent_status_real_shape_delivers(self):
-        """A real-shape agent_status_changed (event key, dotted name) triggers delivery."""
+        """A real-shape broadcast pane_updated (event key, nested data.pane) triggers delivery."""
         callback = MagicMock()
         service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
         service.register_terminal("tid-a", "pane-a", is_kiro=False)
@@ -989,12 +1041,14 @@ class TestHerdrInboxServiceLifecycleEvents:
         idle_event = (
             json.dumps(
                 {
-                    "event": "pane.agent_status_changed",
+                    "event": "pane_updated",
                     "data": {
-                        "agent": "claude",
-                        "agent_status": "idle",
-                        "pane_id": "pane-a",
-                        "workspace_id": "ws-a",
+                        "pane": {
+                            "agent": "claude",
+                            "agent_status": "idle",
+                            "pane_id": "pane-a",
+                            "workspace_id": "ws-a",
+                        }
                     },
                 }
             ).encode()

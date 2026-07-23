@@ -560,8 +560,11 @@ class HerdrInboxService:
                 continue
 
             data = event.get("data", {})
-            pane_id = data.get("pane_id", "")
-            status = data.get("agent_status", "")
+            # pane.updated wraps the pane object under data.pane; agent-status
+            # events put fields at the top of data. Handle both.
+            pane_obj = data.get("pane", data)
+            pane_id = pane_obj.get("pane_id", "")
+            status = pane_obj.get("agent_status", "")
 
             # Only process events for managed panes
             terminal_id = self._pane_to_terminal.get(pane_id)
