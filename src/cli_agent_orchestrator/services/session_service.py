@@ -107,7 +107,7 @@ async def create_session(
 def _enrich_session_ownership(
     backend: TerminalBackend, session_data: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Add best-effort ownership metadata without failing session listing."""
+    """Add best-effort ownership metadata from the session's first known terminal."""
     enriched = dict(session_data)
     enriched.setdefault("working_directory", None)
     enriched.setdefault("agent_profile", None)
@@ -122,23 +122,27 @@ def _enrich_session_ownership(
         logger.warning(f"Failed to load terminal metadata for {session_name}: {e}")
         terminals = []
 
+    ownership_terminal: Dict[str, Any] = {}
     for terminal in terminals:
-        if enriched.get("agent_profile") is None and terminal.get("agent_profile"):
-            enriched["agent_profile"] = terminal["agent_profile"]
-        if enriched.get("working_directory") is None and terminal.get("working_directory"):
-            enriched["working_directory"] = terminal["working_directory"]
-        if (
-            enriched.get("agent_profile") is not None
-            and enriched.get("working_directory") is not None
-        ):
-            return enriched
+        if terminal.get("agent_profile") or terminal.get("working_directory"):
+            ownership_terminal = terminal
+            break
 
-    if enriched.get("working_directory") is None:
-        terminal = next((t for t in terminals if t.get("tmux_window")), None)
-        if terminal:
+    if not ownership_terminal:
+        for terminal in terminals:
+            if terminal.get("tmux_window"):
+                ownership_terminal = terminal
+                break
+
+    if ownership_terminal:
+        enriched["agent_profile"] = ownership_terminal.get("agent_profile")
+        persisted_working_directory = ownership_terminal.get("working_directory")
+        if persisted_working_directory:
+            enriched["working_directory"] = persisted_working_directory
+        elif ownership_terminal.get("tmux_window"):
             try:
                 enriched["working_directory"] = backend.get_pane_working_directory(
-                    session_name, terminal["tmux_window"]
+                    session_name, ownership_terminal["tmux_window"]
                 )
             except Exception as e:
                 logger.warning(f"Failed to resolve working directory for {session_name}: {e}")
@@ -159,7 +163,7 @@ def list_sessions() -> List[Dict]:
             # in this comprehension is swallowed by the outer except and returns
             # []). Shipped backends always populate "id"; this hardens against a
             # future backend that does not.
-            if s.get("id", "").startswith(SESSION_PREFIX)
+            if (s.get("id") or "").startswith(SESSION_PREFIX)
         ]
     except Exception as e:
         logger.error(f"Failed to list sessions: {e}")
