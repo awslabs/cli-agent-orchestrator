@@ -2290,6 +2290,164 @@ class TestDeleteTerminal:
         conditional_delete.assert_not_called()
 
 
+class TestManagedTeardownClaimRecheck:
+    """P1-1 (final conformance §20.2f): the generation-owned teardown claim is
+    rechecked immediately before EVERY destructive subsystem step. A
+    replacement swapped in mid-teardown stops the sequence with zero further
+    destructive action; expected_session alone never degrades to ID-only
+    destruction."""
+
+    GEN = "11111111-1111-4111-8111-111111111111"
+    REPLACEMENT_GEN = "22222222-2222-4222-8222-222222222222"
+
+    def _metadata(self, generation=None):
+        generation = generation or self.GEN
+        return {
+            "tmux_session": "cao-session",
+            "tmux_window": managed_window_name("deadbeef", generation),
+            "generation": generation,
+            "provider": "codex",
+        }
+
+    def _swap_side_effect(self, swap_after):
+        calls = {"n": 0}
+
+        def side_effect(_tid):
+            calls["n"] += 1
+            if calls["n"] <= swap_after:
+                return self._metadata()
+            return self._metadata(self.REPLACEMENT_GEN)
+
+        return side_effect
+
+    def _patches(self, metadata_side_effect):
+        return (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                side_effect=metadata_side_effect,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_terminal_if_generation",
+                return_value=True,
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager"),
+            patch("cli_agent_orchestrator.services.terminal_service.fifo_manager"),
+            patch("cli_agent_orchestrator.services.terminal_service.status_monitor"),
+            patch("cli_agent_orchestrator.services.terminal_service.get_herdr_inbox_service"),
+            patch("cli_agent_orchestrator.backends.registry._backend"),
+        )
+
+    def test_replacement_swap_before_herdr_step_refuses_all_teardown(self):
+        # Swap lands after the entry check: the herdr unregister and every
+        # later destructive step must refuse.
+        patches = self._patches(self._swap_side_effect(swap_after=1))
+        with (
+            patches[0],
+            patches[1] as conditional,
+            patches[2] as provider,
+            patches[3] as fifo,
+            patches[4] as status_mon,
+            patches[5] as herdr,
+            patches[6] as backend,
+        ):
+            with pytest.raises(ValueError, match="changed generation during cleanup"):
+                delete_terminal(
+                    "deadbeef",
+                    expected_generation=self.GEN,
+                    expected_session="cao-session",
+                )
+            self._assert_zero_teardown(conditional, provider, fifo, status_mon, herdr, backend)
+
+    def _assert_zero_teardown(self, conditional, provider, fifo, status_mon, herdr, backend):
+        (herdr.return_value.unregister_terminal).assert_not_called()
+        fifo.stop_reader.assert_not_called()
+        status_mon.clear_terminal.assert_not_called()
+        backend.kill_window.assert_not_called()
+        backend.stop_pipe_pane.assert_not_called()
+        provider.cleanup_provider.assert_not_called()
+        conditional.assert_not_called()
+
+    def test_replacement_swap_mid_teardown_refuses_remaining_steps(self):
+        # Swap lands after the FIFO step: herdr/snapshot/pipe-pane already
+        # ran, but the FIFO stop, status clear, window kill, provider cleanup,
+        # and the CAS delete must all refuse.
+        patches = self._patches(self._swap_side_effect(swap_after=4))
+        with (
+            patches[0] as _m,
+            patches[1] as conditional,
+            patches[2] as provider,
+            patches[3] as fifo,
+            patches[4] as status_mon,
+            patches[5] as herdr,
+            patches[6] as backend,
+        ):
+            with pytest.raises(ValueError, match="changed generation during cleanup"):
+                delete_terminal(
+                    "deadbeef",
+                    expected_generation=self.GEN,
+                    expected_session="cao-session",
+                )
+            (herdr.return_value.unregister_terminal).assert_called_once_with("deadbeef")
+            fifo.stop_reader.assert_not_called()
+            status_mon.clear_terminal.assert_not_called()
+            backend.kill_window.assert_not_called()
+            provider.cleanup_provider.assert_not_called()
+            conditional.assert_not_called()
+
+    def test_session_without_generation_never_degrades_to_id_only_destruction(self):
+        patches = self._patches(self._swap_side_effect(swap_after=0))
+        with (
+            patches[0],
+            patches[1] as conditional,
+            patches[2] as provider,
+            patches[3] as fifo,
+            patches[4] as status_mon,
+            patches[5] as herdr,
+            patches[6] as backend,
+        ):
+            with pytest.raises(ValueError, match="without the exact generation"):
+                delete_terminal("deadbeef", expected_session="cao-session")
+            (herdr.return_value.unregister_terminal).assert_not_called()
+            fifo.stop_reader.assert_not_called()
+            status_mon.clear_terminal.assert_not_called()
+            backend.kill_window.assert_not_called()
+            provider.cleanup_provider.assert_not_called()
+            conditional.assert_not_called()
+
+    def test_row_appearing_on_row_absent_path_is_preserved_as_replacement(self):
+        # Row-absent recovery: the entry window kill is generation-scoped by
+        # name, but if a terminal ROW appears mid-teardown it can only be a
+        # replacement incarnation — every later step refuses.
+        calls = {"n": 0}
+
+        def side_effect(_tid):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None  # row absent at entry
+            return self._metadata(self.REPLACEMENT_GEN)
+
+        patches = self._patches(side_effect)
+        with (
+            patches[0],
+            patches[1] as conditional,
+            patches[2] as provider,
+            patches[3] as fifo,
+            patches[4] as status_mon,
+            patches[5] as herdr,
+            patches[6] as backend,
+        ):
+            backend.window_exists.return_value = False
+            with pytest.raises(ValueError, match="row appeared during row-absent"):
+                delete_terminal(
+                    "deadbeef",
+                    expected_generation=self.GEN,
+                    expected_session="cao-session",
+                )
+            (herdr.return_value.unregister_terminal).assert_not_called()
+            provider.cleanup_provider.assert_not_called()
+            conditional.assert_not_called()
+
+
 class TestDeferredInitFailureNotification:
     """PR #390 must-fixes #1/#3: a deferred-init failure must be OBSERVABLE to
     the supervisor (assign already returned success=True), teardown must pass

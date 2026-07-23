@@ -25,6 +25,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -102,6 +103,7 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.services import (
+    companion_receipts,
     flow_service,
     managed_launch,
     secret_gate,
@@ -1525,6 +1527,7 @@ async def managed_launch_capabilities(
         "provider_submission_receipt": True,
         "provider_native_exact_session_receipts": True,
         "zero_task_route_attestation": True,
+        "pinned_provider_executable": True,
         "trusted_project_root_providers": ["codex"],
         "readiness_providers": ["codex", "kimi_cli"],
     }
@@ -1817,6 +1820,68 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get terminal: {str(e)}",
         )
+
+
+# --- Structured companion surfaces (final conformance §20.2f P1-7/P1-10) ------
+#
+# Observation/receipt only: the §17.2 user-prompt lifecycle, the §18.2
+# refusal receipt, the §18.9 per-turn route identity, and the §19.5
+# message-turn acknowledgement. Every surface is bound to the terminal's
+# exact live generation; a stale/wrong-generation or absent record is a 204
+# (no observation), never stale data. Unknown/unsupported providers simply
+# never produce records, so they fail closed to 204 as well.
+
+
+def _live_terminal_generation(terminal_id: str) -> Optional[str]:
+    metadata = terminal_service.get_terminal_metadata(terminal_id)
+    if not isinstance(metadata, dict):
+        return None
+    return metadata.get("generation")
+
+
+@app.get("/terminals/{terminal_id}/user-prompt")
+async def get_terminal_user_prompt(terminal_id: TerminalId):
+    """The pending provider-native structured user prompt ``{prompt_id, text,
+    choices[]}`` for the terminal's exact live generation, or 204."""
+    prompt = companion_receipts.get_prompt(terminal_id, _live_terminal_generation(terminal_id))
+    if prompt is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return prompt
+
+
+@app.get("/terminals/{terminal_id}/refusal")
+async def get_terminal_refusal(terminal_id: TerminalId):
+    """The pending provider-native structured refusal receipt ``{refusal_id,
+    identity, turn_id, generation}`` for the exact live generation, or 204."""
+    refusal = companion_receipts.get_refusal(terminal_id, _live_terminal_generation(terminal_id))
+    if refusal is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return refusal
+
+
+@app.get("/terminals/{terminal_id}/route")
+async def get_terminal_route(terminal_id: TerminalId):
+    """The provider-native per-turn route receipt ``{provider, model, effort,
+    generation, receipt_id, turn_id}`` for the exact live generation, or 204."""
+    route = companion_receipts.get_route(terminal_id, _live_terminal_generation(terminal_id))
+    if route is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return route
+
+
+@app.get("/terminals/{terminal_id}/inbox/messages/{message_id}/turn-receipt")
+async def get_inbox_message_turn_receipt(terminal_id: TerminalId, message_id: str):
+    """The provider-native ``terminal_queued → submitted`` acknowledgement for
+    one exact inbox message, bound to message id, the receiver's exact live
+    generation, and the provider session/turn — or 204 when no provider-native
+    submission has been recorded (an ordinary inbox ``delivered``/terminal
+    paste is never an acknowledgement)."""
+    ack = companion_receipts.get_message_ack(
+        terminal_id, _live_terminal_generation(terminal_id), message_id
+    )
+    if ack is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return ack
 
 
 @app.get("/terminals/{terminal_id}/memory-context")

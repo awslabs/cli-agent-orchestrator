@@ -20,6 +20,12 @@ from cli_agent_orchestrator.services.managed_provider_bridge import BRIDGE_VERSI
 
 
 def _reserve_request(tmp_path, **changes):
+    # P1-9 (final conformance §20.2f): managed reservations pin the provider
+    # executable's absolute canonical path + digest; the fixture creates a
+    # real stub executable so the pin verifies hermetically.
+    executable = tmp_path / "fake-provider"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
     payload = {
         "protocol_version": PROTOCOL_VERSION,
         "reservation_id": str(uuid.uuid4()),
@@ -31,6 +37,8 @@ def _reserve_request(tmp_path, **changes):
         "trusted_project_root": str(tmp_path),
         "expected_model": "gpt-5.6-sol",
         "expected_effort": "xhigh",
+        "provider_executable": str(executable),
+        "provider_executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
     }
     payload.update(changes)
     return ManagedLaunchReserveRequest(**payload)
@@ -68,6 +76,10 @@ def _ready_receipt_for(record, request):
         "provider_session_id": "provider-session-ready-opaque",
         "provider_receipt_kind": "codex-thread-start",
         "provider_transcript_sha256": "a" * 64,
+        # P1-8 (final conformance §20.2f): the complete readiness schema —
+        # provider version + explicit model-input-ready are mandatory.
+        "provider_version": "0.144.6",
+        "model_input_ready": True,
         "reservation_id": request.reservation_id,
         "terminal_id": record["terminal_id"],
         "generation": record["generation"],
@@ -702,3 +714,174 @@ def test_submission_receipt_id_must_be_provider_turn(isolated_memory_db, tmp_pat
     with pytest.raises(managed_launch.ManagedLaunchConflict):
         managed_launch.complete_admission(request.reservation_id, admission.delivery_id, receipt)
     assert managed_launch.get(request.reservation_id)["state"] == "admitting"
+
+
+# -- P1-8/P1-9: complete readiness schema + pinned executable (§20.2f) -------
+
+
+def test_readiness_without_provider_version_rejected(isolated_memory_db, tmp_path):
+    # §20.2f P1-8: the provider version is mandatory before ready persists.
+    request = _reserve_request(tmp_path)
+    record, _ = managed_launch.reserve(request)
+    managed_launch.claim_launch(request.reservation_id)
+    receipt = _ready_receipt_for(record, request)
+    del receipt["provider_version"]
+    with pytest.raises(managed_launch.ManagedLaunchConflict):
+        managed_launch.mark_ready(
+            request.reservation_id,
+            terminal_id=record["terminal_id"],
+            generation=record["generation"],
+            receipt=receipt,
+        )
+    assert managed_launch.get(request.reservation_id)["state"] == "launching"
+
+
+def test_readiness_without_explicit_model_input_ready_rejected(isolated_memory_db, tmp_path):
+    # §20.2f P1-8: model_input_ready must be explicitly true — omission and
+    # false both fail closed.
+    request = _reserve_request(tmp_path)
+    record, _ = managed_launch.reserve(request)
+    managed_launch.claim_launch(request.reservation_id)
+    for value in (None, False):
+        receipt = _ready_receipt_for(record, request)
+        receipt["model_input_ready"] = value
+        with pytest.raises(managed_launch.ManagedLaunchConflict):
+            managed_launch.mark_ready(
+                request.reservation_id,
+                terminal_id=record["terminal_id"],
+                generation=record["generation"],
+                receipt=receipt,
+            )
+    assert managed_launch.get(request.reservation_id)["state"] == "launching"
+
+
+def test_reserve_without_pinned_executable_refused(isolated_memory_db, tmp_path):
+    # §20.2f P1-9: no pinned executable identity → fail closed at reservation;
+    # ambient PATH resolution is never a fallback.
+    for changes in (
+        {"provider_executable": None},
+        {"provider_executable_sha256": None},
+        {"provider_executable": None, "provider_executable_sha256": None},
+        {"provider_executable": "kimi"},  # non-absolute
+    ):
+        request = _reserve_request(tmp_path, **changes)
+        with pytest.raises(Exception):
+            managed_launch.reserve(request)
+
+
+def test_malformed_executable_digest_rejected_by_schema(tmp_path):
+    with pytest.raises(Exception):
+        _reserve_request(tmp_path, provider_executable_sha256="Z" * 64)
+
+
+@pytest.mark.asyncio
+async def test_launch_refused_when_pinned_executable_digest_drifts(isolated_memory_db, tmp_path):
+    # §20.2f P1-9: the pinned executable changed after reservation → the
+    # launch fails closed (preflight-blocked) with zero provider I/O.
+    request = _reserve_request(tmp_path)
+    managed_launch.reserve(request)
+    executable = tmp_path / "fake-provider"
+    executable.write_text("#!/bin/sh\nexit 1\n")  # drift after the pin
+    result = await managed_launch.launch_reserved(request.reservation_id)
+    assert result["state"] == "preflight_blocked"
+    details = [obs.get("detail", "") for obs in result.get("observations") or []]
+    assert any("digest" in detail for detail in details), details
+
+
+# -- P1-7/P1-10: companion producers (final conformance §20.2f) ---------------
+
+
+def test_ready_and_admission_publish_exact_companion_receipts(
+    isolated_memory_db, tmp_path, monkeypatch
+):
+    # The REAL producer path (no injected sentinel boundary): the validated
+    # provider-native readiness/submission receipts publish the generation-
+    # bound route identity and the message-turn acknowledgement.
+    from cli_agent_orchestrator.services import companion_receipts
+
+    monkeypatch.setattr(companion_receipts, "COMPANION_DIR", tmp_path / "companion")
+    request = _reserve_request(tmp_path)
+    record, _ = managed_launch.reserve(request)
+    managed_launch.claim_launch(request.reservation_id)
+    receipt = _ready_receipt_for(record, request)
+    managed_launch.mark_ready(
+        request.reservation_id,
+        terminal_id=record["terminal_id"],
+        generation=record["generation"],
+        receipt=receipt,
+    )
+    route = companion_receipts.get_route(record["terminal_id"], record["generation"])
+    assert route["receipt_id"] == "provider-session-ready-opaque"
+    assert route["turn_id"] == "provider-session-ready-opaque"
+    assert route["provider_version"] == "0.144.6"
+    assert route["generation"] == record["generation"]
+    # a replacement generation is never served this receipt
+    assert companion_receipts.get_route(record["terminal_id"], str(uuid.uuid4())) is None
+
+    admission = _admit_request()
+    admitting, _ = managed_launch.claim_admission(request.reservation_id, admission)
+    managed_launch.complete_admission(
+        request.reservation_id,
+        admission.delivery_id,
+        _submission_receipt(admitting, admission),
+    )
+    # per-turn route identity moved to the exact provider turn
+    route = companion_receipts.get_route(record["terminal_id"], record["generation"])
+    assert route["turn_id"] == "provider-turn-opaque"
+    # the message-turn acknowledgement binds message id + digest, receiver
+    # generation, and provider session/turn — and carries no message body
+    ack = companion_receipts.get_message_ack(
+        record["terminal_id"], record["generation"], admission.delivery_id
+    )
+    assert ack["kind"] == "submitted"
+    assert ack["message_id"] == admission.delivery_id
+    assert ack["message_sha256"] == admission.message_sha256
+    assert ack["receiver_generation"] == record["generation"]
+    assert ack["provider_turn_id"] == "provider-turn-opaque"
+    assert ack["provider_session_id"] == "provider-session-ready-opaque"
+    assert "message" not in ack
+
+
+def test_deliver_inbox_via_bridge_exact_binding(isolated_memory_db, tmp_path, monkeypatch):
+    # P1-7: one exact queued inbox message is submitted through the receiver's
+    # live managed bridge; anything else falls back WITHOUT an ack.
+    request = _reserve_request(tmp_path)
+    record = _ready_record(request)
+    calls = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.request_bridge",
+        lambda reservation_id, body, timeout: calls.append(body) or {"ok": True},
+    )
+    assert managed_launch.deliver_inbox_via_bridge(
+        record["terminal_id"], message_id=7, message="ping", sender_id="sup-1"
+    )
+    assert len(calls) == 1
+    body = calls[0]
+    assert body["op"] == "deliver"
+    assert body["message_id"] == "7"
+    assert body["message_sha256"] == hashlib.sha256(b"ping").hexdigest()
+    assert body["sender_id"] == "sup-1"
+    assert body["reservation_id"] == request.reservation_id
+    # unmanaged terminal: no bridge, no ack — ordinary path, never inferred
+    assert not managed_launch.deliver_inbox_via_bridge(
+        "ffffffff", message_id=8, message="ping", sender_id="sup-1"
+    )
+    assert len(calls) == 1
+
+
+def test_deliver_inbox_via_bridge_unavailable_is_no_ack_fallback(
+    isolated_memory_db, tmp_path, monkeypatch
+):
+    request = _reserve_request(tmp_path)
+    record = _ready_record(request)
+
+    def unavailable(*_a, **_k):
+        raise RuntimeError("bridge socket gone")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.request_bridge",
+        unavailable,
+    )
+    assert not managed_launch.deliver_inbox_via_bridge(
+        record["terminal_id"], message_id=7, message="ping", sender_id="sup-1"
+    )

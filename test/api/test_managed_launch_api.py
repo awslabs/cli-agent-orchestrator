@@ -7,6 +7,11 @@ from cli_agent_orchestrator.models.managed_launch import PROTOCOL_VERSION
 
 
 def _reservation(tmp_path):
+    # P1-9 (final conformance §20.2f): managed reservations pin the provider
+    # executable's absolute canonical path + digest.
+    executable = tmp_path / "fake-provider"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
     return {
         "protocol_version": PROTOCOL_VERSION,
         "reservation_id": str(uuid.uuid4()),
@@ -18,6 +23,8 @@ def _reservation(tmp_path):
         "trusted_project_root": str(tmp_path),
         "expected_model": "gpt-5.6-sol",
         "expected_effort": "xhigh",
+        "provider_executable": str(executable),
+        "provider_executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
     }
 
 
@@ -52,6 +59,7 @@ def test_capability_handshake_is_exact_and_versioned(client):
         "provider_submission_receipt": True,
         "provider_native_exact_session_receipts": True,
         "zero_task_route_attestation": True,
+        "pinned_provider_executable": True,
         "trusted_project_root_providers": ["codex"],
         "readiness_providers": ["codex", "kimi_cli"],
     }

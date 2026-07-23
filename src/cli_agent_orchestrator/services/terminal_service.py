@@ -1401,6 +1401,14 @@ def delete_terminal(
 ) -> bool:
     """Delete terminal and kill its tmux window."""
     try:
+        # P1-1 (final conformance §20.2f): expected_session without the exact
+        # generation NEVER degrades to ID-only destruction — a session name is
+        # not an incarnation identity.
+        if expected_generation is None and expected_session is not None:
+            raise TerminalGenerationMismatchError(
+                f"terminal {terminal_id} cleanup supplied a session identity "
+                "without the exact generation; refusing ID-only destruction"
+            )
         # Managed cleanup claims the exact DB incarnation before any external
         # destructive action. If the id now names a replacement generation,
         # preserve every resource and report the mismatch.
@@ -1440,7 +1448,32 @@ def delete_terminal(
                         f"{expected_session}:{expected_window}"
                     )
 
+        def _recheck_teardown_claim() -> None:
+            """Generation-owned teardown claim (P1-1, final conformance
+            §20.2f): immediately before EVERY destructive subsystem step,
+            immutably recheck that the live row still names the exact claimed
+            generation. A replacement swapped in mid-teardown (or a row
+            appearing on the row-absent recovery path — only a replacement
+            can appear there) stops the teardown with zero further
+            destructive action."""
+            if expected_generation is None:
+                return
+            current = get_terminal_metadata(terminal_id)
+            if terminal_record_absent:
+                if current is not None:
+                    raise TerminalGenerationMismatchError(
+                        f"terminal {terminal_id} row appeared during "
+                        "row-absent managed cleanup; preserving the "
+                        "replacement incarnation"
+                    )
+                return
+            if current is None or current.get("generation") != expected_generation:
+                raise TerminalGenerationMismatchError(
+                    f"terminal {terminal_id} changed generation during cleanup"
+                )
+
         # Unregister from herdr inbox service
+        _recheck_teardown_claim()
         svc = get_herdr_inbox_service()
         if svc:
             try:
@@ -1449,6 +1482,7 @@ def delete_terminal(
                 logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
 
         if metadata:
+            _recheck_teardown_claim()
             # Snapshot scrollback + metadata before killing (for debugging/restore)
             try:
                 # Capture plain text full scrollback (no -e, no line cap)
@@ -1481,6 +1515,7 @@ def delete_terminal(
                 logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
 
             # Stop pipe-pane logging
+            _recheck_teardown_claim()
             try:
                 get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
@@ -1489,18 +1524,21 @@ def delete_terminal(
             # Stop FIFO reader and cleanup FIFO file. Must run BEFORE kill_window
             # so the reader thread (which reopens the FIFO on EOF) unblocks and
             # joins before the pane disappears.
+            _recheck_teardown_claim()
             try:
                 fifo_manager.stop_reader(terminal_id)
             except Exception as e:
                 logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
 
             # Clear state detector buffers for this terminal
+            _recheck_teardown_claim()
             try:
                 status_monitor.clear_terminal(terminal_id)
             except Exception as e:
                 logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
 
             # Kill the tmux window (this terminates the agent process)
+            _recheck_teardown_claim()
             if expected_generation is None:
                 try:
                     get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
@@ -1515,7 +1553,9 @@ def delete_terminal(
                     )
 
         # Cleanup provider state and database record
+        _recheck_teardown_claim()
         provider_manager.cleanup_provider(terminal_id)
+        _recheck_teardown_claim()
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)
         # Drop any per-curator dispatch lock so the registry doesn't grow

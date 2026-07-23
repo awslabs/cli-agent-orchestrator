@@ -14,6 +14,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import pathlib
 import re
@@ -25,14 +26,14 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from cli_agent_orchestrator.constants import CAO_HOME_DIR
-from cli_agent_orchestrator.constants import SECURITY_PROMPT
+from cli_agent_orchestrator.constants import CAO_HOME_DIR, SECURITY_PROMPT
 from cli_agent_orchestrator.providers.codex import (
     _toml_override,
     _toml_scalar,
     _validate_config_key,
     render_trusted_project_override,
 )
+from cli_agent_orchestrator.services import companion_receipts
 from cli_agent_orchestrator.services.codex_trust import (
     SUPPORTED_CODEX_VERSION,
     _contains_session_flags,
@@ -42,6 +43,8 @@ from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+logger = logging.getLogger(__name__)
 
 BRIDGE_VERSION = "cao-native-provider-bridge-v1"
 BRIDGE_ROOT = CAO_HOME_DIR / "managed-provider-sessions"
@@ -101,6 +104,20 @@ def _assert_bridge_environment() -> None:
         )
 
 
+def _prune_bridge_environment() -> None:
+    """Replace the bridge's OWN environment with the fresh minimal allowlist.
+
+    P1-9 (final conformance §20.2f): the bridge process must not inherit
+    unrelated ambient variables merely because its provider child is pruned.
+    After this runs, the bridge and everything it spawns see only the
+    allowlisted variables and the fixed minimal PATH. Runs after
+    ``_assert_bridge_environment`` so a protected leak still fails closed
+    (with the offending names) instead of being silently dropped."""
+    fresh = _provider_env()
+    os.environ.clear()
+    os.environ.update(fresh)
+
+
 def _provider_env(overrides: Optional[dict[str, str]] = None) -> dict[str, str]:
     """The minimal allowlisted environment for provider child processes."""
     env = {name: os.environ[name] for name in _PROVIDER_ENV_ALLOWLIST if name in os.environ}
@@ -129,6 +146,22 @@ def _canonical(value: Any) -> bytes:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _iter_provider_error_items(node: Any) -> list[dict[str, Any]]:
+    """Provider-native error items inside an RPC notification (§20.2f P1-10).
+    Only the provider's own structured error items qualify — never text
+    pattern-matched out of ordinary output."""
+    found: list[dict[str, Any]] = []
+    if isinstance(node, dict):
+        if node.get("type") == "error" and isinstance(node.get("message"), str):
+            found.append(node)
+        for value in node.values():
+            found.extend(_iter_provider_error_items(value))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_iter_provider_error_items(value))
+    return found
 
 
 def _now() -> str:
@@ -328,7 +361,13 @@ def request_bridge(
 
 
 class _RpcProcess:
-    def __init__(self, argv: list[str], *, env: Optional[dict[str, str]] = None):
+    def __init__(
+        self,
+        argv: list[str],
+        *,
+        env: Optional[dict[str, str]] = None,
+        companion_identity: Optional[tuple[str, str]] = None,
+    ):
         self.proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -341,6 +380,10 @@ class _RpcProcess:
         if self.proc.stdin is None or self.proc.stdout is None or self.proc.stderr is None:
             self.proc.kill()
             raise BridgeError("provider native process pipes were not created")
+        # (terminal_id, generation) for the structured companion prompt
+        # lifecycle (§20.2f P1-10): provider-native reverse requests are
+        # recorded as generation-bound prompt observations while pending.
+        self._companion_identity = companion_identity
         self._write_lock = threading.Lock()
         self._condition = threading.Condition()
         self._responses: dict[int, dict[str, Any]] = {}
@@ -360,29 +403,66 @@ class _RpcProcess:
 
     def _answer_reverse_request(self, item: dict[str, Any]) -> None:
         method = item.get("method")
-        if method == "session/request_permission":
-            options = (item.get("params") or {}).get("options") or []
-            selected = next(
-                (
-                    option.get("optionId")
-                    for option in options
-                    if option.get("kind") in {"allow_always", "allow_once"}
-                ),
-                None,
-            )
-            if selected is None:
-                result = {"outcome": {"outcome": "cancelled"}}
+        companion_prompt_id: Optional[str] = None
+        if self._companion_identity is not None:
+            # §20.2f P1-10: the provider-native structured prompt lifecycle.
+            # Record the pending prompt observation before answering and close
+            # it deterministically once answered — observation only, never an
+            # answer beyond the bridge's existing managed-session policy.
+            params = item.get("params") or {}
+            if method == "session/request_permission":
+                text = str(params.get("title") or method)
+                choices = [
+                    str(option.get("name") or option.get("optionId"))
+                    for option in (params.get("options") or [])
+                    if isinstance(option, dict)
+                ]
             else:
-                result = {"outcome": {"outcome": "selected", "optionId": selected}}
-            self._send({"jsonrpc": "2.0", "id": item["id"], "result": result})
-            return
-        self._send(
-            {
-                "jsonrpc": "2.0",
-                "id": item["id"],
-                "error": {"code": -32601, "message": f"unsupported client method {method}"},
-            }
-        )
+                text = str(method)
+                choices = []
+            companion_prompt_id = f"{method}:{item.get('id')}"
+            try:
+                companion_receipts.record_prompt(
+                    self._companion_identity[0],
+                    self._companion_identity[1],
+                    prompt_id=companion_prompt_id,
+                    text=text,
+                    choices=choices,
+                )
+            except Exception:  # noqa: BLE001 - observation never blocks the RPC
+                companion_prompt_id = None
+        try:
+            if method == "session/request_permission":
+                options = (item.get("params") or {}).get("options") or []
+                selected = next(
+                    (
+                        option.get("optionId")
+                        for option in options
+                        if option.get("kind") in {"allow_always", "allow_once"}
+                    ),
+                    None,
+                )
+                if selected is None:
+                    result = {"outcome": {"outcome": "cancelled"}}
+                else:
+                    result = {"outcome": {"outcome": "selected", "optionId": selected}}
+                self._send({"jsonrpc": "2.0", "id": item["id"], "result": result})
+                return
+            self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": item["id"],
+                    "error": {"code": -32601, "message": f"unsupported client method {method}"},
+                }
+            )
+        finally:
+            if companion_prompt_id is not None and self._companion_identity is not None:
+                with contextlib.suppress(Exception):
+                    companion_receipts.clear_prompt(
+                        self._companion_identity[0],
+                        self._companion_identity[1],
+                        prompt_id=companion_prompt_id,
+                    )
 
     def _read_stdout(self) -> None:
         assert self.proc.stdout is not None
@@ -475,6 +555,12 @@ class _RpcProcess:
         with self._condition:
             return len(self._notifications)
 
+    def notifications_since(self, index: int) -> tuple[list[dict[str, Any]], int]:
+        """A snapshot of buffered notifications from `index`, and the new
+        index — for companion observation scans (§20.2f P1-10)."""
+        with self._condition:
+            return list(self._notifications[index:]), len(self._notifications)
+
     def close(self) -> None:
         with contextlib.suppress(Exception):
             if self.proc.stdin is not None:
@@ -498,6 +584,11 @@ class _ProviderSession:
         self.provider_session_id: Optional[str] = None
         self.readiness: Optional[dict[str, Any]] = None
         self.kimi_wire_path: Optional[pathlib.Path] = None
+        self._companion_scan_index = 0
+        self._current_turn_id: Optional[str] = None
+
+    def _companion_identity(self) -> tuple[str, str]:
+        return (self.request["terminal_id"], self.request["generation"])
 
     def _base_receipt(self) -> dict[str, Any]:
         return {
@@ -559,7 +650,9 @@ class _ProviderSession:
         argv.extend(["app-server", "--stdio"])
         config_path = pathlib.Path(os.path.expanduser("~/.codex/config.toml"))
         config_before = _file_digest_or_absent(config_path)
-        self.rpc = _RpcProcess(argv, env=_provider_env())
+        self.rpc = _RpcProcess(
+            argv, env=_provider_env(), companion_identity=self._companion_identity()
+        )
         initialize_request = {
             "clientInfo": {"name": "cao-managed-native", "version": BRIDGE_VERSION}
         }
@@ -625,7 +718,9 @@ class _ProviderSession:
         # Route control (thinking effort) comes ONLY from the reservation
         # request, applied over the minimal allowlisted environment.
         env = _provider_env({"KIMI_MODEL_THINKING_EFFORT": self.request["effort"]})
-        self.rpc = _RpcProcess([kimi_bin, "acp"], env=env)
+        self.rpc = _RpcProcess(
+            [kimi_bin, "acp"], env=env, companion_identity=self._companion_identity()
+        )
         initialize_request = {
             "protocolVersion": 1,
             "clientCapabilities": {
@@ -689,6 +784,93 @@ class _ProviderSession:
         }
         return self.readiness
 
+    def _submit_provider_turn(
+        self, message: str, *, client_message_id: str, meta: dict[str, Any]
+    ) -> tuple[str, str, dict[str, Any]]:
+        """Submit exact text to the provider as a new model turn and return
+        (provider_turn_id, receipt_kind, provider_evidence). The provider's
+        own turn identity is the only submission proof — never paste success
+        or enqueue (§20.2d(1))."""
+        assert self.rpc is not None and self.provider_session_id is not None
+        if self.provider == "codex":
+            params = {
+                "threadId": self.provider_session_id,
+                "input": [{"type": "text", "text": message}],
+                "clientUserMessageId": client_message_id,
+                "model": self.request["model"],
+                "effort": self.request["effort"],
+                "cwd": self.request["working_directory"],
+                "approvalPolicy": "never",
+            }
+            result = self.rpc.request("turn/start", params, timeout=30.0)
+            turn = result.get("turn") or {}
+            turn_id = turn.get("id")
+            if not isinstance(turn_id, str) or not turn_id:
+                raise BridgeError("Codex turn/start omitted provider turn id")
+            evidence = {
+                "method": "turn/start",
+                "request_sha256": _digest(params),
+                "response": result,
+            }
+            return turn_id, "codex-turn-start", evidence
+        if self.kimi_wire_path is None:
+            raise BridgeError("Kimi exact session journal is unavailable")
+        params = {
+            "sessionId": self.provider_session_id,
+            "prompt": [{"type": "text", "text": message}],
+            "_meta": meta,
+        }
+        wire_offset = self.kimi_wire_path.stat().st_size
+        start_index = self.rpc.notification_count()
+        rpc_id = self.rpc.start_request("session/prompt", params)
+        turn_start = _wait_kimi_turn_start(
+            self.kimi_wire_path, start_offset=wire_offset, timeout=30.0
+        )
+
+        def accepted(item: dict[str, Any]) -> bool:
+            if item.get("method") != "session/update":
+                return False
+            update = item.get("params") or {}
+            return update.get("sessionId") == self.provider_session_id
+
+        first_update = self.rpc.wait_notification(accepted, start_index=start_index, timeout=30.0)
+        evidence = {
+            "method": "session/prompt",
+            "request_sha256": _digest(params),
+            "provider_turn_start": turn_start,
+            "first_provider_update": first_update,
+            "provider_request_id": rpc_id,
+        }
+        return turn_start["uuid"], "kimi-session-update", evidence
+
+    def _scan_companion_events(self) -> None:
+        """§20.2f P1-10: record provider-native refusal receipts from the
+        exact session's own notification stream — observation/receipt only,
+        bound to the terminal's exact generation. Never blocks the session."""
+        if self.rpc is None:
+            return
+        try:
+            items, self._companion_scan_index = self.rpc.notifications_since(
+                self._companion_scan_index
+            )
+            for item in items:
+                for error_item in _iter_provider_error_items(item):
+                    message = error_item.get("message")
+                    if not isinstance(message, str) or not message:
+                        continue
+                    refusal_id = error_item.get("id")
+                    if not isinstance(refusal_id, str) or not refusal_id:
+                        refusal_id = _digest(error_item)
+                    companion_receipts.record_refusal(
+                        self.request["terminal_id"],
+                        self.request["generation"],
+                        refusal_id=refusal_id,
+                        identity=message,
+                        turn_id=self._current_turn_id or self.provider_session_id or "unknown",
+                    )
+        except Exception:  # noqa: BLE001 - observation never blocks the RPC
+            logger.warning("managed bridge companion event scan failed", exc_info=True)
+
     def admit(self, request: dict[str, Any]) -> dict[str, Any]:
         if self.rpc is None or self.provider_session_id is None or self.readiness is None:
             raise BridgeError("provider native session is not ready")
@@ -704,69 +886,19 @@ class _ProviderSession:
             != request["message_sha256"]
         ):
             raise BridgeError("admission message digest mismatch")
-        provider_turn_id: Optional[str] = None
-        if self.provider == "codex":
-            params = {
-                "threadId": self.provider_session_id,
-                "input": [{"type": "text", "text": request["message"]}],
-                "clientUserMessageId": request["delivery_id"],
-                "model": self.request["model"],
-                "effort": self.request["effort"],
-                "cwd": self.request["working_directory"],
-                "approvalPolicy": "never",
-            }
-            result = self.rpc.request("turn/start", params, timeout=30.0)
-            turn = result.get("turn") or {}
-            turn_id = turn.get("id")
-            if not isinstance(turn_id, str) or not turn_id:
-                raise BridgeError("Codex turn/start omitted provider turn id")
-            provider_evidence = {
-                "method": "turn/start",
-                "request_sha256": _digest(params),
-                "response": result,
-            }
-            receipt_id = turn_id
-            provider_turn_id = turn_id
-            kind = "codex-turn-start"
-        else:
-            if self.kimi_wire_path is None:
-                raise BridgeError("Kimi exact session journal is unavailable")
-            params = {
-                "sessionId": self.provider_session_id,
-                "prompt": [{"type": "text", "text": request["message"]}],
-                "_meta": {
-                    "caoReservationId": request["reservation_id"],
-                    "caoGeneration": request["generation"],
-                    "caoMessageSha256": request["message_sha256"],
-                    "caoContextSha256": _digest(request.get("context") or {}),
-                },
-            }
-            wire_offset = self.kimi_wire_path.stat().st_size
-            start_index = self.rpc.notification_count()
-            rpc_id = self.rpc.start_request("session/prompt", params)
-            turn_start = _wait_kimi_turn_start(
-                self.kimi_wire_path, start_offset=wire_offset, timeout=30.0
-            )
-
-            def accepted(item: dict[str, Any]) -> bool:
-                if item.get("method") != "session/update":
-                    return False
-                update = item.get("params") or {}
-                return update.get("sessionId") == self.provider_session_id
-
-            first_update = self.rpc.wait_notification(
-                accepted, start_index=start_index, timeout=30.0
-            )
-            provider_turn_id = turn_start["uuid"]
-            receipt_id = provider_turn_id
-            provider_evidence = {
-                "method": "session/prompt",
-                "request_sha256": _digest(params),
-                "provider_turn_start": turn_start,
-                "first_provider_update": first_update,
-                "provider_request_id": rpc_id,
-            }
-            kind = "kimi-session-update"
+        provider_turn_id, kind, provider_evidence = self._submit_provider_turn(
+            request["message"],
+            client_message_id=request["delivery_id"],
+            meta={
+                "caoReservationId": request["reservation_id"],
+                "caoGeneration": request["generation"],
+                "caoMessageSha256": request["message_sha256"],
+                "caoContextSha256": _digest(request.get("context") or {}),
+            },
+        )
+        self._current_turn_id = provider_turn_id
+        self._scan_companion_events()
+        receipt_id = provider_turn_id
         return {
             **self._base_receipt(),
             "receipt_id": receipt_id,
@@ -781,6 +913,80 @@ class _ProviderSession:
             "context": request["context"],
             "provider_accepted": True,
             "submitted_at": _now(),
+        }
+
+    def deliver_inbox(self, command: dict[str, Any]) -> dict[str, Any]:
+        """P1-7 (final conformance §20.2f): submit one exact queued inbox
+        message to the receiver's provider turn and record the provider-native
+        ``terminal_queued → submitted`` acknowledgement into the generation-
+        bound companion store. Binds message id + digest, the receiver's exact
+        generation, and the provider session/turn — never inferred from
+        ordinary inbox ``delivered``/terminal paste."""
+        if self.rpc is None or self.provider_session_id is None or self.readiness is None:
+            raise BridgeError("provider native session is not ready")
+        if command.get("reservation_id") != self.request["reservation_id"]:
+            raise BridgeError("inbox delivery does not match the exact bridge generation")
+        message = command.get("message")
+        message_id = command.get("message_id")
+        if not isinstance(message, str) or not message:
+            raise BridgeError("inbox delivery omitted the message")
+        if not isinstance(message_id, str) or not message_id:
+            raise BridgeError("inbox delivery omitted the exact message id")
+        if hashlib.sha256(message.encode("utf-8")).hexdigest() != command.get("message_sha256"):
+            raise BridgeError("inbox delivery message digest mismatch")
+        provider_turn_id, kind, provider_evidence = self._submit_provider_turn(
+            message,
+            client_message_id=message_id,
+            meta={
+                "caoInboxMessageId": message_id,
+                "caoMessageSha256": command["message_sha256"],
+                "caoSenderId": command.get("sender_id"),
+            },
+        )
+        self._current_turn_id = provider_turn_id
+        self._scan_companion_events()
+        submitted_at = _now()
+        companion_receipts.record_message_ack(
+            self.request["terminal_id"],
+            self.request["generation"],
+            message_id=message_id,
+            ack={
+                "kind": "submitted",
+                "message_id": message_id,
+                "message_sha256": command["message_sha256"],
+                "sender_id": command.get("sender_id"),
+                "receiver_id": self.request["terminal_id"],
+                "receiver_generation": self.request["generation"],
+                "provider": self.provider,
+                "provider_session_id": self.provider_session_id,
+                "provider_turn_id": provider_turn_id,
+                "submitted_at": submitted_at,
+            },
+        )
+        # The per-turn route identity (§18.9) moves to this exact turn.
+        companion_receipts.record_route_receipt(
+            self.request["terminal_id"],
+            self.request["generation"],
+            provider=self.provider,
+            model=self.request["model"],
+            effort=self.request["effort"],
+            receipt_id=provider_turn_id,
+            turn_id=provider_turn_id,
+            provider_version=(self.readiness or {}).get("provider_version"),
+        )
+        return {
+            **self._base_receipt(),
+            "receipt_id": provider_turn_id,
+            "provider_session_id": self.provider_session_id,
+            "provider_turn_id": provider_turn_id,
+            "provider_receipt_kind": kind,
+            "provider_transcript_sha256": _digest(provider_evidence),
+            "message_id": message_id,
+            "message_sha256": command["message_sha256"],
+            "sender_id": command.get("sender_id"),
+            "receiver_id": self.request["terminal_id"],
+            "provider_accepted": True,
+            "submitted_at": submitted_at,
         }
 
     def close(self) -> None:
@@ -808,6 +1014,7 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
         os.chmod(target["socket"], 0o600)
         server.listen(8)
         readiness = session.initialize()
+        session._scan_companion_events()
         state.update({"state": "ready", "readiness": readiness})
         _atomic_json(target["state"], state)
         print(
@@ -851,6 +1058,12 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                                 flush=True,
                             )
                         response = {"ok": True, "receipt": receipt}
+                    elif command.get("op") == "deliver":
+                        # P1-7 (§20.2f): exact provider-native inbox message
+                        # submission; the acknowledgement is recorded by
+                        # deliver_inbox into the companion store.
+                        receipt = session.deliver_inbox(command)
+                        response = {"ok": True, "receipt": receipt}
                     else:
                         raise BridgeError("unsupported managed bridge operation")
                 except Exception as exc:  # noqa: BLE001 - structured socket failure
@@ -875,6 +1088,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--reservation-id", required=True)
     args = parser.parse_args(argv)
     _assert_bridge_environment()
+    _prune_bridge_environment()
     target = paths(args.reservation_id)
     request = json.loads(target["request"].read_text(encoding="utf-8"))
     if request.get("reservation_id") != args.reservation_id:

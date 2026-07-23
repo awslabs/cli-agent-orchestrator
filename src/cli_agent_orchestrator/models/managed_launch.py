@@ -35,11 +35,24 @@ class ManagedLaunchReserveRequest(BaseModel):
     trusted_project_root: Optional[str] = None
     expected_model: str = Field(min_length=1)
     expected_effort: str = Field(min_length=1)
+    # P1-9 (final conformance §20.2f): the conductor pins the provider
+    # executable's absolute canonical path and digest at reservation time;
+    # the fork verifies and executes exactly this identity and never
+    # PATH-resolves a provider on the managed campaign path.
+    provider_executable: Optional[str] = None
+    provider_executable_sha256: Optional[str] = None
 
     @field_validator("reservation_id")
     @classmethod
     def _validate_reservation_id(cls, value: str) -> str:
         return _uuid_text(value, "reservation_id")
+
+    @field_validator("provider_executable_sha256")
+    @classmethod
+    def _validate_executable_digest(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not _SHA256_RE.fullmatch(value):
+            raise ValueError("provider_executable_sha256 must be 64 lowercase hex characters")
+        return value
 
 
 class ManagedLaunchAdmitRequest(BaseModel):

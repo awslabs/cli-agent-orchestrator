@@ -89,6 +89,12 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
 FIFO_DIR.mkdir(parents=True, exist_ok=True)
 
+# Durable generation-bound structured companion receipts (user-prompt
+# lifecycle, refusal receipt, per-turn route identity, message-turn
+# acknowledgements — final conformance §20.2f P1-7/P1-10)
+COMPANION_DIR = CAO_HOME_DIR / "companion"
+COMPANION_DIR.mkdir(parents=True, exist_ok=True)
+
 # =============================================================================
 # Event-Driven State Detection Configuration
 # =============================================================================

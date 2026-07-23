@@ -52,9 +52,13 @@ def _material():
 
 
 class _CodexRpc:
-    def __init__(self, argv, *, env=None):
+    def __init__(self, argv, *, env=None, companion_identity=None):
         self.argv = argv
         self.calls = []
+        self._notifications = []
+
+    def notifications_since(self, index):
+        return list(self._notifications[index:]), len(self._notifications)
 
     def request(self, method, params, timeout=30.0):
         self.calls.append((method, params))
@@ -118,10 +122,13 @@ def test_codex_readiness_and_submission_share_exact_provider_process(tmp_path, m
 
 
 class _KimiRpc:
-    def __init__(self, argv, *, env=None):
+    def __init__(self, argv, *, env=None, companion_identity=None):
         self.argv = argv
         self.env = env
         self.calls = []
+
+    def notifications_since(self, index):
+        return [], 0
 
     def request(self, method, params, timeout=30.0):
         self.calls.append((method, params))
@@ -204,3 +211,165 @@ def test_kimi_turn_receipt_comes_from_structured_provider_journal(tmp_path):
 
     assert event["uuid"] == "provider-step-opaque"
     assert event["turnId"] == "7"
+
+
+# -- P1-7/P1-10: companion producers (final conformance §20.2f) ---------------
+
+
+def _codex_session(tmp_path, monkeypatch):
+    request = _request(tmp_path)
+    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+    monkeypatch.setattr(bridge, "_RpcProcess", _CodexRpc)
+    monkeypatch.setattr(bridge, "_contains_session_flags", lambda _: True)
+    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "codex-cli 0.144.6")
+    monkeypatch.setattr(bridge, "_file_digest_or_absent", lambda _: "d" * 64)
+    session = bridge._ProviderSession(request)
+    session.initialize()
+    return request, session
+
+
+def test_deliver_inbox_records_exact_provider_turn_ack(tmp_path, monkeypatch):
+    # P1-7: the bridge submits one exact inbox message to the provider turn
+    # and records the generation-bound acknowledgement — digest-bound, no
+    # message body, exactly once.
+    from cli_agent_orchestrator.services import companion_receipts
+
+    monkeypatch.setattr(companion_receipts, "COMPANION_DIR", tmp_path / "companion")
+    request, session = _codex_session(tmp_path, monkeypatch)
+    command = {
+        "op": "deliver",
+        "reservation_id": request["reservation_id"],
+        "message_id": "msg-1",
+        "message": "ping",
+        "message_sha256": hashlib.sha256(b"ping").hexdigest(),
+        "sender_id": "cafebabe",
+    }
+    receipt = session.deliver_inbox(command)
+    assert receipt["provider_turn_id"] == "turn_provider_opaque"
+    assert receipt["provider_receipt_kind"] == "codex-turn-start"
+    assert receipt["receiver_id"] == "deadbeef"
+
+    ack = companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-1")
+    assert ack["kind"] == "submitted"
+    assert ack["message_sha256"] == command["message_sha256"]
+    assert ack["receiver_generation"] == request["generation"]
+    assert ack["provider_session_id"] == "thread_provider_opaque"
+    assert ack["provider_turn_id"] == "turn_provider_opaque"
+    assert "message" not in ack
+    # the per-turn route identity moved to the exact provider turn
+    route = companion_receipts.get_route("deadbeef", request["generation"])
+    assert route["turn_id"] == "turn_provider_opaque"
+    # a wrong-generation reader is never served
+    assert companion_receipts.get_message_ack("deadbeef", "gen-X", "msg-1") is None
+
+    # digest mismatch and identity drift refuse BEFORE any provider I/O
+    import pytest
+
+    with pytest.raises(bridge.BridgeError):
+        session.deliver_inbox({**command, "message_id": "msg-2", "message_sha256": "0" * 64})
+    with pytest.raises(bridge.BridgeError):
+        session.deliver_inbox({**command, "message_id": "msg-3", "reservation_id": "gen-X"})
+    # the refused messages recorded no ack
+    assert companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-2") is None
+    assert companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-3") is None
+
+
+def test_reverse_request_prompt_lifecycle_is_observation_only(tmp_path, monkeypatch):
+    # P1-10: a provider-native reverse request is recorded as a pending
+    # structured prompt and closed when answered — observation only.
+    from cli_agent_orchestrator.services import companion_receipts
+
+    monkeypatch.setattr(companion_receipts, "COMPANION_DIR", tmp_path / "companion")
+    events = []
+    real_record = companion_receipts.record_prompt
+    real_clear = companion_receipts.clear_prompt
+    monkeypatch.setattr(
+        companion_receipts,
+        "record_prompt",
+        lambda *a, **k: events.append(("record", a, k)) or real_record(*a, **k),
+    )
+    monkeypatch.setattr(
+        companion_receipts,
+        "clear_prompt",
+        lambda *a, **k: events.append(("clear", a, k)) or real_clear(*a, **k),
+    )
+    rpc = object.__new__(bridge._RpcProcess)
+    rpc._companion_identity = ("deadbeef", "gen-1")
+    sent = []
+    rpc._send = sent.append
+    rpc._answer_reverse_request(
+        {
+            "id": 7,
+            "method": "session/request_permission",
+            "params": {
+                "title": "Allow tool call?",
+                "options": [
+                    {"optionId": "allow", "kind": "allow_once", "name": "Allow once"},
+                    {"optionId": "deny", "kind": "reject_once", "name": "Deny"},
+                ],
+            },
+        }
+    )
+    kinds = [kind for kind, _a, _k in events]
+    assert kinds == ["record", "clear"]
+    _, args, kwargs = events[0]
+    assert args[0] == "deadbeef" and args[1] == "gen-1"
+    assert kwargs["text"] == "Allow tool call?"
+    assert kwargs["choices"] == ["Allow once", "Deny"]
+    # the bridge's existing managed answer policy is unchanged
+    assert sent[0]["result"]["outcome"] == {
+        "outcome": "selected",
+        "optionId": "allow",
+    }
+
+
+def test_provider_error_items_become_generation_bound_refusal_receipts(tmp_path, monkeypatch):
+    # P1-10: the provider's own structured error items are recorded as
+    # refusal receipts bound to the exact generation and current turn.
+    from cli_agent_orchestrator.services import companion_receipts
+
+    monkeypatch.setattr(companion_receipts, "COMPANION_DIR", tmp_path / "companion")
+    request, session = _codex_session(tmp_path, monkeypatch)
+    session._current_turn_id = "turn-7"
+    rpc = session.rpc
+    rpc._notifications.append(
+        {
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "item-9",
+                    "type": "error",
+                    "message": "This content cannot be shown",
+                }
+            },
+        }
+    )
+    session._scan_companion_events()
+    refusal = companion_receipts.get_refusal("deadbeef", request["generation"])
+    assert refusal["refusal_id"] == "item-9"
+    assert refusal["identity"] == "This content cannot be shown"
+    assert refusal["turn_id"] == "turn-7"
+    assert companion_receipts.get_refusal("deadbeef", "gen-X") is None
+    # a rescan of the same notifications is idempotent (index advanced)
+    session._scan_companion_events()
+    assert (
+        companion_receipts.get_refusal("deadbeef", request["generation"])["refusal_id"] == "item-9"
+    )
+
+
+def test_bridge_environment_is_pruned_to_minimal_allowlist(monkeypatch):
+    # P1-9 (final conformance §20.2f): the bridge's OWN environment becomes
+    # the fresh minimal allowlist — unrelated ambient variables (incl.
+    # protected conductor/route variables) never leak through it, and PATH is
+    # the fixed minimal value, never inherited.
+    import os
+
+    monkeypatch.setenv("HOME", "/home/test")
+    monkeypatch.setenv("UNRELATED_AMBIENT_VARIABLE", "x")
+    monkeypatch.setenv("CONDUCT_DEV_ALLOW_ABSENT_DEPLOY_RECEIPT", "1")
+    monkeypatch.setenv("PATH", "/hostile/bin:/usr/bin")
+    bridge._prune_bridge_environment()
+    assert os.environ.get("UNRELATED_AMBIENT_VARIABLE") is None
+    assert os.environ.get("CONDUCT_DEV_ALLOW_ABSENT_DEPLOY_RECEIPT") is None
+    assert os.environ.get("HOME") == "/home/test"
+    assert os.environ.get("PATH") == bridge._MINIMAL_PATH

@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
-import shutil
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -29,8 +29,10 @@ from cli_agent_orchestrator.models.managed_launch import (
     ManagedLaunchReserveRequest,
     ManagedLaunchRouteAttestRequest,
 )
-from cli_agent_orchestrator.utils.terminal import generate_terminal_id
-from cli_agent_orchestrator.utils.terminal import managed_window_name
+from cli_agent_orchestrator.services import companion_receipts
+
+logger = logging.getLogger(__name__)
+from cli_agent_orchestrator.utils.terminal import generate_terminal_id, managed_window_name
 
 
 class ManagedLaunchError(RuntimeError):
@@ -194,6 +196,17 @@ def _validate_native_receipt(
     }
     if admission is not None:
         required_strings.update({"provider_turn_id", "submitted_at"})
+    else:
+        # P1-8 (final conformance §20.2f): the readiness schema is complete —
+        # the provider version and an explicit model-input-ready flag are
+        # mandatory before ready is persisted, identical to the conductor
+        # boundary. Omission fails closed.
+        required_strings.add("provider_version")
+        if receipt.get("model_input_ready") is not True:
+            mismatches["model_input_ready"] = {
+                "expected": True,
+                "observed": receipt.get("model_input_ready"),
+            }
     missing = sorted(
         key for key in required_strings if not isinstance(receipt.get(key), str) or not receipt[key]
     )
@@ -209,19 +222,33 @@ def _validate_native_receipt(
         )
 
 
-def _executable_identity(name: str) -> tuple[str, str]:
-    resolved = shutil.which(name)
-    if not resolved:
-        raise ManagedLaunchConflict(f"provider executable is unavailable: {name}")
-    canonical = os.path.realpath(resolved)
-    if not os.path.isfile(canonical) or not os.access(canonical, os.X_OK):
-        raise ManagedLaunchConflict(f"provider executable is not executable: {canonical}")
+def _executable_identity(request_payload: dict) -> tuple[str, str]:
+    """Verify the reservation-pinned provider executable identity.
+
+    P1-9 (final conformance §20.2f): managed campaign execution never
+    resolves a provider from the ambient PATH. The conductor pins the
+    absolute canonical path and digest at reservation time; the fork verifies
+    both before any provider effect and fails closed on absence or drift.
+    """
+    pinned_path = request_payload.get("provider_executable")
+    pinned_digest = request_payload.get("provider_executable_sha256")
+    if not pinned_path or not pinned_digest:
+        raise ManagedLaunchConflict(
+            "managed campaign execution requires the reservation-pinned "
+            "provider executable identity; ambient PATH resolution is refused"
+        )
+    if not os.path.isabs(pinned_path) or os.path.realpath(pinned_path) != pinned_path:
+        raise ManagedLaunchConflict("provider executable must be a canonical absolute path")
+    if not os.path.isfile(pinned_path) or not os.access(pinned_path, os.X_OK):
+        raise ManagedLaunchConflict(f"provider executable is not executable: {pinned_path}")
     try:
-        with open(canonical, "rb") as provider_file:
+        with open(pinned_path, "rb") as provider_file:
             digest = hashlib.sha256(provider_file.read()).hexdigest()
     except OSError as exc:
         raise ManagedLaunchConflict(f"provider executable is unreadable: {exc}") from exc
-    return canonical, digest
+    if digest != pinned_digest:
+        raise ManagedLaunchConflict("provider executable digest drifted from the reservation pin")
+    return pinned_path, digest
 
 
 def _validate_request_identity(request: ManagedLaunchReserveRequest) -> dict[str, Any]:
@@ -240,6 +267,16 @@ def _validate_request_identity(request: ManagedLaunchReserveRequest) -> dict[str
             )
     elif trusted is not None:
         raise ManagedLaunchConflict("trusted_project_root is valid only for provider=codex")
+    # P1-9 (final conformance §20.2f): managed campaign execution fails closed
+    # without the reservation-pinned provider executable identity; ambient
+    # PATH resolution is never a fallback.
+    if not request.provider_executable or not request.provider_executable_sha256:
+        raise ManagedLaunchConflict(
+            "managed campaign execution requires the pinned provider executable "
+            "identity (provider_executable + provider_executable_sha256)"
+        )
+    if not os.path.isabs(request.provider_executable):
+        raise ManagedLaunchConflict("provider_executable must be an absolute path")
     return request.model_dump(mode="json")
 
 
@@ -406,6 +443,20 @@ def mark_ready(
             db.commit()
             current = _query(db, reservation_id)
             if updated == 1:
+                # P1-10 (final conformance §20.2f): publish the provider-native
+                # route receipt to the generation-bound companion store. At
+                # readiness the provider session start IS the route turn; the
+                # per-turn identity is refined at each admission.
+                companion_receipts.record_route_receipt(
+                    terminal_id,
+                    generation,
+                    provider=receipt["provider"],
+                    model=receipt["model"],
+                    effort=receipt["effort"],
+                    receipt_id=receipt["provider_session_id"],
+                    turn_id=receipt["provider_session_id"],
+                    provider_version=receipt.get("provider_version"),
+                )
                 return _row_dict(current)
             if current is not None and current.state == "ready":
                 if _parse_json(current.readiness_json, None) == receipt:
@@ -704,6 +755,39 @@ def complete_admission(
             row.updated_at = _now()
             db.commit()
             db.refresh(row)
+            # P1-7/P1-10 (final conformance §20.2f): publish the exact
+            # provider/model-turn submission acknowledgement and the per-turn
+            # route identity to the generation-bound companion store. The ack
+            # binds message id + digest, the receiver's exact generation, and
+            # the provider session/turn — identities and digests only, never
+            # the message body (redaction).
+            companion_receipts.record_route_receipt(
+                row.terminal_id,
+                row.generation,
+                provider=provider_receipt["provider"],
+                model=provider_receipt["model"],
+                effort=provider_receipt["effort"],
+                receipt_id=provider_receipt["receipt_id"],
+                turn_id=provider_receipt["provider_turn_id"],
+                provider_version=provider_receipt.get("provider_version"),
+            )
+            companion_receipts.record_message_ack(
+                row.terminal_id,
+                row.generation,
+                message_id=delivery_id,
+                ack={
+                    "kind": "submitted",
+                    "message_id": delivery_id,
+                    "message_sha256": admission.get("message_sha256"),
+                    "sender_id": provider_receipt.get("sender_id"),
+                    "receiver_id": row.terminal_id,
+                    "receiver_generation": row.generation,
+                    "provider": row.provider,
+                    "provider_session_id": provider_receipt["provider_session_id"],
+                    "provider_turn_id": provider_receipt["provider_turn_id"],
+                    "submitted_at": provider_receipt.get("submitted_at"),
+                },
+            )
             return _row_dict(row)
     except ManagedLaunchError:
         raise
@@ -795,6 +879,58 @@ def attest_route(request: ManagedLaunchRouteAttestRequest) -> dict[str, Any]:
         "provider_route_receipt": provider_receipt,
         "attested_at": _now(),
     }
+
+
+def deliver_inbox_via_bridge(
+    terminal_id: str,
+    *,
+    message_id: Any,
+    message: str,
+    sender_id: Optional[str],
+) -> bool:
+    """P1-7 (final conformance §20.2f): deliver one exact queued inbox message
+    through the receiver's live managed provider bridge, producing the
+    provider-native ``terminal_queued → submitted`` acknowledgement (recorded
+    by the bridge into the generation-bound companion store).
+
+    Returns True only when the exact provider turn accepted the message.
+    Returns False when the terminal is not a live managed session or the
+    bridge is unavailable — the caller then uses the ordinary delivery path
+    and NO acknowledgement is inferred from it.
+    """
+    from cli_agent_orchestrator.services.managed_provider_bridge import request_bridge
+
+    try:
+        with database.SessionLocal() as db:
+            row = (
+                db.query(database.ManagedLaunchReservationModel)
+                .filter(database.ManagedLaunchReservationModel.terminal_id == terminal_id)
+                .one_or_none()
+            )
+        if row is None or row.state not in {"ready", "admitted"}:
+            return False
+        reservation_id = str(row.reservation_id)
+        request_bridge(
+            reservation_id,
+            {
+                "bridge_version": "cao-native-provider-bridge-v1",
+                "op": "deliver",
+                "reservation_id": reservation_id,
+                "message_id": str(message_id),
+                "message": message,
+                "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                "sender_id": sender_id,
+            },
+            timeout=30.0,
+        )
+        return True
+    except Exception:  # noqa: BLE001 - fall back to the ordinary delivery path
+        logger.warning(
+            "managed bridge inbox delivery unavailable for %s; using ordinary path",
+            terminal_id,
+            exc_info=True,
+        )
+        return False
 
 
 def cleanup_reserved(
@@ -982,9 +1118,10 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             detail="managed-launch v1 has no authoritative readiness adapter for this provider",
         )
 
-    executable_name = "codex" if record["provider"] == "codex" else "kimi"
     try:
-        provider_executable, provider_digest = _executable_identity(executable_name)
+        # P1-9 (§20.2f): the provider executable is the reservation-pinned
+        # absolute identity — never a PATH resolution.
+        provider_executable, provider_digest = _executable_identity(request)
         bridge_request = {
             "bridge_version": BRIDGE_VERSION,
             "reservation_id": reservation_id,

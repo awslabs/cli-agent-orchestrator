@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shutil
 import subprocess
 import time
 import uuid
@@ -17,6 +18,25 @@ from cli_agent_orchestrator.utils.path_validation import (
 from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 
 logger = logging.getLogger(__name__)
+
+_TMUX_BINARY: Optional[str] = None
+
+
+def tmux_binary() -> str:
+    """The absolute canonical tmux executable, resolved once and reused.
+
+    P1-9 (final conformance §20.2f): the managed campaign path's tmux
+    invocation is wholly absolute — a per-call PATH lookup (or a mid-run PATH
+    change) can never redirect managed window creation to a different binary.
+    Fails closed when tmux is not resolvable at all.
+    """
+    global _TMUX_BINARY
+    if _TMUX_BINARY is None:
+        resolved = shutil.which("tmux")
+        if not resolved:
+            raise RuntimeError("tmux executable is not resolvable")
+        _TMUX_BINARY = os.path.realpath(resolved)
+    return _TMUX_BINARY
 
 
 class TmuxClient:
@@ -267,7 +287,7 @@ class TmuxClient:
         window_env: dict[str, str] = {}
         self._merge_extra_env(window_env, extra_env)
         window_env["CAO_TERMINAL_ID"] = terminal_id
-        cmd = ["tmux", "new-window", "-d", "-n", window_name, "-c", working_directory]
+        cmd = [tmux_binary(), "new-window", "-d", "-n", window_name, "-c", working_directory]
         for key, value in window_env.items():
             cmd += ["-e", f"{key}={value}"]
         cmd += ["-t", session_name, "--", *argv]
