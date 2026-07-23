@@ -631,6 +631,47 @@ class TestHerdrInboxServiceReconcile:
         mock_delete.assert_not_called()
 
 
+class TestHerdrInboxSnapshot:
+    """_fetch_snapshot returns the parsed snapshot dict from `api snapshot`."""
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_fetch_snapshot_parses_result(self, mock_run):
+        service = HerdrInboxService(socket_path="/tmp/test.sock", herdr_session="cao")
+        snap = {
+            "result": {
+                "snapshot": {
+                    "panes": [
+                        {
+                            "pane_id": "w1:p1",
+                            "terminal_id": "term_a",
+                            "agent_status": "idle",
+                            "tab_id": "w1:t1",
+                            "workspace_id": "w1",
+                        }
+                    ],
+                    "tabs": [{"tab_id": "w1:t1", "label": "conductor", "workspace_id": "w1"}],
+                    "workspaces": [{"workspace_id": "w1", "label": "sess-a"}],
+                }
+            }
+        }
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(snap), stderr="")
+
+        result = service._fetch_snapshot()
+
+        assert [p["pane_id"] for p in result["panes"]] == ["w1:p1"]
+        assert result["workspaces"][0]["label"] == "sess-a"
+        # Invoked `api snapshot` for the configured session.
+        args = mock_run.call_args[0][0]
+        assert args[:2] == ["herdr", "--session"]
+        assert args[-2:] == ["api", "snapshot"]
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_fetch_snapshot_returns_none_on_failure(self, mock_run):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="boom")
+        assert service._fetch_snapshot() is None
+
+
 class TestHerdrInboxServiceStartupDbCleanup:
     """Test _startup_db_cleanup removes ghost terminals on server start."""
 

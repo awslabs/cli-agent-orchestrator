@@ -261,6 +261,30 @@ class HerdrInboxService:
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * _BACKOFF_MULTIPLIER, _BACKOFF_MAX)
 
+    def _fetch_snapshot(self) -> Optional[dict]:
+        """Return herdr's full live session snapshot in one socket call.
+
+        `herdr api snapshot` returns result.snapshot with panes[]/tabs[]/
+        workspaces[]. Each pane carries pane_id, terminal_id, agent_status,
+        tab_id, workspace_id; each tab carries tab_id, label, workspace_id;
+        each workspace carries workspace_id, label. Replaces the former
+        pane-list + workspace-list + tab-list subprocess fan-out.
+        """
+        result = subprocess.run(
+            ["herdr", "--session", self._herdr_session, "api", "snapshot"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            logger.warning(f"Snapshot: `api snapshot` failed: {result.stderr}")
+            return None
+        try:
+            return json.loads(result.stdout)["result"]["snapshot"]
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Snapshot: failed to parse: {e}")
+            return None
+
     async def _reconcile(self) -> None:
         """Reconcile _pane_to_terminal map against live herdr state.
 
