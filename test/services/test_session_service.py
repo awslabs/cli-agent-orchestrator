@@ -210,6 +210,63 @@ class TestListSessions:
         assert result[0]["working_directory"] is None
         assert result[0]["agent_profile"] == "developer"
 
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_handles_orphaned_tmux_session(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        """A tmux session with no DB terminals still lists (null metadata)."""
+        fake_client = self._FakeTmuxClient(
+            [{"id": "cao-orphaned", "name": "Orphaned", "status": "active"}],
+            {},
+        )
+        mock_get_backend.return_value = TmuxBackend(client=fake_client)
+        mock_list_terminals.return_value = []
+
+        result = list_sessions()
+
+        assert len(result) == 1
+        assert result[0]["id"] == "cao-orphaned"
+        assert result[0]["working_directory"] is None
+        assert result[0]["agent_profile"] is None
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_handles_enrichment_exception_gracefully(
+        self, mock_get_backend, mock_list_terminals
+    ):
+        """One session's enrichment failure doesn't blank the entire list."""
+        fake_client = self._FakeTmuxClient(
+            [
+                {"id": "cao-good", "name": "Good", "status": "active"},
+                {"id": "cao-bad", "name": "Bad", "status": "active"},
+            ],
+            {("cao-good", "win-good"): "/home/user/project"},
+        )
+        mock_get_backend.return_value = TmuxBackend(client=fake_client)
+        mock_list_terminals.side_effect = [
+            [
+                {
+                    "id": "term-good",
+                    "tmux_session": "cao-good",
+                    "tmux_window": "win-good",
+                    "agent_profile": "developer",
+                    "working_directory": None,
+                }
+            ],
+            Exception("DB connection failed"),
+        ]
+
+        result = list_sessions()
+
+        assert len(result) == 2
+        assert result[0]["id"] == "cao-good"
+        assert result[0]["working_directory"] == "/home/user/project"
+        assert result[0]["agent_profile"] == "developer"
+        assert result[1]["id"] == "cao-bad"
+        assert result[1]["working_directory"] is None
+        assert result[1]["agent_profile"] is None
+
 
 class TestGetSession:
     """Tests for get_session function."""
