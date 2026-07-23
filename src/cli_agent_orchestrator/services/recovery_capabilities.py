@@ -81,16 +81,34 @@ def build_capabilities(
     )
     observed_route = {
         # PF-2 is red for every pinned provider unless a provider-specific
-        # route receipt is proven: none emits a model-input-bound non-echo
-        # receipt carrying resolved model and effective effort by default.
-        "codex": "proven" if proofs.get("codex") else "unsupported",
-        "claude": "proven" if proofs.get("claude") else "unsupported",
-        "kimi": "proven" if proofs.get("kimi") else "unproven",
+        # route receipt is validated: none emits a model-input-bound
+        # non-echo receipt carrying resolved model and effective effort by
+        # default. Truthiness is not proof — only the validated
+        # cao-route-receipt-v1 for this exact provider counts.
+        "codex": (
+            "proven"
+            if provider_contracts.validate_route_proof("codex", proofs.get("codex"))
+            else "unsupported"
+        ),
+        "claude": (
+            "proven"
+            if provider_contracts.validate_route_proof("claude", proofs.get("claude"))
+            else "unsupported"
+        ),
+        "kimi": (
+            "proven"
+            if provider_contracts.validate_route_proof("kimi", proofs.get("kimi"))
+            else "unproven"
+        ),
     }
     enabled_providers = [
+        # Route authority, not identity: a provider is enabled only when
+        # its authority_supported bit is set, which requires the pinned
+        # version AND a validated provider-specific observed-route proof.
+        # Identity availability alone enables nothing automated.
         provider
         for provider, status in (("codex", codex), ("claude", claude), ("kimi", kimi))
-        if status.identity_available
+        if status.authority_supported
     ]
     zero_proven = not enabled_providers or containment_status != "proven"
     return {

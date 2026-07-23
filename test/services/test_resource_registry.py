@@ -428,17 +428,17 @@ def test_verify_runtime_wiring_reports_unwired_kinds(registry):
     # for a generation must be registered before exposure; the verifier
     # names exactly the unwired classes.
     from cli_agent_orchestrator.services.resource_registry import (
-        RUNTIME_RESOURCE_MANIFEST,
+        MANIFEST_REQUIRED_KINDS,
         verify_runtime_wiring,
     )
 
     missing = verify_runtime_wiring(registry, terminal_id="a1b2c3d4", generation="gen-000042")
-    assert missing == [item["kind"] for item in RUNTIME_RESOURCE_MANIFEST]
+    assert missing == sorted(MANIFEST_REQUIRED_KINDS)
     _declare(registry, "e-fifo", kind="fifo", generation="gen-000042")
     assert verify_runtime_wiring(registry, terminal_id="a1b2c3d4", generation="gen-000042") == [
-        item["kind"] for item in RUNTIME_RESOURCE_MANIFEST if item["kind"] != "fifo"
+        kind for kind in sorted(MANIFEST_REQUIRED_KINDS) if kind != "fifo"
     ]
-    for index, item in enumerate(RUNTIME_RESOURCE_MANIFEST):
-        if item["kind"] != "fifo":
-            _declare(registry, f"e-{item['kind']}", kind=item["kind"], generation="gen-000042")
+    for kind in sorted(MANIFEST_REQUIRED_KINDS):
+        if kind != "fifo":
+            _declare(registry, f"e-{kind}", kind=kind, generation="gen-000042")
     assert verify_runtime_wiring(registry, terminal_id="a1b2c3d4", generation="gen-000042") == []

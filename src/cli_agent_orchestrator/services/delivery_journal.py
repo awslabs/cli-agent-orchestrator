@@ -45,11 +45,17 @@ STATE_SUBMIT_AMBIGUOUS = "submit-ambiguous"
 STATE_CONSUMER_ACKED = "consumer-acked"
 
 # The legal transition set; anything else is refused with zero mutation.
+# (terminal_queued, submit-ambiguous) is the honest ambiguous-accept edge:
+# the provider may have accepted while the journal still reads
+# terminal_queued (response lost before the submitted milestone could be
+# persisted). It never claims submission and is terminal for automated
+# handling, exactly like the post-submitted ambiguity.
 LEGAL_TRANSITIONS = frozenset(
     {
         (None, STATE_ACCEPTED),
         (STATE_ACCEPTED, STATE_TERMINAL_QUEUED),
         (STATE_TERMINAL_QUEUED, STATE_SUBMITTED),
+        (STATE_TERMINAL_QUEUED, STATE_SUBMIT_AMBIGUOUS),
         (STATE_SUBMITTED, STATE_SUBMIT_ACKED),
         (STATE_SUBMITTED, STATE_SUBMIT_AMBIGUOUS),
         (STATE_SUBMIT_ACKED, STATE_CONSUMER_ACKED),

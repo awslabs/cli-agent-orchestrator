@@ -1959,6 +1959,11 @@ async def execute_conditional_destructive(
                 registry=get_plugin_registry(request),
                 expected_generation=body.generation,
                 expected_session=record["session_name"],
+                # This teardown is the endpoint's effect: the heartbeat,
+                # binding/fence, dual-exit, and containment decisions were
+                # made and the single-use intent consumed by
+                # DestructiveEndpoint.execute before this call.
+                via_destructive_endpoint=True,
             )
             if not deleted:
                 raise DestructiveError("teardown returned without a no-survivor proof")
@@ -3035,7 +3040,7 @@ async def delete_terminal(
         # loop so a stalled tmux/FIFO op bounds its blast radius to this one
         # request instead of wedging the whole server (issue #382 fixed this
         # for DELETE /sessions; the per-terminal path had the same hazard).
-        conditional = {}
+        conditional: Dict[str, Any] = {}
         if expected_generation is not None:
             conditional["expected_generation"] = expected_generation
         if expected_session is not None:

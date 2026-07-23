@@ -107,9 +107,34 @@ def test_resume_status_version_checked_and_receipt_bound():
     assert kimi_proven.identity_available and not kimi_proven.authority_supported
     # A provider-specific route receipt promotes ONLY that provider's authority.
     codex_route = pc.resume_status(
-        "codex", installed_version="codex 0.145.0", route_proof={"schema": "route-receipt"}
+        "codex", installed_version="codex 0.145.0", route_proof=_valid_route_proof("codex")
     )
     assert codex_route.authority_supported
+    # An unvalidated/foreign/echo route object never promotes authority.
+    for bad_proof in (
+        {"schema": "route-receipt"},
+        _valid_route_proof("kimi"),
+        {**_valid_route_proof("codex"), "non_echo": False},
+        {**_valid_route_proof("codex"), "observed_effort": ""},
+    ):
+        status = pc.resume_status("codex", installed_version="codex 0.145.0", route_proof=bad_proof)
+        assert status.identity_available and not status.authority_supported
+
+
+def _valid_route_proof(provider: str) -> dict:
+    """A schema-valid cao-route-receipt-v1 for the given provider."""
+    return {
+        "schema": "cao-route-receipt-v1",
+        "provider": provider,
+        "native_session_id": "native-session-1",
+        "native_turn_id": "native-turn-1",
+        "observed_model": "gpt-5.6-sol",
+        "observed_effort": "max",
+        "protocol_version": "app-server/1",
+        "event_sequence": 7,
+        "model_input_digest": "d" * 64,
+        "non_echo": True,
+    }
 
 
 # ------------------------------------------------------------- containment
@@ -224,25 +249,57 @@ def test_capability_claims_derive_from_receipts_never_caller_booleans():
         containment=composition,
         provider_versions={"codex": "codex 0.145.0", "kimi": "kimi 0.29.0"},
         kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"},
-        route_proofs={"codex": {"schema": "route-receipt"}},
+        route_proofs={"codex": _valid_route_proof("codex")},
     )
     assert payload["containment"] == "proven"
     assert payload["observed_route"] == {
-        "codex": "proven",  # only Codex carries a route receipt
+        "codex": "proven",  # only Codex carries a validated route receipt
         "claude": "unsupported",
         "kimi": "unproven",
     }
     assert payload["resume"]["kimi"]["identity_available"] is True
     # Claude's binary was never version-verified: no identity.
     assert payload["resume"]["claude"]["identity_available"] is False
-    assert payload["enabled_providers"] == ["codex", "kimi"]
+    # Identity alone enables nothing: Kimi has identity without route
+    # authority, so only Codex is enabled and bears the automated paths.
+    assert payload["enabled_providers"] == ["codex"]
     assert payload["automated_paths"]["recovery"] is True
+    # Unknown/missing/unsupported route evidence exposes no automated path
+    # even with containment proven and exact pinned versions.
+    identity_only = build_capabilities(
+        containment=composition,
+        provider_versions={"codex": "codex 0.145.0", "kimi": "kimi 0.29.0"},
+        kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"},
+    )
+    assert identity_only["resume"]["codex"]["identity_available"] is True
+    assert identity_only["enabled_providers"] == []
+    assert identity_only["automated_paths"] == {
+        "recovery": False,
+        "finalization": False,
+        "destructive": False,
+    }
+    # An unvalidated route object (wrong schema, foreign provider, echo, or
+    # missing fields) is treated as absent.
+    for bad_proof in (
+        {"schema": "route-receipt"},
+        _valid_route_proof("kimi"),
+        {**_valid_route_proof("codex"), "non_echo": False},
+        {**_valid_route_proof("codex"), "observed_model": None},
+    ):
+        unproven = build_capabilities(
+            containment=composition,
+            provider_versions={"codex": "codex 0.145.0"},
+            route_proofs={"codex": bad_proof},
+        )
+        assert unproven["observed_route"]["codex"] == "unsupported"
+        assert unproven["enabled_providers"] == []
+        assert unproven["automated_paths"]["recovery"] is False
     # Runtime version drift removes the capability.
     drifted = build_capabilities(
         containment=composition,
         provider_versions={"codex": "codex 0.145.1", "kimi": "kimi 0.29.0"},
         kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"},
-        route_proofs={"codex": {"schema": "route-receipt"}},
+        route_proofs={"codex": _valid_route_proof("codex")},
     )
     assert drifted["resume"]["codex"]["identity_available"] is False
     assert drifted["resume"]["codex"]["authority_supported"] is False

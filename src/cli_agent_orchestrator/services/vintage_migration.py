@@ -28,7 +28,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 V2_TABLES = ("managed_launch_v2_reservations", "managed_launch_v2_terminals")
 JOURNAL_TABLE = "v2_migration_journal"
@@ -98,6 +98,55 @@ class RollbackRefused(VintageMigrationError):
     """A rollback was attempted before a complete v2 drain."""
 
 
+class OldBinaryGateRefused(VintageMigrationError):
+    """The exact-old-binary gate observed v2 access or mutation."""
+
+
+def _run_old_binary_gate(gate: Callable[[], Any]) -> dict[str, Any]:
+    """Execute the exact-old-binary proof; refuse on any violation."""
+    verdict = gate()
+    report = {
+        "zero_visibility": bool(verdict.zero_visibility),
+        "surfaces_checked": verdict.surfaces_checked,
+        "violations": list(verdict.violations),
+    }
+    if not report["zero_visibility"]:
+        raise OldBinaryGateRefused(
+            "exact-old-binary gate observed v2 access/mutation; "
+            f"migration/rollout/rollback refused: {report['violations']}"
+        )
+    return report
+
+
+def configured_old_binary_gate() -> Optional[Callable[[], Any]]:
+    """The production exact-old-binary gate, when configured.
+
+    ``CAO_OLD_BINARY_GATE=require`` activates it; ``CAO_OLD_BINARY_REPO``
+    names the git repository holding the old binary's exact source
+    (default: this package's source tree when it is a git checkout) and
+    ``CAO_OLD_BINARY_REF`` pins the old ref (default: the deployed-base
+    H_B constant). With no configuration the gate is absent and the
+    journal records ``not-configured`` — never a proof claim.
+    """
+    import os
+    import tempfile
+
+    if os.environ.get("CAO_OLD_BINARY_GATE") != "require":
+        return None
+    from cli_agent_orchestrator.services import old_binary_rig
+
+    repo = Path(os.environ.get("CAO_OLD_BINARY_REPO") or Path(__file__).resolve().parents[2])
+    ref = os.environ.get("CAO_OLD_BINARY_REF") or old_binary_rig.DEFAULT_OLD_BINARY_REF
+
+    def _gate() -> Any:
+        with tempfile.TemporaryDirectory(prefix="cao-old-binary-gate-") as tmp:
+            return old_binary_rig.prove_old_binary_invisibility(
+                repo=repo, ref=ref, workdir=Path(tmp)
+            )
+
+    return _gate
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -125,12 +174,21 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     )
 
 
-def migrate_v2(db_path: Path) -> dict[str, Any]:
+def migrate_v2(
+    db_path: Path, *, old_binary_gate: Optional[Callable[[], Any]] = None
+) -> dict[str, Any]:
     """Apply the v2 vintage surface migration transactionally (idempotent).
 
     A second run is a no-op beyond the journaled observation; v1 rows are
-    never read or written.  Returns the migration receipt.
+    never read or written.  When ``old_binary_gate`` is supplied, the
+    exact-old-binary invisibility proof runs FIRST and any observed v2
+    access/mutation refuses the migration with zero mutation; the gate
+    outcome (or ``not-configured``) is journaled with the event.  Returns
+    the migration receipt.
     """
+    gate_report: Any = "not-configured"
+    if old_binary_gate is not None:
+        gate_report = _run_old_binary_gate(old_binary_gate)
     path = Path(db_path)
     conn = _connect(path)
     try:
@@ -153,7 +211,10 @@ def migrate_v2(db_path: Path) -> dict[str, Any]:
                 MIGRATION_ID,
                 "migrate",
                 _now(),
-                json.dumps({"already_present": already}, sort_keys=True),
+                json.dumps(
+                    {"already_present": already, "old_binary_gate": gate_report},
+                    sort_keys=True,
+                ),
             ),
         )
         conn.commit()
@@ -197,13 +258,22 @@ def drain_report(db_path: Path) -> dict[str, Any]:
         conn.close()
 
 
-def rollback_v2(db_path: Path) -> dict[str, Any]:
+def rollback_v2(
+    db_path: Path, *, old_binary_gate: Optional[Callable[[], Any]] = None
+) -> dict[str, Any]:
     """Drop the v2 surface transactionally — only after a complete drain.
 
-    Refuses with zero mutation while any v2-owned row exists; a drained
-    rollback drops the v2 tables, journals the event, and leaves every
-    pre-existing v1 row and WAL-committed state intact.
+    Refuses with zero mutation while any v2-owned row exists; when
+    ``old_binary_gate`` is supplied the exact-old-binary invisibility
+    proof must also pass (the old binary becomes the deployed binary on
+    rollback, so any v2 access/mutation it can perform refuses the
+    rollback); a drained rollback drops the v2 tables, journals the event
+    (including the gate outcome), and leaves every pre-existing v1 row
+    and WAL-committed state intact.
     """
+    gate_report: Any = "not-configured"
+    if old_binary_gate is not None:
+        gate_report = _run_old_binary_gate(old_binary_gate)
     report = drain_report(db_path)
     if not report["drained"]:
         raise RollbackRefused(f"v2 rollback refused until a complete drain: {report['tables']}")
@@ -218,7 +288,16 @@ def rollback_v2(db_path: Path) -> dict[str, Any]:
         conn.execute(
             f"INSERT INTO {JOURNAL_TABLE}(event_id, migration_id, action, at, detail) "
             "VALUES (?,?,?,?,?)",
-            (event_id, MIGRATION_ID, "rollback", _now(), json.dumps(report["tables"])),
+            (
+                event_id,
+                MIGRATION_ID,
+                "rollback",
+                _now(),
+                json.dumps(
+                    {"tables": report["tables"], "old_binary_gate": gate_report},
+                    sort_keys=True,
+                ),
+            ),
         )
         conn.commit()
         conn.execute("PRAGMA wal_checkpoint(FULL)")

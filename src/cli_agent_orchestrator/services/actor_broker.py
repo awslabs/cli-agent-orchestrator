@@ -217,6 +217,28 @@ class ActorBroker:
             raise ActorBrokerError("consumed-assertion store has an unknown shape")
         return parsed
 
+    def verify_peer_lineage(self, conn: socket.socket) -> PeerCredentials:
+        """Kernel peer identity + live provider-tree lineage, without issuing.
+
+        The same gate ``issue`` enforces (kernel credentials, then lineage
+        against the live provider process tree), exposed so the bridge can
+        authenticate the provider-originated channel itself. Refusal is
+        fail-closed: ``ActorUnavailable`` on kernel inability,
+        ``ActorRefused`` for any peer outside the provider tree.
+        """
+        try:
+            credentials = peer_credentials(conn)
+        except (OSError, struct.error) as exc:
+            raise ActorUnavailable(f"kernel peer identity unavailable: {exc}") from exc
+        if credentials.pid <= 0:
+            raise ActorUnavailable("kernel reported an invalid peer pid")
+        if not self._lineage(credentials.pid):
+            raise ActorRefused(
+                "peer is outside the live provider process tree for this "
+                "generation (same-UID collector/reconciler/sibling refused)"
+            )
+        return credentials
+
     def issue(
         self,
         conn: socket.socket,

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -126,8 +127,40 @@ def _provider_env(overrides: Optional[dict[str, str]] = None) -> dict[str, str]:
     return env
 
 
+def _launcher_argv(socket_path: pathlib.Path, provider_argv: list[str]) -> list[str]:
+    """Wrap the provider argv with the provider-originated launcher shim.
+
+    The launcher becomes the recorded provider process (the actor broker's
+    provider-tree root) and spawns the real provider as its child, so
+    actor-assertion issuance gains a kernel-verifiable provider-originated
+    channel over the generation-private socket. The launcher proxies
+    stdio byte-transparently, so the provider session is unchanged.
+    """
+    return [
+        sys.executable,
+        "-I",
+        "-m",
+        "cli_agent_orchestrator.services.provider_launcher",
+        "--socket",
+        str(socket_path),
+        "--",
+        *provider_argv,
+    ]
+
+
 class BridgeError(RuntimeError):
     pass
+
+
+class SubmitUncertain(BridgeError):
+    """The provider-boundary outcome is unknowable.
+
+    Raised when a failure occurs after the submission request may have
+    crossed the provider boundary (e.g. response loss, timeout, or
+    connection failure after the request was sent). The provider may have
+    accepted the turn; callers MUST durably record ``submit-ambiguous``
+    evidence rather than asserting either submission or non-submission.
+    """
 
 
 def paths(reservation_id: str) -> dict[str, pathlib.Path]:
@@ -653,6 +686,7 @@ class _ProviderSession:
                 argv.extend(["-c", f"{prefix}.env.{key}={_toml_scalar(item['value'])}"])
             argv.extend(["-c", f"{prefix}.tool_timeout_sec=600.0"])
         argv.extend(["app-server", "--stdio"])
+        argv = _launcher_argv(paths(self.request["reservation_id"])["socket"], argv)
         config_path = pathlib.Path(os.path.expanduser("~/.codex/config.toml"))
         config_before = _file_digest_or_absent(config_path)
         self.rpc = _RpcProcess(
@@ -724,7 +758,9 @@ class _ProviderSession:
         # request, applied over the minimal allowlisted environment.
         env = _provider_env({"KIMI_MODEL_THINKING_EFFORT": self.request["effort"]})
         self.rpc = _RpcProcess(
-            [kimi_bin, "acp"], env=env, companion_identity=self._companion_identity()
+            _launcher_argv(paths(self.request["reservation_id"])["socket"], [kimi_bin, "acp"]),
+            env=env,
+            companion_identity=self._companion_identity(),
         )
         initialize_request = {
             "protocolVersion": 1,
@@ -807,11 +843,20 @@ class _ProviderSession:
                 "cwd": self.request["working_directory"],
                 "approvalPolicy": "never",
             }
-            result = self.rpc.request("turn/start", params, timeout=30.0)
-            turn = result.get("turn") or {}
-            turn_id = turn.get("id")
-            if not isinstance(turn_id, str) or not turn_id:
-                raise BridgeError("Codex turn/start omitted provider turn id")
+            try:
+                result = self.rpc.request("turn/start", params, timeout=30.0)
+                turn = result.get("turn") or {}
+                turn_id = turn.get("id")
+                if not isinstance(turn_id, str) or not turn_id:
+                    raise BridgeError("Codex turn/start omitted provider turn id")
+            except Exception as exc:
+                # The turn/start request may have crossed the provider
+                # boundary before the failure (timeout, connection loss,
+                # malformed or error response after acceptance): the
+                # outcome is unknowable — never assert non-submission.
+                raise SubmitUncertain(
+                    f"Codex turn/start outcome uncertain after provider boundary: {exc}"
+                ) from exc
             evidence = {
                 "method": "turn/start",
                 "request_sha256": _digest(params),
@@ -825,12 +870,6 @@ class _ProviderSession:
             "prompt": [{"type": "text", "text": message}],
             "_meta": meta,
         }
-        wire_offset = self.kimi_wire_path.stat().st_size
-        start_index = self.rpc.notification_count()
-        rpc_id = self.rpc.start_request("session/prompt", params)
-        turn_start = _wait_kimi_turn_start(
-            self.kimi_wire_path, start_offset=wire_offset, timeout=30.0
-        )
 
         def accepted(item: dict[str, Any]) -> bool:
             if item.get("method") != "session/update":
@@ -838,7 +877,23 @@ class _ProviderSession:
             update = item.get("params") or {}
             return update.get("sessionId") == self.provider_session_id
 
-        first_update = self.rpc.wait_notification(accepted, start_index=start_index, timeout=30.0)
+        try:
+            wire_offset = self.kimi_wire_path.stat().st_size
+            start_index = self.rpc.notification_count()
+            rpc_id = self.rpc.start_request("session/prompt", params)
+            turn_start = _wait_kimi_turn_start(
+                self.kimi_wire_path, start_offset=wire_offset, timeout=30.0
+            )
+            first_update = self.rpc.wait_notification(
+                accepted, start_index=start_index, timeout=30.0
+            )
+        except Exception as exc:
+            # The session/prompt request may have crossed the provider
+            # boundary before the failure: the outcome is unknowable —
+            # never assert non-submission.
+            raise SubmitUncertain(
+                f"Kimi session/prompt outcome uncertain after provider boundary: {exc}"
+            ) from exc
         evidence = {
             "method": "session/prompt",
             "request_sha256": _digest(params),
@@ -1164,6 +1219,204 @@ def _build_actor_broker(request: dict[str, Any], session: "_ProviderSession") ->
     )
 
 
+def _register_bridge_resources(target: dict[str, pathlib.Path], request: dict[str, Any]) -> None:
+    """Registry-first registration of the bridge's own v2 resources.
+
+    The generation-private socket, the bridge state tree, and the
+    delivery journal are declared and receipt-marked before the accept
+    loop is exposed, so cleanup/monitors/inventory see them through the
+    registry alone. Re-registration after a crash converges on the live
+    entry for the same generation instead of conflicting.
+    """
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    registry = rr.get_resource_registry()
+    reservation_id = request["reservation_id"]
+    actor = "managed_provider_bridge._serve"
+    entries = (
+        ("socket", f"{reservation_id}/bridge.sock", str(target["socket"])),
+        (
+            "bridge_state",
+            f"managed-provider-sessions/{reservation_id}",
+            str(target["root"]),
+        ),
+        (
+            "db_row_set",
+            f"{reservation_id}/delivery-journal.db",
+            str(target["root"] / "delivery-journal.db"),
+        ),
+    )
+    for kind, entry_id, fs_path in entries:
+        existing = registry.resolve_fs_path(fs_path)
+        if existing is not None and existing["generation"] == request["generation"]:
+            continue  # converge after a crash: the live entry is already ours
+        registry.declare(
+            entry_id=entry_id,
+            kind=kind,
+            protocol_vintage="v2",
+            terminal_id=request["terminal_id"],
+            generation=request["generation"],
+            owner="fork",
+            ownership="owned",
+            constructor_id=actor,
+            deleter_id=actor,
+            rollback_rule="generation-isolated",
+            actor_id=actor,
+            desired_fs_path=fs_path,
+        )
+        registry.register_created(
+            entry_id,
+            actor_id=actor,
+            existence_receipt_digest=rr.receipt_digest(
+                {"entry_id": entry_id, "kind": kind, "fs_path": fs_path}
+            ),
+        )
+
+
+def _deregister_bridge_resources(target: dict[str, pathlib.Path], request: dict[str, Any]) -> None:
+    """Drain/close/delete the bridge's registry entries (best-effort)."""
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    actor = "managed_provider_bridge._serve"
+    try:
+        registry = rr.get_resource_registry()
+        entries = registry.enumerate(
+            terminal_id=request["terminal_id"], generation=request["generation"]
+        )
+    except Exception:  # noqa: BLE001 - teardown never wedges on the registry
+        logger.warning("bridge registry enumeration failed during teardown", exc_info=True)
+        return
+    for entry in entries:
+        if entry["constructor_id"] != actor:
+            continue
+        entry_id = entry["entry_id"]
+        state = entry["lifecycle_state"]
+        absence = rr.receipt_digest({"entry_id": entry_id, "absent": True, "actor": actor})
+        try:
+            if state == "declared":
+                registry.abort(entry_id, actor_id=actor, verified_absence_digest=absence)
+                continue
+            if state in ("created", "active"):
+                registry.drain(entry_id, actor_id=actor)
+                state = "draining"
+            if state == "draining":
+                registry.close(entry_id, actor_id=actor)
+            registry.delete(entry_id, actor_id=actor, verified_absence_digest=absence)
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            logger.warning("bridge resource %s deregistration failed", entry_id, exc_info=True)
+
+
+def _handle_actor_assertion(
+    connection: socket.socket,
+    command: dict[str, Any],
+    broker: Any,
+    provider_channel: dict[str, Any],
+) -> None:
+    """The actor-broker issuance boundary, on its own thread.
+
+    Kernel peer credentials and provider-tree lineage are verified on
+    this generation-private connection. A genuine in-tree peer (the
+    provider child or a descendant) is issued to directly; any other peer
+    (the conductor/bridge client is never in the provider tree) is
+    relayed through the provider-originated channel, where the broker
+    re-verifies kernel peer + lineage on THAT connection at issue time.
+    Runs off the accept loop so a relay wait can never deadlock against
+    the channel's own pending connection.
+    """
+    with connection:
+        try:
+            if broker is None:
+                raise BridgeError("actor broker is unavailable for this generation")
+            required = (
+                "report_sha256",
+                "report_path",
+                "project",
+                "run_id",
+                "obligation_generation",
+                "attempt_id",
+                "native_session_id",
+                "launch_nonce_digest",
+                "route_chain_head",
+            )
+            missing = [
+                field
+                for field in required
+                if not isinstance(command.get(field), str) or not command.get(field)
+            ]
+            if missing:
+                raise BridgeError(f"actor assertion request missing fields: {missing}")
+            fields = {
+                "report_sha256": command["report_sha256"],
+                "report_path": command["report_path"],
+                "project": command["project"],
+                "task_id": command.get("task_id"),
+                "run_id": command["run_id"],
+                "obligation_generation": command["obligation_generation"],
+                "attempt_id": command["attempt_id"],
+                "native_session_id": command["native_session_id"],
+                "launch_nonce_digest": command["launch_nonce_digest"],
+                "route_chain_head": command["route_chain_head"],
+            }
+            from cli_agent_orchestrator.services.actor_broker import ActorRefused
+
+            try:
+                assertion = broker.issue(connection, **fields)
+                issued_via = "direct-provider-peer"
+            except ActorRefused:
+                assertion = _issue_via_provider_channel(broker, provider_channel, fields)
+                issued_via = "provider-channel"
+            response = {"ok": True, "assertion": assertion, "issued_via": issued_via}
+        except Exception as exc:  # noqa: BLE001 - structured socket failure
+            response = {"ok": False, "error": str(exc)}
+        connection.sendall(_canonical(response) + b"\n")
+
+
+def _issue_via_provider_channel(
+    broker: Any, provider_channel: dict[str, Any], fields: dict[str, Any]
+) -> dict[str, Any]:
+    """Provider-originated issuance for a non-provider (conductor) peer.
+
+    The conductor/bridge client can never satisfy the provider-tree
+    lineage rule (it is not descended from the provider child — the
+    bridge is its ancestor). Issuance therefore happens on the
+    provider-originated channel: the request is handed to the live
+    provider tree, its ack proves the tree originated it, and the broker
+    issues on the channel connection whose kernel peer is the provider
+    launcher itself. The same-UID conductor/collector/reconciler peer is
+    never issued to directly.
+    """
+    request_id = str(uuid.uuid4())
+    with provider_channel["cv"]:
+        deadline = time.monotonic() + 5.0
+        while provider_channel["conn"] is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BridgeError(
+                    "actor-unavailable: no live provider-originated channel " "for this generation"
+                )
+            provider_channel["cv"].wait(remaining)
+        channel_conn = provider_channel["conn"]
+    with provider_channel["write_lock"]:
+        channel_conn.sendall(_canonical({"op": "issue-request", "request_id": request_id}) + b"\n")
+    with provider_channel["cv"]:
+        deadline = time.monotonic() + 10.0
+        while request_id not in provider_channel["acks"]:
+            if provider_channel["conn"] is None:
+                raise BridgeError(
+                    "actor-unavailable: provider-originated channel dropped " "during issuance"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BridgeError(
+                    "actor-unavailable: the provider tree did not acknowledge "
+                    "the issuance request"
+                )
+            provider_channel["cv"].wait(remaining)
+        provider_channel["acks"].pop(request_id, None)
+    assertion: dict[str, Any] = broker.issue(channel_conn, **fields)
+    return assertion
+
+
 def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
     state = {
         "bridge_version": BRIDGE_VERSION,
@@ -1175,6 +1428,7 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
     }
     _atomic_json(target["state"], state)
     session: Optional[_ProviderSession] = None
+    registered = False
     with contextlib.suppress(FileNotFoundError):
         target["socket"].unlink()
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1193,24 +1447,117 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
         # call. Neither capability existed before this wiring.
         broker = _build_actor_broker(request, session)
         journal: Any = None
+        # Registry-first: the bridge's own socket/state/journal resources
+        # are declared and receipt-marked before the accept loop is
+        # exposed (fail-closed, like the v2 terminal constructor).
+        _register_bridge_resources(target, request)
+        registered = True
         print(
             f"[managed-provider-ready] provider={request['provider']} "
             f"session={readiness['provider_session_id']} generation={request['generation']}",
             flush=True,
         )
-        while True:
-            connection, _ = server.accept()
-            with connection:
-                raw = bytearray()
-                while b"\n" not in raw:
-                    block = connection.recv(65536)
+        # The provider-originated issuance channel: exactly one connection
+        # whose kernel peer is inside the live provider process tree (the
+        # launcher shim). Issuance for a non-provider (conductor) peer is
+        # relayed through it; the broker still performs its own kernel +
+        # lineage verification on the channel connection at issue time.
+        provider_channel: dict[str, Any] = {
+            "conn": None,
+            "peer": None,
+            "write_lock": threading.Lock(),
+            "cv": threading.Condition(),
+            "acks": {},
+        }
+
+        def _channel_reader(channel_conn: socket.socket) -> None:
+            try:
+                pending = bytearray()
+                while True:
+                    block = channel_conn.recv(65536)
                     if not block:
                         break
-                    raw.extend(block)
-                    if len(raw) > 4 * 1024 * 1024:
-                        raise BridgeError("bridge request exceeded 4 MiB")
+                    pending.extend(block)
+                    if len(pending) > 4 * 1024 * 1024:
+                        break
+                    while b"\n" in pending:
+                        line, _, rest = bytes(pending).partition(b"\n")
+                        pending = bytearray(rest)
+                        try:
+                            message = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if message.get("op") == "issue-ack":
+                            with provider_channel["cv"]:
+                                provider_channel["acks"][message.get("request_id")] = message
+                                provider_channel["cv"].notify_all()
+            finally:
+                with provider_channel["cv"]:
+                    if provider_channel["conn"] is channel_conn:
+                        provider_channel["conn"] = None
+                        provider_channel["peer"] = None
+                    provider_channel["cv"].notify_all()
+                with contextlib.suppress(Exception):
+                    channel_conn.close()
+
+        while True:
+            connection, _ = server.accept()
+            raw = bytearray()
+            while b"\n" not in raw:
+                block = connection.recv(65536)
+                if not block:
+                    break
+                raw.extend(block)
+                if len(raw) > 4 * 1024 * 1024:
+                    connection.close()
+                    raise BridgeError("bridge request exceeded 4 MiB")
+            try:
+                command = json.loads(bytes(raw).split(b"\n", 1)[0])
+            except json.JSONDecodeError as exc:
+                with connection:
+                    connection.sendall(_canonical({"ok": False, "error": str(exc)}) + b"\n")
+                continue
+            if isinstance(command, dict) and command.get("op") == "provider-channel":
+                # The provider-originated channel: kernel-verified to the
+                # live provider tree, single-bind, never closed by the
+                # accept loop (the reader thread owns its lifetime).
                 try:
-                    command = json.loads(bytes(raw).split(b"\n", 1)[0])
+                    if broker is None:
+                        raise BridgeError("actor broker is unavailable for this generation")
+                    peer = broker.verify_peer_lineage(connection)
+                    with provider_channel["cv"]:
+                        if provider_channel["conn"] is not None:
+                            raise BridgeError(
+                                "a provider-originated channel is already bound "
+                                "for this generation"
+                            )
+                        provider_channel["conn"] = connection
+                        provider_channel["peer"] = peer
+                    threading.Thread(
+                        target=_channel_reader, args=(connection,), daemon=True
+                    ).start()
+                    connection.sendall(
+                        _canonical({"ok": True, "provider_channel": "bound"}) + b"\n"
+                    )
+                except Exception as exc:  # noqa: BLE001 - structured refusal
+                    with contextlib.suppress(Exception):
+                        connection.sendall(_canonical({"ok": False, "error": str(exc)}) + b"\n")
+                    connection.close()
+                continue
+            if isinstance(command, dict) and command.get("op") == "actor-assertion":
+                # Issuance may relay through the provider-originated
+                # channel, which binds on a SEPARATE accepted connection.
+                # Handling this op on its own thread keeps the accept loop
+                # free to accept that channel (a relay waited on in the
+                # loop itself would deadlock against the backlog).
+                threading.Thread(
+                    target=_handle_actor_assertion,
+                    args=(connection, command, broker, provider_channel),
+                    daemon=True,
+                ).start()
+                continue
+            with connection:
+                try:
                     if command.get("op") == "status":
                         response = {"ok": True, **state}
                     elif command.get("op") == "admit":
@@ -1240,7 +1587,30 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                                     )
                                 journal.open_intent(obligation, delivery_id, _digest(command))
                                 journal.mark_terminal_queued(obligation, delivery_id)
-                            receipt = session.admit(command)
+                            try:
+                                receipt = session.admit(command)
+                            except SubmitUncertain as exc:
+                                # Response loss after the provider boundary:
+                                # the provider may have accepted. Record the
+                                # ambiguity durably BEFORE returning the
+                                # error; never downgrade to terminal_queued,
+                                # never replay, never assert non-submission.
+                                if journaled:
+                                    journal.mark_submit_ambiguous(
+                                        obligation,
+                                        delivery_id,
+                                        evidence_digest=_digest(
+                                            {
+                                                "kind": "submit-ambiguous",
+                                                "command_sha256": _digest(command),
+                                                "error": str(exc),
+                                            }
+                                        ),
+                                    )
+                                raise BridgeError(
+                                    "provider admission outcome uncertain; "
+                                    f"recorded submit-ambiguous: {exc}"
+                                ) from exc
                             if journaled:
                                 journal.mark_submitted(obligation, delivery_id)
                             state.update(
@@ -1277,49 +1647,32 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                                 journal = DeliveryJournal(target["root"] / "delivery-journal.db")
                             journal.open_intent(obligation, message_id, _digest(command))
                             journal.mark_terminal_queued(obligation, message_id)
-                        receipt = session.deliver_inbox(command)
+                        try:
+                            receipt = session.deliver_inbox(command)
+                        except SubmitUncertain as exc:
+                            # Response loss after the provider boundary:
+                            # record submit-ambiguous durably before
+                            # returning the error; never replay blindly.
+                            if journaled:
+                                journal.mark_submit_ambiguous(
+                                    obligation,
+                                    message_id,
+                                    evidence_digest=_digest(
+                                        {
+                                            "kind": "submit-ambiguous",
+                                            "command_sha256": _digest(command),
+                                            "error": str(exc),
+                                        }
+                                    ),
+                                )
+                            raise BridgeError(
+                                "inbox delivery outcome uncertain; "
+                                f"recorded submit-ambiguous: {exc}"
+                            ) from exc
                         if journaled:
                             journal.mark_submitted(obligation, message_id)
                             journal.mark_submit_acked(obligation, message_id)
                         response = {"ok": True, "receipt": receipt}
-                    elif command.get("op") == "actor-assertion":
-                        # The real actor-broker issuance boundary: kernel
-                        # peer credentials and provider-tree lineage are
-                        # verified on THIS generation-private connection.
-                        if broker is None:
-                            raise BridgeError("actor broker is unavailable for this generation")
-                        required = (
-                            "report_sha256",
-                            "report_path",
-                            "project",
-                            "run_id",
-                            "obligation_generation",
-                            "attempt_id",
-                            "native_session_id",
-                            "launch_nonce_digest",
-                            "route_chain_head",
-                        )
-                        missing = [
-                            field
-                            for field in required
-                            if not isinstance(command.get(field), str) or not command.get(field)
-                        ]
-                        if missing:
-                            raise BridgeError(f"actor assertion request missing fields: {missing}")
-                        assertion = broker.issue(
-                            connection,
-                            report_sha256=command["report_sha256"],
-                            report_path=command["report_path"],
-                            project=command["project"],
-                            task_id=command.get("task_id"),
-                            run_id=command["run_id"],
-                            obligation_generation=command["obligation_generation"],
-                            attempt_id=command["attempt_id"],
-                            native_session_id=command["native_session_id"],
-                            launch_nonce_digest=command["launch_nonce_digest"],
-                            route_chain_head=command["route_chain_head"],
-                        )
-                        response = {"ok": True, "assertion": assertion}
                     else:
                         raise BridgeError("unsupported managed bridge operation")
                 except Exception as exc:  # noqa: BLE001 - structured socket failure
@@ -1336,6 +1689,8 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
             target["socket"].unlink()
         if session is not None:
             session.close()
+        if registered:
+            _deregister_bridge_resources(target, request)
     return 0
 
 

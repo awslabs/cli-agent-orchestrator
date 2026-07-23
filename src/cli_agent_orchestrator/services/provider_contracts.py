@@ -170,6 +170,48 @@ class ProviderResumeStatus:
     reason: str
 
 
+ROUTE_PROOF_SCHEMA = "cao-route-receipt-v1"
+
+# The §3.1 PF-2 fields a model-input-bound non-echo route receipt must
+# carry before any provider may bear automated-recovery/strongest-route
+# authority.
+ROUTE_PROOF_REQUIRED_FIELDS = (
+    "native_session_id",
+    "native_turn_id",
+    "observed_model",
+    "observed_effort",
+    "protocol_version",
+    "event_sequence",
+    "model_input_digest",
+)
+
+
+def validate_route_proof(provider: str, route_proof: Optional[dict]) -> bool:
+    """True only for a validated provider-specific observed-route proof.
+
+    Identity availability alone never satisfies this: the receipt must be
+    the pinned ``cao-route-receipt-v1`` schema for THIS provider, carry
+    every §3.1 field (native session/thread id, turn id, resolved model,
+    effective effort, protocol version, event sequence), be bound to the
+    model input, and be explicitly non-echo. Unknown, missing, malformed,
+    or unsupported route evidence validates to False, which must expose no
+    automated path.
+    """
+    if not isinstance(route_proof, dict):
+        return False
+    if route_proof.get("schema") != ROUTE_PROOF_SCHEMA:
+        return False
+    if route_proof.get("provider") != provider:
+        return False
+    for field in ROUTE_PROOF_REQUIRED_FIELDS:
+        value = route_proof.get(field)
+        if value is None or (isinstance(value, str) and not value):
+            return False
+    if route_proof.get("non_echo") is not True:
+        return False
+    return True
+
+
 def _version_matches(provider: str, installed_version: Optional[str]) -> bool:
     """True only when the installed version is known and matches the pin."""
     if installed_version is None:
@@ -204,7 +246,7 @@ def resume_status(
         return ProviderResumeStatus(
             provider=provider,
             identity_available=version_ok,
-            authority_supported=version_ok and route_proof is not None,
+            authority_supported=version_ok and validate_route_proof(provider, route_proof),
             reason=(
                 "resume identity available (app-server thread id); automated "
                 "recovery/strongest-route authority unsupported until a "

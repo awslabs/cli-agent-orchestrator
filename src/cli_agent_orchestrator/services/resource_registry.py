@@ -409,6 +409,28 @@ class ResourceRegistry:
         finally:
             conn.close()
 
+    def resolve_fs_path(self, fs_path: Any) -> Optional[dict[str, Any]]:
+        """The live entry owning a filesystem identity, or None.
+
+        Registry-first ownership lookup for retention/cleanup/deleters: a
+        path with a live (declared/created/active/draining) entry is
+        registry-owned and no legacy path may delete it. Returns the full
+        entry dict so callers can check vintage, owner, and generation.
+        """
+        conn = self._connect()
+        try:
+            row: Optional[sqlite3.Row] = conn.execute(
+                "SELECT * FROM resource WHERE lifecycle_state IN "
+                "('declared','created','active','draining') "
+                "AND (desired_fs_path=? OR observed_fs_path=?)",
+                (str(fs_path), str(fs_path)),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._entry_dict(conn, row)
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------ writes
 
     def declare(
@@ -794,45 +816,304 @@ class ResourceRegistry:
 # The registry is authoritative only if every runtime constructor,
 # lookup, monitor, and deleter is registered BEFORE the inventory or
 # cleanup APIs are exposed.  RUNTIME_RESOURCE_MANIFEST is the checked
-# source manifest of the resource classes the terminal lifecycle wires;
-# verify_runtime_wiring compares it against the durable entries for one
-# generation.
+# source manifest of every resource class the v2 terminal/bridge
+# lifecycle wires, in the exact spec format {call_site (path:line),
+# api_verb, resource_kind, constructor_id}; verify_runtime_wiring
+# compares it against the durable entries for one generation, and the
+# acceptance tests validate its shape, coverage, and call-site truth.
 
 import hashlib  # noqa: E402
 import threading  # noqa: E402
 
+# Registry API verbs a call site may use (the mandatory API surface).
+MANIFEST_API_VERBS = frozenset(
+    {
+        "declare",
+        "register_created",
+        "resolve",
+        "resolve_fs_path",
+        "monitor",
+        "drain",
+        "close",
+        "delete",
+        "enumerate",
+    }
+)
+
+_TS = "src/cli_agent_orchestrator/services/terminal_service.py"
+_CS = "src/cli_agent_orchestrator/services/cleanup_service.py"
+_FR = "src/cli_agent_orchestrator/services/fifo_reader.py"
+_BR = "src/cli_agent_orchestrator/services/managed_provider_bridge.py"
+_DJ = "src/cli_agent_orchestrator/services/delivery_journal.py"
+_SE = "src/cli_agent_orchestrator/services/session_env.py"
+_HB = "src/cli_agent_orchestrator/services/heartbeat_store.py"
+
+_CREATE = "terminal_service.create_terminal"
+_DELETE = "terminal_service.delete_terminal"
+_BRIDGE = "managed_provider_bridge._serve"
+
 RUNTIME_RESOURCE_MANIFEST: tuple[dict[str, str], ...] = (
+    # --- terminal log artifacts (constructor + generation deleter + retention)
     {
-        "kind": "fifo",
-        "constructor": "terminal_service.create_terminal",
-        "deleter": "terminal_service.delete_terminal",
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "log",
+        "constructor_id": _CREATE,
     },
     {
-        "kind": "log",
-        "constructor": "terminal_service.create_terminal",
-        "deleter": "terminal_service.delete_terminal",
+        "call_site": f"{_TS}:359",
+        "api_verb": "delete",
+        "resource_kind": "log",
+        "constructor_id": _DELETE,
     },
     {
-        "kind": "scrollback",
-        "constructor": "terminal_service.delete_terminal",
-        "deleter": "cleanup_service.cleanup_old_data",
+        "call_site": f"{_CS}:99",
+        "api_verb": "resolve_fs_path",
+        "resource_kind": "log",
+        "constructor_id": "cleanup_service.cleanup_old_data",
     },
     {
-        "kind": "snapshot",
-        "constructor": "terminal_service.delete_terminal",
-        "deleter": "cleanup_service.cleanup_old_data",
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "scrollback",
+        "constructor_id": _CREATE,
     },
     {
-        "kind": "tmux_window",
-        "constructor": "terminal_service.create_terminal",
-        "deleter": "terminal_service.delete_terminal",
+        "call_site": f"{_TS}:359",
+        "api_verb": "delete",
+        "resource_kind": "scrollback",
+        "constructor_id": _DELETE,
     },
     {
-        "kind": "provider_instance",
-        "constructor": "terminal_service.create_terminal",
-        "deleter": "terminal_service.delete_terminal",
+        "call_site": f"{_CS}:99",
+        "api_verb": "resolve_fs_path",
+        "resource_kind": "scrollback",
+        "constructor_id": "cleanup_service.cleanup_old_data",
+    },
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "snapshot",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_TS}:359",
+        "api_verb": "delete",
+        "resource_kind": "snapshot",
+        "constructor_id": _DELETE,
+    },
+    {
+        "call_site": f"{_CS}:99",
+        "api_verb": "resolve_fs_path",
+        "resource_kind": "snapshot",
+        "constructor_id": "cleanup_service.cleanup_old_data",
+    },
+    # --- FIFO + pipe-pane + liveness watchdog
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "fifo",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_FR}:166",
+        "api_verb": "register_created",
+        "resource_kind": "fifo",
+        "constructor_id": "fifo_reader.create_reader",
+    },
+    {
+        "call_site": f"{_FR}:193",
+        "api_verb": "delete",
+        "resource_kind": "fifo",
+        "constructor_id": "fifo_reader.stop_reader",
+    },
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "pipe_pane",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_TS}:359",
+        "api_verb": "delete",
+        "resource_kind": "pipe_pane",
+        "constructor_id": _DELETE,
+    },
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "watchdog",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_FR}:380",
+        "api_verb": "monitor",
+        "resource_kind": "watchdog",
+        "constructor_id": "fifo_reader._ensure_watchdog",
+    },
+    # --- tmux + provider + DB row set
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "tmux_window",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_TS}:359",
+        "api_verb": "delete",
+        "resource_kind": "tmux_window",
+        "constructor_id": _DELETE,
+    },
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "provider_instance",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_TS}:359",
+        "api_verb": "delete",
+        "resource_kind": "provider_instance",
+        "constructor_id": _DELETE,
+    },
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "db_row_set",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_TS}:359",
+        "api_verb": "delete",
+        "resource_kind": "db_row_set",
+        "constructor_id": _DELETE,
+    },
+    # --- session env, herdr, status/memory maps, curator lock
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "session_env",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_SE}:120",
+        "api_verb": "register_created",
+        "resource_kind": "session_env",
+        "constructor_id": "session_env.set_session_env",
+    },
+    {
+        "call_site": f"{_SE}:173",
+        "api_verb": "delete",
+        "resource_kind": "session_env",
+        "constructor_id": "session_env.clear_session_env",
+    },
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "herdr",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_TS}:359",
+        "api_verb": "delete",
+        "resource_kind": "herdr",
+        "constructor_id": _DELETE,
+    },
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "status_map",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_TS}:359",
+        "api_verb": "delete",
+        "resource_kind": "status_map",
+        "constructor_id": _DELETE,
+    },
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "memory_injection",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_TS}:359",
+        "api_verb": "delete",
+        "resource_kind": "memory_injection",
+        "constructor_id": _DELETE,
+    },
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "curator_lock",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_TS}:359",
+        "api_verb": "delete",
+        "resource_kind": "curator_lock",
+        "constructor_id": _DELETE,
+    },
+    # --- companion lock/state dir (shared, monitor-only) + bridge resources
+    {
+        "call_site": f"{_TS}:211",
+        "api_verb": "declare",
+        "resource_kind": "other",
+        "constructor_id": _CREATE,
+    },
+    {
+        "call_site": f"{_HB}:219",
+        "api_verb": "monitor",
+        "resource_kind": "other",
+        "constructor_id": "heartbeat_store.issue_fencing_token",
+    },
+    {
+        "call_site": f"{_BR}:1222",
+        "api_verb": "declare",
+        "resource_kind": "socket",
+        "constructor_id": _BRIDGE,
+    },
+    {
+        "call_site": f"{_BR}:1276",
+        "api_verb": "delete",
+        "resource_kind": "socket",
+        "constructor_id": _BRIDGE,
+    },
+    {
+        "call_site": f"{_BR}:1222",
+        "api_verb": "declare",
+        "resource_kind": "bridge_state",
+        "constructor_id": _BRIDGE,
+    },
+    {
+        "call_site": f"{_BR}:1276",
+        "api_verb": "delete",
+        "resource_kind": "bridge_state",
+        "constructor_id": _BRIDGE,
+    },
+    {
+        "call_site": f"{_BR}:1222",
+        "api_verb": "declare",
+        "resource_kind": "db_row_set",
+        "constructor_id": _BRIDGE,
+    },
+    {
+        "call_site": f"{_DJ}:110",
+        "api_verb": "register_created",
+        "resource_kind": "db_row_set",
+        "constructor_id": "delivery_journal.DeliveryJournal",
+    },
+    {
+        "call_site": f"{_BR}:1276",
+        "api_verb": "delete",
+        "resource_kind": "db_row_set",
+        "constructor_id": _BRIDGE,
     },
 )
+
+# Kinds every v2 generation must have registered before exposure.
+MANIFEST_REQUIRED_KINDS = frozenset(item["resource_kind"] for item in RUNTIME_RESOURCE_MANIFEST)
 
 _REGISTRY_SINGLETON: Optional["ResourceRegistry"] = None
 _REGISTRY_LOCK = threading.Lock()
@@ -877,4 +1158,4 @@ def verify_runtime_wiring(
     """
     entries = registry.enumerate(terminal_id=terminal_id, generation=generation)
     present = {entry["kind"] for entry in entries}
-    return [item["kind"] for item in RUNTIME_RESOURCE_MANIFEST if item["kind"] not in present]
+    return [kind for kind in sorted(MANIFEST_REQUIRED_KINDS) if kind not in present]

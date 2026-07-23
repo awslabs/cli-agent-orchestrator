@@ -702,13 +702,20 @@ def _migrate_managed_launch_v2() -> None:
     reader or deleter can see v2 rows.  ``protocol_vintage`` is pinned to
     'v2' at the DDL level so a v2 row can never silently downgrade.  The
     real transactional migration (with journaled rollback/drain) lives in
-    ``services/vintage_migration.py``; this delegates to it.
+    ``services/vintage_migration.py``; this delegates to it.  When
+    ``CAO_OLD_BINARY_GATE=require`` is configured, the exact-old-binary
+    invisibility proof (H_B's actual entrypoints against v2 forward state)
+    runs as the rollout gate first; a refusal fails closed here — the v2
+    surface is simply never created, so exposure never occurs.
     """
     from cli_agent_orchestrator.constants import DATABASE_FILE
     from cli_agent_orchestrator.services import vintage_migration
 
     try:
-        vintage_migration.migrate_v2(DATABASE_FILE)
+        vintage_migration.migrate_v2(
+            DATABASE_FILE,
+            old_binary_gate=vintage_migration.configured_old_binary_gate(),
+        )
     except Exception as e:  # noqa: BLE001 - the operation path fails closed
         logger.warning(f"managed-launch v2 migration failed: {e}")
 

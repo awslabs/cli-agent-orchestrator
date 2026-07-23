@@ -106,6 +106,17 @@ class TerminalGenerationMismatchError(ValueError):
     409 at the API boundary (distinct from a plain 404 not-found)."""
 
 
+class DestructiveEndpointRequiredError(TerminalGenerationMismatchError):
+    """A v2 terminal row was targeted by a legacy destructive path.
+
+    Every v2 destructive action — including an ordinary terminal DELETE —
+    is lawful only as the effect of the conditional destructive endpoint
+    (exact heartbeat, identity/fence, dual-exit, and containment
+    decisions). A legacy caller carries no endpoint-issued intent, so the
+    teardown refuses with zero mutation. Mapped to HTTP 409 like every
+    other conditional-identity refusal."""
+
+
 _SHELL_COMMANDS = frozenset({"sh", "bash", "zsh", "dash", "fish", "csh", "tcsh", "ksh", "login"})
 
 
@@ -197,43 +208,116 @@ SOFT_ENFORCEMENT_PROVIDERS = {
 }
 
 
-def _register_v2_terminal_resources(terminal_id: str, generation: str, window_name: str) -> None:
+def _register_v2_terminal_resources(
+    terminal_id: str, generation: str, window_name: str, session_name: str
+) -> None:
     """Journal-first registration of a v2 generation's runtime resources.
 
     The code-owned resource registry is the authority for the v2/managed
     lifecycle: every resource the runtime constructs for a v2 generation
     is declared and receipt-marked here, before the generation is
     exposed.  Legacy v1 surfaces predate the registry and stay outside
-    its authority boundary.
+    its authority boundary.  Owned identities embed their entry_id so the
+    create-to-capture crash window stays discoverable (registry rule);
+    the per-generation companion dir is shared among the heartbeat/fence/
+    broker/destructive writers and is registered monitor-only.
     """
+    from cli_agent_orchestrator.constants import COMPANION_DIR
     from cli_agent_orchestrator.services import resource_registry as rr
 
     registry = rr.get_resource_registry()
-    resources: list[tuple[str, str, dict[str, Any]]] = [
-        ("fifo", f"{terminal_id}.fifo", {"desired_fs_path": str(FIFO_DIR / f"{terminal_id}.fifo")}),
+    constructor = "terminal_service.create_terminal"
+    resources: list[tuple[str, str, str, dict[str, Any]]] = [
+        (
+            "fifo",
+            f"{terminal_id}.fifo",
+            "owned",
+            {"desired_fs_path": str(FIFO_DIR / f"{terminal_id}.fifo")},
+        ),
         (
             "log",
             f"{terminal_id}.log",
+            "owned",
             {"desired_fs_path": str(TERMINAL_LOG_DIR / f"{terminal_id}.log")},
         ),
         (
             "scrollback",
             f"{terminal_id}.scrollback",
+            "owned",
             {"desired_fs_path": str(TERMINAL_LOG_DIR / f"{terminal_id}.scrollback")},
         ),
         (
             "snapshot",
             f"{terminal_id}.snapshot.json",
+            "owned",
             {"desired_fs_path": str(TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json")},
         ),
-        ("tmux_window", window_name, {"desired_tmux_name": window_name}),
+        ("tmux_window", window_name, "owned", {"desired_tmux_name": window_name}),
         (
             "provider_instance",
             f"{terminal_id}.provider",
-            {"desired_db_key": f"provider:{terminal_id}"},
+            "owned",
+            {"desired_db_key": f"provider:{terminal_id}.provider"},
+        ),
+        (
+            "session_env",
+            f"{terminal_id}.session-env",
+            "owned",
+            {"desired_db_key": f"session_env:{session_name}:{terminal_id}.session-env"},
+        ),
+        (
+            "herdr",
+            f"{terminal_id}.herdr",
+            "owned",
+            {"desired_db_key": f"herdr:{terminal_id}.herdr"},
+        ),
+        (
+            "pipe_pane",
+            f"{terminal_id}.pipe-pane",
+            "owned",
+            {"desired_db_key": f"pipe_pane:{terminal_id}.pipe-pane"},
+        ),
+        (
+            "watchdog",
+            f"{terminal_id}.watchdog",
+            "owned",
+            {"desired_db_key": f"watchdog:{terminal_id}.watchdog"},
+        ),
+        (
+            "status_map",
+            f"{terminal_id}.status-map",
+            "owned",
+            {"desired_memory_key": f"status:{terminal_id}.status-map"},
+        ),
+        (
+            "memory_injection",
+            f"{terminal_id}.memory-injection",
+            "owned",
+            {"desired_memory_key": f"memory-injection:{terminal_id}.memory-injection"},
+        ),
+        (
+            "curator_lock",
+            f"{terminal_id}.curator-lock",
+            "owned",
+            {"desired_memory_key": f"curator-lock:{terminal_id}.curator-lock"},
+        ),
+        (
+            "db_row_set",
+            f"{terminal_id}.db-row",
+            "owned",
+            {"desired_db_key": f"managed_launch_v2_terminals:{terminal_id}.db-row"},
+        ),
+        (
+            # The per-generation companion dir (heartbeat/fence/broker/
+            # destructive state and their lock sidecars) is written by
+            # several subsystems; registered monitor-only as shared.
+            "other",
+            f"{terminal_id}.companion",
+            "shared",
+            {"desired_fs_path": str(COMPANION_DIR / terminal_id / generation)},
         ),
     ]
-    for kind, entry_id, identity in resources:
+    for kind, entry_id, ownership, identity in resources:
         registry.declare(
             entry_id=entry_id,
             kind=kind,
@@ -241,11 +325,12 @@ def _register_v2_terminal_resources(terminal_id: str, generation: str, window_na
             terminal_id=terminal_id,
             generation=generation,
             owner="fork",
-            ownership="owned",
-            constructor_id="terminal_service.create_terminal",
+            ownership=ownership,
+            constructor_id=constructor,
             deleter_id="terminal_service.delete_terminal",
+            monitor_id=("heartbeat_store.issue_fencing_token" if kind == "other" else None),
             rollback_rule="generation-isolated",
-            actor_id="terminal_service.create_terminal",
+            actor_id=constructor,
             **identity,
         )
         receipt = rr.receipt_digest(
@@ -257,11 +342,18 @@ def _register_v2_terminal_resources(terminal_id: str, generation: str, window_na
                 **identity,
             }
         )
-        registry.register_created(
-            entry_id,
-            actor_id="terminal_service.create_terminal",
-            existence_receipt_digest=receipt,
-        )
+        if ownership == "owned":
+            registry.register_created(
+                entry_id,
+                actor_id=constructor,
+                existence_receipt_digest=receipt,
+            )
+        else:
+            registry.monitor(
+                entry_id,
+                monitor_id="heartbeat_store.issue_fencing_token",
+                actor_id=constructor,
+            )
 
 
 def _deregister_v2_terminal_resources(terminal_id: str, generation: str) -> None:
@@ -572,7 +664,9 @@ async def create_terminal(
             # The v2 generation's runtime resources are registered
             # journal-first (fail-closed: the v2 plane is the registry's
             # authority scope) before the generation is exposed.
-            _register_v2_terminal_resources(terminal_id, terminal_generation, window_name)
+            _register_v2_terminal_resources(
+                terminal_id, terminal_generation, window_name, session_name
+            )
         else:
             db_create_terminal(
                 terminal_id,
@@ -1556,8 +1650,18 @@ def delete_terminal(
     *,
     expected_generation: str | None = None,
     expected_session: str | None = None,
+    via_destructive_endpoint: bool = False,
 ) -> bool:
-    """Delete terminal and kill its tmux window."""
+    """Delete terminal and kill its tmux window.
+
+    A v2 terminal row (or v2 companion binding state for the claimed
+    generation) is never torn down by a legacy caller: every v2
+    destructive action is lawful only as the effect of the conditional
+    destructive endpoint, which has already made the exact heartbeat,
+    identity/fence, dual-exit, and containment decisions and consumed its
+    single-use intent. The endpoint's effect closure passes
+    ``via_destructive_endpoint=True``; every other caller is refused with
+    zero mutation before any external subsystem is touched."""
     try:
         # P1-1 (final conformance §20.2f): expected_session without the exact
         # generation NEVER degrades to ID-only destruction — a session name is
@@ -1567,6 +1671,32 @@ def delete_terminal(
                 f"terminal {terminal_id} cleanup supplied a session identity "
                 "without the exact generation; refusing ID-only destruction"
             )
+        if not via_destructive_endpoint:
+            v2_row = get_terminal_metadata_v2(terminal_id)
+            if v2_row is not None:
+                raise DestructiveEndpointRequiredError(
+                    f"terminal {terminal_id} is a v2 managed row (generation "
+                    f"{v2_row.get('generation')!r}); legacy deletion is "
+                    "refused with zero mutation — v2 teardown is lawful only "
+                    "through the conditional destructive endpoint "
+                    "(POST /managed/destructive) with its endpoint-issued "
+                    "intent, exact heartbeat, identity/fence, dual-exit, and "
+                    "containment decisions"
+                )
+            if expected_generation is not None:
+                from cli_agent_orchestrator.constants import COMPANION_DIR
+                from cli_agent_orchestrator.services.destructive_endpoint import (
+                    binding_record_path,
+                )
+
+                if binding_record_path(COMPANION_DIR, terminal_id, expected_generation).exists():
+                    raise DestructiveEndpointRequiredError(
+                        f"terminal {terminal_id} generation "
+                        f"{expected_generation!r} has v2 companion binding "
+                        "state; legacy deletion is refused with zero "
+                        "mutation — teardown is lawful only through the "
+                        "conditional destructive endpoint"
+                    )
         # Managed cleanup claims the exact DB incarnation before any external
         # destructive action. If the id now names a replacement generation,
         # preserve every resource and report the mismatch.  v2 managed

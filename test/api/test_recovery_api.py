@@ -254,3 +254,27 @@ def test_v1_surface_unaffected_by_v2(client):
     response = client.get("/managed-launch/capabilities")
     assert response.status_code == 200
     assert response.json()["protocol_version"] == "cao-managed-launch-v1"
+
+
+def test_generic_delete_of_v2_row_is_refused_without_endpoint_intent(client, isolated_memory_db):
+    """The ordinary DELETE route can never tear down a v2 row: without an
+    endpoint-issued intent the service refuses with zero mutation (409)."""
+    from cli_agent_orchestrator.clients import database
+
+    generation = str(uuid.uuid4())
+    database.create_terminal_v2(
+        "a1b2c3d4",
+        "cao-test",
+        "managed-a1b2c3d4-000000000000",
+        "codex",
+        generation=generation,
+    )
+    bare = client.delete("/terminals/a1b2c3d4")
+    assert bare.status_code == 409
+    assert "conditional destructive endpoint" in bare.json()["detail"]
+    conditional = client.delete(
+        f"/terminals/a1b2c3d4?expected_generation={generation}&expected_session=cao-test"
+    )
+    assert conditional.status_code == 409
+    # Zero mutation: the v2 row survives both attempts.
+    assert database.get_terminal_metadata_v2("a1b2c3d4") is not None

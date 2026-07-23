@@ -61,6 +61,65 @@ def _is_v2_owned_row(terminal, v2_ids: set, v2_generations: set) -> bool:
     return bool((terminal.tmux_window or "").startswith("managed-"))
 
 
+_REGISTRY_LOOKUP_UNKNOWN = "registry-lookup-unknown"
+
+
+def _registry_or_unknown():
+    """The on-disk resource registry, or a fail-closed sentinel.
+
+    Registry-first retention: a missing registry DB owns nothing (None);
+    a present but unreadable one can neither confirm nor deny ownership,
+    so the caller must preserve (sentinel). The registry is opened
+    read-intent from its canonical path — the singleton is NOT used, so
+    cleanup never creates the registry as a side effect.
+    """
+    from cli_agent_orchestrator.constants import CAO_HOME_DIR
+
+    db_path = CAO_HOME_DIR / "resource-registry.sqlite"
+    if not db_path.exists():
+        return None
+    try:
+        from cli_agent_orchestrator.services import resource_registry as rr
+
+        return rr.ResourceRegistry(db_path)
+    except Exception:  # noqa: BLE001 - unknown ownership fails closed
+        logger.warning("resource registry unreadable during cleanup", exc_info=True)
+        return _REGISTRY_LOOKUP_UNKNOWN
+
+
+def _terminal_id_from_log_name(name: str) -> str | None:
+    """The terminal id embedded in a terminal-log file name, if any."""
+    for suffix in (".snapshot.json", ".scrollback", ".log"):
+        if name.endswith(suffix):
+            stem = name[: -len(suffix)]
+            return stem or None
+    return None
+
+
+def _legacy_file_delete_blocked(log_file: Path, v2_ids: set, registry) -> bool:
+    """Whether legacy retention must preserve this file.
+
+    Registry-first: a live registry entry owning the path blocks deletion
+    (the registry is the ownership authority for every v2 identity). An
+    unreadable registry fails closed. The v2 name-shape guard then blocks
+    any file naming a v2-owned terminal id, so v2 resources stay
+    invisible to legacy cleanup even before registration.
+    """
+    if registry is _REGISTRY_LOOKUP_UNKNOWN:
+        return True
+    if registry is not None:
+        try:
+            if registry.resolve_fs_path(log_file) is not None:
+                return True
+        except Exception:  # noqa: BLE001 - unknown ownership fails closed
+            logger.warning(
+                "registry ownership lookup failed for %s; preserving", log_file, exc_info=True
+            )
+            return True
+    terminal_id = _terminal_id_from_log_name(log_file.name)
+    return terminal_id is not None and terminal_id in v2_ids
+
+
 def cleanup_old_data():
     """Clean up terminals, inbox messages, and log files older than RETENTION_DAYS."""
     try:
@@ -100,21 +159,36 @@ def cleanup_old_data():
             db.commit()
             logger.info(f"Deleted {deleted_messages} old inbox messages from database")
 
-        # Clean up old terminal log files
+        # Clean up old terminal log files — registry-first: any file whose
+        # identity is registry-owned (or unverifiable, or v2-name-shaped)
+        # is preserved; only unowned aged files are unlinked.
+        registry = _registry_or_unknown()
         terminal_logs_deleted = 0
         if TERMINAL_LOG_DIR.exists():
             for pattern in ("*.log", "*.scrollback", "*.snapshot.json"):
                 for log_file in TERMINAL_LOG_DIR.glob(pattern):
                     if log_file.stat().st_mtime < cutoff_date.timestamp():
+                        if _legacy_file_delete_blocked(log_file, v2_ids, registry):
+                            logger.warning(
+                                f"cleanup skipped registry/v2-owned file {log_file}; "
+                                "its lifecycle is generation-claimed"
+                            )
+                            continue
                         log_file.unlink()
                         terminal_logs_deleted += 1
         logger.info(f"Deleted {terminal_logs_deleted} old terminal log files")
 
-        # Clean up old server log files
+        # Clean up old server log files (same registry-first ownership rule)
         server_logs_deleted = 0
         if LOG_DIR.exists():
             for log_file in LOG_DIR.glob("*.log"):
                 if log_file.stat().st_mtime < cutoff_date.timestamp():
+                    if _legacy_file_delete_blocked(log_file, v2_ids, registry):
+                        logger.warning(
+                            f"cleanup skipped registry/v2-owned file {log_file}; "
+                            "its lifecycle is generation-claimed"
+                        )
+                        continue
                     log_file.unlink()
                     server_logs_deleted += 1
         logger.info(f"Deleted {server_logs_deleted} old server log files")
