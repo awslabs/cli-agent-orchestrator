@@ -146,9 +146,9 @@ class TestHerdrBackendCommands:
 
     @patch("subprocess.run")
     def test_create_session_calls_workspace_create(self, mock_run, backend):
-        """create_session should call herdr workspace create with --label and inject env."""
-        # Include root_pane.pane_id so _parse_new_pane_id succeeds and _inject_env_vars
-        # uses the known pane_id directly (no fallback pane list scan needed).
+        """create_session should call herdr workspace create with --label and native --env."""
+        # Include root_pane.pane_id so _parse_new_pane_id succeeds and the pane
+        # cache is seeded directly from the create response (no list scan needed).
         ws_create_resp = _completed(
             json.dumps(
                 {
@@ -168,13 +168,11 @@ class TestHerdrBackendCommands:
         mock_run.side_effect = [
             ws_create_resp,  # workspace create
             _completed(),  # tab rename (root tab labeled with window_name)
-            _completed(),  # pane send-text (env export)
-            _completed(),  # pane send-keys Enter
         ]
 
         backend.create_session("cao-myproj", "window-0", "tid1", "/home/user/project")
 
-        # First call should be workspace create
+        # First call should be workspace create, carrying env natively via --env
         cmd = mock_run.call_args_list[0][0][0]
         assert cmd[:3] == ["herdr", "--session", "cao"]
         assert "workspace" in cmd
@@ -183,15 +181,14 @@ class TestHerdrBackendCommands:
         assert "cao-myproj" in cmd
         assert "--cwd" in cmd
         assert "/home/user/project" in cmd
-        # Env injection should have sent the export command (call index 2)
-        env_cmd = mock_run.call_args_list[2][0][0]
-        assert "send-text" in env_cmd
-        assert "CAO_TERMINAL_ID=tid1" in env_cmd[-1]
-        assert "CAO_SESSION_NAME=cao-myproj" in env_cmd[-1]
+        # Env is injected natively as --env KEY=VALUE argv pairs (no send-text).
+        assert "--env" in cmd
+        assert "CAO_TERMINAL_ID=tid1" in cmd
+        assert "CAO_SESSION_NAME=cao-myproj" in cmd
 
     @staticmethod
     def _workspace_create_resp():
-        """workspace create response carrying a root pane_id for env injection."""
+        """workspace create response carrying a root pane_id for cache seeding."""
         return _completed(
             json.dumps(
                 {
@@ -211,12 +208,10 @@ class TestHerdrBackendCommands:
 
     @patch("subprocess.run")
     def test_create_session_forwards_extra_env(self, mock_run, backend):
-        """extra_env from cao launch --env is exported into the pane (shell-quoted)."""
+        """extra_env from cao launch --env is forwarded natively as --env argv pairs."""
         mock_run.side_effect = [
             self._workspace_create_resp(),  # workspace create
             _completed(),  # tab rename
-            _completed(),  # pane send-text (env export)
-            _completed(),  # pane send-keys Enter
         ]
 
         backend.create_session(
@@ -227,19 +222,17 @@ class TestHerdrBackendCommands:
             extra_env={"AWS_REGION": "us-west-2", "MNEMOSYNE_DIR": "/root/mn"},
         )
 
-        env_cmd = mock_run.call_args_list[2][0][0][-1]
-        assert "export AWS_REGION=us-west-2" in env_cmd
-        assert "export MNEMOSYNE_DIR=/root/mn" in env_cmd
+        cmd = mock_run.call_args_list[0][0][0]
+        assert "AWS_REGION=us-west-2" in cmd
+        assert "MNEMOSYNE_DIR=/root/mn" in cmd
         # CAO identity vars still present
-        assert "CAO_TERMINAL_ID=tid1" in env_cmd
+        assert "CAO_TERMINAL_ID=tid1" in cmd
 
     @patch("subprocess.run")
     def test_create_session_drops_blocked_and_oversized_env(self, mock_run, backend):
         """Blocked-prefix and oversized extra_env values are filtered out (tmux parity)."""
         mock_run.side_effect = [
             self._workspace_create_resp(),
-            _completed(),
-            _completed(),
             _completed(),
         ]
 
@@ -255,18 +248,23 @@ class TestHerdrBackendCommands:
             },
         )
 
-        env_cmd = mock_run.call_args_list[2][0][0][-1]
-        assert "CLAUDE_SECRET" not in env_cmd
-        assert "BIG=" not in env_cmd
-        assert "export OK=kept" in env_cmd
+        cmd = mock_run.call_args_list[0][0][0]
+        joined = " ".join(cmd)
+        assert "CLAUDE_SECRET" not in joined
+        assert "BIG=" not in joined
+        assert "OK=kept" in cmd
 
     @patch("subprocess.run")
-    def test_create_session_quotes_env_values(self, mock_run, backend):
-        """Operator-supplied values are shell-quoted to stay injection-safe."""
+    def test_create_session_env_value_is_single_argv_token(self, mock_run, backend):
+        """Native --env passes each value as one literal argv token (no shell, no quoting).
+
+        Under the former shell ``export`` path a value containing a space needed
+        ``shlex.quote`` to avoid word-splitting/injection. With native --env the
+        value is a single argv element handed to subprocess with shell=False, so
+        it travels verbatim and cannot break out — the injection surface is gone.
+        """
         mock_run.side_effect = [
             self._workspace_create_resp(),
-            _completed(),
-            _completed(),
             _completed(),
         ]
 
@@ -275,12 +273,14 @@ class TestHerdrBackendCommands:
             "window-0",
             "tid1",
             "/home/user/project",
-            extra_env={"DANGER": "a; rm -rf /"},
+            extra_env={"AWS_PROFILE": "my profile"},
         )
 
-        env_cmd = mock_run.call_args_list[2][0][0][-1]
-        # shlex.quote wraps the value so the embedded "; rm" cannot break out.
-        assert "export DANGER='a; rm -rf /'" in env_cmd
+        cmd = mock_run.call_args_list[0][0][0]
+        # The space-containing value is one argv token, unquoted, and never
+        # wrapped in a shell ``export`` statement.
+        assert "AWS_PROFILE=my profile" in cmd
+        assert not any("export" in tok for tok in cmd)
 
     @patch("subprocess.run")
     def test_create_window_forwards_extra_env(self, mock_run, backend):
@@ -303,9 +303,7 @@ class TestHerdrBackendCommands:
         )
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
-            tab_create_resp,  # tab create
-            _completed(),  # pane send-text (env export)
-            _completed(),  # pane send-keys Enter
+            tab_create_resp,  # tab create (carries --env natively)
         ]
 
         backend.create_window(
@@ -315,8 +313,11 @@ class TestHerdrBackendCommands:
             extra_env={"AWS_REGION": "eu-central-1"},
         )
 
-        send_text_call = next(c[0][0] for c in mock_run.call_args_list if "send-text" in c[0][0])
-        assert "export AWS_REGION=eu-central-1" in send_text_call[-1]
+        tab_create_call = next(c[0][0] for c in mock_run.call_args_list if "create" in c[0][0])
+        assert "--env" in tab_create_call
+        assert "AWS_REGION=eu-central-1" in tab_create_call
+        # CAO identity vars ride along on the same tab create argv.
+        assert "CAO_TERMINAL_ID=tid2" in tab_create_call
 
     @patch("subprocess.run")
     def test_kill_session_calls_workspace_close(self, mock_run, backend):
@@ -789,9 +790,7 @@ class TestCreateWindowWindowShell:
         )
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
-            tab_create_resp,  # tab create
-            _completed(),  # pane send-text (env export)
-            _completed(),  # pane send-keys Enter
+            tab_create_resp,  # tab create (env injected natively via --env)
             _completed(),  # pane run
         ]
 
@@ -830,9 +829,7 @@ class TestCreateWindowWindowShell:
         pane_run_fail.stderr = "pane not found"
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
-            tab_create_resp,  # tab create
-            _completed(),  # pane send-text (env export)
-            _completed(),  # pane send-keys Enter
+            tab_create_resp,  # tab create (env injected natively via --env)
             pane_run_fail,  # pane run (fails)
         ]
 
@@ -1069,3 +1066,25 @@ class TestSanitizeHerdrArgs:
 
         with pytest.raises(ValueError, match="unsafe characters"):
             _sanitize_herdr_args(["tab", "create", "--env", "K=line1\nline2"])
+
+
+# --- _build_env_args (native --env argument construction) ---
+
+
+class TestBuildEnvArgs:
+    """Tests for _build_env_args, which builds native ``--env KEY=VALUE`` pairs."""
+
+    def test_build_env_args_includes_identity_and_filters_blocked(self):
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        backend = HerdrBackend.__new__(HerdrBackend)  # no __init__ (avoids server spawn)
+        pairs = backend._build_env_args(
+            terminal_id="term_x",
+            session_name="sess-a",
+            extra_env={"AWS_REGION": "us-west-2"},
+        )
+        assert "--env" in pairs
+        joined = " ".join(pairs)
+        assert "CAO_TERMINAL_ID=term_x" in joined
+        assert "CAO_SESSION_NAME=sess-a" in joined
+        assert "AWS_REGION=us-west-2" in joined
