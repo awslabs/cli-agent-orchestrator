@@ -691,6 +691,28 @@ class TestMultiPaneResolution:
         assert result == "w1-2"
 
 
+# --- Durable snapshot-backed pane_id map ---
+
+
+def test_get_pane_id_uses_snapshot_map_across_restart(monkeypatch):
+    from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+    backend = HerdrBackend.__new__(HerdrBackend)
+    backend._herdr_session = "cao"
+    backend._pane_cache = {}
+    backend._pane_id_map = {"term_a": "w1:p1"}  # durable map (stable IDs)
+
+    # A server restart compacts pane_ids; a refresh rebuilds from snapshot.
+    def fake_refresh():
+        backend._pane_id_map = {"term_a": "w2:p5"}
+
+    monkeypatch.setattr(backend, "_refresh_pane_id_map", fake_refresh)
+
+    assert backend.get_pane_id("term_a") == "w1:p1"  # hit, no refresh
+    backend._pane_id_map = {}  # simulate stale/empty
+    assert backend.get_pane_id("term_a") == "w2:p5"  # miss -> refresh -> hit
+
+
 # --- Session socket path ---
 
 

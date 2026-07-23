@@ -35,6 +35,7 @@ _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
         "tab",
         "pane",
         "session",
+        "api",
     }
 )
 
@@ -139,6 +140,9 @@ class HerdrBackend(TerminalBackend):
         self._herdr_session = herdr_session
         # Resolution cache: terminal_id → (pane_id, timestamp)
         self._pane_cache: Dict[str, tuple[str, float]] = {}
+        # Durable map: terminal_id → pane_id, rebuilt from `api snapshot`.
+        # Public IDs are stable except across a full herdr server restart.
+        self._pane_id_map: Dict[str, str] = {}
         # Workspace cache: session_name → (workspace_id, timestamp)
         self._workspace_cache: Dict[str, tuple[str, float]] = {}
         self._ensure_session_running()
@@ -616,9 +620,15 @@ class HerdrBackend(TerminalBackend):
     def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
         """Resolve CAO terminal_id to herdr pane_id.
 
-        Prefers the _pane_cache (seeded from the create response at create time).
-        Falls back to live label-based resolution (_resolve_workspace_id ->
-        _resolve_tab_id -> pane list) if session/window given.
+        Prefers the durable ``_pane_id_map`` (rebuilt from ``api snapshot``).
+        Herdr 0.7.x public pane_ids are stable except across a full server
+        restart, so a hit is returned directly and a miss triggers a single
+        snapshot refresh before retrying the map. Only if the map still cannot
+        resolve the terminal does resolution fall back to the legacy
+        ``_pane_cache`` fast path and label-based window resolution
+        (``_resolve_workspace_id`` -> ``_resolve_tab_id`` -> pane list). The
+        legacy fallback is retained for reversibility and removed in a
+        follow-up once the durable map is proven.
 
         Args:
             terminal_id: CAO UUID terminal identifier
@@ -631,17 +641,44 @@ class HerdrBackend(TerminalBackend):
         Raises:
             TerminalNotFoundError: If pane cannot be resolved
         """
-        # Fast path: pane_id was seeded from the create response at create time
+        # Durable map (stable IDs): rebuilt from api snapshot on restart.
+        if terminal_id in self._pane_id_map:
+            return self._pane_id_map[terminal_id]
+        self._refresh_pane_id_map()
+        if terminal_id in self._pane_id_map:
+            return self._pane_id_map[terminal_id]
+
+        # Legacy fallback (removed in a follow-up once the map is proven):
         if terminal_id in self._pane_cache:
             pane_id, cached_at = self._pane_cache[terminal_id]
             if time.time() - cached_at < _PANE_CACHE_TTL:
                 return pane_id
-
-        # Fallback: resolve via window mapping if session/window provided
         if session_name and window_name:
             return self._resolve_pane_id_from_window(session_name, window_name)
 
         raise TerminalNotFoundError(terminal_id)
+
+    def _refresh_pane_id_map(self) -> None:
+        """Rebuild terminal_id -> pane_id from a live `api snapshot`.
+
+        Public IDs are stable except across a full herdr server restart, so this
+        is only needed on a miss (or at reconcile time), not per-call.
+        """
+        result = self._run_herdr(["api", "snapshot"], check=False)
+        if result.returncode != 0:
+            return
+        try:
+            data = self._parse_herdr_json(result.stdout)
+            snapshot = data.get("snapshot", data)
+            if not isinstance(snapshot, dict):
+                return
+            self._pane_id_map = {
+                p["terminal_id"]: p["pane_id"]
+                for p in snapshot.get("panes", [])
+                if p.get("terminal_id") and p.get("pane_id")
+            }
+        except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
+            return
 
     # --- Pipe-pane (no-op for herdr) ---
 
