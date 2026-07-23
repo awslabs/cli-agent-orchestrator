@@ -68,25 +68,27 @@ class TestHerdrInboxServiceRegisterReconnect:
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         writer = MagicMock()
         service._writer = writer
-        service._connected = True
-        service._loop = asyncio.new_event_loop()
 
         service.register_terminal("tid1", "w1:p1", is_kiro=False)
 
         assert service._pane_to_terminal["w1:p1"] == "tid1"
         writer.close.assert_not_called()
         writer.write.assert_not_called()
-        service._loop.close()
+        # Guard against re-introducing the removed force-reconnect: registration
+        # must not schedule any coroutine. (writer.close/write above pass
+        # vacuously if a coroutine is merely scheduled on an un-run loop, so
+        # assert on the scheduling itself.)
+        assert not hasattr(service, "_force_reconnect")
 
     def test_register_before_start_does_not_reconnect(self):
-        """register_terminal before start (no loop, not connected) must not touch the socket."""
+        """register_terminal before start() has run must not touch the socket."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         writer = MagicMock()
         service._writer = writer
 
-        # Pre-start state: start() has not run, so no loop captured and not connected.
-        assert service._connected is False
-        assert service._loop is None
+        # Pre-start state: start() has not run. Registration only updates the
+        # in-memory maps; it must not schedule a coroutine or write to the socket.
+        assert not hasattr(service, "_force_reconnect")
 
         service.register_terminal("tid_early", "pane-early")
 

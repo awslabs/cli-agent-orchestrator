@@ -71,11 +71,9 @@ class HerdrInboxService:
         self._workspace_to_session: Dict[str, str] = {}  # workspace_id → session_name
 
         # Connection state
-        self._connected = False
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._backoff = _BACKOFF_BASE
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @staticmethod
     def _default_socket_path(session_name: str = "cao") -> str:
@@ -129,7 +127,6 @@ class HerdrInboxService:
 
     async def start(self) -> None:
         """Start the event loop: wait for first terminal, then connect and listen."""
-        self._loop = asyncio.get_running_loop()
         # Run DB cleanup before starting the socket loop so ghost records from
         # prior server runs are removed even when no terminals are registered yet.
         await self._startup_db_cleanup()
@@ -241,7 +238,6 @@ class HerdrInboxService:
 
             try:
                 await self._connect()
-                self._connected = True
 
                 # Reconcile map against live herdr state before subscribing
                 await self._reconcile()
@@ -259,7 +255,6 @@ class HerdrInboxService:
 
             except (ConnectionError, OSError, asyncio.IncompleteReadError) as e:
                 logger.warning(f"Herdr socket disconnected: {e}")
-                self._connected = False
 
                 # Exponential backoff
                 logger.info(f"Reconnecting in {self._backoff}s...")
