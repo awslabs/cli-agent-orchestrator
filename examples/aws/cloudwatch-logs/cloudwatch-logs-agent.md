@@ -1,6 +1,16 @@
 ---
 name: cloudwatch-logs-agent
 description: Search CloudWatch Logs for execution traces and error patterns
+tags:
+  - aws
+  - cloudwatch
+  - logs
+  - search
+  - errors
+  - verification
+capabilities:
+  - "search CloudWatch log groups for execution IDs"
+  - "analyze log events for success or error patterns"
 allowedTools:
   - execute_bash
   - fs_read

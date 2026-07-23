@@ -59,6 +59,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Opt-in AG-UI run plane with stock wire dialect. The ag-ui-protocol SDK
+# provides RunAgentInput, EventEncoder, and the typed event models. When
+# absent the /agui/v1/run route returns 501 with an install hint.
+agui = [
+    "ag-ui-protocol>=0.1.19,<0.2.0",
+]
 # Opt-in OpenTelemetry GenAI telemetry (telemetry/). The base install stays
 # lean: telemetry/otel.py no-ops when the SDK is absent, matching the
 # default-off posture of the feature itself.

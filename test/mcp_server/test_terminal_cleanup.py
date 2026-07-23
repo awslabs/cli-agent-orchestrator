@@ -3,10 +3,20 @@
 import os
 from unittest.mock import MagicMock, patch
 
-import pytest
 import requests
 
-from cli_agent_orchestrator.mcp_server.server import _get_cleanup_nudge, delete_terminal
+from cli_agent_orchestrator.mcp_server.server import (
+    _current_terminal_id,
+    _get_cleanup_nudge,
+    _get_terminal_context_from_env,
+    delete_terminal,
+)
+
+
+class TestCurrentTerminalId:
+    def test_empty_terminal_id_is_treated_as_unset(self):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            assert _current_terminal_id() is None
 
 
 class TestGetCleanupNudge:
@@ -15,13 +25,13 @@ class TestGetCleanupNudge:
             assert _get_cleanup_nudge() == ""
 
     def test_returns_empty_when_terminal_fetch_fails(self):
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "t1"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
                 mock_get.return_value.status_code = 500
                 assert _get_cleanup_nudge() == ""
 
     def test_returns_empty_when_no_session_name(self):
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "t1"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
                 mock_resp = MagicMock()
                 mock_resp.status_code = 200
@@ -30,7 +40,7 @@ class TestGetCleanupNudge:
                 assert _get_cleanup_nudge() == ""
 
     def test_returns_empty_when_sessions_fetch_fails(self):
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "t1"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
                 terminal_resp = MagicMock()
                 terminal_resp.status_code = 200
@@ -41,7 +51,7 @@ class TestGetCleanupNudge:
                 assert _get_cleanup_nudge() == ""
 
     def test_returns_empty_when_below_threshold(self):
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "t1"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
                 terminal_resp = MagicMock()
                 terminal_resp.status_code = 200
@@ -53,7 +63,7 @@ class TestGetCleanupNudge:
                 assert _get_cleanup_nudge() == ""
 
     def test_returns_nudge_when_at_threshold(self):
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "t1"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
                 terminal_resp = MagicMock()
                 terminal_resp.status_code = 200
@@ -67,12 +77,26 @@ class TestGetCleanupNudge:
                 assert "delete_terminal" in nudge
 
     def test_returns_empty_on_exception(self):
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "t1"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             with patch(
                 "cli_agent_orchestrator.mcp_server.server.requests.get",
                 side_effect=Exception("network error"),
             ):
                 assert _get_cleanup_nudge() == ""
+
+    def test_skips_lookup_for_malformed_terminal_id(self):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
+            with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
+                assert _get_cleanup_nudge() == ""
+        mock_get.assert_not_called()
+
+
+class TestMemoryTerminalContext:
+    def test_malformed_terminal_id_degrades_without_lookup(self):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
+            with patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get:
+                assert _get_terminal_context_from_env() is None
+        mock_get.assert_not_called()
 
 
 class TestDeleteTerminal:

@@ -819,6 +819,193 @@ class TestClaudeCodeProviderStatusDetection:
         assert provider.get_status(output) == TerminalStatus.IDLE
 
 
+class TestClaudeCodeDialogDetection:
+    """Tests for dialog detection anchoring and plan-approval (issue #405)."""
+
+    def test_plan_dialog_many_options_detected_as_waiting(self):
+        """Plan dialog with ~9 options (scrolled beyond old 10-line window) → WAITING."""
+        output = (
+            "⏺ I've analyzed the codebase and prepared a plan.\n"
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "  3. No, refine with Ultraplan\n"
+            "  4. Tell Claude what to change\n"
+            "  5. Save plan and exit\n"
+            "  6. Show plan details\n"
+            "  7. Edit plan in editor\n"
+            "  8. Run with different model\n"
+            "  9. Run with constraints\n"
+            "     shift+tab to approve with this feedback\n"
+            "ctrl+g to edit in  Nvim  · ~/.claude/plans/my-plan.md"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_dialog_dismissed_with_response_marker_not_waiting(self):
+        """Dismissed plan dialog + response marker (⏺) after options → COMPLETED."""
+        output = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "⏺ Done implementing the feature.\n"
+            "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
+
+    def test_plan_dialog_dismissed_with_new_tui_marker_not_waiting(self):
+        """Dismissed plan dialog + newest-TUI response marker (●) → not WAITING.
+
+        The newest TUI renders responses with ● (U+25CF) instead of ⏺; the
+        dismissal guard must accept it as dismissal evidence or the terminal
+        stays falsely WAITING and inbox delivery stalls.
+        """
+        output = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "● Done implementing the feature.\n"
+            "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_dialog_effort_footer_is_not_dismissal_evidence(self):
+        """A '● high · /effort' footer below a LIVE plan dialog must not count
+        as a response marker — the dialog is still open → WAITING."""
+        output = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "  3. No, tell Claude what to change\n"
+            "● high · /effort"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_dialog_dismissed_with_separator_not_waiting(self):
+        """Dismissed plan dialog + separator after options → COMPLETED."""
+        output = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "⏺ Proceeding with option 1\n"
+            "⏺ Done implementing the changes.\n"
+            "────────────────────────\n"
+            "❯ Ask a question or describe a task"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
+
+    def test_nav_footer_in_scrollback_with_idle_at_bottom_not_waiting(self):
+        """'↑/↓ to navigate' in scrollback but NOT in bottom 6 lines → not WAITING."""
+        scrollback_lines = ["line %d of output" % i for i in range(25)]
+        scrollback_lines[5] = "Enter to select · ↑/↓ to navigate · Esc to cancel"
+        scrollback_lines.append("⏺ Here is the result")
+        scrollback_lines.append("────────────────────────")
+        scrollback_lines.append("❯ ")
+        output = "\n".join(scrollback_lines)
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
+
+    def test_ask_user_question_with_notes_hint_and_error_banner(self):
+        """AskUserQuestion footer pushed down by notes-hint + error → still WAITING."""
+        output = (
+            "❯ 1. Option one\n"
+            "  2. Option two\n"
+            "  3. Option three\n"
+            "n to add notes\n"
+            "⚠ Please select a valid option\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_approval_active_with_option_markers_is_waiting(self):
+        """Active plan-approval dialog (option markers present) → WAITING."""
+        output = (
+            "Claude has a plan. Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "  3. No, refine\n"
+            "  4. Tell Claude what to change\n"
+            "     shift+tab to approve with feedback"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_text_far_in_scrollback_no_option_markers_in_bottom(self):
+        """Plan text far in scrollback, no option markers in bottom → not WAITING."""
+        lines = ["line %d" % i for i in range(20)]
+        lines[2] = "Would you like to proceed?"
+        lines[3] = "❯ 1. Yes"
+        lines[4] = "  2. No"
+        lines.extend(
+            [
+                "⏺ Completed the work",
+                "────────────────────────",
+                "❯ ",
+            ]
+        )
+        output = "\n".join(lines)
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
+
+    def test_dismissed_plan_response_marker_no_separator(self):
+        """Response marker after options WITHOUT separator still dismisses the plan."""
+        output = (
+            "Would you like to proceed?\n" "  1. Yes\n" "  2. No\n" "⏺ Here is the response\n" "> "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.COMPLETED
+
+    @pytest.mark.xfail(
+        reason="Known limitation: agent prose containing '↑/↓ to navigate' "
+        "in the 6-line footer window causes false WAITING. Full fix needs "
+        "structural composer detection.",
+        strict=True,
+    )
+    def test_agent_prose_with_nav_text_in_footer_false_waiting(self):
+        """KNOWN LIMITATION: agent prose echoing '↑/↓ to navigate' in the
+        bottom 6 lines of an idle prompt false-positives as WAITING."""
+        output = (
+            "⏺ The dialog shows:\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        # This SHOULD be COMPLETED but will be WAITING due to the known limitation
+        assert status == TerminalStatus.COMPLETED
+
+
 class TestClaudeCodeProviderNativeStatus:
     """Tests for get_status() native-first path (herdr backend)."""
 
