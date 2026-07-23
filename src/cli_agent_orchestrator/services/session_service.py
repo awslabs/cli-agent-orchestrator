@@ -131,7 +131,12 @@ def list_sessions() -> List[Dict]:
         return [
             _enrich_session_ownership(backend, s)
             for s in tmux_sessions
-            if s["id"].startswith(SESSION_PREFIX)
+            # Use .get() rather than s["id"]: a backend that returns a session
+            # dict without an "id" key must not blank the entire list (KeyError
+            # in this comprehension is swallowed by the outer except and returns
+            # []). Shipped backends always populate "id"; this hardens against a
+            # future backend that does not.
+            if s.get("id", "").startswith(SESSION_PREFIX)
         ]
     except Exception as e:
         logger.error(f"Failed to list sessions: {e}")
