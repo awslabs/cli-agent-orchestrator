@@ -726,17 +726,24 @@ class HerdrBackend(TerminalBackend):
     ) -> List[str]:
         """Build ``--env KEY=VALUE`` argument pairs for a create command.
 
-        CAO identity vars first, then operator-forwarded vars filtered with the
-        same policy TmuxClient applies to its ``-e`` argv (blocked prefixes,
-        per-value byte cap). Native ``--env`` replaces the former shell
-        ``export`` injection, removing the command-line injection surface.
+        Operator-forwarded vars are merged first, filtered with the same policy
+        TmuxClient applies to its ``-e`` argv (blocked prefixes, per-value byte
+        cap). The two CAO identity vars are assigned LAST so an operator
+        ``--env CAO_TERMINAL_ID=...`` cannot override the real terminal identity
+        (mirrors TmuxClient, which forces these to win). Native ``--env``
+        replaces the former shell ``export`` injection, removing the
+        command-line injection surface.
+
+        Note: on herdr, env VALUES pass through the herdr arg sanitizer, which
+        rejects shell metacharacters and control chars. A value containing e.g.
+        ``$ ; | & ! * ? < >`` will fail terminal creation on herdr (fail-closed),
+        whereas the tmux backend accepts such values. This is an intentional,
+        safety-conservative divergence; operator env values on herdr must be
+        sanitizer-safe.
         """
         from cli_agent_orchestrator.clients.tmux import TmuxClient
 
-        env: Dict[str, str] = {
-            "CAO_TERMINAL_ID": terminal_id,
-            "CAO_SESSION_NAME": session_name,
-        }
+        env: Dict[str, str] = {}
         for key, value in (extra_env or {}).items():
             if TmuxClient._is_blocked_env_key(key):
                 logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
@@ -745,6 +752,11 @@ class HerdrBackend(TerminalBackend):
                 logger.warning("Dropping forwarded env var %s -- exceeds byte cap", key)
                 continue
             env[key] = value
+
+        # CAO identity vars are assigned last so operator-forwarded --env cannot
+        # override them (mirrors TmuxClient, which forces these to win).
+        env["CAO_TERMINAL_ID"] = terminal_id
+        env["CAO_SESSION_NAME"] = session_name
 
         args: List[str] = []
         for key, value in env.items():

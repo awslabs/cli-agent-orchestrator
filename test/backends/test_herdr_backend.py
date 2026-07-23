@@ -283,6 +283,25 @@ class TestHerdrBackendCommands:
         assert not any("export" in tok for tok in cmd)
 
     @patch("subprocess.run")
+    def test_create_session_rejects_metachar_env_value_on_herdr(self, mock_run, backend):
+        """Documents the intentional fail-closed divergence from tmux: herdr env
+        values must be sanitizer-safe (no shell metacharacters).
+
+        The value ``p@ss$word`` contains ``$``, which the herdr arg sanitizer
+        (_SAFE_ARG_RE) rejects. _run_herdr wraps the sanitizer's ValueError as a
+        TerminalBackendError, so create_session raises before ever reaching
+        subprocess.run for the workspace create. The tmux backend, by contrast,
+        would accept the same value. Keeping herdr strict is a deliberate,
+        safety-conservative choice, and this test pins it so it can't silently
+        change.
+        """
+        # create should not even reach subprocess for the workspace create if the
+        # env value is rejected during arg sanitization.
+        with pytest.raises((ValueError, TerminalBackendError)):
+            backend.create_session("cao-x", "win-0", "tid1", "/tmp", extra_env={"TOK": "p@ss$word"})
+        mock_run.assert_not_called()
+
+    @patch("subprocess.run")
     def test_create_window_forwards_extra_env(self, mock_run, backend):
         """create_window threads extra_env into the injected exports too."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
@@ -1081,10 +1100,29 @@ class TestBuildEnvArgs:
         pairs = backend._build_env_args(
             terminal_id="term_x",
             session_name="sess-a",
-            extra_env={"AWS_REGION": "us-west-2"},
+            extra_env={"AWS_REGION": "us-west-2", "CLAUDE_SECRET": "x"},
         )
         assert "--env" in pairs
         joined = " ".join(pairs)
         assert "CAO_TERMINAL_ID=term_x" in joined
         assert "CAO_SESSION_NAME=sess-a" in joined
         assert "AWS_REGION=us-west-2" in joined
+        # CLAUDE_SECRET matches a blocked prefix and must be dropped.
+        assert all("CLAUDE_SECRET" not in tok for tok in pairs)
+
+    def test_build_env_args_identity_wins_over_extra_env(self):
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="real-tid",
+            session_name="cao-proj",
+            extra_env={"CAO_TERMINAL_ID": "spoofed", "CAO_SESSION_NAME": "evil"},
+        )
+        # Reconstruct the final KEY=VALUE for each var (last write wins on herdr's
+        # side, and our builder must emit the real identity, not the spoof).
+        joined = pairs
+        assert "CAO_TERMINAL_ID=real-tid" in joined
+        assert "CAO_TERMINAL_ID=spoofed" not in joined
+        assert "CAO_SESSION_NAME=cao-proj" in joined
+        assert "CAO_SESSION_NAME=evil" not in joined
