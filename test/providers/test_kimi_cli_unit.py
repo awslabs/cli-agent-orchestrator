@@ -946,6 +946,20 @@ class TestKimiCliProviderModelFlag:
 
         assert "--model" not in command
 
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_explicit_model_override_wins_over_profile_model(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = "kimi-k2-turbo"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "sess", "win", "agent", model="fable-5")
+        command = provider._build_kimi_command()
+
+        assert "--model fable-5" in command
+        assert "--model kimi-k2-turbo" not in command
+
 
 class TestKimiCliProviderMisc:
     """Tests for miscellaneous KimiCliProvider methods and lifecycle."""

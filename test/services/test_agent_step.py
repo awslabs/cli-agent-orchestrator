@@ -124,6 +124,31 @@ class TestHappyPath:
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", working_directory="/tmp/wd"))
         assert m_create.await_args.kwargs["working_directory"] == "/tmp/wd"
 
+    def test_model_forwarded_to_create(self):
+        """handoff's own `model` parameter reaches terminal_service.create_terminal
+        for a freshly created terminal."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x", model="fable-5"))
+        assert m_create.await_args.kwargs["model"] == "fable-5"
+
+    def test_omitted_model_forwards_none_to_create(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+        assert m_create.await_args.kwargs["model"] is None
+
+    def test_reused_terminal_never_passes_model_to_create(self):
+        """Reusing a terminal skips create_terminal entirely -- model has
+        nothing to apply to and must not be silently expected to retarget an
+        already-running provider."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, exit_cli, wait, status:
+            asyncio.run(
+                run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99", model="fable-5")
+            )
+        m_create.assert_not_awaited()
+
     def test_no_session_name_creates_new_session(self):
         """Regression: session_name=None must create a NEW tmux session
         (new_session=True). Otherwise create_terminal auto-generates a name and

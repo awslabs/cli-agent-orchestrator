@@ -208,11 +208,14 @@ class KimiCliProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # Explicit per-call override for profile.model, see initialize().
+        self._model = model
         # Track temp directory for cleanup (created when agent profile needs temp files)
         self._temp_dir: Optional[str] = None
         # Latching flag: set True when user input box (╭─) is detected in ANY
@@ -300,8 +303,12 @@ class KimiCliProvider(BaseProvider):
             try:
                 profile = load_agent_profile(self._agent_profile)
 
-                if profile.model:
-                    command_parts.extend(["--model", profile.model])
+                # self._model is an explicit per-call override (handoff/assign's
+                # own `model` parameter) and wins over the profile's own static
+                # model field when both are given.
+                resolved_model = self._model or profile.model
+                if resolved_model:
+                    command_parts.extend(["--model", resolved_model])
 
                 # Build agent file from profile's system prompt.
                 # Kimi uses YAML agent files with a system_prompt_path pointing
