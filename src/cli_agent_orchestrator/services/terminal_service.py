@@ -305,6 +305,7 @@ async def create_terminal(
             agent_profile,
             allowed_tools,
             caller_id=caller_id,
+            working_directory=working_directory,
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane

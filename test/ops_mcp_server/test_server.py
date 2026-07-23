@@ -451,6 +451,10 @@ class TestSessionLifecycleTools:
             result = await list_sessions()
 
         assert result == SessionListResult(success=True, sessions=sessions)
+        dumped_session = result.model_dump()["sessions"][0]
+        assert dumped_session["session_name"] == "cao-123"
+        assert dumped_session["terminal_count"] == 2
+        assert "working_directory" in dumped_session
 
     async def test_list_sessions_returns_empty_list(self) -> None:
         """Empty session lists should still be a successful result."""

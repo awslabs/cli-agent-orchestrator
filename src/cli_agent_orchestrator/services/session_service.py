@@ -20,8 +20,9 @@ Session Lifecycle:
 """
 
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List
 
+from cli_agent_orchestrator.backends.base import TerminalBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.constants import SESSION_PREFIX
@@ -80,11 +81,63 @@ async def create_session(
     return terminal
 
 
+def _enrich_session_ownership(
+    backend: TerminalBackend, session_data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Add best-effort ownership metadata without failing session listing."""
+    enriched = dict(session_data)
+    enriched.setdefault("working_directory", None)
+    enriched.setdefault("agent_profile", None)
+
+    session_name = str(enriched.get("id", ""))
+    if not session_name:
+        return enriched
+
+    try:
+        terminals = list_terminals_by_session(session_name)
+    except Exception as e:
+        logger.warning(f"Failed to load terminal metadata for {session_name}: {e}")
+        terminals = []
+
+    for terminal in terminals:
+        if enriched.get("agent_profile") is None and terminal.get("agent_profile"):
+            enriched["agent_profile"] = terminal["agent_profile"]
+        if enriched.get("working_directory") is None and terminal.get("working_directory"):
+            enriched["working_directory"] = terminal["working_directory"]
+        if (
+            enriched.get("agent_profile") is not None
+            and enriched.get("working_directory") is not None
+        ):
+            return enriched
+
+    if enriched.get("working_directory") is None:
+        terminal = next((t for t in terminals if t.get("tmux_window")), None)
+        if terminal:
+            try:
+                enriched["working_directory"] = backend.get_pane_working_directory(
+                    session_name, terminal["tmux_window"]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to resolve working directory for {session_name}: {e}")
+
+    return enriched
+
+
 def list_sessions() -> List[Dict]:
     """List all sessions from tmux."""
     try:
-        tmux_sessions = get_backend().list_sessions()
-        return [s for s in tmux_sessions if s["id"].startswith(SESSION_PREFIX)]
+        backend = get_backend()
+        tmux_sessions = backend.list_sessions()
+        return [
+            _enrich_session_ownership(backend, s)
+            for s in tmux_sessions
+            # Use .get() rather than s["id"]: a backend that returns a session
+            # dict without an "id" key must not blank the entire list (KeyError
+            # in this comprehension is swallowed by the outer except and returns
+            # []). Shipped backends always populate "id"; this hardens against a
+            # future backend that does not.
+            if s.get("id", "").startswith(SESSION_PREFIX)
+        ]
     except Exception as e:
         logger.error(f"Failed to list sessions: {e}")
         return []
