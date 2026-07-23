@@ -162,7 +162,9 @@ class TestHerdrInboxServiceSubscription:
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._writer = AsyncMock()
-        service._pane_to_terminal = {"w1:p1": "tid1", "w1:p2": "tid2"}
+        # Empty map: the broadcast subscription shape must NOT depend on any
+        # registered panes — it is a single pane.updated with no per-pane entries.
+        service._pane_to_terminal = {}
 
         _run_async(service._subscribe_all_events())
 

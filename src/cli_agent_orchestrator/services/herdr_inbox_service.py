@@ -1,12 +1,13 @@
 """HerdrInboxService — socket event-based inbox delivery for herdr backend.
 
 Replaces the pipe-pane + file watchdog approach with herdr's native socket API.
-Subscribes to pane.agent_status_changed events and delivers pending inbox
-messages when a pane transitions to idle or done.
+Subscribes to a broadcast pane.updated event (whose payload carries
+agent_status) and delivers pending inbox messages when a pane transitions to
+idle or done.
 
 Design:
 - Maintains a pane_id → terminal_id map for managed panes
-- Subscribes per-pane (wildcard support is unverified; see design.md)
+- Subscribes once to a broadcast pane.updated (no pane_id) covering all panes
 - Reconnects with exponential backoff on socket disconnect
 - Supplements with periodic pane read for kiro-cli (working >30s check)
 """
@@ -258,10 +259,10 @@ class HerdrInboxService:
                 # Reconcile map against live herdr state before subscribing
                 await self._reconcile()
 
-                # Subscribe to everything in ONE events.subscribe call: every
-                # managed pane's agent-status plus the lifecycle events. herdr
-                # resets the connection on a second events.subscribe, so this
-                # must be a single combined call.
+                # Subscribe to everything in ONE events.subscribe call: a single
+                # broadcast pane.updated (no pane_id) plus the lifecycle events.
+                # herdr resets the connection on a second events.subscribe, so
+                # this must be a single combined call.
                 await self._subscribe_all_events()
 
                 self._backoff = _BACKOFF_BASE  # Reset backoff after successful setup
