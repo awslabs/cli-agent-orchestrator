@@ -9,7 +9,10 @@ from typing import Dict, List, Optional
 
 import libtmux
 
-from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
+from cli_agent_orchestrator.constants import (
+    BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
+    TMUX_HISTORY_LINES,
+)
 from cli_agent_orchestrator.utils.path_validation import (
     BLOCKED_SYSTEM_DIRECTORIES,
     resolve_and_validate_path,
@@ -243,6 +246,27 @@ class TmuxClient:
             logger.error(f"Failed to create window in session {session_name}: {e}")
             raise
 
+    def _pane_is_bracketed_paste_incompatible(self, session_name: str, window_name: str) -> bool:
+        """Whether the pane's live foreground command is a known shell.
+
+        Used by ``send_keys(force_bracketed_paste=True)`` to avoid gluing
+        bracketed-paste escape sequences onto a bare shell prompt that
+        doesn't understand them (see BRACKETED_PASTE_INCOMPATIBLE_SHELLS'
+        own docstring for the failure mode). Reuses the same
+        ``#{pane_current_command}`` probe already trusted elsewhere in this
+        codebase for an equivalent "has the TUI exited back to a shell?"
+        check (``codex.py``/``kiro_cli.py``'s own ``shell_baseline``
+        comparison in ``get_status()``).
+
+        Fails closed to "compatible" (returns False) on any lookup failure
+        or an unrecognized command name -- an unknown foreground process is
+        assumed to be a real TUI expecting bracketed paste, preserving the
+        existing behavior for every case this function can't positively
+        rule out.
+        """
+        command = self.get_pane_current_command(session_name, window_name)
+        return command is not None and command in BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+
     def send_keys(
         self,
         session_name: str,
@@ -266,12 +290,19 @@ class TmuxClient:
             enter_count: Number of Enter keys to send after pasting (default 1).
                 Some TUIs enter multi-line mode after bracketed paste,
                 requiring 2 Enters to submit.
-            force_bracketed_paste: If True, unconditionally wrap content in
-                bracketed paste sequences (\x1b[200~...\x1b[201~) instead of
-                relying on paste-buffer -p. Use for message delivery to TUIs.
-                Do NOT use for shell commands sent to bash during initialization
-                (bash 4.x does not support bracketed paste and will inject the
-                escape sequences literally into the command line).
+            force_bracketed_paste: If True, wrap content in bracketed paste
+                sequences (\x1b[200~...\x1b[201~) instead of relying on
+                paste-buffer -p -- UNLESS the pane's live foreground command
+                (per #{pane_current_command}) is a known shell (see
+                BRACKETED_PASTE_INCOMPATIBLE_SHELLS), in which case the wrap
+                is skipped and the content is delivered as plain keystrokes
+                instead. A bare shell doesn't understand the escape
+                sequences and glues them onto the first token of the
+                command, corrupting it -- the caller asking for bracketed
+                delivery does not always know the target TUI has already
+                exited (e.g. via its own `/exit`) and left the pane at a
+                shell prompt, so this is checked fresh on every call rather
+                than trusted from the caller's own intent.
         """
         # Defence-in-depth: re-validate at the sink even though callers
         # validate at the API/MCP boundary. Both halves flow into a
@@ -292,23 +323,40 @@ class TmuxClient:
             # available here at DEBUG for local delivery troubleshooting.
             logger.info(f"send_keys: {target} - keys length: {len(keys)}")
             logger.debug(f"send_keys: {target} - keys: {keys}")
-            if force_bracketed_paste:
+            if force_bracketed_paste and not self._pane_is_bracketed_paste_incompatible(
+                validated_session, validated_window
+            ):
                 # Wrap unconditionally and use -r (no newline→CR conversion).
                 # paste-buffer -p only adds bracketed sequences if tmux tracks
                 # ?2004h for the pane — some TUIs (e.g. current Kiro) don't
                 # send ?2004h so -p is a no-op and \n becomes CR (Enter).
                 buf_content = b"\x1b[200~" + keys.encode() + b"\x1b[201~"
-                paste_flag = "-r"
+                paste_args = ["-r"]
+            elif force_bracketed_paste:
+                # The pane's live foreground command is a known shell (see
+                # BRACKETED_PASTE_INCOMPATIBLE_SHELLS) -- it won't understand
+                # bracketed-paste escapes, so don't ask tmux to add them.
+                # Deliberately omitting -p here too, not just the manual
+                # \x1b[200~ wrap above: -p's own bracket-emitting decision is
+                # driven by tmux's per-pane ?2004h tracking, which can itself
+                # be stale (the very TUI that used to run in this pane can
+                # leave it "on" without ever sending ?2004l on exit) -- so
+                # -p is not a safe fallback here either. Sending with no
+                # paste flag at all never adds escape sequences regardless
+                # of that tracked state; \n still becomes Enter (no -r), the
+                # correct behavior for a plain shell prompt.
+                buf_content = keys.encode()
+                paste_args = []
             else:
                 buf_content = keys.encode()
-                paste_flag = "-p"
+                paste_args = ["-p"]
             subprocess.run(
                 ["tmux", "load-buffer", "-b", buf_name, "-"],
                 input=buf_content,
                 check=True,
             )
             subprocess.run(
-                ["tmux", "paste-buffer", paste_flag, "-b", buf_name, "-t", target],
+                ["tmux", "paste-buffer", *paste_args, "-b", buf_name, "-t", target],
                 check=True,
             )
             # Delay to let the TUI process the bracketed paste end sequence before

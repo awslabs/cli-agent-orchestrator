@@ -25,6 +25,7 @@ from cli_agent_orchestrator.backends.base import (
     TerminalBackendError,
     TerminalNotFoundError,
 )
+from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
@@ -393,6 +394,17 @@ class HerdrBackend(TerminalBackend):
 
     # --- Input ---
 
+    def _pane_is_bracketed_paste_incompatible(self, session_name: str, window_name: str) -> bool:
+        """Whether the pane's live foreground command is a known shell.
+
+        Mirrors ``TmuxClient._pane_is_bracketed_paste_incompatible`` (clients/
+        tmux.py) -- see that method's own docstring for the failure mode this
+        guards against. Fails closed to "compatible" (returns False) on any
+        lookup failure or unrecognized command name.
+        """
+        command = self.get_pane_current_command(session_name, window_name)
+        return command is not None and command in BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+
     def send_keys(
         self,
         session_name: str,
@@ -419,10 +431,23 @@ class HerdrBackend(TerminalBackend):
         # which maps to a terminal in the DB. We'll resolve via the pane list.
         pane_id = self._resolve_pane_id_from_window(session_name, window_name)
 
-        # Wrap in bracketed paste sequences when requested.
-        # herdr pane send-text writes raw bytes to the pty, so escape sequences
-        # pass through to the running process unchanged — same behavior as tmux.
-        if force_bracketed_paste:
+        # Wrap in bracketed paste sequences when requested -- UNLESS the pane's
+        # live foreground process is a known shell (see
+        # BRACKETED_PASTE_INCOMPATIBLE_SHELLS' own docstring in constants.py):
+        # a bare shell doesn't understand the escape sequences and glues them
+        # onto the first token of whatever's sent, corrupting it. Same
+        # tmux-backend fix (clients/tmux.py's
+        # _pane_is_bracketed_paste_incompatible), mirrored here since herdr's
+        # ``pane send-text`` writes raw bytes to the pty just like tmux's
+        # paste-buffer -- the same corruption is equally possible here, and
+        # herdr already exposes the same get_pane_current_command primitive.
+        # Fails closed to "compatible" (wraps, existing behavior) on a lookup
+        # failure or unrecognized command name. Only probed when
+        # force_bracketed_paste is actually requested -- an extra herdr
+        # round-trip whose result would otherwise be discarded.
+        if force_bracketed_paste and not self._pane_is_bracketed_paste_incompatible(
+            session_name, window_name
+        ):
             text = "\x1b[200~" + keys + "\x1b[201~"
         else:
             text = keys
