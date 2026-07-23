@@ -115,6 +115,12 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
 # herdr renumbers panes on deletion, so it resolves the pane fresh every call.
 _PANE_CACHE_TTL = 5.0
 
+# Staleness bound for the durable pane_id map (seconds). Herdr public pane_ids
+# are stable except across a full server restart, so a generous TTL is a cheap
+# safety net: within it, map hits are instant; after it (or on a miss) a single
+# `api snapshot` refresh rebuilds the whole map, self-healing a stale entry.
+_PANE_ID_MAP_TTL = 30.0
+
 
 class HerdrBackend(TerminalBackend):
     """TerminalBackend implementation using herdr CLI commands.
@@ -143,6 +149,9 @@ class HerdrBackend(TerminalBackend):
         # Durable map: terminal_id → pane_id, rebuilt from `api snapshot`.
         # Public IDs are stable except across a full herdr server restart.
         self._pane_id_map: Dict[str, str] = {}
+        # Timestamp of the last successful map rebuild; bounds map staleness
+        # against a herdr restart via _PANE_ID_MAP_TTL (0.0 => never built).
+        self._pane_id_map_ts: float = 0.0
         # Workspace cache: session_name → (workspace_id, timestamp)
         self._workspace_cache: Dict[str, tuple[str, float]] = {}
         self._ensure_session_running()
@@ -641,8 +650,11 @@ class HerdrBackend(TerminalBackend):
         Raises:
             TerminalNotFoundError: If pane cannot be resolved
         """
-        # Durable map (stable IDs): rebuilt from api snapshot on restart.
-        if terminal_id in self._pane_id_map:
+        # Durable map (rebuilt from api snapshot). Trust a hit only while the map
+        # is fresh; herdr IDs are stable except across a server restart, which
+        # this TTL bounds — a stale entry expires and the next lookup refreshes.
+        map_fresh = (time.time() - self._pane_id_map_ts) < _PANE_ID_MAP_TTL
+        if map_fresh and terminal_id in self._pane_id_map:
             return self._pane_id_map[terminal_id]
         self._refresh_pane_id_map()
         if terminal_id in self._pane_id_map:
@@ -663,11 +675,19 @@ class HerdrBackend(TerminalBackend):
 
         Public IDs are stable except across a full herdr server restart, so this
         is only needed on a miss (or at reconcile time), not per-call.
+
+        On any failure — non-zero exit, a raising ``_run_herdr`` (subprocess
+        timeout / missing binary surface as ``TerminalBackendError``; other
+        ``OSError`` subtypes can surface directly), or an unparseable snapshot —
+        the map and its timestamp are left unchanged. This keeps a failed
+        refresh from marking a stale map as fresh and from propagating out of
+        ``get_pane_id`` (which would skip the legacy fallback). ``_pane_id_map_ts``
+        is stamped only after a successful rebuild.
         """
-        result = self._run_herdr(["api", "snapshot"], check=False)
-        if result.returncode != 0:
-            return
         try:
+            result = self._run_herdr(["api", "snapshot"], check=False)
+            if result.returncode != 0:
+                return
             data = self._parse_herdr_json(result.stdout)
             snapshot = data.get("snapshot", data)
             if not isinstance(snapshot, dict):
@@ -677,7 +697,16 @@ class HerdrBackend(TerminalBackend):
                 for p in snapshot.get("panes", [])
                 if p.get("terminal_id") and p.get("pane_id")
             }
-        except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
+            self._pane_id_map_ts = time.time()
+        except (
+            TerminalBackendError,
+            subprocess.SubprocessError,
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            AttributeError,
+            TypeError,
+        ):
             return
 
     # --- Pipe-pane (no-op for herdr) ---
