@@ -141,6 +141,24 @@ def _no_llm_compile_in_tests(monkeypatch):
     monkeypatch.setenv("CAO_MEMORY_COMPILE_MODE", "append")
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_cao_env(monkeypatch):
+    """Strip CAO runtime env vars that leak when the suite runs inside a CAO terminal.
+
+    Without this, tests that assert default values (e.g. sender_id=="supervisor")
+    fail because the real terminal's CAO_TERMINAL_ID overrides the default.
+    monkeypatch.delenv runs BEFORE the test body, so tests that explicitly
+    monkeypatch.setenv one of these after fixture setup still work correctly.
+    """
+    # server.py defaults sender_id to "supervisor" when unset
+    monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
+    # server.py reads these for workflow_return context detection
+    monkeypatch.delenv("CAO_WORKFLOW_RUN_ID", raising=False)
+    monkeypatch.delenv("CAO_WORKFLOW_STEP_ID", raising=False)
+    # cli/commands/info.py uses this for session detection
+    monkeypatch.delenv("CAO_SESSION_NAME", raising=False)
+
+
 @pytest.fixture
 def isolated_memory_db(tmp_path, monkeypatch):
     """Route default memory sessions to an initialized per-test SQLite database."""

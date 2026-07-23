@@ -68,6 +68,23 @@ Pull requests are automatically checked for:
 - License compliance issues
 - Dependency version changes
 
+### Secret Scanning
+
+We use [gitleaks](https://github.com/gitleaks/gitleaks) to keep credentials out
+of the repository (see [`.gitleaks.toml`](.gitleaks.toml) and
+[`.github/workflows/secret-scan.yml`](.github/workflows/secret-scan.yml)):
+
+- **On every pull request**: scans the PR's commit range; a detected secret
+  fails the check so it can't merge.
+- **Weekly (scheduled)**: a full-history sweep, to surface a secret that may
+  predate the per-PR gate.
+
+If a secret ever does land, follow the
+[Leak Response & Git-History Scrub Runbook](docs/security.md).
+The rule of thumb is **rotate/revoke first**; rewriting history is a secondary,
+high-cost step that never substitutes for rotation. See
+[docs/security.md](docs/security.md) for the full operational procedures.
+
 ### Running Security Scans Locally
 
 You can run Trivy locally to check for vulnerabilities before committing:
@@ -91,6 +108,7 @@ Or use the bundled wrapper that mirrors CI (`trivy` + optional local CodeQL):
 scripts/security-scan.sh           # run all available scanners
 scripts/security-scan.sh trivy     # just Trivy
 scripts/security-scan.sh codeql    # just CodeQL (requires the CodeQL CLI)
+scripts/security-scan.sh gitleaks  # just gitleaks (requires the gitleaks CLI)
 ```
 
 ## Tool Restrictions (allowedTools)

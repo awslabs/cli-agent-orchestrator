@@ -36,7 +36,16 @@ from cli_agent_orchestrator.services.terminal_service import (
     send_input,
 )
 
-pytestmark = [pytest.mark.integration, pytest.mark.slow]
+# Skip integration tests by default (deselected in pyproject.toml addopts).
+# Run with: CAO_RUN_LIVE_PROVIDER_TESTS=1 pytest test/providers/test_kiro_cli_integration.py
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.slow,
+    pytest.mark.skipif(
+        os.environ.get("CAO_RUN_LIVE_PROVIDER_TESTS", "") != "1",
+        reason="Live provider tests disabled. Set CAO_RUN_LIVE_PROVIDER_TESTS=1 to enable.",
+    ),
+]
 
 KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"
 TEST_AGENT_NAME = "agent-kiro-cli-integration-test"
@@ -84,10 +93,12 @@ async def terminal(event_pipeline, mock_db, ensure_test_agent):
         delete_terminal(t.id)
     except Exception:
         pass
-    try:
-        tmux_client.kill_session(t.session_name)
-    except Exception:
-        pass
+    # Kill the tmux session unconditionally, regardless of test outcome.
+    # Prevents leaked sessions when tests timeout or fail during init.
+    # kill_session() handles exceptions internally and returns bool; a False
+    # is ambiguous (already gone vs. kill failed), so keep the warning soft.
+    if not tmux_client.kill_session(t.session_name):
+        print(f"\n[CLEANUP WARNING] Failed to kill session {t.session_name} (may already be gone)")
 
 
 @pytest.fixture(autouse=True)
