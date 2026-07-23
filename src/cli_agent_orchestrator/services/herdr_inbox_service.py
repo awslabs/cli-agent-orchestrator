@@ -307,87 +307,53 @@ class HerdrInboxService:
         from cli_agent_orchestrator.clients.database import (
             delete_terminal,
             get_terminal_metadata,
+            list_terminals_by_session,
         )
 
-        # Get live panes from herdr
-        result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "pane", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            logger.warning(f"Reconcile: herdr pane list failed: {result.stderr}")
+        # One socket call replaces the former pane-list + workspace-list +
+        # tab-list subprocess fan-out. All three data structures below are derived
+        # from this single snapshot.
+        snapshot = self._fetch_snapshot()
+        if snapshot is None:
+            logger.warning("Reconcile: no snapshot, skipping")
             return
 
-        try:
-            data = json.loads(result.stdout)
-            panes = data.get("result", {}).get("panes", [])
-            live_pane_ids = {p["pane_id"] for p in panes}
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Reconcile: failed to parse pane list: {e}")
-            return
+        # Live pane_ids (from snapshot.panes).
+        live_pane_ids = {p["pane_id"] for p in snapshot.get("panes", [])}
 
-        # Build workspace_id -> session_name mapping
-        ws_result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "workspace", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if ws_result.returncode == 0:
-            try:
-                ws_data = json.loads(ws_result.stdout)
-                workspaces = ws_data.get("result", {}).get("workspaces", [])
-                self._workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
-            except (json.JSONDecodeError, KeyError):
-                pass
+        # workspace_id -> label (= CAO session name), from snapshot.workspaces.
+        self._workspace_to_session = {
+            ws["workspace_id"]: ws["label"] for ws in snapshot.get("workspaces", [])
+        }
+
+        # workspace_id -> set of live tab labels (= CAO window names), from
+        # snapshot.tabs.
+        live_tabs_by_workspace: Dict[str, set] = {}
+        for tab in snapshot.get("tabs", []):
+            ws_id = tab.get("workspace_id", "")
+            label = tab.get("label", "")
+            if ws_id and label:
+                live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
 
         # DB cross-check: find terminals in DB whose tab no longer exists in herdr.
         # This catches ghost records from previous server runs where _pane_to_terminal
         # starts empty (so the stale-pane diff below produces nothing).
-        tab_result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "tab", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if tab_result.returncode == 0:
-            try:
-                tab_data = json.loads(tab_result.stdout)
-                tabs = tab_data.get("result", {}).get("tabs", [])
-                # Build: workspace_id -> set of live tab labels
-                live_tabs_by_workspace: Dict[str, set] = {}
-                for tab in tabs:
-                    ws_id = tab.get("workspace_id", "")
-                    label = tab.get("label", "")
-                    if ws_id and label:
-                        live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
-
-                from cli_agent_orchestrator.clients.database import (
-                    delete_terminal,
-                    list_terminals_by_session,
-                )
-
-                for ws_id, session_name in self._workspace_to_session.items():
-                    live_labels = live_tabs_by_workspace.get(ws_id, set())
-                    db_terminals = list_terminals_by_session(session_name)
-                    for term in db_terminals:
-                        window = term.get("tmux_window", "")
-                        if window and window not in live_labels:
-                            logger.info(
-                                f"Reconcile: deleting ghost terminal {term['id']} "
-                                f"({session_name}:{window}) — tab not in herdr"
-                            )
-                            try:
-                                delete_terminal(term["id"])
-                            except Exception as e:
-                                logger.warning(
-                                    f"Reconcile: failed to delete ghost terminal "
-                                    f"{term['id']}: {e}"
-                                )
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.warning(f"Reconcile: failed to parse tab list: {e}")
+        for ws_id, session_name in self._workspace_to_session.items():
+            live_labels = live_tabs_by_workspace.get(ws_id, set())
+            db_terminals = list_terminals_by_session(session_name)
+            for term in db_terminals:
+                window = term.get("tmux_window", "")
+                if window and window not in live_labels:
+                    logger.info(
+                        f"Reconcile: deleting ghost terminal {term['id']} "
+                        f"({session_name}:{window}) — tab not in herdr"
+                    )
+                    try:
+                        delete_terminal(term["id"])
+                    except Exception as e:
+                        logger.warning(
+                            f"Reconcile: failed to delete ghost terminal {term['id']}: {e}"
+                        )
 
         # Find stale panes: stored pane_id no longer in herdr's live pane list.
         #
