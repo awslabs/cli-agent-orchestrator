@@ -740,3 +740,23 @@ class TestGetPaneCurrentCommand:
         result = tmux.get_pane_current_command("ses", "win")
 
         assert result is None
+
+
+class TestPaneIsBracketedPasteIncompatible:
+    @pytest.mark.parametrize(
+        "shell", ["sh", "dash", "bash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash"]
+    )
+    def test_every_known_shell_is_incompatible(self, tmux, shell):
+        with patch.object(tmux, "get_pane_current_command", return_value=shell):
+            assert tmux._pane_is_bracketed_paste_incompatible("ses", "win") is True
+
+    @pytest.mark.parametrize("program", ["node", "claude", "kiro-cli", "python3", "codex"])
+    def test_known_tui_programs_are_compatible(self, tmux, program):
+        with patch.object(tmux, "get_pane_current_command", return_value=program):
+            assert tmux._pane_is_bracketed_paste_incompatible("ses", "win") is False
+
+    def test_lookup_failure_is_treated_as_compatible(self, tmux):
+        """Fails closed to the existing (pre-fix) behavior on an
+        unresolvable pane command -- see send_keys' own docstring."""
+        with patch.object(tmux, "get_pane_current_command", return_value=None):
+            assert tmux._pane_is_bracketed_paste_incompatible("ses", "win") is False

@@ -362,6 +362,69 @@ class TestHerdrBackendCommands:
         assert "Enter" in calls[-1]
 
     @patch("subprocess.run")
+    def test_send_keys_force_bracketed_wraps_when_pane_runs_a_real_tui(self, mock_run, backend):
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(),  # send-text
+            _completed(),  # send-keys Enter
+        ]
+
+        with patch.object(backend, "get_pane_current_command", return_value="node"):
+            backend.send_keys("cao-test", "window-0", "hello world", force_bracketed_paste=True)
+
+        send_text_call = mock_run.call_args_list[-2][0][0]
+        text_arg = send_text_call[send_text_call.index("send-text") + 2]
+        assert text_arg == "\x1b[200~hello world\x1b[201~"
+
+    @patch("subprocess.run")
+    def test_send_keys_force_bracketed_skips_wrap_for_bare_shell(self, mock_run, backend):
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(),  # send-text
+            _completed(),  # send-keys Enter
+        ]
+
+        with patch.object(backend, "get_pane_current_command", return_value="bash"):
+            backend.send_keys("cao-test", "window-0", "claude --continue", force_bracketed_paste=True)
+
+        send_text_call = mock_run.call_args_list[-2][0][0]
+        text_arg = send_text_call[send_text_call.index("send-text") + 2]
+        assert text_arg == "claude --continue"
+
+    @patch("subprocess.run")
+    def test_send_keys_non_forced_skips_the_pane_command_probe(self, mock_run, backend):
+        """force_bracketed_paste=False (the default) never calls
+        get_pane_current_command at all -- no wasted herdr round-trip."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(),  # send-text
+            _completed(),  # send-keys Enter
+        ]
+
+        with patch.object(backend, "get_pane_current_command") as mock_get:
+            backend.send_keys("cao-test", "window-0", "hello world")
+
+        mock_get.assert_not_called()
+
+    @patch("subprocess.run")
     def test_send_special_key_enter(self, mock_run, backend):
         """send_special_key with empty string sends Enter."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
