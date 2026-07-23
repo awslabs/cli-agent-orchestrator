@@ -68,6 +68,18 @@ DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
 # Higher values provide more context but increase memory usage
 TMUX_HISTORY_LINES = 200
 
+# Foreground commands that do NOT understand bracketed-paste escape sequences
+# (\x1b[200~...\x1b[201~). send_keys(force_bracketed_paste=True) checks the
+# pane's live #{pane_current_command} against this set before wrapping, so a
+# terminal whose provider process has already exited back to a bare shell
+# (e.g. after a TUI's own `/exit`) doesn't get the escape bytes glued onto
+# the first token of the next command. Bash is included deliberately: bash
+# itself does not interpret bracketed-paste sequences at its own prompt
+# either (see send_keys' own docstring) -- only the TUIs CAO drives do.
+BRACKETED_PASTE_INCOMPATIBLE_SHELLS = frozenset(
+    {"sh", "dash", "bash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash"}
+)
+
 # =============================================================================
 # Application Directory Structure
 # =============================================================================
