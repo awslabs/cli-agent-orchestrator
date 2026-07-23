@@ -110,7 +110,12 @@ class TestConfirmWorkerStartedOrResubmit:
             patch.object(ts, "send_input") as send,
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
-                "t1", "Analyze the logs", None, "sup", None, provider=provider,
+                "t1",
+                "Analyze the logs",
+                None,
+                "sup",
+                None,
+                provider=provider,
             )
         assert ok is True
         key.assert_not_called()
@@ -127,7 +132,12 @@ class TestConfirmWorkerStartedOrResubmit:
             patch.object(ts, "send_input") as send,
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
-                "t1", "Analyze the logs", None, "sup", None, provider=provider,
+                "t1",
+                "Analyze the logs",
+                None,
+                "sup",
+                None,
+                provider=provider,
             )
         assert ok is True
         key.assert_called_once()
@@ -145,7 +155,12 @@ class TestConfirmWorkerStartedOrResubmit:
             patch.object(ts, "send_input"),
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
-                "t1", "Analyze the logs", None, "sup", None, provider=provider,
+                "t1",
+                "Analyze the logs",
+                None,
+                "sup",
+                None,
+                provider=provider,
             )
         assert ok is True
         probe.assert_not_called()
@@ -160,7 +175,12 @@ class TestConfirmWorkerStartedOrResubmit:
             patch.object(ts, "send_input"),
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
-                "t1", "Analyze the logs", None, "sup", None, provider=None,
+                "t1",
+                "Analyze the logs",
+                None,
+                "sup",
+                None,
+                provider=None,
             )
         assert ok is True
         probe.assert_not_called()
@@ -183,9 +203,14 @@ class TestWorkerIsStartedDirect:
 
     def test_returns_false_when_get_history_raises(self):
         with (
-            patch.object(ts, "get_terminal_metadata", return_value={
-                "tmux_session": "s1", "tmux_window": "w1",
-            }),
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={
+                    "tmux_session": "s1",
+                    "tmux_window": "w1",
+                },
+            ),
             patch.object(ts, "get_backend") as mock_be,
         ):
             mock_be.return_value.get_history.side_effect = Exception("capture failed")
@@ -195,9 +220,14 @@ class TestWorkerIsStartedDirect:
         provider = MagicMock()
         provider.get_status.side_effect = Exception("parse failure")
         with (
-            patch.object(ts, "get_terminal_metadata", return_value={
-                "tmux_session": "s1", "tmux_window": "w1",
-            }),
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={
+                    "tmux_session": "s1",
+                    "tmux_window": "w1",
+                },
+            ),
             patch.object(ts, "get_backend") as mock_be,
         ):
             assert ts._worker_is_started_direct("t1", provider) is False
@@ -208,9 +238,14 @@ class TestWorkerIsStartedDirect:
         provider = MagicMock()
         provider.get_status.return_value = TerminalStatus.PROCESSING
         with (
-            patch.object(ts, "get_terminal_metadata", return_value={
-                "tmux_session": "s1", "tmux_window": "w1",
-            }),
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={
+                    "tmux_session": "s1",
+                    "tmux_window": "w1",
+                },
+            ),
             patch.object(ts, "get_backend") as mock_be,
         ):
             assert ts._worker_is_started_direct("t1", provider) is True
@@ -221,9 +256,14 @@ class TestWorkerIsStartedDirect:
         provider = MagicMock()
         provider.get_status.return_value = TerminalStatus.IDLE
         with (
-            patch.object(ts, "get_terminal_metadata", return_value={
-                "tmux_session": "s1", "tmux_window": "w1",
-            }),
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={
+                    "tmux_session": "s1",
+                    "tmux_window": "w1",
+                },
+            ),
             patch.object(ts, "get_backend") as mock_be,
         ):
             assert ts._worker_is_started_direct("t1", provider) is False
