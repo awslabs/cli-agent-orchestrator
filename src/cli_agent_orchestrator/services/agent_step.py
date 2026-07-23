@@ -213,6 +213,7 @@ async def run_agent_step(
     env_vars: Optional[dict[str, str]] = None,
     on_terminal_created: Optional[Callable[[str], None]] = None,
     cancel_event: Optional[asyncio.Event] = None,
+    model: Optional[str] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -288,6 +289,12 @@ async def run_agent_step(
             provider never emits a completion signal is exactly the run that could
             not otherwise be killed. Default None = no cancellation seam (the
             handoff caller passes nothing) — behavior unchanged.
+        model: Explicit per-call model override for a freshly created
+            terminal (ignored when reusing a terminal), forwarded to
+            ``terminal_service.create_terminal``. Lets a handoff caller pin
+            a specific model for this one worker without a dedicated agent
+            profile. Default None = behavior unchanged (profile.model, if
+            any, still applies).
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -354,6 +361,7 @@ async def run_agent_step(
             allowed_tools=allowed_tools,
             caller_id=caller_id,
             env_vars=env_vars,
+            model=model,
         )
         terminal_id = terminal.id
 

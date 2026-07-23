@@ -173,6 +173,7 @@ def _create_terminal(
     defer_init: bool = False,
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    model: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -191,6 +192,16 @@ def _create_terminal(
             initializing. Ignored otherwise.
         initial_message_orchestration_type: Passed through to send_input for
             plugin event emission (assign/handoff).
+        model: Explicit per-call model override for the new terminal, applied
+            ahead of the agent profile's own static model field (where the
+            resolved provider supports it). Only honored on the
+            existing-session branch below (``POST /sessions/{name}/
+            terminals``) -- the new-session branch (``POST /sessions``, used
+            only when this tool is called with no current CAO_TERMINAL_ID)
+            goes through a different server-side route that does not accept
+            it; handoff/assign both already require an existing terminal
+            (see their own CAO_TERMINAL_ID checks), so this branch is the one
+            that matters for both callers in practice.
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -248,6 +259,8 @@ def _create_terminal(
             params["working_directory"] = working_directory
         if child_allowed_tools:
             params["allowed_tools"] = child_allowed_tools
+        if model:
+            params["model"] = model
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
@@ -670,7 +683,11 @@ def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
 
 # Implementation functions
 async def _handoff_impl(
-    agent_profile: str, message: str, timeout: int = 600, working_directory: Optional[str] = None
+    agent_profile: str,
+    message: str,
+    timeout: int = 600,
+    working_directory: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -742,6 +759,8 @@ async def _handoff_impl(
             payload["allowed_tools"] = ctx.allowed_tools
         if working_directory:
             payload["working_directory"] = working_directory
+        if model:
+            payload["model"] = model
 
         # Allow the full step time plus the server-side ready-wait (up to 120s)
         # plus headroom; the server enforces the per-step timeout internally.
@@ -810,6 +829,17 @@ async def _handoff_impl(
         )
 
 
+# Shared by both handoff and assign's tool signatures below.
+_model_field_desc = (
+    "Optional model override for the worker agent (e.g. a concrete model name/id "
+    "accepted by the resolved provider's own --model flag). Takes precedence over "
+    "the agent profile's own configured model, if any, for this one call only -- "
+    "no dedicated profile is needed just to pin a specific model. Not honored by "
+    "every provider (see the target provider's own docs); omit to use the agent "
+    "profile's configured model as before."
+)
+
+
 # Conditional tool registration based on environment variable
 if ENABLE_WORKING_DIRECTORY:
 
@@ -829,6 +859,7 @@ if ENABLE_WORKING_DIRECTORY:
             default=None,
             description='Optional working directory where the agent should execute (e.g., "/path/to/workspace/src/Package")',
         ),
+        model: Optional[str] = Field(default=None, description=_model_field_desc),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -852,6 +883,12 @@ if ENABLE_WORKING_DIRECTORY:
         - You can specify a custom directory via working_directory parameter
         - Directory must exist and be accessible
 
+        ## Model
+
+        - By default, the agent uses whatever model its profile is configured with
+        - You can pin a specific model via the model parameter, without needing a
+          dedicated agent profile -- not honored by every provider
+
         ## Requirements
 
         - Must be called from within a CAO terminal (CAO_TERMINAL_ID environment variable)
@@ -863,11 +900,12 @@ if ENABLE_WORKING_DIRECTORY:
             message: The task/message to send
             timeout: Maximum wait time in seconds
             working_directory: Optional directory path where agent should execute
+            model: Optional model override (not honored by every provider)
 
         Returns:
             HandoffResult with success status, message, and agent output
         """
-        return await _handoff_impl(agent_profile, message, timeout, working_directory)
+        return await _handoff_impl(agent_profile, message, timeout, working_directory, model)
 
 else:
 
@@ -883,6 +921,7 @@ else:
             ge=1,
             le=3600,
         ),
+        model: Optional[str] = Field(default=None, description=_model_field_desc),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -899,6 +938,12 @@ else:
         4. Return the agent's response
         5. Clean up the terminal with /exit
 
+        ## Model
+
+        - By default, the agent uses whatever model its profile is configured with
+        - You can pin a specific model via the model parameter, without needing a
+          dedicated agent profile -- not honored by every provider
+
         ## Requirements
 
         - Must be called from within a CAO terminal (CAO_TERMINAL_ID environment variable)
@@ -908,16 +953,20 @@ else:
             agent_profile: The agent profile for the new terminal
             message: The task/message to send
             timeout: Maximum wait time in seconds
+            model: Optional model override (not honored by every provider)
 
         Returns:
             HandoffResult with success status, message, and agent output
         """
-        return await _handoff_impl(agent_profile, message, timeout, None)
+        return await _handoff_impl(agent_profile, message, timeout, None, model)
 
 
 # Implementation function for assign
 def _assign_impl(
-    agent_profile: str, message: str, working_directory: Optional[str] = None
+    agent_profile: str,
+    message: str,
+    working_directory: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -976,6 +1025,7 @@ def _assign_impl(
             defer_init=True,
             initial_message=worker_message,
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
+            model=model,
         )
 
         return {
@@ -1031,6 +1081,12 @@ Example message: "Analyze the logs. When done, send results back to terminal ee3
 
     desc += """
 
+## Model
+
+- By default, the worker uses whatever model its agent profile is configured with
+- You can pin a specific model for this one worker via the model parameter, without
+  needing a dedicated agent profile -- not honored by every provider
+
 ## Cleanup
 
 When you are done with an assigned terminal (received results or no longer need it),
@@ -1045,6 +1101,7 @@ Args:
     working_directory: Optional working directory where the agent should execute"""
 
     desc += """
+    model: Optional model override for the worker (not honored by every provider)
 
 Returns:
     Dict with success status, worker terminal_id, and message"""
@@ -1072,8 +1129,9 @@ if ENABLE_WORKING_DIRECTORY:
         working_directory: Optional[str] = Field(
             default=None, description="Optional working directory where the agent should execute"
         ),
+        model: Optional[str] = Field(default=None, description=_model_field_desc),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, working_directory)
+        return _assign_impl(agent_profile, message, working_directory, model)
 
 else:
 
@@ -1083,8 +1141,9 @@ else:
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),
         message: str = Field(description=_assign_message_field_desc),
+        model: Optional[str] = Field(default=None, description=_model_field_desc),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, None)
+        return _assign_impl(agent_profile, message, None, model)
 
 
 # Implementation function for send_message

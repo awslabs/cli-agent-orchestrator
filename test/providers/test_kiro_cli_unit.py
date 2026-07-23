@@ -160,6 +160,27 @@ class TestKiroCliProviderInitialization:
             "kiro-cli chat --trust-all-tools --model claude-opus-4-6 --agent developer",
         )
 
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    def test_get_profile_model_explicit_override_wins_over_profile_model(self, mock_load_profile):
+        profile = Mock()
+        profile.model = "claude-opus-4-6"
+        mock_load_profile.return_value = profile
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer", model="fable-5")
+
+        assert provider._get_profile_model() == "fable-5"
+
+    def test_get_profile_model_explicit_override_applies_without_loading_profile(self):
+        """An explicit override short-circuits before even attempting to
+        load the CAO agent profile from disk."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer", model="fable-5")
+
+        with patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile") as mock_load:
+            result = provider._get_profile_model()
+
+        assert result == "fable-5"
+        mock_load.assert_not_called()
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")

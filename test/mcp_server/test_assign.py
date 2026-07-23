@@ -164,6 +164,73 @@ class TestCreateTerminalProviderResolution:
         mock_requests.post.assert_not_called()
 
 
+class TestCreateTerminalModelOverride:
+    """_create_terminal's own `model` parameter -- an explicit per-call model
+    override for the new terminal, forwarded to the existing-session POST as
+    a params entry (see terminal_service.create_terminal's own docstring for
+    how it wins over the profile's own static model field)."""
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_model_is_forwarded_as_a_param(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _create_terminal("reviewer", "/repo", model="fable-5")
+
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["params"]["model"] == "fable-5"
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_omitted_model_leaves_params_unchanged(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """No model given -> params dict is byte-for-byte the pre-fix shape
+        (no 'model' key at all) -- existing callers see zero behavior change."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _create_terminal("reviewer", "/repo")
+
+        _, kwargs = mock_requests.post.call_args
+        assert "model" not in kwargs["params"]
+
+
 class TestAssignSenderIdInjection:
     """Tests for sender ID injection in _assign_impl.
 
@@ -299,6 +366,36 @@ class TestAssignSenderIdInjection:
         # falsely conclude the worker has already received the task.
         assert "initializing" in result["message"].lower()
 
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_assign_forwards_model_to_create_terminal(self, mock_create):
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_create.return_value = ("worker-1", "claude_code")
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = _assign_impl("developer", "Do work", model="fable-5")
+
+        assert result["success"] is True
+        _, kwargs = mock_create.call_args
+        assert kwargs["model"] == "fable-5"
+
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_assign_omitted_model_passes_none(self, mock_create):
+        """No model given -> _create_terminal's own model=None default kicks
+        in (profile.model, if any, still applies) -- existing callers see
+        zero behavior change."""
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_create.return_value = ("worker-1", "claude_code")
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _assign_impl("developer", "Do work")
+
+        _, kwargs = mock_create.call_args
+        assert kwargs["model"] is None
+
 
 class TestBuildAssignDescription:
     """Tests for the _build_assign_description helper.
@@ -385,6 +482,19 @@ class TestBuildAssignDescription:
         """When workdir is off, working_directory does not appear in Args."""
         desc = _build_assign_description(enable_sender_id=False, enable_workdir=False)
         assert "working_directory:" not in desc
+
+    # ------------------------------------------------------------------
+    # Model section (unconditional -- not gated on any flag)
+    # ------------------------------------------------------------------
+
+    def test_model_section_and_arg_always_present(self):
+        """Unlike working_directory, the Model section/arg isn't feature-
+        flagged -- present in all four combinations."""
+        for sender_id in (True, False):
+            for workdir in (True, False):
+                desc = _build_assign_description(sender_id, workdir)
+                assert "## Model" in desc
+                assert "model:" in desc
 
     # ------------------------------------------------------------------
     # All four flag combinations

@@ -239,6 +239,15 @@ class RunStepRequest(BaseModel):
             "values are validated but never echoed in error bodies."
         ),
     )
+    model: Optional[str] = Field(
+        default=None,
+        description=(
+            "Explicit per-call model override for a freshly created terminal "
+            "(ignored when reusing a terminal), applied ahead of the agent "
+            "profile's own static model field. Lets a caller pin a specific "
+            "model for one worker without a dedicated agent profile."
+        ),
+    )
 
     @field_validator("env_vars")
     @classmethod
@@ -1766,6 +1775,7 @@ async def create_terminal_in_session(
     allowed_tools: Optional[str] = None,
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
+    model: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -1784,6 +1794,12 @@ async def create_terminal_in_session(
     ``initial_message_orchestration_type``) rather than query params so prompt
     content isn't exposed in HTTP access logs and isn't subject to URL-length
     limits.
+
+    ``model``: optional explicit override, applied ahead of the agent
+    profile's own static ``model`` field (where the resolved provider
+    supports it -- see ``terminal_service.create_terminal``'s own docstring).
+    Lets a caller pin a specific model for one worker without needing a
+    dedicated agent profile.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -1847,6 +1863,7 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            model=model,
         )
         return result
     except HTTPException:
@@ -2156,6 +2173,7 @@ async def run_step(
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,
+            model=body.model,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure

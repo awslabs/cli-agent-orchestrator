@@ -193,6 +193,66 @@ class TestTerminalCreationWithWorkingDirectory:
             assert call_kwargs.get("caller_id") == "dcba8765"
             assert response.json()["caller_id"] == "dcba8765"
 
+    def test_create_terminal_passes_model(self, client):
+        """model query param threads through to the service -- explicit
+        per-call model override for MCP handoff/assign."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="claude_code",
+                    agent_profile="analyst",
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "claude_code",
+                    "agent_profile": "analyst",
+                    "model": "fable-5",
+                },
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("model") == "fable-5"
+
+    def test_create_terminal_omitted_model_forwards_none(self, client):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="kiro_cli",
+                    agent_profile="analyst",
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("model") is None
+
     def test_create_terminal_rejects_malformed_caller_id(self, client):
         """caller_id is validated against the TerminalId pattern — IDs arrive
         from agent input and must not be persisted unvalidated."""
