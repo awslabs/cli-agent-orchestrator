@@ -142,53 +142,32 @@ class HerdrInboxService:
         Runs once at server startup before any pane registrations.  Cannot
         rely on _pane_to_terminal (empty at startup) or _workspace_to_session
         (populated later by _reconcile).  Builds the workspace map directly
-        from herdr workspace list.
+        from a herdr api snapshot.
         """
         from cli_agent_orchestrator.clients.database import (
             delete_terminal,
             list_terminals_by_session,
         )
 
-        ws_result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "workspace", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if ws_result.returncode != 0:
-            logger.debug("Startup DB cleanup: herdr workspace list failed, skipping")
+        snapshot = self._fetch_snapshot()
+        if snapshot is None:
+            logger.debug("Startup DB cleanup: no snapshot, skipping")
             return
 
-        try:
-            ws_data = json.loads(ws_result.stdout)
-            workspaces = ws_data.get("result", {}).get("workspaces", [])
-            workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Startup DB cleanup: failed to parse workspace list: {e}")
-            return
+        # workspace_id -> label (= CAO session name). Skip malformed records.
+        workspace_to_session = {
+            ws["workspace_id"]: ws["label"]
+            for ws in snapshot.get("workspaces", [])
+            if ws.get("workspace_id") and ws.get("label")
+        }
 
-        tab_result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "tab", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if tab_result.returncode != 0:
-            logger.debug("Startup DB cleanup: herdr tab list failed, skipping")
-            return
-
-        try:
-            tab_data = json.loads(tab_result.stdout)
-            tabs = tab_data.get("result", {}).get("tabs", [])
-            live_tabs_by_workspace: Dict[str, set] = {}
-            for tab in tabs:
-                ws_id = tab.get("workspace_id", "")
-                label = tab.get("label", "")
-                if ws_id and label:
-                    live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Startup DB cleanup: failed to parse tab list: {e}")
-            return
+        # workspace_id -> set of live tab labels (= CAO window names)
+        live_tabs_by_workspace: Dict[str, set] = {}
+        for tab in snapshot.get("tabs", []):
+            ws_id = tab.get("workspace_id", "")
+            label = tab.get("label", "")
+            if ws_id and label:
+                live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
 
         deleted = 0
         for ws_id, session_name in workspace_to_session.items():

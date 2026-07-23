@@ -653,38 +653,20 @@ class TestHerdrInboxSnapshot:
 class TestHerdrInboxServiceStartupDbCleanup:
     """Test _startup_db_cleanup removes ghost terminals on server start."""
 
-    def _make_subprocess_side_effect(self, ws_response, tab_response):
-        def side_effect(cmd, **_):
-            m = MagicMock()
-            m.returncode = 0
-            if "workspace" in cmd and "list" in cmd:
-                m.stdout = ws_response
-            else:
-                m.stdout = tab_response
-            return m
-
-        return side_effect
-
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
-    def test_startup_cleanup_deletes_ghost_terminals(self, mock_list, mock_delete, mock_run):
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_startup_cleanup_deletes_ghost_from_snapshot(self, mock_snap, mock_list, mock_delete):
         """Ghost terminals (window not in live herdr tabs) are deleted at startup."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
-        ws_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
-        )
-        tab_response = json.dumps(
-            {
-                "result": {
-                    "tabs": [
-                        {"label": "live-window", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
-                    ]
-                }
-            }
-        )
-        mock_run.side_effect = self._make_subprocess_side_effect(ws_response, tab_response)
+        mock_snap.return_value = {
+            "panes": [],
+            "workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}],
+            "tabs": [
+                {"label": "live-window", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
+            ],
+        }
         mock_list.return_value = [
             {"id": "tid-live", "tmux_window": "live-window"},
             {"id": "tid-ghost", "tmux_window": "dead-window"},
@@ -694,37 +676,32 @@ class TestHerdrInboxServiceStartupDbCleanup:
 
         mock_delete.assert_called_once_with("tid-ghost")
 
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
-    def test_startup_cleanup_skips_when_workspace_list_fails(self, mock_list, mock_run):
-        """When herdr workspace list fails, no DB queries run."""
-        service = HerdrInboxService(socket_path="/tmp/test.sock")
-
-        fail = MagicMock(returncode=1, stdout="")
-        mock_run.return_value = fail
-        _run_async(service._startup_db_cleanup())
-        mock_list.assert_not_called()
-
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
-    def test_startup_cleanup_no_deletes_when_all_live(self, mock_list, mock_delete, mock_run):
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_startup_cleanup_skips_on_snapshot_none(self, mock_snap, mock_list, mock_delete):
+        """When the snapshot is unavailable (None), no DB queries or deletes run."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+
+        mock_snap.return_value = None
+        _run_async(service._startup_db_cleanup())
+        mock_list.assert_not_called()
+        mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_startup_cleanup_no_deletes_when_all_live(self, mock_snap, mock_list, mock_delete):
         """No deletions when all DB terminals have matching live tabs."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
-        ws_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
-        )
-        tab_response = json.dumps(
-            {
-                "result": {
-                    "tabs": [
-                        {"label": "conductor-10e0", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
-                    ]
-                }
-            }
-        )
-        mock_run.side_effect = self._make_subprocess_side_effect(ws_response, tab_response)
+        mock_snap.return_value = {
+            "panes": [],
+            "workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}],
+            "tabs": [
+                {"label": "conductor-10e0", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
+            ],
+        }
         mock_list.return_value = [{"id": "tid-1", "tmux_window": "conductor-10e0"}]
 
         _run_async(service._startup_db_cleanup())
