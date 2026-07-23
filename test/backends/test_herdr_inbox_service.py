@@ -147,55 +147,32 @@ class TestHerdrInboxServiceDelivery:
 class TestHerdrInboxServiceSubscription:
     """Test combined event subscription message format.
 
-    herdr 0.6.8 resets the connection on a second events.subscribe, so all
-    subscriptions (every managed pane's agent-status plus the two lifecycle
-    events) must be sent in a SINGLE events.subscribe call.
+    herdr 0.7.5 resets the connection on a second events.subscribe, so all
+    subscriptions must be sent in a SINGLE events.subscribe call. The
+    subscription is a broadcast pane.updated (no pane_id) that carries
+    agent_status for every pane, plus the two lifecycle events.
     """
 
-    def test_subscribe_all_events_sends_single_combined_message(self):
-        """_subscribe_all_events should send exactly one events.subscribe containing
-        every managed pane's agent-status subscription plus the lifecycle events."""
+    def test_subscribe_all_events_sends_single_broadcast_message(self):
+        """One events.subscribe with broadcast pane.updated + lifecycle, NO pane_id.
+
+        herdr 0.7.5 resets the connection on a second events.subscribe, so this
+        must stay a single call. pane.updated is a broadcast (no pane_id) that
+        carries agent_status for every pane, so per-pane subscriptions are gone.
+        """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._writer = AsyncMock()
-        service._pane_to_terminal = {"pane-1": "tid1", "pane-2": "tid2"}
-        service._terminal_to_pane = {"tid1": "pane-1", "tid2": "pane-2"}
-
-        _run_async(service._subscribe_all_events())
-
-        # Exactly ONE write — never a second subscribe call.
-        service._writer.write.assert_called_once()
-        written = service._writer.write.call_args[0][0]
-        msg = json.loads(written.decode().strip())
-
-        assert msg["method"] == "events.subscribe"
-        subs = msg["params"]["subscriptions"]
-
-        # Every managed pane has an agent-status subscription with its pane_id.
-        agent_subs = [s for s in subs if s["type"] == "pane.agent_status_changed"]
-        assert {s["pane_id"] for s in agent_subs} == {"pane-1", "pane-2"}
-
-        # Lifecycle events are included in the same single call.
-        types = {s["type"] for s in subs}
-        assert "pane.closed" in types
-        assert "workspace.closed" in types
-
-    def test_subscribe_all_events_with_no_panes_still_includes_lifecycle(self):
-        """With no managed panes, the single subscribe still covers lifecycle events."""
-        service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._pane_to_terminal = {"w1:p1": "tid1", "w1:p2": "tid2"}
 
         _run_async(service._subscribe_all_events())
 
         service._writer.write.assert_called_once()
         msg = json.loads(service._writer.write.call_args[0][0].decode().strip())
+        assert msg["method"] == "events.subscribe"
         types = {s["type"] for s in msg["params"]["subscriptions"]}
-        assert types == {"pane.closed", "workspace.closed"}
-        # No agent-status entry without a pane_id (herdr rejects that as invalid_request).
-        assert all(
-            "pane_id" in s
-            for s in msg["params"]["subscriptions"]
-            if s["type"] == "pane.agent_status_changed"
-        )
+        assert types == {"pane.updated", "pane.closed", "workspace.closed"}
+        # Broadcast subscriptions carry no pane_id.
+        assert all("pane_id" not in s for s in msg["params"]["subscriptions"])
 
 
 class TestHerdrInboxServiceEventParsing:
@@ -303,10 +280,11 @@ class TestHerdrInboxServiceReconnect:
     """Test reconnect re-subscribe behavior: a single combined subscribe per connection."""
 
     def test_reconnect_resubscribe_sends_single_call_for_all_panes(self):
-        """On reconnect, all managed panes are re-subscribed in ONE events.subscribe call.
+        """On reconnect, the broadcast subscription is re-sent in ONE events.subscribe call.
 
         herdr resets the connection on a second events.subscribe, so re-subscribing
-        N panes must be one combined call, not N separate calls.
+        must be one combined call. The subscription is a broadcast pane.updated
+        (no pane_id) covering every pane, plus the two lifecycle events.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._writer = AsyncMock()
@@ -318,15 +296,13 @@ class TestHerdrInboxServiceReconnect:
 
         _run_async(service._subscribe_all_events())
 
-        # Exactly ONE subscribe message for all panes (not one per pane).
+        # Exactly ONE broadcast subscribe message (not one per pane).
         service._writer.write.assert_called_once()
         msg = json.loads(service._writer.write.call_args[0][0].decode().strip())
-        agent_panes = {
-            s["pane_id"]
-            for s in msg["params"]["subscriptions"]
-            if s["type"] == "pane.agent_status_changed"
-        }
-        assert agent_panes == {"pane-1", "pane-2"}
+        types = {s["type"] for s in msg["params"]["subscriptions"]}
+        assert types == {"pane.updated", "pane.closed", "workspace.closed"}
+        # Broadcast subscriptions carry no pane_id.
+        assert all("pane_id" not in s for s in msg["params"]["subscriptions"])
         # Mapping should be unchanged
         assert service._terminal_to_pane["tid1"] == "pane-1"
         assert service._terminal_to_pane["tid2"] == "pane-2"

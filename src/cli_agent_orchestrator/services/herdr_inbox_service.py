@@ -486,25 +486,23 @@ class HerdrInboxService:
     async def _subscribe_all_events(self) -> None:
         """Subscribe to all events in a SINGLE events.subscribe call.
 
-        herdr (0.6.8) resets the entire connection when it receives a second
+        herdr (0.7.5) resets the entire connection when it receives a second
         events.subscribe on a connection that already has an active
-        subscription. So every subscription this service needs — one
-        pane.agent_status_changed per managed pane (pane_id is required; herdr
-        rejects the wildcard form with invalid_request) plus the pane.closed and
-        workspace.closed lifecycle events — must be sent together in one call.
+        subscription, so this must remain exactly one events.subscribe per
+        connection.
 
-        The pane_id → terminal_id mapping in _pane_to_terminal is already current:
-        a socket disconnect does not change pane_ids (only a herdr server restart
-        compacts them), and _reconcile() has already pruned stale panes before
-        this runs.
+        The subscription is a broadcast pane.updated (sent with NO pane_id):
+        herdr streams it for every pane and its payload carries agent_status,
+        so a single broadcast subscription replaces the former per-pane
+        pane.agent_status_changed subscriptions. This is independent of
+        _pane_to_terminal — no per-pane enumeration is needed. The pane.closed
+        and workspace.closed lifecycle events are sent in the same call.
         """
-        subscriptions: list = [
-            {"type": "pane.agent_status_changed", "pane_id": pane_id}
-            for pane_id in self._pane_to_terminal
+        subscriptions = [
+            {"type": "pane.updated"},
+            {"type": "pane.closed"},
+            {"type": "workspace.closed"},
         ]
-        subscriptions.append({"type": "pane.closed"})
-        subscriptions.append({"type": "workspace.closed"})
-
         message = {
             "id": "sub_all",
             "method": "events.subscribe",
@@ -512,8 +510,8 @@ class HerdrInboxService:
         }
         await self._send(message)
         logger.info(
-            f"Subscribed to {len(self._pane_to_terminal)} pane(s) + lifecycle events "
-            f"in one events.subscribe call"
+            "Subscribed to broadcast pane.updated + lifecycle events "
+            "in one events.subscribe call"
         )
 
     async def _force_reconnect(self) -> None:
