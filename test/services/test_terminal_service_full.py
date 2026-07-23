@@ -1,5 +1,6 @@
 """Full tests for terminal service."""
 
+import os
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -182,7 +183,7 @@ class TestCreateTerminal:
             engine="v2",
             group=None,
             metadata=None,
-            working_directory=None,
+            working_directory=os.path.realpath(os.getcwd()),
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
