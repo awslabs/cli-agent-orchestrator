@@ -1,125 +1,123 @@
 # Control Planes
 
-CAO exposes several different ways to drive sessions and to observe what they do. They are not alternatives to each other — they occupy different positions on two axes: who is in charge, and which direction the traffic flows.
+CAO has three inbound management surfaces and one outbound extension surface.
+The right choice depends on who initiates the action and which transport that
+caller can use.
 
-This guide explains what each surface is for, when to use it, and how they fit together.
+## Surfaces at a glance
 
-## The four surfaces at a glance
-
-| Surface | Direction | Who calls it | Transport | Typical use |
+| Surface | Direction | Caller | Transport | Best for |
 |---|---|---|---|---|
-| **Web UI** | Inbound (outside → CAO) | Human in a browser | HTTP + WebSocket | Interactive management from the browser |
-| **`cao session` CLI + [`cao-session-management`](../skills/cao-session-management/SKILL.md) skill** | Inbound | Human in a terminal, OR an external agent that can run shell commands | Shell → HTTP | Scripts, CI pipelines, headless jobs, agents that cannot speak MCP |
-| **`cao-ops-mcp` server** | Inbound | Any external agent that speaks MCP | MCP (stdio) → HTTP | A primary agent managing CAO from inside its own chat loop |
-| **Plugins** (e.g. `cao-discord`) | **Outbound** (CAO → outside) | `cao-server` itself, fire-and-forget | Python hooks → whatever the plugin chooses (webhook, log, metric) | Forwarding events to chat apps, observability, audit logging |
+| [Web UI](web-ui.md) | Inbound | Human operator | HTTP and WebSocket | Interactive browser management |
+| `cao session` and the [session-management skill](../skills/cao-session-management/SKILL.md) | Inbound | Human, script, CI job, or shell-capable agent | Shell to HTTP | Portable automation and one-off commands |
+| `cao-ops-mcp` | Inbound | External MCP-capable agent | MCP stdio to HTTP | Typed fleet-management tools |
+| [Plugins](plugins.md) | Outbound | `cao-server` | Python hooks to an external destination | Notifications, audit records, and observability |
 
-Separately, the in-session MCP server (`cao-mcp-server`) handles agent-to-agent orchestration *within* a CAO session. That is orthogonal to this document — see [Multi-Agent Orchestration](../README.md#multi-agent-orchestration) in the README for `handoff` / `assign` / `send_message`.
+These surfaces manage CAO from outside a session. The separate
+`cao-mcp-server` is an orthogonal, in-session surface through which CAO agents
+coordinate with tools such as `handoff`, `assign`, and `send_message`. See the
+[core MCP tools](../skills/cao-supervisor-protocols/SKILL.md#core-mcp-tools)
+and the guide to
+[choosing between assign and handoff](../skills/cao-supervisor-protocols/SKILL.md#choosing-between-assign-and-handoff).
 
-## Inbound vs outbound
+## Inbound and outbound traffic
 
-The first thing to internalise is that **Web UI, `cao session`, and `cao-ops-mcp` are all inbound** — they are ways to tell CAO what to do. **Plugins are outbound** — they are how CAO tells the outside world what it is doing.
+The Web UI, shell CLI, and `cao-ops-mcp` send management requests into CAO.
+Plugins receive events from CAO and send them outward. A bidirectional
+integration therefore needs both an inbound command path and an outbound
+plugin.
 
-So "should I use plugins or `cao-ops-mcp`?" is not the right question. The right question is:
+All inbound surfaces ultimately use the local HTTP API. See the
+[API overview](api.md) for route families and generated OpenAPI for individual
+HTTP operations.
 
-- Who is initiating? → inbound surface.
-- Does something need to know when CAO did something? → plugin.
+## Web UI
 
-A bidirectional bridge (e.g. a Telegram bot that lets Telegram users drive CAO and also streams CAO events back to the channel) is two components: one plugin for outbound, one inbound call path for commands.
+The browser dashboard is bundled with `cao-server` and is the simplest surface
+for interactively inspecting sessions and terminals. Its setup, remote-access,
+and frontend-development details live in the [Web UI guide](web-ui.md).
 
-## Inbound surfaces
+## Shell CLI
 
-All three inbound surfaces ultimately hit the same HTTP API at `localhost:9889`. They differ only in *how* a caller gets there.
+Use `cao session` commands for scripts, CI, cron, or any caller that can execute
+shell commands. `cao launch` creates sessions and `cao shutdown` removes them.
+The canonical command reference and agent-facing procedure are in the
+[session-management skill](../skills/cao-session-management/SKILL.md#commands).
 
-### Web UI
+## `cao-ops-mcp` server
 
-Browser-based dashboard bundled with `cao-server`. See [Web UI](../README.md#web-ui) in the README.
+`cao-ops-mcp` exposes operations such as profile installation, session launch,
+and session inspection as typed MCP tools. Use it when a primary agent outside
+CAO already speaks MCP and benefits from tool discovery and structured
+arguments. The server forwards operations to a running `cao-server`; it does
+not replace the in-session `cao-mcp-server`.
 
-- **Strength:** interactive, visual, no configuration for a human operator.
-- **Weakness:** human only — no scripting, no agent access.
+Start `cao-server` before the MCP server. By default, both use
+`http://localhost:9889`; when CAO uses a custom endpoint, set `CAO_API_HOST` and
+`CAO_API_PORT` in the MCP server environment to match it.
 
-### `cao session` CLI and the `cao-session-management` skill
+For Claude Code, add this stdio server to `.mcp.json`:
 
-A set of `cao session <verb>` commands (`list`, `status`, `send`, plus `cao launch` / `cao shutdown`) wrapped into a [skill](../skills/cao-session-management/SKILL.md) so any agent that follows the SKILL.md format can drive CAO by running shell commands.
+```json
+{
+  "mcpServers": {
+    "cao-ops-mcp": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+        "cao-ops-mcp-server"
+      ]
+    }
+  }
+}
+```
 
-- **Strength:** universal — works from bash, Python, `subprocess`, any agent framework, any external tool that can run a command. Zero protocol requirements on the caller.
-- **When to use:**
-  - Scripting, CI pipelines, headless jobs.
-  - An external AI assistant that does not speak MCP — e.g. [OpenClaw](https://github.com/openclaw/openclaw) or [Hermes Agent](https://github.com/NousResearch/hermes-agent). Any assistant that supports shell-callable skills should work.
-  - Quick one-shots where spinning up an MCP client is overkill.
+For other MCP clients, configure the equivalent stdio command:
 
-See [Session Management CLI](../README.md#session-management-cli) in the README for the command reference.
+```bash
+uvx --from git+https://github.com/awslabs/cli-agent-orchestrator.git@main cao-ops-mcp-server
+```
 
-### `cao-ops-mcp` server
+The current tools are grouped by purpose:
 
-An MCP server that exposes the same set of management operations as structured tool calls. Add it to a primary agent's MCP configuration and that agent can call `launch_session`, `list_sessions`, `install_profile`, etc. as typed tools.
+- Profiles: `list_profiles`, `get_profile_details`, `install_profile`
+- Launch and messaging: `launch_session`, `send_session_message`
+- Terminal inspection: `read_session_output`, `get_terminal_status`,
+  `get_terminal_output`
+- Session lifecycle: `list_sessions`, `get_session_info`, `shutdown_session`
 
-- **Strength:** structured tool calls instead of shell parsing. Typed arguments, typed results, errors surface as tool-call errors.
-- **When to use:**
-  - A primary agent (Claude Code, Claude Desktop, etc.) that already uses MCP should prefer this over shell.
-  - Multi-step workflows where an agent benefits from tool-level discoverability.
-- **When *not* to use:** if your caller cannot speak MCP or you are writing a shell script — use `cao session` instead.
+MCP tool discovery is authoritative for clients. The declarations in
+[`ops_mcp_server/server.py`](../src/cli_agent_orchestrator/ops_mcp_server/server.py)
+are the source of truth when the server surface changes.
 
-See [CAO Ops MCP Server](../README.md#cao-ops-mcp-server) in the README for setup and the tool catalog.
+Choose the surface by caller:
 
-### Choosing between `cao session` and `cao-ops-mcp`
-
-| If your caller is… | Prefer |
+| Caller | Preferred surface |
 |---|---|
-| A human in a browser | Web UI |
-| A shell script, cron job, CI step | `cao session` |
-| An MCP-capable agent (Claude Code, Claude Desktop, etc.) | `cao-ops-mcp` |
-| An AI assistant that can only run shell commands | `cao session` via the skill |
-| A custom Python service polling CAO | Call the HTTP API at `localhost:9889` directly (see [docs/api.md](api.md)) |
+| Human in a browser | Web UI |
+| Shell script, CI step, or cron job | `cao session` |
+| External MCP-capable agent | `cao-ops-mcp` |
+| Agent that can execute shell but not MCP | `cao session` through the skill |
+| Custom application | [HTTP API](api.md) |
 
-They are functionally equivalent — both end up calling the same HTTP endpoints. The choice is purely ergonomic.
+## Outbound plugins
 
-## Outbound surface: plugins
+Plugins are Python extensions loaded by `cao-server`. They subscribe to
+lifecycle and message events and can forward those events to chat systems,
+logs, metrics, or other destinations. They are event consumers, not an inbound
+management protocol.
 
-Plugins are Python packages loaded into `cao-server` at startup. They subscribe to lifecycle and message events via `@hook("<event_type>")` and react — typically by forwarding the event somewhere else.
-
-- **Strength:** zero polling. The event is dispatched the moment it happens, with typed payload and direct DB access.
-- **Constraint:** plugins today are **observer only**. They cannot block, modify, or reject CAO operations. See `docs/plugins.md` and the Plugins section in the README.
-
-### Why plugins instead of polling
-
-You could build a Discord bridge by polling `/terminals/{id}/inbox/messages` or tailing logs. Plugins exist because they sidestep that:
-
-1. Events are dispatched from inside `cao-server`, so there is no polling lag or wasted calls.
-2. Events are pydantic models, not JSON blobs to parse.
-3. Plugins run in-process and can query the DB directly via `get_terminal_metadata()` — no HTTP round-trip.
-4. Hook exceptions are caught and logged, so a broken plugin cannot take the server down.
-5. Lifecycle is tied to `cao-server`, so there is no extra daemon to babysit.
-
-### What plugins are commonly used for
-
-- Forwarding inter-agent messages to chat apps (Discord, Slack, Telegram, Teams).
-- Audit logging of session and terminal lifecycle.
-- Metrics export (Prometheus, CloudWatch).
-- Alerting on specific events (errors, long-running sessions).
-
-### Authoring a plugin
-
-- **Reference implementation:** [`examples/plugins/cao-discord/`](../examples/plugins/cao-discord/) — ~75 lines, forwards `post_send_message` events to a Discord webhook. The pattern is directly reusable for Slack, Telegram, or any webhook-style integration — swap the URL format and JSON payload shape.
-- **Guided scaffolding:** the [`cao-plugin`](../skills/cao-plugin/SKILL.md) skill. Point any skill-aware agent at it and ask "create a CAO plugin for Telegram"; it will scaffold the package layout, entry-point, and hook registration and show you which events are available.
-- **Installing and configuring:** see [docs/plugins.md](plugins.md).
-
-## Putting it all together
-
-A practical example: "I want a Telegram channel where my team can type `/cao launch …` and see the agents talk back."
-
-That is three parts:
-
-1. **Outbound:** a `cao-telegram` plugin that subscribes to `post_send_message` (and possibly session lifecycle events) and posts them into the channel.
-2. **Inbound:** a Telegram bot process that listens for chat commands and translates them into calls against `cao-ops-mcp` or `cao session` (either works).
-3. **Glue:** whatever mapping layer you like between Telegram user IDs and CAO session names.
-
-Each component is small. The surface split keeps each one focused on a single direction.
+The [plugins guide](plugins.md) owns installation, supported events,
+troubleshooting, and authoring. The
+[`cao-plugin` skill](../skills/cao-plugin/SKILL.md) provides guided
+scaffolding.
 
 ## Related reading
 
-- [Session Management CLI](../README.md#session-management-cli) in the README — command reference for `cao session` / `cao launch` / `cao shutdown`.
-- [CAO Ops MCP Server](../README.md#cao-ops-mcp-server) in the README — setup and tool catalog for `cao-ops-mcp`.
-- [docs/plugins.md](plugins.md) — plugin installation, event catalog, troubleshooting.
-- [docs/api.md](api.md) — the underlying HTTP API that every inbound surface calls.
-- [skills/cao-session-management/SKILL.md](../skills/cao-session-management/SKILL.md) — teach an agent to drive CAO via shell.
-- [skills/cao-plugin/SKILL.md](../skills/cao-plugin/SKILL.md) — scaffold a new plugin.
+- [Web UI](web-ui.md)
+- [HTTP API and PTY WebSocket](api.md)
+- [Plugin guide](plugins.md)
+- [Session-management commands](../skills/cao-session-management/SKILL.md#commands)
+- [In-session MCP tools](../skills/cao-supervisor-protocols/SKILL.md#core-mcp-tools)
+- [Assign and handoff selection](../skills/cao-supervisor-protocols/SKILL.md#choosing-between-assign-and-handoff)

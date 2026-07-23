@@ -1,403 +1,150 @@
-# CLI Agent Orchestrator API Documentation
+# API Overview
 
-Base URL: `http://localhost:9889` (default)
+The default base URL is `http://localhost:9889`.
 
-## Health Check
+This page maps the public API by family and gives representative requests.
+When `cao-server` is running, its generated FastAPI OpenAPI schema and schema
+UI are the exhaustive contract for individual HTTP operations. OpenAPI does
+not describe WebSocket behavior; the PTY WebSocket contract is documented
+below.
 
-### GET /health
-Check if the server is running.
+## Representative HTTP usage
 
-**Response:**
-```json
-{
-  "status": "ok",
-  "service": "cli-agent-orchestrator"
-}
+```bash
+curl http://localhost:9889/health
+curl http://localhost:9889/sessions
+curl http://localhost:9889/agents/providers
 ```
 
----
+HTTP errors use standard status codes and generally return a JSON `detail`
+field. Authentication and network behavior depend on server configuration;
+see [Configuration](configuration.md) and [Security](../SECURITY.md).
 
-## Providers
+## HTTP route families
 
-### GET /agents/providers
-List available providers with installation status.
+### Health and auth discovery
 
-**Response:** Array of provider objects
-```json
-[
-  {
-    "name": "kiro_cli",
-    "binary": "kiro-cli",
-    "installed": true
-  },
-  {
-    "name": "claude_code",
-    "binary": "claude",
-    "installed": true
-  },
-  {
-    "name": "codex",
-    "binary": "codex",
-    "installed": true
-  },
-  {
-    "name": "kimi_cli",
-    "binary": "kimi",
-    "installed": false
-  },
-  {
-    "name": "hermes",
-    "binary": "hermes",
-    "installed": true
-  },
-  {
-    "name": "copilot_cli",
-    "binary": "copilot",
-    "installed": false
-  }
-]
+- `GET /health` reports service health.
+- `GET /.well-known/oauth-protected-resource` publishes OAuth protected
+  resource metadata when applicable.
+
+### Events and AG-UI
+
+- `/events` and `/events/history` expose server events.
+- `/agui/v1/stream` and `/agui/v1/emit_ui` provide the AG-UI stream and
+  generative UI input.
+
+See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
+
+### Profiles, providers, and settings
+
+- `/agents/profiles*` lists, reads, and installs profiles.
+- `/agents/providers` reports provider availability.
+- `/settings/*` exposes supported agent-directory, skill-directory, and memory
+  settings.
+
+See [Agent Profiles](agent-profile.md) and
+[Configuration](configuration.md).
+
+### Skills
+
+- `/skills/{name}` retrieves an installed skill.
+
+See [Skills](skills.md) for discovery, installation, and catalog behavior.
+
+### Sessions and terminals
+
+- `/sessions*` creates, lists, inspects, and deletes sessions.
+- `/sessions/{session_name}/terminals*` creates and lists session terminals.
+- `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
+  output and working-directory state, exits providers, and deletes terminals.
+
+Terminal identifiers used in these routes are eight-character hexadecimal
+strings. See [Control Planes](control-planes.md) for operator-facing choices.
+
+### Inbox
+
+- `/terminals/{terminal_id}/inbox/messages` sends and reads terminal inbox
+  messages.
+
+Agents normally use the in-session
+[supervisor protocols](../skills/cao-supervisor-protocols/SKILL.md) rather
+than calling these routes directly.
+
+### Workflows
+
+- `/workflows*` validates and inspects workflow specifications.
+- `/workflows/runs*` starts, inspects, cancels, and resumes runs and retrieves
+  run output.
+
+See [Workflows](workflows.md).
+
+### Memory and graph
+
+- `/settings/memory` reports memory enablement.
+- `/memory*` lists, reads, exports, and deletes memories.
+- `/graph/{provider}*` projects and exports graph views.
+
+See [Memory](memory.md) and
+[Knowledge Graph Viewing](knowledge-graph-viewing.md).
+
+### Flows
+
+- `/flows*` creates, lists, reads, deletes, enables, disables, and runs
+  scheduled flows.
+
+See [Flows](flows.md).
+
+## PTY WebSocket
+
+Connect to:
+
+```text
+/terminals/{terminal_id}/ws
 ```
 
-**Note:** The `installed` field checks if the provider binary is available in the system PATH via `shutil.which()`.
+The path must identify an existing terminal. This endpoint is unauthenticated
+and grants full read/write access to that terminal's PTY.
 
----
+### Client access boundary
 
-## Sessions
+By default, only loopback clients identified as `127.0.0.1`, `::1`, or
+`localhost` are allowed. `CAO_WS_ALLOWED_CLIENTS` adds comma-separated client
+IP addresses or hostnames to that allowlist. A literal `*` disables the
+client-IP restriction.
 
-### POST /sessions
-Create a new session with one terminal.
+Adding clients or using `*` gives those clients full PTY read/write access.
+Treat either change as a security-boundary change and do not expose the
+endpoint to untrusted networks. See the
+[network configuration](configuration.md#network-network--env-var-only) for
+related server settings.
 
-**Parameters:**
-- `provider` (string, required): Provider type ("kiro_cli", "claude_code", "codex", "antigravity_cli", "hermes", "kimi_cli", "copilot_cli", "opencode_cli", or "cursor_cli")
-- `agent_profile` (string, required): Agent profile name
-- `session_name` (string, optional): Custom session name
-- `working_directory` (string, optional): Working directory for the agent session
+### Frames and messages
 
-**Response:** Terminal object (201 Created)
+The server sends binary WebSocket frames containing raw PTY bytes.
 
-### GET /sessions
-List all sessions.
+Clients send JSON in text frames:
 
-**Response:** Array of session objects
-
-### GET /sessions/{session_name}
-Get details of a specific session.
-
-**Response:** Session object with terminals list
-
-### DELETE /sessions/{session_name}
-Delete a session and all its terminals.
-
-**Response:**
 ```json
-{
-  "success": true
-}
+{"type":"input","data":"ls -la\n"}
 ```
 
----
+The `input` message writes the UTF-8 string in `data` to the PTY.
 
-## Terminals
-
-**Note:** All `terminal_id` path parameters must be 8-character hexadecimal strings (e.g., "a1b2c3d4").
-
-### POST /sessions/{session_name}/terminals
-Create an additional terminal in an existing session.
-
-**Parameters:**
-- `provider` (string, required): Provider type
-- `agent_profile` (string, required): Agent profile name
-- `working_directory` (string, optional): Working directory for the terminal
-- `allowed_tools` (string, optional): Comma-separated list of allowed CAO tools for the worker.
-- `caller_id` (string, optional): Terminal ID of the creating terminal (8-character hexadecimal). Recorded so `send_message` can default replies to the caller (issue #284).
-- `defer_init` (bool, optional, default `false`): When `true`, return as soon as the tmux window and DB record exist, without waiting for `provider.initialize()` to finish. The provider is still created and initialized — but on a background asyncio task on cao-server, so the HTTP round-trip stays under ~2s regardless of provider startup latency. Used by the MCP `assign` tool to keep tool-call latency well under kiro-cli 2.11's ~60s per-tool client timeout, and to allow multiple concurrent assigns to run their init phases in parallel.
-
-**Request body (optional, JSON):** the deferred-init message payload is sent in the body — not query params — so prompt content is not exposed in HTTP access logs and is not subject to URL-length limits.
-- `initial_message` (string, optional): When `defer_init=true`, this message is delivered to the newly created worker via `send_input` after `provider.initialize()` completes. Ignored if `defer_init=false`. Ordering: init runs first, then message delivery, both on the same background task.
-- `initial_message_orchestration_type` (string, optional): One of `assign` or `handoff`. Passed through to `send_input` for plugin event emission when `initial_message` is delivered.
-
-**Response:** Terminal object (201 Created). When `defer_init=true`, the returned status is `unknown` (the provider is still initializing on a background task); poll `GET /terminals/{id}` for the live status before sending further input.
-
-### GET /sessions/{session_name}/terminals
-List all terminals in a session.
-
-**Response:** Array of terminal objects
-
-### GET /terminals/{terminal_id}
-Get terminal details.
-
-**Response:** Terminal object
 ```json
-{
-  "id": "string",
-  "name": "string",
-  "provider": "kiro_cli|claude_code|codex|antigravity_cli|hermes|kimi_cli|copilot_cli|opencode_cli|cursor_cli",
-  "session_name": "string",
-  "agent_profile": "string",
-  "caller_id": "string|null",
-  "status": "idle|processing|completed|waiting_user_answer|error",
-  "last_active": "timestamp"
-}
+{"type":"resize","rows":24,"cols":80}
 ```
 
-### POST /terminals/{terminal_id}/input
-Send input to a terminal.
+The `resize` message changes the PTY dimensions. Missing values default to 24
+rows and 80 columns.
 
-**Parameters:**
-- `message` (string, required): Message to send
+### Close outcomes
 
-**Response:**
-```json
-{
-  "success": true
-}
-```
+- `4003`: the client is restricted, or terminal/backend target metadata is
+  invalid.
+- `4004`: the terminal does not exist, or the backend cannot attach to it.
+- A normal viewer disconnect detaches that viewer and preserves the session.
 
-### POST /terminals/{terminal_id}/key
-Send a tmux key sequence to a terminal. Use this for interactive prompts that
-require non-text key presses, such as Hermes clarify picker navigation.
-
-The endpoint is generic, but the only in-tree structured consumer today is the
-Hermes path of `answer_user_prompt`. Other providers can use it in the future
-when they expose equivalent prompt states or key-navigation flows.
-
-**Parameters:**
-- `key` (string, required): allowed tmux key name: `Up`, `Down`, `Left`,
-  `Right`, `Enter`, `Tab`, `Escape`, `Space`, a single alphanumeric key, or a
-  `C-`, `M-`, or `S-` modifier combo such as `C-c` or `M-x`
-
-**Response:**
-```json
-{
-  "success": true
-}
-```
-
-### GET /terminals/{terminal_id}/output
-Get terminal output.
-
-**Parameters:**
-- `mode` (string, optional): Output mode - "full" (default), "last", or "tail"
-  - `"full"` returns the StatusMonitor rolling buffer (most recent ~8KB of streamed output), not unbounded scrollback. Long sessions are truncated to the tail; use the on-disk terminal log for complete history.
-
-**Response:**
-```json
-{
-  "output": "string",
-  "mode": "string"
-}
-```
-
-### GET /terminals/{terminal_id}/working-directory
-Get the current working directory of a terminal's pane.
-
-**Response:**
-```json
-{
-  "working_directory": "/home/user/project"
-}
-```
-
-**Note:** Returns `null` if working directory is unavailable.
-
-### POST /terminals/{terminal_id}/exit
-Send provider-specific exit command to terminal.
-
-**Behavior:**
-- Calls the provider's `exit_cli()` method to get the exit command
-- Text commands (e.g., `/exit`, `quit`) are sent as literal text via `send_input()`
-- Key sequences prefixed with `C-` or `M-` (e.g., `C-d` for Ctrl+D) are sent as tmux key sequences via `send_special_key()`, which tmux interprets as actual key presses
-
-| Provider | Exit Command | Type |
-|----------|-------------|------|
-| kiro_cli | `/exit` | Text |
-| claude_code | `/exit` | Text |
-| codex | `/exit` | Text |
-| antigravity_cli | `/exit` | Text |
-| hermes | `/exit` | Text |
-| kimi_cli | `/exit` | Text |
-| copilot_cli | `/exit` | Text |
-
-**Response:**
-```json
-{
-  "success": true
-}
-```
-
-### DELETE /terminals/{terminal_id}
-Delete a terminal.
-
-**Response:**
-```json
-{
-  "success": true
-}
-```
-
----
-
-## Inbox (Terminal-to-Terminal Messaging)
-
-### POST /terminals/{receiver_id}/inbox/messages
-Send a message to another terminal's inbox.
-
-**Parameters:**
-- `sender_id` (string, required): Sender terminal ID
-- `message` (string, required): Message content
-
-**Response:**
-```json
-{
-  "success": true,
-  "message_id": "string",
-  "sender_id": "string",
-  "receiver_id": "string",
-  "created_at": "timestamp"
-}
-```
-
-**Behavior:**
-- Messages are queued and delivered when the receiver terminal is IDLE
-- Messages are delivered in order (oldest first)
-- Delivery is automatic via event-driven status detection
-
----
-
-## Memory
-
-REST mirror of the `cao memory` CLI. All `/memory` endpoints return `404` with
-`"Memory system is disabled"` when `memory.enabled` is false in settings.json;
-use `GET /settings/memory` to discover the enabled state (e.g. for hiding UI).
-
-Keys must match `^[a-z0-9-]{1,60}$` and `scope_id` must match
-`^[a-zA-Z0-9._-]{1,128}$`; malformed values return `422`.
-
-Because the server's working directory is not the user's project, project scope
-is addressed by an explicit `scope_id` query parameter (the resolved project
-ID). This intentionally diverges from the MCP `memory_forget` tool, which
-resolves context from the calling terminal.
-
-Known inconsistency: the internal `GET /terminals/{id}/memory-context` endpoint
-predates this contract and returns an empty `200` (not `404`) when memory is
-disabled.
-
-### GET /settings/memory
-Return whether the memory subsystem is enabled.
-
-**Response:**
-```json
-{
-  "enabled": true
-}
-```
-
-### GET /memory
-List stored memories across all projects (the CLI's `cao memory list --all`).
-
-**Parameters:**
-- `scope` (string, optional): Filter by scope (`global`, `project`, `session`, `agent`)
-- `type` (string, optional): Filter by memory type (`user`, `feedback`, `project`, `reference`)
-- `scope_id` (string, optional): Filter to one project/session/agent
-- `limit` (integer, optional): Max results, 1–100 (default: 50)
-
-**Response:**
-```json
-[
-  {
-    "key": "string",
-    "scope": "string",
-    "scope_id": "string|null",
-    "memory_type": "string",
-    "tags": "string",
-    "created_at": "timestamp",
-    "updated_at": "timestamp"
-  }
-]
-```
-
-`scope_id` is the project ID for project memories, the session/agent ID for
-those scopes, and `null` for global.
-
-### GET /memory/export
-Export one memory scope as an archive bundle (the CLI's `cao memory export`).
-Streams a gzipped tarball of the OKF bundle (topic files plus `index.md` and
-`manifest.md`).
-
-**Parameters:**
-- `scope` (string, required): Scope to export (`global`, `project`, or `federated`; `400` for the private `session`/`agent` scopes — there is no include-private escape hatch over HTTP)
-- `format` (string, optional): Archive format (default: `okf`; `400` on unknown formats)
-- `scope_id` (string): Required for `project` scope (`400` if missing)
-- `include_history` (boolean, optional): Include `history/<key>.md` files (default: `false`)
-- `redact` (boolean, optional): Redact secret matches instead of skipping the topic (default: `false`)
-
-**Response:** `200` with `Content-Type: application/gzip` — the bundle tarball
-as the response body.
-
-When API auth is enabled, this endpoint requires a token carrying at least the
-read scope (`cao:read`, `cao:write`, or `cao:admin`); requests without one are
-`403`'d.
-
-### GET /memory/{key}
-Show a memory by key (first match wins when the same key exists in several
-scopes; narrow with `scope`/`scope_id`).
-
-**Parameters:**
-- `scope` (string, optional): Scope to search in
-- `scope_id` (string, optional): Project/session/agent to search in
-
-**Response:** the list entry shape plus `"content"` (the latest wiki section).
-`404` if no exact key match.
-
-### DELETE /memory/{key}
-Delete a memory by key.
-
-**Parameters:**
-- `scope` (string, optional): Scope of the memory (default: `project`)
-- `scope_id` (string): Required for `project`, `session`, and `agent` scopes (`400` if missing)
-
-**Response:**
-```json
-{
-  "success": true
-}
-```
-
-`404` if the key does not exist in the scope.
-
-### DELETE /memory
-Clear all memories in a scope. Best-effort: deletion continues past
-per-item failures and reports how many were removed.
-
-**Parameters:**
-- `scope` (string, required): Scope to clear
-- `scope_id` (string): Required for `project`, `session`, and `agent` scopes (`400` if missing)
-
-**Response:**
-```json
-{
-  "success": true,
-  "deleted_count": 3
-}
-```
-
----
-
-## Error Responses
-
-All endpoints return standard HTTP status codes:
-
-- `200 OK`: Success
-- `201 Created`: Resource created
-- `400 Bad Request`: Invalid parameters
-- `404 Not Found`: Resource not found
-- `500 Internal Server Error`: Server error
-
-Error response format:
-```json
-{
-  "detail": "Error message"
-}
-```
-
----
+Malformed JSON, missing input data, unsupported message types, and other
+forwarding errors do not currently have a documented stable application close
+code.

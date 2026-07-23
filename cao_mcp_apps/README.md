@@ -12,8 +12,7 @@ Archestra.AI — see the
 
 This package is **build-time only** — Node is not required to *run* CAO. You only
 need it to develop, test, or rebuild these views. For the feature overview and
-host setup, see [`../docs/mcp-apps.md`](../docs/mcp-apps.md) and the
-[MCP Apps section of the root README](../README.md#mcp-apps--host-rendered-fleet-ui).
+host setup, see [`../docs/mcp-apps.md`](../docs/mcp-apps.md).
 
 ## Views
 
