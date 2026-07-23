@@ -329,6 +329,25 @@ class TestHerdrInboxServiceEventParsing:
 
         callback.assert_not_called()
 
+    def test_event_loop_survives_pane_null(self):
+        """A malformed pane.updated with data.pane=null must not raise (which
+        would escape _event_loop/_socket_loop and permanently kill delivery)."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        callback = MagicMock()
+        service._delivery_callback = callback
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+
+        frame = {"event": "pane_updated", "data": {"pane": None}}
+        reader = AsyncMock()
+        reader.readline.side_effect = [(json.dumps(frame) + "\n").encode(), b""]
+        service._reader = reader
+        try:
+            _run_async(service._event_loop())
+        except ConnectionError:
+            pass  # EOF — expected
+        # No AttributeError; malformed event is simply ignored (no delivery).
+        callback.assert_not_called()
+
 
 class TestHerdrInboxServiceReconnect:
     """Test reconnect re-subscribe behavior: a single combined subscribe per connection."""

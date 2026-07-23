@@ -560,9 +560,13 @@ class HerdrInboxService:
                 continue
 
             data = event.get("data", {})
-            # pane.updated wraps the pane object under data.pane; agent-status
-            # events put fields at the top of data. Handle both.
-            pane_obj = data.get("pane", data)
+            # Broadcast pane.updated nests the pane under data.pane; retired
+            # agent-status events used top-level data. Fall back to data, and
+            # guard against a null/non-dict pane so one malformed event cannot
+            # escape the loop and kill delivery.
+            pane_obj = data.get("pane") or data
+            if not isinstance(pane_obj, dict):
+                pane_obj = {}
             pane_id = pane_obj.get("pane_id", "")
             status = pane_obj.get("agent_status", "")
 
