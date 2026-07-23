@@ -559,6 +559,28 @@ class TestHerdrInboxServiceReconcile:
 
         mock_delete.assert_not_called()
 
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_reconcile_survives_malformed_snapshot_records(
+        self, mock_snap, mock_list, mock_delete, mock_meta
+    ):
+        """A pane missing pane_id or a workspace missing label must not raise
+        (which would escape _reconcile and kill the socket loop)."""
+        mock_list.return_value = []
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+        service._terminal_to_pane = {"tid1": "w1:p1"}
+        mock_snap.return_value = {
+            "panes": [{"agent_status": "idle"}, {"pane_id": "w1:p1"}],  # first missing pane_id
+            "workspaces": [{"workspace_id": "w1"}],  # missing label
+            "tabs": [{"workspace_id": "w1"}],  # missing label
+        }
+        # Must not raise; w1:p1 is live so nothing pruned.
+        _run_async(service._reconcile())
+        assert service._pane_to_terminal == {"w1:p1": "tid1"}
+
 
 class TestHerdrInboxSnapshot:
     """_fetch_snapshot returns the parsed snapshot dict from `api snapshot`."""
@@ -618,6 +640,13 @@ class TestHerdrInboxSnapshot:
 
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         mock_run.side_effect = _sp.TimeoutExpired(cmd="herdr", timeout=10)
+        assert service._fetch_snapshot() is None
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_fetch_snapshot_returns_none_when_snapshot_not_dict(self, mock_run):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        payload = {"result": {"snapshot": [1, 2, 3]}}  # snapshot is a list, not a dict
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
         assert service._fetch_snapshot() is None
 
 

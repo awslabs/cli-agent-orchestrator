@@ -286,7 +286,11 @@ class HerdrInboxService:
             if result.returncode != 0:
                 logger.warning(f"Snapshot: `api snapshot` failed: {result.stderr}")
                 return None
-            return json.loads(result.stdout)["result"]["snapshot"]
+            snapshot = json.loads(result.stdout)["result"]["snapshot"]
+            if not isinstance(snapshot, dict):
+                logger.warning("Snapshot: result.snapshot is not a dict; ignoring")
+                return None
+            return snapshot
         except (
             subprocess.SubprocessError,
             OSError,
@@ -319,11 +323,16 @@ class HerdrInboxService:
             return
 
         # Live pane_ids (from snapshot.panes).
-        live_pane_ids = {p["pane_id"] for p in snapshot.get("panes", [])}
+        live_pane_ids = {p["pane_id"] for p in snapshot.get("panes", []) if p.get("pane_id")}
 
         # workspace_id -> label (= CAO session name), from snapshot.workspaces.
+        # Skip malformed records (missing id/label) rather than letting a
+        # KeyError escape _reconcile and kill the socket loop — matches the
+        # defensive .get() style used in the tabs loop below.
         self._workspace_to_session = {
-            ws["workspace_id"]: ws["label"] for ws in snapshot.get("workspaces", [])
+            ws["workspace_id"]: ws["label"]
+            for ws in snapshot.get("workspaces", [])
+            if ws.get("workspace_id") and ws.get("label")
         }
 
         # workspace_id -> set of live tab labels (= CAO window names), from
