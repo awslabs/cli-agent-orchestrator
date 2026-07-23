@@ -298,6 +298,11 @@ topics no longer in the scope). `--format` selects the archive backend (`okf` to
 The same bundle is available over HTTP via `GET /memory/export` (see
 [docs/api.md](api.md)), which never exports private scopes.
 
+> **Read-only mirror:** OKF exports are generated snapshots of CAO memory.
+> Editing exported files does not update the CAO store, and a later export may
+> overwrite those mirror edits. Import is an explicit ingestion operation, not
+> automatic reverse synchronization.
+
 `cao memory import` reads a bundle directory back into a scope. The bundle is treated as
 untrusted input: target `--scope` is required and limited to `global`/`project`/`federated`,
 every topic runs through the store pipeline's validation and secret gate, and structural

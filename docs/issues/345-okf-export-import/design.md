@@ -1,14 +1,17 @@
 # Design: Open Knowledge Format (OKF) Export/Import for CAO Memory
 
 **Issue:** #345
-**Status:** Draft for maintainer review
-**Scope:** Design only — no code in this document's commit.
+**Implemented by:** merged PR #384 (`1ab0ea9`)
+**Status:** Implemented historical design record
+**Scope:** Records the design and implementation decisions retained in source
+comments as D1-D7. Follow-ups are status-annotated at the end of this document.
 
 ---
 
 ## Summary
 
-Add `cao memory export --format okf` and `cao memory import --format okf` so CAO's
+PR #384 added `cao memory export --format okf` and
+`cao memory import --format okf` so CAO's
 wiki-based memory can be published as a plain directory of OKF v0.1 markdown files
 (git/Obsidian/sync-friendly) and ingested back from such a directory. The feature is
 built behind a small `MemoryArchiveBackend` ABC + registry (the project's established
@@ -24,14 +27,37 @@ through `MemoryService.store()` so SQLite metadata, `index.md`, and file locking
 consistent.
 
 Export is deterministic and idempotent (stable filenames, stable frontmatter key order,
-content-hash change detection), which makes the follow-up `cao memory sync <dir>`
+direct comparison of rendered bytes), which makes the follow-up `cao memory sync <dir>`
 command (maintainer ask, out of scope here) a thin loop over the same writer.
+
+---
+
+## Implementation reconciliation
+
+The implementation follows D1-D7 and shipped the archive backend registry, OKF
+directory and deterministic tar export, directory import, CLI commands, and the
+read-only `GET /memory/export` API. It also resolved the design's three open
+questions:
+
+1. Bundles contain one scope. `manifest.md` records that scope (and `scope_id`
+   when present) as human-readable provenance; import ignores it and requires an
+   explicit target scope.
+2. `MemoryService.store()` gained the recommended optional `occurred_at`
+   parameter and implements D5's ordering and future-timestamp clamp.
+3. Files under the reserved `history/` path remain frontmatter-free and are not
+   treated as OKF topics.
+
+One implemented deviation is worth making explicit: every export, including an
+empty export, contains both `index.md` **and** `manifest.md`. The original D7
+shorthand said an empty bundle had `index.md` only. The manifest is required by
+D4's generated-mirror warning and D5's provenance decision, and tests lock the
+implemented two-file empty bundle.
 
 ---
 
 ## Context
 
-### What exists on `main` today
+### What existed before PR #384
 
 - **Content store:** wiki markdown files under `MEMORY_BASE_DIR`
   (`~/.aws/cli-agent-orchestrator/memory/<container>/wiki/<scope>[/<scope_id>]/<key>.md`),
@@ -74,9 +100,9 @@ command (maintainer ask, out of scope here) a thin loop over the same writer.
   go through the HTTP API. A REST mirror of list/show/delete/clear exists on the
   server side (issue #286, `api/main.py`) for the web UI, but the CLI's pattern is
   direct service calls. Export/import follows the CLI's actual pattern (see D6).
-- **No export/import of any kind on main.**
+- **No export/import of any kind before this work.**
 
-### What exists on the parked branch (`docs/memory-import-export`, NOT on main)
+### What existed on the parked branch (`docs/memory-import-export`)
 
 A CAO-native tar.gz bundle design: full-fidelity archive (scope, scope_id,
 provenance, SQLite metadata included), with a documented tar threat model
@@ -146,13 +172,14 @@ class MemoryArchiveBackend(ABC):
     @abstractmethod
     def export_bundle(
         self, scope: str, scope_id: Optional[str], dest: Path,
-        include_history: bool, redact: bool,
+        include_history: bool, redact: bool, prune: bool = False,
     ) -> ExportReport: ...
 
     @abstractmethod
     def import_bundle(
         self, src: Path, target_scope: str,
         conflict_policy: str, dry_run: bool,
+        terminal_context: Optional[dict] = None,
     ) -> ImportReport: ...
 ```
 
@@ -161,9 +188,9 @@ links_dropped), plus per-topic skip reasons carrying **pattern names only**. The
 no `skipped_private` count — export is strictly per-scope, so private scopes are
 gated at the flag level (a whole-command error, D5), never skipped per topic.
 `ImportReport`: counts (imported, skipped_conflict, replaced, merged, rejected,
-see_also_dropped, bodies_escaped, timestamps_clamped), per-file parse/validation errors, the **resolved target scope and
-scope_id** (for `--scope project`, the cwd-resolved project id — D5), and the
-`dry_run` flag.
+see_also_dropped, bodies_escaped, timestamps_clamped), per-file parse/validation
+errors, the **resolved target scope and scope_id** (for `--scope project`, the
+cwd-resolved project id — D5), and the `dry_run` flag.
 
 Backends receive a `MemoryService` instance (constructor injection) and use only its
 public/validated surfaces: for reading, walk `_parse_index` per container index and
@@ -220,12 +247,16 @@ the CLI maps to a `click.ClickException` and the API maps to HTTP 400.
     preserved verbatim), emitted only with `--include-history`.
     *Why `history/` over a single per-topic-appended `log.md`:* a single `log.md`
     interleaves every topic's history into one file, which breaks per-topic
-    content-hash idempotency (D3 — one changed topic would rewrite the shared
+    byte-comparison idempotency (D3 — one changed topic would rewrite the shared
     log), scales poorly, and pollutes graph views. A `history/` subdirectory is
-    excluded from OKF §9 conformance as a reserved path, keeps hashes per-topic,
-    and lets Obsidian users simply ignore one folder.
+    excluded from OKF §9 conformance as a reserved path, keeps comparisons
+    per-topic, and lets Obsidian users simply ignore one folder.
   - `index.md` is regenerated in OKF's line form: `* [Title](key.md) - description`,
     no frontmatter. CAO's `~Ntok`/`updated:` annotations are dropped.
+  - `manifest.md` is always emitted, including for an empty scope. It records
+    format, scope, optional scope_id, and the D4 read-only mirror warning. It has
+    no frontmatter and import treats it as reserved provenance, never as routing
+    authority.
   - `## See Also` links pass through **on export** with path normalization: CAO's
     `../<scope_id>/<key>.md` relative form is rewritten to bundle-relative
     `<key>.md`. Links whose target key is not in the bundle (e.g. points at a
@@ -263,10 +294,11 @@ the CLI maps to a `click.ClickException` and the API maps to HTTP 400.
   - Stable frontmatter — fixed key order (`type`, `title`, `description`, `tags`,
     `timestamp`, `created`), deterministic YAML serialization (no dict-order
     dependence), LF line endings, single trailing newline.
-  - Change detection by content hash: before writing `<key>.md`, hash the
-    would-be bytes and compare against the existing file; identical → skip
-    (reported as `unchanged`). No mtimes or export-run timestamps are embedded
-    in file content (nothing varies run-to-run for unchanged topics).
+  - Change detection by direct byte comparison: encode the rendered
+    `<key>.md` content as UTF-8 and compare it with `path.read_bytes()`; exact
+    equality → skip (reported as `unchanged`). No content hash is computed. No
+    mtimes or export-run timestamps are embedded in file content (nothing
+    varies run-to-run for unchanged topics).
   - `--prune`: topics present in the destination directory but no longer in the
     CAO scope are deleted (reserved paths `index.md`, `manifest.md`, `history/`
     handled by the same rule keyed on their source topic). Off by default —
@@ -294,10 +326,10 @@ the CLI maps to a `click.ClickException` and the API maps to HTTP 400.
   produces a **read-only mirror** for Obsidian/Notion/dashboards. Import exists
   for **migration and ingestion** (bringing an external OKF corpus *into* CAO, or
   moving between machines), not for round-tripping edits made in the mirror.
-  Documentation and the export report both state this; export may drop a
-  `manifest.md` noting "generated by CAO — edits here are not synced back".
+  User-facing documentation and the generated `manifest.md` state this; the
+  export report payload contains operational counters and skip reasons only.
 - **Consequences.** Edits made in the mirror are overwritten by the next export
-  with `--prune`/hash-rewrite. This is the documented contract, not data loss.
+  with `--prune`/content rewrite. This is the documented contract, not data loss.
   Dashboards and clippers get a consistent graph because there is exactly one
   writer.
 - **Rejected: bidirectional editing.** Would require, at minimum: per-topic edit
@@ -433,15 +465,10 @@ validation, secret handling by pattern name only.)
 - **Writes go through `MemoryService.store()`, never raw file writes.** This
   keeps SQLite metadata, `index.md` regeneration, per-topic flock, and the
   cross-scope write guard on the one code path that already implements them.
-  *Trade-off:* `store()` stamps `now()` as the entry timestamp, so the OKF
-  `timestamp` frontmatter is lost. Proposed resolution, in preference order:
-  1. add an optional `occurred_at: Optional[datetime]` parameter to `store()`
-     (used for the `## <ts>` section heading and `created_at` when the topic is
-     new) — small, honest API change; or
-  2. documented post-write metadata fixup (rewrite the section heading under the
-     topic lock + `_upsert_metadata` with the original timestamp) — no API
-     change but re-opens the file and duplicates header logic.
-  The design recommends (1); final call at implementation review.
+  **Implemented resolution:** `store()` gained an optional
+  `occurred_at: Optional[datetime]` parameter, used for the `## <ts>` section
+  heading and `created_at` when a topic is new. This avoided the rejected
+  post-write file and metadata fixup.
 
   **Ordering rule for `occurred_at` (required for correctness, not optional).**
   `store()`'s contract is append-only: the new `## <ts>` section always lands
@@ -518,7 +545,7 @@ clean before the PR.)
 | 1 | Round-trip, global + project scope | export → every non-reserved `*.md` parses YAML frontmatter with non-empty `type` (OKF §9 conformance) → import into a **fresh `MEMORY_BASE_DIR`** (tmp_path + injected base_dir) under explicit `--scope` → topics recallable via `recall`/`cao memory list` with matching content |
 | 2 | Secret-gate regression | topic containing a planted `AKIA…` key: default export **skips** it; `ExportReport` carries `aws_access_key` (pattern name) and **no content bytes anywhere in report or logs**; `--redact` exports with `[REDACTED:aws_access_key]` |
 | 3 | Private-scope gate | `export --scope session` / `--scope agent` without `--include-private` errors (whole command, nothing written); succeeds with the flag, topics nested per scope_id (D2 layout) |
-| 4 | Idempotent re-export | second export into the same dir rewrites **zero** files (hash/mtime assertion); after deleting one CAO topic, `--prune` removes exactly that file |
+| 4 | Idempotent re-export | second export into the same dir rewrites **zero** files (byte/mtime assertion); after deleting one CAO topic, `--prune` removes exactly that file |
 | 5 | Conflict-policy matrix | existing key × {skip, replace, merge} × {dry_run on/off}: skip leaves file+SQLite untouched; replace yields fresh single-entry article; merge appends a new `## <ts>` section; dry_run mutates nothing while reporting all outcomes |
 | 6 | Traversal-attack import fixture | bundle containing `../evil.md`-style names and a topic whose stem fails sanitizer round-trip: rejected with report entries; a See-Also block with a bundle-escaping link is stripped like any other (test 11); nothing written outside `MEMORY_BASE_DIR` |
 | 7 | Unknown frontmatter keys tolerated | topic with extra OKF/Obsidian keys (`aliases`, `cssclass`, …) imports cleanly; unknown keys ignored, not errors |
@@ -531,7 +558,8 @@ clean before the PR.)
 | 14 | Validator extraction regression | extracted shared path validator: tmux working-directory behavior unchanged (existing-dir required, blocked dirs rejected); archive mode accepts a not-yet-existing export dest (nearest-ancestor validation) and a `-o out.tar.gz` file target |
 
 Plus: `ValueError` from `get_backend("nope")` surfaces as CLI error / HTTP 400;
-export of an empty scope produces a valid empty bundle (index.md only).
+export of an empty scope produces a valid empty bundle containing `index.md` and
+`manifest.md`.
 
 - **Consequences.** The suite locks D5's security decisions (gate, escape, clamp,
   scope echo) as regression tests, at the cost of a larger first-PR test surface
@@ -560,38 +588,44 @@ export of an empty scope produces a valid empty bundle (index.md only).
 
 ---
 
-## Follow-ups (explicitly out of scope for the first PR)
+## Follow-up status after PR #384
 
-1. **`cao memory sync <dir>`** (haofei ask #1). Thin loop over the idempotent
-   exporter. Proposed signature:
+1. **Deferred: `cao memory sync <dir>`** (haofei ask #1). The implemented
+   exporter remains suitable for the proposed thin loop:
    ```
    cao memory sync --format okf --scope <s> DIR
                    [--interval 60s | --once] [--prune] [--redact]
    ```
    `--once` = one export pass (equivalent to `export --prune`); `--interval`
    re-runs on a timer (or, later, on memory-write events via the event bus).
-   Sync is export-only per D4 — it never reads mirror edits back.
-2. **Live knowledge-graph view** (haofei ask #2): the OKF directory (or the
-   `GET /memory/export` stream) consumed by the Obsidian web clipper / CAO
-   dashboard to render the topic + See-Also graph. Depends on sync for liveness.
-3. **POST /memory/import API** — needs the tar threat-model implementation
-   (caps in `constants.py`) plus an authz story for a mutating endpoint.
-4. **Bidirectional editing** — rejected in D4; would require base-hash
-   frontmatter, three-way merge, and inbound secret gating. Recorded here so the
-   requirements are not lost.
-5. **`cao` archive backend** — revive the parked `docs/memory-import-export`
-   branch as the second registry entry.
-6. **See-Also ingestion on import** — post-import metadata step (designed in
-   D5): collect valid same-bundle keys from stripped `## See Also` blocks and
-   write them into SQLite `related_keys` via `_upsert_metadata`, letting the
-   compile pipeline re-render the block. Export-only is the PR-1 contract.
+   Sync would be export-only per D4. No `cao memory sync` command is
+   implemented.
+2. **Completed separately under issue #348 across merged PRs #402
+   (`84d79ff`, contract and registries), #416 (`98443e3`, providers), #424
+   (`67f8e4b`, API and three file sinks), and #442 (`d7c1cd0`, Sigma renderer,
+   web view, and cache):** CAO now has a typed `GraphView`, memory provider, web
+   Memory-tab graph, MCP Apps Sigma renderer, and OKF/Obsidian/GraphML graph
+   sinks. This completed the viewing outcome without implementing continuous
+   OKF-directory sync; see
+   [`../../knowledge-graph-viewing.md`](../../knowledge-graph-viewing.md).
+3. **Deferred: POST `/memory/import` API.** This needs the tar threat-model
+   implementation (caps in `constants.py`) plus an authz story for a mutating endpoint.
+   The implemented HTTP surface remains read-only export.
+4. **Intentional non-goal: bidirectional editing.** Rejected in D4; exported
+   files are generated mirrors, not a second writable store.
+5. **Deferred: `cao` archive backend.** The parked `docs/memory-import-export`
+   work remains a possible second registry entry; only `okf` is registered.
+6. **Deferred: See-Also ingestion on import.** A post-import metadata step
+   (designed in D5) would collect valid same-bundle keys from stripped
+   `## See Also` blocks and write them into SQLite `related_keys` via
+   `_upsert_metadata`, letting the compile pipeline re-render the block. The
+   implemented importer still strips and reports these links.
 
 ---
 
-## Open questions for maintainer triage
+## Resolved implementation questions
 
-1. **Multi-scope merged bundles.** Should one bundle ever contain topics from
-   multiple scopes? **Recommendation: no — one bundle per scope**, because OKF
+1. **Multi-scope merged bundles:** no. One bundle represents one scope because OKF
    has no scope field and a merged bundle cannot be re-imported without
    inventing per-file scope metadata (which would be a CAO extension, defeating
    the point of a standard format). A top-level `manifest.md` (reserved name)
@@ -599,9 +633,7 @@ export of an empty scope produces a valid empty bundle (index.md only).
    human-readable provenance — import never trusts it for scope assignment
    (D5). Users who want "everything" run one export per scope into sibling
    directories.
-2. **`store(occurred_at=…)` parameter vs post-write fixup** for timestamp
-   preservation (D5) — design recommends the parameter; needs a maintainer nod
-   since it touches `store()`'s signature.
-3. Should `--include-history` history files carry frontmatter (making them OKF
-   topics) or stay frontmatter-free under the reserved `history/` path
-   (recommended — keeps §9 conformance checks trivial)?
+2. **Timestamp preservation:** the implementation uses
+   `store(occurred_at=...)`; no post-write fixup is used.
+3. **History frontmatter:** history files are frontmatter-free under the
+   reserved `history/` path and are excluded from OKF topic conformance checks.
