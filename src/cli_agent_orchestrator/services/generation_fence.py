@@ -281,3 +281,22 @@ def assert_admission_open(companion_dir: Path, terminal_id: str, generation: str
             f"generation {generation} is sealed by an installed fence; "
             "post-report input/tool admission is prevented"
         )
+
+
+@contextmanager
+def admission_critical_section(
+    companion_dir: Path, terminal_id: str, generation: str
+) -> Iterator[None]:
+    """Hold the generation fence lock across the final recheck AND the I/O.
+
+    A bare ``assert_admission_open`` is a check-then-act seam: a fence
+    installed between the check and the provider submission would still
+    admit the input.  This context manager takes the same per-generation
+    lock ``install_fence`` uses, re-verifies the generation is open under
+    that lock, and holds it until the caller's provider/model/tool-entry
+    I/O completes — a fence install cannot interleave with an admission.
+    """
+    directory = Path(companion_dir) / terminal_id / generation
+    with _generation_lock(directory):
+        assert_admission_open(companion_dir, terminal_id, generation)
+        yield

@@ -132,6 +132,65 @@ def test_fenced_generation_rejects_input_admission(store):
         gf.assert_admission_open(store, "a1b2c3d4", "gen-000042")
 
 
+def test_admission_critical_section_recheck_and_post_fence_refusal(store):
+    # The critical section re-verifies the generation under the fence lock;
+    # once a fence lands, entering the section refuses (FENCE-1 boundary).
+    with gf.admission_critical_section(store, "a1b2c3d4", "gen-000042"):
+        pass  # provider/model/tool-entry I/O would run here
+    gf.install_fence(
+        store,
+        terminal_id="a1b2c3d4",
+        generation="gen-000042",
+        vintage="v2",
+        request=_request(),
+        fencing_token_id="token-1",
+    )
+    with pytest.raises(gf.FencedError):
+        with gf.admission_critical_section(store, "a1b2c3d4", "gen-000042"):
+            pass
+
+
+def test_admission_critical_section_blocks_concurrent_fence_install(store):
+    # FENCE-1 durable regression: a fence install issued while an admission
+    # holds the critical section must wait — it cannot land between the
+    # final fence recheck and the provider I/O (no check-then-submit gap).
+    import threading
+
+    in_section = threading.Event()
+    finish_io = threading.Event()
+    installed: list = []
+
+    def admit():
+        with gf.admission_critical_section(store, "a1b2c3d4", "gen-000042"):
+            in_section.set()
+            assert finish_io.wait(timeout=10)
+
+    def install():
+        installed.append(
+            gf.install_fence(
+                store,
+                terminal_id="a1b2c3d4",
+                generation="gen-000042",
+                vintage="v2",
+                request=_request(),
+                fencing_token_id="token-1",
+            )
+        )
+
+    admission = threading.Thread(target=admit)
+    admission.start()
+    assert in_section.wait(timeout=10)
+    installer = threading.Thread(target=install)
+    installer.start()
+    installer.join(timeout=2)
+    assert installer.is_alive()  # blocked behind the held fence lock
+    finish_io.set()
+    admission.join(timeout=10)
+    installer.join(timeout=10)
+    assert not admission.is_alive() and not installer.is_alive()
+    assert installed[0]["outcome"] == gf.OUTCOME_FENCED
+
+
 def test_verify_fence_freshness(store):
     response = gf.install_fence(
         store,

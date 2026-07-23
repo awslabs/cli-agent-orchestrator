@@ -133,6 +133,51 @@ def test_fence_install_and_outcomes(client, isolated_memory_db, worktree, tmp_pa
     assert unknown.json()["outcome"] == "unknown-generation"
 
 
+def test_fence_install_binds_body_identity_to_reservation_row(
+    client, isolated_memory_db, worktree, tmp_path
+):
+    # FENCE durable regression: a fence body naming a different terminal
+    # than the v2 generation's owner is never acknowledged — the truthful
+    # outcome is unknown-generation and nothing is written under the
+    # attacker-selected path; the row's own terminal drives the state path.
+    from cli_agent_orchestrator.services.generation_fence import fence_state_path
+
+    payload = _reserve_payload(worktree, tmp_path)
+    record = client.post("/managed-launch/v2/reservations", json=payload).json()
+    companion = tmp_path / "companion"
+    fence_request = {
+        "schema": "cao-w13-fence-req-v1",
+        "terminal_id": "feedface",  # attacker-selected, not the row's terminal
+        "terminal_generation": record["generation"],
+        "obligation_generation": record["obligation_generation"],
+        "attempt_id": str(uuid.uuid4()),
+        "intent_id": str(uuid.uuid4()),
+        "report_sha256": "a" * 64,
+    }
+    refused = client.post("/managed-launch/v2/fence", json=fence_request)
+    assert refused.status_code == 200
+    assert refused.json()["outcome"] == "unknown-generation"
+    assert not fence_state_path(companion, "feedface", record["generation"]).exists()
+    assert not fence_state_path(companion, record["terminal_id"], record["generation"]).exists()
+    # A mismatched obligation generation conflicts (never acknowledged).
+    mismatched = client.post(
+        "/managed-launch/v2/fence",
+        json={
+            **fence_request,
+            "terminal_id": record["terminal_id"],
+            "obligation_generation": "other-obligation",
+        },
+    )
+    assert mismatched.status_code == 409
+    # The correct identity still fences, under the row's terminal path.
+    correct = client.post(
+        "/managed-launch/v2/fence",
+        json={**fence_request, "terminal_id": record["terminal_id"]},
+    )
+    assert correct.json()["outcome"] == "fenced"
+    assert fence_state_path(companion, record["terminal_id"], record["generation"]).exists()
+
+
 def test_destructive_endpoint_refusal_and_execution(
     client, isolated_memory_db, worktree, tmp_path, monkeypatch
 ):
@@ -164,11 +209,33 @@ def test_destructive_endpoint_refusal_and_execution(
         "reservation_id": reservation_id,
         "attempt_id": attempt_id,
         "fencing_token_id": "token-1",
-        "requires_containment": False,
     }
     monkeypatch.setattr(
         "cli_agent_orchestrator.api.main.terminal_service.delete_terminal",
         lambda *a, **k: True,
+    )
+    # Containment is derived server-side by effect class; with the
+    # composition unproven the teardown refuses — there is no request bit.
+    refused = client.post("/managed/destructive", json=intent)
+    assert refused.status_code == 409
+    # With a proven composition AND the durable dual-exit proof, it runs.
+    from cli_agent_orchestrator.services import containment
+    from cli_agent_orchestrator.services.destructive_endpoint import write_dual_exit_proof
+
+    class _ProvenComposition:
+        def status(self):
+            return "proven"
+
+    monkeypatch.setattr(containment, "ContainmentComposition", _ProvenComposition)
+    write_dual_exit_proof(
+        companion,
+        terminal_id="a1b2c3d4",
+        generation=generation,
+        reservation_id=reservation_id,
+        attempt_id=attempt_id,
+        fencing_token_id="token-1",
+        provider_exit={"pid": 1, "exit_code": 0},
+        bridge_exit={"pid": 2, "exit_code": 0},
     )
     executed = client.post("/managed/destructive", json=intent)
     assert executed.status_code == 200
@@ -181,12 +248,6 @@ def test_destructive_endpoint_refusal_and_execution(
         json={**intent, "intent_id": str(uuid.uuid4()), "fencing_token_id": "wrong"},
     )
     assert mismatch.status_code == 409
-    # Containment-required effects refuse while unproven.
-    contained = client.post(
-        "/managed/destructive",
-        json={**intent, "intent_id": str(uuid.uuid4()), "requires_containment": True},
-    )
-    assert contained.status_code == 409
 
 
 def test_v1_surface_unaffected_by_v2(client):

@@ -144,6 +144,43 @@ def test_consumption_is_durable_across_broker_restart(tmp_path):
         restarted.verify_and_consume(assertion)
 
 
+def test_concurrent_cross_broker_consumption_is_single_use(tmp_path):
+    # ACT-1 durable regression: two independent broker instances over one
+    # state dir/key racing verify_and_consume at P-MUT must produce exactly
+    # one acceptance — consumption is a cross-process transaction (flock),
+    # not an unlocked load/check/write.
+    import threading
+
+    kwargs = dict(
+        state_dir=tmp_path / "broker",
+        terminal_generation="gen-000042",
+        provider_pids=frozenset({1000}),
+        lineage_checker=lambda pid: True,
+        signing_key=b"k" * 32,
+    )
+    issuer = ActorBroker(**kwargs)
+    assertion = issuer.issue(None, peer=PeerCredentials(pid=2000, uid=501), **_issue_kwargs())
+    left, right = ActorBroker(**kwargs), ActorBroker(**kwargs)
+    barrier = threading.Barrier(2)
+    outcomes: list = []
+
+    def consume(broker):
+        barrier.wait(timeout=5)
+        try:
+            broker.verify_and_consume(assertion)
+            outcomes.append("accepted")
+        except AssertionInvalid:
+            outcomes.append("refused")
+
+    threads = [threading.Thread(target=consume, args=(broker,)) for broker in (left, right)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
+    assert sorted(outcomes) == ["accepted", "refused"]
+
+
 def test_platform_peer_credentials_real_socketpair():
     # On supported platforms the kernel path works for a real socketpair.
     if not actor_broker.platform_supported():

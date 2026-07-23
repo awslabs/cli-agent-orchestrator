@@ -46,7 +46,18 @@ class ManagedLaunchV2ReserveRequest(BaseModel):
     obligation_generation: str
     task_id: Optional[str] = None
     run_id: str
+    project: Optional[str] = None
     launch_nonce: str
+
+    @field_validator("project")
+    @classmethod
+    def _project_non_empty(cls, value: Optional[str]) -> Optional[str]:
+        # The immutable project identity: when supplied it is persisted
+        # verbatim and binds every heartbeat/bridge fact for the
+        # generation; it may never silently fall back to another field.
+        if value is not None and not value:
+            raise ValueError("project must be non-empty when supplied")
+        return value
 
     @field_validator("reservation_id")
     @classmethod
@@ -183,7 +194,11 @@ class ManagedV2FenceInstallRequest(BaseModel):
 
 
 class ManagedDestructiveRequest(BaseModel):
-    """One single-use conditional destructive intent for the fork endpoint."""
+    """One single-use conditional destructive intent for the fork endpoint.
+
+    Whether the effect class requires proven containment is derived
+    server-side by the fork; the request carries no containment bit.
+    """
 
     intent_id: str
     kind: Literal["terminal-teardown"]
@@ -192,7 +207,6 @@ class ManagedDestructiveRequest(BaseModel):
     reservation_id: str
     attempt_id: str
     fencing_token_id: str
-    requires_containment: bool = False
 
     @field_validator("intent_id", "attempt_id", "reservation_id")
     @classmethod

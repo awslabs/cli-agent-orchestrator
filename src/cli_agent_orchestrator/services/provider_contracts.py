@@ -7,7 +7,10 @@ authority, or a non-resumable mode.
 
 Invariant: resume acceptance requires the exact pinned form for the
 exact pinned provider version; installed-version drift fails closed
-(outcome 41) until the pinned binary is stage-verified.
+(outcome 41) until the pinned binary is stage-verified.  Claude's
+native id is a canonical UUID and is shape-validated.  Capability
+claims derive only from provider-specific, version-checked receipts —
+never from caller-supplied booleans.
 
 Failure mode prevented: ``--continue``/``--last``/newest-session forms
 bind whatever session happens to be newest — after any other session
@@ -22,6 +25,8 @@ ambient or recency-derived one.
 
 from __future__ import annotations
 
+import re
+import uuid as _uuid_module
 from dataclasses import dataclass
 from typing import Optional
 
@@ -70,8 +75,11 @@ def check_pinned_version(provider: str, installed_version: str) -> None:
     pinned = PINNED_VERSIONS.get(provider)
     if pinned is None:
         raise ProviderContractError(f"unknown provider: {provider!r}")
-    # Accept an exact match or a "<name> <version>" banner tail match.
-    normalized = installed_version.strip().split()[-1] if installed_version.strip() else ""
+    # Accept the exact pin anywhere in a "<name> <version> ..." banner:
+    # the first semver-shaped token is the version fact ("codex 0.145.0",
+    # "2.1.218 (Claude Code)", "kimi 0.29.0" all parse).
+    tokens = installed_version.strip().split()
+    normalized = next((token for token in tokens if re.fullmatch(r"\d+\.\d+\.\d+", token)), "")
     if normalized != pinned:
         raise ProviderVersionDrift(
             f"{provider} version drift: pinned {pinned}, installed "
@@ -138,7 +146,17 @@ def validate_resume_argv(provider: str, argv: list[str]) -> ResumeForm:
         raise ResumeFormRefused("kimi resume accepts exactly `--session <id>` or `-r <id>`")
     # claude
     if len(args) == 2 and args[0] == "--resume" and args[1] and not args[1].startswith("-"):
-        return ResumeForm(provider, tuple(args), args[1])
+        native_id = args[1]
+        try:
+            parsed = _uuid_module.UUID(native_id)
+        except ValueError as exc:
+            raise ResumeFormRefused(
+                "claude resume native id must be a canonical UUID "
+                f"(the --session-id form); got {native_id!r}"
+            ) from exc
+        if str(parsed) != native_id:
+            raise ResumeFormRefused("claude resume native id must be a canonical lowercase UUID")
+        return ResumeForm(provider, tuple(args), native_id)
     raise ResumeFormRefused("claude resume accepts exactly `--resume <uuid>`")
 
 
@@ -152,51 +170,77 @@ class ProviderResumeStatus:
     reason: str
 
 
+def _version_matches(provider: str, installed_version: Optional[str]) -> bool:
+    """True only when the installed version is known and matches the pin."""
+    if installed_version is None:
+        return False
+    try:
+        check_pinned_version(provider, installed_version)
+    except ProviderVersionDrift:
+        return False
+    return True
+
+
 def resume_status(
     provider: str,
     *,
-    kimi_acp_proof_green: bool = False,
-    route_receipt_proven: bool = False,
+    installed_version: Optional[str] = None,
+    kimi_acp_proof: Optional[dict] = None,
+    route_proof: Optional[dict] = None,
 ) -> ProviderResumeStatus:
     """Report the pinned resume support for one provider, truthfully.
 
-    With PF-2 red for every enabled provider, no provider carries
-    authority-bearing automated recovery: Codex and Kimi have resumable
-    *identity* but unsupported authority; Claude is unsupported by
-    default (no pre-input effort surface); Kimi's identity mechanics
-    additionally require the installed-CLI ACP session/load proof.
+    Every claim derives from provider-specific, version-checked,
+    generation-bound receipts: ``installed_version`` is the live
+    ``--version`` fact for the pinned binary (drift or absence removes
+    the capability), ``kimi_acp_proof`` is the validated durable ACP
+    new→kill→load receipt, and ``route_proof`` is the provider-specific
+    model-input-bound non-echo route receipt.  With PF-2 red and no
+    receipts, every provider reports unproven/unsupported — caller
+    booleans can no longer promote anything.
     """
     if provider == PROVIDER_CODEX:
+        version_ok = _version_matches(PROVIDER_CODEX, installed_version)
         return ProviderResumeStatus(
             provider=provider,
-            identity_available=True,
-            authority_supported=route_receipt_proven,
+            identity_available=version_ok,
+            authority_supported=version_ok and route_proof is not None,
             reason=(
                 "resume identity available (app-server thread id); automated "
                 "recovery/strongest-route authority unsupported until a "
                 "model-input-bound non-echo route receipt is proven"
+                if version_ok
+                else "identity unavailable: pinned Codex binary is absent or "
+                "version-drifted (fail closed, outcome 41)"
             ),
         )
     if provider == PROVIDER_CLAUDE:
+        version_ok = _version_matches(PROVIDER_CLAUDE, installed_version)
         return ProviderResumeStatus(
             provider=provider,
-            identity_available=True,
+            identity_available=version_ok,
             authority_supported=False,
             reason=(
                 "resume identity available (--session-id/--resume); unsupported "
                 "by default: no pre-input effort surface exists"
+                if version_ok
+                else "identity unavailable: pinned Claude binary is absent or "
+                "version-drifted (fail closed, outcome 41)"
             ),
         )
     if provider == PROVIDER_KIMI:
+        version_ok = _version_matches(PROVIDER_KIMI, installed_version)
+        proven = version_ok and kimi_acp_proof is not None
         return ProviderResumeStatus(
             provider=provider,
-            identity_available=kimi_acp_proof_green,
+            identity_available=proven,
             authority_supported=False,
             reason=(
                 "identity requires the installed-CLI ACP session/new→kill→"
                 "session/load proof; effort authority unproven"
-                if kimi_acp_proof_green
-                else "identity disabled until the installed-CLI ACP "
+                if proven
+                else "identity disabled until the pinned binary is "
+                "version-verified and the installed-CLI ACP "
                 "session/new→kill→session/load proof passes"
             ),
         )

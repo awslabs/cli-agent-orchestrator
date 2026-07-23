@@ -27,6 +27,7 @@ anti-accident scope, not a security boundary.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
@@ -37,10 +38,11 @@ import struct
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from cli_agent_orchestrator.services.canonical_json import encode_canonical
 from cli_agent_orchestrator.services.durable_publish import (
@@ -183,6 +185,25 @@ class ActorBroker:
     def _consumed_path(self) -> Path:
         return self._dir / "actor-assertions.json"
 
+    @contextmanager
+    def _consumption_lock(self) -> Iterator[None]:
+        """The cross-process one-use transaction lock.
+
+        ``verify_and_consume`` is a check-then-write transaction: without
+        a shared lock, two broker instances (separate processes or
+        objects over one state dir) can both load, both see the assertion
+        unconsumed, and both accept — consuming one assertion twice.
+        flock serializes the load/check/persist across processes.
+        """
+        self._dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._dir / ".actor.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def _load_consumed(self) -> dict[str, Any]:
         try:
             raw = self._consumed_path().read_bytes()
@@ -288,24 +309,24 @@ class ActorBroker:
         assertion_id = assertion.get("assertion_id")
         if not isinstance(assertion_id, str):
             raise AssertionInvalid("assertion lacks an id")
-        store = self._load_consumed()
-        if assertion_id in store["consumed"]:
-            raise AssertionInvalid("assertion replay: one-use assertion already consumed")
-        store["consumed"] = store["consumed"] + [assertion_id]
-        store["updated_seq"] = int(store.get("updated_seq") or 0) + 1
-        self._dir.mkdir(parents=True, exist_ok=True)
-        path = self._consumed_path()
-        try:
-            old = path.read_bytes() if path.exists() and not path.is_symlink() else None
-            publish_mutable(
-                path,
-                json.dumps(store, sort_keys=True).encode() + b"\n",
-                expected_old_sha256=(
-                    hashlib.sha256(old).hexdigest() if old is not None else ABSENT
-                ),
-            )
-        except PublicationError as exc:
-            raise ActorBrokerError(f"could not persist assertion consumption: {exc}") from exc
+        with self._consumption_lock():
+            store = self._load_consumed()
+            if assertion_id in store["consumed"]:
+                raise AssertionInvalid("assertion replay: one-use assertion already consumed")
+            store["consumed"] = store["consumed"] + [assertion_id]
+            store["updated_seq"] = int(store.get("updated_seq") or 0) + 1
+            path = self._consumed_path()
+            try:
+                old = path.read_bytes() if path.exists() and not path.is_symlink() else None
+                publish_mutable(
+                    path,
+                    json.dumps(store, sort_keys=True).encode() + b"\n",
+                    expected_old_sha256=(
+                        hashlib.sha256(old).hexdigest() if old is not None else ABSENT
+                    ),
+                )
+            except PublicationError as exc:
+                raise ActorBrokerError(f"could not persist assertion consumption: {exc}") from exc
 
     def check(self, assertion: dict[str, Any]) -> bool:
         """Non-consuming validity check (signature/binding/expiry only)."""

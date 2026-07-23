@@ -171,6 +171,9 @@ WHEN OLD.lifecycle_state IN ('deleted','aborted')
 BEGIN SELECT RAISE(ABORT,'terminal resource row is immutable'); END;
 CREATE TRIGGER resource_no_delete BEFORE DELETE ON resource
 BEGIN SELECT RAISE(ABORT,'resource rows are history; never deleted'); END;
+CREATE TRIGGER resource_no_replace BEFORE INSERT ON resource
+WHEN EXISTS (SELECT 1 FROM resource r WHERE r.entry_id = NEW.entry_id)
+BEGIN SELECT RAISE(ABORT,'resource rows are history; never replaced'); END;
 CREATE TRIGGER rd_no_update BEFORE UPDATE ON resource_dependency
   BEGIN SELECT RAISE(ABORT,'resource_dependency is append-only'); END;
 CREATE TRIGGER rd_no_delete BEFORE DELETE ON resource_dependency
@@ -223,9 +226,63 @@ def _now() -> str:
 class ResourceRegistry:
     """The fork-owned durable resource registry (one DB per side)."""
 
+    _REQUIRED_TABLES = (
+        "registry_meta",
+        "resource",
+        "resource_dependency",
+        "resource_event",
+        "resource_consumer",
+    )
+
     def __init__(self, db_path: Path, *, db_uuid: Optional[str] = None) -> None:
         self._path = Path(db_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        if self._path.exists() and self._path.stat().st_size > 0:
+            # Validated reopen: an existing registry is opened, verified,
+            # and schema-migrated atomically — the literal CREATE script
+            # never re-runs against a live registry.
+            self._open_existing()
+        else:
+            self._create_new(db_uuid)
+        os.chmod(self._path, 0o600)
+        self._verify_meta()
+
+    def _has_table(self, conn: sqlite3.Connection, table: str) -> bool:
+        return (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            is not None
+        )
+
+    def _open_existing(self) -> None:
+        """Open and validate an existing registry; migrate missing guards."""
+        conn = self._connect()
+        try:
+            missing = [t for t in self._REQUIRED_TABLES if not self._has_table(conn, t)]
+            if missing:
+                raise RegistryError(
+                    f"existing registry is missing required tables {missing}; "
+                    "refusing to treat it as empty-and-new"
+                )
+            # Atomic open-time guard migration: registries created before
+            # the no-REPLACE trigger gain it here, inside one transaction.
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS resource_no_replace BEFORE INSERT "
+                "ON resource WHEN EXISTS (SELECT 1 FROM resource r WHERE "
+                "r.entry_id = NEW.entry_id) BEGIN SELECT RAISE(ABORT,"
+                "'resource rows are history; never replaced'); END;"
+            )
+            conn.commit()
+        except sqlite3.Error as exc:
+            conn.rollback()
+            raise RegistryError(f"registry open failed: {exc}") from exc
+        finally:
+            conn.close()
+
+    def _create_new(self, db_uuid: Optional[str]) -> None:
+        """First create: the literal create script, race-tolerant."""
         # Concurrent first-open constructors race on the create
         # transaction; creation is idempotent, so a locked loser retries.
         last_error: Optional[sqlite3.Error] = None
@@ -256,8 +313,6 @@ class ResourceRegistry:
                 conn.close()
         else:
             raise RegistryError(f"registry creation failed under contention: {last_error}")
-        os.chmod(self._path, 0o600)
-        self._verify_meta()
 
     def _verify_meta(self) -> None:
         conn = self._connect()
@@ -487,6 +542,15 @@ class ResourceRegistry:
                 raise RegistryTransitionRefused(
                     f"illegal lifecycle transition {from_state!r} -> {to_state!r}"
                 )
+            if row["ownership"] in ("external", "shared") and to_state != "aborted":
+                # External/shared resources are monitor-only: this registry
+                # never creates, activates, drains, closes, or deletes
+                # them; abandoning the monitor declaration (aborted, on a
+                # verified-absence receipt) is the only lawful transition.
+                raise RegistryTransitionRefused(
+                    f"{row['ownership']} resources are monitor-only; "
+                    f"{from_state!r} -> {to_state!r} is refused"
+                )
             if to_state == "active":
                 for dependency in conn.execute(
                     "SELECT depends_on_entry_id FROM resource_dependency WHERE entry_id=?",
@@ -595,6 +659,7 @@ class ResourceRegistry:
         *,
         actor_id: str,
         finder: Callable[[dict[str, Any]], Optional[dict[str, Any]]],
+        existence_receipt_digest: str,
     ) -> dict[str, Any]:
         """Restart reconciliation for the create-to-capture crash window.
 
@@ -602,12 +667,18 @@ class ResourceRegistry:
         (tmux name/format tag, path, key) and returns the observed
         identity (or None when no trace exists).  A declaration with no
         physical trace is left ``declared`` for re-create or abort; a
-        found resource records its observed identity by state_seq CAS.
+        found resource is promoted to ``created`` ONLY against a verified
+        existence receipt (its digest is journaled as the transition
+        evidence) — discovery never silently manufactures ``created``.
         """
         entry = self.resolve(entry_id)
         found = finder(entry)
         if found is None:
             return entry
+        if len(existence_receipt_digest) != 64:
+            raise RegistryError(
+                "discovery promotion requires a verified existence receipt digest (64 hex)"
+            )
         if entry["lifecycle_state"] not in ("declared", "created"):
             raise RegistryTransitionRefused(
                 f"discovery is lawful only from declared/created, not "
@@ -618,7 +689,7 @@ class ResourceRegistry:
             "created",
             actor_id=actor_id,
             observed=found,
-            evidence_digest=None,
+            evidence_digest=existence_receipt_digest,
         )
 
     def drain(self, entry_id: str, *, actor_id: str) -> dict[str, Any]:
@@ -632,9 +703,17 @@ class ResourceRegistry:
         entry_id: str,
         *,
         actor_id: str,
-        verified_absence_digest: Optional[str] = None,
+        verified_absence_digest: str,
     ) -> dict[str, Any]:
-        """Physical removal happened first and was verified; row retained."""
+        """Physical removal happened first and was verified; row retained.
+
+        A verified-absence receipt (64-hex digest) is REQUIRED — an owned
+        resource is only ever marked deleted against proof the physical
+        resource is gone.  External/shared entries can never reach
+        ``deleted`` here at all (monitor-only, enforced in _transition).
+        """
+        if not isinstance(verified_absence_digest, str) or len(verified_absence_digest) != 64:
+            raise RegistryError("delete requires a verified-absence receipt digest (64 hex)")
         return self._transition(
             entry_id, "deleted", actor_id=actor_id, evidence_digest=verified_absence_digest
         )
@@ -708,3 +787,94 @@ class ResourceRegistry:
         for entry in entries:
             visit(entry["entry_id"])
         return ordered
+
+
+# ------------------------------------------------------------ runtime wiring
+#
+# The registry is authoritative only if every runtime constructor,
+# lookup, monitor, and deleter is registered BEFORE the inventory or
+# cleanup APIs are exposed.  RUNTIME_RESOURCE_MANIFEST is the checked
+# source manifest of the resource classes the terminal lifecycle wires;
+# verify_runtime_wiring compares it against the durable entries for one
+# generation.
+
+import hashlib  # noqa: E402
+import threading  # noqa: E402
+
+RUNTIME_RESOURCE_MANIFEST: tuple[dict[str, str], ...] = (
+    {
+        "kind": "fifo",
+        "constructor": "terminal_service.create_terminal",
+        "deleter": "terminal_service.delete_terminal",
+    },
+    {
+        "kind": "log",
+        "constructor": "terminal_service.create_terminal",
+        "deleter": "terminal_service.delete_terminal",
+    },
+    {
+        "kind": "scrollback",
+        "constructor": "terminal_service.delete_terminal",
+        "deleter": "cleanup_service.cleanup_old_data",
+    },
+    {
+        "kind": "snapshot",
+        "constructor": "terminal_service.delete_terminal",
+        "deleter": "cleanup_service.cleanup_old_data",
+    },
+    {
+        "kind": "tmux_window",
+        "constructor": "terminal_service.create_terminal",
+        "deleter": "terminal_service.delete_terminal",
+    },
+    {
+        "kind": "provider_instance",
+        "constructor": "terminal_service.create_terminal",
+        "deleter": "terminal_service.delete_terminal",
+    },
+)
+
+_REGISTRY_SINGLETON: Optional["ResourceRegistry"] = None
+_REGISTRY_LOCK = threading.Lock()
+
+
+def get_resource_registry(db_path: Optional[Path] = None) -> "ResourceRegistry":
+    """The process-wide runtime registry (constructed before exposure)."""
+    global _REGISTRY_SINGLETON
+    with _REGISTRY_LOCK:
+        if _REGISTRY_SINGLETON is None:
+            from cli_agent_orchestrator.constants import CAO_HOME_DIR
+
+            _REGISTRY_SINGLETON = ResourceRegistry(
+                Path(db_path) if db_path is not None else CAO_HOME_DIR / "resource-registry.sqlite"
+            )
+        return _REGISTRY_SINGLETON
+
+
+def reset_resource_registry() -> None:
+    """Drop the singleton (tests/isolated state roots)."""
+    global _REGISTRY_SINGLETON
+    with _REGISTRY_LOCK:
+        _REGISTRY_SINGLETON = None
+
+
+def receipt_digest(payload: dict[str, Any]) -> str:
+    """The existence/absence receipt digest for one observed fact set."""
+    import json as _json
+
+    return hashlib.sha256(_json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def verify_runtime_wiring(
+    registry: "ResourceRegistry", *, terminal_id: str, generation: str
+) -> list[str]:
+    """Manifest kinds with no durable entry for one generation.
+
+    An empty list means every resource class the runtime constructs,
+    looks up, monitors, or deletes for this generation is registered
+    before any inventory/cleanup consumer sees it; a non-empty list is
+    the exact set of unwired classes and must fail the exposing check.
+    """
+    entries = registry.enumerate(terminal_id=terminal_id, generation=generation)
+    present = {entry["kind"] for entry in entries}
+    return [item["kind"] for item in RUNTIME_RESOURCE_MANIFEST if item["kind"] not in present]

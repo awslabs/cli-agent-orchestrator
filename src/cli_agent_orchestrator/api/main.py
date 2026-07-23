@@ -1692,31 +1692,65 @@ async def cleanup_managed_generation(
 # ---------------------------------------------------------------------------
 
 
+def _provider_version_output(executable_name: str) -> Optional[str]:
+    """Live ``--version`` fact for one provider binary (None = unverified)."""
+    import shutil
+    import subprocess
+
+    binary = shutil.which(executable_name)
+    if not binary:
+        return None
+    try:
+        proc = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return proc.stdout.strip()
+
+
 @app.get("/managed/recovery-capabilities")
 async def managed_recovery_capabilities(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
     """The truthful negotiation surface: absence/unknown means fail closed."""
-    import shutil
     from pathlib import Path
 
     from cli_agent_orchestrator.constants import CAO_HOME_DIR
     from cli_agent_orchestrator.services import kimi_acp_proof, recovery_capabilities
 
+    # Version facts come from the live binaries — never hardcoded strings;
+    # runtime drift removes the capability.  The Kimi identity claim
+    # additionally requires the validated durable ACP new→kill→load proof.
+    versions = {
+        "codex": await asyncio.to_thread(_provider_version_output, "codex"),
+        "claude": await asyncio.to_thread(_provider_version_output, "claude"),
+        "kimi": await asyncio.to_thread(_provider_version_output, "kimi"),
+    }
+    kimi_proof = None
+    import shutil
+
     kimi_bin = shutil.which("kimi")
-    kimi_proven = False
-    if kimi_bin:
+    if kimi_bin and versions["kimi"]:
         try:
-            kimi_proven = await asyncio.to_thread(
-                kimi_acp_proof.kimi_identity_enabled,
+            kimi_proof = await asyncio.to_thread(
+                kimi_acp_proof.load_valid_proof,
                 state_dir=CAO_HOME_DIR / "recovery",
                 kimi_binary=Path(kimi_bin),
-                version_output="kimi 0.29.0",
+                version_output=versions["kimi"],
             )
         except Exception:  # noqa: BLE001 - absence of proof means disabled
-            kimi_proven = False
+            kimi_proof = None
     return await asyncio.to_thread(
-        recovery_capabilities.build_capabilities, kimi_acp_proof_green=kimi_proven
+        recovery_capabilities.build_capabilities,
+        provider_versions=versions,
+        kimi_acp_proof=kimi_proof,
     )
 
 
@@ -1818,11 +1852,14 @@ async def install_managed_fence(
     from cli_agent_orchestrator.services import generation_fence, heartbeat_store
 
     def _install() -> Dict[str, Any]:
+        import json as _json
+
         from cli_agent_orchestrator.clients import database
 
         vintage: Optional[str] = None
         superseded = False
         fencing_token_id = "unissued"
+        row_terminal_id: Optional[str] = None
         with database.SessionLocal() as db:
             row = (
                 db.query(database.ManagedLaunchV2ReservationModel)
@@ -1832,9 +1869,30 @@ async def install_managed_fence(
                 .first()
             )
             if row is not None:
+                # Identity binding: the body's terminal, generation,
+                # obligation, attempt, and the current fencing token must
+                # all match the fork-owned reservation row BEFORE any
+                # acknowledgement, and the row's terminal — never the
+                # caller's — drives the state path.
+                if body.terminal_id != row.terminal_id:
+                    return {
+                        "schema": "cao-w13-fence-resp-v1",
+                        "outcome": "unknown-generation",
+                        "fence_receipt_sha256": None,
+                    }
+                if body.obligation_generation != row.obligation_generation:
+                    raise generation_fence.FenceRequestError(
+                        "fence obligation_generation does not match the reservation row"
+                    )
+                binding = _json.loads(str(row.binding_json)) if row.binding_json else None
+                if binding is not None and body.attempt_id != binding.get("attempt_id"):
+                    raise generation_fence.FenceRequestError(
+                        "fence attempt_id does not match the journaled native binding"
+                    )
                 vintage = "v2"
+                row_terminal_id = str(row.terminal_id)
                 fencing_record = heartbeat_store.current_fencing_record(
-                    COMPANION_DIR, row.terminal_id
+                    COMPANION_DIR, row_terminal_id
                 )
                 if fencing_record is not None:
                     token = (fencing_record.get("current_token") or {}).get("id")
@@ -1861,7 +1919,7 @@ async def install_managed_fence(
             }
         return generation_fence.install_fence(
             COMPANION_DIR,
-            terminal_id=body.terminal_id,
+            terminal_id=row_terminal_id if row_terminal_id is not None else body.terminal_id,
             generation=body.terminal_generation,
             vintage=vintage,
             superseded=superseded,
@@ -1891,6 +1949,8 @@ async def execute_conditional_destructive(
     )
 
     def _execute() -> Dict[str, Any]:
+        from cli_agent_orchestrator.services.containment import ContainmentComposition
+
         record = managed_launch_v2.get(body.reservation_id)
 
         def _effect() -> str:
@@ -1904,7 +1964,15 @@ async def execute_conditional_destructive(
                 raise DestructiveError("teardown returned without a no-survivor proof")
             return "terminal-torn-down"
 
-        endpoint = DestructiveEndpoint(companion_dir=COMPANION_DIR)
+        # Containment truth comes from the live composition (unproven by
+        # default), never from the request; the containment requirement is
+        # derived server-side from the effect class, and the endpoint
+        # fails closed on any non-ACTIVE heartbeat reading absent a
+        # durable dual-exit proof.
+        endpoint = DestructiveEndpoint(
+            companion_dir=COMPANION_DIR,
+            containment_proven=lambda: ContainmentComposition().status() == "proven",
+        )
         return endpoint.execute(
             DestructiveIntent(
                 intent_id=body.intent_id,
@@ -1914,7 +1982,6 @@ async def execute_conditional_destructive(
                 reservation_id=body.reservation_id,
                 attempt_id=body.attempt_id,
                 fencing_token_id=body.fencing_token_id,
-                requires_containment=body.requires_containment,
             ),
             _effect,
         )

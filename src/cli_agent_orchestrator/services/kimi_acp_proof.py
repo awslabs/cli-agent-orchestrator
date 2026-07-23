@@ -55,8 +55,15 @@ def run_identity_proof(
     """Execute the proof against the installed CLI and publish its receipt.
 
     ``acp_driver`` performs the actual ACP exchange (session/new → kill
-    → resume) and must return ``{"session_id": …, "resumed": True}``
+    → session/load) and must return::
+
+        {"session_id": …, "resumed": True,
+         "exchange": {"session_new_id": …, "killed": True,
+                      "session_load_id": …, "transcript_sha256": …}}
+
     only when the exact same session id came back after the kill.  The
+    exchange evidence is journaled in the receipt so a bare file with
+    matching self-authored fields is never accepted as a proof.  The
     driver is injectable so the proof is testable without a live CLI;
     production wiring supplies the real ACP client.
     """
@@ -73,6 +80,20 @@ def run_identity_proof(
     session_id = outcome.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         raise KimiAcpProofError("proof driver returned no session_id")
+    exchange = outcome.get("exchange")
+    if not isinstance(exchange, dict):
+        raise KimiAcpProofError("proof driver returned no ACP exchange evidence")
+    if (
+        exchange.get("session_new_id") != session_id
+        or exchange.get("session_load_id") != session_id
+        or exchange.get("killed") is not True
+        or not isinstance(exchange.get("transcript_sha256"), str)
+        or len(exchange["transcript_sha256"]) != 64
+    ):
+        raise KimiAcpProofError(
+            "ACP exchange evidence does not prove session/new→kill→session/load "
+            "of one exact session id"
+        )
     binary_digest = hashlib.sha256(binary.read_bytes()).hexdigest()
     receipt = {
         "schema": PROOF_SCHEMA,
@@ -81,6 +102,12 @@ def run_identity_proof(
         "binary_sha256": binary_digest,
         "session_id": session_id,
         "resumed_after_kill": True,
+        "acp_exchange": {
+            "session_new_id": exchange["session_new_id"],
+            "killed": True,
+            "session_load_id": exchange["session_load_id"],
+            "transcript_sha256": exchange["transcript_sha256"],
+        },
         "proven_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     state = Path(state_dir)
@@ -93,13 +120,47 @@ def run_identity_proof(
     return receipt
 
 
+def _is_content_addressed(candidate: Path, raw: bytes) -> bool:
+    """The proof file must sit at its immutable content address.
+
+    ``publish_immutable`` names receipts
+    ``kimi-acp-proof.<sha256(bytes)[:16]>.json``; a hand-authored file at
+    any other name was never immutably published and is not a proof.
+    """
+    digest = hashlib.sha256(raw).hexdigest()
+    return candidate.name == f"kimi-acp-proof.{digest[:16]}.json"
+
+
+def _exchange_valid(receipt: dict[str, Any]) -> bool:
+    """The receipt must carry authenticated new→kill→load exchange evidence."""
+    exchange = receipt.get("acp_exchange")
+    session_id = receipt.get("session_id")
+    return (
+        isinstance(exchange, dict)
+        and isinstance(session_id, str)
+        and bool(session_id)
+        and exchange.get("session_new_id") == session_id
+        and exchange.get("session_load_id") == session_id
+        and exchange.get("killed") is True
+        and isinstance(exchange.get("transcript_sha256"), str)
+        and len(exchange["transcript_sha256"]) == 64
+    )
+
+
 def load_valid_proof(
     *,
     state_dir: Path,
     kimi_binary: Path,
     version_output: str,
 ) -> Optional[dict[str, Any]]:
-    """The durable proof receipt iff it is valid for the current binary."""
+    """The durable proof receipt iff it is valid for the current binary.
+
+    Valid requires: the pinned version matches, the receipt sits at its
+    immutable content address, its binary digest/path match the current
+    pinned binary, and it carries authenticated ACP
+    session/new→kill→session/load exchange evidence for one exact
+    session id.  Anything else is not a proof (fail closed).
+    """
     state = Path(state_dir)
     try:
         check_pinned_version(PROVIDER_KIMI, version_output)
@@ -108,8 +169,11 @@ def load_valid_proof(
         return None
     for candidate in sorted(state.glob("kimi-acp-proof.*.json")):
         try:
-            receipt = json.loads(candidate.read_bytes())
+            raw = candidate.read_bytes()
+            receipt = json.loads(raw)
         except (OSError, json.JSONDecodeError):
+            continue
+        if not _is_content_addressed(candidate, raw):
             continue
         if (
             isinstance(receipt, dict)
@@ -118,7 +182,7 @@ def load_valid_proof(
             and receipt.get("binary_path") == str(kimi_binary)
             and receipt.get("kimi_version") == PINNED_VERSIONS[PROVIDER_KIMI]
             and receipt.get("resumed_after_kill") is True
-            and receipt.get("session_id")
+            and _exchange_valid(receipt)
         ):
             return receipt
     return None

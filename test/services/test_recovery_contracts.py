@@ -40,7 +40,20 @@ def test_exact_resume_forms_accepted():
     assert pc.validate_resume_argv("codex", ["exec", "resume", "thr_1"]).native_id == "thr_1"
     assert pc.validate_resume_argv("kimi", ["--session", "session_abc"]).native_id == "session_abc"
     assert pc.validate_resume_argv("kimi", ["-r", "session_abc"]).native_id == "session_abc"
-    assert pc.validate_resume_argv("claude", ["--resume", "uuid-1"]).native_id == "uuid-1"
+    claude = pc.validate_resume_argv("claude", ["--resume", "11111111-1111-4111-8111-111111111111"])
+    assert claude.native_id == "11111111-1111-4111-8111-111111111111"
+
+
+def test_claude_resume_native_id_must_be_canonical_uuid():
+    # PROV-2 durable regression: Claude's native session id is a canonical
+    # UUID; any other shape is refused, never resumed blindly.
+    with pytest.raises(pc.ResumeFormRefused):
+        pc.validate_resume_argv("claude", ["--resume", "not-a-native-uuid"])
+    with pytest.raises(pc.ResumeFormRefused):
+        pc.validate_resume_argv("claude", ["--resume", "11111111-1111-4111-8111-11111111111Z"])
+    with pytest.raises(pc.ResumeFormRefused):
+        # non-canonical (uppercase) rendering
+        pc.validate_resume_argv("claude", ["--resume", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"])
 
 
 @pytest.mark.parametrize(
@@ -64,14 +77,39 @@ def test_forbidden_resume_forms_refused(provider, argv):
 
 
 def test_resume_status_truthful_defaults():
+    # Without a live version fact every provider fails closed: no identity,
+    # no authority (an absent or drifted binary removes the capability).
     codex = pc.resume_status("codex")
-    assert codex.identity_available and not codex.authority_supported
+    assert not codex.identity_available and not codex.authority_supported
     claude = pc.resume_status("claude")
-    assert claude.identity_available and not claude.authority_supported
+    assert not claude.identity_available and not claude.authority_supported
     kimi = pc.resume_status("kimi")
     assert not kimi.identity_available and not kimi.authority_supported
-    kimi_proven = pc.resume_status("kimi", kimi_acp_proof_green=True)
+
+
+def test_resume_status_version_checked_and_receipt_bound():
+    # A version-matched binary restores resume identity (never authority);
+    # version drift removes it again (outcome 41 semantics).
+    codex = pc.resume_status("codex", installed_version="codex 0.145.0")
+    assert codex.identity_available and not codex.authority_supported
+    drifted = pc.resume_status("codex", installed_version="codex 0.145.1")
+    assert not drifted.identity_available
+    claude = pc.resume_status("claude", installed_version="2.1.218 (Claude Code)")
+    assert claude.identity_available and not claude.authority_supported
+    drifted_claude = pc.resume_status("claude", installed_version="2.1.216 (Claude Code)")
+    assert not drifted_claude.identity_available
+    # Kimi identity additionally requires the validated durable ACP proof.
+    kimi_unproven = pc.resume_status("kimi", installed_version="kimi 0.29.0")
+    assert not kimi_unproven.identity_available
+    kimi_proven = pc.resume_status(
+        "kimi", installed_version="kimi 0.29.0", kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"}
+    )
     assert kimi_proven.identity_available and not kimi_proven.authority_supported
+    # A provider-specific route receipt promotes ONLY that provider's authority.
+    codex_route = pc.resume_status(
+        "codex", installed_version="codex 0.145.0", route_proof={"schema": "route-receipt"}
+    )
+    assert codex_route.authority_supported
 
 
 # ------------------------------------------------------------- containment
@@ -157,7 +195,15 @@ def test_zero_proven_providers_advertised_truthfully():
         "claude": "unsupported",
         "kimi": "unproven",
     }
-    assert payload["resume"]["codex"]["identity_available"] is True
+    # Zero proven providers: no enabled provider and every automated
+    # recovery/finalization/destructive path is unavailable.
+    assert payload["enabled_providers"] == []
+    assert payload["automated_paths"] == {
+        "recovery": False,
+        "finalization": False,
+        "destructive": False,
+    }
+    assert payload["resume"]["codex"]["identity_available"] is False
     assert payload["resume"]["codex"]["authority_supported"] is False
     assert payload["resume"]["kimi"]["identity_available"] is False
     assert payload["resource_registry_version"] == 1
@@ -165,15 +211,41 @@ def test_zero_proven_providers_advertised_truthfully():
     assert "cao-w13-fence-receipt-v1" in payload["receipts"]
 
 
-def test_capability_claims_derive_from_composition_not_config():
+def test_capability_claims_derive_from_receipts_never_caller_booleans():
+    # CAP-2 durable regression: a provider's observed-route claim derives
+    # only from that provider's own version-checked receipt — one receipt
+    # promotes exactly one provider, and there is no global caller boolean.
     composition = ContainmentComposition(
         authorization=_authorization(),
         live_proof_receipt=_receipt(),
         deployment_generation=3,
     )
-    payload = build_capabilities(containment=composition, kimi_acp_proof_green=True)
+    payload = build_capabilities(
+        containment=composition,
+        provider_versions={"codex": "codex 0.145.0", "kimi": "kimi 0.29.0"},
+        kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"},
+        route_proofs={"codex": {"schema": "route-receipt"}},
+    )
     assert payload["containment"] == "proven"
+    assert payload["observed_route"] == {
+        "codex": "proven",  # only Codex carries a route receipt
+        "claude": "unsupported",
+        "kimi": "unproven",
+    }
     assert payload["resume"]["kimi"]["identity_available"] is True
+    # Claude's binary was never version-verified: no identity.
+    assert payload["resume"]["claude"]["identity_available"] is False
+    assert payload["enabled_providers"] == ["codex", "kimi"]
+    assert payload["automated_paths"]["recovery"] is True
+    # Runtime version drift removes the capability.
+    drifted = build_capabilities(
+        containment=composition,
+        provider_versions={"codex": "codex 0.145.1", "kimi": "kimi 0.29.0"},
+        kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"},
+        route_proofs={"codex": {"schema": "route-receipt"}},
+    )
+    assert drifted["resume"]["codex"]["identity_available"] is False
+    assert drifted["resume"]["codex"]["authority_supported"] is False
     # A dead extension (no live receipt) reports unproven regardless.
     dead = ContainmentComposition(
         authorization=_authorization(),

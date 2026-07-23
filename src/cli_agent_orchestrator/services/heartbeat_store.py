@@ -123,6 +123,27 @@ def _generation_lock(companion_dir: Path, terminal_id: str, generation: str) -> 
         os.close(fd)
 
 
+@contextmanager
+def _terminal_lock(companion_dir: Path, terminal_id: str) -> Iterator[None]:
+    """The per-terminal lock serializing fencing-token issuance.
+
+    The fencing registry is terminal-scoped, so issuance must serialize on
+    a terminal-scoped lock — a per-generation lock lets two generations of
+    one terminal read the same prior fence number and both publish
+    ``fence_no = prior + 1``, breaking strict monotonicity across
+    generations.
+    """
+    directory = Path(companion_dir) / terminal_id
+    directory.mkdir(parents=True, exist_ok=True)
+    fd = os.open(directory / ".fencing.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 @dataclass(frozen=True)
 class FencingToken:
     """Immutable producer fencing token: UUID + per-terminal fence number."""
@@ -205,33 +226,37 @@ def issue_fencing_token(
 
     Issued at reservation (and again at each resume attempt): the fence
     number strictly increases per terminal, so a superseded producer's
-    token compares stale and its writes are refused.  Issuance runs under
-    the target generation's lock and publishes through the P-MUT CAS.
+    token compares stale and its writes are refused.  Issuance is
+    serialized on the *terminal*-scoped lock (the registry is per
+    terminal) and then runs under the target generation's lock, so
+    concurrent issuance for two generations of one terminal still yields
+    strictly increasing fence numbers.
     """
-    with _generation_lock(companion_dir, terminal_id, generation):
-        path = _fencing_path(companion_dir, terminal_id)
-        current = _read_json(path)
-        prior_no = 0
-        if current is not None:
-            token = current.get("current_token") or {}
-            prior_no = int(token.get("fence_no") or 0)
-        new_token = FencingToken(id=str(uuid.uuid4()), fence_no=prior_no + 1)
-        record = {
-            "schema": "cao-producer-fencing-v1",
-            "terminal_id": terminal_id,
-            "generation": generation,
-            "attempt_id": attempt_id,
-            "current_token": new_token.as_dict(),
-            "updated_seq": new_token.fence_no,
-            "issued_at": _rfc3339(_utcnow()),
-        }
-        old_sha = _sha(path)
-        publish_mutable(
-            path,
-            json.dumps(record, sort_keys=True).encode() + b"\n",
-            expected_old_sha256=old_sha if old_sha is not None else ABSENT,
-        )
-        return new_token
+    with _terminal_lock(companion_dir, terminal_id):
+        with _generation_lock(companion_dir, terminal_id, generation):
+            path = _fencing_path(companion_dir, terminal_id)
+            current = _read_json(path)
+            prior_no = 0
+            if current is not None:
+                token = current.get("current_token") or {}
+                prior_no = int(token.get("fence_no") or 0)
+            new_token = FencingToken(id=str(uuid.uuid4()), fence_no=prior_no + 1)
+            record = {
+                "schema": "cao-producer-fencing-v1",
+                "terminal_id": terminal_id,
+                "generation": generation,
+                "attempt_id": attempt_id,
+                "current_token": new_token.as_dict(),
+                "updated_seq": new_token.fence_no,
+                "issued_at": _rfc3339(_utcnow()),
+            }
+            old_sha = _sha(path)
+            publish_mutable(
+                path,
+                json.dumps(record, sort_keys=True).encode() + b"\n",
+                expected_old_sha256=old_sha if old_sha is not None else ABSENT,
+            )
+            return new_token
 
 
 def current_fencing_record(companion_dir: Path, terminal_id: str) -> Optional[dict[str, Any]]:
@@ -330,6 +355,34 @@ class HeartbeatProducer:
         self._seq = 0
         self._last_write: Optional[datetime] = None
 
+    def _rehydrate(self, path: Path) -> None:
+        """Restore durable producer position for a reconstructed producer.
+
+        A producer is not a singleton: the bridge or a restarted process
+        may construct a fresh instance for the same generation and token.
+        Under the generation lock, a current record written by *this*
+        token rehydrates ``(epoch, seq)`` and the coalescing watermark so
+        the sequence continues instead of restarting at zero (which the
+        fencing compare step would — correctly — refuse as a regression).
+        A record from a different token is left to ``_check_writer``.
+        """
+        try:
+            current = _read_json(path)
+        except HeartbeatSchemaError:
+            return  # malformed: the P-MUT CAS/fence check governs
+        if current is None:
+            return
+        theirs = current.get("fencing_token") or {}
+        if theirs.get("id") != self._token.id:
+            return
+        self._epoch = max(self._epoch, int(current.get("epoch") or 0))
+        self._seq = max(self._seq, int(current.get("seq") or 0))
+        if self._last_write is None and isinstance(current.get("observed_at"), str):
+            try:
+                self._last_write = _parse_time(current["observed_at"])
+            except HeartbeatSchemaError:
+                pass
+
     def _check_writer(self, current: Optional[dict[str, Any]]) -> None:
         """Refuse a superseded or regressive writer with zero mutation."""
         if current is None:
@@ -388,6 +441,16 @@ class HeartbeatProducer:
                     "one (revoked or never issued)"
                 )
             path = heartbeat_path(self._dir, identity.terminal_id, identity.generation)
+            self._rehydrate(path)
+            if (
+                not force
+                and turn_state == "active"
+                and self._last_write is not None
+                and (now - self._last_write) < timedelta(seconds=COALESCE_SECONDS)
+            ):
+                # The durable watermark (rehydrated above) coalesces beats
+                # from a reconstructed producer exactly as for a live one.
+                return None
             record = {
                 "schema_version": HEARTBEAT_SCHEMA_VERSION,
                 "protocol_vintage": PROTOCOL_VINTAGE,

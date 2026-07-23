@@ -171,29 +171,77 @@ def test_superseded_producer_refused(store):
         )
 
 
-def test_regressive_epoch_seq_refused(store):
+def test_restarted_producer_rehydrates_epoch_seq(store):
+    # HB-1 durable regression: a reconstructed producer with the same valid
+    # token (bridge re-emit, process restart) must rehydrate the durable
+    # (epoch, seq) position and coalescing watermark instead of restarting
+    # at zero — a restart-at-zero write is a regression the fencing compare
+    # step would refuse, which is exactly how the live bridge lost liveness.
     identity = _identity()
     token = hb.issue_fencing_token(
         store, identity.terminal_id, identity.generation, identity.attempt_id
     )
     now = [datetime(2026, 7, 23, 12, 0, 0, tzinfo=UTC)]
     producer = _producer(store, identity, token, now)
-    producer.beat(
+    first = producer.beat(
         turn_state="active",
         provider_turn_id="t",
         evidence_kind="app_server_event",
         evidence_id="e1",
     )
-    # A second producer instance with the same token restarts at seq 0 and
-    # must not regress the durable (epoch, seq) position.
+    assert first is not None and first["seq"] == 1
     restarted = _producer(store, identity, token, now)
-    with pytest.raises(hb.FencingRefused):
+    # The durable watermark rehydrated: an immediate active beat coalesces
+    # exactly as it would on the original instance.
+    assert (
         restarted.beat(
             turn_state="active",
             provider_turn_id="t",
             evidence_kind="app_server_event",
-            evidence_id="e2",
+            evidence_id="e1b",
         )
+        is None
+    )
+    now[0] += timedelta(seconds=30)
+    continued = restarted.beat(
+        turn_state="active",
+        provider_turn_id="t",
+        evidence_kind="app_server_event",
+        evidence_id="e2",
+    )
+    assert continued is not None
+    assert continued["epoch"] == token.fence_no
+    assert continued["seq"] == 2  # continues, never regresses to 0/1
+
+
+def test_concurrent_cross_generation_issuance_is_monotone(store):
+    # HB-2 durable regression: racing token issuance for concurrent
+    # generations of one terminal must yield strictly increasing fence
+    # numbers — issuance serializes on the terminal-scoped lock, not the
+    # generation lock (two generations must never both read the same prior
+    # number and both publish prior+1).
+    import threading
+    import uuid
+
+    tokens: list = []
+    errors: list = []
+
+    def issue(generation: str) -> None:
+        try:
+            tokens.append(hb.issue_fencing_token(store, "a1b2c3d4", generation, str(uuid.uuid4())))
+        except Exception as exc:  # noqa: BLE001 - test records the exact outcome
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    workers = [threading.Thread(target=issue, args=(f"gen-race-{i}",)) for i in range(8)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+    assert not any(worker.is_alive() for worker in workers)
+    assert errors == []
+    assert len(tokens) == 8
+    assert sorted(token.fence_no for token in tokens) == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert len({token.id for token in tokens}) == 8
 
 
 def test_record_never_stores_secrets_or_prompt_text(store):

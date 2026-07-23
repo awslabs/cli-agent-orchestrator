@@ -223,9 +223,40 @@ class ManagedLaunchV2ReservationModel(Base):
     state = Column(Text, nullable=False)
     request_json = Column(Text, nullable=False)
     binding_json = Column(Text, nullable=True)
+    # Journaled bind intent (exact canonical creation/binding/route
+    # payload bytes + fencing token), committed BEFORE any immutable
+    # external publication so a crash on either side of the SQL/filesystem
+    # boundary reconciles against the same bytes.
+    bind_intent_json = Column(Text, nullable=True)
     admission_json = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
     updated_at = Column(Text, nullable=False)
+
+
+class ManagedLaunchV2TerminalModel(Base):
+    """Isolated v2 managed-terminal metadata (distinct protocol vintage).
+
+    v2 managed terminal rows live ONLY here — never in the shared
+    ``terminals`` table — so every old-binary query, list, watchdog, and
+    cleanup path (which only knows ``terminals``) has zero visibility
+    into v2 terminal state by construction.  ``protocol_vintage`` is
+    pinned to 'v2'.
+    """
+
+    __tablename__ = "managed_launch_v2_terminals"
+
+    id = Column(String, primary_key=True)  # "abc123ef"
+    tmux_session = Column(String, nullable=False)
+    tmux_window = Column(String, nullable=False)
+    provider = Column(String, nullable=False)
+    agent_profile = Column(String)
+    allowed_tools = Column(String, nullable=True)
+    caller_id = Column(String, nullable=True)
+    generation = Column(Text, nullable=False, unique=True)
+    protocol_vintage = Column(Text, nullable=False, default="v2")
+    pane_id = Column(Text, nullable=True)
+    window_id = Column(Text, nullable=True)
+    last_active = Column(DateTime, default=datetime.now)
 
 
 class FlowModel(Base):
@@ -669,39 +700,15 @@ def _migrate_managed_launch_v2() -> None:
     The v2 table is a separate surface: every pre-existing row in any v1
     table is classified immutable v1 by its absence here, and no v1
     reader or deleter can see v2 rows.  ``protocol_vintage`` is pinned to
-    'v2' at the DDL level so a v2 row can never silently downgrade.
+    'v2' at the DDL level so a v2 row can never silently downgrade.  The
+    real transactional migration (with journaled rollback/drain) lives in
+    ``services/vintage_migration.py``; this delegates to it.
     """
-    import sqlite3
-
     from cli_agent_orchestrator.constants import DATABASE_FILE
+    from cli_agent_orchestrator.services import vintage_migration
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS managed_launch_v2_reservations ("
-                "reservation_id TEXT PRIMARY KEY, "
-                "terminal_id TEXT NOT NULL UNIQUE, "
-                "generation TEXT NOT NULL UNIQUE, "
-                "protocol_vintage TEXT NOT NULL DEFAULT 'v2' "
-                "CHECK (protocol_vintage = 'v2'), "
-                "session_name TEXT NOT NULL, "
-                "provider TEXT NOT NULL, "
-                "agent_profile TEXT NOT NULL, "
-                "caller_id TEXT NOT NULL, "
-                "working_directory TEXT NOT NULL, "
-                "trusted_project_root TEXT, "
-                "obligation_generation TEXT NOT NULL, "
-                "task_id TEXT, "
-                "run_id TEXT NOT NULL, "
-                "launch_nonce_digest TEXT NOT NULL, "
-                "state TEXT NOT NULL, "
-                "request_json TEXT NOT NULL, "
-                "binding_json TEXT, "
-                "admission_json TEXT, "
-                "created_at TEXT NOT NULL, "
-                "updated_at TEXT NOT NULL"
-                ")"
-            )
+        vintage_migration.migrate_v2(DATABASE_FILE)
     except Exception as e:  # noqa: BLE001 - the operation path fails closed
         logger.warning(f"managed-launch v2 migration failed: {e}")
 
@@ -794,6 +801,116 @@ def create_terminal(
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
         }
+
+
+def create_terminal_v2(
+    terminal_id: str,
+    tmux_session: str,
+    tmux_window: str,
+    provider: str,
+    agent_profile: Optional[str] = None,
+    allowed_tools: Optional[List[str]] = None,
+    caller_id: Optional[str] = None,
+    generation: Optional[str] = None,
+    pane_id: Optional[str] = None,
+    window_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a v2 managed terminal metadata record (isolated vintage surface).
+
+    v2 managed terminals live ONLY in ``managed_launch_v2_terminals`` —
+    never in the shared ``terminals`` table — so old-binary query, list,
+    watchdog, and cleanup paths have zero visibility into them.
+    """
+    import json as _json
+
+    if not generation:
+        raise ValueError("v2 managed terminals require the exact generation")
+    with SessionLocal() as db:
+        terminal = ManagedLaunchV2TerminalModel(
+            id=terminal_id,
+            tmux_session=tmux_session,
+            tmux_window=tmux_window,
+            provider=provider,
+            agent_profile=agent_profile,
+            allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
+            caller_id=caller_id,
+            generation=generation,
+            protocol_vintage="v2",
+            pane_id=pane_id,
+            window_id=window_id,
+        )
+        db.add(terminal)
+        db.commit()
+        return {
+            "id": terminal.id,
+            "tmux_session": terminal.tmux_session,
+            "tmux_window": terminal.tmux_window,
+            "provider": terminal.provider,
+            "agent_profile": terminal.agent_profile,
+            "allowed_tools": allowed_tools,
+            "caller_id": terminal.caller_id,
+            "generation": terminal.generation,
+            "protocol_vintage": "v2",
+            "pane_id": terminal.pane_id,
+            "window_id": terminal.window_id,
+        }
+
+
+def get_terminal_metadata_v2(terminal_id: str) -> Optional[Dict[str, Any]]:
+    """Get v2 managed terminal metadata by ID (isolated vintage surface)."""
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = (
+            db.query(ManagedLaunchV2TerminalModel)
+            .filter(ManagedLaunchV2TerminalModel.id == terminal_id)
+            .first()
+        )
+        if not terminal:
+            return None
+        allowed_tools = _json.loads(terminal.allowed_tools) if terminal.allowed_tools else None
+        return {
+            "id": terminal.id,
+            "tmux_session": terminal.tmux_session,
+            "tmux_window": terminal.tmux_window,
+            "provider": terminal.provider,
+            "agent_profile": terminal.agent_profile,
+            "allowed_tools": allowed_tools,
+            "shell_command": None,
+            "caller_id": terminal.caller_id,
+            "generation": terminal.generation,
+            "protocol_vintage": "v2",
+            "pane_id": terminal.pane_id,
+            "window_id": terminal.window_id,
+            "last_active": terminal.last_active,
+        }
+
+
+def delete_terminal_v2(terminal_id: str) -> bool:
+    """Delete a v2 managed terminal metadata record (v2 surface only)."""
+    with SessionLocal() as db:
+        deleted = (
+            db.query(ManagedLaunchV2TerminalModel)
+            .filter(ManagedLaunchV2TerminalModel.id == terminal_id)
+            .delete()
+        )
+        db.commit()
+        return deleted > 0
+
+
+def delete_terminal_v2_if_generation(terminal_id: str, generation: str) -> bool:
+    """Delete a v2 managed terminal row only if it still names the generation."""
+    with SessionLocal() as db:
+        deleted = (
+            db.query(ManagedLaunchV2TerminalModel)
+            .filter(
+                ManagedLaunchV2TerminalModel.id == terminal_id,
+                ManagedLaunchV2TerminalModel.generation == generation,
+            )
+            .delete()
+        )
+        db.commit()
+        return deleted > 0
 
 
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:

@@ -18,6 +18,49 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 logger = logging.getLogger(__name__)
 
 
+def _v2_terminal_identities(db) -> tuple[set, set]:
+    """The terminal ids/generations owned by the isolated v2 surface.
+
+    Old cleanup paths must have zero visibility into v2 state; if the v2
+    tables are unreadable the shape guard below still applies, so the
+    failure mode is preservation, never deletion.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        ManagedLaunchV2ReservationModel,
+        ManagedLaunchV2TerminalModel,
+    )
+
+    ids: set = set()
+    generations: set = set()
+    try:
+        for row in db.query(ManagedLaunchV2TerminalModel.id).all():
+            ids.add(row[0])
+        for row in db.query(ManagedLaunchV2TerminalModel.generation).all():
+            generations.add(row[0])
+        for row in db.query(ManagedLaunchV2ReservationModel.terminal_id).all():
+            ids.add(row[0])
+        for row in db.query(ManagedLaunchV2ReservationModel.generation).all():
+            generations.add(row[0])
+    except Exception:  # noqa: BLE001 - shape guard still applies; never delete on doubt
+        logger.warning("v2 vintage surface unreadable during cleanup; relying on shape guard")
+    return ids, generations
+
+
+def _is_v2_owned_row(terminal, v2_ids: set, v2_generations: set) -> bool:
+    """Whether a shared-table row belongs to a managed/v2 incarnation.
+
+    Managed windows embed the generation in their name (``managed-*``);
+    their lifecycle is owned by the generation-claimed delete path, never
+    by unfiltered retention cleanup.  Rows whose id or generation appears
+    in the v2 surface are likewise invisible to this old path.
+    """
+    if terminal.id in v2_ids:
+        return True
+    if terminal.generation and terminal.generation in v2_generations:
+        return True
+    return bool((terminal.tmux_window or "").startswith("managed-"))
+
+
 def cleanup_old_data():
     """Clean up terminals, inbox messages, and log files older than RETENTION_DAYS."""
     try:
@@ -26,17 +69,26 @@ def cleanup_old_data():
             f"Starting cleanup of data older than {RETENTION_DAYS} days (before {cutoff_date})"
         )
 
-        # Clean up old terminals (stop FIFO readers and clear state first)
+        # Clean up old terminals (stop FIFO readers and clear state first).
+        # v2-owned/managed rows are invisible to this legacy path: they are
+        # skipped, never deleted (zero old-binary visibility into v2 state).
         with SessionLocal() as db:
+            v2_ids, v2_generations = _v2_terminal_identities(db)
             old_terminals = (
                 db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
             )
+            deleted_terminals = 0
             for terminal in old_terminals:
+                if _is_v2_owned_row(terminal, v2_ids, v2_generations):
+                    logger.warning(
+                        f"cleanup skipped managed/v2-owned terminal row {terminal.id}; "
+                        "its lifecycle is generation-claimed"
+                    )
+                    continue
                 fifo_manager.stop_reader(terminal.id)
                 status_monitor.clear_terminal(terminal.id)
-            deleted_terminals = (
-                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).delete()
-            )
+                db.delete(terminal)
+                deleted_terminals += 1
             db.commit()
             logger.info(f"Deleted {deleted_terminals} old terminals from database")
 

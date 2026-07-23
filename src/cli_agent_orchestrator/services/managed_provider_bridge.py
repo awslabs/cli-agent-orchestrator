@@ -586,6 +586,11 @@ class _ProviderSession:
         self.kimi_wire_path: Optional[pathlib.Path] = None
         self._companion_scan_index = 0
         self._current_turn_id: Optional[str] = None
+        # One fenced heartbeat producer per bridge lifetime: epoch/sequence
+        # and the coalescing watermark are producer state; constructing a
+        # fresh producer per beat would restart the sequence (the fencing
+        # compare step refuses that as a regression) and never coalesce.
+        self._heartbeat_producer: Any = None
 
     def _companion_identity(self) -> tuple[str, str]:
         return (self.request["terminal_id"], self.request["generation"])
@@ -881,27 +886,36 @@ class _ProviderSession:
         }
         if any(request.get(key) != value for key, value in expected.items()):
             raise BridgeError("admission does not match the exact bridge generation")
-        # The W13 fence is the admission boundary: a sealed generation
-        # rejects every post-fence input with zero provider I/O.
-        self._assert_fence_open()
         if (
             hashlib.sha256(request["message"].encode("utf-8")).hexdigest()
             != request["message_sha256"]
         ):
             raise BridgeError("admission message digest mismatch")
-        provider_turn_id, kind, provider_evidence = self._submit_provider_turn(
-            request["message"],
-            client_message_id=request["delivery_id"],
-            meta={
-                "caoReservationId": request["reservation_id"],
-                "caoGeneration": request["generation"],
-                "caoMessageSha256": request["message_sha256"],
-                "caoContextSha256": _digest(request.get("context") or {}),
-            },
-        )
-        self._current_turn_id = provider_turn_id
-        self._scan_companion_events()
-        self._emit_beat(provider_turn_id, f"{kind}:{provider_turn_id}")
+        # The W13 fence is the admission boundary, held atomically: the
+        # generation fence lock is taken across the final fence recheck AND
+        # every provider/model/tool-entry I/O, so a fence installed
+        # concurrent with this admission cannot interleave (no
+        # check-then-submit gap). A sealed generation rejects the entry
+        # with zero provider I/O.
+        from cli_agent_orchestrator.services import generation_fence
+
+        try:
+            with self._admission_critical_section():
+                provider_turn_id, kind, provider_evidence = self._submit_provider_turn(
+                    request["message"],
+                    client_message_id=request["delivery_id"],
+                    meta={
+                        "caoReservationId": request["reservation_id"],
+                        "caoGeneration": request["generation"],
+                        "caoMessageSha256": request["message_sha256"],
+                        "caoContextSha256": _digest(request.get("context") or {}),
+                    },
+                )
+                self._current_turn_id = provider_turn_id
+                self._scan_companion_events()
+                self._emit_beat(provider_turn_id, f"{kind}:{provider_turn_id}")
+        except generation_fence.FencedError as exc:
+            raise BridgeError(str(exc)) from exc
         receipt_id = provider_turn_id
         return {
             **self._base_receipt(),
@@ -938,20 +952,27 @@ class _ProviderSession:
             raise BridgeError("inbox delivery omitted the exact message id")
         if hashlib.sha256(message.encode("utf-8")).hexdigest() != command.get("message_sha256"):
             raise BridgeError("inbox delivery message digest mismatch")
-        # Sealed generations reject queued unsubmitted input at the boundary.
-        self._assert_fence_open()
-        provider_turn_id, kind, provider_evidence = self._submit_provider_turn(
-            message,
-            client_message_id=message_id,
-            meta={
-                "caoInboxMessageId": message_id,
-                "caoMessageSha256": command["message_sha256"],
-                "caoSenderId": command.get("sender_id"),
-            },
-        )
-        self._current_turn_id = provider_turn_id
-        self._scan_companion_events()
-        self._emit_beat(provider_turn_id, f"{kind}:{provider_turn_id}")
+        # Sealed generations reject queued unsubmitted input at the
+        # boundary; the fence lock is held across the recheck and the
+        # provider I/O (no check-then-submit gap).
+        from cli_agent_orchestrator.services import generation_fence
+
+        try:
+            with self._admission_critical_section():
+                provider_turn_id, kind, provider_evidence = self._submit_provider_turn(
+                    message,
+                    client_message_id=message_id,
+                    meta={
+                        "caoInboxMessageId": message_id,
+                        "caoMessageSha256": command["message_sha256"],
+                        "caoSenderId": command.get("sender_id"),
+                    },
+                )
+                self._current_turn_id = provider_turn_id
+                self._scan_companion_events()
+                self._emit_beat(provider_turn_id, f"{kind}:{provider_turn_id}")
+        except generation_fence.FencedError as exc:
+            raise BridgeError(str(exc)) from exc
         submitted_at = _now()
         companion_receipts.record_message_ack(
             self.request["terminal_id"],
@@ -1000,12 +1021,23 @@ class _ProviderSession:
         if self.rpc is not None:
             self.rpc.close()
 
+    def _admission_critical_section(self):
+        """The fence lock held across the final recheck and provider I/O."""
+        from cli_agent_orchestrator.constants import COMPANION_DIR
+        from cli_agent_orchestrator.services import generation_fence
+
+        return generation_fence.admission_critical_section(
+            COMPANION_DIR, self.request["terminal_id"], self.request["generation"]
+        )
+
     def _assert_fence_open(self) -> None:
         """Refuse provider-bound input for a sealed (W13-fenced) generation.
 
         Post-report input/tool admission must be *prevented*, not merely
         detected: a callback can only ever bind the tree the sealed
-        generation actually left behind.
+        generation actually left behind.  Callers that submit provider I/O
+        must use ``_admission_critical_section`` instead — this bare check
+        alone is a check-then-act seam.
         """
         from cli_agent_orchestrator.constants import COMPANION_DIR
         from cli_agent_orchestrator.services import generation_fence
@@ -1069,9 +1101,15 @@ class _ProviderSession:
             assigned_policy_sha256=request["assigned_policy_sha256"],
             segment_hash=segment_hash,
         )
-        producer = heartbeat_store.HeartbeatProducer(
-            companion_dir=COMPANION_DIR, identity=identity, token=token
-        )
+        # Retain one producer for the bridge lifetime (reconstructed only
+        # when the registered token changed); its epoch/sequence and
+        # coalescing watermark are the durable producer state.
+        producer = self._heartbeat_producer
+        if producer is None or producer._token.id != token.id:  # noqa: SLF001
+            producer = heartbeat_store.HeartbeatProducer(
+                companion_dir=COMPANION_DIR, identity=identity, token=token
+            )
+            self._heartbeat_producer = producer
         evidence_kind = "app_server_event" if self.provider == "codex" else "acp_update"
         try:
             producer.beat(
@@ -1091,6 +1129,39 @@ class _ProviderSession:
                 request["generation"],
                 exc_info=True,
             )
+
+
+def _build_actor_broker(request: dict[str, Any], session: "_ProviderSession") -> Any:
+    """The generation-private actor broker, wired to the real UDS accept path.
+
+    Issuance happens only over the generation-private socket with
+    kernel-verified peer credentials and live provider-tree lineage; the
+    broker is bound to the exact generation and refuses once the fencing
+    registry names a different (superseding) generation.
+    """
+    from cli_agent_orchestrator.constants import COMPANION_DIR
+    from cli_agent_orchestrator.services import actor_broker, heartbeat_store
+
+    if not actor_broker.platform_supported():
+        return None
+    provider_pids = (
+        frozenset({session.rpc.proc.pid})
+        if session.rpc is not None and session.rpc.proc is not None
+        else frozenset()
+    )
+    terminal_id = request["terminal_id"]
+    generation = request["generation"]
+
+    def _generation_current() -> bool:
+        record = heartbeat_store.current_fencing_record(COMPANION_DIR, terminal_id)
+        return record is not None and record.get("generation") == generation
+
+    return actor_broker.ActorBroker(
+        state_dir=COMPANION_DIR / terminal_id / generation,
+        terminal_generation=generation,
+        provider_pids=provider_pids,
+        generation_current=_generation_current,
+    )
 
 
 def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
@@ -1116,6 +1187,12 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
         session._scan_companion_events()
         state.update({"state": "ready", "readiness": readiness})
         _atomic_json(target["state"], state)
+        # Lane-B production wiring: the generation-private UDS accept path
+        # is the actor broker's issuance boundary, and the delivery journal
+        # records intent/submit/ack transitions around the real provider
+        # call. Neither capability existed before this wiring.
+        broker = _build_actor_broker(request, session)
+        journal: Any = None
         print(
             f"[managed-provider-ready] provider={request['provider']} "
             f"session={readiness['provider_session_id']} generation={request['generation']}",
@@ -1142,7 +1219,30 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                                 raise BridgeError("bridge already admitted a different task")
                             receipt = state["submission"]
                         else:
+                            # Delivery journal: the durable intent lands
+                            # BEFORE any provider I/O; submit/ack straddle
+                            # the provider call and the state persistence.
+                            obligation = request.get("obligation_generation")
+                            delivery_id = command.get("delivery_id")
+                            journaled = (
+                                bool(obligation)
+                                and isinstance(delivery_id, str)
+                                and bool(delivery_id)
+                            )
+                            if journaled:
+                                if journal is None:
+                                    from cli_agent_orchestrator.services.delivery_journal import (
+                                        DeliveryJournal,
+                                    )
+
+                                    journal = DeliveryJournal(
+                                        target["root"] / "delivery-journal.db"
+                                    )
+                                journal.open_intent(obligation, delivery_id, _digest(command))
+                                journal.mark_terminal_queued(obligation, delivery_id)
                             receipt = session.admit(command)
+                            if journaled:
+                                journal.mark_submitted(obligation, delivery_id)
                             state.update(
                                 {
                                     "state": "admitted",
@@ -1151,6 +1251,8 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                                 }
                             )
                             _atomic_json(target["state"], state)
+                            if journaled:
+                                journal.mark_submit_acked(obligation, delivery_id)
                             print(
                                 f"[managed-provider-admitted] delivery={receipt['delivery_id']} "
                                 f"turn={receipt['provider_turn_id']}",
@@ -1161,8 +1263,63 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                         # P1-7 (§20.2f): exact provider-native inbox message
                         # submission; the acknowledgement is recorded by
                         # deliver_inbox into the companion store.
+                        obligation = request.get("obligation_generation")
+                        message_id = command.get("message_id")
+                        journaled = (
+                            bool(obligation) and isinstance(message_id, str) and bool(message_id)
+                        )
+                        if journaled:
+                            if journal is None:
+                                from cli_agent_orchestrator.services.delivery_journal import (
+                                    DeliveryJournal,
+                                )
+
+                                journal = DeliveryJournal(target["root"] / "delivery-journal.db")
+                            journal.open_intent(obligation, message_id, _digest(command))
+                            journal.mark_terminal_queued(obligation, message_id)
                         receipt = session.deliver_inbox(command)
+                        if journaled:
+                            journal.mark_submitted(obligation, message_id)
+                            journal.mark_submit_acked(obligation, message_id)
                         response = {"ok": True, "receipt": receipt}
+                    elif command.get("op") == "actor-assertion":
+                        # The real actor-broker issuance boundary: kernel
+                        # peer credentials and provider-tree lineage are
+                        # verified on THIS generation-private connection.
+                        if broker is None:
+                            raise BridgeError("actor broker is unavailable for this generation")
+                        required = (
+                            "report_sha256",
+                            "report_path",
+                            "project",
+                            "run_id",
+                            "obligation_generation",
+                            "attempt_id",
+                            "native_session_id",
+                            "launch_nonce_digest",
+                            "route_chain_head",
+                        )
+                        missing = [
+                            field
+                            for field in required
+                            if not isinstance(command.get(field), str) or not command.get(field)
+                        ]
+                        if missing:
+                            raise BridgeError(f"actor assertion request missing fields: {missing}")
+                        assertion = broker.issue(
+                            connection,
+                            report_sha256=command["report_sha256"],
+                            report_path=command["report_path"],
+                            project=command["project"],
+                            task_id=command.get("task_id"),
+                            run_id=command["run_id"],
+                            obligation_generation=command["obligation_generation"],
+                            attempt_id=command["attempt_id"],
+                            native_session_id=command["native_session_id"],
+                            launch_nonce_digest=command["launch_nonce_digest"],
+                            route_chain_head=command["route_chain_head"],
+                        )
+                        response = {"ok": True, "assertion": assertion}
                     else:
                         raise BridgeError("unsupported managed bridge operation")
                 except Exception as exc:  # noqa: BLE001 - structured socket failure

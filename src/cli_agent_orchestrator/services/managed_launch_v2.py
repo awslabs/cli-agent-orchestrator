@@ -116,6 +116,7 @@ def _row_dict(row: Any) -> dict[str, Any]:
         "state": row.state,
         "request": _parse_json(row.request_json, {}),
         "binding": _parse_json(row.binding_json, None),
+        "bind_intent": _parse_json(getattr(row, "bind_intent_json", None), None),
         "admission": _parse_json(row.admission_json, None),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
@@ -344,6 +345,15 @@ def bind_native(reservation_id: str, request: ManagedLaunchV2BindRequest) -> dic
     bridge (a fork-owned fact), derives the creation/binding payload
     digests, publishes the fork-owned binding record, issues the
     producer fencing token, and transitions ``launching → bound``.
+
+    Crash safety: the bind intent — the exact canonical creation/binding/
+    route payload bytes, the binding record, and the fencing token — is
+    journaled to the reservation row and committed BEFORE any immutable
+    external publication.  A crash on either side of the SQL/filesystem
+    boundary is reconciled on retry against those journaled bytes: an
+    already-published binding record that matches the intent is adopted
+    and the row converges to ``bound``; a mismatch is a conflict, never
+    a silent re-publication.
     """
     from cli_agent_orchestrator.services.managed_provider_bridge import read_state
 
@@ -364,146 +374,256 @@ def bind_native(reservation_id: str, request: ManagedLaunchV2BindRequest) -> dic
                     f"native bind requires state 'launching', not {row.state!r}"
                 )
 
-            state = read_state(reservation_id)
-            receipt = (state or {}).get("readiness")
-            if not isinstance(receipt, dict) or (state or {}).get("state") != "ready":
-                raise ManagedLaunchConflict(
-                    "native bind requires the bridge's durable ready state with a "
-                    "provider-native readiness receipt"
-                )
-            _validate_readiness_for_bind(row, receipt)
-
-            terminal = (
-                db.query(database.TerminalModel)
-                .filter(database.TerminalModel.id == row.terminal_id)
-                .first()
-            )
-            tmux_incarnation = (
-                f"tmux:{terminal.tmux_session}:{terminal.window_id}:{terminal.pane_id}"
-                if terminal is not None
-                else f"tmux:{row.session_name}:unknown:unknown"
-            )
-            route_digest = hashlib.sha256(
-                _canonical_json(
-                    {
-                        "model": receipt["model"],
-                        "effort": receipt["effort"],
-                        "agent_profile": row.agent_profile,
-                    }
-                ).encode()
-            ).hexdigest()
-            created_at = _now()
-            # The worktree head is a fork-observable fact (read-only git);
-            # a worktree that cannot report its head fails the bind closed.
-            import subprocess
-
-            try:
-                head_proc = subprocess.run(
-                    ["git", "-C", row.working_directory, "rev-parse", "HEAD"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise ManagedLaunchConflict(
-                    f"worktree head is not readable for the binding: {exc}"
-                ) from exc
-            head = head_proc.stdout.strip()
-            if (
-                head_proc.returncode != 0
-                or len(head) != 40
-                or any(ch not in "0123456789abcdef" for ch in head)
-            ):
-                raise ManagedLaunchConflict(
-                    "worktree head is not a full lowercase hex OID; the binding "
-                    "requires the exact head"
-                )
-            creation_payload = recovery_receipts.creation_payload(
-                provider=_PINNED_PROVIDER[row.provider],
-                native_id=receipt["provider_session_id"],
-                provider_version=receipt["provider_version"],
-                issuance_source=_ISSUANCE_SOURCES[row.provider],
-                obligation_generation=row.obligation_generation,
-                task_id=row.task_id,
-                run_id=row.run_id,
-                created_at=created_at,
-            )
-            binding_payload = recovery_receipts.binding_payload(
-                provider=_PINNED_PROVIDER[row.provider],
-                native_id=receipt["provider_session_id"],
-                launch_nonce_digest=row.launch_nonce_digest,
-                provider_process_identity=f"bridge:{reservation_id}",
-                tmux_incarnation=tmux_incarnation,
-                terminal_generation=row.generation,
-                worktree_realpath=row.working_directory,
-                repository=os.path.basename(row.working_directory),
-                head=head,
-                assigned_route_digest=route_digest,
-                bound_at=created_at,
-            )
-            token = heartbeat_store.issue_fencing_token(
-                COMPANION_DIR, row.terminal_id, row.generation, request.attempt_id
-            )
-            # The fork-side route fact: an unobserved route payload (PF-2 is
-            # red for every pinned provider — no provider-observed fields may
-            # be claimed).  The conductor binds the §6.3 segment chain from
-            # these facts; the heartbeat's route field binds this digest.
-            route_payload = recovery_receipts.route_payload(
-                provider=_PINNED_PROVIDER[row.provider],
-                native_id=receipt["provider_session_id"],
-                authority_status="unobserved",
-                assigned_model=receipt["model"],
-                assigned_effort=receipt["effort"],
-                assigned_policy_sha256=receipt.get("profile_sha256") or ("0" * 64),
-                assigned_profile_sha256=receipt.get("profile_sha256") or ("0" * 64),
-                assigned_config_sha256=receipt.get("protected_config_sha256") or ("0" * 64),
-                requested_model=receipt["model"],
-                requested_effort=receipt["effort"],
-                observed_model=None,
-                observed_effort=None,
-                protocol_version=None,
-                event_sequence=None,
-                native_turn_id=None,
-                attested_at=created_at,
-            )
-            route_payload_digest = recovery_receipts.payload_digest(route_payload)
-            write_binding_record(
-                COMPANION_DIR,
-                terminal_id=row.terminal_id,
-                generation=row.generation,
-                reservation_id=reservation_id,
-                attempt_id=request.attempt_id,
-                launch_nonce_digest=row.launch_nonce_digest,
-                fencing_token_id=token.id,
-                provider=row.provider,
-                native_session_id=receipt["provider_session_id"],
-                assigned_policy_sha256=receipt.get("profile_sha256"),
-                route_payload_sha256=route_payload_digest,
-            )
-            binding = {
-                "schema": "cao-managed-v2-native-binding-v1",
-                "attempt_id": request.attempt_id,
-                "native_session_id": receipt["provider_session_id"],
-                "provider_version": receipt["provider_version"],
-                "issuance_source": _ISSUANCE_SOURCES[row.provider],
-                "creation_payload_sha256": recovery_receipts.payload_digest(creation_payload),
-                "binding_payload_sha256": recovery_receipts.payload_digest(binding_payload),
-                "fencing_token_id": token.id,
-                "fence_no": token.fence_no,
-                "assigned_route_digest": route_digest,
-                "bound_at": created_at,
-            }
-            row.binding_json = _canonical_json(binding)
-            row.state = "bound"
-            row.updated_at = _now()
-            db.commit()
-            db.refresh(row)
+            intent = _parse_json(row.bind_intent_json, None)
+            if intent is not None:
+                if intent.get("schema") != "cao-managed-v2-bind-intent-v1":
+                    raise ManagedLaunchUnavailable("bind intent journal has an unknown schema")
+                if intent.get("attempt_id") != request.attempt_id:
+                    raise ManagedLaunchConflict(
+                        "a bind intent for a different attempt is already journaled"
+                    )
+            if intent is None:
+                state = read_state(reservation_id)
+                receipt = (state or {}).get("readiness")
+                if not isinstance(receipt, dict) or (state or {}).get("state") != "ready":
+                    raise ManagedLaunchConflict(
+                        "native bind requires the bridge's durable ready state with a "
+                        "provider-native readiness receipt"
+                    )
+                _validate_readiness_for_bind(row, receipt)
+                intent = _build_bind_intent(db, row, reservation_id, request, receipt)
+                # Journal the intent BEFORE the immutable external
+                # publication; this commit is the recoverable boundary.
+                row.bind_intent_json = _canonical_json(intent)
+                row.updated_at = _now()
+                db.commit()
+                db.refresh(row)
+            _reconcile_and_complete_bind(db, row, reservation_id, intent)
             return _row_dict(row)
     except ManagedLaunchError:
         raise
     except Exception as exc:  # noqa: BLE001
         raise ManagedLaunchUnavailable(f"native bind failed: {exc}") from exc
+
+
+def _build_bind_intent(
+    db: Any,
+    row: Any,
+    reservation_id: str,
+    request: ManagedLaunchV2BindRequest,
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Compute the exact bind intent (payload bytes + token) for one attempt."""
+    terminal = (
+        db.query(database.TerminalModel)
+        .filter(database.TerminalModel.id == row.terminal_id)
+        .first()
+    )
+    if terminal is None:
+        terminal = (
+            db.query(database.ManagedLaunchV2TerminalModel)
+            .filter(database.ManagedLaunchV2TerminalModel.id == row.terminal_id)
+            .first()
+        )
+    tmux_incarnation = (
+        f"tmux:{terminal.tmux_session}:{terminal.window_id}:{terminal.pane_id}"
+        if terminal is not None
+        else f"tmux:{row.session_name}:unknown:unknown"
+    )
+    route_digest = hashlib.sha256(
+        _canonical_json(
+            {
+                "model": receipt["model"],
+                "effort": receipt["effort"],
+                "agent_profile": row.agent_profile,
+            }
+        ).encode()
+    ).hexdigest()
+    created_at = _now()
+    # The worktree head is a fork-observable fact (read-only git);
+    # a worktree that cannot report its head fails the bind closed.
+    import subprocess
+
+    try:
+        head_proc = subprocess.run(
+            ["git", "-C", row.working_directory, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ManagedLaunchConflict(
+            f"worktree head is not readable for the binding: {exc}"
+        ) from exc
+    head = head_proc.stdout.strip()
+    if (
+        head_proc.returncode != 0
+        or len(head) != 40
+        or any(ch not in "0123456789abcdef" for ch in head)
+    ):
+        raise ManagedLaunchConflict(
+            "worktree head is not a full lowercase hex OID; the binding " "requires the exact head"
+        )
+    creation_payload = recovery_receipts.creation_payload(
+        provider=_PINNED_PROVIDER[row.provider],
+        native_id=receipt["provider_session_id"],
+        provider_version=receipt["provider_version"],
+        issuance_source=_ISSUANCE_SOURCES[row.provider],
+        obligation_generation=row.obligation_generation,
+        task_id=row.task_id,
+        run_id=row.run_id,
+        created_at=created_at,
+    )
+    binding_payload = recovery_receipts.binding_payload(
+        provider=_PINNED_PROVIDER[row.provider],
+        native_id=receipt["provider_session_id"],
+        launch_nonce_digest=row.launch_nonce_digest,
+        provider_process_identity=f"bridge:{reservation_id}",
+        tmux_incarnation=tmux_incarnation,
+        terminal_generation=row.generation,
+        worktree_realpath=row.working_directory,
+        repository=os.path.basename(row.working_directory),
+        head=head,
+        assigned_route_digest=route_digest,
+        bound_at=created_at,
+    )
+    token = heartbeat_store.issue_fencing_token(
+        COMPANION_DIR, row.terminal_id, row.generation, request.attempt_id
+    )
+    # The fork-side route fact: an unobserved route payload (PF-2 is
+    # red for every pinned provider — no provider-observed fields may
+    # be claimed).  The conductor binds the §6.3 segment chain from
+    # these facts; the heartbeat's route field binds this digest.
+    route_payload = recovery_receipts.route_payload(
+        provider=_PINNED_PROVIDER[row.provider],
+        native_id=receipt["provider_session_id"],
+        authority_status="unobserved",
+        assigned_model=receipt["model"],
+        assigned_effort=receipt["effort"],
+        assigned_policy_sha256=receipt.get("profile_sha256") or ("0" * 64),
+        assigned_profile_sha256=receipt.get("profile_sha256") or ("0" * 64),
+        assigned_config_sha256=receipt.get("protected_config_sha256") or ("0" * 64),
+        requested_model=receipt["model"],
+        requested_effort=receipt["effort"],
+        observed_model=None,
+        observed_effort=None,
+        protocol_version=None,
+        event_sequence=None,
+        native_turn_id=None,
+        attested_at=created_at,
+    )
+    route_payload_digest = recovery_receipts.payload_digest(route_payload)
+    binding_record = {
+        "schema": "cao-generation-binding-v1",
+        "reservation_id": reservation_id,
+        "terminal_id": row.terminal_id,
+        "generation": row.generation,
+        "attempt_id": request.attempt_id,
+        "launch_nonce_digest": row.launch_nonce_digest,
+        "fencing_token_id": token.id,
+        "provider": row.provider,
+        "native_session_id": receipt["provider_session_id"],
+        "assigned_policy_sha256": receipt.get("profile_sha256"),
+        "route_payload_sha256": route_payload_digest,
+        "bound_at": created_at,
+    }
+    binding = {
+        "schema": "cao-managed-v2-native-binding-v1",
+        "attempt_id": request.attempt_id,
+        "native_session_id": receipt["provider_session_id"],
+        "provider_version": receipt["provider_version"],
+        "issuance_source": _ISSUANCE_SOURCES[row.provider],
+        "creation_payload_sha256": recovery_receipts.payload_digest(creation_payload),
+        "binding_payload_sha256": recovery_receipts.payload_digest(binding_payload),
+        "fencing_token_id": token.id,
+        "fence_no": token.fence_no,
+        "assigned_route_digest": route_digest,
+        "bound_at": created_at,
+    }
+    import base64
+
+    return {
+        "schema": "cao-managed-v2-bind-intent-v1",
+        "attempt_id": request.attempt_id,
+        "fencing_token": token.as_dict(),
+        # The exact canonical payload bytes (base64 for JSON durability),
+        # not only their digests: a reconciled retry verifies the journaled
+        # bytes still digest to the journaled binding's payload digests.
+        "creation_payload_b64": base64.b64encode(creation_payload).decode("ascii"),
+        "binding_payload_b64": base64.b64encode(binding_payload).decode("ascii"),
+        "route_payload_b64": base64.b64encode(route_payload).decode("ascii"),
+        "binding_record": binding_record,
+        "binding": binding,
+    }
+
+
+def _reconcile_and_complete_bind(
+    db: Any, row: Any, reservation_id: str, intent: dict[str, Any]
+) -> None:
+    """Converge the journaled intent across the SQL/filesystem boundary.
+
+    The binding record may already exist (crash after publication,
+    before the SQL commit): it must match the journaled bytes exactly
+    and the journaled fencing token must still be the registered one;
+    then the row commits ``bound``.  Absent the record, it is published
+    now from the journaled bytes.
+    """
+    from cli_agent_orchestrator.services.destructive_endpoint import binding_record_path
+
+    record_path = binding_record_path(COMPANION_DIR, row.terminal_id, row.generation)
+    expected_record = intent["binding_record"]
+    if record_path.exists():
+        try:
+            existing = json.loads(record_path.read_bytes())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ManagedLaunchConflict(
+                f"existing binding record is unreadable; cannot reconcile: {exc}"
+            ) from exc
+        if existing != expected_record:
+            raise ManagedLaunchConflict(
+                "existing binding record does not match the journaled bind "
+                "intent; refusing to overwrite immutable publication"
+            )
+    registered = heartbeat_store.current_fencing_token(COMPANION_DIR, row.terminal_id)
+    if registered is None or registered.id != intent["fencing_token"]["id"]:
+        raise ManagedLaunchConflict(
+            "journaled fencing token is not the registered one; refusing to bind"
+        )
+    # The journaled canonical payload bytes must still digest to the
+    # journaled binding's payload digests (journal tamper check).
+    import base64
+
+    binding = intent["binding"]
+    for field, digest_key in (
+        ("creation_payload_b64", "creation_payload_sha256"),
+        ("binding_payload_b64", "binding_payload_sha256"),
+    ):
+        if recovery_receipts.payload_digest(base64.b64decode(intent[field])) != binding[digest_key]:
+            raise ManagedLaunchConflict(
+                "journaled bind payload bytes do not match the journaled "
+                "binding digests; refusing to reconcile"
+            )
+    if not record_path.exists():
+        write_binding_record(
+            COMPANION_DIR,
+            terminal_id=row.terminal_id,
+            generation=row.generation,
+            reservation_id=reservation_id,
+            attempt_id=intent["attempt_id"],
+            launch_nonce_digest=row.launch_nonce_digest,
+            fencing_token_id=intent["fencing_token"]["id"],
+            provider=row.provider,
+            native_session_id=expected_record["native_session_id"],
+            assigned_policy_sha256=expected_record["assigned_policy_sha256"],
+            route_payload_sha256=expected_record["route_payload_sha256"],
+            bound_at=expected_record["bound_at"],
+        )
+    row.binding_json = _canonical_json(intent["binding"])
+    row.state = "bound"
+    row.updated_at = _now()
+    db.commit()
+    db.refresh(row)
 
 
 def claim_admission(
@@ -560,9 +680,25 @@ def claim_admission(
                 return _row_dict(row), True
             existing = _parse_json(row.admission_json, None)
             if existing is not None:
-                if existing.get("delivery_id") != request.delivery_id:
+                # Replay binds the FULL admission identity: the same
+                # delivery id with a changed message, sender, context,
+                # orchestration type, or binding is a different immutable
+                # identity and is refused — never treated as a safe replay.
+                replay_identity = {
+                    "delivery_id": request.delivery_id,
+                    "message_sha256": request.message_sha256,
+                    "sender_id": request.sender_id,
+                    "orchestration_type": request.orchestration_type,
+                    "context": request.context.model_dump(mode="json"),
+                    "native_binding_digest": request.native_binding_digest,
+                }
+                mismatches = [
+                    key for key, value in replay_identity.items() if existing.get(key) != value
+                ]
+                if mismatches:
                     raise ManagedLaunchConflict(
-                        "reservation already carries a different task admission"
+                        "delivery_id is already bound to a different admission "
+                        f"identity: {sorted(mismatches)}"
                     )
                 return _row_dict(row), False
             raise ManagedLaunchConflict(f"task admission requires state 'bound', not {row.state!r}")
@@ -697,8 +833,12 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             "provider_executable": executable,
             "provider_executable_sha256": digest,
             # v2 identity fields: the bridge emits fenced heartbeats only
-            # when these are present (v1 requests never carry them).
-            "project": request.get("project", record["run_id"]),
+            # when these are present (v1 requests never carry them).  The
+            # immutable project identity persists from the reservation; it
+            # is never silently dropped (model_dump includes the key with
+            # a None value when unset, so a plain .get default would not
+            # fall back).
+            "project": request.get("project") or record["run_id"],
             "task_id": record["task_id"],
             "run_id": record["run_id"],
             "obligation_generation": record["obligation_generation"],
@@ -733,6 +873,10 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
                 "--reservation-id",
                 reservation_id,
             ],
+            # v2 terminals persist only to the isolated v2 surface; the
+            # shared terminals table (and every old cleanup/list path)
+            # never sees them.
+            protocol_vintage="v2",
         )
     except Exception as exc:  # noqa: BLE001 - preserve and expose, never cleanup/retry
         return _mark_preflight_blocked(reservation_id, str(exc))

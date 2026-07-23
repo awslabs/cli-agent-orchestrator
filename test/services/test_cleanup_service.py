@@ -225,3 +225,128 @@ class TestCleanupOldData:
 
         # Verify filter was called (terminals: .all() + .delete(), inbox: .delete())
         assert len(filter_calls) >= 2
+
+
+# ------------------------------------------- v2 vintage invisibility (MIG)
+
+
+class TestCleanupV2VintageInvisibility:
+    """MIG durable regression: old cleanup has zero visibility into v2 state.
+
+    A v2-shaped managed row in the shared terminals table (managed-* window
+    or a generation/id present in the v2 surface) is preserved by the
+    legacy retention cleanup — never deleted; ordinary old v1 rows are
+    still cleaned up exactly as before.
+    """
+
+    def _run_cleanup(self, tmp_path, session):
+        from cli_agent_orchestrator.services import cleanup_service
+
+        prior = (
+            cleanup_service.SessionLocal,
+            cleanup_service.fifo_manager,
+            cleanup_service.status_monitor,
+            cleanup_service.TERMINAL_LOG_DIR,
+            cleanup_service.LOG_DIR,
+        )
+        try:
+            cleanup_service.SessionLocal = session
+            cleanup_service.fifo_manager = type(
+                "NoopFifo", (), {"stop_reader": staticmethod(lambda _id: None)}
+            )()
+            cleanup_service.status_monitor = type(
+                "NoopMonitor", (), {"clear_terminal": staticmethod(lambda _id: None)}
+            )()
+            cleanup_service.TERMINAL_LOG_DIR = tmp_path / "terminal-logs"
+            cleanup_service.LOG_DIR = tmp_path / "logs"
+            cleanup_service.cleanup_old_data()
+        finally:
+            (
+                cleanup_service.SessionLocal,
+                cleanup_service.fifo_manager,
+                cleanup_service.status_monitor,
+                cleanup_service.TERMINAL_LOG_DIR,
+                cleanup_service.LOG_DIR,
+            ) = prior
+
+    def _engine(self, tmp_path):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database
+
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'metadata.db'}", connect_args={"check_same_thread": False}
+        )
+        database.Base.metadata.create_all(bind=engine)
+        return engine, sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    def test_v2_shaped_managed_row_survives_old_cleanup(self, tmp_path):
+        from cli_agent_orchestrator.clients import database
+
+        engine, session = self._engine(tmp_path)
+        old = datetime.now() - timedelta(days=999)
+        with session() as db:
+            db.add(
+                database.TerminalModel(
+                    id="0ldc1ean",
+                    tmux_session="v2-session",
+                    tmux_window="managed-v2-window",
+                    provider="codex",
+                    agent_profile="probe",
+                    generation="gen-v2",
+                    last_active=old,
+                )
+            )
+            db.add(
+                database.TerminalModel(
+                    id="p1ainv1",
+                    tmux_session="v1-session",
+                    tmux_window="plain-v1-window",
+                    provider="codex",
+                    agent_profile="probe",
+                    generation=None,
+                    last_active=old,
+                )
+            )
+            db.commit()
+        self._run_cleanup(tmp_path, session)
+        with session() as db:
+            assert db.query(database.TerminalModel).filter_by(id="0ldc1ean").first() is not None
+            assert db.query(database.TerminalModel).filter_by(id="p1ainv1").first() is None
+        engine.dispose()
+
+    def test_row_owned_by_v2_surface_survives_old_cleanup(self, tmp_path):
+        from cli_agent_orchestrator.clients import database
+
+        engine, session = self._engine(tmp_path)
+        old = datetime.now() - timedelta(days=999)
+        with session() as db:
+            db.add(
+                database.ManagedLaunchV2TerminalModel(
+                    id="v2owned1",
+                    tmux_session="v2-session",
+                    tmux_window="win",
+                    provider="codex",
+                    generation="gen-owned",
+                    protocol_vintage="v2",
+                )
+            )
+            # The same id also appears in the shared table (e.g. written by
+            # an older binary before the isolation landed): still preserved.
+            db.add(
+                database.TerminalModel(
+                    id="v2owned1",
+                    tmux_session="v2-session",
+                    tmux_window="win",
+                    provider="codex",
+                    agent_profile="probe",
+                    generation="gen-owned",
+                    last_active=old,
+                )
+            )
+            db.commit()
+        self._run_cleanup(tmp_path, session)
+        with session() as db:
+            assert db.query(database.TerminalModel).filter_by(id="v2owned1").first() is not None
+        engine.dispose()

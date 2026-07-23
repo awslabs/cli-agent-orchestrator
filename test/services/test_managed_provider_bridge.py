@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
+
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 
 
@@ -373,3 +375,217 @@ def test_bridge_environment_is_pruned_to_minimal_allowlist(monkeypatch):
     assert os.environ.get("CONDUCT_DEV_ALLOW_ABSENT_DEPLOY_RECEIPT") is None
     assert os.environ.get("HOME") == "/home/test"
     assert os.environ.get("PATH") == bridge._MINIMAL_PATH
+
+
+# -- P1 bridge wiring regressions (fence atomicity, heartbeat producer) ------
+
+
+def _v2_session(tmp_path, monkeypatch):
+    """A minimal v2-identified session over a patched companion dir."""
+    from cli_agent_orchestrator import constants
+
+    companion = tmp_path / "companion"
+    monkeypatch.setattr(constants, "COMPANION_DIR", companion)
+    request = _request(tmp_path)
+    request.update(
+        {
+            "project": "cao-conductor-self-heal",
+            "task_id": "self-heal-demo-task",
+            "run_id": "run-0001",
+            "obligation_generation": "obgen-7c2e4a1b",
+            "assigned_policy_sha256": "7" * 64,
+        }
+    )
+    session = bridge._ProviderSession.__new__(bridge._ProviderSession)
+    session.request = request
+    session.provider = request["provider"]
+    session.rpc = object()
+    session.provider_session_id = "thread_provider_opaque"
+    session.readiness = {"provider_version": "0.145.0"}
+    session._current_turn_id = None
+    session._heartbeat_producer = None
+    session.kimi_wire_path = None
+    session._companion_scan_index = 0
+    return session, companion, request
+
+
+def _bound_generation(companion, request):
+    from cli_agent_orchestrator.services import heartbeat_store as hb
+    from cli_agent_orchestrator.services.destructive_endpoint import write_binding_record
+
+    token = hb.issue_fencing_token(
+        companion, request["terminal_id"], request["generation"], "attempt-1"
+    )
+    write_binding_record(
+        companion,
+        terminal_id=request["terminal_id"],
+        generation=request["generation"],
+        reservation_id=request["reservation_id"],
+        attempt_id="attempt-1",
+        launch_nonce_digest="a" * 64,
+        fencing_token_id=token.id,
+        provider=request["provider"],
+        native_session_id="thread_provider_opaque",
+        assigned_policy_sha256=request["assigned_policy_sha256"],
+        route_payload_sha256="c" * 64,
+    )
+    return token
+
+
+def test_emit_beat_retains_producer_and_rehydrates_across_sessions(tmp_path, monkeypatch):
+    # HB-1 bridge-wiring durable regression: the bridge keeps ONE producer
+    # for its lifetime, and a reconstructed bridge (fresh session object)
+    # rehydrates the durable epoch/sequence instead of restarting at zero
+    # (the per-beat construction made every second beat a refused
+    # regression and silently killed liveness).
+    import json as _json
+
+    from cli_agent_orchestrator.services import heartbeat_store as hb
+
+    monkeypatch.setattr(hb, "COALESCE_SECONDS", 0)  # every beat writes
+    session, companion, request = _v2_session(tmp_path, monkeypatch)
+    _bound_generation(companion, request)
+    session._emit_beat("turn-1", "codex-turn-start:turn-1")
+    first_producer = session._heartbeat_producer
+    assert first_producer is not None
+    session._emit_beat("turn-2", "codex-turn-start:turn-2")
+    assert session._heartbeat_producer is first_producer  # retained, not rebuilt
+    record = _json.loads(
+        hb.heartbeat_path(companion, request["terminal_id"], request["generation"]).read_bytes()
+    )
+    assert record["seq"] == 2
+    # A reconstructed bridge (new session, fresh producer) continues the
+    # sequence — before the fix this beat regressed to seq 0/1 and was
+    # refused by the fencing compare step.
+    restarted, _, _ = _v2_session(tmp_path, monkeypatch)
+    restarted._emit_beat("turn-3", "codex-turn-start:turn-3")
+    record = _json.loads(
+        hb.heartbeat_path(companion, request["terminal_id"], request["generation"]).read_bytes()
+    )
+    assert record["seq"] == 3
+    assert record["epoch"] == 1
+
+
+def test_admission_holds_fence_lock_across_provider_io(tmp_path, monkeypatch):
+    # FENCE-1 bridge-wiring durable regression: the generation fence lock is
+    # held across the final fence recheck AND the provider/model/tool-entry
+    # I/O, so a fence installed concurrent with an admission cannot land
+    # between the check and the submission — it waits, and every later
+    # admission is refused.
+    import threading
+
+    from cli_agent_orchestrator import constants
+    from cli_agent_orchestrator.services import generation_fence as gf
+
+    session, companion, request = _v2_session(tmp_path, monkeypatch)
+    submitted: list = []
+
+    def fake_submit(message, **_kwargs):
+        submitted.append(message)
+        return "turn-race", "codex-turn-start", {"source": "test"}
+
+    session._submit_provider_turn = fake_submit
+    session._scan_companion_events = lambda: None
+    session._emit_beat = lambda *_args: None
+
+    rechecked = threading.Event()
+    finish_io = threading.Event()
+    real_check = gf.assert_admission_open
+
+    def check_then_pause(companion_dir, terminal_id, generation):
+        real_check(companion_dir, terminal_id, generation)
+        rechecked.set()
+        assert finish_io.wait(timeout=10)
+
+    monkeypatch.setattr(gf, "assert_admission_open", check_then_pause)
+    admission = _admission(request)
+    outcome: list = []
+
+    def admit():
+        try:
+            outcome.append(session.admit(admission))
+        except Exception as exc:  # noqa: BLE001 - the test records the outcome
+            outcome.append(exc)
+
+    worker = threading.Thread(target=admit)
+    worker.start()
+    assert rechecked.wait(timeout=10)
+    installed: list = []
+
+    def install():
+        installed.append(
+            gf.install_fence(
+                constants.COMPANION_DIR,
+                terminal_id=request["terminal_id"],
+                generation=request["generation"],
+                vintage="v2",
+                request={
+                    "schema": gf.FENCE_REQUEST_SCHEMA,
+                    "terminal_generation": request["generation"],
+                    "obligation_generation": request["obligation_generation"],
+                    "attempt_id": "attempt-1",
+                    "intent_id": "3d813cbb-47fb-42ba-91df-831e1593ac29",
+                    "report_sha256": "a" * 64,
+                },
+                fencing_token_id="token-1",
+            )
+        )
+
+    installer = threading.Thread(target=install)
+    installer.start()
+    installer.join(timeout=2)
+    # The fence cannot interleave with the in-flight admission's provider I/O.
+    assert installer.is_alive()
+    finish_io.set()
+    worker.join(timeout=10)
+    installer.join(timeout=10)
+    assert not worker.is_alive() and not installer.is_alive()
+    assert submitted == [admission["message"]]
+    assert outcome[0]["provider_turn_id"] == "turn-race"
+    assert installed[0]["outcome"] == gf.OUTCOME_FENCED
+    # Every admission after the fence is refused before any provider I/O.
+    monkeypatch.setattr(gf, "assert_admission_open", real_check)
+    import pytest
+
+    with pytest.raises(bridge.BridgeError, match="sealed"):
+        session.admit({**admission, "delivery_id": "44444444-4444-4444-8444-444444444444"})
+    assert submitted == [admission["message"]]
+
+
+def test_actor_broker_built_for_generation_private_uds(tmp_path, monkeypatch):
+    # ACTOR durable regression: the production broker construction exists —
+    # bound to the exact generation-private state dir and refusing once the
+    # fencing registry names a superseding generation.
+    from cli_agent_orchestrator.services import heartbeat_store as hb
+    from cli_agent_orchestrator.services.actor_broker import (
+        AssertionInvalid,
+        PeerCredentials,
+        platform_supported,
+    )
+
+    session, companion, request = _v2_session(tmp_path, monkeypatch)
+    session.rpc = None  # no live provider process in this unit test
+    _bound_generation(companion, request)
+    broker = bridge._build_actor_broker(request, session)
+    if not platform_supported():
+        assert broker is None  # unwired capability is never advertised
+        return
+    assert broker is not None
+    assert broker._dir == companion / request["terminal_id"] / request["generation"]
+    issue_kwargs = dict(
+        report_sha256="a" * 64,
+        report_path="/abs/report.md",
+        project="p",
+        task_id="t",
+        run_id="r",
+        obligation_generation="o",
+        attempt_id="attempt-1",
+        native_session_id="n",
+        launch_nonce_digest="b" * 64,
+        route_chain_head="c" * 64,
+        peer=PeerCredentials(pid=999999, uid=501),
+    )
+    # After supersession the broker's generation gate closes first.
+    hb.issue_fencing_token(companion, request["terminal_id"], "gen-superseding", "attempt-2")
+    with pytest.raises(AssertionInvalid, match="superseded"):
+        broker.issue(None, **issue_kwargs)

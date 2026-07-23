@@ -62,8 +62,59 @@ def test_absent_meta_refused(tmp_path):
     )
     conn.commit()
     conn.close()
+    # An existing non-registry DB is never treated as empty-and-new.
+    with pytest.raises(RegistryError, match="missing required tables"):
+        ResourceRegistry(path)
+
+
+def test_existing_registry_with_absent_meta_rows_refused(tmp_path, registry):
+    path = tmp_path / "recovery" / "resource-registry-fork.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute("DELETE FROM registry_meta")
+    conn.commit()
+    conn.close()
     with pytest.raises(RegistryError, match="meta"):
         ResourceRegistry(path)
+
+
+def test_reopen_existing_registry_is_validated_not_created(tmp_path):
+    # REG-1 durable regression: a second ResourceRegistry over a valid
+    # existing DB reopens it (validated open) — the literal CREATE script
+    # never re-runs against a live registry, and the contents survive.
+    path = tmp_path / "recovery" / "registry.sqlite"
+    first = ResourceRegistry(path)
+    _declare(first, "e-reopen")
+    reopened = ResourceRegistry(path)
+    assert reopened.resolve("e-reopen")["lifecycle_state"] == "declared"
+    # Concurrent reopen keeps working (the open is race-tolerant).
+    third = ResourceRegistry(path)
+    assert third.resolve("e-reopen")["entry_id"] == "e-reopen"
+
+
+def test_open_migrates_no_replace_guard_atomically(tmp_path):
+    # A registry created before the no-REPLACE guard gains it on open, in
+    # one transaction — the guard never depends on a per-connection pragma.
+    path = tmp_path / "recovery" / "registry.sqlite"
+    registry = ResourceRegistry(path)
+    conn = sqlite3.connect(str(path))
+    conn.execute("DROP TRIGGER IF EXISTS resource_no_replace")
+    conn.commit()
+    conn.close()
+    reopened = ResourceRegistry(path)
+    _declare(reopened, "e-guard")
+    raw = sqlite3.connect(str(path))  # fresh connection, no pragmas
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            raw.execute(
+                "INSERT OR REPLACE INTO resource(entry_id, kind, protocol_vintage, "
+                "terminal_id, generation, owner, ownership, constructor_id, "
+                "deleter_id, lifecycle_state, state_seq, rollback_rule, "
+                "desired_fs_path) VALUES ('e-guard','socket','v2','a1b2c3d4',"
+                "'gen-000042','fork','owned','x','x','active',1,"
+                "'generation-isolated','/tmp/e-guard')"
+            )
+    finally:
+        raw.close()
 
 
 def test_declared_before_physical_and_journal_first(registry):
@@ -120,9 +171,24 @@ def test_illegal_transitions_refused(registry):
     with pytest.raises(RegistryTransitionRefused):
         registry.activate(entry_id, actor_id="test", existence_receipt_digest="1" * 64)
     with pytest.raises(RegistryTransitionRefused):
-        registry.delete(entry_id, actor_id="test")
+        registry.delete(entry_id, actor_id="test", verified_absence_digest="1" * 64)
     with pytest.raises(RegistryNotFound):
         registry.resolve("e-missing")
+
+
+def test_delete_requires_verified_absence_receipt(registry):
+    # REG-3 durable regression (owned side): an owned resource is marked
+    # deleted only against a verified-absence receipt — never on a bare call.
+    entry_id = "e-delreceipt"
+    _declare(registry, entry_id)
+    registry.register_created(entry_id, actor_id="t", existence_receipt_digest="1" * 64)
+    registry.drain(entry_id, actor_id="t")
+    registry.close(entry_id, actor_id="t")
+    with pytest.raises(RegistryError, match="verified-absence"):
+        registry.delete(entry_id, actor_id="t", verified_absence_digest="short")
+    deleted = registry.delete(entry_id, actor_id="t", verified_absence_digest="3" * 64)
+    assert deleted["lifecycle_state"] == "deleted"
+    assert deleted["events"][-1]["evidence_digest"] == "3" * 64
 
 
 def test_activation_requires_active_dependencies(registry):
@@ -172,7 +238,7 @@ def test_terminal_rows_immutable_and_never_deleted(registry):
     registry.register_created(entry_id, actor_id="t", existence_receipt_digest="1" * 64)
     registry.drain(entry_id, actor_id="t")
     registry.close(entry_id, actor_id="t")
-    registry.delete(entry_id, actor_id="t")
+    registry.delete(entry_id, actor_id="t", verified_absence_digest="2" * 64)
     conn = registry._connect()
     try:
         with pytest.raises(sqlite3.IntegrityError):
@@ -204,15 +270,39 @@ def test_discover_records_observed_identity_after_crash_window(registry):
         finder=lambda entry: (
             {"observed_tmux_id": "@42"} if entry_id in entry["desired_tmux_name"] else None
         ),
+        existence_receipt_digest="7" * 64,
     )
     assert found["lifecycle_state"] == "created"
     assert found["observed_tmux_id"] == "@42"
+    # REG-2 durable regression: discovery promotes to `created` ONLY
+    # against a verified existence receipt, journaled as the evidence.
+    assert found["events"][-1]["evidence_digest"] == "7" * 64
+
+
+def test_discover_requires_existence_receipt(registry):
+    # REG-2: discovery never silently manufactures `created` — a found
+    # resource without a verified existence receipt is refused.
+    entry_id = "e-noreceipt"
+    _declare(registry, entry_id, kind="tmux_window", desired_tmux_name=f"managed-{entry_id}")
+    with pytest.raises(RegistryError, match="existence receipt"):
+        registry.discover(
+            entry_id,
+            actor_id="reconciler",
+            finder=lambda entry: {"observed_tmux_id": "@42"},
+            existence_receipt_digest="short",
+        )
+    assert registry.resolve(entry_id)["lifecycle_state"] == "declared"
 
 
 def test_discover_no_trace_leaves_declared(registry):
     entry_id = "e-notrace"
     _declare(registry, entry_id)
-    entry = registry.discover(entry_id, actor_id="reconciler", finder=lambda e: None)
+    entry = registry.discover(
+        entry_id,
+        actor_id="reconciler",
+        finder=lambda e: None,
+        existence_receipt_digest="7" * 64,
+    )
     assert entry["lifecycle_state"] == "declared"
 
 
@@ -228,7 +318,7 @@ def test_live_identity_uniqueness_and_terminal_freeing(registry):
     registry.register_created("e-one", actor_id="t", existence_receipt_digest="1" * 64)
     registry.drain("e-one", actor_id="t")
     registry.close("e-one", actor_id="t")
-    registry.delete("e-one", actor_id="t")
+    registry.delete("e-one", actor_id="t", verified_absence_digest="2" * 64)
     _declare(registry, "e-two", desired_fs_path=shared_path)
 
 
@@ -300,3 +390,55 @@ def test_enumerate_filters(registry):
     assert len(registry.enumerate(generation="gen-A")) == 1
     assert len(registry.enumerate(terminal_id="a1b2c3d4")) == 2
     assert registry.enumerate(generation="gen-A")[0]["entry_id"] == "e-f1"
+
+
+def test_external_shared_entries_are_monitor_only(registry):
+    # REG-3 durable regression: external/shared resources are monitor-only.
+    # The registry never creates, activates, drains, closes, or deletes
+    # them; abandoning the monitor declaration (aborted, on a verified
+    # absence receipt) is the only lawful transition.
+    entry_id = "e-ext-only"
+    _declare(
+        registry,
+        entry_id,
+        ownership="external",
+        kind="tmux_server_state",
+        desired_tmux_name="cao-shared-server",
+        monitor_id="watchdog-1",
+    )
+    with pytest.raises(RegistryTransitionRefused, match="monitor-only"):
+        registry.register_created(entry_id, actor_id="t", existence_receipt_digest="1" * 64)
+    # The remaining lifecycle verbs are refused as well (declared -> x is
+    # itself illegal for monitor-only entries; they can never advance).
+    for verb in (
+        lambda: registry.activate(entry_id, actor_id="t", existence_receipt_digest="1" * 64),
+        lambda: registry.drain(entry_id, actor_id="t"),
+        lambda: registry.close(entry_id, actor_id="t"),
+        lambda: registry.delete(entry_id, actor_id="t", verified_absence_digest="2" * 64),
+    ):
+        with pytest.raises(RegistryTransitionRefused):
+            verb()
+    assert registry.resolve(entry_id)["lifecycle_state"] == "declared"
+    aborted = registry.abort(entry_id, actor_id="t", verified_absence_digest="2" * 64)
+    assert aborted["lifecycle_state"] == "aborted"
+
+
+def test_verify_runtime_wiring_reports_unwired_kinds(registry):
+    # Every resource class the runtime constructs/looks up/monitors/deletes
+    # for a generation must be registered before exposure; the verifier
+    # names exactly the unwired classes.
+    from cli_agent_orchestrator.services.resource_registry import (
+        RUNTIME_RESOURCE_MANIFEST,
+        verify_runtime_wiring,
+    )
+
+    missing = verify_runtime_wiring(registry, terminal_id="a1b2c3d4", generation="gen-000042")
+    assert missing == [item["kind"] for item in RUNTIME_RESOURCE_MANIFEST]
+    _declare(registry, "e-fifo", kind="fifo", generation="gen-000042")
+    assert verify_runtime_wiring(registry, terminal_id="a1b2c3d4", generation="gen-000042") == [
+        item["kind"] for item in RUNTIME_RESOURCE_MANIFEST if item["kind"] != "fifo"
+    ]
+    for index, item in enumerate(RUNTIME_RESOURCE_MANIFEST):
+        if item["kind"] != "fifo":
+            _declare(registry, f"e-{item['kind']}", kind=item["kind"], generation="gen-000042")
+    assert verify_runtime_wiring(registry, terminal_id="a1b2c3d4", generation="gen-000042") == []

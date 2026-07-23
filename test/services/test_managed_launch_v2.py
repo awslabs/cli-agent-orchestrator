@@ -331,3 +331,140 @@ def test_attempt_resume_refused_45_while_containment_red(
     v2.bind_native(record["reservation_id"], _bind_request(record))
     with pytest.raises(ManagedLaunchConflict, match="45"):
         v2.attempt_resume(record["reservation_id"], containment_proven=False)
+
+
+def test_project_persists_to_bridge_handoff(isolated_memory_db, worktree, tmp_path, monkeypatch):
+    # ADM-1 durable regression: the immutable project identity survives the
+    # reserve wire model, persists on the reservation, reaches the bridge
+    # request verbatim (never silently substituted), and the v2 launch
+    # persists only to the isolated v2 vintage surface.
+    import asyncio
+
+    from cli_agent_orchestrator.services import managed_provider_bridge as bridge
+    from cli_agent_orchestrator.services import terminal_service
+
+    request = _reserve_request(worktree, tmp_path, project="actual-project-which-must-bind")
+    record, _ = v2.reserve(request)
+    assert record["request"]["project"] == "actual-project-which-must-bind"
+    captured: dict = {}
+    monkeypatch.setattr(
+        bridge, "write_request", lambda _rid, req: captured.update(req), raising=False
+    )
+    # Keep the test hermetic: the profile digest otherwise reads agent
+    # profiles from the developer's real HOME.
+    monkeypatch.setattr(bridge, "profile_digest", lambda _profile: "a" * 64, raising=False)
+    create_calls: dict = {}
+
+    async def fake_create(**kwargs):
+        create_calls.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(terminal_service, "create_terminal", fake_create)
+    monkeypatch.setattr(
+        bridge,
+        "request_bridge",
+        lambda _rid, _cmd, timeout=120.0: {"state": "ready", "readiness": {"ok": True}},
+        raising=False,
+    )
+    asyncio.run(v2.launch_reserved(record["reservation_id"]))
+    assert captured["project"] == "actual-project-which-must-bind"
+    assert create_calls["protocol_vintage"] == "v2"
+
+
+def test_admission_replay_binds_full_identity(isolated_memory_db, worktree, tmp_path, monkeypatch):
+    # ADM-2 durable regression: the same delivery id carrying a changed
+    # message, sender, context, or binding is a DIFFERENT immutable
+    # identity and is refused — only the byte-identical replay dedupes.
+    request = _reserve_request(worktree, tmp_path)
+    record, _ = v2.reserve(request)
+    v2.claim_launch(record["reservation_id"])
+    _ready_bridge_state(record, monkeypatch)
+    bound = v2.bind_native(record["reservation_id"], _bind_request(record))
+    digest = v2.native_binding_digest(bound)
+    admit = _admit_request(bound, digest)
+    _, should_send = v2.claim_admission(record["reservation_id"], admit)
+    assert should_send
+    replayed, send_again = v2.claim_admission(record["reservation_id"], admit)
+    assert not send_again
+    changed_message = "a different task under the same delivery id"
+    changed_context = admit.context.model_dump(mode="json")
+    changed_context["project"] = "someone-elses-project"
+    for changes in (
+        {
+            "message": changed_message,
+            "message_sha256": hashlib.sha256(changed_message.encode()).hexdigest(),
+        },
+        {"sender_id": "0badf00d"},
+        {"context": changed_context},
+        {"native_binding_digest": "0" * 64},
+    ):
+        with pytest.raises(ManagedLaunchConflict):
+            v2.claim_admission(
+                record["reservation_id"],
+                _admit_request(bound, digest, delivery_id=admit.delivery_id, **changes),
+            )
+
+
+def test_bind_crash_reconciles_to_bound(isolated_memory_db, worktree, tmp_path, monkeypatch):
+    # ADM-3 durable regression: a crash after the immutable binding
+    # publication but before the SQL commit no longer strands the row
+    # `launching` — the journaled bind intent lets the retry adopt the
+    # already-published record (byte-identical) and converge to `bound`.
+    request = _reserve_request(worktree, tmp_path)
+    record, _ = v2.reserve(request)
+    v2.claim_launch(record["reservation_id"])
+    _ready_bridge_state(record, monkeypatch)
+    bind_request = _bind_request(record)
+    real_write = v2.write_binding_record
+
+    def write_then_crash(*args, **kwargs):
+        path = real_write(*args, **kwargs)
+        raise RuntimeError("simulated process death after binding publication")
+
+    monkeypatch.setattr(v2, "write_binding_record", write_then_crash)
+    with pytest.raises(v2.ManagedLaunchUnavailable):
+        v2.bind_native(record["reservation_id"], bind_request)
+    stranded = v2.get(record["reservation_id"])
+    assert stranded["state"] == "launching"
+    assert stranded["bind_intent"] is not None  # the recoverable boundary held
+    monkeypatch.setattr(v2, "write_binding_record", real_write)
+    converged = v2.bind_native(record["reservation_id"], bind_request)
+    assert converged["state"] == "bound"
+    assert converged["binding"]["attempt_id"] == bind_request.attempt_id
+    # Byte-identical idempotence: a third bind returns the same binding.
+    again = v2.bind_native(record["reservation_id"], bind_request)
+    assert again["binding"] == converged["binding"]
+
+
+def test_bind_reconcile_refuses_mismatched_publication(
+    isolated_memory_db, worktree, tmp_path, monkeypatch
+):
+    # The other side of ADM-3: an existing binding record that does NOT
+    # match the journaled intent is a conflict, never a silent overwrite
+    # of the immutable publication.
+    import json as _json
+
+    from cli_agent_orchestrator.services.destructive_endpoint import binding_record_path
+
+    request = _reserve_request(worktree, tmp_path)
+    record, _ = v2.reserve(request)
+    v2.claim_launch(record["reservation_id"])
+    _ready_bridge_state(record, monkeypatch)
+    bind_request = _bind_request(record)
+    real_write = v2.write_binding_record
+
+    def write_then_crash(*args, **kwargs):
+        path = real_write(*args, **kwargs)
+        raise RuntimeError("simulated process death after binding publication")
+
+    monkeypatch.setattr(v2, "write_binding_record", write_then_crash)
+    with pytest.raises(v2.ManagedLaunchUnavailable):
+        v2.bind_native(record["reservation_id"], bind_request)
+    monkeypatch.setattr(v2, "write_binding_record", real_write)
+    path = binding_record_path(v2.COMPANION_DIR, record["terminal_id"], record["generation"])
+    corrupted = _json.loads(path.read_bytes())
+    corrupted["native_session_id"] = "forged-session"
+    path.write_text(_json.dumps(corrupted, sort_keys=True) + "\n")
+    with pytest.raises(ManagedLaunchConflict, match="does not match the journaled"):
+        v2.bind_native(record["reservation_id"], bind_request)
+    assert v2.get(record["reservation_id"])["state"] == "launching"

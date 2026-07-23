@@ -34,7 +34,7 @@ import json
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, TypeVar
 
@@ -49,6 +49,12 @@ T = TypeVar("T")
 
 INTENT_STATE_SCHEMA = "cao-destructive-intent-v1"
 BINDING_RECORD_SCHEMA = "cao-generation-binding-v1"
+DUAL_EXIT_PROOF_SCHEMA = "cao-dual-exit-proof-v1"
+
+# Server-side effect classification: whether an effect kind requires the
+# proven containment composition is derived from the fork's own effect
+# table — NEVER from a caller-supplied request bit.
+CONTAINMENT_REQUIRED_KINDS = frozenset({"terminal-teardown"})
 
 
 class DestructiveError(RuntimeError):
@@ -70,7 +76,6 @@ class DestructiveIntent:
     reservation_id: str
     attempt_id: str
     fencing_token_id: str
-    requires_containment: bool = True
 
 
 @contextmanager
@@ -93,6 +98,58 @@ def binding_record_path(companion_dir: Path, terminal_id: str, generation: str) 
     return Path(companion_dir) / terminal_id / generation / "binding.json"
 
 
+def dual_exit_proof_path(companion_dir: Path, terminal_id: str, generation: str) -> Path:
+    return Path(companion_dir) / terminal_id / generation / "dual-exit.json"
+
+
+def write_dual_exit_proof(
+    companion_dir: Path,
+    *,
+    terminal_id: str,
+    generation: str,
+    reservation_id: str,
+    attempt_id: str,
+    fencing_token_id: str,
+    provider_exit: dict[str, Any],
+    bridge_exit: dict[str, Any],
+) -> Path:
+    """Publish the durable dual-exit proof for a dead generation (P-IMM-style).
+
+    The proof asserts that BOTH the provider process and the bridge
+    exited (the two halves that could still be heartbeating), bound to
+    the exact generation identity and fencing token.  It is the only
+    evidence under which the destructive endpoint may act on a heartbeat
+    reading that is missing, stale, skewed, malformed, or mismatched.
+    Written once; a second write for the same generation is refused.
+    """
+    if not provider_exit or not bridge_exit:
+        raise DestructiveError("a dual-exit proof requires both exit observations")
+    path = dual_exit_proof_path(companion_dir, terminal_id, generation)
+    if path.exists():
+        raise DestructiveError(f"dual-exit proof already exists: {path}")
+    record = {
+        "schema": DUAL_EXIT_PROOF_SCHEMA,
+        "terminal_id": terminal_id,
+        "generation": generation,
+        "reservation_id": reservation_id,
+        "attempt_id": attempt_id,
+        "fencing_token_id": fencing_token_id,
+        "provider_exit": provider_exit,
+        "bridge_exit": bridge_exit,
+        "recorded_at": _rfc3339_now(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        publish_mutable(
+            path,
+            json.dumps(record, sort_keys=True).encode() + b"\n",
+            expected_old_sha256=ABSENT,
+        )
+    except PublicationError as exc:
+        raise DestructiveError(str(exc)) from exc
+    return path
+
+
 def write_binding_record(
     companion_dir: Path,
     *,
@@ -106,11 +163,14 @@ def write_binding_record(
     native_session_id: str,
     assigned_policy_sha256: Optional[str] = None,
     route_payload_sha256: Optional[str] = None,
+    bound_at: Optional[str] = None,
 ) -> Path:
     """Publish the fork-owned immutable binding record for a generation.
 
     Written once at bind time (P-IMM-style: the record is immutable; a
     resume writes a new generation's record, never rewrites this one).
+    ``bound_at`` is supplied by the journaled bind intent so a reconciled
+    retry reproduces byte-identical record content.
     """
     path = binding_record_path(companion_dir, terminal_id, generation)
     if path.exists():
@@ -127,7 +187,7 @@ def write_binding_record(
         "native_session_id": native_session_id,
         "assigned_policy_sha256": assigned_policy_sha256,
         "route_payload_sha256": route_payload_sha256,
-        "bound_at": _rfc3339_now(),
+        "bound_at": bound_at or _rfc3339_now(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -163,10 +223,16 @@ class DestructiveEndpoint:
         *,
         companion_dir: Path,
         containment_proven: Callable[[], bool] = lambda: False,
+        containment_required: Optional[Callable[[str], bool]] = None,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._dir = Path(companion_dir)
         self._containment_proven = containment_proven
+        # Effect classification is server-side: the caller's request can
+        # never downgrade a containment-requiring effect class.
+        self._containment_required = containment_required or (
+            lambda kind: kind in CONTAINMENT_REQUIRED_KINDS
+        )
         self._clock = clock
 
     def _intents_path(self, terminal_id: str, generation: str) -> Path:
@@ -211,54 +277,91 @@ class DestructiveEndpoint:
         if mismatches:
             raise DestructiveRefused(f"destructive binding mismatch: {sorted(mismatches)}")
 
-    def _check_heartbeat(self, intent: DestructiveIntent) -> None:
-        """Refuse when the generation may still be alive.
+    def _verify_dual_exit(self, intent: DestructiveIntent) -> None:
+        """Require the durable, server-verified dual-exit proof.
 
-        ACTIVE, wrong-identity, malformed, and fencing-refused readings
-        are all treated as possibly-alive and refuse; only readings that
-        carry no evidence of life (missing, stale, regressed, skew) allow
-        the caller's own dual proof to govern.
+        The proof must exist, carry the exact generation identity, and
+        bind the same fencing token as the fork-owned binding record.
+        Anything less fails closed.
         """
-        path = heartbeat_store.heartbeat_path(self._dir, intent.terminal_id, intent.generation)
-        try:
-            record = heartbeat_store._read_json(path)  # noqa: SLF001 - same package seam
-        except heartbeat_store.HeartbeatSchemaError as exc:
-            raise DestructiveRefused(f"heartbeat record malformed: {exc}") from exc
-        if record is None:
-            return  # no evidence of life
-        try:
-            heartbeat_store.validate_schema(record)
-        except heartbeat_store.HeartbeatSchemaError as exc:
-            raise DestructiveRefused(f"heartbeat record malformed: {exc}") from exc
+        record = _read_json(dual_exit_proof_path(self._dir, intent.terminal_id, intent.generation))
+        if record is None or record.get("schema") != DUAL_EXIT_PROOF_SCHEMA:
+            raise DestructiveRefused(
+                "no durable dual-exit proof for this generation; a missing, "
+                "stale, skewed, malformed, or mismatched heartbeat fails closed"
+            )
         binding = (
             _read_json(binding_record_path(self._dir, intent.terminal_id, intent.generation)) or {}
         )
-        if (
-            record.get("reservation_id") != intent.reservation_id
-            or record.get("terminal_id") != intent.terminal_id
-            or record.get("generation") != intent.generation
-            or record.get("attempt_id") != intent.attempt_id
+        expected = {
+            "terminal_id": intent.terminal_id,
+            "generation": intent.generation,
+            "reservation_id": intent.reservation_id,
+            "attempt_id": intent.attempt_id,
+            "fencing_token_id": binding.get("fencing_token_id"),
+        }
+        mismatches = [key for key, value in expected.items() if record.get(key) != value]
+        if mismatches:
+            raise DestructiveRefused(f"dual-exit proof identity mismatch: {sorted(mismatches)}")
+        if not isinstance(record.get("provider_exit"), dict) or not isinstance(
+            record.get("bridge_exit"), dict
         ):
-            raise DestructiveRefused("heartbeat record carries a wrong identity")
-        registered = heartbeat_store.current_fencing_token(self._dir, intent.terminal_id)
-        token = record.get("fencing_token") or {}
-        if registered is None or registered.id != token.get("id"):
-            raise DestructiveRefused("heartbeat fencing token is not the registered one")
-        expires = heartbeat_store._parse_time(record["lease_expires_at"])  # noqa: SLF001
-        observed = heartbeat_store._parse_time(record["observed_at"])  # noqa: SLF001
-        now = self._clock()
-        capped = observed.timestamp() + min(
-            int(record["lease_ttl_s"]), heartbeat_store.MAX_LEASE_TTL_S
-        )
-        from datetime import timedelta
+            raise DestructiveRefused("dual-exit proof is incomplete (needs both exits)")
 
-        if now < min(expires, datetime.fromtimestamp(capped, tz=timezone.utc)) and now >= (
-            observed - timedelta(seconds=heartbeat_store.SKEW_TOLERANCE_SECONDS)
-        ):
-            raise DestructiveRefused(
-                "generation heartbeat reads ACTIVE; a missing callback never "
-                "deletes an actively heartbeating generation"
+    def _check_heartbeat(self, intent: DestructiveIntent) -> None:
+        """Fail closed on every heartbeat reading that is not provably dead.
+
+        An ACTIVE reading always refuses with zero mutation — a missing
+        callback never deletes an actively heartbeating generation.  Every
+        other reading (missing, stale, regressed, skewed, malformed,
+        wrong-identity, fencing-mismatch) is untrustworthy rather than
+        dead: the effect may proceed only against a durable, complete,
+        server-verified dual-exit proof.
+        """
+        path = heartbeat_store.heartbeat_path(self._dir, intent.terminal_id, intent.generation)
+        record: Optional[dict[str, Any]] = None
+        malformed: Optional[str] = None
+        try:
+            record = heartbeat_store._read_json(path)  # noqa: SLF001 - same package seam
+            if record is not None:
+                heartbeat_store.validate_schema(record)
+        except heartbeat_store.HeartbeatSchemaError as exc:
+            malformed = str(exc)
+        if malformed is None and record is not None:
+            if (
+                record.get("reservation_id") != intent.reservation_id
+                or record.get("terminal_id") != intent.terminal_id
+                or record.get("generation") != intent.generation
+                or record.get("attempt_id") != intent.attempt_id
+            ):
+                # Wrong identity is not death; require the dual-exit proof.
+                self._verify_dual_exit(intent)
+                return
+            registered = heartbeat_store.current_fencing_token(self._dir, intent.terminal_id)
+            token = record.get("fencing_token") or {}
+            if registered is None or registered.id != token.get("id"):
+                self._verify_dual_exit(intent)
+                return
+            expires = heartbeat_store._parse_time(record["lease_expires_at"])  # noqa: SLF001
+            observed = heartbeat_store._parse_time(record["observed_at"])  # noqa: SLF001
+            now = self._clock()
+            if observed > now + timedelta(seconds=heartbeat_store.SKEW_TOLERANCE_SECONDS):
+                # A future-dated record is untrustworthy, never permission.
+                self._verify_dual_exit(intent)
+                return
+            capped = observed.timestamp() + min(
+                int(record["lease_ttl_s"]), heartbeat_store.MAX_LEASE_TTL_S
             )
+            if now < min(expires, datetime.fromtimestamp(capped, tz=timezone.utc)):
+                raise DestructiveRefused(
+                    "generation heartbeat reads ACTIVE; a missing callback never "
+                    "deletes an actively heartbeating generation"
+                )
+            # Stale/expired lease: not proof of death on its own.
+            self._verify_dual_exit(intent)
+            return
+        # Missing or malformed record: fail closed absent the dual-exit proof.
+        self._verify_dual_exit(intent)
 
     def execute(
         self,
@@ -267,50 +370,67 @@ class DestructiveEndpoint:
     ) -> dict[str, Any]:
         """Verify, consume, and run one destructive effect under lock 4.
 
-        Returns the endpoint receipt.  Re-issuing the *same* intent id
-        after a crash re-drives a pending effect (effects must be
-        idempotent) or returns the stored receipt; a *distinct* intent id
-        is a new single-use token.
+        The final generation/fence critical section (the fence lock, then
+        the heartbeat lock, then the destructive-intent lock, in that
+        fixed order) is held through the effect itself, so no concurrent
+        beat or fence install can land between the last verification and
+        the external effect.  Returns the endpoint receipt.  Re-issuing
+        the *same* intent id after a crash re-drives a pending effect
+        (effects must be idempotent) or returns the stored receipt; a
+        *distinct* intent id is a new single-use token.
         """
+        from cli_agent_orchestrator.services import generation_fence
+
         directory = self._dir / intent.terminal_id / intent.generation
-        with _generation_lock(directory):
-            if intent.requires_containment and not self._containment_proven():
-                raise DestructiveRefused(
-                    "effect class requires the containment composition, which is "
-                    "unproven; the path stays preserved/alert-only"
-                )
-            self._verify_binding(intent)
-            self._check_heartbeat(intent)
-            path = self._intents_path(intent.terminal_id, intent.generation)
-            store = self._load_intents(path)
-            entry = store["intents"].get(intent.intent_id)
-            if entry is not None and entry.get("state") == "effect-completed":
-                receipt: dict[str, Any] = entry["receipt"]
-                return receipt  # idempotent re-issue
-            if entry is None:
-                store["intents"][intent.intent_id] = {
-                    "state": "effect-pending",
-                    "kind": intent.kind,
-                    "consumed_at": _rfc3339_now(),
-                }
-                self._save_intents(path, store)  # single-use consumed pre-effect
-            result = effect()
-            receipt = {
-                "schema": "cao-destructive-receipt-v1",
-                "intent_id": intent.intent_id,
-                "kind": intent.kind,
-                "terminal_id": intent.terminal_id,
-                "generation": intent.generation,
-                "outcome": "completed",
-                "result": result if isinstance(result, (str, int, bool, type(None))) else None,
-                "completed_at": _rfc3339_now(),
-            }
-            store = self._load_intents(path)
+        with generation_fence._generation_lock(directory):  # noqa: SLF001 - shared lock 4
+            with heartbeat_store._generation_lock(  # noqa: SLF001 - shared lock 4
+                self._dir, intent.terminal_id, intent.generation
+            ):
+                with _generation_lock(directory):
+                    return self._execute_locked(intent, effect)
+
+    def _execute_locked(
+        self,
+        intent: DestructiveIntent,
+        effect: Callable[[], T],
+    ) -> dict[str, Any]:
+        if self._containment_required(intent.kind) and not self._containment_proven():
+            raise DestructiveRefused(
+                "effect class requires the containment composition, which is "
+                "unproven; the path stays preserved/alert-only"
+            )
+        self._verify_binding(intent)
+        self._check_heartbeat(intent)
+        path = self._intents_path(intent.terminal_id, intent.generation)
+        store = self._load_intents(path)
+        entry = store["intents"].get(intent.intent_id)
+        if entry is not None and entry.get("state") == "effect-completed":
+            receipt: dict[str, Any] = entry["receipt"]
+            return receipt  # idempotent re-issue
+        if entry is None:
             store["intents"][intent.intent_id] = {
-                "state": "effect-completed",
+                "state": "effect-pending",
                 "kind": intent.kind,
-                "consumed_at": store["intents"][intent.intent_id]["consumed_at"],
-                "receipt": receipt,
+                "consumed_at": _rfc3339_now(),
             }
-            self._save_intents(path, store)
-            return receipt
+            self._save_intents(path, store)  # single-use consumed pre-effect
+        result = effect()
+        receipt = {
+            "schema": "cao-destructive-receipt-v1",
+            "intent_id": intent.intent_id,
+            "kind": intent.kind,
+            "terminal_id": intent.terminal_id,
+            "generation": intent.generation,
+            "outcome": "completed",
+            "result": result if isinstance(result, (str, int, bool, type(None))) else None,
+            "completed_at": _rfc3339_now(),
+        }
+        store = self._load_intents(path)
+        store["intents"][intent.intent_id] = {
+            "state": "effect-completed",
+            "kind": intent.kind,
+            "consumed_at": store["intents"][intent.intent_id]["consumed_at"],
+            "receipt": receipt,
+        }
+        self._save_intents(path, store)
+        return receipt

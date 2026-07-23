@@ -25,19 +25,24 @@ import threading
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import create_terminal_v2 as db_create_terminal_v2
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     delete_terminal_if_generation as db_delete_terminal_if_generation,
 )
 from cli_agent_orchestrator.clients.database import (
+    delete_terminal_v2_if_generation as db_delete_terminal_v2_if_generation,
+)
+from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
+    get_terminal_metadata_v2,
     update_last_active,
     update_terminal_shell_command,
 )
@@ -192,6 +197,122 @@ SOFT_ENFORCEMENT_PROVIDERS = {
 }
 
 
+def _register_v2_terminal_resources(terminal_id: str, generation: str, window_name: str) -> None:
+    """Journal-first registration of a v2 generation's runtime resources.
+
+    The code-owned resource registry is the authority for the v2/managed
+    lifecycle: every resource the runtime constructs for a v2 generation
+    is declared and receipt-marked here, before the generation is
+    exposed.  Legacy v1 surfaces predate the registry and stay outside
+    its authority boundary.
+    """
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    registry = rr.get_resource_registry()
+    resources: list[tuple[str, str, dict[str, Any]]] = [
+        ("fifo", f"{terminal_id}.fifo", {"desired_fs_path": str(FIFO_DIR / f"{terminal_id}.fifo")}),
+        (
+            "log",
+            f"{terminal_id}.log",
+            {"desired_fs_path": str(TERMINAL_LOG_DIR / f"{terminal_id}.log")},
+        ),
+        (
+            "scrollback",
+            f"{terminal_id}.scrollback",
+            {"desired_fs_path": str(TERMINAL_LOG_DIR / f"{terminal_id}.scrollback")},
+        ),
+        (
+            "snapshot",
+            f"{terminal_id}.snapshot.json",
+            {"desired_fs_path": str(TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json")},
+        ),
+        ("tmux_window", window_name, {"desired_tmux_name": window_name}),
+        (
+            "provider_instance",
+            f"{terminal_id}.provider",
+            {"desired_db_key": f"provider:{terminal_id}"},
+        ),
+    ]
+    for kind, entry_id, identity in resources:
+        registry.declare(
+            entry_id=entry_id,
+            kind=kind,
+            protocol_vintage="v2",
+            terminal_id=terminal_id,
+            generation=generation,
+            owner="fork",
+            ownership="owned",
+            constructor_id="terminal_service.create_terminal",
+            deleter_id="terminal_service.delete_terminal",
+            rollback_rule="generation-isolated",
+            actor_id="terminal_service.create_terminal",
+            **identity,
+        )
+        receipt = rr.receipt_digest(
+            {
+                "entry_id": entry_id,
+                "kind": kind,
+                "terminal_id": terminal_id,
+                "generation": generation,
+                **identity,
+            }
+        )
+        registry.register_created(
+            entry_id,
+            actor_id="terminal_service.create_terminal",
+            existence_receipt_digest=receipt,
+        )
+
+
+def _deregister_v2_terminal_resources(terminal_id: str, generation: str) -> None:
+    """Drain/close/delete a v2 generation's registry entries with absence receipts."""
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    try:
+        registry = rr.get_resource_registry()
+    except Exception:  # noqa: BLE001 - teardown stays best-effort
+        logger.warning("resource registry unavailable during v2 teardown", exc_info=True)
+        return
+    try:
+        entries = registry.enumerate(terminal_id=terminal_id, generation=generation)
+    except Exception:  # noqa: BLE001
+        logger.warning("resource registry enumeration failed during v2 teardown", exc_info=True)
+        return
+    for entry in entries:
+        entry_id = entry["entry_id"]
+        state = entry["lifecycle_state"]
+        if state in ("deleted", "aborted"):
+            continue
+        absence = rr.receipt_digest(
+            {
+                "entry_id": entry_id,
+                "terminal_id": terminal_id,
+                "generation": generation,
+                "absent": True,
+            }
+        )
+        try:
+            if state == "declared":
+                registry.abort(
+                    entry_id,
+                    actor_id="terminal_service.delete_terminal",
+                    verified_absence_digest=absence,
+                )
+                continue
+            if state in ("created", "active"):
+                registry.drain(entry_id, actor_id="terminal_service.delete_terminal")
+                state = "draining"
+            if state == "draining":
+                registry.close(entry_id, actor_id="terminal_service.delete_terminal")
+            registry.delete(
+                entry_id,
+                actor_id="terminal_service.delete_terminal",
+                verified_absence_digest=absence,
+            )
+        except Exception:  # noqa: BLE001 - one entry's failure must not strand the rest
+            logger.warning("registry deregistration failed for %s", entry_id, exc_info=True)
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -212,6 +333,7 @@ async def create_terminal(
     expected_effort: Optional[str] = None,
     preserve_on_init_failure: bool = False,
     managed_native_command: Optional[list[str]] = None,
+    protocol_vintage: str = "v1",
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -319,6 +441,14 @@ async def create_terminal(
                     "managed native launches require an existing session; atomic "
                     "process creation is only defined for window creation"
                 )
+        if protocol_vintage not in ("v1", "v2"):
+            raise ValueError("protocol_vintage must be v1 or v2")
+        if protocol_vintage == "v2" and (
+            managed_native_command is None
+            or reserved_terminal_id is None
+            or terminal_generation is None
+        ):
+            raise ValueError("v2 terminal persistence requires a managed native reserved launch")
 
         if not session_name:
             session_name = generate_session_name()
@@ -418,19 +548,44 @@ async def create_terminal(
         # are resolved so API reads and snapshots report the actual launch policy.
         # Bind the server-owned immutable pane/window identity at creation:
         # attestation binds supervisors by pane_id, never by mutable window name.
+        # v2 managed terminals persist ONLY to the isolated v2 surface so
+        # old-binary query/list/cleanup paths have zero visibility into them.
         identity = get_backend().window_identity(session_name, window_name) or {}
-        db_create_terminal(
-            terminal_id,
-            session_name,
-            window_name,
-            provider,
-            agent_profile,
-            allowed_tools,
-            caller_id=caller_id,
-            generation=terminal_generation,
-            pane_id=identity.get("pane_id"),
-            window_id=identity.get("window_id"),
-        )
+        if protocol_vintage == "v2":
+            if terminal_generation is None:
+                # Redundant with the v2 validation above; mypy cannot
+                # narrow through it, and the v2 surface requires the exact
+                # generation — fail closed rather than persist without it.
+                raise ValueError("v2 terminal persistence requires the exact generation")
+            db_create_terminal_v2(
+                terminal_id,
+                session_name,
+                window_name,
+                provider,
+                agent_profile,
+                allowed_tools,
+                caller_id=caller_id,
+                generation=terminal_generation,
+                pane_id=identity.get("pane_id"),
+                window_id=identity.get("window_id"),
+            )
+            # The v2 generation's runtime resources are registered
+            # journal-first (fail-closed: the v2 plane is the registry's
+            # authority scope) before the generation is exposed.
+            _register_v2_terminal_resources(terminal_id, terminal_generation, window_name)
+        else:
+            db_create_terminal(
+                terminal_id,
+                session_name,
+                window_name,
+                provider,
+                agent_profile,
+                allowed_tools,
+                caller_id=caller_id,
+                generation=terminal_generation,
+                pane_id=identity.get("pane_id"),
+                window_id=identity.get("window_id"),
+            )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
@@ -604,6 +759,9 @@ async def create_terminal(
         if preserve_on_init_failure:
             try:
                 persisted_terminal = get_terminal_metadata(terminal_id)
+                if persisted_terminal is None:
+                    # v2 managed terminals persist to the isolated v2 surface.
+                    persisted_terminal = get_terminal_metadata_v2(terminal_id)
             except Exception:
                 # Metadata lookup itself failed.  Fail closed by leaving any
                 # resources untouched; the reservation remains queryable and
@@ -1411,8 +1569,14 @@ def delete_terminal(
             )
         # Managed cleanup claims the exact DB incarnation before any external
         # destructive action. If the id now names a replacement generation,
-        # preserve every resource and report the mismatch.
+        # preserve every resource and report the mismatch.  v2 managed
+        # terminals live in the isolated v2 surface; the legacy table is
+        # consulted first, then the v2 table.
         metadata = get_terminal_metadata(terminal_id)
+        v2_record = False
+        if metadata is None and expected_generation is not None:
+            metadata = get_terminal_metadata_v2(terminal_id)
+            v2_record = metadata is not None
         terminal_record_absent = False
         if expected_generation is not None:
             if metadata is None:
@@ -1459,6 +1623,8 @@ def delete_terminal(
             if expected_generation is None:
                 return
             current = get_terminal_metadata(terminal_id)
+            if current is None and v2_record:
+                current = get_terminal_metadata_v2(terminal_id)
             if terminal_record_absent:
                 if current is not None:
                     raise TerminalGenerationMismatchError(
@@ -1566,6 +1732,17 @@ def delete_terminal(
         if expected_generation is not None:
             if terminal_record_absent:
                 deleted = True
+            elif v2_record:
+                deleted = db_delete_terminal_v2_if_generation(terminal_id, expected_generation)
+                if not deleted:
+                    current = get_terminal_metadata_v2(terminal_id)
+                    if current is not None:
+                        raise TerminalGenerationMismatchError(
+                            f"terminal {terminal_id} changed generation during cleanup"
+                        )
+                    deleted = True
+                if deleted:
+                    _deregister_v2_terminal_resources(terminal_id, expected_generation)
             else:
                 deleted = db_delete_terminal_if_generation(terminal_id, expected_generation)
                 if not deleted:

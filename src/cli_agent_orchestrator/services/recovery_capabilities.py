@@ -42,27 +42,57 @@ RECEIPT_SCHEMAS = [
 def build_capabilities(
     *,
     containment: Optional[ContainmentComposition] = None,
-    kimi_acp_proof_green: bool = False,
-    route_receipt_proven: bool = False,
+    provider_versions: Optional[dict[str, Optional[str]]] = None,
+    kimi_acp_proof: Optional[dict[str, Any]] = None,
+    route_proofs: Optional[dict[str, dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Assemble the capability payload from live composition state.
 
-    Every authority claim derives from the composed objects themselves —
-    never from configuration or caller assertion.
+    Every authority claim derives from provider-specific, version-checked,
+    generation-bound receipts — never from configuration or caller
+    assertion.  ``provider_versions`` maps provider → live ``--version``
+    output (None = binary absent/unverified, which removes the
+    capability); ``kimi_acp_proof`` is the validated durable ACP
+    new→kill→load receipt; ``route_proofs`` maps provider → validated
+    model-input-bound non-echo route receipt.  With zero receipts the
+    surface advertises exactly that: unproven containment, no observed
+    routes, no enabled providers, and no automated
+    recovery/finalization/destructive path.
     """
     composition = containment or ContainmentComposition()
     containment_status = composition.status()
-    codex = provider_contracts.resume_status("codex", route_receipt_proven=route_receipt_proven)
-    claude = provider_contracts.resume_status("claude")
-    kimi = provider_contracts.resume_status("kimi", kimi_acp_proof_green=kimi_acp_proof_green)
+    versions = provider_versions or {}
+    proofs = route_proofs or {}
+    codex = provider_contracts.resume_status(
+        "codex",
+        installed_version=versions.get("codex"),
+        route_proof=proofs.get("codex"),
+    )
+    claude = provider_contracts.resume_status(
+        "claude",
+        installed_version=versions.get("claude"),
+        route_proof=proofs.get("claude"),
+    )
+    kimi = provider_contracts.resume_status(
+        "kimi",
+        installed_version=versions.get("kimi"),
+        kimi_acp_proof=kimi_acp_proof,
+        route_proof=proofs.get("kimi"),
+    )
     observed_route = {
-        # PF-2 is red for every pinned provider: none emits a
-        # model-input-bound non-echo receipt carrying resolved model and
-        # effective effort, so observed-route authority is unsupported.
-        "codex": "proven" if route_receipt_proven else "unsupported",
-        "claude": "proven" if route_receipt_proven else "unsupported",
-        "kimi": "proven" if route_receipt_proven else "unproven",
+        # PF-2 is red for every pinned provider unless a provider-specific
+        # route receipt is proven: none emits a model-input-bound non-echo
+        # receipt carrying resolved model and effective effort by default.
+        "codex": "proven" if proofs.get("codex") else "unsupported",
+        "claude": "proven" if proofs.get("claude") else "unsupported",
+        "kimi": "proven" if proofs.get("kimi") else "unproven",
     }
+    enabled_providers = [
+        provider
+        for provider, status in (("codex", codex), ("claude", claude), ("kimi", kimi))
+        if status.identity_available
+    ]
+    zero_proven = not enabled_providers or containment_status != "proven"
     return {
         "schema_version": CAPABILITY_SCHEMA_VERSION,
         "protocol": CAPABILITY_PROTOCOL,
@@ -81,9 +111,20 @@ def build_capabilities(
         "actor_broker": {
             "assertion_schema": "cao-actor-assertion-v1",
             "platform_peer_identity": actor_broker.platform_supported(),
+            # Issuance is wired to the generation-private UDS accept path
+            # with kernel credentials/lineage in managed_provider_bridge.
+            "production_wiring": "managed-provider-bridge",
         },
         "containment": containment_status,
         "observed_route": observed_route,
+        "enabled_providers": enabled_providers,
+        "automated_paths": {
+            # Zero proven providers keeps every automated authority surface
+            # unavailable — preserved/alert-only is the only honest state.
+            "recovery": not zero_proven,
+            "finalization": not zero_proven,
+            "destructive": not zero_proven,
+        },
         "delivery_journal": {
             "schema_version": 1,
             "states": [
@@ -95,6 +136,9 @@ def build_capabilities(
                 "consumer-acked",
             ],
             "at_most_once_honest": True,
+            # Intent/submit/ack transitions are wired around the real
+            # provider call in managed_provider_bridge.
+            "production_wiring": "managed-provider-bridge",
         },
         "resource_registry_version": REGISTRY_SCHEMA_VERSION,
         "resume": {
