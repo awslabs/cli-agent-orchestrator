@@ -578,6 +578,12 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     (not the 8 KB rolling buffer, which is too small to reliably hold the
     footer) and calls ``provider.get_status()`` directly, catching the real
     state so the retry loop doesn't re-deliver into a working terminal.
+
+    Only providers that set ``supports_direct_status_probe = True`` should
+    be passed to this function; the ``get_status()`` contract for other
+    providers (e.g. kiro_cli, antigravity_cli, cursor_cli) relies on
+    dispatch bookkeeping and cannot distinguish IDLE from COMPLETED on a
+    rendered capture-pane snapshot.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -588,9 +594,14 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
         if not session_name or not window_name:
             return False
         output = get_backend().get_history(session_name, window_name, tail_lines=200)
+        status = provider.get_status(output)
     except Exception:
+        logger.debug(
+            "Direct status probe for %s failed (falling through to cached path)",
+            terminal_id,
+            exc_info=True,
+        )
         return False
-    status = provider.get_status(output)
     return status in _DEFERRED_STARTED_STATUSES
 
 
@@ -641,12 +652,14 @@ async def _confirm_worker_started_or_resubmit(
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
         # The cached status_monitor status is event-driven (pyte screener at
         # rising-edge/quiescence only) and can lag behind reality. Before
-        # re-delivering, do a direct raw-buffer check via the provider to
-        # catch cases where the worker IS processing but the cached status
-        # hasn't caught up yet (e.g. OpenCode's ``esc interrupt`` footer
-        # appearing between pyte detection edges).
-        if provider is not None and _worker_is_started_direct(terminal_id, provider):
-            return True
+        # re-delivering, do a direct capture-pane / visible-screen check via
+        # the provider to catch cases where the worker IS processing but the
+        # cached status hasn't caught up yet (e.g. OpenCode's ``esc interrupt``
+        # footer appearing between pyte detection edges). Only providers that
+        # opt in via ``supports_direct_status_probe = True`` take this path.
+        if provider is not None and getattr(provider, "supports_direct_status_probe", False):
+            if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
+                return True
 
         if await asyncio.to_thread(_message_visible_in_box, terminal_id, message):
             logger.warning(
