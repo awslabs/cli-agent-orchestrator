@@ -1067,5 +1067,5 @@ class TestSanitizeHerdrArgs:
     def test_sanitize_rejects_env_value_with_newline(self):
         from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="unsafe characters"):
             _sanitize_herdr_args(["tab", "create", "--env", "K=line1\nline2"])
