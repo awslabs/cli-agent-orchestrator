@@ -671,6 +671,26 @@ class TestHerdrInboxSnapshot:
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="boom")
         assert service._fetch_snapshot() is None
 
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_fetch_snapshot_returns_none_on_malformed_json(self, mock_run):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_run.return_value = MagicMock(returncode=0, stdout="not json", stderr="")
+        assert service._fetch_snapshot() is None
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_fetch_snapshot_returns_none_on_non_object_json(self, mock_run):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_run.return_value = MagicMock(returncode=0, stdout="null", stderr="")
+        assert service._fetch_snapshot() is None
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_fetch_snapshot_returns_none_on_timeout(self, mock_run):
+        import subprocess as _sp
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_run.side_effect = _sp.TimeoutExpired(cmd="herdr", timeout=10)
+        assert service._fetch_snapshot() is None
+
 
 class TestHerdrInboxServiceStartupDbCleanup:
     """Test _startup_db_cleanup removes ghost terminals on server start."""

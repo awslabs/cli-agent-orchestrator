@@ -269,20 +269,32 @@ class HerdrInboxService:
         tab_id, workspace_id; each tab carries tab_id, label, workspace_id;
         each workspace carries workspace_id, label. Replaces the former
         pane-list + workspace-list + tab-list subprocess fan-out.
+
+        Returns None on any failure (non-zero exit, timeout, missing binary,
+        or malformed output). This is the single entry point all snapshot reads
+        route through, so it swallows the same broad error set as the file's
+        other herdr-subprocess helpers rather than letting one bad response
+        kill the socket loop.
         """
-        result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "api", "snapshot"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            logger.warning(f"Snapshot: `api snapshot` failed: {result.stderr}")
-            return None
         try:
+            result = subprocess.run(
+                ["herdr", "--session", self._herdr_session, "api", "snapshot"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                logger.warning(f"Snapshot: `api snapshot` failed: {result.stderr}")
+                return None
             return json.loads(result.stdout)["result"]["snapshot"]
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Snapshot: failed to parse: {e}")
+        except (
+            subprocess.SubprocessError,
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+        ) as e:
+            logger.warning(f"Snapshot: failed to fetch/parse: {e}")
             return None
 
     async def _reconcile(self) -> None:
