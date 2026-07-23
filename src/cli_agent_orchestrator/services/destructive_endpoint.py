@@ -285,7 +285,8 @@ class DestructiveEndpoint:
             store = self._load_intents(path)
             entry = store["intents"].get(intent.intent_id)
             if entry is not None and entry.get("state") == "effect-completed":
-                return entry["receipt"]  # idempotent re-issue
+                receipt: dict[str, Any] = entry["receipt"]
+                return receipt  # idempotent re-issue
             if entry is None:
                 store["intents"][intent.intent_id] = {
                     "state": "effect-pending",

@@ -881,6 +881,9 @@ class _ProviderSession:
         }
         if any(request.get(key) != value for key, value in expected.items()):
             raise BridgeError("admission does not match the exact bridge generation")
+        # The W13 fence is the admission boundary: a sealed generation
+        # rejects every post-fence input with zero provider I/O.
+        self._assert_fence_open()
         if (
             hashlib.sha256(request["message"].encode("utf-8")).hexdigest()
             != request["message_sha256"]
@@ -898,6 +901,7 @@ class _ProviderSession:
         )
         self._current_turn_id = provider_turn_id
         self._scan_companion_events()
+        self._emit_beat(provider_turn_id, f"{kind}:{provider_turn_id}")
         receipt_id = provider_turn_id
         return {
             **self._base_receipt(),
@@ -934,6 +938,8 @@ class _ProviderSession:
             raise BridgeError("inbox delivery omitted the exact message id")
         if hashlib.sha256(message.encode("utf-8")).hexdigest() != command.get("message_sha256"):
             raise BridgeError("inbox delivery message digest mismatch")
+        # Sealed generations reject queued unsubmitted input at the boundary.
+        self._assert_fence_open()
         provider_turn_id, kind, provider_evidence = self._submit_provider_turn(
             message,
             client_message_id=message_id,
@@ -945,6 +951,7 @@ class _ProviderSession:
         )
         self._current_turn_id = provider_turn_id
         self._scan_companion_events()
+        self._emit_beat(provider_turn_id, f"{kind}:{provider_turn_id}")
         submitted_at = _now()
         companion_receipts.record_message_ack(
             self.request["terminal_id"],
@@ -992,6 +999,98 @@ class _ProviderSession:
     def close(self) -> None:
         if self.rpc is not None:
             self.rpc.close()
+
+    def _assert_fence_open(self) -> None:
+        """Refuse provider-bound input for a sealed (W13-fenced) generation.
+
+        Post-report input/tool admission must be *prevented*, not merely
+        detected: a callback can only ever bind the tree the sealed
+        generation actually left behind.
+        """
+        from cli_agent_orchestrator.constants import COMPANION_DIR
+        from cli_agent_orchestrator.services import generation_fence
+
+        try:
+            generation_fence.assert_admission_open(
+                COMPANION_DIR, self.request["terminal_id"], self.request["generation"]
+            )
+        except generation_fence.FencedError as exc:
+            raise BridgeError(str(exc)) from exc
+
+    def _emit_beat(self, provider_turn_id: str, evidence_id: str) -> None:
+        """Emit one fenced heartbeat for a provider-native turn event.
+
+        Beats are a v2 behavior: they require the v2 identity fields in
+        the bridge request and a producer fencing token issued at native
+        bind.  A v1 request (no v2 fields) or an unbound generation
+        produces no beat — v1 generations never gain v2 semantics.  A
+        superseded producer's refusal is logged, never fatal: the bridge
+        keeps serving its generation, and the fencing registry is what
+        stops the stale writer.
+        """
+        from cli_agent_orchestrator.constants import COMPANION_DIR
+        from cli_agent_orchestrator.services import heartbeat_store
+        from cli_agent_orchestrator.services.destructive_endpoint import (
+            binding_record_path,
+        )
+
+        request = self.request
+        required = ("obligation_generation", "run_id", "assigned_policy_sha256", "project")
+        if any(not request.get(field) for field in required):
+            return
+        terminal_id = request["terminal_id"]
+        token = heartbeat_store.current_fencing_token(COMPANION_DIR, terminal_id)
+        if token is None:
+            return
+        try:
+            import json as _json
+
+            binding = _json.loads(
+                binding_record_path(COMPANION_DIR, terminal_id, request["generation"]).read_bytes()
+            )
+        except (OSError, _json.JSONDecodeError):
+            return
+        segment_hash = binding.get("route_payload_sha256")
+        if not isinstance(segment_hash, str) or len(segment_hash) != 64:
+            return  # unbound route fact: no truthful route field, no beat
+        identity = heartbeat_store.HeartbeatIdentity(
+            project=request["project"],
+            task_id=request.get("task_id"),
+            run_id=request["run_id"],
+            obligation_generation=request["obligation_generation"],
+            reservation_id=request["reservation_id"],
+            launch_nonce_digest=binding.get("launch_nonce_digest", "0" * 64),
+            terminal_id=terminal_id,
+            generation=request["generation"],
+            attempt_id=binding.get("attempt_id", ""),
+            provider=request["provider"],
+            provider_version=(self.readiness or {}).get("provider_version", "unknown"),
+            native_session_id=self.provider_session_id or "",
+            assigned_policy_sha256=request["assigned_policy_sha256"],
+            segment_hash=segment_hash,
+        )
+        producer = heartbeat_store.HeartbeatProducer(
+            companion_dir=COMPANION_DIR, identity=identity, token=token
+        )
+        evidence_kind = "app_server_event" if self.provider == "codex" else "acp_update"
+        try:
+            producer.beat(
+                turn_state="active",
+                provider_turn_id=provider_turn_id,
+                evidence_kind=evidence_kind,
+                evidence_id=evidence_id,
+            )
+        except heartbeat_store.FencingRefused:
+            logger.warning(
+                "heartbeat write refused for superseded generation %s",
+                request["generation"],
+            )
+        except heartbeat_store.HeartbeatError:
+            logger.warning(
+                "heartbeat write failed for generation %s",
+                request["generation"],
+                exc_info=True,
+            )
 
 
 def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:

@@ -287,7 +287,9 @@ class ResourceRegistry:
     # ------------------------------------------------------------ reads
 
     def _row(self, conn: sqlite3.Connection, entry_id: str) -> sqlite3.Row:
-        row = conn.execute("SELECT * FROM resource WHERE entry_id=?", (entry_id,)).fetchone()
+        row: Optional[sqlite3.Row] = conn.execute(
+            "SELECT * FROM resource WHERE entry_id=?", (entry_id,)
+        ).fetchone()
         if row is None:
             raise RegistryNotFound(f"no registry entry: {entry_id}")
         return row

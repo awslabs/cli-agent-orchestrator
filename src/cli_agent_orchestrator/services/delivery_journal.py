@@ -382,8 +382,9 @@ class DeliveryJournal:
 
     def is_ambiguous_preserved(self, obligation_generation: str, logical_callback_id: str) -> bool:
         try:
-            return self.get(obligation_generation, logical_callback_id)["state"] == (
-                STATE_SUBMIT_AMBIGUOUS
+            return bool(
+                self.get(obligation_generation, logical_callback_id)["state"]
+                == STATE_SUBMIT_AMBIGUOUS
             )
         except DeliveryNotFound:
             return False

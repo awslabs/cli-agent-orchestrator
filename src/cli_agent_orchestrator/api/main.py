@@ -83,6 +83,13 @@ from cli_agent_orchestrator.models.managed_launch import (
     ManagedLaunchReserveRequest,
     ManagedLaunchRouteAttestRequest,
 )
+from cli_agent_orchestrator.models.managed_launch_v2 import (
+    ManagedDestructiveRequest,
+    ManagedLaunchV2AdmitRequest,
+    ManagedLaunchV2BindRequest,
+    ManagedLaunchV2ReserveRequest,
+    ManagedV2FenceInstallRequest,
+)
 from cli_agent_orchestrator.models.memory import (
     MemoryKey,
     MemoryScope,
@@ -106,6 +113,7 @@ from cli_agent_orchestrator.services import (
     companion_receipts,
     flow_service,
     managed_launch,
+    managed_launch_v2,
     secret_gate,
     session_service,
     terminal_service,
@@ -1669,6 +1677,254 @@ async def cleanup_managed_generation(
             body,
             registry=get_plugin_registry(request),
         )
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Recovery control-plane surfaces (Lane B foundation)
+#
+# These endpoints expose the v2 managed-launch seam, the W13 fence RPC, the
+# conditional destructive endpoint, and the truthful capability negotiation
+# surface.  Every containment-dependent path stays fail-closed while the
+# deployed composition reports unproven — these surfaces advertise that
+# honestly rather than claiming recovery authority that does not exist.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/managed/recovery-capabilities")
+async def managed_recovery_capabilities(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """The truthful negotiation surface: absence/unknown means fail closed."""
+    import shutil
+    from pathlib import Path
+
+    from cli_agent_orchestrator.constants import CAO_HOME_DIR
+    from cli_agent_orchestrator.services import kimi_acp_proof, recovery_capabilities
+
+    kimi_bin = shutil.which("kimi")
+    kimi_proven = False
+    if kimi_bin:
+        try:
+            kimi_proven = await asyncio.to_thread(
+                kimi_acp_proof.kimi_identity_enabled,
+                state_dir=CAO_HOME_DIR / "recovery",
+                kimi_binary=Path(kimi_bin),
+                version_output="kimi 0.29.0",
+            )
+        except Exception:  # noqa: BLE001 - absence of proof means disabled
+            kimi_proven = False
+    return await asyncio.to_thread(
+        recovery_capabilities.build_capabilities, kimi_acp_proof_green=kimi_proven
+    )
+
+
+@app.post("/managed-launch/v2/reservations", status_code=status.HTTP_201_CREATED)
+async def reserve_managed_launch_v2(
+    body: ManagedLaunchV2ReserveRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        record, created = await asyncio.to_thread(managed_launch_v2.reserve, body)
+        return {"created": created, **record}
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.get("/managed-launch/v2/reservations/{reservation_id}")
+async def get_managed_launch_v2(
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(managed_launch_v2.get, reservation_id)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/launch")
+async def launch_managed_launch_v2(
+    request: Request,
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await managed_launch_v2.launch_reserved(
+            reservation_id, registry=get_plugin_registry(request)
+        )
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/bind")
+async def bind_managed_launch_v2(
+    reservation_id: str,
+    body: ManagedLaunchV2BindRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(managed_launch_v2.bind_native, reservation_id, body)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/admit")
+async def admit_managed_launch_v2(
+    request: Request,
+    reservation_id: str,
+    body: ManagedLaunchV2AdmitRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    from cli_agent_orchestrator.services import generation_fence
+
+    try:
+        return await managed_launch_v2.admit_reserved(
+            reservation_id, body, registry=get_plugin_registry(request)
+        )
+    except generation_fence.FencedError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/resume")
+async def resume_managed_launch_v2(
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    # Resume admission stays fail-closed while the containment composition is
+    # unproven; the fork seam journals the refusal fact.
+    try:
+        return await asyncio.to_thread(
+            managed_launch_v2.attempt_resume, reservation_id, containment_proven=False
+        )
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/fence")
+async def install_managed_fence(
+    body: ManagedV2FenceInstallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """The W13 fence-install RPC (conductor → fork).
+
+    The fork resolves the generation's vintage and current fencing token
+    from its own durable state — never from the caller — so a request
+    naming a superseded or v1 generation gets the truthful outcome.
+    """
+    from cli_agent_orchestrator.constants import COMPANION_DIR
+    from cli_agent_orchestrator.services import generation_fence, heartbeat_store
+
+    def _install() -> Dict[str, Any]:
+        from cli_agent_orchestrator.clients import database
+
+        vintage: Optional[str] = None
+        superseded = False
+        fencing_token_id = "unissued"
+        with database.SessionLocal() as db:
+            row = (
+                db.query(database.ManagedLaunchV2ReservationModel)
+                .filter(
+                    database.ManagedLaunchV2ReservationModel.generation == body.terminal_generation
+                )
+                .first()
+            )
+            if row is not None:
+                vintage = "v2"
+                fencing_record = heartbeat_store.current_fencing_record(
+                    COMPANION_DIR, row.terminal_id
+                )
+                if fencing_record is not None:
+                    token = (fencing_record.get("current_token") or {}).get("id")
+                    if token:
+                        fencing_token_id = token
+                    # A fencing token issued for a *different* generation of
+                    # the same terminal means this generation was superseded.
+                    if fencing_record.get("generation") != body.terminal_generation:
+                        superseded = True
+            else:
+                legacy = (
+                    db.query(database.TerminalModel)
+                    .filter(database.TerminalModel.generation == body.terminal_generation)
+                    .first()
+                )
+                if legacy is not None:
+                    vintage = "v1"
+        if vintage is None:
+            # The fork has no such generation in any store it owns.
+            return {
+                "schema": "cao-w13-fence-resp-v1",
+                "outcome": "unknown-generation",
+                "fence_receipt_sha256": None,
+            }
+        return generation_fence.install_fence(
+            COMPANION_DIR,
+            terminal_id=body.terminal_id,
+            generation=body.terminal_generation,
+            vintage=vintage,
+            superseded=superseded,
+            request=body.model_dump(mode="json", by_alias=True),
+            fencing_token_id=fencing_token_id,
+        )
+
+    try:
+        return await asyncio.to_thread(_install)
+    except generation_fence.FenceError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@app.post("/managed/destructive")
+async def execute_conditional_destructive(
+    request: Request,
+    body: ManagedDestructiveRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """The single conditional endpoint for fork destructive effects."""
+    from cli_agent_orchestrator.constants import COMPANION_DIR
+    from cli_agent_orchestrator.services.destructive_endpoint import (
+        DestructiveEndpoint,
+        DestructiveError,
+        DestructiveIntent,
+        DestructiveRefused,
+    )
+
+    def _execute() -> Dict[str, Any]:
+        record = managed_launch_v2.get(body.reservation_id)
+
+        def _effect() -> str:
+            deleted = terminal_service.delete_terminal(
+                body.terminal_id,
+                registry=get_plugin_registry(request),
+                expected_generation=body.generation,
+                expected_session=record["session_name"],
+            )
+            if not deleted:
+                raise DestructiveError("teardown returned without a no-survivor proof")
+            return "terminal-torn-down"
+
+        endpoint = DestructiveEndpoint(companion_dir=COMPANION_DIR)
+        return endpoint.execute(
+            DestructiveIntent(
+                intent_id=body.intent_id,
+                kind=body.kind,
+                terminal_id=body.terminal_id,
+                generation=body.generation,
+                reservation_id=body.reservation_id,
+                attempt_id=body.attempt_id,
+                fencing_token_id=body.fencing_token_id,
+                requires_containment=body.requires_containment,
+            ),
+            _effect,
+        )
+
+    try:
+        return await asyncio.to_thread(_execute)
+    except DestructiveRefused as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except DestructiveError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
     except managed_launch.ManagedLaunchError as exc:
         raise _managed_launch_http_error(exc)
 
