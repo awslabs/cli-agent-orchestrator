@@ -140,7 +140,11 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     3. If the tmux session survives, call ``kill_session`` and trust its
        verified boolean result. The tmux backend primitive owns the bounded
        confirmation that the session is gone, so the service does not run a
-       second poll for the same guarantee.
+       second poll for the same guarantee. NOTE: this atomicity guarantee holds
+       for backends whose ``kill_session`` confirms the session is gone before
+       returning True (TmuxBackend does; HerdrBackend does not yet — it returns
+       the close subprocess's exit code without a liveness poll, so on herdr
+       this reduces to trusting the bool blindly). Tracked as a follow-up.
     4. Only once the tmux session is provably gone do we drop any leftover
        registry rows for the session and the forwarded-env mapping. Sweeping
        ``delete_terminals_by_session`` reconciles rows that ``delete_terminal``
