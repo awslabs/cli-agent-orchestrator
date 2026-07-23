@@ -205,7 +205,8 @@ def list_agent_profiles() -> List[Dict]:
     disabled = {normalized_path(d) for d in get_disabled_agent_dirs()}
     scanned_paths: Set[str] = set()
 
-    # 1. Local agent store (~/.aws/cli-agent-orchestrator/agent-store/).
+    # 1. Local agent store (derives from CAO_HOME_DIR, default
+    # ~/.aws/cli-agent-orchestrator/agent-store/).
     # It shares a path with the claude_code/codex default, so honour the
     # disable toggle here too — otherwise disabling that default wouldn't hide
     # its profiles.
@@ -292,7 +293,8 @@ def _read_agent_profile_source(agent_name: str) -> str:
     """Locate an agent profile across configured stores and return the raw text.
 
     Search order:
-    1. Local store: ~/.aws/cli-agent-orchestrator/agent-store/{name}.md
+    1. Local store: <CAO_HOME_DIR>/agent-store/{name}.md (default
+       ~/.aws/cli-agent-orchestrator/agent-store/)
     2. Provider-specific directories (flat {name}.md or {name}/agent.md)
     3. Extra user-added directories (flat {name}.md or {name}/agent.md)
     4. Built-in store (packaged with CAO)

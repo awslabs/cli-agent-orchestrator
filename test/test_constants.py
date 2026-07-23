@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 class TestServerConstants:
     """Tests for server configuration constants."""
@@ -324,6 +326,146 @@ class TestCaoHomeDir:
         from cli_agent_orchestrator.constants import CAO_HOME_DIR, SKILLS_DIR
 
         assert SKILLS_DIR == CAO_HOME_DIR / "skills"
+
+
+class TestCaoHomeDirEnvOverride:
+    """The ``CAO_HOME_DIR`` env var relocates CAO's entire data tree.
+
+    Some environments restrict access to ``~/.aws`` (where CAO stores its data
+    by default) to protect AWS credentials, which can leave CAO unable to read
+    its own agent profiles. Setting ``CAO_HOME_DIR`` moves the whole tree
+    elsewhere. The override is read at import, so a single reload must
+    propagate to every derived path.
+    """
+
+    def _reload_constants(self, env_overrides):
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_HOME_DIR", None)
+        env_copy.update(env_overrides)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def _reload_constants_and_settings(self, override):
+        """Reload constants, then settings_service, under a CAO_HOME_DIR override.
+
+        ``settings_service`` binds ``CAO_HOME_DIR`` at its own import time, so it
+        must be reloaded *after* constants for the override to reach its
+        ``_DEFAULTS`` agent-dir map. Passing ``None`` restores the defaults.
+        """
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_HOME_DIR", None)
+        if override is not None:
+            env_copy["CAO_HOME_DIR"] = str(override)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+            import cli_agent_orchestrator.services.settings_service as settings_module
+
+            importlib.reload(constants_module)
+            importlib.reload(settings_module)
+            return constants_module, settings_module
+
+    @pytest.fixture(autouse=True)
+    def _restore_default_constants(self):
+        # Reloading under an override mutates the shared modules in place; reload
+        # them back to their original-env state after each test so the override
+        # cannot leak into tests (here or in other files) that import directly.
+        import os
+
+        original_value = os.environ.get("CAO_HOME_DIR")
+        yield
+        self._reload_constants_and_settings(original_value)
+
+    def test_override_relocates_home_dir(self, tmp_path):
+        override = tmp_path / "cao-home"
+        mod = self._reload_constants({"CAO_HOME_DIR": str(override)})
+        assert mod.CAO_HOME_DIR == override.resolve()
+
+    def test_derived_paths_follow_override(self, tmp_path):
+        override = tmp_path / "cao-home"
+        mod = self._reload_constants({"CAO_HOME_DIR": str(override)})
+        resolved = override.resolve()
+        assert mod.DB_DIR == resolved / "db"
+        assert mod.LOG_DIR == resolved / "logs"
+        assert mod.FIFO_DIR == resolved / "fifos"
+        assert mod.AGENT_CONTEXT_DIR == resolved / "agent-context"
+        assert mod.LOCAL_AGENT_STORE_DIR == resolved / "agent-store"
+        assert mod.SKILLS_DIR == resolved / "skills"
+        assert mod.MEMORY_BASE_DIR == resolved / "memory"
+        assert mod.DATABASE_FILE == resolved / "db" / "cli-agent-orchestrator.db"
+
+    def test_import_time_dirs_created_under_override(self, tmp_path):
+        # constants.py mkdirs TERMINAL_LOG_DIR and FIFO_DIR at import; under the
+        # override they must be created below the new root, never under ~/.aws.
+        override = tmp_path / "cao-home"
+        self._reload_constants({"CAO_HOME_DIR": str(override)})
+        resolved = override.resolve()
+        assert (resolved / "logs" / "terminal").is_dir()
+        assert (resolved / "fifos").is_dir()
+
+    def test_agent_dir_defaults_follow_override(self, tmp_path):
+        # Load-bearing for the restricted-~/.aws case: the agent-store and
+        # agent-context defaults used for the handoff profile read must relocate.
+        override = tmp_path / "cao-home"
+        _, settings_module = self._reload_constants_and_settings(override)
+        resolved = override.resolve()
+        assert settings_module._DEFAULTS["claude_code"] == str(resolved / "agent-store")
+        assert settings_module._DEFAULTS["codex"] == str(resolved / "agent-store")
+        assert settings_module._DEFAULTS["cao_installed"] == str(resolved / "agent-context")
+        # kiro_cli tracks ~/.kiro, not CAO_HOME_DIR, so it is intentionally unchanged.
+        assert settings_module._DEFAULTS["kiro_cli"] == str(Path.home() / ".kiro" / "agents")
+
+    def test_default_when_env_not_set(self):
+        mod = self._reload_constants({})
+        assert mod.CAO_HOME_DIR == Path.home() / ".aws" / "cli-agent-orchestrator"
+
+    def test_empty_string_treated_as_unset(self):
+        # An empty CAO_HOME_DIR (e.g. `export CAO_HOME_DIR=`) must not resolve
+        # to CWD; treat it as unset and fall back to the default.
+        mod = self._reload_constants({"CAO_HOME_DIR": ""})
+        assert mod.CAO_HOME_DIR == Path.home() / ".aws" / "cli-agent-orchestrator"
+
+    def test_whitespace_only_treated_as_unset(self):
+        mod = self._reload_constants({"CAO_HOME_DIR": "   "})
+        assert mod.CAO_HOME_DIR == Path.home() / ".aws" / "cli-agent-orchestrator"
+
+    def test_tilde_expanded(self, tmp_path):
+        # A literal ~/some-path must be expanded, not create a dir named "~".
+        mod = self._reload_constants({"CAO_HOME_DIR": "~/cao-test-data"})
+        expected = Path("~/cao-test-data").expanduser().resolve()
+        assert mod.CAO_HOME_DIR == expected
+        assert "~" not in str(mod.CAO_HOME_DIR)
+
+    def test_import_time_dirs_have_restricted_permissions(self, tmp_path):
+        # Directories created at import time must have no group/other access
+        # to protect secret-bearing terminal logs when relocated outside ~/.aws.
+        override = tmp_path / "cao-home"
+        self._reload_constants({"CAO_HOME_DIR": str(override)})
+        resolved = override.resolve()
+        # Base dir itself is hardened
+        assert resolved.stat().st_mode & 0o077 == 0
+        # Leaf dirs are hardened
+        terminal_log_dir = resolved / "logs" / "terminal"
+        fifo_dir = resolved / "fifos"
+        assert terminal_log_dir.stat().st_mode & 0o077 == 0
+        assert fifo_dir.stat().st_mode & 0o077 == 0
+
+    def test_pre_existing_base_dir_is_chmodded(self, tmp_path):
+        # If the base dir already exists with lax permissions, the import-time
+        # chmod tightens it to owner-only.
+        override = tmp_path / "cao-home"
+        override.mkdir(mode=0o755)
+        self._reload_constants({"CAO_HOME_DIR": str(override)})
+        resolved = override.resolve()
+        assert resolved.stat().st_mode & 0o077 == 0
 
 
 class TestSessionConstants:
