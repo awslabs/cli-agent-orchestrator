@@ -121,7 +121,10 @@ def _enrich_session_ownership(
     enriched.setdefault("working_directory", None)
     enriched.setdefault("agent_profile", None)
 
-    session_name = str(enriched.get("id", ""))
+    # `... or ""` (not `.get("id", "")`): an explicit id=None must collapse to
+    # "" too, matching the sibling guard in list_sessions. `.get("id", "")`
+    # would yield the truthy string "None" and try to enrich a bogus session.
+    session_name = enriched.get("id") or ""
     if not session_name:
         return enriched
 
