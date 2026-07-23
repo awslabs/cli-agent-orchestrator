@@ -6,6 +6,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 
 
 class Flow(BaseModel):
@@ -16,6 +17,7 @@ class Flow(BaseModel):
     schedule: str = Field(..., description="Cron expression")
     agent_profile: str = Field(..., description="Agent profile to use")
     provider: str = Field(default=DEFAULT_PROVIDER, description="Provider to use")
+    engine: Optional[KiroEngine] = Field(default=None, description="Optional Kiro engine")
     script: str = Field("", description="Path to poll script (optional)")
     last_run: Optional[datetime] = Field(None, description="Last execution time")
     next_run: Optional[datetime] = Field(None, description="Next scheduled execution time")

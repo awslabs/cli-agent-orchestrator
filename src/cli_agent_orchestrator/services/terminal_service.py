@@ -24,7 +24,7 @@ import threading
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -43,7 +43,9 @@ from cli_agent_orchestrator.constants import (
     SESSION_PREFIX,
     TERMINAL_LOG_DIR,
 )
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.plugins import (
@@ -51,6 +53,12 @@ from cli_agent_orchestrator.plugins import (
     PostCreateTerminalEvent,
     PostKillTerminalEvent,
     PostSendMessageEvent,
+)
+from cli_agent_orchestrator.providers.kiro_capabilities import (
+    KiroCapabilities,
+    KiroPhase0KASError,
+    probe_kiro_capabilities,
+    requested_kiro_capabilities,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
@@ -159,6 +167,8 @@ async def create_terminal(
     defer_init: bool = False,
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    engine: Optional[KiroEngine | str] = None,
+    kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -187,6 +197,9 @@ async def create_terminal(
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
             None for operator-launched terminals.
+        engine: Explicit Kiro engine. For Kiro, it must agree with the selected
+            profile's engine when both are present; omitted resolves to v2.
+        kiro_capability_probe: Optional test seam for the bounded wrapper probe.
 
     Returns:
         Terminal object with all metadata populated
@@ -195,6 +208,7 @@ async def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    terminal_id: Optional[str] = None
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
     # already-existing session (the `new_session=False` branch below — what
@@ -205,6 +219,59 @@ async def create_terminal(
     # already existed — see the `except` block.
     window_created = False
     try:
+        # Resolve profile policy and Kiro engine BEFORE allocating any backend
+        # resource. A KAS request must probe then fail closed with no window,
+        # database row, FIFO, Herdr registration, or provider process.
+        try:
+            profile = load_agent_profile(agent_profile)
+        except FileNotFoundError:
+            profile = None
+        # Production loaders return AgentProfile. Treat a test double or an
+        # otherwise malformed object as no selected profile rather than
+        # accepting arbitrary attributes as configuration.
+        if profile is not None and not isinstance(profile, AgentProfile):
+            profile = None
+
+        if provider == ProviderType.KIRO_CLI.value:
+            resolved_engine = resolve_kiro_engine(
+                explicit=engine,
+                profile=getattr(profile, "engine", None),
+            )
+            if allowed_tools is None and profile is not None:
+                from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                allowed_tools = resolve_allowed_tools(
+                    profile.allowedTools, profile.role, mcp_server_names
+                )
+            # Kiro runs headlessly, so current CAO behavior always bypasses its
+            # interactive approval prompt. Profile/MCP policy remains enforced
+            # by CAO, while unrestricted profiles additionally force legacy UI.
+            requested = requested_kiro_capabilities(
+                resolved_engine,
+                model=profile.model if profile else None,
+                yolo=True,
+            )
+            probe = kiro_capability_probe or probe_kiro_capabilities
+            await asyncio.to_thread(probe, resolved_engine, requested)
+            if resolved_engine == KiroEngine.KAS:
+                raise KiroPhase0KASError(
+                    bool(profile and (profile.allowedTools or profile.toolsSettings))
+                )
+        else:
+            if engine is not None:
+                raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
+            resolved_engine = None
+
+        # Resolve tool policy before persistence for non-Kiro providers too.
+        if allowed_tools is None and profile is not None:
+            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+            allowed_tools = resolve_allowed_tools(
+                profile.allowedTools, profile.role, mcp_server_names
+            )
+
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
 
@@ -259,29 +326,15 @@ async def create_terminal(
             )
             window_created = True  # only set after successful creation
 
-        # Step 3: Load the profile once for allowed tool resolution before
-        # provider initialization. The skill catalog is computed only for
-        # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
-        try:
-            profile = load_agent_profile(agent_profile)
-        except FileNotFoundError:
-            profile = None
+        # Step 3: Build a runtime skill catalog only for providers that consume
+        # it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
         skill_prompt = (
             build_skill_catalog(profile.skills if profile else None)
             if provider in RUNTIME_SKILL_PROMPT_PROVIDERS
             else None
         )
 
-        # Step 3b: Resolve allowed_tools from profile if not explicitly provided
-        if allowed_tools is None and profile is not None:
-            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
-
-            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
-            allowed_tools = resolve_allowed_tools(
-                profile.allowedTools, profile.role, mcp_server_names
-            )
-
-        # Soft-enforcement guard: kimi_cli/codex have NO native tool-blocking
+        # Step 3b: Soft-enforcement guard: kimi_cli/codex have NO native tool-blocking
         # mechanism (kimi runs --yolo; restrictions are prompt-level text
         # only), so a restricted policy on them is advisory, not enforced.
         # Surface that loudly at launch so operators route restricted or
@@ -305,6 +358,7 @@ async def create_terminal(
             agent_profile,
             allowed_tools,
             caller_id=caller_id,
+            engine=resolved_engine.value if resolved_engine is not None else None,
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
@@ -358,6 +412,7 @@ async def create_terminal(
             allowed_tools,
             skill_prompt=skill_prompt,
             model=profile.model if profile else None,
+            engine=resolved_engine,
         )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
@@ -401,6 +456,7 @@ async def create_terminal(
             agent_profile=agent_profile,
             caller_id=caller_id,
             allowed_tools=allowed_tools,
+            engine=resolved_engine,
             shell_command=shell_command,
             status=initial_status,
             last_active=datetime.now(),
@@ -435,15 +491,18 @@ async def create_terminal(
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
         try:
-            fifo_manager.stop_reader(terminal_id)
+            if terminal_id is not None:
+                fifo_manager.stop_reader(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         try:
-            status_monitor.clear_terminal(terminal_id)
+            if terminal_id is not None:
+                status_monitor.clear_terminal(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         try:
-            provider_manager.cleanup_provider(terminal_id)
+            if terminal_id is not None:
+                provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         # Roll back the DB terminal row so a failed create does not leave an
@@ -453,7 +512,8 @@ async def create_terminal(
         # before the row was written. Runs regardless of session_created so a
         # pre-existing session keeps its live terminals but loses the dead row.
         try:
-            db_delete_terminal(terminal_id)
+            if terminal_id is not None:
+                db_delete_terminal(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         if session_created and session_name:
@@ -790,6 +850,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "agent_profile": metadata["agent_profile"],
             "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
+            "engine": metadata.get("engine"),
             "status": status,
             "last_active": metadata["last_active"],
         }
@@ -845,6 +906,12 @@ def send_input(
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        if (
+            metadata.get("provider") == ProviderType.KIRO_CLI.value
+            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
+        ):
+            raise KiroPhase0KASError(profile_has_v2_policy=False)
 
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = (

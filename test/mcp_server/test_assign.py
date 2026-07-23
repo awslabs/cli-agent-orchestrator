@@ -117,6 +117,7 @@ class TestCreateTerminalProviderResolution:
         metadata_response = MagicMock()
         metadata_response.json.return_value = {
             "provider": "kiro_cli",
+            "engine": "kas",
             "session_name": "cao-session",
             "allowed_tools": None,
         }
@@ -142,6 +143,42 @@ class TestCreateTerminalProviderResolution:
         assert "initial_message" not in kwargs["params"]
         assert kwargs["json"]["initial_message"] == "Analyze the sensitive logs at /secret/path"
         assert kwargs["json"]["initial_message_orchestration_type"] == "assign"
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools",
+        return_value=None,
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="kiro_cli")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_child_engine_is_explicit_not_inherited(
+        self, mock_requests, _mock_resolve_provider, _mock_allowed_tools
+    ):
+        """A parent KAS value does not become an implicit child engine."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "engine": "kas",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-3", "provider": "kiro_cli"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _create_terminal("reviewer", "/repo")
+
+        assert "engine" not in mock_requests.post.call_args.kwargs["params"]
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _create_terminal("reviewer", "/repo", engine="v2")
+
+        assert mock_requests.post.call_args.kwargs["params"]["engine"] == "v2"
 
     @patch("cli_agent_orchestrator.mcp_server.server.requests")
     def test_defer_init_on_new_session_branch_raises(self, mock_requests):

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- add Phase 0 Kiro engine selection (`v2` default; `kas` capability-probed and rejected before terminal allocation)
 - `cao profile find <query>` CLI verb and `find_profiles` MCP tool for keyword/BM25 profile discovery over metadata (name, description, tags, capabilities); metadata-only, never exposes prompt bodies (#340)
 - Optional `capabilities` and `tags` arrays in the agent profile frontmatter schema (#340)
 
@@ -640,5 +641,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-
-

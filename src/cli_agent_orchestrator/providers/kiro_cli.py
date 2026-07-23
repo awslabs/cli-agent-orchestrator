@@ -23,8 +23,13 @@ import shlex
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.kiro_capabilities import (
+    KiroPhase0KASError,
+    build_kiro_command,
+)
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -160,6 +165,7 @@ class KiroCliProvider(BaseProvider):
         window_name: str,
         agent_profile: str,
         allowed_tools: Optional[list] = None,
+        engine: Optional[KiroEngine] = None,
     ):
         """Initialize Kiro CLI provider with terminal context.
 
@@ -169,11 +175,13 @@ class KiroCliProvider(BaseProvider):
             window_name: Name of the tmux window
             agent_profile: Name of the Kiro agent profile to use (e.g., "developer")
             allowed_tools: Optional list of CAO tool names the agent is allowed to use
+            engine: Resolved Kiro engine. Terminal creation probes it before this provider exists.
         """
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._input_received = False
         self._agent_profile = agent_profile
+        self._engine = resolve_kiro_engine(persisted=engine)
 
         # Build dynamic prompt pattern based on agent profile
         # This pattern matches various Kiro prompt formats after ANSI stripping:
@@ -257,6 +265,12 @@ class KiroCliProvider(BaseProvider):
         """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+        if self._engine == KiroEngine.KAS:
+            # This defensive guard makes direct provider use fail closed too.
+            # Normal terminal creation has already probed and rejected KAS before
+            # a backend window or provider is allocated.
+            raise KiroPhase0KASError(profile_has_v2_policy=False)
+
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands
         init_timeout = get_server_settings()["provider_init_timeout"]
@@ -299,12 +313,22 @@ class KiroCliProvider(BaseProvider):
                 "kiro_cli yolo mode: forcing --legacy-ui (kiro-cli 2.0.1 TUI "
                 "shows a non-bypassable trust-all-tools consent dialog)"
             )
-            base_args = ["kiro-cli", "chat", "--legacy-ui", "--trust-all-tools"]
+            base_args = build_kiro_command(
+                self._engine,
+                self._agent_profile,
+                model=model,
+                yolo=True,
+                legacy_ui=True,
+            )
         else:
-            base_args = ["kiro-cli", "chat", "--trust-all-tools"]
-        if model:
-            base_args.extend(["--model", model])
-        base_args.extend(["--agent", self._agent_profile])
+            # Current CAO policy always bypasses Kiro's interactive approval
+            # prompt; CAO still enforces the profile/MCP allowlist itself.
+            base_args = build_kiro_command(
+                self._engine,
+                self._agent_profile,
+                model=model,
+                yolo=True,
+            )
         command = shlex.join(base_args)
         # Arm the StatusMonitor stickiness gate before launching the CLI so
         # the IDLE → PROCESSING → IDLE/COMPLETED transition is honored.
@@ -336,10 +360,13 @@ class KiroCliProvider(BaseProvider):
             # against a clean buffer, not one still full of stale TUI marker bytes
             # from the failed first attempt (which would otherwise time out too).
             status_monitor.reset_buffer(self.terminal_id)
-            legacy_args = ["kiro-cli", "chat", "--legacy-ui", "--trust-all-tools"]
-            if model:
-                legacy_args.extend(["--model", model])
-            legacy_args.extend(["--agent", self._agent_profile])
+            legacy_args = build_kiro_command(
+                self._engine,
+                self._agent_profile,
+                model=model,
+                yolo=True,
+                legacy_ui=True,
+            )
             legacy_command = shlex.join(legacy_args)
             status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, legacy_command)

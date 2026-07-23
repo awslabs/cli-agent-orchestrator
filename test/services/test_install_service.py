@@ -267,6 +267,27 @@ class TestInstallAgent:
         # persisted=True prefers the stable PATH launcher.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
 
+    def test_install_rejects_kas_profile_before_writing_kiro_config(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        profile_path = install_paths["local_store_dir"] / "kas-agent.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-agent\n"
+            "description: KAS agent\n"
+            "engine: kas\n"
+            "allowedTools: [fs_read]\n"
+            "---\n"
+            "KAS profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-agent", "kiro_cli")
+
+        assert result.success is False
+        assert "Cedar" in result.message
+        assert not (install_paths["kiro_dir"] / "kas-agent.json").exists()
+
     def test_install_sets_env_vars_before_profile_loading(
         self, install_paths: dict[str, Path]
     ) -> None:

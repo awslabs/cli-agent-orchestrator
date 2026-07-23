@@ -42,6 +42,30 @@ class TestRunStepEndpoint:
         assert kwargs["agent"] == "developer"
         assert kwargs["prompt"] == "do it"
 
+    def test_matching_v2_reuse_constraints_are_forwarded(self, client):
+        result = AgentStepResult(
+            terminal_id="existing-v2",
+            last_message="all done",
+            status=TerminalStatus.COMPLETED,
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json=_body(reuse_terminal_id="existing-v2", engine="v2"),
+            )
+
+        assert resp.status_code == 200
+        kwargs = m_run.await_args.kwargs
+        assert kwargs["reuse_terminal_id"] == "existing-v2"
+        assert kwargs["engine"] == "v2"
+
+    def test_invalid_engine_is_422(self, client):
+        with patch(_RUN_STEP, new=AsyncMock()) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(engine="v3"))
+
+        assert resp.status_code == 422
+        m_run.assert_not_awaited()
+
     def test_timeout_maps_to_504_with_structured_terminal_id(self, client):
         with patch(
             _RUN_STEP,

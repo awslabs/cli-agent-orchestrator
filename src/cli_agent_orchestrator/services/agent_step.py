@@ -26,8 +26,11 @@ import logging
 import time
 from typing import Callable, Optional
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_engine
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import OutputMode
@@ -52,6 +55,46 @@ DEFAULT_READY_TIMEOUT = 120.0
 # IDLE reads required before a post-input IDLE is accepted as "done" (issue #409a).
 _COMPLETION_POLL_INTERVAL = 1.0
 _IDLE_STABLE_POLLS = 3
+
+
+async def _validate_reused_terminal(
+    terminal_id: str,
+    requested_provider: str,
+    requested_engine: Optional[KiroEngine | str],
+) -> None:
+    """Require reuse constraints to agree with authoritative terminal metadata."""
+    metadata = await asyncio.to_thread(terminal_service.get_terminal_metadata, terminal_id)
+    if metadata is None:
+        raise ValueError(f"Terminal '{terminal_id}' not found")
+
+    persisted_provider = metadata.get("provider")
+    if persisted_provider != requested_provider:
+        raise ValueError(
+            f"Provider mismatch for reused terminal '{terminal_id}': "
+            f"requested {requested_provider!r}, persisted {persisted_provider!r}"
+        )
+
+    if requested_engine is None:
+        return
+    if persisted_provider != ProviderType.KIRO_CLI.value:
+        raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
+
+    explicit_engine = parse_kiro_engine(requested_engine)
+    assert explicit_engine is not None
+    if explicit_engine == KiroEngine.KAS:
+        # KAS remains unavailable regardless of which engine the terminal
+        # persisted; use the same structured Phase 0 guard as terminal creation.
+        raise KiroPhase0KASError(profile_has_v2_policy=False)
+
+    persisted_engine = parse_kiro_engine(metadata.get("engine"))
+    if persisted_engine is None:
+        # Legacy Kiro rows predate the engine column and are v2 by definition.
+        persisted_engine = KiroEngine.V2
+    if explicit_engine != persisted_engine:
+        raise ValueError(
+            f"Kiro engine mismatch for reused terminal '{terminal_id}': "
+            f"requested {explicit_engine.value!r}, persisted {persisted_engine.value!r}"
+        )
 
 
 class StepExecutionError(Exception):
@@ -213,6 +256,7 @@ async def run_agent_step(
     env_vars: Optional[dict[str, str]] = None,
     on_terminal_created: Optional[Callable[[str], None]] = None,
     cancel_event: Optional[asyncio.Event] = None,
+    engine: Optional[KiroEngine | str] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -288,6 +332,8 @@ async def run_agent_step(
             provider never emits a completion signal is exactly the run that could
             not otherwise be killed. Default None = no cancellation seam (the
             handoff caller passes nothing) — behavior unchanged.
+        engine: Explicit Kiro engine for this child step. This is never inferred
+            from a parent terminal.
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -354,6 +400,7 @@ async def run_agent_step(
             allowed_tools=allowed_tools,
             caller_id=caller_id,
             env_vars=env_vars,
+            engine=engine,
         )
         terminal_id = terminal.id
 
@@ -388,6 +435,9 @@ async def run_agent_step(
                 kind="timeout",
                 terminal_id=terminal_id,
             )
+    else:
+        assert terminal_id is not None
+        await _validate_reused_terminal(terminal_id, provider, engine)
 
     assert terminal_id is not None  # for type-checkers: set in both branches
 

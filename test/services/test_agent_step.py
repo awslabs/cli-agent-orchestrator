@@ -11,7 +11,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 
@@ -107,6 +109,10 @@ class TestHappyPath:
             exit_cli as m_exit,
             wait,
             status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+            ),
         ):
             result = asyncio.run(
                 run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99")
@@ -117,6 +123,113 @@ class TestHappyPath:
         # A reused terminal is owned by the caller — no graceful exit either.
         m_exit.assert_not_called()
         m_send.assert_called_once_with("reuse99", "x")
+
+    @pytest.mark.parametrize("engine", [KiroEngine.V2, "v2"])
+    def test_reuse_matching_explicit_v2(self, engine):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create as m_create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+            ),
+        ):
+            result = asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    reuse_terminal_id="reuse99",
+                    engine=engine,
+                )
+            )
+
+        assert result.terminal_id == "reuse99"
+        m_create.assert_not_awaited()
+        m_send.assert_called_once_with("reuse99", "x")
+
+    def test_reuse_conflicting_kas_uses_phase0_guard_before_send(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create as m_create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+            ),
+            pytest.raises(KiroPhase0KASError, match="Phase 0"),
+        ):
+            asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    reuse_terminal_id="reuse99",
+                    engine=KiroEngine.KAS,
+                )
+            )
+
+        m_create.assert_not_awaited()
+        m_send.assert_not_called()
+
+    def test_reuse_rejects_engine_for_non_kiro_terminal_before_send(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "codex", "engine": None},
+            ),
+            pytest.raises(ValueError, match="only valid for provider 'kiro_cli'"),
+        ):
+            asyncio.run(
+                run_agent_step(
+                    "codex",
+                    "dev",
+                    "x",
+                    reuse_terminal_id="reuse99",
+                    engine=KiroEngine.V2,
+                )
+            )
+
+        m_send.assert_not_called()
+
+    def test_reuse_rejects_provider_mismatch_before_send(self):
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        with (
+            create,
+            send as m_send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "codex", "engine": None},
+            ),
+            pytest.raises(ValueError, match="Provider mismatch"),
+        ):
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99"))
+
+        m_send.assert_not_called()
 
     def test_working_directory_forwarded_to_create(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
@@ -534,7 +647,19 @@ class TestInterruptibleCancel:
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             final_status=TerminalStatus.PROCESSING,
         )
-        with create, send, delete as m_delete, get_output, exit_cli as m_exit, wait, status:
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
+            ),
+        ):
             with pytest.raises(StepCancelledError):
                 asyncio.run(
                     run_agent_step(

@@ -41,6 +41,7 @@ class TerminalModel(Base):
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
+    engine = Column(String, nullable=True)  # resolved Kiro engine; NULL for legacy/non-Kiro rows
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -495,7 +496,7 @@ def _migrate_workflow_run_step() -> None:
 
 
 def _migrate_terminals_schema() -> None:
-    """Add allowed_tools and shell_command columns to terminals table if missing (schema migration)."""
+    """Add terminal metadata columns to existing SQLite databases."""
     import sqlite3
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
@@ -516,6 +517,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
             conn.commit()
             logger.info("Migration: added caller_id column to terminals table")
+        if "engine" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN engine TEXT")
+            conn.commit()
+            logger.info("Migration: added engine column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -530,6 +535,7 @@ def create_terminal(
     allowed_tools: Optional[List[str]] = None,
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
+    engine: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -544,6 +550,7 @@ def create_terminal(
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
             caller_id=caller_id,
+            engine=engine,
         )
         db.add(terminal)
         db.commit()
@@ -556,6 +563,7 @@ def create_terminal(
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "engine": terminal.engine,
         }
 
 
@@ -581,6 +589,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "engine": terminal.engine or ("v2" if terminal.provider == "kiro_cli" else None),
             "last_active": terminal.last_active,
         }
 
@@ -596,6 +605,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -635,6 +645,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "last_active": t.last_active,
             }
             for t in terminals

@@ -22,6 +22,7 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.utils.agent_profiles import (
@@ -339,6 +340,12 @@ def install_agent(
         safe_filename = profile.name.replace("/", "__")
 
         if provider == ProviderType.KIRO_CLI.value:
+            if profile.engine == KiroEngine.KAS:
+                raise ValueError(
+                    "Kiro KAS profiles cannot be installed in Phase 0: CAO cannot "
+                    "render KAS profiles or translate allowedTools/toolsSettings to Cedar. "
+                    "Set engine: v2 or wait for a later migration phase."
+                )
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             # Kiro natively supports skill:// resources with progressive loading
             # (metadata at startup, full content on demand).
