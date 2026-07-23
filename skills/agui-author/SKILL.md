@@ -89,19 +89,55 @@ emit_ui("metric", {"label": "tokens used", "value": 12840, "unit": "tok"})
 emit_ui("agent_card", {"name": "reviewer", "provider": "claude_code", "status": "working"})
 ```
 
-## Guidance
+## L2 constructs (Phase 2)
 
-- Prefer an `approval_card` over asking for confirmation in prose when an action
-  is destructive — it gives the operator an explicit approve/reject affordance in
-  the dashboard. Note the card is **display + operator-side actions**: today the
-  action routes to the dashboard's command surface, not back to you as a tool
-  result — pair it with your provider's own wait-for-input mechanism.
-- Keep `props` small and structured; do not embed large blobs (the 8 KB bound
-  rejects them — the tool raises a `ValueError`). Reference file paths, not file contents.
-- Do **not** try to smuggle markup through props — there is no HTML sink; strings
-  render as text.
-- One intent per meaningful UI moment (a decision, a diff, a milestone). Don't emit
-  a `progress` card on every token.
+The AG-UI surface also exposes **L2 constructs** — higher-level projections that
+fold the raw event stream into structured views. As an agent you don't author L2
+constructs, but you should know they exist because your `emit_ui` intents feed
+them:
+
+- **`SupervisorDashboardStream`** — folds `STATE_SNAPSHOT`/`STATE_DELTA` + your
+  `agent_card` emits into a live fleet hierarchy view.
+- **`MultiAgentSessionTimeline`** — reconstructs delegation/message timeline
+  from `TOOL_CALL` lifecycle events.
+- **`AgentHandoffWithApproval`** — the full interrupt lifecycle: provider prompt
+  → reason classification → interrupt → approve/deny/edit → delivery.
+- **`CrossProviderStateSync`** — convergence proof across providers.
+
+The **run plane** (`POST /agui/v1/run`) streams these as stock AG-UI wire frames.
+Interrupts (approval prompts) route through `POST /agui/v1/interrupts/{id}/resume`.
+
+For details: [references/l2-constructs.md](references/l2-constructs.md) and
+[references/run-plane.md](references/run-plane.md).
+
+## Gotchas
+
+1. **Emitting to a disabled surface** — if `CAO_AGUI_ENABLED` is unset, `emit_ui`
+   returns `{"ok": false}` gracefully. Don't treat this as an error or retry — it's
+   a no-op by design. The fix: always check `ok` in the return but never fail on it.
+
+2. **Props over 8 KB are rejected** — the tool raises a `ValueError` and nothing
+   renders. The fix: reference file paths instead of embedding content. Keep props
+   to metadata (paths, counts, labels).
+
+3. **No HTML sink exists** — strings in props render as plain text. Attempting to
+   smuggle markup through props (e.g. `<script>`, `<iframe>`) won't render and
+   looks broken. The fix: use structured props, not markup.
+
+4. **One intent per meaningful moment** — emitting a `progress` card on every
+   token or tool call floods the stream and degrades client rendering. The fix:
+   emit at milestones (start, 25%, 50%, 75%, done) or once per logical phase.
+
+5. **`approval_card` is display-only today** — it gives the operator an
+   approve/reject affordance in the dashboard, but the action routes to the
+   dashboard's command surface, not back to you. The fix: pair it with your
+   provider's own wait-for-input mechanism (e.g. Kiro's trust prompts, Claude
+   Code's permission dialog).
+
+6. **Off-list components are refused server-side** — the allow-list is fixed
+   (`approval_card`, `choice_prompt`, `diff_summary`, `progress`, `metric`,
+   `agent_card`). A typo or new component name returns HTTP 400. The fix: use
+   only the six listed names; check spelling.
 
 ## Verifying locally
 
@@ -123,6 +159,10 @@ component is refused with HTTP 400.
 
 ## See also
 
-- `examples/agui-dashboard/` — a runnable demo (`run.sh` + `showcase.sh`) that
+- `examples/ag-ui/ag-ui-dashboard/` — a runnable demo (`run.sh` + `showcase.sh`) that
   drives all six components live and shows the off-list refusal.
 - `docs/agui.md` — the AG-UI stream and generative-UI reference.
+- **`cao-mcp-apps` skill** — operate and extend the MCP Apps surface that renders
+  your `emit_ui` intents inside host dashboards (Claude Desktop, VS Code, etc.).
+- **`mcp-apps-builder` skill** — build new MCP App views that consume the AG-UI
+  stream your emits feed into.

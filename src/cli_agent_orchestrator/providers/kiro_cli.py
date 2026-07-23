@@ -125,6 +125,11 @@ TUI_PERMISSION_PATTERN = (
     r"|Yes,\s*single permission[\s\S]{0,200}?Trust,\s*always allow[\s\S]{0,200}?No"
 )
 
+# TUI trust-all-tools acceptance dialog: shown at startup when --trust-all-tools is passed.
+# Matches the footer navigation chrome to avoid false positives on warning text in agent output.
+# Must be anchored to bottom screen region (see get_status WAITING check) to avoid stale matches.
+TUI_TRUST_ALL_TOOLS_FOOTER = r"esc to cancel · ↑↓ to navigate · ↵ to select"
+
 # =============================================================================
 # Error Detection
 # =============================================================================
@@ -439,6 +444,22 @@ class KiroCliProvider(BaseProvider):
             )
             if not idle_after_working:
                 return TerminalStatus.PROCESSING
+
+        # Check 2a: Trust-all-tools acceptance dialog at startup (no idle prompt case).
+        # Must come BEFORE the "no idle prompt → PROCESSING" check below, since
+        # the dialog has no idle prompt but should classify WAITING_USER_ANSWER.
+        # Anchored to bottom 20 lines to avoid false positives when the warning text
+        # appears in scrollback with an idle prompt below (same class as issue #405).
+        lines = clean_output.split("\n")
+        bottom_region = "\n".join(lines[-20:]) if len(lines) > 20 else clean_output
+        footer_match = re.search(TUI_TRUST_ALL_TOOLS_FOOTER, bottom_region)
+        if footer_match:
+            after_footer = bottom_region[footer_match.end() :]
+            has_idle_after = re.search(self._idle_prompt_pattern, after_footer) or re.search(
+                NEW_TUI_IDLE_PATTERN, after_footer
+            )
+            if not has_idle_after:
+                return TerminalStatus.WAITING_USER_ANSWER
 
         # Check 3: If no idle prompt found, determine if kiro is still running.
         # Compare current pane command against the shell captured before kiro launched.

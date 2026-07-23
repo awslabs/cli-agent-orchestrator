@@ -19,6 +19,7 @@ Terminal Workflow:
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from datetime import datetime
@@ -68,6 +69,7 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
+    wait_until_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -543,6 +545,104 @@ def _notify_caller_of_deferred_failure(
             )
 
 
+# --- deferred-init submit verification ----------------------------------------
+# send_input delivers via paste-buffer → fixed sleep → Enter (clients/tmux.py).
+# That fixed sleep only guesses when the TUI is input-ready; when it guesses
+# wrong the Enter (or the whole paste) is dropped and the message sits
+# unsubmitted in the prompt box. In the deferred-init path nobody blocks on
+# completion, so a dropped submit leaves the worker IDLE forever with the task
+# never started and NO exception raised — the supervisor then waits on a
+# callback that can never arrive. Confirm the worker actually began processing
+# and re-submit if it did not.
+_DEFERRED_SUBMIT_CONFIRM_TIMEOUT = 8.0  # per-attempt wait for the PROCESSING edge
+_DEFERRED_SUBMIT_MAX_RESUBMITS = 3
+# Statuses proving the worker accepted the task (left the ready IDLE state).
+# WAITING_USER_ANSWER counts: the worker consumed the input and is now asking.
+_DEFERRED_STARTED_STATUSES = {
+    TerminalStatus.PROCESSING,
+    TerminalStatus.COMPLETED,
+    TerminalStatus.WAITING_USER_ANSWER,
+}
+
+
+def _message_visible_in_box(terminal_id: str, message: str) -> bool:
+    """True when the delivered message is still sitting in the input box.
+
+    Decides the resubmit action: if our text is there the paste landed and only
+    the Enter was dropped (send a bare Enter); if it is absent the paste itself
+    was dropped (re-deliver the full message). Guessing wrong the other way must
+    be avoided — a bare Enter into an EMPTY box would submit a blank prompt and
+    the real task would be lost. Collapse to [a-z0-9] so wrapping / whitespace /
+    unicode punctuation in the rendered box can't defeat the match.
+    """
+    probe = re.sub(r"[^a-z0-9]", "", message.lower())[:24]
+    if len(probe) < 8:
+        # Too short to match reliably — treat as "not shown" so we re-deliver
+        # in full rather than risk a blank submit.
+        return False
+    try:
+        rendered = get_output(terminal_id)
+    except Exception:
+        return False
+    return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
+
+
+async def _confirm_worker_started_or_resubmit(
+    terminal_id: str,
+    message: str,
+    registry: "PluginRegistry | None",
+    sender_id: Optional[str],
+    orchestration_type: Optional[OrchestrationType],
+) -> bool:
+    """Confirm a deferred-init worker began processing; re-submit if not.
+
+    Returns True once the terminal reaches a started status, False if it is
+    still stuck at IDLE after all resubmit attempts. Blocking tmux/DB I/O runs
+    off the loop via to_thread so concurrent deferred inits aren't frozen.
+    """
+    if await wait_until_status(
+        terminal_id,
+        _DEFERRED_STARTED_STATUSES,
+        timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
+        polling_interval=0.5,
+    ):
+        return True
+
+    for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
+        if await asyncio.to_thread(_message_visible_in_box, terminal_id, message):
+            logger.warning(
+                "Deferred assign to %s unsubmitted (Enter swallowed); "
+                "re-submitting via Enter (attempt %d)",
+                terminal_id,
+                attempt,
+            )
+            await asyncio.to_thread(send_special_key, terminal_id, "Enter")
+        else:
+            logger.warning(
+                "Deferred assign to %s not accepted (paste dropped); "
+                "re-delivering message (attempt %d)",
+                terminal_id,
+                attempt,
+            )
+            await asyncio.to_thread(
+                send_input,
+                terminal_id,
+                message,
+                registry=registry,
+                sender_id=sender_id,
+                orchestration_type=orchestration_type,
+            )
+        if await wait_until_status(
+            terminal_id,
+            _DEFERRED_STARTED_STATUSES,
+            timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
+            polling_interval=0.5,
+        ):
+            return True
+
+    return False
+
+
 def _schedule_deferred_init(
     provider_instance,
     terminal_id: str,
@@ -592,6 +692,36 @@ def _schedule_deferred_init(
                     sender_id=caller_id,
                     orchestration_type=orchestration_type,
                 )
+                # Delivery can be silently dropped (Enter swallowed / paste lost)
+                # when the TUI isn't input-ready. Confirm the worker actually
+                # started and re-submit if not; if it never starts, surface the
+                # failure so the supervisor re-routes instead of waiting forever.
+                started = await _confirm_worker_started_or_resubmit(
+                    terminal_id,
+                    initial_message,
+                    registry,
+                    caller_id,
+                    orchestration_type,
+                )
+                if not started:
+                    logger.error(
+                        "Deferred init for %s: worker never started after "
+                        "resubmits; task not delivered — notifying caller and "
+                        "tearing down.",
+                        terminal_id,
+                    )
+                    await asyncio.to_thread(
+                        _notify_caller_of_deferred_failure,
+                        terminal_id,
+                        (
+                            f"Worker {terminal_id} received the assigned task but "
+                            f"never started processing (input not accepted after "
+                            f"retries). It has been deleted — re-assign the task."
+                        ),
+                        registry,
+                        True,  # delete_worker
+                    )
+                    return
         except TerminalInputBlockedError as e:
             # The worker initialized but is parked on an interactive prompt
             # (WAITING_USER_ANSWER). It is alive and can be driven via
@@ -722,18 +852,30 @@ def send_input(
             if isinstance(orchestration_type, OrchestrationType)
             else str(orchestration_type or "")
         )
-        if (
-            provider
-            and provider.blocks_orchestrated_input_while_waiting_user_answer is True
-            and orchestration_value
-            in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
-            and status_monitor.get_status(terminal_id) == TerminalStatus.WAITING_USER_ANSWER
-        ):
-            raise TerminalInputBlockedError(
-                f"Terminal {terminal_id} is waiting for a user answer. "
-                "Use answer_user_prompt to submit a selection or approval before "
-                f"sending {orchestration_value} input."
-            )
+
+        if provider:
+            current_status = status_monitor.get_status(terminal_id)
+
+            # Guard: refuse to type into a terminal whose provider process has
+            # exited. Without this check, queued messages would be pasted into
+            # a bare shell and executed as arbitrary commands.
+            if current_status == TerminalStatus.ERROR:
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} provider is in ERROR state "
+                    "(provider process may have exited). Refusing to deliver input."
+                )
+
+            if (
+                provider.blocks_orchestrated_input_while_waiting_user_answer is True
+                and orchestration_value
+                in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
+                and current_status == TerminalStatus.WAITING_USER_ANSWER
+            ):
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} is waiting for a user answer. "
+                    "Use answer_user_prompt to submit a selection or approval before "
+                    f"sending {orchestration_value} input."
+                )
 
         # Inject memory context into the very first user message after init.
         # Phase 1 wires injection inline for every provider. The Kiro

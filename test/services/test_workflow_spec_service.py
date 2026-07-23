@@ -573,3 +573,88 @@ class TestExtractInputs:
         path = _write_script(spec_dir, "badinputs", "INPUTS = [1, 2]\n")
         with pytest.raises(ValueError, match="must be a dict literal"):
             svc.get_workflow(str(path), scan_dir=str(spec_dir))
+
+
+class TestColocatedPathGuards:
+    """The containment SafeAccessCheck is colocated with each filesystem sink.
+
+    CodeQL's ``py/path-injection`` ``startswith`` barrier is flow-sensitive and
+    function-local, so a helper that validates a path then RETURNS it leaves the
+    caller's ``open``/``isfile`` sink seeing an unchecked value (alerts
+    166/167/168). These tests pin the behavior of the two helpers that now own
+    every taint-reachable sink: ``_read_contained_spec_bytes`` (open) and
+    ``_contained_spec_file`` (isfile).
+    """
+
+    def test_read_contained_returns_realpath_and_bytes(self, spec_dir):
+        path = _write_spec(spec_dir, "reader")
+        real_path, raw = svc._read_contained_spec_bytes(str(path), base_dir=str(spec_dir))
+        assert real_path == os.path.realpath(str(path))
+        assert isinstance(raw, bytes) and b"reader" in raw
+
+    def test_read_contained_missing_file_raises_filenotfound(self, spec_dir):
+        with pytest.raises(FileNotFoundError):
+            svc._read_contained_spec_bytes(str(spec_dir / "absent.yaml"), base_dir=str(spec_dir))
+
+    def test_read_contained_escaping_path_raises_valueerror(self, spec_dir):
+        # An absolute path outside the bound base escapes containment.
+        with pytest.raises(ValueError, match="escapes its validated directory"):
+            svc._read_contained_spec_bytes("/etc/passwd", base_dir=str(spec_dir))
+
+    def test_read_contained_symlink_escape_rejected(self, spec_dir):
+        target = "/etc/hosts"
+        if not os.path.exists(target):
+            pytest.skip("no stable escape target on this platform")
+        link = spec_dir / "escape.yaml"
+        os.symlink(target, link)
+        with pytest.raises(ValueError, match="escapes its validated directory"):
+            svc._read_contained_spec_bytes(str(link), base_dir=str(spec_dir))
+
+    def test_read_contained_opens_exactly_once(self, spec_dir, monkeypatch):
+        """The single open() sink lives behind the colocated guard — one call."""
+        path = _write_spec(spec_dir, "single")
+        real_open = open
+        opens = {"count": 0}
+
+        def counting_open(file, *a, **kw):
+            if str(file) == os.path.realpath(str(path)):
+                opens["count"] += 1
+            return real_open(file, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", counting_open)
+        svc._read_contained_spec_bytes(str(path), base_dir=str(spec_dir))
+        assert opens["count"] == 1
+
+    def test_contained_spec_file_returns_realpath_for_file(self, spec_dir):
+        path = _write_spec(spec_dir, "probe")
+        assert svc._contained_spec_file(str(path), base_dir=str(spec_dir)) == os.path.realpath(
+            str(path)
+        )
+
+    def test_contained_spec_file_returns_none_for_missing(self, spec_dir):
+        # In-base but not an existing file -> None (caller falls through to the
+        # index lookup), never an exception.
+        assert (
+            svc._contained_spec_file(str(spec_dir / "ghost.yaml"), base_dir=str(spec_dir)) is None
+        )
+
+    def test_contained_spec_file_escaping_path_raises(self, spec_dir):
+        with pytest.raises(ValueError, match="escapes its validated directory"):
+            svc._contained_spec_file("/etc/passwd", base_dir=str(spec_dir))
+
+    def test_validate_only_escaping_path_raises_not_fails(self, spec_dir):
+        """An escaping path is a hard ValueError (-> 400), NOT a soft fail
+        result — the guard fires before the read degrades to a fail."""
+        with pytest.raises(ValueError, match="escapes its validated directory"):
+            svc.validate_only("/etc/passwd", base_dir=str(spec_dir))
+
+    def test_get_workflow_by_absolute_path_loads(self, isolated_db, spec_dir):
+        """The path arm of get_workflow loads a contained spec file directly
+        (via the colocated isfile probe), no index lookup required."""
+        path = _write_spec(spec_dir, "direct")
+        spec = svc.get_workflow(str(path), scan_dir=str(spec_dir))
+        assert spec.name == "direct"
+
+    def test_get_workflow_escaping_path_raises(self, isolated_db, spec_dir):
+        with pytest.raises(ValueError, match="escapes its validated directory"):
+            svc.get_workflow("/etc/passwd.yaml", scan_dir=str(spec_dir))

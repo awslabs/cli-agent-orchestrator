@@ -775,6 +775,236 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
+    def test_get_status_own_line_effort_footer_only_is_idle(self):
+        """GH #459: on Claude Code v2.1.212 the effort footer can render on its
+        OWN line at column 0 ("● high · /effort"), not just mid-line after
+        "esc to interrupt". A fresh terminal whose only "●" content is this
+        footer must read IDLE, not COMPLETED — there is no response yet.
+        """
+        output = "● high · /effort\n❯ \n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
+    def test_get_status_post_paste_stale_own_line_effort_footer_not_completed(self):
+        """GH #459 exact premature-exit trigger: a task was just pasted (echoed
+        by the ❯ line), the worker has not produced a spinner or response yet,
+        and the only "●" content is a stale own-line effort footer. This must
+        NOT read COMPLETED — a false COMPLETED here is what drove `handoff` to
+        paste `/exit` into a still-running worker.
+        """
+        box = "─" * 24
+        output = (
+            "❯ Delegate to developer: create fizzbuzz.py\n"
+            "● high · /effort\n" + box + "\n❯ \n" + box + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) != TerminalStatus.COMPLETED
+
+    def test_get_status_live_spinner_above_own_line_effort_footer_is_processing(self):
+        """GH #459 box-walk: a live spinner renders above the input box with an
+        own-line effort footer sitting BETWEEN the spinner and the box's top
+        border. The box-walk must skip the footer line (like it already skips
+        blank lines and "⎿" hints) to still see the spinner → PROCESSING.
+        """
+        box = "─" * 30
+        output = "✢ Cultivating…\n● high · /effort\n" + box + "\n\n❯ \n\n" + box + "\n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_get_status_own_line_effort_footer_medium_level_is_idle(self):
+        """The effort footer's level varies by setting ("medium", "low", etc.),
+        not just "high" — the exclusion must not be hardcoded to one level."""
+        output = "● medium · /effort\n❯ \n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
+
+class TestClaudeCodeDialogDetection:
+    """Tests for dialog detection anchoring and plan-approval (issue #405)."""
+
+    def test_plan_dialog_many_options_detected_as_waiting(self):
+        """Plan dialog with ~9 options (scrolled beyond old 10-line window) → WAITING."""
+        output = (
+            "⏺ I've analyzed the codebase and prepared a plan.\n"
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "  3. No, refine with Ultraplan\n"
+            "  4. Tell Claude what to change\n"
+            "  5. Save plan and exit\n"
+            "  6. Show plan details\n"
+            "  7. Edit plan in editor\n"
+            "  8. Run with different model\n"
+            "  9. Run with constraints\n"
+            "     shift+tab to approve with this feedback\n"
+            "ctrl+g to edit in  Nvim  · ~/.claude/plans/my-plan.md"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_dialog_dismissed_with_response_marker_not_waiting(self):
+        """Dismissed plan dialog + response marker (⏺) after options → COMPLETED."""
+        output = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "⏺ Done implementing the feature.\n"
+            "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
+
+    def test_plan_dialog_dismissed_with_new_tui_marker_not_waiting(self):
+        """Dismissed plan dialog + newest-TUI response marker (●) → not WAITING.
+
+        The newest TUI renders responses with ● (U+25CF) instead of ⏺; the
+        dismissal guard must accept it as dismissal evidence or the terminal
+        stays falsely WAITING and inbox delivery stalls.
+        """
+        output = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "● Done implementing the feature.\n"
+            "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_dialog_effort_footer_is_not_dismissal_evidence(self):
+        """A '● high · /effort' footer below a LIVE plan dialog must not count
+        as a response marker — the dialog is still open → WAITING."""
+        output = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "  3. No, tell Claude what to change\n"
+            "● high · /effort"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_dialog_dismissed_with_separator_not_waiting(self):
+        """Dismissed plan dialog + separator after options → COMPLETED."""
+        output = (
+            "Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "⏺ Proceeding with option 1\n"
+            "⏺ Done implementing the changes.\n"
+            "────────────────────────\n"
+            "❯ Ask a question or describe a task"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
+
+    def test_nav_footer_in_scrollback_with_idle_at_bottom_not_waiting(self):
+        """'↑/↓ to navigate' in scrollback but NOT in bottom 6 lines → not WAITING."""
+        scrollback_lines = ["line %d of output" % i for i in range(25)]
+        scrollback_lines[5] = "Enter to select · ↑/↓ to navigate · Esc to cancel"
+        scrollback_lines.append("⏺ Here is the result")
+        scrollback_lines.append("────────────────────────")
+        scrollback_lines.append("❯ ")
+        output = "\n".join(scrollback_lines)
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
+
+    def test_ask_user_question_with_notes_hint_and_error_banner(self):
+        """AskUserQuestion footer pushed down by notes-hint + error → still WAITING."""
+        output = (
+            "❯ 1. Option one\n"
+            "  2. Option two\n"
+            "  3. Option three\n"
+            "n to add notes\n"
+            "⚠ Please select a valid option\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_approval_active_with_option_markers_is_waiting(self):
+        """Active plan-approval dialog (option markers present) → WAITING."""
+        output = (
+            "Claude has a plan. Would you like to proceed?\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "  3. No, refine\n"
+            "  4. Tell Claude what to change\n"
+            "     shift+tab to approve with feedback"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_plan_text_far_in_scrollback_no_option_markers_in_bottom(self):
+        """Plan text far in scrollback, no option markers in bottom → not WAITING."""
+        lines = ["line %d" % i for i in range(20)]
+        lines[2] = "Would you like to proceed?"
+        lines[3] = "❯ 1. Yes"
+        lines[4] = "  2. No"
+        lines.extend(
+            [
+                "⏺ Completed the work",
+                "────────────────────────",
+                "❯ ",
+            ]
+        )
+        output = "\n".join(lines)
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
+
+    def test_dismissed_plan_response_marker_no_separator(self):
+        """Response marker after options WITHOUT separator still dismisses the plan."""
+        output = (
+            "Would you like to proceed?\n" "  1. Yes\n" "  2. No\n" "⏺ Here is the response\n" "> "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        assert status == TerminalStatus.COMPLETED
+
+    @pytest.mark.xfail(
+        reason="Known limitation: agent prose containing '↑/↓ to navigate' "
+        "in the 6-line footer window causes false WAITING. Full fix needs "
+        "structural composer detection.",
+        strict=True,
+    )
+    def test_agent_prose_with_nav_text_in_footer_false_waiting(self):
+        """KNOWN LIMITATION: agent prose echoing '↑/↓ to navigate' in the
+        bottom 6 lines of an idle prompt false-positives as WAITING."""
+        output = (
+            "⏺ The dialog shows:\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+        # This SHOULD be COMPLETED but will be WAITING due to the known limitation
+        assert status == TerminalStatus.COMPLETED
+
 
 class TestClaudeCodeProviderNativeStatus:
     """Tests for get_status() native-first path (herdr backend)."""
@@ -936,6 +1166,8 @@ class TestClaudeCodeProviderNativeStatus:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_mark_input_received_resets_detection_flags(self, mock_backend):
         """mark_input_received() sets _task_dispatched=True and resets detection flags."""
+        mock_backend.get_history.return_value = "❯ "
+
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._done_first_detected = 999.0
         provider._idle_first_detected = 999.0
@@ -1059,6 +1291,56 @@ Map<String, List<Integer>> nested = getMap();
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         with pytest.raises(ValueError, match="No Claude Code response found"):
             provider.extract_last_message_from_script(output)
+
+    def test_extract_message_own_line_effort_footer_not_a_marker(self):
+        """GH #459: on v2.1.212 the effort footer can render on its OWN line at
+        column 0 ("● high · /effort"), where the start-of-line anchor alone no
+        longer excludes it. A buffer whose only "●"-prefixed line is this
+        footer must still yield no response, not the footer text itself
+        mistaken for a message."""
+        output = "● high · /effort\n❯ \n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        with pytest.raises(ValueError, match="No Claude Code response found"):
+            provider.extract_last_message_from_script(output)
+
+    def test_extract_message_styled_own_line_effort_footer_not_a_marker(self):
+        """GH #459 follow-up: real ``tmux capture-pane -e`` output re-renders
+        the pane's SGR color state, so the own-line effort footer arrives
+        wrapped in ANSI codes with a trailing reset directly after "/effort"
+        (e.g. "\\x1b[38;5;246m● high · /effort\\x1b[39m"). That reset must not
+        defeat the exclusion lookahead in EXTRACTION_RESPONSE_PATTERN — a real
+        answer followed by this styled footer must still extract the answer,
+        not the footer's own text."""
+        output = (
+            "● def greet(name):\n"
+            '    return f"Hello, {name}!"\n\n'
+            "\x1b[38;5;246m●  high  ·  /effort\x1b[39m\n"
+            "❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "def greet(name):" in result
+        assert 'return f"Hello, {name}!"' in result
+        assert "effort" not in result
+        assert "high" not in result
+
+    def test_extract_message_own_line_effort_footer_not_leaked_into_response(self):
+        """GH #459 follow-up: the own-line effort footer can render directly
+        below a real response, before the idle prompt or any other stop
+        condition. The line-collection loop must treat it as a stop boundary
+        like the separator and completion-summary lines — not append its text
+        onto the extracted answer as trailing garbage."""
+        output = (
+            "● def greet(name):\n" '    return f"Hello, {name}!"\n\n' "● high · /effort\n" "❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "def greet(name):" in result
+        assert 'return f"Hello, {name}!"' in result
+        assert "effort" not in result
+        assert "high" not in result
 
     def test_extract_message_with_table_not_truncated(self):
         """Extraction must NOT stop at table borders containing ─ runs inside │ box chars."""

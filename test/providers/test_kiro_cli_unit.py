@@ -295,6 +295,33 @@ class TestKiroCliProviderStatusDetection:
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
+    def test_get_status_trust_all_tools_dialog_active(self):
+        """Trust-all-tools dialog at startup classifies WAITING_USER_ANSWER."""
+        output = load_fixture("kiro_trust_all_tools_dialog_active.txt")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_trust_all_tools_dialog_stale(self):
+        """Stale trust-all-tools dialog with idle prompt does NOT classify WAITING."""
+        output = load_fixture("kiro_trust_all_tools_dialog_stale.txt")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.IDLE
+
+    def test_get_status_trust_all_tools_dialog_in_scrollback(self):
+        """Trust-all-tools dialog far in scrollback does NOT classify WAITING."""
+        output = load_fixture("kiro_trust_all_tools_dialog_in_scrollback.txt")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.COMPLETED
+
     def test_get_status_error(self):
         """Test ERROR status detection."""
         output = load_fixture("kiro_cli_error_output.txt")

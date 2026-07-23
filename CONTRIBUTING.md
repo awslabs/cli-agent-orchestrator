@@ -47,6 +47,35 @@ for how to start `cao-server`, forward port `9889`, and troubleshoot 404s on the
 forwarded URL.
 
 
+## Recording test fixtures safely
+
+Many provider tests use fixtures captured from **live CLI output** (see
+`test/providers/fixtures/`). That output can embed personal or sensitive data —
+notably login/banner lines that print your account email, and tokens that hide
+inside ANSI escape sequences where they are easy to miss in review. A real
+incident (#436) merged personal emails this way.
+
+When recording or updating a live-output fixture:
+
+- **Capture on a synthetic/throwaway account** where possible, not your personal
+  or corporate account.
+- **Scrub any login/banner/identity line before committing** — replace a real
+  email with `user@example.com`, an account name with a placeholder, etc.
+- **Skim the raw bytes, not just the rendered view.** A secret can sit next to
+  ANSI escape codes and not be visible in a normal terminal render or diff.
+- Prefer the reserved placeholders scanners already treat as safe:
+  `user@example.com`, and for AWS the documented `AKIAIOSFODNN7EXAMPLE`.
+
+A gitleaks secret scan runs on every PR and weekly over full history (see
+[SECURITY.md](SECURITY.md#secret-scanning)); you can run it locally with
+`scripts/security-scan.sh gitleaks`, or enable the optional pre-commit hook
+([`.pre-commit-config.yaml`](.pre-commit-config.yaml)) with `pre-commit install`
+to catch secrets before they enter a commit. If a secret ever lands, follow the
+[Leak Response & Git-History Scrub Runbook](docs/security.md)
+— **rotate/revoke first**, rewrite history only if warranted by the runbook's
+severity triage table.
+
+
 ## Finding contributions to work on
 Looking at the existing issues is a great way to find something to contribute on. As our projects, by default, use the default GitHub issue labels (enhancement/bug/duplicate/help wanted/invalid/question/wontfix), looking at any 'help wanted' issues is a great place to start.
 

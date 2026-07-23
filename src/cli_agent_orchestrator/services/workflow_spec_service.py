@@ -160,6 +160,92 @@ def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> s
 
 
 # ---------------------------------------------------------------------------
+# Colocated resolve-contain-AND-access helpers (CodeQL py/path-injection)
+# ---------------------------------------------------------------------------
+# ``_safe_spec_path`` above resolves+contains a path and then RETURNS it. That
+# is a genuine traversal defence, but CodeQL's ``py/path-injection`` barrier for
+# ``str.startswith`` is *flow-sensitive and function-local*: the "contained"
+# state a guard establishes inside ``_safe_spec_path`` is NOT carried across the
+# ``return`` to the caller, so an ``open()``/``os.path.isfile()`` sink in the
+# CALLER still sees a normalized-but-unchecked path and is (correctly, from the
+# query's point of view) flagged — alerts 166/167/168.
+#
+# The fix is to colocate the containment SafeAccessCheck with the filesystem
+# sink in the SAME function, so the guard dominates the sink and the query's
+# barrier applies. These helpers own every taint-reachable ``open``/``isfile``
+# on a user-supplied spec path; callers receive the *result* (bytes / a bool-ish
+# path), never a bare path they must re-open. The guard uses the single positive
+# ``startswith(base + os.sep)`` idiom from CodeQL's own "GOOD" example (the
+# trailing separator also closes the ``/base`` vs ``/base-evil`` prefix hole).
+
+
+def _resolve_contained_spec_path(path: Union[str, Path], safe_base: str) -> str:
+    """Canonicalize ``path`` and return it ONLY if it resolves under ``safe_base``.
+
+    Pure path math (no filesystem access): mirrors ``_safe_spec_path``'s
+    resolution so the two ``open``/``isfile`` helpers below share identical
+    semantics. The containment guard itself is intentionally NOT here — it is
+    re-asserted inline next to each sink so CodeQL's function-local barrier
+    covers the sink.
+    """
+    if not path or (isinstance(path, str) and not path.strip()):
+        raise ValueError("workflow spec path is required")
+    user_path = os.fspath(path)
+    candidate = user_path if os.path.isabs(user_path) else os.path.join(safe_base, user_path)
+    return os.path.realpath(os.path.abspath(candidate))
+
+
+def _read_contained_spec_bytes(
+    path: Union[str, Path], base_dir: Optional[str] = None
+) -> tuple[str, bytes]:
+    """Resolve + contain + READ a spec file, guard colocated with the sinks.
+
+    Returns ``(real_path, raw)`` where ``raw`` is capped at
+    ``WORKFLOW_MAX_SPEC_BYTES + 1`` bytes (callers own the over-cap message and
+    the decode). The ``os.path.isfile`` and ``open`` sinks live HERE, right
+    after the ``startswith`` containment SafeAccessCheck, so the check dominates
+    them within one function (unlike a returned path, whose checked state CodeQL
+    drops at the call boundary — the cause of alerts 166/167).
+
+    Raises:
+        ValueError: the base directory is blocked or the resolved path escapes it.
+        FileNotFoundError: the resolved path is not an existing regular file.
+    """
+    safe_base = _safe_dir(base_dir)
+    real_path = _resolve_contained_spec_path(path, safe_base)
+    # SafeAccessCheck — single positive containment guard, colocated with the
+    # open() sink below (a spec FILE is always strictly UNDER its base dir).
+    if not real_path.startswith(safe_base + os.sep):
+        raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
+    if not os.path.isfile(real_path):
+        raise FileNotFoundError(f"workflow spec not found: {path}")
+    with open(real_path, "rb") as fh:
+        return real_path, fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
+
+
+def _contained_spec_file(path: Union[str, Path], base_dir: Optional[str] = None) -> Optional[str]:
+    """Resolve + contain a candidate path; return its realpath IFF it is a file.
+
+    Used by ``get_workflow`` to decide "path vs bare name" without leaking an
+    unchecked path to the ``os.path.isfile`` sink (alert 168). The containment
+    guard is colocated with the ``isfile`` sink; an escaping path is a
+    ``ValueError`` (matching the previous ``_safe_spec_path`` behavior), an
+    in-base non-file returns ``None`` (caller falls through to the index lookup).
+    """
+    safe_base = _safe_dir(base_dir)
+    real_path = _resolve_contained_spec_path(path, safe_base)
+    # SafeAccessCheck — single positive containment guard, colocated with the
+    # isfile sink below. Must match the ``_read_contained_spec_bytes`` form: a
+    # COMPOUND ``!= base and not startswith`` guard leaves the ``real_path ==
+    # base`` branch reaching the sink un-guarded, which CodeQL (correctly) will
+    # not treat as a barrier. A candidate that resolves exactly to the base dir
+    # is not a spec file, so rejecting it here is the right behavior anyway.
+    if not real_path.startswith(safe_base + os.sep):
+        raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
+    return real_path if os.path.isfile(real_path) else None
+
+
+# ---------------------------------------------------------------------------
 # Read path
 # ---------------------------------------------------------------------------
 def load_and_validate(path: str, base_dir: Optional[str] = None) -> WorkflowSpec:
@@ -182,19 +268,11 @@ def load_and_validate(path: str, base_dir: Optional[str] = None) -> WorkflowSpec
         ValueError: the directory is blocked, the file is unreadable, or the
             spec fails grammar validation.
     """
-    # Canonicalize + bind the file to its configured base directory (rejects a
-    # blocked base or a path that escapes it) before any stat/open.
-    real_path = _safe_spec_path(path, base_dir)
-
-    if not os.path.isfile(real_path):
-        raise FileNotFoundError(f"workflow spec not found: {path}")
-
-    # Single read: byte-cap, decode, then reuse the text for BOTH validation and
-    # construction so they see byte-identical content (closes the TOCTOU window).
-    # The read itself is capped at MAX+1 bytes — an oversized file is rejected
-    # without ever being fully read into memory.
-    with open(real_path, "rb") as fh:
-        raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
+    # Resolve + contain + read behind ONE guarded helper: the containment
+    # SafeAccessCheck is colocated with the open() sink inside the helper, so no
+    # unchecked path reaches a filesystem op here (clears alert 166). The file is
+    # read EXACTLY ONCE; the capped bytes feed BOTH validation and construction.
+    _real_path, raw = _read_contained_spec_bytes(path, base_dir)
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
         raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)")
     try:
@@ -228,14 +306,16 @@ def validate_only(path: str, base_dir: Optional[str] = None) -> ValidationResult
     Raises:
         ValueError: the base directory is blocked or the path escapes it.
     """
-    real_path = _safe_spec_path(path, base_dir)
+    # Resolve + contain + read behind the guarded helper (open sink colocated
+    # with the containment check — clears alert 167). An escaping/blocked path is
+    # a ValueError (-> 400); a missing/unreadable file degrades to a ``fail``
+    # result so the surface still NEVER raises for a well-formed-but-absent spec.
     try:
-        with open(real_path, "rb") as fh:
-            # Capped read: an oversized file is rejected without ever being
-            # fully read into memory.
-            raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
+        _real_path, raw = _read_contained_spec_bytes(path, base_dir)
     except OSError as exc:
-        logger.debug("validate_only: could not read spec %s: %s", real_path, exc)
+        # FileNotFoundError (missing spec) and any other read error degrade to a
+        # ``fail`` result — validate_only NEVER raises for an absent spec.
+        logger.debug("validate_only: could not read spec %s: %s", path, exc)
         return ValidationResult(status="fail", errors=[f"could not read spec: {exc}"])
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
         return ValidationResult(
@@ -556,9 +636,12 @@ def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> S
     ``list``/``get`` rendering (BR-6); it is a SEPARATE call from U4's
     run-path defensive re-check.
     """
-    real_path = _safe_spec_path(path, base_dir)
-    with open(real_path, "rb") as fh:
-        raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
+    # Read behind the guarded helper: the containment SafeAccessCheck is
+    # colocated with the open() sink inside ``_read_contained_spec_bytes`` (never
+    # trust the caller to have validated ``path`` — the bare-name arm hands back
+    # a raw string read out of SQLite). This is the ONLY entry that opens a
+    # ``.py`` spec file.
+    real_path, raw = _read_contained_spec_bytes(path, base_dir)
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
         raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (short-circuited read)")
     display_path = real_path
@@ -610,10 +693,13 @@ def get_workflow(
     """
     # A path-like argument is canonicalized + bound to its configured base
     # directory BEFORE the stat (never stat raw user input); a bare name falls
-    # through to the index lookup. A blocked/escaping path raises ValueError.
+    # through to the index lookup. ``_contained_spec_file`` colocates the
+    # containment guard with its ``os.path.isfile`` sink (clears alert 168) and
+    # returns the contained realpath only when it names an existing file; a
+    # blocked/escaping path raises ValueError.
     if os.sep in name_or_path or (os.altsep and os.altsep in name_or_path):
-        safe_path = _safe_spec_path(name_or_path, scan_dir)
-        if os.path.isfile(safe_path):
+        safe_path = _contained_spec_file(name_or_path, scan_dir)
+        if safe_path is not None:
             return _load_by_extension(safe_path, scan_dir)
     # The resolved source_path lives under scan_dir (the index was rebuilt from
     # it), so bind containment to that same dir on load.

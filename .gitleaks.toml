@@ -1,0 +1,76 @@
+# gitleaks configuration for cli-agent-orchestrator (issue #457).
+#
+# Extends gitleaks' built-in rule set via `useDefault` so we stay current with
+# upstream credential detections rather than maintaining our own copy, adds two
+# custom rules for shapes still missing from the defaults, and allowlists one
+# well-known documentation placeholder.
+#
+# This complements — it does not replace — the runtime redactor in
+# secret_gate.py (which guards memory writes / archive export at runtime). This
+# config gates git content in CI so a real credential can't land on a branch.
+#
+# False positives: the scan keys on real credential SHAPES (AWS/GitHub/GitLab
+# keys, PEM private keys, JWTs, Slack webhooks), not on placeholders, env
+# references, hashes, UUIDs, or the word "secret". Ordinary code/docs/fixtures
+# pass. The one realistic edge case for this repo is a provider fixture that
+# captures a JWT-shaped token from a live CLI banner. If that happens and the
+# token is NOT a real credential, either scrub it (preferred — see the fixture
+# hygiene guidance) or exempt that single line with a trailing `# gitleaks:allow`
+# annotation. Do NOT broadly allowlist `test/providers/fixtures/**` — that would
+# blind the gate to a real key captured into a fixture, which is exactly the
+# incident (#436) this guards against.
+title = "CAO gitleaks config"
+
+[extend]
+useDefault = true
+
+# Custom rules closing gaps still present in gitleaks' default set (verified
+# missing as of gitleaks 8.30.1). These credential shapes are real and worth
+# catching.
+[[rules]]
+id = "aws-secret-access-key"
+description = "AWS secret access key (40-char base64) in an assignment"
+# Anchored to an aws-ish key name so we match the secret in context rather than
+# flagging every 40-char base64 blob (which would false-positive on hashes).
+# The trailing (?:[^A-Za-z0-9/+]|$) requires the 40-char run to END at a
+# non-base64 char OR end-of-line, so a key terminated by ; , ) & etc. (common in
+# code/shell) is still caught, while a 41st base64 char correctly disqualifies
+# it (real AWS secrets are exactly 40).
+regex = '''(?i)aws.{0,20}(?:secret|access).{0,20}['"=:\s]([A-Za-z0-9/+]{40})(?:[^A-Za-z0-9/+]|$)'''
+keywords = ["aws"]
+
+[[rules]]
+id = "github-fine-grained-pat"
+description = "GitHub fine-grained personal access token (github_pat_...)"
+# Structure-accurate to avoid flagging doc placeholders like
+# `github_pat_..._example_placeholder`: the real format is `github_pat_` + 22
+# alphanumerics + `_` + 59+ alphanumerics. Requiring that shape (not a loose
+# [0-9a-zA-Z_]{22,255}) rejects underscore-laden placeholders while catching
+# real tokens.
+#
+# This id matches a built-in rule, so `useDefault` merges the two; we set
+# `entropy` explicitly (rather than inheriting the built-in's 3.0) so a
+# low-entropy placeholder that happens to fit the shape is still rejected and
+# the threshold is visible here instead of implied.
+regex = '''github_pat_[0-9a-zA-Z]{22}_[0-9a-zA-Z]{59,}'''
+entropy = 3.0
+keywords = ["github_pat_"]
+
+# Array-table form ([[allowlists]], plural) rather than the singular [allowlist],
+# which gitleaks has deprecated for removal in v9.
+[[allowlists]]
+description = "Intentional non-secrets."
+
+# We deliberately do NOT allowlist whole test files, PEM key material, or whole
+# commits — each of those would suppress real findings too. The synthetic PEM
+# sample in test/services/test_secret_gate.py has only 16 chars of key body,
+# below gitleaks' private-key rule threshold (>=64), so it isn't flagged and
+# needs no allowlist. The only allowlisted value is AWS's documented example
+# access key: the exact 20-char string, word-bounded so a real key merely
+# containing it as a substring is NOT exempt.
+#
+# For any genuine historical false positive, prefer a finding-level
+# .gitleaksignore fingerprint over a commit- or path-level allowlist.
+regexes = [
+  '''\bAKIAIOSFODNN7EXAMPLE\b''',
+]

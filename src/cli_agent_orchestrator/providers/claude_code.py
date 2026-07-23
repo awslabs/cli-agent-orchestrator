@@ -1,6 +1,7 @@
 """Claude Code provider implementation."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -45,17 +46,60 @@ class ProviderError(Exception):
 # Regex patterns for Claude Code output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between marker and text
+# Shared shape of the reasoning-effort footer's tail, e.g. "high · /effort" or
+# "xhigh · /effort". "\w+" matches the effort level generically (any name, not
+# just "high") rather than enumerating known levels. End-anchored so it only
+# describes a line that IS ENTIRELY this shape; a genuine response that merely
+# mentions "/effort" in prose (e.g. "Run /effort to change settings") does not
+# end the line with "<word> · /effort" and is unaffected.
+#
+# _ANSI_OPT is spliced between every token: real capture-pane -e output (used
+# by extraction, per this module's docstring guidance) re-renders the pane's
+# SGR color state, so this exact chrome line arrives wrapped in color codes,
+# e.g. "\x1b[38;5;246m● high · /effort\x1b[39m" — a trailing reset directly
+# after "/effort" (GH #459 follow-up). Without this, the reset defeats the
+# "[ \t]*$" end anchor and the exclusion silently stops firing on styled
+# output, even though it passes on the plain-text unit fixtures.
+_ANSI_OPT = r"(?:\x1b\[[0-9;]*m)*"
+_EFFORT_FOOTER_TAIL = (
+    _ANSI_OPT
+    + r"\w+"
+    + _ANSI_OPT
+    + r"[ \t]*·[ \t]*"
+    + _ANSI_OPT
+    + r"/effort"
+    + _ANSI_OPT
+    + r"[ \t]*$"
+)
 # Response marker at the START of a line, for message EXTRACTION only (not
 # status detection). Matches the legacy "⏺" (U+23FA) and the newest TUI's
 # "●" (U+25CF) response glyphs. Anchored to line start (MULTILINE) so a
 # mid-line "●" — e.g. the footer effort indicator "… esc to interrupt ● high
-# · /effort" — is NOT mistaken for a response marker. Kept separate from
-# RESPONSE_PATTERN so get_status's legacy ⏺-COMPLETED check is unaffected (adding
-# "●" there could fire COMPLETED mid-stream while a response is still rendering).
+# · /effort" — is NOT mistaken for a response marker.
+#
+# On Claude Code v2.1.212+ the same footer can instead render on its OWN line
+# at column 0 — "● high · /effort" — where the line-start anchor no longer
+# protects against it (GH #459: this false-matched as a response marker, so
+# get_status() reported COMPLETED while the worker was still processing,
+# causing handoff to paste a premature "/exit"). The negative lookahead below
+# guards that exact shape. It sits right after the glyph (+ optional ANSI),
+# BEFORE the trailing "\s+" — placing it AFTER "\s+" instead lets that greedy
+# "\s+" backtrack by one space to dodge the lookahead whenever the footer has
+# more than one space after the glyph, silently reopening the false match.
+#
+# Kept separate from RESPONSE_PATTERN so get_status's legacy ⏺-COMPLETED check
+# is unaffected (adding "●" there could fire COMPLETED mid-stream while a
+# response is still rendering).
 EXTRACTION_RESPONSE_PATTERN = re.compile(
-    r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*\s+",
+    r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*(?![ \t]*" + _EFFORT_FOOTER_TAIL + r")\s+",
     re.MULTILINE,
 )
+# Own-line effort-footer, e.g. "● high · /effort" (glyph + the tail shape
+# above). Standalone (not a lookahead) so get_status()'s box-walk can skip past
+# this exact chrome line while searching for a live spinner (GH #459). Shares
+# _EFFORT_FOOTER_TAIL with EXTRACTION_RESPONSE_PATTERN instead of duplicating
+# the shape.
+EFFORT_FOOTER_LINE_PATTERN = re.compile(r"^[ \t]*[⏺●][ \t]*" + _EFFORT_FOOTER_TAIL, re.MULTILINE)
 # Match Claude Code processing spinners:
 # - Old format: "✽ Cooking… (esc to interrupt)" / "✶ Thinking… (esc to interrupt)"
 # - New format: "✽ Cooking… (6s · ↓ 174 tokens · thinking)"
@@ -79,8 +123,10 @@ IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" pro
 WAITING_USER_ANSWER_PATTERN = (
     r"↑/↓ to navigate"  # Ink TUI footer shown only while a selection widget is active
 )
+PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
+_DIALOG_BOTTOM_LINES = 15
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # New Claude Code TUI completion summary, e.g. "✻ Sautéed for 1s" /
 # "✶ Cultivated for 12s". Unlike the active spinner (PROCESSING_PATTERN, which
@@ -160,6 +206,8 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*i
 class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
 
+    _TAIL_HASH_LINES = 30
+
     def __init__(
         self,
         terminal_id: str,
@@ -175,6 +223,46 @@ class ClaudeCodeProvider(BaseProvider):
         self._agent_profile = agent_profile
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
+        self._input_generation: int = 0
+        self._snapshot_tail_hash: Optional[str] = None
+        self._snapshot_last_response: Optional[str] = None
+        self._snapshot_response_count: int = 0
+
+    @staticmethod
+    def _tail_hash(output: str, n: int = 30) -> str:
+        """Hash the ANSI-stripped last *n* lines of *output*."""
+        clean = re.sub(ANSI_CODE_PATTERN, "", output)
+        tail = "\n".join(clean.split("\n")[-n:])
+        return hashlib.md5(tail.encode()).hexdigest()
+
+    @staticmethod
+    def _strip_effort_footer_lines(clean: str) -> str:
+        """Drop own-line effort-footer lines ("● high · /effort") before marker
+        counting/extraction — their glyph is not a response marker (GH #459)."""
+        return "\n".join(
+            line for line in clean.split("\n") if not EFFORT_FOOTER_LINE_PATTERN.match(line)
+        )
+
+    @staticmethod
+    def _extract_last_response_text(output: str) -> Optional[str]:
+        """Extract the text of the last response marker (⏺/●) in *output*, ANSI-stripped."""
+        clean = ClaudeCodeProvider._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
+        matches = list(re.finditer(r"[⏺●]\s+", clean))
+        if not matches:
+            return None
+        last = matches[-1]
+        remaining = clean[last.end() :]
+        lines = remaining.split("\n")
+        response_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if re.match(r"^[>❯]\s", stripped):
+                break
+            if re.search(r"─{20,}", stripped):
+                break
+            response_lines.append(stripped)
+        text = "\n".join(response_lines).strip()
+        return text if text else None
 
     def _load_profile(self) -> Optional["AgentProfile"]:
         """Load this terminal's CAO agent profile from disk, if any.
@@ -617,6 +705,16 @@ class ClaudeCodeProvider(BaseProvider):
         if not output.strip():
             return TerminalStatus.UNKNOWN
 
+        # Issue #407: content-based staleness guard. The tmux sliding window
+        # (-S -200) is NOT monotonically growing — Ink composer-collapse and
+        # short-line eviction can shrink it. Instead of raw length, compare a
+        # hash of the tail region: while unchanged since mark_input_received,
+        # the screen hasn't updated yet → PROCESSING.
+        if self._input_generation > 0 and self._snapshot_tail_hash is not None:
+            current_hash = self._tail_hash(output, self._TAIL_HASH_LINES)
+            if current_hash == self._snapshot_tail_hash:
+                return TerminalStatus.PROCESSING
+
         # PRIMARY PROCESSING check: walk backwards from the *last* separator.
         _sep_re = re.compile(r"(?:\x1b\[[0-9;]*m)*\u2500{20,}")
         _sep_positions = [m.start() for m in _sep_re.finditer(output)]
@@ -682,13 +780,51 @@ class ClaudeCodeProvider(BaseProvider):
             if last_idle is None or last_processing.start() > last_idle.start():
                 return TerminalStatus.PROCESSING
 
-        # Check for waiting user answer via the active Ink selection footer.
-        if (
-            re.search(WAITING_USER_ANSWER_PATTERN, output)
-            and not re.search(TRUST_PROMPT_PATTERN, output)
-            and not re.search(BYPASS_PROMPT_PATTERN, output)
+        # Anchor dialog detection to the bottom region only. Dialog chrome is
+        # always rendered at the bottom; matching the full buffer false-positives
+        # on stale scrollback containing "↑/↓ to navigate" (issue #405).
+        lines = output.split("\n")
+        bottom_region = "\n".join(lines[-_DIALOG_BOTTOM_LINES:])
+        # AskUserQuestion footer can be pushed down by notes-hint, error banner,
+        # or IDE status line — use a 6-line anchor.
+        bottom_chrome = "\n".join(lines[-6:])
+
+        if not re.search(TRUST_PROMPT_PATTERN, bottom_region) and not re.search(
+            BYPASS_PROMPT_PATTERN, bottom_region
         ):
-            return TerminalStatus.WAITING_USER_ANSWER
+            # AskUserQuestion: "↑/↓ to navigate" in bottom chrome (last 6 lines).
+            # Known residual: agent prose containing this exact string in the
+            # 6-line footer window of an idle prompt will false-positive as
+            # WAITING. Full fix needs structural composer detection (out of scope).
+            if re.search(WAITING_USER_ANSWER_PATTERN, bottom_chrome):
+                return TerminalStatus.WAITING_USER_ANSWER
+            # Plan-approval: "Would you like to proceed?" with no nav footer.
+            # Guard against dismissed dialog in scrollback: only classify as
+            # WAITING if option markers appear AFTER the plan text AND neither
+            # a separator (────) nor a response marker (⏺/●) follows them —
+            # either indicates the agent proceeded past the dialog.
+            plan_match = re.search(PLAN_APPROVAL_PATTERN, bottom_region)
+            if plan_match:
+                after_plan = bottom_region[plan_match.end() :]
+                has_option_markers = re.search(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE)
+                sep_after_plan = re.search(r"─{20,}", after_plan)
+                response_after_options = False
+                if has_option_markers:
+                    last_option = None
+                    for m in re.finditer(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE):
+                        last_option = m
+                    if last_option:
+                        after_options = after_plan[last_option.end() :]
+                        # EXTRACTION_RESPONSE_PATTERN (not RESPONSE_PATTERN):
+                        # the newest TUI's response marker is ● which
+                        # RESPONSE_PATTERN deliberately excludes, and its
+                        # effort-footer lookahead keeps a "● high · /effort"
+                        # line from counting as dismissal evidence.
+                        response_after_options = bool(
+                            EXTRACTION_RESPONSE_PATTERN.search(after_options)
+                        )
+                if has_option_markers and not sep_after_plan and not response_after_options:
+                    return TerminalStatus.WAITING_USER_ANSWER
 
         # New Claude Code TUI PROCESSING: the input prompt is BOXED between two
         # separators, and the live spinner renders on the line DIRECTLY ABOVE the
@@ -708,13 +844,20 @@ class ClaudeCodeProvider(BaseProvider):
                 if m.start() <= last_idle.start() < m.end():
                     input_box = m
         if input_box is not None:
-            # Walk up from the box past footer chrome — "⎿ Tip: …" hint lines
-            # and blanks render BETWEEN the live spinner and the box's top
+            # Walk up from the box past footer chrome — "⎿ Tip: …" hint lines,
+            # blanks, and (GH #459) an own-line effort footer ("● high ·
+            # /effort") — render BETWEEN the live spinner and the box's top
             # border, so checking only the single line above the box misses
-            # an active spinner (false COMPLETED during MCP calls).
+            # an active spinner (false COMPLETED during MCP calls, or IDLE
+            # once fix #1 above stops the footer from false-matching COMPLETED
+            # via EXTRACTION_RESPONSE_PATTERN).
             above_lines = output[: input_box.start()].rstrip("\n").split("\n")
             for line in reversed(above_lines[-4:]):
-                if not line.strip() or line.lstrip().startswith("⎿"):
+                if (
+                    not line.strip()
+                    or line.lstrip().startswith("⎿")
+                    or EFFORT_FOOTER_LINE_PATTERN.match(line)
+                ):
                     continue
                 if NEW_TUI_BOX_SPINNER_PATTERN.search(line):
                     return TerminalStatus.PROCESSING
@@ -729,8 +872,12 @@ class ClaudeCodeProvider(BaseProvider):
         # IDLE when the newest TUI clipped the completion summary's duration —
         # "✻ Crunched for " — or rendered the summary on a · / * glyph frame that
         # COMPLETION_SUMMARY_PATTERN excludes; the ● response marker is the robust
-        # fallback.) The ● is matched at line start only, so the footer effort
-        # indicator "… esc to interrupt ● high · /effort" is never counted.
+        # fallback.) The ● is matched at line start only, so the mid-line
+        # footer indicator "… esc to interrupt ● high · /effort" is never
+        # counted. The footer's own-line variant ("● high · /effort" at
+        # column 0) starts at line start too — that case is excluded by the
+        # negative lookahead in EXTRACTION_RESPONSE_PATTERN, not by the
+        # line-start anchor (GH #459).
         last_sol_response = None
         for m in re.finditer(EXTRACTION_RESPONSE_PATTERN, output):
             last_sol_response = m
@@ -764,6 +911,16 @@ class ClaudeCodeProvider(BaseProvider):
             or last_sol_response is not None
             or last_response is not None
         ):
+            # Issue #407 paste-echo guard: when tail-hash differs but the
+            # extracted last-response text matches the snapshot, block COMPLETED
+            # unless the response marker count changed (proving new activity).
+            if self._input_generation > 0 and self._snapshot_last_response is not None:
+                current_response = self._extract_last_response_text(output)
+                if current_response == self._snapshot_last_response:
+                    clean = self._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
+                    current_count = len(list(re.finditer(r"[⏺●]\s+", clean)))
+                    if current_count == self._snapshot_response_count:
+                        return TerminalStatus.PROCESSING
             return TerminalStatus.COMPLETED
 
         # IDLE: shell prompt visible but no response yet (e.g. just initialized).
@@ -884,6 +1041,20 @@ class ClaudeCodeProvider(BaseProvider):
         """
         return self._initialized
 
+    def mark_input_received(self) -> None:
+        """Capture content-based snapshots for the staleness guard (issue #407).
+
+        Uses tail-hash instead of raw length because the tmux sliding window
+        is not monotonically growing.
+        """
+        output = get_backend().get_history(self.session_name, self.window_name) or ""
+        self._snapshot_tail_hash = self._tail_hash(output, self._TAIL_HASH_LINES)
+        self._snapshot_last_response = self._extract_last_response_text(output)
+        clean = self._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
+        self._snapshot_response_count = len(list(re.finditer(r"[⏺●]\s+", clean)))
+        self._input_generation += 1
+        super().mark_input_received()
+
     def get_idle_pattern_for_log(self) -> str:
         """Return Claude Code IDLE prompt pattern for log files."""
         return IDLE_PROMPT_PATTERN_LOG
@@ -929,6 +1100,16 @@ class ClaudeCodeProvider(BaseProvider):
             if re.search(r"─{20,}", clean_line) and not re.search("[━-╿]", clean_line):
                 break
             if re.search(COMPLETION_SUMMARY_PATTERN, clean_line):
+                break
+            # GH #459 follow-up: the exclusion lookahead in
+            # EXTRACTION_RESPONSE_PATTERN stops the own-line effort footer from
+            # being mistaken for a SECOND response marker, but does nothing
+            # about the footer's own text once collection has started from an
+            # earlier, real marker — that footer line would otherwise be
+            # appended verbatim as trailing garbage on the extracted answer.
+            # clean_line is already ANSI-stripped, so this matches on the
+            # footer's plain-text shape regardless of surrounding SGR codes.
+            if EFFORT_FOOTER_LINE_PATTERN.match(clean_line):
                 break
 
             response_lines.append(clean_line)
