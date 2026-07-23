@@ -20,7 +20,6 @@ Session Lifecycle:
 """
 
 import logging
-import time
 from typing import Dict, List
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -125,31 +124,6 @@ def get_session(session_name: str) -> Dict:
         raise
 
 
-# Bounded confirmation that ``kill_session`` actually reaped the tmux session.
-# ``session.kill()`` can return before tmux has finished tearing the session
-# down (libtmux's session list is a cached view of ``list-sessions``), so a
-# single post-kill ``session_exists`` check can still see the dying session.
-# Poll a few times before declaring the kill a failure. Total worst-case wait
-# is _KILL_CONFIRM_ATTEMPTS * _KILL_CONFIRM_INTERVAL seconds.
-_KILL_CONFIRM_ATTEMPTS = 10
-_KILL_CONFIRM_INTERVAL = 0.2
-
-
-def _confirm_session_gone(session_name: str) -> bool:
-    """Return True once the backend reports the tmux session no longer exists.
-
-    Polls ``session_exists`` up to ``_KILL_CONFIRM_ATTEMPTS`` times because a
-    freshly-issued kill can race the tmux server's own teardown. Returns False
-    if the session is still visible after the last attempt.
-    """
-    backend = get_backend()
-    for _ in range(_KILL_CONFIRM_ATTEMPTS):
-        if not backend.session_exists(session_name):
-            return True
-        time.sleep(_KILL_CONFIRM_INTERVAL)
-    return not backend.session_exists(session_name)
-
-
 def delete_session(session_name: str, registry: PluginRegistry | None = None) -> Dict:
     """Delete session and cleanup, reconciling tmux and the registry atomically.
 
@@ -163,10 +137,10 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     2. Re-check ``session_exists`` AFTER the terminal loop — killing the last
        window can make tmux drop the whole session, so a pre-loop snapshot of
        "was it alive" is stale by the time we would act on it.
-    3. If the tmux session survives, kill it and CONFIRM it is gone (bounded
-       poll). ``kill_session``'s success is verified, not assumed: a swallowed
-       failure or stale libtmux cache used to leave an orphaned tmux session
-       with no registry entry (observation A).
+    3. If the tmux session survives, call ``kill_session`` and trust its
+       verified boolean result. The tmux backend primitive owns the bounded
+       confirmation that the session is gone, so the service does not run a
+       second poll for the same guarantee.
     4. Only once the tmux session is provably gone do we drop any leftover
        registry rows for the session and the forwarded-env mapping. Sweeping
        ``delete_terminals_by_session`` reconciles rows that ``delete_terminal``
@@ -174,10 +148,10 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
        teardown raised) so a caller can never observe a lingering registry
        entry for a dead session (observation B).
 
-    If the tmux session cannot be confirmed dead, we raise WITHOUT deleting the
-    remaining registry rows — leaving a re-runnable state (rows still point at
-    the surviving session) instead of a permanent orphan, and surfacing the
-    failure to the caller rather than reporting a false success.
+    If the tmux session cannot be confirmed dead, we raise WITHOUT sweeping
+    remaining registry rows — leaving a re-runnable state instead of a
+    permanent orphan, and surfacing the failure to the caller rather than
+    reporting a false success.
 
     Returns:
         Dict with 'deleted' (list of deleted session names) and 'errors' (list of error dicts).
@@ -197,11 +171,13 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                 logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
         # Step 2/3: Re-check liveness AFTER the loop (killing the last window
-        # can drop the session), then kill and CONFIRM the tmux session is
-        # gone. Do not trust kill_session's return alone — verify.
-        if get_backend().session_exists(session_name):
-            get_backend().kill_session(session_name)
-            if not _confirm_session_gone(session_name):
+        # can drop the session), then trust the backend primitive's verified
+        # result. TmuxClient.kill_session owns the bounded poll; avoid double
+        # waiting here.
+        backend = get_backend()
+        if backend.session_exists(session_name):
+            killed = backend.kill_session(session_name)
+            if not killed:
                 # Leave registry rows in place so a re-run reconciles rather
                 # than orphaning the survivor. Surface the failure — never
                 # report success while a tmux session lives on.

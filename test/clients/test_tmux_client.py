@@ -520,7 +520,7 @@ class TestGetSessionWindows:
 class TestKillSession:
     def test_kill_session_success(self, tmux):
         mock_session = MagicMock()
-        tmux.server.sessions.get.return_value = mock_session
+        tmux.server.sessions.get.side_effect = [mock_session, None]
 
         result = tmux.kill_session("ses")
 
@@ -540,6 +540,16 @@ class TestKillSession:
         result = tmux.kill_session("ses")
 
         assert result is False
+
+    def test_kill_session_returns_false_when_session_survives(self, tmux, monkeypatch):
+        mock_session = MagicMock()
+        tmux.server.sessions.get.return_value = mock_session
+        monkeypatch.setattr(tmux, "_KILL_SESSION_VERIFY_TIMEOUT_SECONDS", 0)
+
+        result = tmux.kill_session("ses")
+
+        assert result is False
+        mock_session.kill.assert_called_once()
 
 
 # ── kill_window ──────────────────────────────────────────────────────

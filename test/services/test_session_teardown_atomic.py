@@ -41,9 +41,10 @@ class FakeTmuxBackend:
     * ``kill_window`` removes a window; removing a session's LAST window drops
       the whole session — exactly like tmux, so a "was it alive" snapshot taken
       before the terminal loop is stale by the time the kill would run.
-    * ``kill_session`` supports two failure shapes seen in production:
+    * ``kill_session`` mirrors the verified tmux primitive and supports two
+      failure shapes seen in production:
         - ``kill_lag``: ``session.kill()`` returns but tmux has not finished
-          reaping, so ``session_exists`` keeps reporting True for a few polls.
+          reaping, so ``kill_session`` polls before returning True.
         - ``kill_fails``: the kill is swallowed entirely and the session
           survives indefinitely (observation A).
     """
@@ -81,10 +82,13 @@ class FakeTmuxBackend:
             # Swallowed failure: session survives, caller (old code) never knew.
             return False
         if self._kill_lag > 0:
-            # Returns "success" but tmux keeps reporting the session alive for
-            # ``kill_lag`` more existence checks before it is actually reaped.
+            # The tmux primitive now owns verification: it does not report
+            # success until the lagged reap has actually completed.
             self._pending_reap[session_name] = self._kill_lag
-            return True
+            for _ in range(self._kill_lag + 1):
+                if not self.session_exists(session_name):
+                    return True
+            return False
         self._sessions.pop(session_name, None)
         return True
 
@@ -117,17 +121,6 @@ def real_db(tmp_path, monkeypatch):
         yield engine
     finally:
         engine.dispose()
-
-
-@pytest.fixture(autouse=True)
-def _fast_kill_confirm(monkeypatch):
-    """Shrink the kill-confirmation poll interval so tests stay fast.
-
-    raising=False so this test module can also be run against a pre-fix
-    ``session_service`` (which has no ``_KILL_CONFIRM_INTERVAL``) to confirm
-    the assertions — not a missing attribute — are what fail there.
-    """
-    monkeypatch.setattr(session_service, "_KILL_CONFIRM_INTERVAL", 0.0, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -191,18 +184,17 @@ def test_success_leaves_no_orphan_in_either_store(real_db, monkeypatch):
 def test_kill_session_lag_is_confirmed_before_returning_success(real_db, monkeypatch):
     """kill_session returns before tmux reaps the session (a real race).
 
-    The reconciling implementation polls until the session is provably gone, so
-    the invariant holds THE MOMENT delete_session returns. The pre-fix code
-    fired kill_session and returned immediately, so at return time the session
-    was still visible — this test fails against it.
+    The tmux backend primitive polls until the session is provably gone, and
+    delete_session trusts that verified result instead of polling a second time.
+    The invariant still holds THE MOMENT delete_session returns.
     """
     backend = FakeTmuxBackend(kill_lag=3)
     set_backend(backend)
     _seed(backend, "cao-lag", [("t1", "w1")])
     # Kill the window WITHOUT dropping the session, so the session-level
-    # kill_session path (and its confirmation) is what must reap it. Model a
-    # multi-window session: keep a second window alive so the loop's window
-    # kills don't auto-drop the session.
+    # kill_session path (and its primitive-level confirmation) is what must
+    # reap it. Model a multi-window session: keep a second window alive so the
+    # loop's window kills don't auto-drop the session.
     backend.add_session("cao-lag", {"w1", "keepalive"})
     monkeypatch.setattr(
         terminal_service, "delete_terminal", _faithful_delete_terminal(backend, "cao-lag")
@@ -221,10 +213,10 @@ def test_silent_kill_session_failure_is_surfaced_not_swallowed(real_db, monkeypa
     """kill_session fails silently (observation A) — must raise, not report success.
 
     Pre-fix code ignored kill_session's return and reported success while the
-    tmux session lived on, orphaned. The reconciling code confirms the kill and
-    raises when the session survives. Crucially it does NOT delete the leftover
-    registry rows, so the state stays re-runnable rather than a permanent
-    orphan.
+    tmux session lived on, orphaned. The reconciling code trusts the verified
+    kill result and raises when the session survives. Crucially it does NOT
+    delete the leftover registry rows, so the state stays re-runnable rather
+    than a permanent orphan.
     """
     backend = FakeTmuxBackend(kill_fails=True)
     set_backend(backend)
@@ -248,8 +240,9 @@ def test_rerun_reconciles_half_torn_down_session(real_db, monkeypatch):
 
     First run: kill_session is broken → raises, tmux session survives, its DB
     rows were removed by the terminal loop. Second run (kill now works): the
-    post-loop liveness re-check finds the surviving session, kills it, confirms
-    it gone, and the registry sweep is a safe no-op. Reconciled — no orphan.
+    post-loop liveness re-check finds the surviving session, kills it via the
+    verified primitive, and the registry sweep is a safe no-op. Reconciled —
+    no orphan.
     """
     backend = FakeTmuxBackend(kill_fails=True)
     set_backend(backend)

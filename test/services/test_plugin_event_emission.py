@@ -100,11 +100,9 @@ class TestSessionPluginEvents:
         async def record_dispatch(*_args):
             call_order.append("dispatch")
 
-        # Post-loop liveness check sees it alive; the kill confirmation poll
-        # then sees it gone (kill_session took effect).
-        mock_tmux.return_value.session_exists.side_effect = [True, False]
-        mock_tmux.return_value.kill_session.side_effect = lambda *_: call_order.append(
-            "kill_session"
+        mock_tmux.return_value.session_exists.return_value = True
+        mock_tmux.return_value.kill_session.side_effect = lambda *_: (
+            call_order.append("kill_session") or True
         )
         # One contained terminal so we can assert it is torn down before the
         # session is killed and the event is emitted.
