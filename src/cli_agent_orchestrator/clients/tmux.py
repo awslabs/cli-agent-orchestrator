@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shlex
 import subprocess
 import time
 import uuid
@@ -601,7 +602,7 @@ class TmuxClient:
 
             pane = window.active_pane
             if pane:
-                pane.cmd("pipe-pane", "-o", f"cat >> {file_path}")
+                pane.cmd("pipe-pane", "-o", f"cat >> {shlex.quote(str(file_path))}")
                 logger.info(f"Started pipe-pane for {session_name}:{window_name} to {file_path}")
         except Exception as e:
             logger.error(f"Failed to start pipe-pane for {session_name}:{window_name}: {e}")

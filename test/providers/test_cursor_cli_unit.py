@@ -1228,7 +1228,9 @@ class TestMiscInterface:
         # <CAO_HOME_DIR>/tmp. Since cursor_cli binds CAO_HOME_DIR at its own
         # import time, we must reload both constants and cursor_cli.
         import importlib
+        import os
 
+        original_value = os.environ.get("CAO_HOME_DIR")
         override = tmp_path / "cao-home"
         monkeypatch.setenv("CAO_HOME_DIR", str(override))
         monkeypatch.delenv("CAO_TMP_DIR", raising=False)
@@ -1241,11 +1243,20 @@ class TestMiscInterface:
 
         importlib.reload(cursor_module)
 
-        provider = make_provider()
-        result = provider._cao_tmp_dir()
-        resolved_override = override.resolve()
-        assert result == resolved_override / "tmp"
-        assert result.is_dir()
+        try:
+            provider = make_provider()
+            result = provider._cao_tmp_dir()
+            resolved_override = override.resolve()
+            assert result == resolved_override / "tmp"
+            assert result.is_dir()
+        finally:
+            # Restore module state so the reload doesn't leak into later tests.
+            if original_value is not None:
+                monkeypatch.setenv("CAO_HOME_DIR", original_value)
+            else:
+                monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+            importlib.reload(constants_module)
+            importlib.reload(cursor_module)
 
     def test_cao_tmp_dir_env_override_wins(self, tmp_path, monkeypatch):
         # CAO_TMP_DIR takes precedence over the CAO_HOME_DIR-derived fallback.
