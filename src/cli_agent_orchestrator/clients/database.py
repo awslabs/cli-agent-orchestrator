@@ -315,6 +315,70 @@ class NativeSessionAttachmentModel(Base):
     updated_at = Column(Text, nullable=False)
 
 
+class KimiNativeControlOperationModel(Base):
+    """One human/orchestrator control operation against a native Kimi TUI.
+
+    Deliberately a separate store from the delivery journal and from every
+    ACP receipt kind.  The delivery journal records the truth of ordinary
+    task submission; a native control operation is a different act against
+    a different surface, and writing one into the other would let a pane
+    keystroke rewrite delivery truth.
+
+    Keyed by the caller-minted ``operation_id`` so a lost response is
+    resolvable by exact id rather than by re-sending.  The row is written
+    with its intent BEFORE anything is typed into the pane, so a crash
+    between intent and keystroke leaves a durable record that recovery
+    adjudicates instead of a silent maybe-sent.
+
+    ``posted_at`` records that bytes reached the transport and nothing
+    more.  It is stored separately from the provider observation on
+    purpose: a successful pane write is not provider acceptance, and the
+    two must never be readable as the same fact.
+    """
+
+    __tablename__ = "kimi_native_control_operations"
+
+    operation_id = Column(Text, primary_key=True)
+    kind = Column(Text, nullable=False)
+    state = Column(Text, nullable=False)
+    # The full binding this operation is valid for. A mismatch on any
+    # component is refused before the pane is touched, so an operation
+    # minted for one generation can never land in its successor.
+    provider = Column(Text, nullable=False)
+    native_session_id = Column(Text, nullable=False)
+    terminal_id = Column(Text, nullable=False)
+    generation = Column(Text, nullable=False)
+    execution_mode = Column(Text, nullable=False)
+    # Present only for a steer, which binds to the exact active turn it
+    # intends to interrupt. A queue operation has no turn by definition.
+    turn_id = Column(Text, nullable=True)
+    # The digest of the exact literal payload rather than the payload
+    # itself: enough to prove the same operation was not re-sent with
+    # different bytes, without durably storing message content here.
+    payload_sha256 = Column(Text, nullable=False)
+    # Canonical JSON of the intent journaled before any side effect.
+    intent_json = Column(Text, nullable=False)
+    # Canonical JSON of the transport-level observation: the digest of
+    # what was written, and that Enter went as its own explicit key after
+    # the literal text. Facts about what this process did -- never a claim
+    # about what the provider received.
+    transport_json = Column(Text, nullable=True)
+    # Canonical JSON of the provider-side observation that justified
+    # acceptance, completion, or refusal. Absent means no provider fact
+    # was ever observed -- which is exactly why such a row cannot read as
+    # accepted.
+    observation_json = Column(Text, nullable=True)
+    posted_at = Column(Text, nullable=True)
+    refusal_reason = Column(Text, nullable=True)
+    ambiguity_reason = Column(Text, nullable=True)
+    # Monotonic per-row counter; every CAS transition bumps it so two
+    # concurrent operators racing the same operation are detected rather
+    # than silently last-write-wins.
+    epoch = Column(Integer, nullable=False, default=0)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+
 class FlowModel(Base):
     """SQLAlchemy model for flow metadata."""
 
@@ -391,6 +455,7 @@ def init_db() -> None:
     _migrate_workflow_run_step()
     _migrate_session_env()
     _migrate_native_session_attachments()
+    _migrate_kimi_native_control_operations()
     _migrate_managed_launch_reservations()
     _migrate_managed_launch_v2()
 
@@ -774,6 +839,54 @@ def _migrate_native_session_attachments() -> None:
             )
     except Exception as e:  # noqa: BLE001 - the operation path fails closed
         logger.warning(f"native-session attachment migration failed: {e}")
+
+
+def _migrate_kimi_native_control_operations() -> None:
+    """Create the native control-operation store on older databases.
+
+    ``Base.metadata.create_all`` covers fresh databases via
+    ``KimiNativeControlOperationModel``; this idempotent migration covers
+    databases created before native control existed. The DDL is
+    byte-compatible with the ORM model so both paths yield one schema.
+
+    A failure here is logged rather than raised, matching the other
+    migrations, because startup must not be blocked by a table that only
+    one optional surface needs. Nothing unsafe follows from that: every
+    native control operation fails closed when this table cannot be
+    written, so an operation that cannot journal its intent types nothing
+    into a provider pane.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS kimi_native_control_operations ("
+                "operation_id TEXT PRIMARY KEY, "
+                "kind TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "provider TEXT NOT NULL, "
+                "native_session_id TEXT NOT NULL, "
+                "terminal_id TEXT NOT NULL, "
+                "generation TEXT NOT NULL, "
+                "execution_mode TEXT NOT NULL, "
+                "turn_id TEXT, "
+                "payload_sha256 TEXT NOT NULL, "
+                "intent_json TEXT NOT NULL, "
+                "transport_json TEXT, "
+                "observation_json TEXT, "
+                "posted_at TEXT, "
+                "refusal_reason TEXT, "
+                "ambiguity_reason TEXT, "
+                "epoch INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 - the operation path fails closed
+        logger.warning(f"kimi native control migration failed: {e}")
 
 
 def _migrate_managed_launch_reservations() -> None:
