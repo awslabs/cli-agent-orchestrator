@@ -1224,50 +1224,50 @@ def _build_actor_broker(request: dict[str, Any], session: "_ProviderSession") ->
     )
 
 
-def _register_bridge_resources(target: dict[str, pathlib.Path], request: dict[str, Any]) -> None:
-    """Registry-first registration of the bridge's own v2 resources.
+def _bridge_resources(
+    target: dict[str, pathlib.Path], request: dict[str, Any]
+) -> tuple[tuple[str, str, str], ...]:
+    """The bridge's registry-first v2 identities: (kind, entry_id, fs_path).
 
-    The generation-private socket, the bridge state tree, and the
-    delivery journal are declared before the accept loop is exposed, so
-    cleanup/monitors/inventory see them through the registry alone.  An
-    entry is marked ``created`` ONLY when its exact filesystem identity is
-    observed to exist (the socket is bound and the state tree written
-    before this runs; the delivery journal is created lazily and marked
-    by ``_mark_bridge_journal_created`` at construction).  Re-registration
-    after a crash converges on the live entry for the same generation —
-    including promoting a still-declared entry whose file now exists —
-    instead of conflicting.
+    The bridge-state resource is the EXACT state file, never the
+    reservation root: ``write_request`` creates the root in the launcher
+    process before this process starts, so the root can never satisfy the
+    declare-before-construction rule and is only the launcher-written
+    envelope, removed best-effort at teardown without a registry claim.
     """
-    from cli_agent_orchestrator.services import resource_registry as rr
-
-    registry = rr.get_resource_registry()
     reservation_id = request["reservation_id"]
-    actor = "managed_provider_bridge._serve"
-    entries = (
+    return (
         ("socket", f"{reservation_id}/bridge.sock", str(target["socket"])),
-        (
-            "bridge_state",
-            f"managed-provider-sessions/{reservation_id}",
-            str(target["root"]),
-        ),
+        ("bridge_state", f"{reservation_id}/state.json", str(target["state"])),
         (
             "db_row_set",
             f"{reservation_id}/delivery-journal.db",
             str(target["root"] / "delivery-journal.db"),
         ),
     )
-    for kind, entry_id, fs_path in entries:
+
+
+def _declare_bridge_resources(target: dict[str, pathlib.Path], request: dict[str, Any]) -> None:
+    """Durably declare the bridge's own v2 resources BEFORE construction.
+
+    Declarations commit before ``_serve`` writes ``state.json`` or binds/
+    listens on the generation-private socket, so a hard crash during
+    provider initialization leaves discoverable declared entries for
+    reconciliation — never physical artifacts with no registry row.
+    Declaration is intent-only: nothing is marked ``created`` here, even
+    if a stale artifact already occupies the path.  Creation is receipted
+    by ``_mark_bridge_resource_created`` / ``_mark_bridge_journal_created``
+    only against the exact observed identity.  Re-declaration after a
+    crash converges on the live entry for the same generation instead of
+    conflicting.
+    """
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    registry = rr.get_resource_registry()
+    actor = "managed_provider_bridge._serve"
+    for kind, entry_id, fs_path in _bridge_resources(target, request):
         existing = registry.resolve_fs_path(fs_path)
         if existing is not None and existing["generation"] == request["generation"]:
-            if existing["lifecycle_state"] == "declared" and pathlib.Path(fs_path).exists():
-                registry.register_created(
-                    entry_id,
-                    actor_id=actor,
-                    observed={"observed_fs_path": fs_path},
-                    existence_receipt_digest=rr.receipt_digest(
-                        {"entry_id": entry_id, "observed_fs_path": fs_path}
-                    ),
-                )
             continue  # converge after a crash: the live entry is already ours
         registry.declare(
             entry_id=entry_id,
@@ -1283,15 +1283,36 @@ def _register_bridge_resources(target: dict[str, pathlib.Path], request: dict[st
             actor_id=actor,
             desired_fs_path=fs_path,
         )
-        if pathlib.Path(fs_path).exists():
-            registry.register_created(
-                entry_id,
-                actor_id=actor,
-                observed={"observed_fs_path": fs_path},
-                existence_receipt_digest=rr.receipt_digest(
-                    {"entry_id": entry_id, "observed_fs_path": fs_path}
-                ),
-            )
+
+
+def _mark_bridge_resource_created(
+    target: dict[str, pathlib.Path], request: dict[str, Any], kind: str
+) -> None:
+    """Receipt one bridge resource's observed physical creation.
+
+    Called only after the exact filesystem identity exists (the state
+    file write, or the socket bind/listen); a declared entry whose
+    artifact is absent is never promoted.  Runs before the accept loop is
+    exposed, so a registry failure here fails the bridge closed.
+    """
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    actor = "managed_provider_bridge._serve"
+    entries = {
+        k: (entry_id, fs_path) for k, entry_id, fs_path in _bridge_resources(target, request)
+    }
+    entry_id, fs_path = entries[kind]
+    registry = rr.get_resource_registry()
+    entry = registry.resolve(entry_id)
+    if entry["lifecycle_state"] == "declared" and pathlib.Path(fs_path).exists():
+        registry.register_created(
+            entry_id,
+            actor_id=actor,
+            observed={"observed_fs_path": fs_path},
+            existence_receipt_digest=rr.receipt_digest(
+                {"entry_id": entry_id, "observed_fs_path": fs_path}
+            ),
+        )
 
 
 def _mark_bridge_journal_created(target: dict[str, pathlib.Path], request: dict[str, Any]) -> None:
@@ -1322,18 +1343,29 @@ def _mark_bridge_journal_created(target: dict[str, pathlib.Path], request: dict[
         pass  # never declared (tests bypassing registration): nothing to mark
 
 
-def _deregister_bridge_resources(target: dict[str, pathlib.Path], request: dict[str, Any]) -> None:
+def _deregister_bridge_resources(
+    target: dict[str, pathlib.Path], request: dict[str, Any], *, retain_state: bool = False
+) -> None:
     """Drain/close/delete the bridge's registry entries, truthfully.
 
     A still-declared entry is aborted ONLY on a verified-absence probe; a
     created entry is drained/closed, its physical artifact (socket, state
-    tree, journal DB and WAL/SHM siblings) is actually removed, and it is
+    file, journal DB and WAL/SHM siblings) is actually removed, and it is
     marked deleted ONLY after a real absence check — a resource that is
     still present keeps its row instead of a synthesized absence claim.
+    With ``retain_state`` (the controlled-failure path) the state file is
+    deliberately kept as the launcher's ``preflight_blocked`` diagnostic:
+    its row stays ``closed`` — present and discoverable, never deleted
+    underneath a surviving artifact.  The launcher-written envelope
+    (``request.json`` and the reservation root, created by
+    ``write_request`` before this process started) is not a registry
+    resource; it is removed best-effort once the registered resources are
+    reconciled, and a retained diagnostic keeps the root present.
     """
     from cli_agent_orchestrator.services import resource_registry as rr
 
     actor = "managed_provider_bridge._serve"
+    state_entry_id = f"{request['reservation_id']}/state.json"
     try:
         registry = rr.get_resource_registry()
         entries = registry.enumerate(
@@ -1388,6 +1420,10 @@ def _deregister_bridge_resources(target: dict[str, pathlib.Path], request: dict[
                 state = "draining"
             if state == "draining":
                 registry.close(entry_id, actor_id=actor)
+            if retain_state and entry_id == state_entry_id:
+                # Controlled-failure diagnostic: the row stays closed and
+                # the file present — discoverable, never a false absence.
+                continue
             if fs_path:
                 _remove(fs_path)
             if not fs_path or not pathlib.Path(fs_path).exists():
@@ -1398,6 +1434,13 @@ def _deregister_bridge_resources(target: dict[str, pathlib.Path], request: dict[
                 )
         except Exception:  # noqa: BLE001 - best-effort teardown
             logger.warning("bridge resource %s deregistration failed", entry_id, exc_info=True)
+
+    # The launcher-written envelope is not registry-tracked; remove it
+    # best-effort once the entries above are reconciled.
+    with contextlib.suppress(OSError):
+        (target["root"] / "request.json").unlink()
+    with contextlib.suppress(OSError):
+        target["root"].rmdir()
 
 
 def _handle_actor_assertion(
@@ -1565,17 +1608,28 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
         "readiness": None,
         "submission": None,
     }
-    _atomic_json(target["state"], state)
     session: Optional[_ProviderSession] = None
     registered = False
+    blocked = False
     with contextlib.suppress(FileNotFoundError):
         target["socket"].unlink()
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
+        # Registry-first, declaration-before-construction: the bridge's
+        # own socket/state/journal identities are durably declared BEFORE
+        # any physical v2 artifact is written or bound, so a hard crash in
+        # the provider-initialization window leaves discoverable declared
+        # entries — never unregistered state/socket orphans (fail-closed,
+        # like the v2 terminal constructor).
+        _declare_bridge_resources(target, request)
+        registered = True
+        _atomic_json(target["state"], state)
+        _mark_bridge_resource_created(target, request, "bridge_state")
         session = _ProviderSession(request)
         server.bind(str(target["socket"]))
         os.chmod(target["socket"], 0o600)
         server.listen(8)
+        _mark_bridge_resource_created(target, request, "socket")
         readiness = session.initialize()
         session._scan_companion_events()
         state.update({"state": "ready", "readiness": readiness})
@@ -1586,11 +1640,6 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
         # call. Neither capability existed before this wiring.
         broker = _build_actor_broker(request, session)
         journal: Any = None
-        # Registry-first: the bridge's own socket/state/journal resources
-        # are declared and receipt-marked before the accept loop is
-        # exposed (fail-closed, like the v2 terminal constructor).
-        _register_bridge_resources(target, request)
-        registered = True
         print(
             f"[managed-provider-ready] provider={request['provider']} "
             f"session={readiness['provider_session_id']} generation={request['generation']}",
@@ -1825,6 +1874,7 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
         state.update({"state": "preflight_blocked", "error": str(exc)})
         _atomic_json(target["state"], state)
         print(f"[managed-provider-blocked] {exc}", file=sys.stderr, flush=True)
+        blocked = True
         return 1
     finally:
         server.close()
@@ -1833,7 +1883,10 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
         if session is not None:
             session.close()
         if registered:
-            _deregister_bridge_resources(target, request)
+            # Controlled failure keeps the state file as the launcher's
+            # diagnostic (its row stays closed, present and discoverable);
+            # every other resource converges to real absence.
+            _deregister_bridge_resources(target, request, retain_state=blocked)
     return 0
 
 

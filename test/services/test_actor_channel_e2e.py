@@ -88,8 +88,9 @@ def live_bridge(short_root, monkeypatch):
     )
     # Keep this test's state root registry-free; registry-first bridge
     # resources have their own dedicated coverage.
-    monkeypatch.setattr(bridge, "_register_bridge_resources", lambda *a: None)
-    monkeypatch.setattr(bridge, "_deregister_bridge_resources", lambda *a: None)
+    monkeypatch.setattr(bridge, "_declare_bridge_resources", lambda *a: None)
+    monkeypatch.setattr(bridge, "_mark_bridge_resource_created", lambda *a: None)
+    monkeypatch.setattr(bridge, "_deregister_bridge_resources", lambda *a, **k: None)
     target = _target(short_root)
     captured: dict = {}
 

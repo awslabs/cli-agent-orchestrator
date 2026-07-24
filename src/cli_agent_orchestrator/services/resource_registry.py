@@ -856,17 +856,21 @@ _BRIDGE = "managed_provider_bridge._serve"
 # any physical construction), transitioned to created in
 # ``_mark_v2_resource_created`` only after observed creation, and deleted
 # in ``_deregister_v2_terminal_resources`` only after a real absence
-# probe; bridge resources follow the same rules in
-# ``_register_bridge_resources`` / ``_mark_bridge_journal_created`` /
-# ``_deregister_bridge_resources``.
+# probe.  Bridge resources follow the same rule: ``_serve`` calls
+# ``_declare_bridge_resources`` BEFORE writing state.json or binding the
+# socket, receipts observed creation through
+# ``_mark_bridge_resource_created`` / ``_mark_bridge_journal_created``,
+# and deletes in ``_deregister_bridge_resources`` only after a real
+# absence probe.
 _TS_DECLARE = f"{_TS}:328"  # registry.declare in _register_v2_terminal_resources
 _TS_MARK = f"{_TS}:376"  # registry.register_created in _mark_v2_resource_created
 _TS_MONITOR = f"{_TS}:344"  # registry.monitor in _register_v2_terminal_resources
 _TS_DELETE = f"{_TS}:601"  # registry.delete in _deregister_v2_terminal_resources
 _CS_RESOLVE = f"{_CS}:112"  # registry.resolve_fs_path in cleanup_old_data
-_BR_DECLARE = f"{_BR}:1272"  # registry.declare in _register_bridge_resources
-_BR_JOURNAL_MARK = f"{_BR}:1313"  # registry.register_created in _mark_bridge_journal_created
-_BR_DELETE = f"{_BR}:1394"  # registry.delete in _deregister_bridge_resources
+_BR_DECLARE = f"{_BR}:1272"  # registry.declare in _declare_bridge_resources
+_BR_MARK = f"{_BR}:1308"  # registry.register_created in _mark_bridge_resource_created
+_BR_JOURNAL_MARK = f"{_BR}:1334"  # registry.register_created in _mark_bridge_journal_created
+_BR_DELETE = f"{_BR}:1430"  # registry.delete in _deregister_bridge_resources
 
 _MANIFEST_SPEC: tuple[tuple[str, str, str, str], ...] = (
     # --- terminal log artifacts (constructor + generation deleter + retention)
@@ -910,8 +914,10 @@ _MANIFEST_SPEC: tuple[tuple[str, str, str, str], ...] = (
     (_TS_DECLARE, "declare", "other", _CREATE),
     (_TS_MONITOR, "monitor", "other", _CREATE),
     (_BR_DECLARE, "declare", "socket", _BRIDGE),
+    (_BR_MARK, "register_created", "socket", _BRIDGE),
     (_BR_DELETE, "delete", "socket", _BRIDGE),
     (_BR_DECLARE, "declare", "bridge_state", _BRIDGE),
+    (_BR_MARK, "register_created", "bridge_state", _BRIDGE),
     (_BR_DELETE, "delete", "bridge_state", _BRIDGE),
     (_BR_DECLARE, "declare", "db_row_set", _BRIDGE),
     (_BR_JOURNAL_MARK, "register_created", "db_row_set", _BRIDGE),

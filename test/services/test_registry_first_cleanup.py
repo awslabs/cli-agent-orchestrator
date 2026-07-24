@@ -246,7 +246,7 @@ def test_register_v2_terminal_resources_covers_manifest_kinds(tmp_path, monkeypa
         window = f"managed-{terminal_id}-abcdef123456"
         terminals._register_v2_terminal_resources(terminal_id, generation, window, "cao-test")
         # Production wiring is complete only once the bridge has also
-        # registered its socket/state/journal for the same generation.
+        # declared its socket/state/journal for the same generation.
         from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 
         reservation_id = str(uuid.uuid4())
@@ -256,7 +256,7 @@ def test_register_v2_terminal_resources_covers_manifest_kinds(tmp_path, monkeypa
             "state": root / "state.json",
             "socket": root / "bridge.sock",
         }
-        bridge._register_bridge_resources(
+        bridge._declare_bridge_resources(
             target,
             {
                 "reservation_id": reservation_id,
@@ -315,9 +315,10 @@ def test_register_v2_terminal_resources_covers_manifest_kinds(tmp_path, monkeypa
 
 
 def test_bridge_resources_register_and_deregister(tmp_path, monkeypatch):
-    """The bridge's socket/state/journal resources are registry-first too,
-    with created only after observed existence and deletion only after
-    real removal."""
+    """The bridge's socket/state/journal resources are registry-first too:
+    declaration is intent-only and never claims the pre-existing
+    reservation root, created is recorded only after observed existence,
+    and deletion only after real removal."""
     from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 
     home = tmp_path / "cao-home"
@@ -339,22 +340,31 @@ def test_bridge_resources_register_and_deregister(tmp_path, monkeypatch):
             "terminal_id": "a1b2c3d4",
             "generation": generation,
         }
-        # Only the state tree exists at registration: socket and journal
-        # entries are declared, never manufactured as created.
-        target["state"].write_text("{}", encoding="utf-8")
-        bridge._register_bridge_resources(target, request)
+        # Declaration comes BEFORE any bridge physical construction: the
+        # reservation root already exists (write_request creates it in the
+        # launcher process) but is NOT the bridge-state resource — the
+        # exact state file is, and nothing is marked created yet.
+        bridge._declare_bridge_resources(target, request)
         registry = rr.get_resource_registry()
         entries = registry.enumerate(terminal_id="a1b2c3d4", generation=generation)
         assert {e["kind"] for e in entries} == {"socket", "bridge_state", "db_row_set"}
         by_kind = {e["kind"]: e for e in entries}
+        assert by_kind["bridge_state"]["desired_fs_path"] == str(target["state"])
+        assert all(e["lifecycle_state"] == "declared" for e in entries)
+        # Observed creation transitions only the artifact that really exists.
+        target["state"].write_text("{}", encoding="utf-8")
+        bridge._mark_bridge_resource_created(target, request, "bridge_state")
+        by_kind = {
+            e["kind"]: e for e in registry.enumerate(terminal_id="a1b2c3d4", generation=generation)
+        }
         assert by_kind["bridge_state"]["lifecycle_state"] == "created"
-        assert by_kind["bridge_state"]["observed_fs_path"] == str(root)
+        assert by_kind["bridge_state"]["observed_fs_path"] == str(target["state"])
         assert by_kind["socket"]["lifecycle_state"] == "declared"
         assert by_kind["db_row_set"]["lifecycle_state"] == "declared"
         # The socket and journal appear later: observed creation.
         target["socket"].write_text("", encoding="utf-8")
         (root / "delivery-journal.db").write_text("", encoding="utf-8")
-        bridge._register_bridge_resources(target, request)
+        bridge._mark_bridge_resource_created(target, request, "socket")
         bridge._mark_bridge_journal_created(target, request)
         by_kind = {
             e["kind"]: e for e in registry.enumerate(terminal_id="a1b2c3d4", generation=generation)
@@ -514,3 +524,264 @@ def test_v2_construction_is_journal_first_and_teardown_is_truthful(tmp_path, mon
     finally:
         rr.reset_resource_registry()
         engine.dispose()
+
+
+def test_bridge_serve_declares_before_physical_construction(monkeypatch):
+    """Production-path ordering regression (P1): inside the real ``_serve``
+    the durable declarations precede the state-file write and the socket
+    bind/listen, created is receipted only against the exact observed
+    artifact, and a controlled pre-exposure failure tears down truthfully
+    — the socket really removed before its delete, the never-created
+    journal aborted on a verified-absence probe, and the diagnostic state
+    file retained with its row closed (present, never synthesized away)."""
+    import json
+    import tempfile
+
+    from cli_agent_orchestrator.services import managed_provider_bridge as bridge
+
+    with tempfile.TemporaryDirectory(prefix="lb-brq-", dir="/tmp") as root_arg:
+        base = Path(root_arg)
+        home = base / "cao-home"
+        home.mkdir()
+        monkeypatch.setattr("cli_agent_orchestrator.constants.CAO_HOME_DIR", home)
+        monkeypatch.setattr(bridge, "BRIDGE_ROOT", base / "managed-provider-sessions")
+        rr.reset_resource_registry()
+        try:
+            reservation_id = str(uuid.uuid4())
+            generation = str(uuid.uuid4())
+            terminal_id = "a1b2c3d4"
+            request = {
+                "reservation_id": reservation_id,
+                "terminal_id": terminal_id,
+                "generation": generation,
+                "provider": "codex",
+            }
+            # The production launcher envelope: write_request creates the
+            # reservation root (and request.json) before the bridge starts.
+            target = bridge.write_request(reservation_id, request)
+            assert target["root"].exists() and not target["state"].exists()
+            registry = rr.get_resource_registry()
+            observed: dict[str, object] = {}
+            real_atomic = bridge._atomic_json
+
+            def _observing_atomic(path, value):
+                if path == target["state"] and "at_first_state_write" not in observed:
+                    observed["state_file_existed"] = path.exists()
+                    observed["socket_existed"] = target["socket"].exists()
+                    observed["at_first_state_write"] = {
+                        e["kind"]: e["lifecycle_state"]
+                        for e in registry.enumerate(terminal_id=terminal_id, generation=generation)
+                    }
+                return real_atomic(path, value)
+
+            monkeypatch.setattr(bridge, "_atomic_json", _observing_atomic)
+
+            class _InitFailure:
+                def __init__(self, _request):
+                    pass
+
+                def initialize(self):
+                    observed["socket_bound_at_initialize"] = target["socket"].exists()
+                    observed["at_initialize"] = {
+                        e["kind"]: e["lifecycle_state"]
+                        for e in registry.enumerate(terminal_id=terminal_id, generation=generation)
+                    }
+                    raise bridge.BridgeError("provider initialization failed")
+
+                def close(self):
+                    pass
+
+            monkeypatch.setattr(bridge, "_ProviderSession", _InitFailure)
+
+            assert bridge._serve(request, target) == 1
+
+            # Declaration-before-physical: at the first state write every
+            # entry was already durably declared and neither physical
+            # artifact existed.
+            assert observed["state_file_existed"] is False
+            assert observed["socket_existed"] is False
+            assert observed["at_first_state_write"] == {
+                "socket": "declared",
+                "bridge_state": "declared",
+                "db_row_set": "declared",
+            }
+            # Observed-only creation: by provider initialization the state
+            # file and the bound socket were receipted created; the lazy
+            # journal stays declared.
+            assert observed["socket_bound_at_initialize"] is True
+            assert observed["at_initialize"] == {
+                "socket": "created",
+                "bridge_state": "created",
+                "db_row_set": "declared",
+            }
+            # Truthful teardown of the controlled failure.
+            assert not target["socket"].exists()
+            assert target["state"].exists(), "the preflight diagnostic survives"
+            persisted = json.loads(target["state"].read_text(encoding="utf-8"))
+            assert persisted["state"] == "preflight_blocked"
+            assert "provider initialization failed" in persisted["error"]
+            final = {
+                e["kind"]: e
+                for e in registry.enumerate(terminal_id=terminal_id, generation=generation)
+            }
+            assert final["socket"]["lifecycle_state"] == "deleted"
+            assert final["db_row_set"]["lifecycle_state"] == "aborted"
+            assert final["bridge_state"]["lifecycle_state"] == "closed"
+            assert final["bridge_state"]["desired_fs_path"] == str(target["state"])
+            # No false absence: a deleted entry's artifact is really gone.
+            for entry in final.values():
+                if entry["lifecycle_state"] == "deleted" and entry["desired_fs_path"]:
+                    assert not Path(entry["desired_fs_path"]).exists()
+        finally:
+            rr.reset_resource_registry()
+
+
+def test_bridge_teardown_never_synthesizes_absence(tmp_path, monkeypatch):
+    """A bridge resource that cannot be physically removed keeps its row:
+    the registry records deletion only against a real absence probe."""
+    from cli_agent_orchestrator.services import managed_provider_bridge as bridge
+
+    home = tmp_path / "cao-home"
+    home.mkdir()
+    monkeypatch.setattr("cli_agent_orchestrator.constants.CAO_HOME_DIR", home)
+    rr.reset_resource_registry()
+    try:
+        reservation_id = str(uuid.uuid4())
+        generation = str(uuid.uuid4())
+        root = tmp_path / "managed-provider-sessions" / reservation_id
+        root.mkdir(parents=True)
+        target = {
+            "root": root,
+            "state": root / "state.json",
+            "socket": root / "bridge.sock",
+        }
+        request = {
+            "reservation_id": reservation_id,
+            "terminal_id": "a1b2c3d4",
+            "generation": generation,
+        }
+        bridge._declare_bridge_resources(target, request)
+        target["state"].write_text("{}", encoding="utf-8")
+        target["socket"].write_text("", encoding="utf-8")
+        bridge._mark_bridge_resource_created(target, request, "bridge_state")
+        bridge._mark_bridge_resource_created(target, request, "socket")
+        registry = rr.get_resource_registry()
+
+        real_unlink = Path.unlink
+
+        def _refusing_unlink(self, *args, **kwargs):
+            if self == target["socket"]:
+                raise OSError("socket unlink refused")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", _refusing_unlink)
+        bridge._deregister_bridge_resources(target, request)
+
+        # The surviving socket keeps a closed row — present and
+        # discoverable; everything converged around it truthfully.
+        assert target["socket"].exists()
+        by_kind = {
+            e["kind"]: e for e in registry.enumerate(terminal_id="a1b2c3d4", generation=generation)
+        }
+        assert by_kind["socket"]["lifecycle_state"] == "closed"
+        assert by_kind["bridge_state"]["lifecycle_state"] == "deleted"
+        assert by_kind["db_row_set"]["lifecycle_state"] == "aborted"
+        deleted = [
+            e
+            for e in by_kind.values()
+            if e["lifecycle_state"] == "deleted" and e["desired_fs_path"]
+        ]
+        assert all(not Path(e["desired_fs_path"]).exists() for e in deleted)
+    finally:
+        rr.reset_resource_registry()
+
+
+def test_bridge_hard_crash_leaves_durable_declarations():
+    """The production hard-crash window (P1): the bridge process dies
+    during provider initialization — AFTER ``state.json`` is written and
+    the real Unix socket is bound/listening.  The durable declarations and
+    the observed creation receipts are already committed, so the surviving
+    artifacts stay discoverable for reconciliation instead of becoming
+    unregistered orphans."""
+    import subprocess
+    import sys
+    import tempfile
+    import textwrap
+
+    repo_root = Path(__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory(prefix="lb-bc-", dir="/tmp") as root_arg:
+        base = Path(root_arg)
+        env = dict(os.environ)
+        # HOME is the fixture root directly: the AF_UNIX path under
+        # <home>/.aws/.../bridge.sock must stay within the macOS limit.
+        env["HOME"] = str(base)
+        env["PYTHONPATH"] = str(repo_root / "src")
+        for var in ("AUTH0_DOMAIN", "AUTH0_AUDIENCE", "CAO_AUTH_JWKS_URI"):
+            env.pop(var, None)
+        child = textwrap.dedent("""
+            import os
+            import sys
+            from unittest.mock import patch
+
+            from cli_agent_orchestrator.services import (
+                managed_provider_bridge as bridge,
+            )
+
+            request = {
+                "reservation_id": "crash-res",
+                "terminal_id": "c1a5c0de",
+                "generation": "generation-crash-probe",
+                "provider": "codex",
+            }
+            target = bridge.write_request("crash-res", request)
+
+
+            class CrashDuringInitialize:
+                def __init__(self, _request):
+                    pass
+
+                def initialize(self):
+                    # _serve has already written state.json and bound/
+                    # listened on the real Unix socket; die abruptly here.
+                    os._exit(77)
+
+                def close(self):
+                    pass
+
+
+            with patch.object(bridge, "_ProviderSession", CrashDuringInitialize):
+                bridge._serve(request, target)
+            os._exit(99)
+            """)
+        completed = subprocess.run(
+            [sys.executable, "-c", child],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+            check=False,
+        )
+        assert completed.returncode == 77, completed.stderr
+
+        cao_home = base / ".aws" / "cli-agent-orchestrator"
+        root = cao_home / "managed-provider-sessions" / "crash-res"
+        state_path = root / "state.json"
+        socket_path = root / "bridge.sock"
+        registry_path = cao_home / "resource-registry.sqlite"
+        # The physical artifacts survive the hard crash for reconciliation…
+        assert state_path.exists(), "state file must survive the hard crash"
+        assert socket_path.exists(), "bound socket path must survive the hard crash"
+        # …and the durable registry rows already exist to discover them.
+        assert registry_path.exists(), "declarations must be committed before the crash"
+        registry = rr.ResourceRegistry(registry_path)
+        entries = registry.enumerate(terminal_id="c1a5c0de", generation="generation-crash-probe")
+        by_kind = {e["kind"]: e for e in entries}
+        assert set(by_kind) == {"socket", "bridge_state", "db_row_set"}
+        assert by_kind["bridge_state"]["lifecycle_state"] == "created"
+        assert by_kind["bridge_state"]["desired_fs_path"] == str(state_path)
+        assert by_kind["socket"]["lifecycle_state"] == "created"
+        assert by_kind["socket"]["desired_fs_path"] == str(socket_path)
+        assert by_kind["db_row_set"]["lifecycle_state"] == "declared"
+        # The surviving artifacts resolve to their live rows: no orphans.
+        assert registry.resolve_fs_path(str(socket_path)) is not None
+        assert registry.resolve_fs_path(str(state_path)) is not None

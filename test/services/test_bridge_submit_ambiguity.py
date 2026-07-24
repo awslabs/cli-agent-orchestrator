@@ -60,8 +60,9 @@ def _serve_in_thread(request, target, monkeypatch=None):
     if monkeypatch is not None:
         # The registry-first bridge registration is exercised in its own
         # dedicated tests; these tests keep the state root registry-free.
-        monkeypatch.setattr(bridge, "_register_bridge_resources", lambda *a: None)
-        monkeypatch.setattr(bridge, "_deregister_bridge_resources", lambda *a: None)
+        monkeypatch.setattr(bridge, "_declare_bridge_resources", lambda *a: None)
+        monkeypatch.setattr(bridge, "_mark_bridge_resource_created", lambda *a: None)
+        monkeypatch.setattr(bridge, "_deregister_bridge_resources", lambda *a, **k: None)
     server = threading.Thread(target=bridge._serve, args=(request, target), daemon=True)
     server.start()
     for _ in range(200):
