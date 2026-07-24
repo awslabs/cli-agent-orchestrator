@@ -86,11 +86,12 @@ class TestSessionPluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_dispatches_post_kill_session_event_after_cleanup(
-        self, mock_tmux, mock_list_terminals, mock_delete_terminal
+        self, mock_tmux, mock_list_terminals, mock_delete_terminal, mock_sweep
     ):
         """Session kill should emit after per-terminal cleanup and the tmux kill succeed."""
         registry = _registry_mock()
@@ -100,8 +101,8 @@ class TestSessionPluginEvents:
             call_order.append("dispatch")
 
         mock_tmux.return_value.session_exists.return_value = True
-        mock_tmux.return_value.kill_session.side_effect = lambda *_: call_order.append(
-            "kill_session"
+        mock_tmux.return_value.kill_session.side_effect = lambda *_: (
+            call_order.append("kill_session") or True
         )
         # One contained terminal so we can assert it is torn down before the
         # session is killed and the event is emitted.

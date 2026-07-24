@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 class TmuxClient:
     """Simplified tmux client for basic operations."""
 
+    _KILL_SESSION_VERIFY_TIMEOUT_SECONDS = 2.0
+    _KILL_SESSION_VERIFY_INTERVAL_SECONDS = 0.2
+
     def __init__(self) -> None:
         self.server = libtmux.Server()
 
@@ -562,13 +565,29 @@ class TmuxClient:
             return []
 
     def kill_session(self, session_name: str) -> bool:
-        """Kill tmux session."""
+        """Kill tmux session, returning True only once it is confirmed gone."""
         try:
             session = self.server.sessions.get(session_name=session_name)
             if session:
                 session.kill()
-                logger.info(f"Killed tmux session: {session_name}")
-                return True
+                start = time.monotonic()
+                deadline = start + self._KILL_SESSION_VERIFY_TIMEOUT_SECONDS
+                while True:
+                    if not self.session_exists(session_name):
+                        logger.info(f"Killed tmux session: {session_name}")
+                        return True
+                    if time.monotonic() >= deadline:
+                        # Elapsed time helps diagnose a false negative: on a
+                        # heavily loaded host tmux can take longer than the
+                        # bound to reap a session that kill() did dispatch, so a
+                        # caller re-run will typically then see it gone.
+                        elapsed = time.monotonic() - start
+                        logger.error(
+                            f"Tmux session {session_name} still exists "
+                            f"{elapsed:.2f}s after kill_session"
+                        )
+                        return False
+                    time.sleep(self._KILL_SESSION_VERIFY_INTERVAL_SECONDS)
             return False
         except Exception as e:
             logger.error(f"Failed to kill session {session_name}: {e}")
