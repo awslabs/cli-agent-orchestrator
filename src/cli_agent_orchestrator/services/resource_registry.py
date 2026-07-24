@@ -912,10 +912,10 @@ _BRIDGE = "managed_provider_bridge._serve"
 # ``_mark_bridge_resource_created`` / ``_mark_bridge_journal_created``,
 # and deletes in ``_deregister_bridge_resources`` only after a real
 # absence probe.
-_TS_DECLARE = f"{_TS}:343"  # registry.declare in _register_v2_terminal_resources
-_TS_MARK = f"{_TS}:391"  # registry.register_created in _mark_v2_resource_created
-_TS_MONITOR = f"{_TS}:359"  # registry.monitor in _register_v2_terminal_resources
-_TS_DELETE = f"{_TS}:634"  # registry.delete in _deregister_v2_terminal_resources
+_TS_DECLARE = f"{_TS}:344"  # registry.declare in _register_v2_terminal_resources
+_TS_MARK = f"{_TS}:392"  # registry.register_created in _mark_v2_resource_created
+_TS_MONITOR = f"{_TS}:360"  # registry.monitor in _register_v2_terminal_resources
+_TS_DELETE = f"{_TS}:635"  # registry.delete in _deregister_v2_terminal_resources
 _CS_RESOLVE = f"{_CS}:112"  # registry.resolve_fs_path in cleanup_old_data
 _BR_DECLARE = f"{_BR}:2927"  # registry.declare in _declare_bridge_resources
 _BR_MARK = f"{_BR}:2971"  # registry.register_created in _mark_bridge_resource_created

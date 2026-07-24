@@ -146,6 +146,13 @@ class TerminalBackend(ABC):
         window, or None when the backend cannot resolve one."""
         return None
 
+    def terminal_bound_window_identity(
+        self, terminal_id: str, session_name: str, window_name: str
+    ) -> Optional[Dict[str, str]]:
+        """Return an immutable window identity only when the backend can prove
+        the live pane is still bound to ``terminal_id``."""
+        return None
+
     def create_window_with_argv(
         self,
         session_name: str,

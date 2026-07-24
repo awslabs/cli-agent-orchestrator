@@ -33,6 +33,7 @@ from sqlalchemy.exc import OperationalError
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
+    backfill_terminal_identity_if_missing,
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
@@ -1575,6 +1576,36 @@ def get_terminal(terminal_id: str) -> Dict:
         metadata = _get_terminal_metadata_any(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        # A pre-identity-persistence terminal is eligible only when BOTH
+        # fields are absent.  The backend must prove the candidate pane's
+        # process lineage still carries this exact terminal id; the mutable
+        # window name merely locates a candidate and is never sufficient.
+        if (
+            "pane_id" in metadata
+            and "window_id" in metadata
+            and metadata.get("pane_id") is None
+            and metadata.get("window_id") is None
+            and metadata.get("protocol_vintage") != "v2"
+        ):
+            identity = get_backend().terminal_bound_window_identity(
+                terminal_id,
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+            )
+            if (
+                isinstance(identity, dict)
+                and isinstance(identity.get("pane_id"), str)
+                and identity["pane_id"]
+                and isinstance(identity.get("window_id"), str)
+                and identity["window_id"]
+                and backfill_terminal_identity_if_missing(
+                    terminal_id, identity["pane_id"], identity["window_id"]
+                )
+            ):
+                refreshed = get_terminal_metadata(terminal_id)
+                if refreshed is not None:
+                    metadata = refreshed
 
         status = status_monitor.get_status(terminal_id).value
 
