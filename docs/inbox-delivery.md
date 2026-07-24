@@ -2,7 +2,12 @@
 
 ## Overview
 
-When an agent calls `send_message(terminal_id, message)`, the message is queued in the database and delivered to the target terminal's input area via bracketed paste. Delivery has two paths:
+When an agent calls `send_message(terminal_id, message)`, the message is queued in the database and delivered to the target terminal's input area as a bracketed paste. How the bracketing is applied depends on the host's tmux version (issue #413):
+
+- **tmux < 3.7**: CAO wraps the buffer in hand-crafted `ESC [200~` / `ESC [201~` markers and pastes with `paste-buffer -r`. This guarantees bracketed framing even for TUIs that never enable bracketed paste mode (DECSET 2004) themselves — e.g. kiro-cli — so multi-line messages arrive as one input.
+- **tmux >= 3.7**: pasted buffer content passes through `vis(3)` sanitization (hardening against bracket-end injection), so hand-crafted markers would render as literal `^[[200~` garbage. CAO loads only the raw message bytes and pastes with `paste-buffer -p`; tmux emits genuine markers conditionally on the pane's DECSET 2004 state. TUIs that never enable 2004 receive raw text and multi-line content submits per line — tmux-sanctioned semantics with no workaround short of `paste-buffer -S`, which CAO refuses because it bypasses the sanitization.
+
+Delivery has two paths:
 
 1. **Immediate**: the API endpoint attempts delivery right after persisting the message
 2. **Watchdog**: a `PollingObserver` (5s interval) monitors terminal log files for changes and attempts delivery when idle patterns are detected
