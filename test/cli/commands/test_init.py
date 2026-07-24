@@ -1,7 +1,6 @@
 """Tests for the init CLI command."""
 
 import errno
-import os
 import shutil
 import uuid
 from pathlib import Path
@@ -308,7 +307,7 @@ class TestSeedDefaultSkills:
             (destination / "winner.txt").write_text("preserve me")
             raise FileExistsError(errno.EEXIST, "destination exists", target)
 
-        monkeypatch.setattr(os, "rename", concurrent_rename)
+        monkeypatch.setattr(Path, "rename", concurrent_rename)
 
         seeded_count = seed_default_skills()
 
