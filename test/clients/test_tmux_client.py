@@ -1,6 +1,8 @@
 """Tests for TmuxClient methods (mocked libtmux — no real tmux required)."""
 
+import io
 import os
+import subprocess
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -92,6 +94,74 @@ class TestTerminalBoundWindowIdentity:
 
         assert result is None
         descendants.assert_not_called()
+
+    def test_descendant_processes_returns_bounded_tree(self, tmux):
+        observed = subprocess.CompletedProcess(
+            args=["ps"],
+            returncode=0,
+            stdout="101 1\n102 101\n103 102\n200 1\n",
+        )
+        with (
+            patch("cli_agent_orchestrator.clients.tmux.shutil.which", return_value="/bin/ps"),
+            patch(
+                "cli_agent_orchestrator.clients.tmux.subprocess.run",
+                return_value=observed,
+            ),
+        ):
+            assert tmux._descendant_processes(101) == [101, 102, 103]
+
+    def test_descendant_processes_refuses_malformed_or_oversized_observation(self, tmux):
+        malformed = subprocess.CompletedProcess(
+            args=["ps"],
+            returncode=0,
+            stdout="not-a-process-row\n",
+        )
+        children = "\n".join(f"{pid} 101" for pid in range(102, 167))
+        oversized = subprocess.CompletedProcess(args=["ps"], returncode=0, stdout=children)
+        with (
+            patch("cli_agent_orchestrator.clients.tmux.shutil.which", return_value="/bin/ps"),
+            patch(
+                "cli_agent_orchestrator.clients.tmux.subprocess.run",
+                side_effect=[malformed, oversized],
+            ),
+        ):
+            assert tmux._descendant_processes(101) is None
+            assert tmux._descendant_processes(101) is None
+
+    def test_descendant_processes_refuses_failed_observation(self, tmux):
+        failed = subprocess.CompletedProcess(args=["ps"], returncode=1, stdout="")
+        with (
+            patch("cli_agent_orchestrator.clients.tmux.shutil.which", return_value="/bin/ps"),
+            patch(
+                "cli_agent_orchestrator.clients.tmux.subprocess.run",
+                side_effect=[subprocess.TimeoutExpired("ps", 2), failed],
+            ),
+        ):
+            assert tmux._descendant_processes(101) is None
+            assert tmux._descendant_processes(101) is None
+
+    def test_process_terminal_id_reads_exact_environment_entry(self, tmux):
+        environment = io.BytesIO(b"PATH=/bin\0CAO_TERMINAL_ID=abcd1234\0")
+        with patch("builtins.open", return_value=environment):
+            assert tmux._process_has_terminal_id(101, "abcd1234") is True
+
+    def test_process_terminal_id_uses_fail_closed_ps_fallback(self, tmux):
+        matching = subprocess.CompletedProcess(
+            args=["ps"],
+            returncode=0,
+            stdout=b"agent CAO_TERMINAL_ID=abcd1234 OTHER=value",
+        )
+        failed = subprocess.CompletedProcess(args=["ps"], returncode=1, stdout=b"")
+        with (
+            patch("builtins.open", side_effect=OSError),
+            patch("cli_agent_orchestrator.clients.tmux.shutil.which", return_value="/bin/ps"),
+            patch(
+                "cli_agent_orchestrator.clients.tmux.subprocess.run",
+                side_effect=[matching, failed],
+            ),
+        ):
+            assert tmux._process_has_terminal_id(101, "abcd1234") is True
+            assert tmux._process_has_terminal_id(101, "abcd1234") is False
 
 
 # ── create_session ───────────────────────────────────────────────────
