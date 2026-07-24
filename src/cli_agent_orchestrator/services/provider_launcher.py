@@ -35,7 +35,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 
 def _read_available(stream, size: int) -> bytes:
@@ -113,7 +113,9 @@ def _channel_loop(sock: socket.socket) -> None:
                     return
 
 
-def _open_channel(socket_path: str, binding_identity: dict[str, str]) -> Optional[socket.socket]:
+def _open_channel(
+    socket_path: str, binding_identity: dict[str, str]
+) -> Optional[tuple[socket.socket, Any]]:
     """Connect to the generation-private bridge socket as the provider peer."""
     from cli_agent_orchestrator.services.managed_provider_bridge import (
         BridgeError,
@@ -121,15 +123,24 @@ def _open_channel(socket_path: str, binding_identity: dict[str, str]) -> Optiona
     )
 
     sock: Optional[socket.socket] = None
+    verification: Any = None
     for _ in range(200):
         try:
             # Re-read the O_EXCL binding immediately before every connect
             # attempt; never carry an earlier verification across retries.
-            verify_rendezvous_binding(socket_path, binding_identity)
+            verification = verify_rendezvous_binding(socket_path, binding_identity)
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.connect(socket_path)
+            # A pathname swap during connect gets no handshake bytes.
+            verify_rendezvous_binding(
+                socket_path,
+                binding_identity,
+                expected=verification,
+            )
             break
         except BridgeError:
+            if sock is not None:
+                sock.close()
             return None
         except OSError:
             if sock is not None:
@@ -138,16 +149,29 @@ def _open_channel(socket_path: str, binding_identity: dict[str, str]) -> Optiona
             time.sleep(0.05)
     if sock is None:
         return None
+    if verification is None:
+        sock.close()
+        return None
     hello = {
         "rendezvous_identity": binding_identity,
         "request": {"op": "provider-channel", "pid": os.getpid()},
     }
     try:
         sock.sendall(json.dumps(hello).encode() + b"\n")
+        # Pin the same claim on both sides of the handshake send. A later
+        # provider spawn may rely only on this unchanged channel/claim pair.
+        verify_rendezvous_binding(
+            socket_path,
+            binding_identity,
+            expected=verification,
+        )
     except OSError:
         sock.close()
         return None
-    return sock
+    except BridgeError:
+        sock.close()
+        return None
+    return sock, verification
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -174,10 +198,26 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Verify the full rendezvous tuple and establish the provider-originated
     # channel before the real provider child can have any effect.
-    channel = _open_channel(args.socket, binding_identity)
-    if channel is None:
+    opened = _open_channel(args.socket, binding_identity)
+    if opened is None:
         return 1
+    channel, verification = opened
+    from cli_agent_orchestrator.services.managed_provider_bridge import (
+        BridgeError,
+        verify_launch_binding_identity,
+        verify_rendezvous_binding,
+    )
+
     try:
+        # This is the actual provider-effect boundary: both the repository
+        # HEAD and the exact sidecar/socket inodes must still match the
+        # channel established above. Drift refuses before real-provider Popen.
+        verify_launch_binding_identity(binding_identity)
+        verify_rendezvous_binding(
+            args.socket,
+            binding_identity,
+            expected=verification,
+        )
         child = subprocess.Popen(
             provider_argv,
             stdin=subprocess.PIPE,
@@ -187,6 +227,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             stderr=None,
             env=dict(os.environ),
         )
+    except BridgeError:
+        channel.close()
+        return 1
     except Exception:
         channel.close()
         raise

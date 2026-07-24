@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -21,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
+from cli_agent_orchestrator.services import resource_registry as rr
 from cli_agent_orchestrator.services.delivery_journal import (
     DeliveryJournal,
     DeliveryTransitionRefused,
@@ -33,14 +35,37 @@ def short_root(monkeypatch):
     # macOS for a bridge socket, so the bridge root lives under /tmp.
     with tempfile.TemporaryDirectory(prefix="lb-amb-") as root:
         root_path = Path(root)
+        subprocess.run(["git", "init", "-q"], cwd=root_path, check=True)
+        (root_path / "identity.txt").write_text("submit-ambiguity\n", encoding="utf-8")
+        subprocess.run(["git", "add", "identity.txt"], cwd=root_path, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=submit-ambiguity-test",
+                "-c",
+                "user.email=submit-ambiguity@example.test",
+                "commit",
+                "-qm",
+                "identity",
+            ],
+            cwd=root_path,
+            check=True,
+        )
         monkeypatch.setattr(bridge, "RENDEZVOUS_ROOT", root_path / "runtime")
-        yield root_path
+        rr.reset_resource_registry()
+        rr.get_resource_registry(root_path / "registry.sqlite")
+        try:
+            yield root_path
+        finally:
+            rr.reset_resource_registry()
 
 
 def _target(root, request):
+    bridge_root = root / "bridge" / request["reservation_id"]
     target = {
-        "root": root / "bridge",
-        "state": root / "bridge" / "state.json",
+        "root": bridge_root,
+        "state": bridge_root / "state.json",
     }
     target.update(bridge.rendezvous_paths(request["rendezvous_identity"]))
     target["root"].mkdir(parents=True)
@@ -56,25 +81,21 @@ def _request(root, **overrides):
         "obligation_generation": "obligation-delivery",
     }
     request.update(overrides)
-    request["rendezvous_identity"] = {
-        "project": "test-project",
-        "task_id": request["reservation_id"],
-        "terminal_id": request["terminal_id"],
-        "terminal_generation": request["generation"],
-        "worktree_realpath": str(root.resolve()),
-        "repository": "test-repository",
-        "head": "1" * 40,
-        "actor": "cafebabe",
-    }
+    request["rendezvous_identity"] = bridge.launch_binding_identity(
+        project="test-project",
+        task_id=request["reservation_id"],
+        terminal_id=request["terminal_id"],
+        terminal_generation=request["generation"],
+        working_directory=str(root.resolve()),
+        actor="cafebabe",
+    )
     return request
 
 
 def _serve_in_thread(request, target, monkeypatch=None):
     if monkeypatch is not None:
-        # The registry-first bridge registration is exercised in its own
-        # dedicated tests; these tests keep the state root registry-free.
-        monkeypatch.setattr(bridge, "_declare_bridge_resources", lambda *a: None)
-        monkeypatch.setattr(bridge, "_mark_bridge_resource_created", lambda *a: None)
+        # The loop stays live for the assertion; suppress only its eventual
+        # daemon-thread teardown, never the production registry-first claim.
         monkeypatch.setattr(bridge, "_deregister_bridge_resources", lambda *a, **k: None)
     server = threading.Thread(target=bridge._serve, args=(request, target), daemon=True)
     server.start()

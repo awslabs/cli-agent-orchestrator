@@ -677,6 +677,28 @@ def claim_admission(
     }
     try:
         with database.SessionLocal() as db:
+            row = _query(db, reservation_id)
+            if row is None:
+                raise ManagedLaunchNotFound(f"reservation not found: {reservation_id}")
+            reservation_request = _parse_json(row.request_json, {})
+            expected_context = {
+                "project": reservation_request.get("project"),
+                "task_id": reservation_request.get("task_id"),
+            }
+            observed_context = {
+                "project": request.context.project,
+                "task_id": request.context.task_id,
+            }
+            if observed_context != expected_context:
+                raise ManagedLaunchConflict(
+                    "admission project/task identity does not match reservation: "
+                    + _canonical_json(
+                        {
+                            "expected": expected_context,
+                            "observed": observed_context,
+                        }
+                    )
+                )
             admission = {
                 **identity,
                 "status": "io-attempted",
@@ -701,8 +723,6 @@ def claim_admission(
             )
             db.commit()
             row = _query(db, reservation_id)
-            if row is None:
-                raise ManagedLaunchNotFound(f"reservation not found: {reservation_id}")
             if updated == 1:
                 return _row_dict(row), True
             existing = _parse_json(row.admission_json, None)
@@ -1124,8 +1144,8 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
         # absolute identity — never a PATH resolution.
         provider_executable, provider_digest = _executable_identity(request)
         rendezvous_identity = launch_binding_identity(
-            project=os.path.basename(record["working_directory"]),
-            task_id=record["reservation_id"],
+            project=request["project"],
+            task_id=request["task_id"],
             terminal_id=record["terminal_id"],
             terminal_generation=record["generation"],
             working_directory=record["working_directory"],
@@ -1144,6 +1164,8 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             "working_directory": record["working_directory"],
             "provider_executable": provider_executable,
             "provider_executable_sha256": provider_digest,
+            "project": request["project"],
+            "task_id": request["task_id"],
             "rendezvous_identity": rendezvous_identity,
         }
         write_request(reservation_id, bridge_request)

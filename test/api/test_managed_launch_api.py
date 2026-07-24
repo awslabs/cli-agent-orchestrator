@@ -19,6 +19,8 @@ def _reservation(tmp_path):
         "provider": "codex",
         "agent_profile": "reviewer-sol-max",
         "caller_id": "deadbeef",
+        "project": "test-project",
+        "task_id": "test-task",
         "working_directory": str(tmp_path),
         "trusted_project_root": str(tmp_path),
         "expected_model": "gpt-5.6-sol",

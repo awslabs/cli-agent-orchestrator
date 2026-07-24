@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -61,10 +62,11 @@ def _request(worktree: Path, **identity_changes):
 
 
 def _target(tmp_path: Path, request: dict):
+    root = tmp_path / request["reservation_id"]
     target = {
-        "root": tmp_path / "bridge-state",
-        "request": tmp_path / "bridge-state" / "request.json",
-        "state": tmp_path / "bridge-state" / "state.json",
+        "root": root,
+        "request": root / "request.json",
+        "state": root / "state.json",
     }
     target["root"].mkdir(parents=True, exist_ok=True)
     target.update(bridge.rendezvous_paths(request["rendezvous_identity"]))
@@ -74,7 +76,38 @@ def _target(tmp_path: Path, request: dict):
 def _bind_path(path: Path) -> socket.socket:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
+    path.chmod(0o600)
     return server
+
+
+def _declare_and_claim(request: dict, target: dict) -> int:
+    bridge._declare_bridge_resources(target, request)
+    identity, descriptor = bridge._claim_rendezvous(request, target)
+    assert identity == request["rendezvous_identity"]
+    return descriptor
+
+
+def _publish_claim(request: dict, target: dict, descriptor: int) -> None:
+    bridge._publish_socket_claim(
+        descriptor,
+        target["binding"],
+        target["socket"],
+        request["rendezvous_identity"],
+    )
+
+
+def test_rendezvous_digest_uses_domain_fixed_order_and_trailing_newline(rendezvous_env, tmp_path):
+    identity = _identity(tmp_path)
+    canonical = bridge._rendezvous_canonical_bytes(identity)
+
+    assert canonical.endswith(b"\n") and not canonical.endswith(b"\n\n")
+    payload = json.loads(canonical)
+    assert list(payload) == ["domain", *bridge.RENDEZVOUS_IDENTITY_FIELDS]
+    assert payload["domain"] == bridge.RENDEZVOUS_DIGEST_DOMAIN
+    assert {field: payload[field] for field in bridge.RENDEZVOUS_IDENTITY_FIELDS} == identity
+    digest = hashlib.sha256(canonical).hexdigest()
+    assert bridge._rendezvous_digest(identity) == digest
+    assert bridge._rendezvous_key(identity) == f"sk-{digest[:16]}"
 
 
 def test_long_cond0081_worktree_kept_exact_while_socket_is_bounded(
@@ -179,8 +212,9 @@ def test_long_cond0081_worktree_kept_exact_while_socket_is_bounded(
 def test_exact_duplicate_is_refused_without_unlink(rendezvous_env, tmp_path):
     request = _request(tmp_path)
     target = _target(tmp_path, request)
-    bridge._claim_rendezvous(request, target)
+    descriptor = _declare_and_claim(request, target)
     server = _bind_path(target["socket"])
+    _publish_claim(request, target, descriptor)
     before = target["binding"].read_bytes()
     try:
         with pytest.raises(bridge.BridgeError, match="duplicate-live"):
@@ -189,13 +223,15 @@ def test_exact_duplicate_is_refused_without_unlink(rendezvous_env, tmp_path):
         assert target["binding"].read_bytes() == before
     finally:
         server.close()
+        os.close(descriptor)
 
 
 def test_duplicate_startup_does_not_clobber_live_bridge_state(rendezvous_env, tmp_path):
     request = _request(tmp_path)
     target = bridge.write_request(request["reservation_id"], request)
-    bridge._claim_rendezvous(request, target)
+    descriptor = _declare_and_claim(request, target)
     server = _bind_path(target["socket"])
+    _publish_claim(request, target, descriptor)
     live_state = b'{"bridge_version":"live","state":"ready"}\n'
     target["state"].write_bytes(live_state)
     try:
@@ -205,6 +241,7 @@ def test_duplicate_startup_does_not_clobber_live_bridge_state(rendezvous_env, tm
         assert target["binding"].exists()
     finally:
         server.close()
+        os.close(descriptor)
 
 
 def test_forced_digest_collision_refuses_with_zero_foreign_unlink(
@@ -215,8 +252,9 @@ def test_forced_digest_collision_refuses_with_zero_foreign_unlink(
     second = _request(tmp_path, task_id="intended-task")
     first_target = _target(tmp_path, first)
     second_target = _target(tmp_path, second)
-    bridge._claim_rendezvous(first, first_target)
+    descriptor = _declare_and_claim(first, first_target)
     server = _bind_path(first_target["socket"])
+    _publish_claim(first, first_target, descriptor)
     before = first_target["binding"].read_bytes()
     try:
         with pytest.raises(bridge.BridgeError, match="socket-identity-collision"):
@@ -225,6 +263,7 @@ def test_forced_digest_collision_refuses_with_zero_foreign_unlink(
         assert first_target["binding"].read_bytes() == before
     finally:
         server.close()
+        os.close(descriptor)
 
 
 @pytest.mark.parametrize("record_kind", ["absent", "malformed"])
@@ -233,6 +272,7 @@ def test_existing_socket_with_absent_or_malformed_record_never_unlinks(
 ):
     request = _request(tmp_path)
     target = _target(tmp_path, request)
+    bridge._declare_bridge_resources(target, request)
     if record_kind == "malformed":
         target["binding"].write_text("{not-json", encoding="utf-8")
         target["binding"].chmod(0o600)
@@ -267,10 +307,9 @@ def test_handshake_mismatch_is_journaled_and_keeps_rendezvous(
     request = _request(tmp_path)
     target = _target(tmp_path, request)
     monkeypatch.setattr(bridge, "_ProviderSession", _ReadySession)
-    monkeypatch.setattr(bridge, "_declare_bridge_resources", lambda *_: None)
-    monkeypatch.setattr(bridge, "_mark_bridge_resource_created", lambda *_: None)
     monkeypatch.setattr(bridge, "_deregister_bridge_resources", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(bridge, "_build_actor_broker", lambda *_: None)
+    monkeypatch.setattr(bridge, "verify_launch_binding_identity", lambda *_: None)
     thread = threading.Thread(target=bridge._serve, args=(request, target), daemon=True)
     thread.start()
     for _ in range(200):
@@ -306,29 +345,21 @@ def test_stale_cleanup_requires_closed_exact_registry_tuple(rendezvous_env, tmp_
     request = _request(tmp_path)
     identity = request["rendezvous_identity"]
     target = _target(tmp_path, request)
-    bridge._create_binding_record(target["binding"], identity)
+    descriptor = _declare_and_claim(request, target)
     server = _bind_path(target["socket"])
+    _publish_claim(request, target, descriptor)
     server.close()
     entry_id = target["socket"].name
-    registry.declare(
-        entry_id=entry_id,
-        kind="socket",
-        protocol_vintage="v2",
-        terminal_id=request["terminal_id"],
-        generation=request["generation"],
-        owner="fork",
-        ownership="owned",
-        constructor_id="managed_provider_bridge._serve",
-        deleter_id="terminal_service.delete_terminal",
-        rollback_rule="generation-isolated",
-        actor_id="managed_provider_bridge._serve",
-        desired_fs_path=str(target["socket"]),
-        binding_identity=identity,
-    )
+    socket_identity = bridge.verify_rendezvous_binding(target["socket"], identity).record[
+        "socket_identity"
+    ]
     registry.register_created(
         entry_id,
         actor_id="managed_provider_bridge._serve",
-        observed={"observed_fs_path": str(target["socket"])},
+        observed={
+            "observed_fs_path": str(target["socket"]),
+            "observed_fs_identity": socket_identity,
+        },
         existence_receipt_digest="1" * 64,
     )
     live = registry.resolve(entry_id)
@@ -350,18 +381,227 @@ def test_stale_cleanup_requires_closed_exact_registry_tuple(rendezvous_env, tmp_
     )
     assert not target["socket"].exists()
     assert not target["binding"].exists()
+    os.close(descriptor)
 
 
 def test_declared_pre_bind_crash_compare_deletes_only_its_exact_sidecar(rendezvous_env, tmp_path):
     request = _request(tmp_path)
-    identity = request["rendezvous_identity"]
     target = bridge.write_request(request["reservation_id"], request)
     bridge._declare_bridge_resources(target, request)
-    bridge._create_binding_record(target["binding"], identity)
+    _, descriptor = bridge._claim_rendezvous(request, target)
 
     bridge._deregister_bridge_resources(target, request)
+    os.close(descriptor)
 
     assert not target["socket"].exists()
     assert not target["binding"].exists()
     socket_row = rr.get_resource_registry().resolve(target["socket"].name)
     assert socket_row["lifecycle_state"] == "aborted"
+
+
+def test_production_order_recovers_crash_after_o_excl_sidecar(
+    rendezvous_env, tmp_path, monkeypatch
+):
+    _, registry = rendezvous_env
+    request = _request(tmp_path)
+    target = bridge.write_request(request["reservation_id"], request)
+    real_claim = bridge._claim_rendezvous
+
+    class _SimulatedHardCrash(BaseException):
+        pass
+
+    def _crash_after_claim(actual_request, actual_target):
+        identity, descriptor = real_claim(actual_request, actual_target)
+        row = registry.resolve(actual_target["socket"].name)
+        assert row["lifecycle_state"] == "declared"
+        assert row["binding_identity"] == identity
+        assert actual_target["binding"].exists()
+        assert not actual_target["socket"].exists()
+        os.close(descriptor)  # process death releases the pinned claim lock
+        raise _SimulatedHardCrash
+
+    monkeypatch.setattr(bridge, "_claim_rendezvous", _crash_after_claim)
+    with pytest.raises(_SimulatedHardCrash):
+        bridge._serve(request, target)
+
+    assert target["binding"].exists()
+    assert not target["socket"].exists()
+    assert registry.resolve(target["socket"].name)["lifecycle_state"] == "declared"
+
+    monkeypatch.setattr(bridge, "_claim_rendezvous", real_claim)
+    bridge._declare_bridge_resources(target, request)
+    identity, descriptor = bridge._claim_rendezvous(request, target)
+    try:
+        assert identity == request["rendezvous_identity"]
+        assert bridge._read_binding_record(target["binding"])["socket_identity"] is None
+    finally:
+        bridge._deregister_bridge_resources(target, request)
+        os.close(descriptor)
+
+
+def test_stale_cleanup_refuses_foreign_socket_path_takeover(rendezvous_env, tmp_path):
+    _, registry = rendezvous_env
+    request = _request(tmp_path)
+    identity = request["rendezvous_identity"]
+    target = _target(tmp_path, request)
+    descriptor = _declare_and_claim(request, target)
+    owned_server = _bind_path(target["socket"])
+    _publish_claim(request, target, descriptor)
+    socket_identity = bridge.verify_rendezvous_binding(target["socket"], identity).record[
+        "socket_identity"
+    ]
+    registry.register_created(
+        target["socket"].name,
+        actor_id="managed_provider_bridge._serve",
+        observed={
+            "observed_fs_path": str(target["socket"]),
+            "observed_fs_identity": socket_identity,
+        },
+        existence_receipt_digest="2" * 64,
+    )
+    registry.drain(
+        target["socket"].name,
+        actor_id="terminal_service.delete_terminal",
+    )
+    registry.close(
+        target["socket"].name,
+        actor_id="terminal_service.delete_terminal",
+    )
+    closed = registry.resolve(target["socket"].name)
+
+    owned_server.close()
+    target["socket"].unlink()
+    foreign_server = _bind_path(target["socket"])
+    foreign_inode = target["socket"].lstat().st_ino
+    try:
+        with pytest.raises(bridge.BridgeError, match="socket-identity-collision"):
+            bridge.cleanup_stale_rendezvous(
+                closed,
+                terminal_id=request["terminal_id"],
+                generation=request["generation"],
+            )
+        assert target["socket"].lstat().st_ino == foreign_inode
+        assert target["binding"].exists()
+        assert bridge._read_binding_record(target["binding"])["binding_identity"] == identity
+    finally:
+        foreign_server.close()
+        os.close(descriptor)
+
+
+def test_request_connect_swap_sends_zero_bytes_to_foreign_socket(
+    rendezvous_env, tmp_path, monkeypatch
+):
+    request = _request(tmp_path)
+    target = bridge.write_request(request["reservation_id"], request)
+    descriptor = _declare_and_claim(request, target)
+    owned_server = _bind_path(target["socket"])
+    owned_server.listen(1)
+    _publish_claim(request, target, descriptor)
+
+    real_socket = socket.socket
+    foreign: dict[str, socket.socket] = {}
+
+    class _SwappingClient:
+        def __init__(self, *args, **kwargs):
+            self._socket = real_socket(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._socket, name)
+
+        def connect(self, path):
+            target["socket"].unlink()
+            foreign_server = real_socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            foreign_server.bind(path)
+            Path(path).chmod(0o600)
+            foreign_server.listen(1)
+            foreign["server"] = foreign_server
+            self._socket.connect(path)
+
+        def close(self):
+            self._socket.close()
+
+    monkeypatch.setattr(bridge.socket, "socket", _SwappingClient)
+    with pytest.raises(bridge.BridgeError, match="socket-identity-collision"):
+        bridge.request_bridge(request["reservation_id"], {"op": "status"}, timeout=0.2)
+
+    foreign_server = foreign["server"]
+    foreign_server.settimeout(2)
+    connection, _ = foreign_server.accept()
+    try:
+        connection.settimeout(2)
+        assert connection.recv(65536) == b""
+    finally:
+        connection.close()
+        foreign_server.close()
+        owned_server.close()
+        os.close(descriptor)
+    assert target["binding"].exists()
+
+
+def test_bridge_rechecks_head_immediately_before_socket_bind(rendezvous_env, tmp_path, monkeypatch):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "base.txt"], cwd=tmp_path, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=bridge-test",
+            "-c",
+            "user.email=bridge@example.test",
+            "commit",
+            "-qm",
+            "base",
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+    identity = bridge.launch_binding_identity(
+        project="cao-conductor-self-heal",
+        task_id="cond0081",
+        terminal_id="a1b2c3d4",
+        terminal_generation="22222222-2222-4222-8222-222222222222",
+        working_directory=str(tmp_path.resolve()),
+        actor="deadbeef",
+    )
+    request = _request(tmp_path)
+    request["rendezvous_identity"] = identity
+    target = bridge.write_request(request["reservation_id"], request)
+
+    (tmp_path / "drift.txt").write_text("drift\n", encoding="utf-8")
+    subprocess.run(["git", "add", "drift.txt"], cwd=tmp_path, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=bridge-test",
+            "-c",
+            "user.email=bridge@example.test",
+            "commit",
+            "-qm",
+            "drift",
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+    initialized = []
+
+    class _MustNotInitialize:
+        def __init__(self, _request):
+            self.rpc = None
+
+        def initialize(self):
+            initialized.append(True)
+            raise AssertionError("provider initialization must not follow HEAD drift")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(bridge, "_ProviderSession", _MustNotInitialize)
+
+    assert bridge._serve(request, target) == 1
+    assert initialized == []
+    assert not target["socket"].exists()
+    state = json.loads(target["state"].read_text(encoding="utf-8"))
+    assert state["state"] == "preflight_blocked"
+    assert "repository/head identity drifted" in state["error"]

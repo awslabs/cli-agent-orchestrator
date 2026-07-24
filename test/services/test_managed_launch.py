@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,7 @@ from cli_agent_orchestrator.models.managed_launch import (
     ManagedLaunchRouteAttestRequest,
 )
 from cli_agent_orchestrator.services import managed_launch
+from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services.managed_provider_bridge import BRIDGE_VERSION
 
 
@@ -34,6 +36,8 @@ def _reserve_request(tmp_path, **changes):
         "provider": "codex",
         "agent_profile": "reviewer-sol-max",
         "caller_id": "deadbeef",
+        "project": "test-project",
+        "task_id": "test-task",
         "working_directory": str(tmp_path),
         "trusted_project_root": str(tmp_path),
         "expected_model": "gpt-5.6-sol",
@@ -277,6 +281,26 @@ def test_admission_digest_and_identity_are_immutable(isolated_memory_db, tmp_pat
         managed_launch.claim_admission(request.reservation_id, bad_digest)
 
 
+def test_admission_project_task_must_match_reserved_launch_identity(isolated_memory_db, tmp_path):
+    request = _reserve_request(tmp_path)
+    _ready_record(request)
+    admission = _admit_request()
+    mismatched_context = admission.context.model_dump(mode="json")
+    mismatched_context["task_id"] = "foreign-task"
+
+    with pytest.raises(
+        managed_launch.ManagedLaunchConflict,
+        match="project/task identity does not match reservation",
+    ):
+        managed_launch.claim_admission(
+            request.reservation_id,
+            _admit_request(context=mismatched_context),
+        )
+    record = managed_launch.get(request.reservation_id)
+    assert record["state"] == "ready"
+    assert record["admission"] is None
+
+
 def test_observation_append_is_idempotent(isolated_memory_db, tmp_path):
     request = _reserve_request(tmp_path)
     record, _ = managed_launch.reserve(request)
@@ -489,6 +513,67 @@ async def test_launch_reserved_uses_exact_provider_bridge_before_readiness(
     duplicate = await managed_launch.launch_reserved(request.reservation_id)
     assert ready["state"] == duplicate["state"] == "ready"
     assert [call[0] for call in calls] == ["write", "create"]
+    written = calls[0][2]
+    assert written["rendezvous_identity"]["project"] == request.project
+    assert written["rendezvous_identity"]["task_id"] == request.task_id
+
+
+@pytest.mark.asyncio
+async def test_v1_long_worktree_uses_exact_admission_identity_in_bounded_launcher_mapping(
+    isolated_memory_db, tmp_path, monkeypatch
+):
+    worktree = tmp_path
+    for index in range(7):
+        worktree = worktree / f"cond0081-unchanged-long-worktree-segment-{index}"
+    worktree.mkdir(parents=True)
+    request = _reserve_request(
+        worktree,
+        project="cao-conductor-self-heal",
+        task_id="self-heal-control-plane-recovery-fix-cond0081-activation-observation",
+    )
+    _commit_fixture_worktree(worktree)
+    record, _ = managed_launch.reserve(request)
+    written = {}
+
+    monkeypatch.setattr(managed_launch, "_executable_identity", lambda _: ("/provider", "d" * 64))
+    monkeypatch.setattr(bridge, "profile_digest", lambda _: "e" * 64)
+    monkeypatch.setattr(
+        bridge,
+        "write_request",
+        lambda reservation_id, body: written.update(
+            {"reservation_id": reservation_id, "body": body}
+        ),
+    )
+
+    async def fake_create_terminal(**kwargs):
+        assert kwargs["working_directory"] == str(worktree.resolve())
+        return SimpleNamespace(status="idle")
+
+    monkeypatch.setattr(
+        bridge,
+        "request_bridge",
+        lambda reservation_id, body, timeout: {
+            "state": "ready",
+            "readiness": _ready_receipt_for(record, request),
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.create_terminal",
+        fake_create_terminal,
+    )
+
+    result = await managed_launch.launch_reserved(request.reservation_id)
+
+    identity = written["body"]["rendezvous_identity"]
+    assert result["state"] == "ready"
+    assert identity["project"] == request.project
+    assert identity["task_id"] == request.task_id
+    assert identity["task_id"] != request.reservation_id
+    assert identity["worktree_realpath"] == str(worktree.resolve())
+    assert len(os.fsencode(identity["worktree_realpath"])) > bridge._AF_UNIX_SAFE_PATH_BYTES
+    assert len(os.fsencode(bridge.rendezvous_paths(identity)["socket"])) <= (
+        bridge._AF_UNIX_SAFE_PATH_BYTES
+    )
 
 
 @pytest.mark.asyncio

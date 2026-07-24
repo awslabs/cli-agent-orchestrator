@@ -11,6 +11,7 @@ manifest is complete and non-vacuous.
 from __future__ import annotations
 
 import os
+import socket
 import tempfile
 import time
 import uuid
@@ -398,8 +399,17 @@ def test_bridge_resources_register_and_deregister(tmp_path, monkeypatch):
         assert by_kind["socket"]["lifecycle_state"] == "declared"
         assert by_kind["db_row_set"]["lifecycle_state"] == "declared"
         # The socket and journal appear later: observed creation.
-        bridge._create_binding_record(target["binding"], request["rendezvous_identity"])
-        target["socket"].write_text("", encoding="utf-8")
+        _, descriptor = bridge._claim_rendezvous(request, target)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(target["socket"]))
+        target["socket"].chmod(0o600)
+        server.listen(1)
+        bridge._publish_socket_claim(
+            descriptor,
+            target["binding"],
+            target["socket"],
+            request["rendezvous_identity"],
+        )
         (root / "delivery-journal.db").write_text("", encoding="utf-8")
         bridge._mark_bridge_resource_created(target, request, "socket")
         bridge._mark_bridge_journal_created(target, request)
@@ -416,6 +426,8 @@ def test_bridge_resources_register_and_deregister(tmp_path, monkeypatch):
         assert all(e["lifecycle_state"] == "deleted" for e in entries)
         for entry in entries:
             assert not Path(entry["desired_fs_path"]).exists()
+        server.close()
+        os.close(descriptor)
     finally:
         rr.reset_resource_registry()
 
@@ -630,6 +642,7 @@ def test_bridge_serve_declares_before_physical_construction(monkeypatch):
                     pass
 
             monkeypatch.setattr(bridge, "_ProviderSession", _InitFailure)
+            monkeypatch.setattr(bridge, "verify_launch_binding_identity", lambda *_: None)
 
             assert bridge._serve(request, target) == 1
 
@@ -699,8 +712,17 @@ def test_bridge_teardown_never_synthesizes_absence(tmp_path, monkeypatch):
         target = _bridge_target(bridge, root, request)
         bridge._declare_bridge_resources(target, request)
         target["state"].write_text("{}", encoding="utf-8")
-        bridge._create_binding_record(target["binding"], request["rendezvous_identity"])
-        target["socket"].write_text("", encoding="utf-8")
+        _, descriptor = bridge._claim_rendezvous(request, target)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(target["socket"]))
+        target["socket"].chmod(0o600)
+        server.listen(1)
+        bridge._publish_socket_claim(
+            descriptor,
+            target["binding"],
+            target["socket"],
+            request["rendezvous_identity"],
+        )
         bridge._mark_bridge_resource_created(target, request, "bridge_state")
         bridge._mark_bridge_resource_created(target, request, "socket")
         registry = rr.get_resource_registry()
@@ -730,6 +752,8 @@ def test_bridge_teardown_never_synthesizes_absence(tmp_path, monkeypatch):
             if e["lifecycle_state"] == "deleted" and e["desired_fs_path"]
         ]
         assert all(not Path(e["desired_fs_path"]).exists() for e in deleted)
+        server.close()
+        os.close(descriptor)
     finally:
         rr.reset_resource_registry()
 
@@ -801,7 +825,10 @@ def test_bridge_hard_crash_leaves_durable_declarations():
                     pass
 
 
-            with patch.object(bridge, "_ProviderSession", CrashDuringInitialize):
+            with (
+                patch.object(bridge, "_ProviderSession", CrashDuringInitialize),
+                patch.object(bridge, "verify_launch_binding_identity", lambda *_: None),
+            ):
                 bridge._serve(request, target)
             os._exit(99)
             """)
