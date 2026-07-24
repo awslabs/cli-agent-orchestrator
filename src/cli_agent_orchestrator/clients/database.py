@@ -275,6 +275,19 @@ class FlowModel(Base):
     enabled = Column(Boolean, default=True)
 
 
+# The v2 vintage surface (``managed_launch_v2_reservations``,
+# ``managed_launch_v2_terminals``) is deliberately absent from the
+# unconditional ``init_db`` create_all: it is created only by the gated
+# transactional migration so a required exact-old-binary gate refusal
+# precedes — and prevents — any v2 surface creation.
+_V2_ORM_TABLE_NAMES = frozenset(
+    {
+        ManagedLaunchV2ReservationModel.__tablename__,
+        ManagedLaunchV2TerminalModel.__tablename__,
+    }
+)
+
+
 def _ensure_db_dir() -> None:
     """Create the DB dir owner-only (0o700).
 
@@ -300,7 +313,17 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
     _migrate_project_aliases_schema()
-    Base.metadata.create_all(bind=engine)
+    # The v2 vintage surface is created ONLY by the gated transactional
+    # migration (``_migrate_managed_launch_v2`` below): an exact-old-binary
+    # gate refusal must abort initialization BEFORE any metadata operation
+    # capable of creating v2 tables runs, so the v2 ORM models are excluded
+    # from this unconditional create_all.
+    Base.metadata.create_all(
+        bind=engine,
+        tables=[
+            table for table in Base.metadata.sorted_tables if table.name not in _V2_ORM_TABLE_NAMES
+        ],
+    )
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
     _migrate_memory_indexes()
@@ -705,17 +728,24 @@ def _migrate_managed_launch_v2() -> None:
     ``services/vintage_migration.py``; this delegates to it.  When
     ``CAO_OLD_BINARY_GATE=require`` is configured, the exact-old-binary
     invisibility proof (H_B's actual entrypoints against v2 forward state)
-    runs as the rollout gate first; a refusal fails closed here — the v2
-    surface is simply never created, so exposure never occurs.
+    runs as the rollout gate FIRST — before any v2-capable metadata
+    operation (the v2 ORM models are excluded from ``init_db``'s
+    unconditional create_all) — and a refusal or rig failure ABORTS
+    initialization by propagating: a configured rollout may never proceed
+    on the prohibited surface, so the refusal is never logged and
+    swallowed.
     """
     from cli_agent_orchestrator.constants import DATABASE_FILE
     from cli_agent_orchestrator.services import vintage_migration
 
+    gate = vintage_migration.configured_old_binary_gate()
+    if gate is not None:
+        # Required gate: run it (inside migrate_v2, before any v2 DDL) and
+        # let OldBinaryGateRefused / rig failures propagate to the caller.
+        vintage_migration.migrate_v2(DATABASE_FILE, old_binary_gate=gate)
+        return
     try:
-        vintage_migration.migrate_v2(
-            DATABASE_FILE,
-            old_binary_gate=vintage_migration.configured_old_binary_gate(),
-        )
+        vintage_migration.migrate_v2(DATABASE_FILE, old_binary_gate=None)
     except Exception as e:  # noqa: BLE001 - the operation path fails closed
         logger.warning(f"managed-launch v2 migration failed: {e}")
 

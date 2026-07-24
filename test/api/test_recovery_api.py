@@ -278,3 +278,140 @@ def test_generic_delete_of_v2_row_is_refused_without_endpoint_intent(client, iso
     assert conditional.status_code == 409
     # Zero mutation: the v2 row survives both attempts.
     assert database.get_terminal_metadata_v2("a1b2c3d4") is not None
+
+
+def _admitted_v2_reservation(tmp_path, monkeypatch):
+    """A live admitted v2 reservation + its delivery journal + CAO home."""
+    import json
+
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services.delivery_journal import DeliveryJournal
+
+    home = tmp_path / "cao-home"
+    home.mkdir()
+    monkeypatch.setattr("cli_agent_orchestrator.constants.CAO_HOME_DIR", home)
+    generation = str(uuid.uuid4())
+    reservation_id = str(uuid.uuid4())
+    request = {"expected_model": "gpt-5.6-sol", "expected_effort": "xhigh"}
+    with database.SessionLocal() as db:
+        db.add(
+            database.ManagedLaunchV2ReservationModel(
+                reservation_id=reservation_id,
+                terminal_id="a1b2c3d4",
+                generation=generation,
+                protocol_vintage="v2",
+                session_name="cao-test",
+                provider="codex",
+                agent_profile="reviewer-sol-max",
+                caller_id="deadbeef",
+                working_directory=str(tmp_path),
+                obligation_generation="obgen-7c2e4a1b",
+                run_id="run-0001",
+                launch_nonce_digest="d" * 64,
+                state="admitted",
+                request_json=json.dumps(request),
+                created_at="2026-07-24T00:00:00Z",
+                updated_at="2026-07-24T00:00:00Z",
+            )
+        )
+        db.commit()
+    root = home / "managed-provider-sessions" / reservation_id
+    journal = DeliveryJournal(root / "delivery-journal.db")
+    command = {"op": "admit", "delivery_id": "delivery-1", "message": "run the task"}
+    digest = hashlib.sha256(
+        json.dumps(command, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    journal.open_intent("obgen-7c2e4a1b", "delivery-1", digest)
+    journal.mark_terminal_queued("obgen-7c2e4a1b", "delivery-1")
+    return home, generation, digest
+
+
+def _write_codex_route_receipt(home, generation, digest, **changes):
+    from cli_agent_orchestrator.services import route_receipts
+
+    args = {
+        "state_dir": home / "recovery",
+        "provider": "codex",
+        "native_session_id": "thr_0192a7b4",
+        "native_turn_id": "turn-1",
+        "generation": generation,
+        "terminal_id": "a1b2c3d4",
+        "delivery_id": "delivery-1",
+        "expected_model": "gpt-5.6-sol",
+        "expected_effort": "xhigh",
+        "observed_model": "gpt-5.6-sol",
+        "observed_effort": "xhigh",
+        "protocol": "app-server/1",
+        "event_sequence": 1,
+        "model_input_digest": digest,
+        "provider_version": "codex 0.145.0",
+    }
+    args.update(changes)
+    return route_receipts.write_route_receipt(**args)
+
+
+def test_recovery_capabilities_consumes_provider_route_receipts(
+    client, isolated_memory_db, tmp_path, monkeypatch
+):
+    """cond-0069 closure: the production endpoint's route authority comes
+    only from the provider-generated authenticated durable receipt."""
+    from cli_agent_orchestrator.api import main as api_main
+
+    home, generation, digest = _admitted_v2_reservation(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        api_main,
+        "_provider_version_output",
+        lambda binary: "codex 0.145.0" if binary == "codex" else None,
+    )
+    _write_codex_route_receipt(home, generation, digest)
+
+    response = client.get("/managed/recovery-capabilities")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["observed_route"]["codex"] == "proven"
+    assert payload["enabled_providers"] == ["codex"]
+    # Containment is still unproven: automated paths stay closed regardless.
+    assert payload["automated_paths"] == {
+        "recovery": False,
+        "finalization": False,
+        "destructive": False,
+    }
+
+
+def test_recovery_capabilities_rejects_drifted_or_unjournaled_route_evidence(
+    client, isolated_memory_db, tmp_path, monkeypatch
+):
+    """Malformed/drifted/missing receipt evidence exposes no authority."""
+    from cli_agent_orchestrator.api import main as api_main
+
+    home, generation, digest = _admitted_v2_reservation(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        api_main,
+        "_provider_version_output",
+        lambda binary: "codex 0.145.0" if binary == "codex" else None,
+    )
+    # An authenticated receipt whose model input was never journaled for
+    # this generation is not authority.
+    _write_codex_route_receipt(home, generation, "f" * 64)
+    payload = client.get("/managed/recovery-capabilities").json()
+    assert payload["observed_route"]["codex"] == "unsupported"
+    assert payload["enabled_providers"] == []
+
+    # A receipt valid at write time but tampered afterwards (HMAC/content
+    # address broken) is not authority either.
+    _write_codex_route_receipt(home, generation, digest)
+    published = list((home / "recovery").glob("route-receipt.*.json"))
+    assert published
+    import json
+
+    for candidate in published:
+        receipt = json.loads(candidate.read_bytes())
+        receipt["observed_model"] = "different-model"
+        import os
+
+        os.chmod(candidate, 0o600)  # published receipts are 0400 by design
+        candidate.write_bytes(json.dumps(receipt, sort_keys=True).encode() + b"\n")
+    payload = client.get("/managed/recovery-capabilities").json()
+    assert payload["observed_route"]["codex"] == "unsupported"
+    assert payload["enabled_providers"] == []

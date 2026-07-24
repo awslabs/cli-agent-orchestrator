@@ -691,6 +691,124 @@ class TestInitDb:
         mock_base.metadata.create_all.assert_called_once()
 
 
+class TestInitDbOldBinaryGate:
+    """The configured exact-old-binary gate precedes any v2 surface creation.
+
+    Production regression (P1): ``init_db`` must never create the v2 ORM
+    surface through the unconditional ``create_all`` — v2 tables come only
+    from the gated transactional migration — and a REQUIRED gate refusal
+    must propagate out of ``init_db`` instead of being logged and
+    swallowed.
+    """
+
+    @pytest.fixture
+    def isolated_init_db(self, tmp_path, monkeypatch):
+        """Bind the module engine/session/DB file to a per-test SQLite file."""
+        import sqlite3
+
+        from cli_agent_orchestrator import constants
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "init.sqlite"
+        engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
+        monkeypatch.setattr(db_mod, "engine", engine)
+        monkeypatch.setattr(
+            db_mod,
+            "SessionLocal",
+            sessionmaker(autocommit=False, autoflush=False, bind=engine),
+        )
+        monkeypatch.setattr(db_mod, "DB_DIR", tmp_path)
+        monkeypatch.setattr(constants, "DATABASE_FILE", db_file)
+
+        def v2_tables():
+            with sqlite3.connect(str(db_file)) as conn:
+                return sorted(
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name LIKE 'managed_launch_v2%'"
+                    )
+                )
+
+        return v2_tables
+
+    def test_required_gate_refusal_propagates_before_v2_surface(
+        self, isolated_init_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import old_binary_rig, vintage_migration
+
+        monkeypatch.setenv("CAO_OLD_BINARY_GATE", "require")
+        hostile = old_binary_rig.RigVerdict(
+            zero_visibility=False, violations=("v2 access",), surfaces_checked=7
+        )
+        monkeypatch.setattr(
+            old_binary_rig, "prove_old_binary_invisibility", lambda **_kwargs: hostile
+        )
+
+        with pytest.raises(vintage_migration.OldBinaryGateRefused):
+            init_db()
+
+        assert isolated_init_db() == [], (
+            "a required gate refusal must abort initialization BEFORE any "
+            "v2-capable metadata operation creates the v2 surface"
+        )
+
+    def test_required_gate_pass_creates_v2_only_through_migration(
+        self, isolated_init_db, monkeypatch, tmp_path
+    ):
+        import sqlite3
+
+        from cli_agent_orchestrator.services import old_binary_rig
+
+        monkeypatch.setenv("CAO_OLD_BINARY_GATE", "require")
+        passing = old_binary_rig.RigVerdict(zero_visibility=True, violations=(), surfaces_checked=7)
+        monkeypatch.setattr(
+            old_binary_rig, "prove_old_binary_invisibility", lambda **_kwargs: passing
+        )
+
+        init_db()
+
+        assert isolated_init_db() == [
+            "managed_launch_v2_reservations",
+            "managed_launch_v2_terminals",
+        ]
+        # The v2 surface came through the gated transactional migration,
+        # journaled with the gate outcome — never the bare create_all.
+        from cli_agent_orchestrator import constants
+
+        with sqlite3.connect(str(constants.DATABASE_FILE)) as conn:
+            detail = conn.execute(
+                "SELECT detail FROM v2_migration_journal ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()[0]
+        assert '"zero_visibility": true' in detail
+
+    def test_ungated_init_creates_v2_through_migration(self, isolated_init_db, monkeypatch):
+        monkeypatch.delenv("CAO_OLD_BINARY_GATE", raising=False)
+
+        init_db()
+
+        assert isolated_init_db() == [
+            "managed_launch_v2_reservations",
+            "managed_launch_v2_terminals",
+        ]
+
+    def test_create_all_excludes_v2_orm_tables(self):
+        """The unconditional create_all metadata list names no v2 table."""
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        names = {
+            table.name
+            for table in Base.metadata.sorted_tables
+            if table.name not in db_mod._V2_ORM_TABLE_NAMES
+        }
+        assert "managed_launch_v2_reservations" not in names
+        assert "managed_launch_v2_terminals" not in names
+        assert db_mod._V2_ORM_TABLE_NAMES == {
+            "managed_launch_v2_reservations",
+            "managed_launch_v2_terminals",
+        }
+
+
 class TestTerminalsSchemaMigration:
     """Tests for the terminals-table column-add migration (caller_id, issue #284)."""
 

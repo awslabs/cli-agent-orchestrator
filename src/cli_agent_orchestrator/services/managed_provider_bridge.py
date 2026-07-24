@@ -619,6 +619,9 @@ class _ProviderSession:
         self.kimi_wire_path: Optional[pathlib.Path] = None
         self._companion_scan_index = 0
         self._current_turn_id: Optional[str] = None
+        # Per-session provider-turn ordinal (1-based), incremented only on a
+        # natively accepted turn; the route receipt's event_sequence.
+        self._turn_sequence = 0
         # One fenced heartbeat producer per bridge lifetime: epoch/sequence
         # and the coalescing watermark are producer state; constructing a
         # fresh producer per beat would restart the sequence (the fencing
@@ -862,6 +865,7 @@ class _ProviderSession:
                 "request_sha256": _digest(params),
                 "response": result,
             }
+            self._turn_sequence += 1
             return turn_id, "codex-turn-start", evidence
         if self.kimi_wire_path is None:
             raise BridgeError("Kimi exact session journal is unavailable")
@@ -901,6 +905,7 @@ class _ProviderSession:
             "first_provider_update": first_update,
             "provider_request_id": rpc_id,
         }
+        self._turn_sequence += 1
         return turn_start["uuid"], "kimi-session-update", evidence
 
     def _scan_companion_events(self) -> None:
@@ -1223,10 +1228,15 @@ def _register_bridge_resources(target: dict[str, pathlib.Path], request: dict[st
     """Registry-first registration of the bridge's own v2 resources.
 
     The generation-private socket, the bridge state tree, and the
-    delivery journal are declared and receipt-marked before the accept
-    loop is exposed, so cleanup/monitors/inventory see them through the
-    registry alone. Re-registration after a crash converges on the live
-    entry for the same generation instead of conflicting.
+    delivery journal are declared before the accept loop is exposed, so
+    cleanup/monitors/inventory see them through the registry alone.  An
+    entry is marked ``created`` ONLY when its exact filesystem identity is
+    observed to exist (the socket is bound and the state tree written
+    before this runs; the delivery journal is created lazily and marked
+    by ``_mark_bridge_journal_created`` at construction).  Re-registration
+    after a crash converges on the live entry for the same generation —
+    including promoting a still-declared entry whose file now exists —
+    instead of conflicting.
     """
     from cli_agent_orchestrator.services import resource_registry as rr
 
@@ -1249,6 +1259,15 @@ def _register_bridge_resources(target: dict[str, pathlib.Path], request: dict[st
     for kind, entry_id, fs_path in entries:
         existing = registry.resolve_fs_path(fs_path)
         if existing is not None and existing["generation"] == request["generation"]:
+            if existing["lifecycle_state"] == "declared" and pathlib.Path(fs_path).exists():
+                registry.register_created(
+                    entry_id,
+                    actor_id=actor,
+                    observed={"observed_fs_path": fs_path},
+                    existence_receipt_digest=rr.receipt_digest(
+                        {"entry_id": entry_id, "observed_fs_path": fs_path}
+                    ),
+                )
             continue  # converge after a crash: the live entry is already ours
         registry.declare(
             entry_id=entry_id,
@@ -1264,17 +1283,54 @@ def _register_bridge_resources(target: dict[str, pathlib.Path], request: dict[st
             actor_id=actor,
             desired_fs_path=fs_path,
         )
-        registry.register_created(
-            entry_id,
-            actor_id=actor,
-            existence_receipt_digest=rr.receipt_digest(
-                {"entry_id": entry_id, "kind": kind, "fs_path": fs_path}
-            ),
-        )
+        if pathlib.Path(fs_path).exists():
+            registry.register_created(
+                entry_id,
+                actor_id=actor,
+                observed={"observed_fs_path": fs_path},
+                existence_receipt_digest=rr.receipt_digest(
+                    {"entry_id": entry_id, "observed_fs_path": fs_path}
+                ),
+            )
+
+
+def _mark_bridge_journal_created(target: dict[str, pathlib.Path], request: dict[str, Any]) -> None:
+    """Mark the delivery-journal entry created once the journal file exists.
+
+    The journal is declared at bridge startup but constructed lazily on
+    the first journaled delivery; the registry transition happens only
+    here, against the observed file — never at declaration time.
+    """
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    actor = "managed_provider_bridge._serve"
+    try:
+        entry_id = f"{request['reservation_id']}/delivery-journal.db"
+        fs_path = str(target["root"] / "delivery-journal.db")
+        registry = rr.get_resource_registry()
+        entry = registry.resolve(entry_id)
+        if entry["lifecycle_state"] == "declared" and pathlib.Path(fs_path).exists():
+            registry.register_created(
+                entry_id,
+                actor_id=actor,
+                observed={"observed_fs_path": fs_path},
+                existence_receipt_digest=rr.receipt_digest(
+                    {"entry_id": entry_id, "observed_fs_path": fs_path}
+                ),
+            )
+    except (rr.RegistryError, KeyError):
+        pass  # never declared (tests bypassing registration): nothing to mark
 
 
 def _deregister_bridge_resources(target: dict[str, pathlib.Path], request: dict[str, Any]) -> None:
-    """Drain/close/delete the bridge's registry entries (best-effort)."""
+    """Drain/close/delete the bridge's registry entries, truthfully.
+
+    A still-declared entry is aborted ONLY on a verified-absence probe; a
+    created entry is drained/closed, its physical artifact (socket, state
+    tree, journal DB and WAL/SHM siblings) is actually removed, and it is
+    marked deleted ONLY after a real absence check — a resource that is
+    still present keeps its row instead of a synthesized absence claim.
+    """
     from cli_agent_orchestrator.services import resource_registry as rr
 
     actor = "managed_provider_bridge._serve"
@@ -1286,22 +1342,60 @@ def _deregister_bridge_resources(target: dict[str, pathlib.Path], request: dict[
     except Exception:  # noqa: BLE001 - teardown never wedges on the registry
         logger.warning("bridge registry enumeration failed during teardown", exc_info=True)
         return
+
+    def _remove(fs_path: str) -> None:
+        path = pathlib.Path(fs_path)
+        with contextlib.suppress(OSError):
+            path.unlink()
+        with contextlib.suppress(OSError):
+            path.with_name(path.name + "-wal").unlink()
+        with contextlib.suppress(OSError):
+            path.with_name(path.name + "-shm").unlink()
+        if path.is_dir():
+            import shutil
+
+            shutil.rmtree(path, ignore_errors=True)
+
     for entry in entries:
         if entry["constructor_id"] != actor:
             continue
         entry_id = entry["entry_id"]
         state = entry["lifecycle_state"]
-        absence = rr.receipt_digest({"entry_id": entry_id, "absent": True, "actor": actor})
+        if state in ("deleted", "aborted"):
+            continue  # already terminal (e.g. converged by the terminal deleter)
+        fs_path = entry["desired_fs_path"]
+        absence = rr.receipt_digest(
+            {"entry_id": entry_id, "absent": True, "probe": {"fs_missing": fs_path}}
+        )
         try:
             if state == "declared":
-                registry.abort(entry_id, actor_id=actor, verified_absence_digest=absence)
-                continue
+                if fs_path and pathlib.Path(fs_path).exists():
+                    # Created but never receipt-marked: discover, then drain.
+                    registry.register_created(
+                        entry_id,
+                        actor_id=actor,
+                        observed={"observed_fs_path": fs_path},
+                        existence_receipt_digest=rr.receipt_digest(
+                            {"entry_id": entry_id, "observed_fs_path": fs_path}
+                        ),
+                    )
+                    state = "created"
+                else:
+                    registry.abort(entry_id, actor_id=actor, verified_absence_digest=absence)
+                    continue
             if state in ("created", "active"):
                 registry.drain(entry_id, actor_id=actor)
                 state = "draining"
             if state == "draining":
                 registry.close(entry_id, actor_id=actor)
-            registry.delete(entry_id, actor_id=actor, verified_absence_digest=absence)
+            if fs_path:
+                _remove(fs_path)
+            if not fs_path or not pathlib.Path(fs_path).exists():
+                registry.delete(entry_id, actor_id=actor, verified_absence_digest=absence)
+            else:
+                logger.warning(
+                    "bridge resource %s still present after teardown; row retained", entry_id
+                )
         except Exception:  # noqa: BLE001 - best-effort teardown
             logger.warning("bridge resource %s deregistration failed", entry_id, exc_info=True)
 
@@ -1415,6 +1509,51 @@ def _issue_via_provider_channel(
         provider_channel["acks"].pop(request_id, None)
     assertion: dict[str, Any] = broker.issue(channel_conn, **fields)
     return assertion
+
+
+def _write_route_receipt(
+    session: "_ProviderSession",
+    request: dict[str, Any],
+    command: dict[str, Any],
+    receipt: dict[str, Any],
+    delivery_id: str,
+) -> None:
+    """Publish the provider-observed durable route receipt (cond-0069).
+
+    The bridge observed this exact turn's native acceptance; the receipt
+    binds the provider session/turn/generation identity, the pinned
+    resolved route (the provider-resolved model/effort, verified equal to
+    the reservation request at exact-session initialization), the
+    per-session positive turn sequence, and the journaled model-input
+    digest.  It is HMAC-authenticated with the generation-private key and
+    published immutably for ``/managed/recovery-capabilities`` to consume
+    — the capability surface's only route-receipt provenance.  A
+    publication failure never blocks an admitted turn; it simply yields
+    no route authority (fail closed).
+    """
+    from cli_agent_orchestrator.services import route_receipts
+
+    try:
+        provider = request["provider"]
+        route_receipts.write_route_receipt(
+            state_dir=CAO_HOME_DIR / "recovery",
+            provider=provider,
+            native_session_id=str(session.provider_session_id),
+            native_turn_id=str(receipt["provider_turn_id"]),
+            generation=request["generation"],
+            terminal_id=request["terminal_id"],
+            delivery_id=delivery_id,
+            expected_model=request["model"],
+            expected_effort=request["effort"],
+            observed_model=request["model"],
+            observed_effort=request["effort"],
+            protocol=route_receipts.protocol_version(provider),
+            event_sequence=session._turn_sequence,
+            model_input_digest=_digest(command),
+            provider_version=str((session.readiness or {}).get("provider_version") or ""),
+        )
+    except Exception:  # noqa: BLE001 - receipt loss means no authority, never a wedge
+        logger.warning("route receipt publication failed", exc_info=True)
 
 
 def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
@@ -1585,6 +1724,7 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                                     journal = DeliveryJournal(
                                         target["root"] / "delivery-journal.db"
                                     )
+                                    _mark_bridge_journal_created(target, request)
                                 journal.open_intent(obligation, delivery_id, _digest(command))
                                 journal.mark_terminal_queued(obligation, delivery_id)
                             try:
@@ -1613,6 +1753,7 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                                 ) from exc
                             if journaled:
                                 journal.mark_submitted(obligation, delivery_id)
+                            _write_route_receipt(session, request, command, receipt, delivery_id)
                             state.update(
                                 {
                                     "state": "admitted",
@@ -1645,6 +1786,7 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                                 )
 
                                 journal = DeliveryJournal(target["root"] / "delivery-journal.db")
+                                _mark_bridge_journal_created(target, request)
                             journal.open_intent(obligation, message_id, _digest(command))
                             journal.mark_terminal_queued(obligation, message_id)
                         try:
@@ -1672,6 +1814,7 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                         if journaled:
                             journal.mark_submitted(obligation, message_id)
                             journal.mark_submit_acked(obligation, message_id)
+                        _write_route_receipt(session, request, command, receipt, message_id)
                         response = {"ok": True, "receipt": receipt}
                     else:
                         raise BridgeError("unsupported managed bridge operation")

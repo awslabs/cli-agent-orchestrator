@@ -1715,6 +1715,72 @@ def _provider_version_output(executable_name: str) -> Optional[str]:
     return proc.stdout.strip()
 
 
+def _load_route_proofs() -> "tuple[Dict[str, Any], Dict[str, Any]]":
+    """Provider-generated route receipts bound to live v2 reservations.
+
+    The capability surface's ONLY route-receipt provenance: expectations
+    come from the authority boundary (each live v2 reservation's journaled
+    request — pinned generation/model/effort — and its delivery journal's
+    journaled request digests); the loader authenticates each durable
+    receipt (content address + generation-key HMAC + pinned provider
+    version) and validates the typed contract against those expectations.
+    Any failure yields no receipts (fail closed, no automated authority).
+    """
+    import json as _json
+
+    from cli_agent_orchestrator.clients.database import (
+        ManagedLaunchV2ReservationModel,
+        SessionLocal,
+    )
+    from cli_agent_orchestrator.constants import CAO_HOME_DIR
+    from cli_agent_orchestrator.services import route_receipts
+
+    expected_routes: Dict[str, Dict[str, Any]] = {}
+    expected_digests: Dict[str, Any] = {}
+    with SessionLocal() as db:
+        rows = (
+            db.query(ManagedLaunchV2ReservationModel)
+            .filter(ManagedLaunchV2ReservationModel.state.in_(("bound", "admitting", "admitted")))
+            .order_by(ManagedLaunchV2ReservationModel.updated_at.desc())
+            .all()
+        )
+    for row in rows:
+        provider = route_receipts.capability_provider(str(row.provider))
+        if provider is None or provider in expected_routes:
+            continue
+        try:
+            request = _json.loads(str(row.request_json))
+        except ValueError:
+            continue
+        model = request.get("expected_model")
+        effort = request.get("expected_effort")
+        if not isinstance(model, str) or not model or not isinstance(effort, str) or not effort:
+            continue
+        generation = str(row.generation)
+        digests = route_receipts.journaled_request_digests(
+            CAO_HOME_DIR / "managed-provider-sessions" / str(row.reservation_id),
+            str(row.obligation_generation),
+        )
+        if not digests:
+            continue
+        expected_routes[provider] = {
+            "generation": generation,
+            "model": model,
+            "effort": effort,
+        }
+        expected_digests[provider] = digests
+    proofs = route_receipts.load_valid_route_proofs(
+        state_dir=CAO_HOME_DIR / "recovery",
+        expected_routes=expected_routes,
+        expected_input_digests=expected_digests,
+    )
+    expectations = {
+        provider: {"model": route["model"], "effort": route["effort"]}
+        for provider, route in expected_routes.items()
+    }
+    return proofs, expectations
+
+
 @app.get("/managed/recovery-capabilities")
 async def managed_recovery_capabilities(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
@@ -1747,10 +1813,19 @@ async def managed_recovery_capabilities(
             )
         except Exception:  # noqa: BLE001 - absence of proof means disabled
             kimi_proof = None
+    # Route authority derives only from provider-generated, authenticated,
+    # durable route receipts bound to live v2 reservations — never from
+    # caller-shaped dictionaries (cond-0069 closure).
+    try:
+        route_proofs, route_expectations = await asyncio.to_thread(_load_route_proofs)
+    except Exception:  # noqa: BLE001 - absence of proof means disabled
+        route_proofs, route_expectations = {}, {}
     return await asyncio.to_thread(
         recovery_capabilities.build_capabilities,
         provider_versions=versions,
         kimi_acp_proof=kimi_proof,
+        route_proofs=route_proofs,
+        route_expectations=route_expectations,
     )
 
 

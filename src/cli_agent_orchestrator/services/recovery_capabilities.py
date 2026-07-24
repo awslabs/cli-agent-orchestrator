@@ -45,6 +45,7 @@ def build_capabilities(
     provider_versions: Optional[dict[str, Optional[str]]] = None,
     kimi_acp_proof: Optional[dict[str, Any]] = None,
     route_proofs: Optional[dict[str, dict[str, Any]]] = None,
+    route_expectations: Optional[dict[str, dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Assemble the capability payload from live composition state.
 
@@ -54,52 +55,61 @@ def build_capabilities(
     output (None = binary absent/unverified, which removes the
     capability); ``kimi_acp_proof`` is the validated durable ACP
     new→kill→load receipt; ``route_proofs`` maps provider → validated
-    model-input-bound non-echo route receipt.  With zero receipts the
-    surface advertises exactly that: unproven containment, no observed
-    routes, no enabled providers, and no automated
-    recovery/finalization/destructive path.
+    model-input-bound non-echo route receipt, and ``route_expectations``
+    maps provider → the authority boundary's pinned route
+    (``model``/``effort``/``model_input_digest``) each receipt is
+    validated against.  With zero receipts the surface advertises exactly
+    that: unproven containment, no observed routes, no enabled providers,
+    and no automated recovery/finalization/destructive path.
     """
     composition = containment or ContainmentComposition()
     containment_status = composition.status()
     versions = provider_versions or {}
     proofs = route_proofs or {}
+    expectations = route_expectations or {}
+
+    def _expectation_kwargs(provider: str) -> dict[str, Any]:
+        expectation = expectations.get(provider) or {}
+        return {
+            "expected_model": expectation.get("model"),
+            "expected_effort": expectation.get("effort"),
+            "expected_model_input_digest": expectation.get("model_input_digest"),
+        }
+
+    def _route_valid(provider: str) -> bool:
+        return provider_contracts.validate_route_proof(
+            provider, proofs.get(provider), **_expectation_kwargs(provider)
+        )
+
     codex = provider_contracts.resume_status(
         "codex",
         installed_version=versions.get("codex"),
         route_proof=proofs.get("codex"),
+        **_expectation_kwargs("codex"),
     )
     claude = provider_contracts.resume_status(
         "claude",
         installed_version=versions.get("claude"),
         route_proof=proofs.get("claude"),
+        **_expectation_kwargs("claude"),
     )
     kimi = provider_contracts.resume_status(
         "kimi",
         installed_version=versions.get("kimi"),
         kimi_acp_proof=kimi_acp_proof,
         route_proof=proofs.get("kimi"),
+        **_expectation_kwargs("kimi"),
     )
     observed_route = {
         # PF-2 is red for every pinned provider unless a provider-specific
-        # route receipt is validated: none emits a model-input-bound
-        # non-echo receipt carrying resolved model and effective effort by
-        # default. Truthiness is not proof — only the validated
-        # cao-route-receipt-v1 for this exact provider counts.
-        "codex": (
-            "proven"
-            if provider_contracts.validate_route_proof("codex", proofs.get("codex"))
-            else "unsupported"
-        ),
-        "claude": (
-            "proven"
-            if provider_contracts.validate_route_proof("claude", proofs.get("claude"))
-            else "unsupported"
-        ),
-        "kimi": (
-            "proven"
-            if provider_contracts.validate_route_proof("kimi", proofs.get("kimi"))
-            else "unproven"
-        ),
+        # route receipt is validated against the authority boundary's
+        # pinned route: none emits a model-input-bound non-echo receipt
+        # carrying resolved model and effective effort by default.
+        # Truthiness is not proof — only the validated cao-route-receipt-v1
+        # for this exact provider counts.
+        "codex": "proven" if _route_valid("codex") else "unsupported",
+        "claude": "proven" if _route_valid("claude") else "unsupported",
+        "kimi": "proven" if _route_valid("kimi") else "unproven",
     }
     enabled_providers = [
         # Route authority, not identity: a provider is enabled only when

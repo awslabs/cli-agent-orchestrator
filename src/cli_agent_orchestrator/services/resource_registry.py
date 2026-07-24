@@ -842,275 +842,92 @@ MANIFEST_API_VERBS = frozenset(
 
 _TS = "src/cli_agent_orchestrator/services/terminal_service.py"
 _CS = "src/cli_agent_orchestrator/services/cleanup_service.py"
-_FR = "src/cli_agent_orchestrator/services/fifo_reader.py"
 _BR = "src/cli_agent_orchestrator/services/managed_provider_bridge.py"
-_DJ = "src/cli_agent_orchestrator/services/delivery_journal.py"
-_SE = "src/cli_agent_orchestrator/services/session_env.py"
-_HB = "src/cli_agent_orchestrator/services/heartbeat_store.py"
 
 _CREATE = "terminal_service.create_terminal"
 _DELETE = "terminal_service.delete_terminal"
 _BRIDGE = "managed_provider_bridge._serve"
 
-RUNTIME_RESOURCE_MANIFEST: tuple[dict[str, str], ...] = (
+# Verified call sites: each names the exact line where the declared API
+# verb executes (the acceptance test asserts the verb call is on that
+# line, inside the named constructor/deleter or a helper it directly
+# calls).  Terminal resources are declared journal-first in
+# ``_register_v2_terminal_resources`` (invoked by create_terminal BEFORE
+# any physical construction), transitioned to created in
+# ``_mark_v2_resource_created`` only after observed creation, and deleted
+# in ``_deregister_v2_terminal_resources`` only after a real absence
+# probe; bridge resources follow the same rules in
+# ``_register_bridge_resources`` / ``_mark_bridge_journal_created`` /
+# ``_deregister_bridge_resources``.
+_TS_DECLARE = f"{_TS}:328"  # registry.declare in _register_v2_terminal_resources
+_TS_MARK = f"{_TS}:376"  # registry.register_created in _mark_v2_resource_created
+_TS_MONITOR = f"{_TS}:344"  # registry.monitor in _register_v2_terminal_resources
+_TS_DELETE = f"{_TS}:601"  # registry.delete in _deregister_v2_terminal_resources
+_CS_RESOLVE = f"{_CS}:112"  # registry.resolve_fs_path in cleanup_old_data
+_BR_DECLARE = f"{_BR}:1272"  # registry.declare in _register_bridge_resources
+_BR_JOURNAL_MARK = f"{_BR}:1313"  # registry.register_created in _mark_bridge_journal_created
+_BR_DELETE = f"{_BR}:1394"  # registry.delete in _deregister_bridge_resources
+
+_MANIFEST_SPEC: tuple[tuple[str, str, str, str], ...] = (
     # --- terminal log artifacts (constructor + generation deleter + retention)
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "log",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_TS}:359",
-        "api_verb": "delete",
-        "resource_kind": "log",
-        "constructor_id": _DELETE,
-    },
-    {
-        "call_site": f"{_CS}:99",
-        "api_verb": "resolve_fs_path",
-        "resource_kind": "log",
-        "constructor_id": "cleanup_service.cleanup_old_data",
-    },
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "scrollback",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_TS}:359",
-        "api_verb": "delete",
-        "resource_kind": "scrollback",
-        "constructor_id": _DELETE,
-    },
-    {
-        "call_site": f"{_CS}:99",
-        "api_verb": "resolve_fs_path",
-        "resource_kind": "scrollback",
-        "constructor_id": "cleanup_service.cleanup_old_data",
-    },
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "snapshot",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_TS}:359",
-        "api_verb": "delete",
-        "resource_kind": "snapshot",
-        "constructor_id": _DELETE,
-    },
-    {
-        "call_site": f"{_CS}:99",
-        "api_verb": "resolve_fs_path",
-        "resource_kind": "snapshot",
-        "constructor_id": "cleanup_service.cleanup_old_data",
-    },
+    (_TS_DECLARE, "declare", "log", _CREATE),
+    (_TS_DELETE, "delete", "log", _DELETE),
+    (_CS_RESOLVE, "resolve_fs_path", "log", "cleanup_service.cleanup_old_data"),
+    (_TS_DECLARE, "declare", "scrollback", _CREATE),
+    (_TS_DELETE, "delete", "scrollback", _DELETE),
+    (_CS_RESOLVE, "resolve_fs_path", "scrollback", "cleanup_service.cleanup_old_data"),
+    (_TS_DECLARE, "declare", "snapshot", _CREATE),
+    (_TS_DELETE, "delete", "snapshot", _DELETE),
+    (_CS_RESOLVE, "resolve_fs_path", "snapshot", "cleanup_service.cleanup_old_data"),
     # --- FIFO + pipe-pane + liveness watchdog
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "fifo",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_FR}:166",
-        "api_verb": "register_created",
-        "resource_kind": "fifo",
-        "constructor_id": "fifo_reader.create_reader",
-    },
-    {
-        "call_site": f"{_FR}:193",
-        "api_verb": "delete",
-        "resource_kind": "fifo",
-        "constructor_id": "fifo_reader.stop_reader",
-    },
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "pipe_pane",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_TS}:359",
-        "api_verb": "delete",
-        "resource_kind": "pipe_pane",
-        "constructor_id": _DELETE,
-    },
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "watchdog",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_FR}:380",
-        "api_verb": "monitor",
-        "resource_kind": "watchdog",
-        "constructor_id": "fifo_reader._ensure_watchdog",
-    },
+    (_TS_DECLARE, "declare", "fifo", _CREATE),
+    (_TS_MARK, "register_created", "fifo", _CREATE),
+    (_TS_DELETE, "delete", "fifo", _DELETE),
+    (_TS_DECLARE, "declare", "pipe_pane", _CREATE),
+    (_TS_DELETE, "delete", "pipe_pane", _DELETE),
+    (_TS_DECLARE, "declare", "watchdog", _CREATE),
+    (_TS_MARK, "register_created", "watchdog", _CREATE),
     # --- tmux + provider + DB row set
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "tmux_window",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_TS}:359",
-        "api_verb": "delete",
-        "resource_kind": "tmux_window",
-        "constructor_id": _DELETE,
-    },
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "provider_instance",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_TS}:359",
-        "api_verb": "delete",
-        "resource_kind": "provider_instance",
-        "constructor_id": _DELETE,
-    },
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "db_row_set",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_TS}:359",
-        "api_verb": "delete",
-        "resource_kind": "db_row_set",
-        "constructor_id": _DELETE,
-    },
+    (_TS_DECLARE, "declare", "tmux_window", _CREATE),
+    (_TS_DELETE, "delete", "tmux_window", _DELETE),
+    (_TS_DECLARE, "declare", "provider_instance", _CREATE),
+    (_TS_DELETE, "delete", "provider_instance", _DELETE),
+    (_TS_DECLARE, "declare", "db_row_set", _CREATE),
+    (_TS_DELETE, "delete", "db_row_set", _DELETE),
     # --- session env, herdr, status/memory maps, curator lock
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "session_env",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_SE}:120",
-        "api_verb": "register_created",
-        "resource_kind": "session_env",
-        "constructor_id": "session_env.set_session_env",
-    },
-    {
-        "call_site": f"{_SE}:173",
-        "api_verb": "delete",
-        "resource_kind": "session_env",
-        "constructor_id": "session_env.clear_session_env",
-    },
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "herdr",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_TS}:359",
-        "api_verb": "delete",
-        "resource_kind": "herdr",
-        "constructor_id": _DELETE,
-    },
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "status_map",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_TS}:359",
-        "api_verb": "delete",
-        "resource_kind": "status_map",
-        "constructor_id": _DELETE,
-    },
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "memory_injection",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_TS}:359",
-        "api_verb": "delete",
-        "resource_kind": "memory_injection",
-        "constructor_id": _DELETE,
-    },
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "curator_lock",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_TS}:359",
-        "api_verb": "delete",
-        "resource_kind": "curator_lock",
-        "constructor_id": _DELETE,
-    },
+    (_TS_DECLARE, "declare", "session_env", _CREATE),
+    (_TS_MARK, "register_created", "session_env", _CREATE),
+    (_TS_DELETE, "delete", "session_env", _DELETE),
+    (_TS_DECLARE, "declare", "herdr", _CREATE),
+    (_TS_DELETE, "delete", "herdr", _DELETE),
+    (_TS_DECLARE, "declare", "status_map", _CREATE),
+    (_TS_DELETE, "delete", "status_map", _DELETE),
+    (_TS_DECLARE, "declare", "memory_injection", _CREATE),
+    (_TS_DELETE, "delete", "memory_injection", _DELETE),
+    (_TS_DECLARE, "declare", "curator_lock", _CREATE),
+    (_TS_DELETE, "delete", "curator_lock", _DELETE),
     # --- companion lock/state dir (shared, monitor-only) + bridge resources
-    {
-        "call_site": f"{_TS}:211",
-        "api_verb": "declare",
-        "resource_kind": "other",
-        "constructor_id": _CREATE,
-    },
-    {
-        "call_site": f"{_HB}:219",
-        "api_verb": "monitor",
-        "resource_kind": "other",
-        "constructor_id": "heartbeat_store.issue_fencing_token",
-    },
-    {
-        "call_site": f"{_BR}:1222",
-        "api_verb": "declare",
-        "resource_kind": "socket",
-        "constructor_id": _BRIDGE,
-    },
-    {
-        "call_site": f"{_BR}:1276",
-        "api_verb": "delete",
-        "resource_kind": "socket",
-        "constructor_id": _BRIDGE,
-    },
-    {
-        "call_site": f"{_BR}:1222",
-        "api_verb": "declare",
-        "resource_kind": "bridge_state",
-        "constructor_id": _BRIDGE,
-    },
-    {
-        "call_site": f"{_BR}:1276",
-        "api_verb": "delete",
-        "resource_kind": "bridge_state",
-        "constructor_id": _BRIDGE,
-    },
-    {
-        "call_site": f"{_BR}:1222",
-        "api_verb": "declare",
-        "resource_kind": "db_row_set",
-        "constructor_id": _BRIDGE,
-    },
-    {
-        "call_site": f"{_DJ}:110",
-        "api_verb": "register_created",
-        "resource_kind": "db_row_set",
-        "constructor_id": "delivery_journal.DeliveryJournal",
-    },
-    {
-        "call_site": f"{_BR}:1276",
-        "api_verb": "delete",
-        "resource_kind": "db_row_set",
-        "constructor_id": _BRIDGE,
-    },
+    (_TS_DECLARE, "declare", "other", _CREATE),
+    (_TS_MONITOR, "monitor", "other", _CREATE),
+    (_BR_DECLARE, "declare", "socket", _BRIDGE),
+    (_BR_DELETE, "delete", "socket", _BRIDGE),
+    (_BR_DECLARE, "declare", "bridge_state", _BRIDGE),
+    (_BR_DELETE, "delete", "bridge_state", _BRIDGE),
+    (_BR_DECLARE, "declare", "db_row_set", _BRIDGE),
+    (_BR_JOURNAL_MARK, "register_created", "db_row_set", _BRIDGE),
+    (_BR_DELETE, "delete", "db_row_set", _BRIDGE),
 )
+
+RUNTIME_RESOURCE_MANIFEST: tuple[dict[str, str], ...] = tuple(
+    {
+        "call_site": call_site,
+        "api_verb": api_verb,
+        "resource_kind": resource_kind,
+        "constructor_id": constructor_id,
+    }
+    for call_site, api_verb, resource_kind, constructor_id in _MANIFEST_SPEC
+)
+
 
 # Kinds every v2 generation must have registered before exposure.
 MANIFEST_REQUIRED_KINDS = frozenset(item["resource_kind"] for item in RUNTIME_RESOURCE_MANIFEST)

@@ -121,6 +121,52 @@ def test_resume_status_version_checked_and_receipt_bound():
         assert status.identity_available and not status.authority_supported
 
 
+def test_route_proof_typed_validation_and_pinned_binding():
+    """cond-0069 closure: malformed or drifted receipts expose no authority.
+
+    The validator requires typed session/turn/generation identity, a
+    positive event sequence, a 64-hex model-input digest, and a resolved
+    route equal to the pinned expectation — never mere key presence.
+    """
+    complete = _valid_route_proof("codex")
+    assert pc.validate_route_proof("codex", complete)
+    # Structurally malformed evidence never validates.
+    for mutation in (
+        {"native_turn_id": {}},
+        {"native_turn_id": ""},
+        {"native_session_id": 17},
+        {"generation": None},
+        {"event_sequence": -1},
+        {"event_sequence": 0},
+        {"event_sequence": "7"},
+        {"event_sequence": True},
+        {"model_input_digest": "not-a-digest"},
+        {"model_input_digest": "D" * 64},
+        {"model_input_digest": "d" * 63},
+        {"protocol_version": ""},
+        {"observed_model": "different-model"},
+        {"observed_effort": "different-effort"},
+    ):
+        assert not pc.validate_route_proof("codex", {**complete, **mutation}), mutation
+    # Missing pinned expectation: no authority.
+    without_pin = {k: v for k, v in complete.items() if k not in ("expected_model",)}
+    assert not pc.validate_route_proof("codex", without_pin)
+    # The authority boundary's expectation binds observed model/effort and
+    # the model-input digest; drift against it never validates.
+    assert pc.validate_route_proof(
+        "codex",
+        complete,
+        expected_model="gpt-5.6-sol",
+        expected_effort="max",
+        expected_model_input_digest="d" * 64,
+    )
+    assert not pc.validate_route_proof("codex", complete, expected_model="different-model")
+    assert not pc.validate_route_proof("codex", complete, expected_effort="different-effort")
+    assert not pc.validate_route_proof("codex", complete, expected_model_input_digest="e" * 64)
+    # Foreign providers never validate for this provider.
+    assert not pc.validate_route_proof("codex", _valid_route_proof("kimi"))
+
+
 def _valid_route_proof(provider: str) -> dict:
     """A schema-valid cao-route-receipt-v1 for the given provider."""
     return {
@@ -128,8 +174,11 @@ def _valid_route_proof(provider: str) -> dict:
         "provider": provider,
         "native_session_id": "native-session-1",
         "native_turn_id": "native-turn-1",
+        "generation": "gen-000042",
         "observed_model": "gpt-5.6-sol",
         "observed_effort": "max",
+        "expected_model": "gpt-5.6-sol",
+        "expected_effort": "max",
         "protocol_version": "app-server/1",
         "event_sequence": 7,
         "model_input_digest": "d" * 64,
@@ -303,6 +352,30 @@ def test_capability_claims_derive_from_receipts_never_caller_booleans():
     )
     assert drifted["resume"]["codex"]["identity_available"] is False
     assert drifted["resume"]["codex"]["authority_supported"] is False
+    # The authority boundary's pinned route binds the receipt: a mismatching
+    # expectation exposes no authority even for a well-formed receipt.
+    pinned = build_capabilities(
+        containment=composition,
+        provider_versions={"codex": "codex 0.145.0"},
+        route_proofs={"codex": _valid_route_proof("codex")},
+        route_expectations={
+            "codex": {"model": "gpt-5.6-sol", "effort": "max", "model_input_digest": "d" * 64}
+        },
+    )
+    assert pinned["enabled_providers"] == ["codex"]
+    for drifted_expectation in (
+        {"model": "different-model", "effort": "max"},
+        {"model": "gpt-5.6-sol", "effort": "different-effort"},
+        {"model": "gpt-5.6-sol", "effort": "max", "model_input_digest": "e" * 64},
+    ):
+        refused = build_capabilities(
+            containment=composition,
+            provider_versions={"codex": "codex 0.145.0"},
+            route_proofs={"codex": _valid_route_proof("codex")},
+            route_expectations={"codex": drifted_expectation},
+        )
+        assert refused["enabled_providers"] == []
+        assert refused["observed_route"]["codex"] == "unsupported"
     # A dead extension (no live receipt) reports unproven regardless.
     dead = ContainmentComposition(
         authorization=_authorization(),

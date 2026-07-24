@@ -178,6 +178,7 @@ ROUTE_PROOF_SCHEMA = "cao-route-receipt-v1"
 ROUTE_PROOF_REQUIRED_FIELDS = (
     "native_session_id",
     "native_turn_id",
+    "generation",
     "observed_model",
     "observed_effort",
     "protocol_version",
@@ -185,17 +186,41 @@ ROUTE_PROOF_REQUIRED_FIELDS = (
     "model_input_digest",
 )
 
+_ROUTE_PROOF_TEXT_FIELDS = (
+    "native_session_id",
+    "native_turn_id",
+    "generation",
+    "observed_model",
+    "observed_effort",
+    "protocol_version",
+)
 
-def validate_route_proof(provider: str, route_proof: Optional[dict]) -> bool:
+_DIGEST_64_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def validate_route_proof(
+    provider: str,
+    route_proof: Optional[dict],
+    *,
+    expected_model: Optional[str] = None,
+    expected_effort: Optional[str] = None,
+    expected_model_input_digest: Optional[str] = None,
+) -> bool:
     """True only for a validated provider-specific observed-route proof.
 
     Identity availability alone never satisfies this: the receipt must be
     the pinned ``cao-route-receipt-v1`` schema for THIS provider, carry
-    every §3.1 field (native session/thread id, turn id, resolved model,
-    effective effort, protocol version, event sequence), be bound to the
-    model input, and be explicitly non-echo. Unknown, missing, malformed,
-    or unsupported route evidence validates to False, which must expose no
-    automated path.
+    every §3.1 field with the correct TYPE (typed native session/turn/
+    generation identity, a positive integer event sequence, a 64-hex
+    model-input digest), and be explicitly non-echo.  The provider-observed
+    resolved model/effort must equal the pinned expectation — supplied by
+    the authority boundary (``expected_model``/``expected_effort``) or
+    embedded in an authenticated receipt as ``expected_model``/
+    ``expected_effort``; with no pinned expectation there is no authority.
+    When the authority boundary supplies the expected model-input digest,
+    the receipt's digest must match it exactly.  Unknown, missing,
+    malformed, drifted, or unsupported route evidence validates to False,
+    which must expose no automated path.
     """
     if not isinstance(route_proof, dict):
         return False
@@ -203,11 +228,37 @@ def validate_route_proof(provider: str, route_proof: Optional[dict]) -> bool:
         return False
     if route_proof.get("provider") != provider:
         return False
-    for field in ROUTE_PROOF_REQUIRED_FIELDS:
+    for field in _ROUTE_PROOF_TEXT_FIELDS:
         value = route_proof.get(field)
-        if value is None or (isinstance(value, str) and not value):
+        if not isinstance(value, str) or not value:
             return False
+    sequence = route_proof.get("event_sequence")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+        return False
+    digest = route_proof.get("model_input_digest")
+    if not isinstance(digest, str) or _DIGEST_64_HEX.fullmatch(digest) is None:
+        return False
     if route_proof.get("non_echo") is not True:
+        return False
+    pinned_model = (
+        expected_model if expected_model is not None else route_proof.get("expected_model")
+    )
+    if (
+        not isinstance(pinned_model, str)
+        or not pinned_model
+        or route_proof["observed_model"] != pinned_model
+    ):
+        return False
+    pinned_effort = (
+        expected_effort if expected_effort is not None else route_proof.get("expected_effort")
+    )
+    if (
+        not isinstance(pinned_effort, str)
+        or not pinned_effort
+        or route_proof["observed_effort"] != pinned_effort
+    ):
+        return False
+    if expected_model_input_digest is not None and digest != expected_model_input_digest:
         return False
     return True
 
@@ -229,6 +280,9 @@ def resume_status(
     installed_version: Optional[str] = None,
     kimi_acp_proof: Optional[dict] = None,
     route_proof: Optional[dict] = None,
+    expected_model: Optional[str] = None,
+    expected_effort: Optional[str] = None,
+    expected_model_input_digest: Optional[str] = None,
 ) -> ProviderResumeStatus:
     """Report the pinned resume support for one provider, truthfully.
 
@@ -237,16 +291,25 @@ def resume_status(
     ``--version`` fact for the pinned binary (drift or absence removes
     the capability), ``kimi_acp_proof`` is the validated durable ACP
     new→kill→load receipt, and ``route_proof`` is the provider-specific
-    model-input-bound non-echo route receipt.  With PF-2 red and no
-    receipts, every provider reports unproven/unsupported — caller
-    booleans can no longer promote anything.
+    model-input-bound non-echo route receipt, validated against the
+    pinned route expectation supplied by the authority boundary
+    (``expected_model``/``expected_effort``/``expected_model_input_digest``).
+    With PF-2 red and no receipts, every provider reports
+    unproven/unsupported — caller booleans can no longer promote anything.
     """
     if provider == PROVIDER_CODEX:
         version_ok = _version_matches(PROVIDER_CODEX, installed_version)
         return ProviderResumeStatus(
             provider=provider,
             identity_available=version_ok,
-            authority_supported=version_ok and validate_route_proof(provider, route_proof),
+            authority_supported=version_ok
+            and validate_route_proof(
+                provider,
+                route_proof,
+                expected_model=expected_model,
+                expected_effort=expected_effort,
+                expected_model_input_digest=expected_model_input_digest,
+            ),
             reason=(
                 "resume identity available (app-server thread id); automated "
                 "recovery/strongest-route authority unsupported until a "
