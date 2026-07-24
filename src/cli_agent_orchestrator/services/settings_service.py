@@ -21,6 +21,9 @@ _DEFAULTS = {
     "cao_installed": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-context"),
 }
 
+_BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
 
 def _load() -> Dict[str, Any]:
     """Load settings from disk."""
@@ -261,8 +264,15 @@ def get_memory_settings() -> Dict[str, Any]:
     operations — see ``is_memory_enabled()``.
     """
     settings = _load()
-    defaults: Dict[str, Any] = {"enabled": True, "flush_threshold": 0.85}
+    defaults: Dict[str, Any] = {
+        "enabled": True,
+        "flush_threshold": 0.85,
+        "lint_enabled": True,
+    }
     saved = settings.get("memory", {})
+    if not isinstance(saved, dict):
+        logger.warning("Invalid settings.memory=%r (expected object); using defaults", saved)
+        saved = {}
     result = dict(defaults)
     result.update(saved)
 
@@ -289,7 +299,54 @@ def get_memory_settings() -> Dict[str, Any]:
                 f"(expected float); using file/default"
             )
 
+    result["lint_enabled"] = is_memory_lint_enabled(settings=settings)
     return result
+
+
+def _coerce_optional_bool(value: Any, *, label: str) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "":
+            return None
+        if normalized in _BOOL_TRUE_VALUES:
+            return True
+        if normalized in _BOOL_FALSE_VALUES:
+            return False
+    logger.warning("Ignoring invalid %s=%r (expected bool); using file/default", label, value)
+    return None
+
+
+def _explicit_false(value: Any, *, label: str) -> bool:
+    return _coerce_optional_bool(value, label=label) is False
+
+
+def is_memory_lint_enabled(settings: Optional[Dict[str, Any]] = None) -> bool:
+    """Return True unless persisted settings or env explicitly disable lint.
+
+    This is intentionally not normal env precedence: either explicit false
+    source disables lint, so env true cannot override persisted false and
+    persisted true cannot override env false.
+    """
+    try:
+        data = settings if settings is not None else _load()
+        saved = data.get("memory", {}) if isinstance(data, dict) else {}
+        if not isinstance(saved, dict):
+            saved = {}
+
+        if _explicit_false(saved.get("lint_enabled", True), label="memory.lint_enabled"):
+            return False
+
+        raw_env = os.environ.get("CAO_MEMORY_LINT_ENABLED")
+        if raw_env is not None and raw_env.strip() != "":
+            coerced = _coerce_optional_bool(raw_env, label="CAO_MEMORY_LINT_ENABLED")
+            if coerced is False:
+                return False
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to read memory.lint_enabled, defaulting to True: {e}")
+        return True
 
 
 def is_memory_enabled() -> bool:
@@ -360,13 +417,20 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
     Supported keys:
         ``enabled`` (bool) — master switch for the memory subsystem.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
+        ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
     """
     settings = _load()
     memory = settings.get("memory", {})
+    if not isinstance(memory, dict):
+        memory = {}
 
     if key == "enabled":
         if not isinstance(value, bool):
             raise ValueError(f"enabled must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key == "lint_enabled":
+        if not isinstance(value, bool):
+            raise ValueError(f"lint_enabled must be a bool, got {type(value).__name__}")
         memory[key] = value
     elif key == "flush_threshold":
         fval = float(value)

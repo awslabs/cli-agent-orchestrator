@@ -1,4 +1,6 @@
-"""Per-(provider, scope, scope_id) GraphView cache (Issue #348, perf follow-up).
+"""Per-(provider, scope, scope_id, lint_enabled) GraphView cache.
+
+Issue #348, perf follow-up.
 
 DELIBERATE ADR REVERSAL. The original graph-layer design record specified
 "lint-on-demand, no caching machinery" (ADR-7): every ``/graph/{provider}``
@@ -41,10 +43,11 @@ from cli_agent_orchestrator.graph.models import GraphView
 # write-invalidation (see module docstring).
 DEFAULT_TTL_S = 300.0
 
-# Cache key: (provider name, scope, scope_id). scope_id is normalized to a
-# string-or-None so ``("memory","global",None)`` and a project projection never
-# collide, and a global request never serves a project-scope entry.
-CacheKey = tuple[str, str, Optional[str]]
+# Cache key: (provider name, scope, scope_id, lint_enabled). scope_id is
+# normalized to a string-or-None so ``("memory","global",None,True)`` and a
+# project projection never collide, a global request never serves a
+# project-scope entry, and lint-enabled/disabled graph projections stay isolated.
+CacheKey = tuple[str, str, Optional[str], bool]
 
 
 @dataclass
