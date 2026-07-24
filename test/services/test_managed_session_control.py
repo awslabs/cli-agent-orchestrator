@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import threading
 import time
 
@@ -54,6 +55,23 @@ def test_ambiguous_is_terminal_for_automated_replay(tmp_path):
 
     with pytest.raises(SessionControlRefused, match="illegal managed-session transition"):
         journal.transition("op-1", ACCEPTED)
+
+
+def test_journal_idempotent_lookup_repeat_and_latest_paths(tmp_path):
+    journal = SessionControlJournal(tmp_path / "control.db")
+    opened = _journal_begin(journal)
+
+    assert _journal_begin(journal) == opened
+    assert journal.transition("op-1", QUEUED) == opened
+    journal.transition("op-1", SUBMITTED)
+    journal.transition("op-1", ACCEPTED)
+    journal.transition("op-1", COMPLETED, result={"answer": 42})
+    assert journal.latest(limit=0)[0]["result"] == {"answer": 42}
+
+    with pytest.raises(SessionControlRefused, match="unknown managed-session operation"):
+        journal.get("missing")
+    with pytest.raises(SessionControlRefused, match="unknown managed-session operation"):
+        journal.transition("missing", REFUSED)
 
 
 class _Rpc:
@@ -291,3 +309,209 @@ def test_follow_up_receipt_persists_digest_not_message(tmp_path, monkeypatch):
     assert receipt["state"] == ACCEPTED
     assert receipt["result"]["message_sha256"] == hashlib.sha256(message.encode()).hexdigest()
     assert message.encode() not in journal_path.read_bytes()
+
+
+_OPERATION_SEQUENCE = itertools.count()
+
+
+def _run_operation(journal, session, action, **values):
+    command = _command(action, **values)
+    command["operation_id"] = f"op-{action}-{next(_OPERATION_SEQUENCE)}"
+    _begin(journal, session, command)
+    return session.session_operation(command, journal)
+
+
+def test_route_query_resume_and_existing_operation_paths(tmp_path):
+    session = _session(_Rpc(commands=["compact"]))
+    journal = SessionControlJournal(tmp_path / "control.db")
+
+    route_command = _command("route-query")
+    _begin(journal, session, route_command)
+    route = session.session_operation(route_command, journal)
+    assert route["state"] == COMPLETED
+    assert route["result"]["capabilities"]["compact"] is True
+    assert session.session_operation(route_command, journal)["state"] == COMPLETED
+
+    resumed = _run_operation(journal, session, "resume")
+    assert resumed["state"] == REFUSED
+    assert resumed["reason_code"] == "resume_requires_new_generation"
+
+    session.provider = "codex"
+    unsupported = _run_operation(journal, session, "resume-status")
+    assert unsupported["state"] == REFUSED
+    assert unsupported["reason_code"] == "capability_unsupported"
+    unsupported = _run_operation(
+        journal,
+        session,
+        "route-set",
+        config_id="model",
+        value="gpt-5.6-sol",
+    )
+    assert unsupported["state"] == REFUSED
+    assert unsupported["reason_code"] == "capability_unsupported"
+    inactive = _run_operation(journal, session, "cancel")
+    assert inactive["state"] == REFUSED
+    assert inactive["reason_code"] == "turn_not_active"
+
+
+def test_kimi_resume_status_success_and_response_loss(tmp_path):
+    session = _session(_Rpc())
+    journal = SessionControlJournal(tmp_path / "control.db")
+
+    session.rpc.request = lambda *_args, **_kwargs: {
+        "sessions": [
+            "ignored",
+            {"sessionId": "other"},
+            {"sessionId": "session-1", "cwd": "/tmp/worktree"},
+        ]
+    }
+    receipt = _run_operation(journal, session, "resume-status")
+    assert receipt["state"] == COMPLETED
+    assert receipt["result"]["resumable_session"]["sessionId"] == "session-1"
+
+    def unavailable(*_args, **_kwargs):
+        raise TimeoutError("provider did not respond")
+
+    session.rpc.request = unavailable
+    receipt = _run_operation(journal, session, "resume-status")
+    assert receipt["state"] == AMBIGUOUS
+    assert receipt["reason_code"] == "provider_response_unavailable"
+
+
+def test_kimi_cancel_inactive_accepted_and_ambiguous_paths(tmp_path):
+    session = _session(_Rpc())
+    journal = SessionControlJournal(tmp_path / "control.db")
+
+    inactive = _run_operation(journal, session, "cancel")
+    assert inactive["reason_code"] == "turn_not_active"
+
+    session._active_prompt_request_id = 17
+    accepted = _run_operation(journal, session, "cancel")
+    assert accepted["state"] == ACCEPTED
+    assert accepted["result"]["cancelled_provider_request_id"] == 17
+
+    def notify_unavailable(*_args, **_kwargs):
+        raise BrokenPipeError("provider channel lost")
+
+    session.rpc.notify = notify_unavailable
+    ambiguous = _run_operation(journal, session, "cancel")
+    assert ambiguous["state"] == AMBIGUOUS
+    assert ambiguous["reason_code"] == "cancel_delivery_ambiguous"
+
+
+def test_codex_cancel_success_and_response_loss_paths(tmp_path):
+    session = _session(_Rpc())
+    session.provider = "codex"
+    session._current_turn_id = "turn-1"
+    journal = SessionControlJournal(tmp_path / "control.db")
+
+    session.rpc.request = lambda *_args, **_kwargs: {"interrupted": True}
+    completed = _run_operation(journal, session, "cancel")
+    assert completed["state"] == COMPLETED
+    assert completed["result"] == {"interrupted": True}
+
+    def unavailable(*_args, **_kwargs):
+        raise TimeoutError("turn interrupt response lost")
+
+    session.rpc.request = unavailable
+    ambiguous = _run_operation(journal, session, "cancel")
+    assert ambiguous["state"] == AMBIGUOUS
+    assert ambiguous["reason_code"] == "cancel_outcome_ambiguous"
+
+
+def test_route_set_busy_invalid_refused_ambiguous_and_unattested_paths(tmp_path):
+    session = _session(_Rpc())
+    journal = SessionControlJournal(tmp_path / "control.db")
+
+    session._active_prompt_request_id = 3
+    busy = _run_operation(
+        journal,
+        session,
+        "route-set",
+        config_id="model",
+        value="kimi-code/k2.7",
+    )
+    assert busy["reason_code"] == "turn_busy"
+    session._active_prompt_request_id = None
+
+    invalid = _run_operation(
+        journal,
+        session,
+        "route-set",
+        config_id="invalid",
+        value="value",
+    )
+    assert invalid["reason_code"] == "invalid_route"
+
+    def refused(*_args, **_kwargs):
+        raise bridge.BridgeError("provider request failed: route denied")
+
+    session.rpc.request = refused
+    receipt = _run_operation(
+        journal,
+        session,
+        "route-set",
+        config_id="model",
+        value="kimi-code/k2.7",
+    )
+    assert receipt["state"] == REFUSED
+    assert receipt["reason_code"] == "route_refused"
+
+    def ambiguous(*_args, **_kwargs):
+        raise TimeoutError("response lost")
+
+    session.rpc.request = ambiguous
+    receipt = _run_operation(
+        journal,
+        session,
+        "route-set",
+        config_id="model",
+        value="kimi-code/k2.7",
+    )
+    assert receipt["state"] == AMBIGUOUS
+    assert receipt["reason_code"] == "route_outcome_ambiguous"
+
+    session.rpc.request = lambda *_args, **_kwargs: {
+        "configOptions": [{"id": "model", "category": "model", "currentValue": "kimi-code/k3"}]
+    }
+    receipt = _run_operation(
+        journal,
+        session,
+        "route-set",
+        config_id="model",
+        value="kimi-code/k2.7",
+    )
+    assert receipt["state"] == REFUSED
+    assert receipt["reason_code"] == "route_not_applied"
+
+
+def test_compact_and_follow_up_typed_refusal_and_ambiguity_paths(tmp_path, monkeypatch):
+    session = _session(_Rpc(commands=["compact"]))
+    journal = SessionControlJournal(tmp_path / "control.db")
+
+    session._active_prompt_request_id = 9
+    busy = _run_operation(journal, session, "compact")
+    assert busy["reason_code"] == "turn_busy"
+    session._active_prompt_request_id = None
+
+    invalid = _run_operation(journal, session, "compact", instruction={"not": "text"})
+    assert invalid["reason_code"] == "invalid_instruction"
+
+    empty = _run_operation(journal, session, "follow-up", message=" ")
+    assert empty["reason_code"] == "message_empty"
+
+    def provider_busy(*_args, **_kwargs):
+        raise bridge.SessionOperationRefused("turn_busy", "wait for the active turn")
+
+    monkeypatch.setattr(session, "_submit_provider_turn", provider_busy)
+    refused = _run_operation(journal, session, "follow-up", message="continue")
+    assert refused["state"] == REFUSED
+    assert refused["reason_code"] == "turn_busy"
+
+    def response_lost(*_args, **_kwargs):
+        raise TimeoutError("provider response lost")
+
+    monkeypatch.setattr(session, "_submit_provider_turn", response_lost)
+    ambiguous = _run_operation(journal, session, "follow-up", message="continue")
+    assert ambiguous["state"] == AMBIGUOUS
+    assert ambiguous["reason_code"] == "prompt_outcome_ambiguous"

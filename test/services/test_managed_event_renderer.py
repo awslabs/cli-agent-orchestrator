@@ -60,6 +60,71 @@ def test_renderer_coalesces_repeated_tool_state():
     assert "must-not-render" not in first
 
 
+@pytest.mark.parametrize(
+    ("item", "expected"),
+    [
+        (
+            _update(
+                "agent_thought_chunk",
+                content=[
+                    {"content": {"text": "first"}},
+                    {"text": " second"},
+                ],
+            ),
+            "first second",
+        ),
+        (
+            {"method": "session/update", "params": None},
+            "[provider event] session update\n",
+        ),
+        (
+            _update(
+                "plan",
+                entries=[
+                    {"status": "in progress", "content": "Inspect code"},
+                    "ignored",
+                    {"title": "Run tests"},
+                ],
+            ),
+            "[plan]\n  [in progress] Inspect code\n  [pending] Run tests\n",
+        ),
+        (_update("plan_update", entries=None), "[plan updated]\n"),
+        (_update("plan_removed"), "[plan cleared]\n"),
+        (
+            _update(
+                "available_commands_update",
+                availableCommands=[{"name": "compact"}, {"name": " route   query "}],
+            ),
+            "[commands] compact, route query\n",
+        ),
+        (
+            _update("available_commands_update", availableCommands=None),
+            "[commands] none advertised\n",
+        ),
+        (
+            _update("config_option_update", configId="model", currentValue="kimi-code/k3"),
+            "[route] model=kimi-code/k3\n",
+        ),
+        (_update("current_mode_update", currentModeId="agent"), "[mode] agent\n"),
+        (_update("session_info_update"), "[session metadata updated]\n"),
+        (_update("usage_update"), "[usage updated]\n"),
+        (_update("future_event"), "[provider event] future_event\n"),
+        ({"method": "item/output/delta", "params": {"delta": "hello"}}, "hello"),
+        (
+            {"method": "item/output/delta", "params": {"delta": {"text": "world"}}},
+            "world",
+        ),
+        ({"method": "item/output/delta", "params": {"delta": {}}}, None),
+        ({"method": "turn/started"}, "\n[turn started]\n"),
+        ({"method": "tool/progress"}, "[provider event] tool/progress\n"),
+        ({"method": "future/notification"}, "[provider event] future/notification\n"),
+        ({"not_method": True}, "[provider event]\n"),
+    ],
+)
+def test_renderer_projects_all_supported_event_families(item, expected):
+    assert ManagedEventRenderer(provider="kimi_cli").render(item) == expected
+
+
 def test_rpc_process_pane_output_is_rendered_not_json(capsys):
     item = _update(
         "agent_message_chunk",
@@ -140,6 +205,71 @@ def test_operator_console_reconciles_same_operation_after_response_loss(monkeypa
     output = capsys.readouterr().out
     assert "response was lost" in output
     assert "is accepted; do not resend it" in output
+
+
+def test_operator_console_help_query_and_success_paths(monkeypatch, capsys):
+    calls = []
+
+    def fake_request_bridge(reservation_id, command, *, timeout):
+        calls.append((reservation_id, command, timeout))
+        if command["op"] == "session.op.query" and command["operation_id"] == "op-missing":
+            raise BridgeError("unknown operation")
+        if command["op"] == "session.op.query":
+            return {"ok": True, "receipt": {"state": "completed"}}
+        return {
+            "ok": True,
+            "receipt": {"state": "refused", "reason_detail": "turn is busy"},
+        }
+
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO("\n/help\n/exit\n/operation op-done\n/op op-missing\ncontinue\n"),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.request_bridge",
+        fake_request_bridge,
+    )
+    _operator_console(
+        {
+            "reservation_id": "reservation-1",
+            "terminal_id": "terminal-1",
+            "generation": "generation-1",
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "messages create provider-native follow-up turns" in output
+    assert "unknown local command: /exit" in output
+    assert "operation op-done is completed" in output
+    assert "operation op-missing could not be reconciled" in output
+    assert "follow-up refused" in output
+    assert "turn is busy" in output
+    assert [command["op"] for _, command, _ in calls] == [
+        "session.op.query",
+        "session.op.query",
+        "session.op.begin",
+    ]
+
+
+def test_operator_console_preserves_id_when_begin_and_query_both_fail(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stdin", StringIO("continue\n"))
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.request_bridge",
+        MagicMock(side_effect=[TimeoutError("begin lost"), TimeoutError("query lost")]),
+    )
+
+    _operator_console(
+        {
+            "reservation_id": "reservation-1",
+            "terminal_id": "terminal-1",
+            "generation": "generation-1",
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "outcome is unresolved" in output
+    assert "Do not resend; use /operation terminal-" in output
 
 
 def test_structured_stderr_is_not_rendered_as_raw_json():
