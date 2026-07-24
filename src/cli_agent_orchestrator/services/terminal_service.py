@@ -18,22 +18,33 @@ Terminal Workflow:
 """
 
 import asyncio
+import contextlib
 import logging
+import os
 import re
 import threading
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import create_terminal_v2 as db_create_terminal_v2
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
+    delete_terminal_if_generation as db_delete_terminal_if_generation,
+)
+from cli_agent_orchestrator.clients.database import (
+    delete_terminal_v2_if_generation as db_delete_terminal_v2_if_generation,
+)
+from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
+    get_terminal_metadata_v2,
     update_last_active,
     update_terminal_shell_command,
 )
@@ -69,6 +80,7 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
+    managed_window_name,
     wait_until_status,
 )
 
@@ -87,6 +99,58 @@ _deferred_init_tasks: set = set()
 
 class TerminalInputBlockedError(Exception):
     """Raised when orchestrated input would answer an active interactive prompt."""
+
+
+class TerminalGenerationMismatchError(ValueError):
+    """The terminal id now names a different incarnation than the caller's
+    bound generation/session. Destructive cleanup must preserve every resource
+    and report the ambiguity — never delete the replacement. Mapped to HTTP
+    409 at the API boundary (distinct from a plain 404 not-found)."""
+
+
+class DestructiveEndpointRequiredError(TerminalGenerationMismatchError):
+    """A v2 terminal row was targeted by a legacy destructive path.
+
+    Every v2 destructive action — including an ordinary terminal DELETE —
+    is lawful only as the effect of the conditional destructive endpoint
+    (exact heartbeat, identity/fence, dual-exit, and containment
+    decisions). A legacy caller carries no endpoint-issued intent, so the
+    teardown refuses with zero mutation. Mapped to HTTP 409 like every
+    other conditional-identity refusal."""
+
+
+_SHELL_COMMANDS = frozenset({"sh", "bash", "zsh", "dash", "fish", "csh", "tcsh", "ksh", "login"})
+
+
+def _verify_managed_pane_process(session_name: str, window_name: str) -> None:
+    """Prove the managed window is NOT running a shell (fail-closed check).
+
+    The zero-keystroke contract: the pane's process must be the bridge argv
+    itself. If the pane reports a shell — or its process cannot be resolved —
+    the launch is unsafe: kill the window and raise so the reservation records
+    a preflight block instead of degrading to shell typing."""
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            command = get_backend().get_pane_current_command(session_name, window_name)
+        except Exception:
+            command = None
+        if command:
+            break
+        if time.monotonic() >= deadline:
+            command = None
+            break
+        time.sleep(0.05)
+    if command and command.strip().lower() not in _SHELL_COMMANDS:
+        return
+    try:
+        get_backend().kill_window(session_name, window_name)
+    finally:
+        raise RuntimeError(
+            f"managed window {session_name}:{window_name} did not start the "
+            f"bridge as its own process (pane command: {command!r}); refusing "
+            "to fall back to shell-typed startup"
+        )
 
 
 def inject_memory_context(first_message: str, terminal_id: str) -> str:
@@ -146,6 +210,419 @@ SOFT_ENFORCEMENT_PROVIDERS = {
 }
 
 
+def _register_v2_terminal_resources(
+    terminal_id: str, generation: str, window_name: str, session_name: str
+) -> None:
+    """Journal-first DECLARATION of a v2 generation's runtime resources.
+
+    The code-owned resource registry is the authority for the v2/managed
+    lifecycle: every resource the runtime constructs for a v2 generation
+    is declared here — durably, BEFORE any physical window or DB row is
+    constructed — so a crash can never orphan an undeclared resource.
+    This function only declares intent (and attaches the shared
+    companion-dir monitor); it NEVER marks anything created.  Each entry
+    is transitioned to ``created`` by ``_mark_v2_resource_created`` only
+    after the exact physical/DB/memory identity is observed to exist.
+    Legacy v1 surfaces predate the registry and stay outside its
+    authority boundary.  Owned identities embed their entry_id so the
+    create-to-capture crash window stays discoverable (registry rule);
+    the per-generation companion dir is shared among the heartbeat/fence/
+    broker/destructive writers and is registered monitor-only.
+    """
+    from cli_agent_orchestrator.constants import COMPANION_DIR
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    registry = rr.get_resource_registry()
+    constructor = "terminal_service.create_terminal"
+    resources: list[tuple[str, str, str, dict[str, Any]]] = [
+        (
+            "fifo",
+            f"{terminal_id}.fifo",
+            "owned",
+            {"desired_fs_path": str(FIFO_DIR / f"{terminal_id}.fifo")},
+        ),
+        (
+            "log",
+            f"{terminal_id}.log",
+            "owned",
+            {"desired_fs_path": str(TERMINAL_LOG_DIR / f"{terminal_id}.log")},
+        ),
+        (
+            "scrollback",
+            f"{terminal_id}.scrollback",
+            "owned",
+            {"desired_fs_path": str(TERMINAL_LOG_DIR / f"{terminal_id}.scrollback")},
+        ),
+        (
+            "snapshot",
+            f"{terminal_id}.snapshot.json",
+            "owned",
+            {"desired_fs_path": str(TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json")},
+        ),
+        ("tmux_window", window_name, "owned", {"desired_tmux_name": window_name}),
+        (
+            "provider_instance",
+            f"{terminal_id}.provider",
+            "owned",
+            {"desired_db_key": f"provider:{terminal_id}.provider"},
+        ),
+        (
+            "session_env",
+            f"{terminal_id}.session-env",
+            "owned",
+            {"desired_db_key": f"session_env:{session_name}:{terminal_id}.session-env"},
+        ),
+        (
+            "herdr",
+            f"{terminal_id}.herdr",
+            "owned",
+            {"desired_db_key": f"herdr:{terminal_id}.herdr"},
+        ),
+        (
+            "pipe_pane",
+            f"{terminal_id}.pipe-pane",
+            "owned",
+            {"desired_db_key": f"pipe_pane:{terminal_id}.pipe-pane"},
+        ),
+        (
+            "watchdog",
+            f"{terminal_id}.watchdog",
+            "owned",
+            {"desired_db_key": f"watchdog:{terminal_id}.watchdog"},
+        ),
+        (
+            "status_map",
+            f"{terminal_id}.status-map",
+            "owned",
+            {"desired_memory_key": f"status:{terminal_id}.status-map"},
+        ),
+        (
+            "memory_injection",
+            f"{terminal_id}.memory-injection",
+            "owned",
+            {"desired_memory_key": f"memory-injection:{terminal_id}.memory-injection"},
+        ),
+        (
+            "curator_lock",
+            f"{terminal_id}.curator-lock",
+            "owned",
+            {"desired_memory_key": f"curator-lock:{terminal_id}.curator-lock"},
+        ),
+        (
+            "db_row_set",
+            f"{terminal_id}.db-row",
+            "owned",
+            {"desired_db_key": f"managed_launch_v2_terminals:{terminal_id}.db-row"},
+        ),
+        (
+            # The per-generation companion dir (heartbeat/fence/broker/
+            # destructive state and their lock sidecars) is written by
+            # several subsystems; registered monitor-only as shared.
+            "other",
+            f"{terminal_id}.companion",
+            "shared",
+            {"desired_fs_path": str(COMPANION_DIR / terminal_id / generation)},
+        ),
+    ]
+    for kind, entry_id, ownership, identity in resources:
+        registry.declare(
+            entry_id=entry_id,
+            kind=kind,
+            protocol_vintage="v2",
+            terminal_id=terminal_id,
+            generation=generation,
+            owner="fork",
+            ownership=ownership,
+            constructor_id=constructor,
+            deleter_id="terminal_service.delete_terminal",
+            monitor_id=("heartbeat_store.issue_fencing_token" if kind == "other" else None),
+            rollback_rule="generation-isolated",
+            actor_id=constructor,
+            **identity,
+        )
+        if ownership != "owned":
+            registry.monitor(
+                entry_id,
+                monitor_id="heartbeat_store.issue_fencing_token",
+                actor_id=constructor,
+            )
+
+
+def _mark_v2_resource_created(
+    entry_id: str,
+    *,
+    actor_id: str,
+    observed: Optional[dict[str, Any]] = None,
+    receipt_subject: Optional[dict[str, Any]] = None,
+) -> None:
+    """Transition a declared v2 entry to ``created`` after observed creation.
+
+    Callers invoke this ONLY at the point the exact physical/DB/memory
+    identity was observed to exist (the window creation returned, the DB
+    insert committed, the FIFO/path is present); the observed identity and
+    the existence receipt digest are journaled with the transition.  An
+    undeclared or already-created entry is left untouched — creation is
+    never manufactured and re-drives converge.
+    """
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    registry = rr.get_resource_registry()
+    try:
+        entry = registry.resolve(entry_id)
+    except rr.RegistryError:
+        return
+    if entry["lifecycle_state"] != "declared":
+        return
+    registry.register_created(
+        entry_id,
+        actor_id=actor_id,
+        observed=observed,
+        existence_receipt_digest=rr.receipt_digest(
+            {"entry_id": entry_id, "observed": receipt_subject or observed or {}}
+        ),
+    )
+
+
+def _mark_existing_v2_fs_artifacts(terminal_id: str) -> None:
+    """Mark fs-backed v2 entries created iff the artifact is really present."""
+    actor = "terminal_service.create_terminal"
+    for entry_id, path in (
+        (f"{terminal_id}.log", TERMINAL_LOG_DIR / f"{terminal_id}.log"),
+        (f"{terminal_id}.scrollback", TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"),
+        (f"{terminal_id}.snapshot.json", TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"),
+    ):
+        if path.exists():
+            _mark_v2_resource_created(
+                entry_id,
+                actor_id=actor,
+                observed={"observed_fs_path": str(path)},
+                receipt_subject={"fs_exists": str(path)},
+            )
+
+
+def _v2_resource_presence(
+    entry: dict[str, Any], terminal_id: str, session_name: Optional[str]
+) -> Optional[bool]:
+    """Identity-specific existence probe: True/False, None when unprovable.
+
+    Every teardown verdict derives from a REAL check of the underlying
+    identity — a filesystem stat, a DB read, a backend window query, or an
+    in-process membership probe — never from a synthesized claim.
+    """
+    kind = entry["kind"]
+    fs_path = entry.get("desired_fs_path")
+    if fs_path:
+        return Path(fs_path).exists()
+    if kind in ("tmux_window", "provider_instance", "pipe_pane"):
+        # The provider process and its pipe die with the window.  Only the
+        # tmux_window entry carries the window identity; for the others the
+        # managed v2 window name is deterministic from the generation.
+        session = session_name
+        window = entry.get("desired_tmux_name")
+        metadata = None
+        if window is None and entry.get("generation"):
+            window = managed_window_name(terminal_id, entry["generation"])
+        if session is None:
+            metadata = get_terminal_metadata_v2(terminal_id) or {}
+            session = metadata.get("tmux_session")
+        if not session or not window:
+            return None
+        try:
+            return bool(get_backend().window_exists(session, window))
+        except Exception:  # noqa: BLE001 - an unanswerable probe is unknown
+            return None
+    if kind == "db_row_set":
+        return get_terminal_metadata_v2(terminal_id) is not None
+    if kind == "session_env":
+        # The underlying row is session-scoped: present while the SESSION's
+        # forwarded-env row exists (it is never this terminal's to remove).
+        key = entry.get("desired_db_key") or ""
+        parts = key.split(":", 2)
+        if len(parts) < 3:
+            return None
+        try:
+            return bool(get_session_env(parts[1]))
+        except Exception:  # noqa: BLE001
+            return None
+    if kind == "watchdog":
+        return (
+            terminal_id in fifo_manager._readers
+            or terminal_id in fifo_manager._threads
+            or terminal_id in fifo_manager._pane_probe
+        )
+    if kind == "status_map":
+        return (
+            terminal_id in status_monitor._buffers
+            or terminal_id in status_monitor._last_status
+            or terminal_id in status_monitor._screens
+        )
+    if kind == "memory_injection":
+        return terminal_id in _memory_injected_terminals
+    if kind == "curator_lock":
+        from cli_agent_orchestrator.services.memory_service import _curator_locks
+
+        return terminal_id in _curator_locks
+    if kind == "herdr":
+        svc = get_herdr_inbox_service()
+        if svc is None:
+            return False
+        try:
+            return terminal_id in svc._terminal_to_pane
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def _remove_v2_resource(entry: dict[str, Any], terminal_id: str) -> None:
+    """Physically remove the generation-owned artifacts this teardown owns.
+
+    FS artifacts (FIFO/log/scrollback/snapshot) are unlinked; in-process
+    maps (status/watchdog/memory-injection/curator lock) are cleared.
+    The tmux window, provider process, v2 DB row, and session-scoped env
+    row are removed by the caller's ordered teardown (or shared with the
+    session) — here they are only ever probed, never removed.
+    """
+    fs_path = entry.get("desired_fs_path")
+    if fs_path:
+        with contextlib.suppress(OSError):
+            Path(fs_path).unlink()
+        return
+    kind = entry["kind"]
+    if kind == "watchdog":
+        with contextlib.suppress(Exception):
+            fifo_manager.stop_reader(terminal_id)
+    elif kind == "status_map":
+        with contextlib.suppress(Exception):
+            status_monitor.clear_terminal(terminal_id)
+    elif kind == "memory_injection":
+        with _memory_injected_lock:
+            _memory_injected_terminals.discard(terminal_id)
+    elif kind == "curator_lock":
+        with contextlib.suppress(Exception):
+            from cli_agent_orchestrator.services.memory_service import _curator_locks
+
+            _curator_locks.pop(terminal_id, None)
+
+
+def _absence_receipt(entry: dict[str, Any]) -> str:
+    """Digest of the actual absence probe result for one entry."""
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    return rr.receipt_digest(
+        {
+            "entry_id": entry["entry_id"],
+            "absent": True,
+            "probe": {
+                "kind": entry["kind"],
+                "desired_fs_path": entry.get("desired_fs_path"),
+                "desired_db_key": entry.get("desired_db_key"),
+                "desired_tmux_name": entry.get("desired_tmux_name"),
+                "desired_memory_key": entry.get("desired_memory_key"),
+            },
+        }
+    )
+
+
+def _deregister_v2_terminal_resources(
+    terminal_id: str, generation: str, session_name: Optional[str] = None
+) -> None:
+    """Drain/close/delete a v2 generation's registry entries, truthfully.
+
+    An entry still only ``declared`` is aborted ONLY on a verified-absence
+    probe (a probe that finds a trace first records the observed creation
+    — the create-to-capture crash window — and never aborts).  An entry
+    marked created is drained and closed, its generation-owned physical
+    artifact is actually removed, and it is marked ``deleted`` ONLY after
+    an identity-specific absence probe confirms the removal — a resource
+    that is still present keeps its row (retained, never a synthesized
+    absence claim).  Shared monitor-only entries are abandoned on a
+    verified-empty probe; a present shared identity is retained.
+    """
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    deleter = "terminal_service.delete_terminal"
+    try:
+        registry = rr.get_resource_registry()
+    except Exception:  # noqa: BLE001 - teardown stays best-effort
+        logger.warning("resource registry unavailable during v2 teardown", exc_info=True)
+        return
+    try:
+        entries = registry.enumerate(terminal_id=terminal_id, generation=generation)
+    except Exception:  # noqa: BLE001
+        logger.warning("resource registry enumeration failed during v2 teardown", exc_info=True)
+        return
+    for entry in entries:
+        entry_id = entry["entry_id"]
+        state = entry["lifecycle_state"]
+        if state in ("deleted", "aborted"):
+            continue
+        presence = _v2_resource_presence(entry, terminal_id, session_name)
+        try:
+            if entry["ownership"] != "owned":
+                # Monitor-only: abandon the declaration on a verified-empty
+                # probe; a present shared identity retains its monitor row.
+                if presence is False:
+                    registry.abort(
+                        entry_id,
+                        actor_id=deleter,
+                        verified_absence_digest=_absence_receipt(entry),
+                    )
+                continue
+            if state == "declared":
+                if presence is True:
+                    # Created but never receipt-marked (e.g. the teardown
+                    # scrollback/snapshot capture): discover first, never abort.
+                    _mark_v2_resource_created(
+                        entry_id,
+                        actor_id=deleter,
+                        observed=_observed_identity(entry),
+                        receipt_subject={"discovered_at_teardown": True},
+                    )
+                    state = "created"
+                elif presence is False:
+                    registry.abort(
+                        entry_id,
+                        actor_id=deleter,
+                        verified_absence_digest=_absence_receipt(entry),
+                    )
+                    continue
+                else:
+                    logger.warning(
+                        "v2 registry entry %s: absence unprovable; row retained", entry_id
+                    )
+                    continue
+            if state in ("created", "active"):
+                registry.drain(entry_id, actor_id=deleter)
+                state = "draining"
+            if state == "draining":
+                registry.close(entry_id, actor_id=deleter)
+            _remove_v2_resource(entry, terminal_id)
+            if _v2_resource_presence(entry, terminal_id, session_name) is False:
+                registry.delete(
+                    entry_id,
+                    actor_id=deleter,
+                    verified_absence_digest=_absence_receipt(entry),
+                )
+            else:
+                logger.warning(
+                    "v2 resource %s still present after teardown; registry row retained",
+                    entry_id,
+                )
+        except Exception:  # noqa: BLE001 - one entry's failure must not strand the rest
+            logger.warning("registry deregistration failed for %s", entry_id, exc_info=True)
+
+
+def _observed_identity(entry: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """The observed-identity capture for a discovered (declared→created) entry."""
+    if entry.get("desired_fs_path"):
+        return {"observed_fs_path": entry["desired_fs_path"]}
+    if entry.get("desired_db_key"):
+        return {"observed_db_key": entry["desired_db_key"]}
+    if entry.get("desired_memory_key"):
+        return {"observed_memory_key": entry["desired_memory_key"]}
+    return None
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -159,10 +636,21 @@ async def create_terminal(
     defer_init: bool = False,
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    reserved_terminal_id: Optional[str] = None,
+    terminal_generation: Optional[str] = None,
+    trusted_project_root: Optional[str] = None,
+    expected_model: Optional[str] = None,
+    expected_effort: Optional[str] = None,
+    preserve_on_init_failure: bool = False,
+    managed_native_command: Optional[list[str]] = None,
+    protocol_vintage: str = "v1",
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
     This function orchestrates the complete terminal creation workflow:
+    0. (new sessions only) Preflight: strictly pre-clear any stale persisted
+       session env BEFORE any resource exists — a failure aborts with zero
+       cleanup actions
     1. Generate unique terminal ID and window name
     2. Create tmux session/window (new or existing)
     3. Save terminal metadata to database
@@ -195,6 +683,35 @@ async def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    # cond-0067: the no-env/new-session strict pre-clear is a TRUE PREFLIGHT.
+    # It runs BEFORE terminal-ID generation and OUTSIDE the resource-owning
+    # try/except below, so if it fails, creation aborts with ZERO cleanup
+    # actions: at this point the invocation has acquired nothing, and cleanup
+    # may only ever touch resources this invocation itself acquired. (When
+    # this pre-clear sat inside the broad cleanup try, a failure still drove
+    # FIFO stop/unlink, status clear, provider cleanup, and terminal-row
+    # delete against the freshly generated — possibly 32-bit-colliding —
+    # terminal ID, destroying an unrelated live terminal's state.)
+    if new_session:
+        if not session_name:
+            session_name = generate_session_name()
+
+        # Ensure session name has the CAO prefix for identification
+        if not session_name.startswith(SESSION_PREFIX):
+            session_name = f"{SESSION_PREFIX}{session_name}"
+
+        # Prevent duplicate sessions
+        if get_backend().session_exists(session_name):
+            raise ValueError(f"Session '{session_name}' already exists")
+
+        # Wipe any stale mapping a prior aborted lifecycle for this name
+        # may have left behind, so a no-env relaunch can't inherit them.
+        # Strict (cond-0050): if the durable delete cannot complete, this
+        # raises and creation aborts BEFORE any tmux session/provider/
+        # window/terminal side effect — a session name may never be
+        # reused over an unconfirmed stale row.
+        clear_session_env(session_name)
+
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
     # already-existing session (the `new_session=False` branch below — what
@@ -205,28 +722,70 @@ async def create_terminal(
     # already existed — see the `except` block.
     window_created = False
     try:
-        # Step 1: Generate unique identifiers
-        terminal_id = generate_terminal_id()
+        # Step 1: Generate unique identifiers.  Managed launches allocate the
+        # terminal id durably before provider I/O and pass it back here; the
+        # ordinary path retains its existing local allocation.
+        if reserved_terminal_id is None:
+            terminal_id = generate_terminal_id()
+        else:
+            terminal_id = reserved_terminal_id
+        if reserved_terminal_id is not None and not re.fullmatch(r"[a-f0-9]{8}", terminal_id):
+            raise ValueError("reserved_terminal_id must be exactly 8 lowercase hex characters")
+        if reserved_terminal_id is not None and terminal_generation is None:
+            raise ValueError("managed reserved terminals require terminal_generation")
+        if reserved_terminal_id is None and terminal_generation is not None:
+            raise ValueError("terminal_generation is valid only with reserved_terminal_id")
+        if trusted_project_root is not None and provider != ProviderType.CODEX.value:
+            raise ValueError("trusted_project_root is supported only by the Codex provider")
+        if managed_native_command is not None:
+            if reserved_terminal_id is None or terminal_generation is None:
+                raise ValueError("managed_native_command requires a reserved terminal generation")
+            if not managed_native_command or not all(
+                isinstance(item, str) and "\x00" not in item for item in managed_native_command
+            ):
+                raise ValueError("managed_native_command must be a non-empty argv list")
+            if not os.path.isabs(managed_native_command[0]):
+                raise ValueError("managed_native_command executable must be absolute")
+            if new_session:
+                raise ValueError(
+                    "managed native launches require an existing session; atomic "
+                    "process creation is only defined for window creation"
+                )
+        if protocol_vintage not in ("v1", "v2"):
+            raise ValueError("protocol_vintage must be v1 or v2")
+        if protocol_vintage == "v2" and (
+            managed_native_command is None
+            or reserved_terminal_id is None
+            or terminal_generation is None
+        ):
+            raise ValueError("v2 terminal persistence requires a managed native reserved launch")
 
         if not session_name:
             session_name = generate_session_name()
 
-        window_name = generate_window_name(agent_profile)
+        window_name = (
+            managed_window_name(terminal_id, terminal_generation)
+            if managed_native_command is not None and terminal_generation is not None
+            else generate_window_name(agent_profile)
+        )
+
+        # v2 journal-first: every intended resource is declared durably in
+        # the registry BEFORE any physical window or DB row is constructed,
+        # so a crash can never orphan an undeclared v2 resource and nothing
+        # is ever registered as created before it is observed to exist
+        # (fail-closed: the v2 plane is the registry's authority scope).
+        if protocol_vintage == "v2":
+            if terminal_generation is None:
+                # Redundant with the v2 validation above; mypy cannot
+                # narrow through it — fail closed rather than declare
+                # without the exact generation.
+                raise ValueError("v2 terminal persistence requires the exact generation")
+            _register_v2_terminal_resources(
+                terminal_id, terminal_generation, window_name, session_name
+            )
 
         # Step 2: Create tmux session or window
         if new_session:
-            # Ensure session name has the CAO prefix for identification
-            if not session_name.startswith(SESSION_PREFIX):
-                session_name = f"{SESSION_PREFIX}{session_name}"
-
-            # Prevent duplicate sessions
-            if get_backend().session_exists(session_name):
-                raise ValueError(f"Session '{session_name}' already exists")
-
-            # Wipe any stale mapping a prior aborted lifecycle for this name
-            # may have left behind, so a no-env relaunch can't inherit them.
-            clear_session_env(session_name)
-
             # Create new tmux session with initial window
             get_backend().create_session(
                 session_name,
@@ -246,17 +805,32 @@ async def create_terminal(
             # Add window to existing session
             if not get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
-            # Merge explicit per-step env_vars over the persisted session env
-            # (per-step wins on conflict): workflow routing ids like
-            # CAO_WORKFLOW_RUN_ID must reach the window even when it joins an
-            # existing session (issue #408).
-            window_name = get_backend().create_window(
-                session_name,
-                window_name,
-                terminal_id,
-                working_directory,
-                extra_env={**get_session_env(session_name), **(env_vars or {})},
-            )
+            if managed_native_command is not None:
+                # ZERO-KEYSTROKE managed creation (spec §20.2d(3)/§20.2e P1-4):
+                # the bridge is the pane's OWN process/argv at window creation.
+                # Nothing is typed into a shell — no send_keys, no special key,
+                # no generic input — and the window env is the minimal managed
+                # identity, never ambient operator session env (P1-9).
+                window_name = get_backend().create_window_with_argv(
+                    session_name,
+                    window_name,
+                    terminal_id,
+                    managed_native_command,
+                    working_directory,
+                    extra_env={},
+                )
+            else:
+                # Merge explicit per-step env_vars over the persisted session env
+                # (per-step wins on conflict): workflow routing ids like
+                # CAO_WORKFLOW_RUN_ID must reach the window even when it joins an
+                # existing session (issue #408).
+                window_name = get_backend().create_window(
+                    session_name,
+                    window_name,
+                    terminal_id,
+                    working_directory,
+                    extra_env={**get_session_env(session_name), **(env_vars or {})},
+                )
             window_created = True  # only set after successful creation
 
         # Step 3: Load the profile once for allowed tool resolution before
@@ -297,15 +871,81 @@ async def create_terminal(
 
         # Step 3c: Persist terminal metadata to database after restrictions
         # are resolved so API reads and snapshots report the actual launch policy.
-        db_create_terminal(
-            terminal_id,
-            session_name,
-            window_name,
-            provider,
-            agent_profile,
-            allowed_tools,
-            caller_id=caller_id,
-        )
+        # Bind the server-owned immutable pane/window identity at creation:
+        # attestation binds supervisors by pane_id, never by mutable window name.
+        # v2 managed terminals persist ONLY to the isolated v2 surface so
+        # old-binary query/list/cleanup paths have zero visibility into them.
+        identity = get_backend().window_identity(session_name, window_name) or {}
+        if protocol_vintage == "v2":
+            if terminal_generation is None:
+                # Redundant with the v2 validation above; mypy cannot
+                # narrow through it, and the v2 surface requires the exact
+                # generation — fail closed rather than persist without it.
+                raise ValueError("v2 terminal persistence requires the exact generation")
+            # The window now physically exists: record the OBSERVED creation
+            # (never before, never for an absent identity).
+            _mark_v2_resource_created(
+                window_name,
+                actor_id="terminal_service.create_terminal",
+                observed=(
+                    {"observed_tmux_id": identity["window_id"]}
+                    if identity.get("window_id")
+                    else None
+                ),
+                receipt_subject={"tmux_window": window_name, "identity": identity},
+            )
+            db_create_terminal_v2(
+                terminal_id,
+                session_name,
+                window_name,
+                provider,
+                agent_profile,
+                allowed_tools,
+                caller_id=caller_id,
+                generation=terminal_generation,
+                pane_id=identity.get("pane_id"),
+                window_id=identity.get("window_id"),
+            )
+            # The v2 DB row is durably committed: observed creation.
+            _mark_v2_resource_created(
+                f"{terminal_id}.db-row",
+                actor_id="terminal_service.create_terminal",
+                observed={"observed_db_key": f"managed_launch_v2_terminals:{terminal_id}.db-row"},
+                receipt_subject={"db_row": "managed_launch_v2_terminals", "id": terminal_id},
+            )
+            # The forwarded-env row is session-scoped: mark it created only
+            # when it is really present; otherwise the entry stays declared.
+            try:
+                if get_session_env(session_name):
+                    _mark_v2_resource_created(
+                        f"{terminal_id}.session-env",
+                        actor_id="terminal_service.create_terminal",
+                        observed={
+                            "observed_db_key": (
+                                f"session_env:{session_name}:{terminal_id}.session-env"
+                            )
+                        },
+                        receipt_subject={"session_env_row": session_name},
+                    )
+            except Exception:  # noqa: BLE001 - an unanswerable probe stays declared
+                logger.warning(
+                    "session-env observation failed for v2 terminal %s",
+                    terminal_id,
+                    exc_info=True,
+                )
+        else:
+            db_create_terminal(
+                terminal_id,
+                session_name,
+                window_name,
+                provider,
+                agent_profile,
+                allowed_tools,
+                caller_id=caller_id,
+                generation=terminal_generation,
+                pane_id=identity.get("pane_id"),
+                window_id=identity.get("window_id"),
+            )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
@@ -336,12 +976,81 @@ async def create_terminal(
             # has a single pipe-pane target, so we pipe ONLY to the FIFO.
             get_backend().pipe_pane(session_name, window_name, str(fifo_path))
 
+            if protocol_vintage == "v2":
+                # Observed creation only: the FIFO is on disk, the pane pipe
+                # is attached, and the liveness watchdog is enrolled.
+                if fifo_path.exists():
+                    _mark_v2_resource_created(
+                        f"{terminal_id}.fifo",
+                        actor_id="terminal_service.create_terminal",
+                        observed={"observed_fs_path": str(fifo_path)},
+                        receipt_subject={"fs_exists": str(fifo_path)},
+                    )
+                _mark_v2_resource_created(
+                    f"{terminal_id}.pipe-pane",
+                    actor_id="terminal_service.create_terminal",
+                    observed={"observed_db_key": f"pipe_pane:{terminal_id}.pipe-pane"},
+                    receipt_subject={"pipe_pane": str(fifo_path)},
+                )
+                _mark_v2_resource_created(
+                    f"{terminal_id}.watchdog",
+                    actor_id="terminal_service.create_terminal",
+                    observed={"observed_db_key": f"watchdog:{terminal_id}.watchdog"},
+                    receipt_subject={"watchdog_enrolled": terminal_id},
+                )
+
             # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
             # pipe-pane only captures output produced after it starts; on a fast
             # shell the initial prompt is drawn before the pipe attaches, leaving
             # the StatusMonitor buffer empty so wait_for_shell() times out. A bare
             # Enter produces a fresh prompt line that flows through the pipe.
-            get_backend().send_special_key(session_name, window_name, "Enter")
+            # Managed native windows run the bridge as their own process and
+            # receive ZERO keystrokes/special keys (spec §20.2d(3)).
+            if managed_native_command is None:
+                get_backend().send_special_key(session_name, window_name, "Enter")
+
+        # Managed native sessions run a structured provider bridge in the
+        # reserved pane. The bridge process was created ATOMICALLY as the
+        # window's own argv above — nothing is typed into a shell. The bridge,
+        # not pane scraping or tmux paste, owns readiness and task admission
+        # receipts for this exact generation.
+        if managed_native_command is not None:
+            _verify_managed_pane_process(session_name, window_name)
+            if protocol_vintage == "v2":
+                # The bridge process was verified as the pane's own process:
+                # observed provider-instance creation.
+                _mark_v2_resource_created(
+                    f"{terminal_id}.provider",
+                    actor_id="terminal_service.create_terminal",
+                    observed={"observed_db_key": f"provider:{terminal_id}.provider"},
+                    receipt_subject={"provider_process": "pane-verified"},
+                )
+                # Log artifacts appear lazily; mark only what really exists.
+                _mark_existing_v2_fs_artifacts(terminal_id)
+            terminal = Terminal(
+                id=terminal_id,
+                name=window_name,
+                provider=ProviderType(provider),
+                session_name=session_name,
+                agent_profile=agent_profile,
+                caller_id=caller_id,
+                allowed_tools=allowed_tools,
+                shell_command=None,
+                status=TerminalStatus.UNKNOWN,
+                last_active=datetime.now(),
+            )
+            dispatch_plugin_event(
+                registry,
+                "post_create_terminal",
+                PostCreateTerminalEvent(
+                    session_id=terminal.session_name,
+                    terminal_id=terminal.id,
+                    generation=terminal_generation,
+                    agent_name=terminal.agent_profile,
+                    provider=provider,
+                ),
+            )
+            return terminal
 
         # Step 6: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
@@ -358,6 +1067,9 @@ async def create_terminal(
             allowed_tools,
             skill_prompt=skill_prompt,
             model=profile.model if profile else None,
+            trusted_project_root=trusted_project_root,
+            expected_model=expected_model,
+            expected_effort=expected_effort,
         )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
@@ -434,6 +1146,33 @@ async def create_terminal(
     except Exception as e:
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+        # A managed no-task launch deliberately preserves a generation once
+        # its durable terminal row exists.  The reservation service records the
+        # structured preflight/negative evidence and owns later reconciliation;
+        # deleting here would turn response loss into an unfindable generation.
+        if preserve_on_init_failure:
+            try:
+                persisted_terminal = get_terminal_metadata(terminal_id)
+                if persisted_terminal is None:
+                    # v2 managed terminals persist to the isolated v2 surface.
+                    persisted_terminal = get_terminal_metadata_v2(terminal_id)
+            except Exception:
+                # Metadata lookup itself failed.  Fail closed by leaving any
+                # resources untouched; the reservation remains queryable and
+                # explicit recovery must reconcile it.
+                logger.warning(
+                    "Could not prove whether managed terminal %s was persisted; "
+                    "preserving resources for reconciliation",
+                    terminal_id,
+                    exc_info=True,
+                )
+                raise e
+            if persisted_terminal is not None:
+                logger.warning(
+                    "Preserving managed terminal %s after initialization failure",
+                    terminal_id,
+                )
+                raise
         try:
             fifo_manager.stop_reader(terminal_id)
         except Exception:
@@ -463,8 +1202,20 @@ async def create_terminal(
                 pass  # Ignore cleanup errors
             # Session is gone, drop any forwarded env we stashed for it so
             # secrets don't linger in memory or bleed into a future reuse
-            # of the same name.
-            clear_session_env(session_name)
+            # of the same name. The store's clear is strict (cond-0050);
+            # this exception-teardown path must preserve the primary failure
+            # being handled above, so a failed delete is caught and logged
+            # HERE — the one sanctioned softening call site — and the
+            # retained row is left for the startup reconcile to retry and
+            # report truthfully.
+            try:
+                clear_session_env(session_name)
+            except Exception:
+                logger.warning(
+                    "could not clear session env for %s during create-terminal teardown",
+                    session_name,
+                    exc_info=True,
+                )
         elif window_created and session_name and window_name:
             # harness-control#186: a window added to an ALREADY-EXISTING session
             # (new_session=False -- every MCP spawn/assign-into-existing-session
@@ -483,6 +1234,18 @@ async def create_terminal(
                 get_backend().kill_window(session_name, window_name)
             except Exception:
                 pass  # Ignore cleanup errors
+        if protocol_vintage == "v2" and terminal_generation is not None:
+            # Roll back the journal-first declarations truthfully: entries
+            # still declared are aborted ONLY on a verified-absence probe
+            # (physical teardown above ran first); anything already observed
+            # created is drained/closed/deleted only against the same real
+            # absence checks. Never a synthesized absence claim.
+            try:
+                _deregister_v2_terminal_resources(
+                    terminal_id, terminal_generation, session_name=session_name
+                )
+            except Exception:
+                logger.warning("v2 registry rollback failed for %s", terminal_id, exc_info=True)
         raise
 
 
@@ -790,6 +1553,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "agent_profile": metadata["agent_profile"],
             "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
+            "pane_id": metadata.get("pane_id"),
+            "window_id": metadata.get("window_id"),
             "status": status,
             "last_active": metadata["last_active"],
         }
@@ -1191,10 +1956,132 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         raise
 
 
-def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
-    """Delete terminal and kill its tmux window."""
+def delete_terminal(
+    terminal_id: str,
+    registry: PluginRegistry | None = None,
+    *,
+    expected_generation: str | None = None,
+    expected_session: str | None = None,
+    via_destructive_endpoint: bool = False,
+) -> bool:
+    """Delete terminal and kill its tmux window.
+
+    A v2 terminal row (or v2 companion binding state for the claimed
+    generation) is never torn down by a legacy caller: every v2
+    destructive action is lawful only as the effect of the conditional
+    destructive endpoint, which has already made the exact heartbeat,
+    identity/fence, dual-exit, and containment decisions and consumed its
+    single-use intent. The endpoint's effect closure passes
+    ``via_destructive_endpoint=True``; every other caller is refused with
+    zero mutation before any external subsystem is touched."""
     try:
+        # P1-1 (final conformance §20.2f): expected_session without the exact
+        # generation NEVER degrades to ID-only destruction — a session name is
+        # not an incarnation identity.
+        if expected_generation is None and expected_session is not None:
+            raise TerminalGenerationMismatchError(
+                f"terminal {terminal_id} cleanup supplied a session identity "
+                "without the exact generation; refusing ID-only destruction"
+            )
+        if not via_destructive_endpoint:
+            v2_row = get_terminal_metadata_v2(terminal_id)
+            if v2_row is not None:
+                raise DestructiveEndpointRequiredError(
+                    f"terminal {terminal_id} is a v2 managed row (generation "
+                    f"{v2_row.get('generation')!r}); legacy deletion is "
+                    "refused with zero mutation — v2 teardown is lawful only "
+                    "through the conditional destructive endpoint "
+                    "(POST /managed/destructive) with its endpoint-issued "
+                    "intent, exact heartbeat, identity/fence, dual-exit, and "
+                    "containment decisions"
+                )
+            if expected_generation is not None:
+                from cli_agent_orchestrator.constants import COMPANION_DIR
+                from cli_agent_orchestrator.services.destructive_endpoint import (
+                    binding_record_path,
+                )
+
+                if binding_record_path(COMPANION_DIR, terminal_id, expected_generation).exists():
+                    raise DestructiveEndpointRequiredError(
+                        f"terminal {terminal_id} generation "
+                        f"{expected_generation!r} has v2 companion binding "
+                        "state; legacy deletion is refused with zero "
+                        "mutation — teardown is lawful only through the "
+                        "conditional destructive endpoint"
+                    )
+        # Managed cleanup claims the exact DB incarnation before any external
+        # destructive action. If the id now names a replacement generation,
+        # preserve every resource and report the mismatch.  v2 managed
+        # terminals live in the isolated v2 surface; the legacy table is
+        # consulted first, then the v2 table.
+        metadata = get_terminal_metadata(terminal_id)
+        v2_record = False
+        if metadata is None and expected_generation is not None:
+            metadata = get_terminal_metadata_v2(terminal_id)
+            v2_record = metadata is not None
+        terminal_record_absent = False
+        if expected_generation is not None:
+            if metadata is None:
+                if not expected_session:
+                    raise TerminalGenerationMismatchError(
+                        "managed cleanup of a missing terminal record requires "
+                        "the reserved session identity"
+                    )
+                terminal_record_absent = True
+            elif metadata.get("generation") != expected_generation:
+                raise TerminalGenerationMismatchError(
+                    f"terminal {terminal_id} generation mismatch; expected "
+                    f"{expected_generation!r}"
+                )
+            expected_window = managed_window_name(terminal_id, expected_generation)
+            if metadata is not None and (
+                metadata.get("tmux_session") != expected_session
+                or metadata.get("tmux_window") != expected_window
+            ):
+                raise TerminalGenerationMismatchError(
+                    f"terminal {terminal_id} route identity mismatch; expected "
+                    f"{expected_session!r}:{expected_window!r}"
+                )
+            if terminal_record_absent:
+                # The window name embeds the immutable generation, so recovery
+                # can finish a crash that occurred before the terminal row was
+                # persisted or after another cleanup removed it. A different
+                # generation has a different window identity.
+                get_backend().kill_window(expected_session, expected_window)
+                if get_backend().window_exists(expected_session, expected_window):
+                    raise RuntimeError(
+                        f"managed terminal window survived cleanup: "
+                        f"{expected_session}:{expected_window}"
+                    )
+
+        def _recheck_teardown_claim() -> None:
+            """Generation-owned teardown claim (P1-1, final conformance
+            §20.2f): immediately before EVERY destructive subsystem step,
+            immutably recheck that the live row still names the exact claimed
+            generation. A replacement swapped in mid-teardown (or a row
+            appearing on the row-absent recovery path — only a replacement
+            can appear there) stops the teardown with zero further
+            destructive action."""
+            if expected_generation is None:
+                return
+            current = get_terminal_metadata(terminal_id)
+            if current is None and v2_record:
+                current = get_terminal_metadata_v2(terminal_id)
+            if terminal_record_absent:
+                if current is not None:
+                    raise TerminalGenerationMismatchError(
+                        f"terminal {terminal_id} row appeared during "
+                        "row-absent managed cleanup; preserving the "
+                        "replacement incarnation"
+                    )
+                return
+            if current is None or current.get("generation") != expected_generation:
+                raise TerminalGenerationMismatchError(
+                    f"terminal {terminal_id} changed generation during cleanup"
+                )
+
         # Unregister from herdr inbox service
+        _recheck_teardown_claim()
         svc = get_herdr_inbox_service()
         if svc:
             try:
@@ -1202,10 +2089,8 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
             except Exception as e:
                 logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
 
-        # Get metadata before deletion
-        metadata = get_terminal_metadata(terminal_id)
-
         if metadata:
+            _recheck_teardown_claim()
             # Snapshot scrollback + metadata before killing (for debugging/restore)
             try:
                 # Capture plain text full scrollback (no -e, no line cap)
@@ -1238,6 +2123,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
 
             # Stop pipe-pane logging
+            _recheck_teardown_claim()
             try:
                 get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
@@ -1246,25 +2132,38 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
             # Stop FIFO reader and cleanup FIFO file. Must run BEFORE kill_window
             # so the reader thread (which reopens the FIFO on EOF) unblocks and
             # joins before the pane disappears.
+            _recheck_teardown_claim()
             try:
                 fifo_manager.stop_reader(terminal_id)
             except Exception as e:
                 logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
 
             # Clear state detector buffers for this terminal
+            _recheck_teardown_claim()
             try:
                 status_monitor.clear_terminal(terminal_id)
             except Exception as e:
                 logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
 
             # Kill the tmux window (this terminates the agent process)
-            try:
+            _recheck_teardown_claim()
+            if expected_generation is None:
+                try:
+                    get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
+                except Exception as e:
+                    logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+            else:
                 get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
-            except Exception as e:
-                logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+                if get_backend().window_exists(metadata["tmux_session"], metadata["tmux_window"]):
+                    raise RuntimeError(
+                        f"managed terminal window survived cleanup: "
+                        f"{metadata['tmux_session']}:{metadata['tmux_window']}"
+                    )
 
         # Cleanup provider state and database record
+        _recheck_teardown_claim()
         provider_manager.cleanup_provider(terminal_id)
+        _recheck_teardown_claim()
         with _memory_injected_lock:
             _memory_injected_terminals.discard(terminal_id)
         # Drop any per-curator dispatch lock so the registry doesn't grow
@@ -1272,7 +2171,35 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         from cli_agent_orchestrator.services.memory_service import _curator_locks
 
         _curator_locks.pop(terminal_id, None)
-        deleted = db_delete_terminal(terminal_id)
+        if expected_generation is not None:
+            if terminal_record_absent:
+                deleted = True
+            elif v2_record:
+                deleted = db_delete_terminal_v2_if_generation(terminal_id, expected_generation)
+                if not deleted:
+                    current = get_terminal_metadata_v2(terminal_id)
+                    if current is not None:
+                        raise TerminalGenerationMismatchError(
+                            f"terminal {terminal_id} changed generation during cleanup"
+                        )
+                    deleted = True
+                if deleted:
+                    _deregister_v2_terminal_resources(
+                        terminal_id,
+                        expected_generation,
+                        session_name=(metadata or {}).get("tmux_session") or expected_session,
+                    )
+            else:
+                deleted = db_delete_terminal_if_generation(terminal_id, expected_generation)
+                if not deleted:
+                    current = get_terminal_metadata(terminal_id)
+                    if current is not None:
+                        raise TerminalGenerationMismatchError(
+                            f"terminal {terminal_id} changed generation during cleanup"
+                        )
+                    deleted = True
+        else:
+            deleted = db_delete_terminal(terminal_id)
         logger.info(f"Deleted terminal: {terminal_id}")
         if deleted and metadata:
             dispatch_plugin_event(
@@ -1281,6 +2208,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 PostKillTerminalEvent(
                     session_id=metadata["tmux_session"],
                     terminal_id=terminal_id,
+                    generation=metadata.get("generation"),
                     agent_name=metadata.get("agent_profile"),
                 ),
             )
@@ -1337,5 +2265,23 @@ def reattach_existing_output_pipelines() -> dict:
         except Exception:
             logger.warning("could not re-attach output pipeline for %s", terminal_id, exc_info=True)
             skipped.append(terminal_id)
-    logger.info("Re-attached output pipelines: %d re-attached, %d skipped", len(reattached), len(skipped))
+    logger.info(
+        "Re-attached output pipelines: %d re-attached, %d skipped", len(reattached), len(skipped)
+    )
     return {"reattached": reattached, "skipped": skipped}
+
+
+def reconcile_session_env() -> dict:
+    """Drop persisted session-env rows whose tmux session no longer exists.
+
+    Restart recovery companion to ``reattach_existing_output_pipelines``:
+    sessions torn down while the server was dead leave ``session_env`` rows
+    behind, and a later same-named session must not inherit stale forwarded
+    env. Live-session rows are retained so windows created post-restart still
+    receive the persisted env (issue #248 durability). Rows are recorded as
+    removed only after their durable deletion is confirmed; failed deletions
+    are retained and reported under ``failed`` (cond-0050).
+    """
+    from cli_agent_orchestrator.services import session_env
+
+    return session_env.reconcile_session_env(get_backend().session_exists)

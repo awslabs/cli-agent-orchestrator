@@ -50,7 +50,7 @@ Rejected at the CLI boundary:
 - Keys outside `[A-Za-z_][A-Za-z0-9_]*` (non-POSIX names break the shell).
 - Values ≥ 2048 bytes (per-var cap that keeps the tmux argv under the kernel limit — see PR #246).
 
-Forwarded vars are held in process memory on cao-server and dropped when the session is deleted; restarting cao-server wipes them.
+Forwarded vars are persisted in cao-server's SQLite database (the `session_env` table) and dropped when the session is deleted; they survive a cao-server restart, and rows for sessions torn down while the server was down are removed at startup. Values are stored **plaintext** — the DB file is owner-only (0600 in a 0700 dir), the same exposure class as the previous in-memory copy plus disk persistence, but do not forward secrets through `--env`; forwarded values are expected to be non-secret path/routing data (e.g. `PATH`/`ZDOTDIR` shim routing). Unreadable persisted state (corrupt row, locked DB, missing table) fails closed: window creation aborts before any tmux launch rather than silently starting a terminal with empty env.
 
 ## Notes
 

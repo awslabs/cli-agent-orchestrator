@@ -86,11 +86,12 @@ class TestSessionPluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
+    @patch("cli_agent_orchestrator.services.session_service.clear_session_env")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_dispatches_post_kill_session_event_after_cleanup(
-        self, mock_tmux, mock_list_terminals, mock_delete_terminal
+        self, mock_tmux, mock_list_terminals, mock_delete_terminal, mock_clear_session_env
     ):
         """Session kill should emit after per-terminal cleanup and the tmux kill succeed."""
         registry = _registry_mock()
@@ -152,8 +153,10 @@ class TestTerminalPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.clear_session_env")
     async def test_create_terminal_dispatches_post_create_terminal_event_after_setup(
         self,
+        mock_clear_session_env,
         mock_status_monitor,
         mock_fifo_manager,
         mock_fifo_dir,
@@ -236,8 +239,10 @@ class TestTerminalPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.clear_session_env")
     async def test_create_terminal_does_not_dispatch_on_failure(
         self,
+        mock_clear_session_env,
         mock_status_monitor,
         mock_fifo_manager,
         mock_fifo_dir,

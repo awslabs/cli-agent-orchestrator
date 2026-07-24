@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import BaseProvider, ProviderPreflightBlocked
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
@@ -208,11 +208,15 @@ class KimiCliProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        expected_model: Optional[str] = None,
+        expected_effort: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        self._expected_model = expected_model
+        self._expected_effort = expected_effort
         # Track temp directory for cleanup (created when agent profile needs temp files)
         self._temp_dir: Optional[str] = None
         # Latching flag: set True when user input box (╭─) is detected in ANY
@@ -375,9 +379,17 @@ class KimiCliProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
+        # Managed launches force the provider-native route after profile-derived
+        # arguments so the attested values cannot be shadowed by profile drift.
+        if self._expected_model is not None:
+            command_parts.extend(["--model", self._expected_model])
+
         # cd to unique temp dir (per-directory lock) + set TERM for tmux compatibility
         kimi_cmd = shlex.join(command_parts)
-        return f"cd {shlex.quote(self._temp_dir)} && TERM=xterm-256color {kimi_cmd}"
+        environment = ["TERM=xterm-256color"]
+        if self._expected_effort is not None:
+            environment.append("KIMI_MODEL_THINKING_EFFORT=" + shlex.quote(self._expected_effort))
+        return f"cd {shlex.quote(self._temp_dir)} && {' '.join(environment)} {kimi_cmd}"
 
     @classmethod
     def _ensure_mcp_timeout(cls) -> None:
@@ -500,6 +512,39 @@ class KimiCliProvider(BaseProvider):
                     return
             time.sleep(1.0)
 
+    async def _wait_for_managed_ready(self, timeout: float) -> bool:
+        """Observe managed startup without ever answering an interactive UI.
+
+        Pane text is used only to classify a blocking preflight; it is not an
+        authoritative managed readiness receipt. The managed-launch service
+        obtains readiness from the provider-native session boundary.
+        """
+        import asyncio
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            output = get_backend().get_history(self.session_name, self.window_name)
+            if output:
+                clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+                if re.search(UPGRADE_PROMPT_PATTERN, clean_output):
+                    raise ProviderPreflightBlocked(
+                        "update-prompt",
+                        "managed Kimi generation is blocked on an update reminder; "
+                        "zero input was sent",
+                        evidence={
+                            "provider": "kimi_cli",
+                            "terminal_id": self.terminal_id,
+                            "input_sent": False,
+                        },
+                    )
+                if self.get_status(output) in {
+                    TerminalStatus.IDLE,
+                    TerminalStatus.COMPLETED,
+                }:
+                    return True
+            await asyncio.sleep(1.0)
+        return False
+
     async def initialize(self) -> bool:
         """Initialize Kimi CLI provider by starting the kimi command.
 
@@ -540,19 +585,20 @@ class KimiCliProvider(BaseProvider):
         # Send Kimi command to the tmux window
         get_backend().send_keys(self.session_name, self.window_name, command)
 
-        # Dismiss the startup upgrade-reminder dialog before waiting for ready:
-        # unanswered it blocks kimi from reaching its prompt (init would time out).
-        self._handle_startup_dialog(outer_timeout=ready_timeout)
-
-        # Wait for Kimi CLI to reach IDLE or COMPLETED state (prompt visible).
-        # Accept both IDLE and COMPLETED — some CLI versions show a startup
-        # message that get_status() interprets as a completed response.
-        if not await wait_until_status(
-            self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=ready_timeout,
-            polling_interval=1.0,
-        ):
+        managed = self._expected_model is not None or self._expected_effort is not None
+        if managed:
+            ready = await self._wait_for_managed_ready(ready_timeout)
+        else:
+            # Legacy/unmanaged launches retain the historical convenience
+            # behavior. Managed launches never drive interactive menus.
+            self._handle_startup_dialog(outer_timeout=ready_timeout)
+            ready = await wait_until_status(
+                self.terminal_id,
+                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+                timeout=ready_timeout,
+                polling_interval=1.0,
+            )
+        if not ready:
             raise TimeoutError(f"Kimi CLI initialization timed out after {ready_timeout} seconds")
 
         self._initialized = True

@@ -1,5 +1,6 @@
 """Full tests for terminal service."""
 
+from contextlib import ExitStack
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,10 +19,20 @@ from cli_agent_orchestrator.services.terminal_service import (
     get_working_directory,
     send_input,
 )
+from cli_agent_orchestrator.utils.terminal import managed_window_name
 
 
 class TestCreateTerminal:
     """Tests for create_terminal function."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_clear_session_env(self):
+        """These tests exercise create_terminal orchestration, not the env
+        store; stub the (strict, cond-0050) new-session pre-clear so they do
+        not depend on a migrated DB. The store's own behavior is covered in
+        test_session_env.py and TestCreateTerminalSessionEnvStore."""
+        with patch("cli_agent_orchestrator.services.terminal_service.clear_session_env"):
+            yield
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -109,15 +120,21 @@ class TestCreateTerminal:
         result = await create_terminal("kiro_cli", "developer", new_session=True)
 
         assert result.allowed_tools == ["fs_read"]
-        mock_db_create.assert_called_once_with(
+        assert mock_db_create.call_count == 1
+        call = mock_db_create.call_args
+        assert call.args == (
             "test1234",
             "cao-session",
             "developer-abcd",
             "kiro_cli",
             "developer",
             ["fs_read"],
-            caller_id=None,
         )
+        assert call.kwargs["caller_id"] is None
+        assert call.kwargs["generation"] is None
+        # server-owned immutable pane identity is bound at creation
+        assert "pane_id" in call.kwargs
+        assert "window_id" in call.kwargs
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
     @pytest.mark.asyncio
@@ -679,6 +696,14 @@ class TestCreateTerminalEnvVars:
     (CAO_WORKFLOW_RUN_ID/STEP_ID) never reached the terminal.
     """
 
+    @pytest.fixture(autouse=True)
+    def _patch_clear_session_env(self):
+        """The store functions are mocked per-test here; stub the (strict,
+        cond-0050) new-session pre-clear likewise so these orchestration tests
+        do not depend on a migrated DB."""
+        with patch("cli_agent_orchestrator.services.terminal_service.clear_session_env"):
+            yield
+
     def _wire_happy_mocks(
         self,
         mock_gen_id,
@@ -904,6 +929,654 @@ class TestCreateTerminalEnvVars:
         assert mock_tmux.create_session.call_args.kwargs["extra_env"] == {"FOO": "bar"}
         mock_set_session_env.assert_called_once_with("cao-session", {"FOO": "bar"})
         mock_tmux.create_window.assert_not_called()
+
+
+class TestCreateTerminalSessionEnvStore:
+    """create_terminal against the REAL write-through session-env store (no
+    get_session_env mock): post-restart durability, merge precedence, and
+    fail-closed behavior at the window-creation seam (issue #248)."""
+
+    @pytest.fixture
+    def real_store(self, tmp_path, monkeypatch):
+        """Point the store at an isolated tmp DB with a cold in-memory cache."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import session_env
+
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'session-env.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        database.Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(
+            database,
+            "SessionLocal",
+            sessionmaker(autocommit=False, autoflush=False, bind=engine),
+        )
+        with session_env._lock:
+            session_env._session_forwarded_env.clear()
+        yield engine
+        with session_env._lock:
+            session_env._session_forwarded_env.clear()
+        engine.dispose()
+
+    def _wire_happy_mocks(
+        self,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_provider_manager,
+        mock_fifo_dir,
+        *,
+        session_exists,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = session_exists
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_post_restart_window_gets_persisted_env_with_precedence(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        real_store,
+    ):
+        """Simulated restart (cold cache, seeded DB row): a window joining the
+        session receives the persisted env, and per-step env still wins on
+        conflict — {**get_session_env(session), **env_vars} unchanged."""
+        import sqlite3
+
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=True,
+        )
+        with sqlite3.connect(real_store.url.database) as conn:
+            conn.execute(
+                "INSERT INTO session_env (session_name, env_vars, updated_at) "
+                "VALUES ('cao-existing', ?, '2026-07-21T00:00:00Z')",
+                ('{"SHARED_KEY": "session-value", "KEEP": "kept"}',),
+            )
+
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            new_session=False,
+            env_vars={"SHARED_KEY": "per-step-value"},
+        )
+
+        extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        assert extra_env == {"SHARED_KEY": "per-step-value", "KEEP": "kept"}
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_missing_row_proceeds_with_per_step_env_only(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        real_store,
+    ):
+        """The legitimate no-forwarded-env case: no row, working DB — window
+        creation proceeds and gets exactly the per-step env."""
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=True,
+        )
+
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-existing",
+            new_session=False,
+            env_vars={"CAO_WORKFLOW_RUN_ID": "run-1"},
+        )
+
+        extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        assert extra_env == {"CAO_WORKFLOW_RUN_ID": "run-1"}
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_corrupt_session_env_aborts_before_any_tmux_launch(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        real_store,
+    ):
+        """Fail closed: corrupt persisted env raises, and NO tmux window,
+        provider, FIFO, or DB row is created — zero launch side effects."""
+        import sqlite3
+
+        from cli_agent_orchestrator.services.session_env import SessionEnvStoreError
+
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=True,
+        )
+        with sqlite3.connect(real_store.url.database) as conn:
+            conn.execute(
+                "INSERT INTO session_env (session_name, env_vars, updated_at) "
+                "VALUES ('cao-existing', 'not json{', '2026-07-21T00:00:00Z')"
+            )
+
+        with pytest.raises(SessionEnvStoreError):
+            await create_terminal(
+                "kiro_cli",
+                "developer",
+                session_name="cao-existing",
+                new_session=False,
+            )
+
+        mock_tmux.create_window.assert_not_called()
+        mock_tmux.create_session.assert_not_called()
+        mock_provider_manager.create_provider.assert_not_called()
+        mock_db_create.assert_not_called()
+        mock_fifo_manager.create_reader.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_failed_preclear_aborts_before_any_launch_side_effect(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        real_store,
+        monkeypatch,
+    ):
+        """cond-0050: a no-env new session reusing a name whose stale-row
+        pre-clear cannot complete durably (real SQLite IMMEDIATE lock) must
+        abort BEFORE any tmux/provider/window/terminal side effect. Once the
+        lock clears, the retried pre-clear deletes the row durably, so no
+        later window of the reused name can receive the prior routing env."""
+        import sqlite3
+
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import session_env
+        from cli_agent_orchestrator.services.session_env import SessionEnvStoreError
+
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=False,
+        )
+        with sqlite3.connect(real_store.url.database) as conn:
+            conn.execute(
+                "INSERT INTO session_env (session_name, env_vars, updated_at) "
+                "VALUES ('cao-reused', ?, '2026-07-21T00:00:00Z')",
+                ('{"PATH": "/old/shim", "ZDOTDIR": "/old/zsh"}',),
+            )
+
+        # Store operations go through a short-busy-timeout engine so the real
+        # lock refuses fast; the lock itself is a genuine second connection.
+        fast_engine = create_engine(
+            f"sqlite:///{real_store.url.database}",
+            connect_args={"check_same_thread": False, "timeout": 0.1},
+        )
+        monkeypatch.setattr(
+            database,
+            "SessionLocal",
+            sessionmaker(autocommit=False, autoflush=False, bind=fast_engine),
+        )
+        monkeypatch.setattr(session_env, "_RETRY_DELAY_SECONDS", 0)
+
+        lock_conn = sqlite3.connect(real_store.url.database)
+        lock_conn.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(SessionEnvStoreError):
+                await create_terminal(
+                    "kiro_cli",
+                    "developer",
+                    session_name="cao-reused",
+                    new_session=True,
+                )
+        finally:
+            lock_conn.rollback()
+            lock_conn.close()
+
+        # Zero launch side effects: no tmux session/window, no provider, no
+        # terminal DB row, no FIFO reader.
+        mock_tmux.create_session.assert_not_called()
+        mock_tmux.create_window.assert_not_called()
+        mock_provider_manager.create_provider.assert_not_called()
+        mock_db_create.assert_not_called()
+        mock_fifo_manager.create_reader.assert_not_called()
+        # The stale row survived — nothing claimed it was cleared.
+        with sqlite3.connect(real_store.url.database) as conn:
+            rows = conn.execute(
+                "SELECT env_vars FROM session_env WHERE session_name = 'cao-reused'"
+            ).fetchall()
+        assert len(rows) == 1
+
+        # Retry with the lock released: the pre-clear now completes durably
+        # BEFORE tmux creation, so the reused name starts clean — no later
+        # window can inherit the prior routing env.
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-reused",
+            new_session=True,
+        )
+        assert mock_tmux.create_session.call_args.kwargs["extra_env"] is None
+        with sqlite3.connect(real_store.url.database) as conn:
+            rows = conn.execute(
+                "SELECT env_vars FROM session_env WHERE session_name = 'cao-reused'"
+            ).fetchall()
+        assert rows == []
+        fast_engine.dispose()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    async def test_failed_preclear_preserves_colliding_live_terminal_state(
+        self,
+        mock_gen_id,
+        mock_tmux,
+        mock_db_delete,
+        real_store,
+        monkeypatch,
+        tmp_path,
+    ):
+        """cond-0067 forced-collision regression: generated terminal IDs carry
+        only 32 bits, so force the would-be generated ID to collide with an
+        unrelated LIVE terminal, inject durable pre-clear exhaustion, and prove
+        the abort touches nothing — the unrelated terminal's DB row, FIFO
+        bytes, status entry, and provider state are preserved byte-for-byte,
+        every cleanup seam records ZERO calls, the stale session-env row is
+        retained, and creation aborts before any terminal-ID-dependent work."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+        from cli_agent_orchestrator.services import fifo_reader, session_env, terminal_service
+        from cli_agent_orchestrator.services.fifo_reader import FifoManager
+        from cli_agent_orchestrator.services.session_env import SessionEnvStoreError
+
+        collision_id = "deadbeef"
+        db_path = real_store.url.database
+
+        # Seed the unrelated live terminal's full state under the exact ID the
+        # generator would have been forced to return: durable DB row, on-disk
+        # FIFO, status entry, and provider state.
+        database.create_terminal(
+            collision_id, "cao-unrelated-live", "unrelated-window", "kiro_cli", "developer"
+        )
+
+        def terminal_row_state():
+            with database.SessionLocal() as db:
+                row = db.query(database.TerminalModel).filter_by(id=collision_id).first()
+                return (
+                    None
+                    if row is None
+                    else tuple(
+                        (column.name, getattr(row, column.name))
+                        for column in database.TerminalModel.__table__.columns
+                    )
+                )
+
+        row_before = terminal_row_state()
+        assert row_before is not None
+
+        collateral_dir = tmp_path / "fifos"
+        collateral_dir.mkdir()
+        collateral_fifo = collateral_dir / f"{collision_id}.fifo"
+        sentinel_bytes = b"unrelated live terminal sentinel\x00\xffbytes"
+        collateral_fifo.write_bytes(sentinel_bytes)
+        monkeypatch.setattr(fifo_reader, "FIFO_DIR", collateral_dir)
+        # Real managers wrapped in spies: if any cleanup seam fired, the
+        # destruction would be REAL (unlink/row-delete/provider removal) and
+        # the spy would record it.
+        fifo = FifoManager()
+        fifo_stop_spy = MagicMock(wraps=fifo.stop_reader)
+        monkeypatch.setattr(fifo, "stop_reader", fifo_stop_spy)
+        monkeypatch.setattr(terminal_service, "fifo_manager", fifo)
+
+        provider_cleaned = []
+
+        class ExistingProvider:
+            def cleanup(self):
+                provider_cleaned.append(collision_id)
+
+        manager = ProviderManager()
+        manager._providers[collision_id] = ExistingProvider()
+        provider_cleanup_spy = MagicMock(wraps=manager.cleanup_provider)
+        monkeypatch.setattr(manager, "cleanup_provider", provider_cleanup_spy)
+        monkeypatch.setattr(terminal_service, "provider_manager", manager)
+
+        status_spy = MagicMock()
+        monkeypatch.setattr(terminal_service, "status_monitor", status_spy)
+
+        # The stale routing row for the reused name, and injected exhaustion of
+        # its durable pre-clear delete.
+        session_env.set_session_env("cao-reused", {"PATH": "/old/shim"})
+        monkeypatch.setattr(
+            session_env,
+            "_delete_row",
+            lambda _: (_ for _ in ()).throw(sqlite3.OperationalError("injected delete exhaustion")),
+        )
+        monkeypatch.setattr(session_env, "_RETRY_DELAY_SECONDS", 0)
+
+        mock_gen_id.return_value = collision_id  # the forced 32-bit collision
+        mock_tmux.session_exists.return_value = False
+
+        with pytest.raises(SessionEnvStoreError):
+            await create_terminal(
+                "kiro_cli", "developer", session_name="cao-reused", new_session=True
+            )
+
+        # Creation aborted before terminal-ID-dependent work: the ID generator
+        # itself was never reached.
+        mock_gen_id.assert_not_called()
+        mock_tmux.create_session.assert_not_called()
+        # Every cleanup seam recorded ZERO calls.
+        fifo_stop_spy.assert_not_called()
+        status_spy.clear_terminal.assert_not_called()
+        provider_cleanup_spy.assert_not_called()
+        mock_db_delete.assert_not_called()
+        # The unrelated live terminal's state is byte-for-byte preserved.
+        assert terminal_row_state() == row_before
+        assert collateral_fifo.read_bytes() == sentinel_bytes
+        assert collision_id in manager._providers
+        assert provider_cleaned == []
+        # The stale session-env row is retained — nothing claimed it was cleared.
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT env_vars FROM session_env WHERE session_name = 'cao-reused'"
+            ).fetchall()
+        assert rows == [('{"PATH": "/old/shim"}',)]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.clear_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    async def test_preclear_runs_before_id_generation_outside_cleanup_scope(
+        self,
+        mock_gen_id,
+        mock_tmux,
+        mock_provider_manager,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_db_delete,
+        mock_clear_session_env,
+    ):
+        """cond-0067 ordering contract: the strict pre-clear is a true
+        preflight — it executes BEFORE terminal-ID generation and OUTSIDE the
+        resource-owning try/except, so its failure propagates with zero
+        cleanup actions for resources this invocation never acquired."""
+        import inspect
+
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.session_env import SessionEnvStoreError
+
+        mock_tmux.session_exists.return_value = False
+        mock_clear_session_env.side_effect = SessionEnvStoreError("durable delete refused")
+
+        with pytest.raises(SessionEnvStoreError, match="durable delete refused"):
+            await create_terminal(
+                "kiro_cli", "developer", session_name="cao-reused", new_session=True
+            )
+
+        # Runtime ordering: the pre-clear ran; terminal-ID generation never did.
+        mock_clear_session_env.assert_called_once_with("cao-reused")
+        mock_gen_id.assert_not_called()
+        # Outside the cleanup scope: zero cleanup calls despite the propagating
+        # exception, because nothing had been acquired.
+        mock_fifo_manager.stop_reader.assert_not_called()
+        mock_status_monitor.clear_terminal.assert_not_called()
+        mock_provider_manager.cleanup_provider.assert_not_called()
+        mock_db_delete.assert_not_called()
+        mock_tmux.create_session.assert_not_called()
+        mock_tmux.kill_session.assert_not_called()
+
+        # Structural pin: the pre-clear call site precedes both the
+        # resource-owning try and terminal-ID generation in the source.
+        source, _ = inspect.getsourcelines(terminal_service.create_terminal)
+        joined = "".join(source)
+        preclear_at = joined.index("clear_session_env(session_name)")
+        cleanup_try_at = joined.index("    try:")
+        id_generation_at = joined.index("terminal_id = generate_terminal_id()")
+        assert preclear_at < cleanup_try_at < id_generation_at
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.clear_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_teardown_clear_failure_preserves_primary_exception(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_clear_session_env,
+        caplog,
+    ):
+        """cond-0050's single sanctioned softening: the create-terminal
+        exception-teardown path catches and logs a strict-clear failure so
+        the earlier, primary exception is preserved for the caller."""
+        from cli_agent_orchestrator.services.session_env import SessionEnvStoreError
+
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        self._wire_happy_mocks(
+            mock_gen_id,
+            mock_gen_session,
+            mock_gen_window,
+            mock_tmux,
+            mock_provider_manager,
+            mock_fifo_dir,
+            session_exists=False,
+        )
+        # Pre-clear succeeds; the teardown clear fails.
+        mock_clear_session_env.side_effect = [None, SessionEnvStoreError("delete failed")]
+        mock_provider_manager.create_provider.side_effect = RuntimeError("provider boom")
+
+        with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.terminal_service"):
+            with pytest.raises(RuntimeError, match="provider boom"):
+                await create_terminal(
+                    "kiro_cli",
+                    "developer",
+                    session_name="cao-session",
+                    new_session=True,
+                )
+
+        assert mock_clear_session_env.call_count == 2
+        assert "could not clear session env for cao-session" in caplog.text
+
+
+class TestManagedCreatePreservation:
+    @pytest.mark.asyncio
+    async def test_persisted_reserved_generation_survives_provider_init_failure(self, tmp_path):
+        with ExitStack() as stack:
+            clear_env = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.clear_session_env")
+            )
+            status = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+            )
+            fifo = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+            )
+            fifo_dir = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+            )
+            manager = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+            )
+            db_create = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+            )
+            db_delete = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+            )
+            get_metadata = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+            )
+            backend = stack.enter_context(
+                patch("cli_agent_orchestrator.backends.registry._backend")
+            )
+            gen_window = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+            )
+            gen_terminal = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+            )
+            load_profile = stack.enter_context(
+                patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+            )
+
+            backend.session_exists.return_value = False
+            gen_window.return_value = "reviewer-abcd"
+            fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+            load_profile.return_value = AgentProfile(
+                name="reviewer-sol-max", description="Reviewer"
+            )
+            provider = AsyncMock()
+            provider.initialize.side_effect = RuntimeError("provider startup failed")
+            manager.create_provider.return_value = provider
+            get_metadata.return_value = {"id": "aabbccdd"}
+
+            with pytest.raises(RuntimeError, match="provider startup failed"):
+                await create_terminal(
+                    "codex",
+                    "reviewer-sol-max",
+                    session_name="cao-managed-test",
+                    new_session=True,
+                    working_directory=str(tmp_path),
+                    reserved_terminal_id="aabbccdd",
+                    terminal_generation="11111111-1111-4111-8111-111111111111",
+                    trusted_project_root=str(tmp_path),
+                    preserve_on_init_failure=True,
+                )
+
+            gen_terminal.assert_not_called()
+            clear_env.assert_called_once_with("cao-managed-test")
+            db_create.assert_called_once()
+            manager.create_provider.assert_called_once()
+            assert manager.create_provider.call_args.kwargs["trusted_project_root"] == str(tmp_path)
+            fifo.stop_reader.assert_not_called()
+            status.clear_terminal.assert_not_called()
+            manager.cleanup_provider.assert_not_called()
+            db_delete.assert_not_called()
+            backend.kill_session.assert_not_called()
 
 
 class TestGetTerminal:
@@ -1496,6 +2169,283 @@ class TestDeleteTerminal:
         result = delete_terminal("test1234")
 
         assert result is True
+
+    def test_managed_delete_refuses_stale_generation_before_external_cleanup(self):
+        metadata = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "generation": "replacement-generation",
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_terminal_if_generation",
+                return_value=False,
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager") as provider,
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+        ):
+            with pytest.raises(ValueError, match="generation mismatch"):
+                delete_terminal(
+                    "test1234",
+                    expected_generation="old-generation",
+                    expected_session="cao-session",
+                )
+
+        backend.kill_window.assert_not_called()
+        provider.cleanup_provider.assert_not_called()
+
+    def test_managed_delete_claims_exact_generation_once(self):
+        generation = "11111111-1111-4111-8111-111111111111"
+        metadata = {
+            "tmux_session": "cao-session",
+            "tmux_window": managed_window_name("deadbeef", generation),
+            "generation": generation,
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_terminal_if_generation",
+                return_value=True,
+            ) as conditional_delete,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_terminal"
+            ) as unconditional_delete,
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager"),
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+        ):
+            backend.window_exists.return_value = False
+            assert (
+                delete_terminal(
+                    "deadbeef",
+                    expected_generation=generation,
+                    expected_session="cao-session",
+                )
+                is True
+            )
+
+        conditional_delete.assert_called_once_with("deadbeef", generation)
+        unconditional_delete.assert_not_called()
+
+    def test_managed_delete_preserves_row_when_window_survives(self):
+        generation = "11111111-1111-4111-8111-111111111111"
+        metadata = {
+            "tmux_session": "cao-session",
+            "tmux_window": managed_window_name("deadbeef", generation),
+            "generation": generation,
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_terminal_if_generation"
+            ) as conditional_delete,
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+        ):
+            backend.kill_window.return_value = False
+            backend.window_exists.return_value = True
+            with pytest.raises(RuntimeError, match="survived cleanup"):
+                delete_terminal(
+                    "deadbeef",
+                    expected_generation=generation,
+                    expected_session="cao-session",
+                )
+
+        conditional_delete.assert_not_called()
+
+    def test_managed_delete_recovers_when_row_is_already_absent(self):
+        generation = "11111111-1111-4111-8111-111111111111"
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_terminal_if_generation"
+            ) as conditional_delete,
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+        ):
+            backend.kill_window.return_value = False
+            backend.window_exists.return_value = False
+            assert (
+                delete_terminal(
+                    "deadbeef",
+                    expected_generation=generation,
+                    expected_session="cao-session",
+                )
+                is True
+            )
+
+        backend.kill_window.assert_called_once_with(
+            "cao-session", managed_window_name("deadbeef", generation)
+        )
+        conditional_delete.assert_not_called()
+
+
+class TestManagedTeardownClaimRecheck:
+    """P1-1 (final conformance §20.2f): the generation-owned teardown claim is
+    rechecked immediately before EVERY destructive subsystem step. A
+    replacement swapped in mid-teardown stops the sequence with zero further
+    destructive action; expected_session alone never degrades to ID-only
+    destruction."""
+
+    GEN = "11111111-1111-4111-8111-111111111111"
+    REPLACEMENT_GEN = "22222222-2222-4222-8222-222222222222"
+
+    def _metadata(self, generation=None):
+        generation = generation or self.GEN
+        return {
+            "tmux_session": "cao-session",
+            "tmux_window": managed_window_name("deadbeef", generation),
+            "generation": generation,
+            "provider": "codex",
+        }
+
+    def _swap_side_effect(self, swap_after):
+        calls = {"n": 0}
+
+        def side_effect(_tid):
+            calls["n"] += 1
+            if calls["n"] <= swap_after:
+                return self._metadata()
+            return self._metadata(self.REPLACEMENT_GEN)
+
+        return side_effect
+
+    def _patches(self, metadata_side_effect):
+        return (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                side_effect=metadata_side_effect,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_terminal_if_generation",
+                return_value=True,
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager"),
+            patch("cli_agent_orchestrator.services.terminal_service.fifo_manager"),
+            patch("cli_agent_orchestrator.services.terminal_service.status_monitor"),
+            patch("cli_agent_orchestrator.services.terminal_service.get_herdr_inbox_service"),
+            patch("cli_agent_orchestrator.backends.registry._backend"),
+        )
+
+    def test_replacement_swap_before_herdr_step_refuses_all_teardown(self):
+        # Swap lands after the entry check: the herdr unregister and every
+        # later destructive step must refuse.
+        patches = self._patches(self._swap_side_effect(swap_after=1))
+        with (
+            patches[0],
+            patches[1] as conditional,
+            patches[2] as provider,
+            patches[3] as fifo,
+            patches[4] as status_mon,
+            patches[5] as herdr,
+            patches[6] as backend,
+        ):
+            with pytest.raises(ValueError, match="changed generation during cleanup"):
+                delete_terminal(
+                    "deadbeef",
+                    expected_generation=self.GEN,
+                    expected_session="cao-session",
+                )
+            self._assert_zero_teardown(conditional, provider, fifo, status_mon, herdr, backend)
+
+    def _assert_zero_teardown(self, conditional, provider, fifo, status_mon, herdr, backend):
+        (herdr.return_value.unregister_terminal).assert_not_called()
+        fifo.stop_reader.assert_not_called()
+        status_mon.clear_terminal.assert_not_called()
+        backend.kill_window.assert_not_called()
+        backend.stop_pipe_pane.assert_not_called()
+        provider.cleanup_provider.assert_not_called()
+        conditional.assert_not_called()
+
+    def test_replacement_swap_mid_teardown_refuses_remaining_steps(self):
+        # Swap lands after the FIFO step: herdr/snapshot/pipe-pane already
+        # ran, but the FIFO stop, status clear, window kill, provider cleanup,
+        # and the CAS delete must all refuse.
+        patches = self._patches(self._swap_side_effect(swap_after=4))
+        with (
+            patches[0] as _m,
+            patches[1] as conditional,
+            patches[2] as provider,
+            patches[3] as fifo,
+            patches[4] as status_mon,
+            patches[5] as herdr,
+            patches[6] as backend,
+        ):
+            with pytest.raises(ValueError, match="changed generation during cleanup"):
+                delete_terminal(
+                    "deadbeef",
+                    expected_generation=self.GEN,
+                    expected_session="cao-session",
+                )
+            (herdr.return_value.unregister_terminal).assert_called_once_with("deadbeef")
+            fifo.stop_reader.assert_not_called()
+            status_mon.clear_terminal.assert_not_called()
+            backend.kill_window.assert_not_called()
+            provider.cleanup_provider.assert_not_called()
+            conditional.assert_not_called()
+
+    def test_session_without_generation_never_degrades_to_id_only_destruction(self):
+        patches = self._patches(self._swap_side_effect(swap_after=0))
+        with (
+            patches[0],
+            patches[1] as conditional,
+            patches[2] as provider,
+            patches[3] as fifo,
+            patches[4] as status_mon,
+            patches[5] as herdr,
+            patches[6] as backend,
+        ):
+            with pytest.raises(ValueError, match="without the exact generation"):
+                delete_terminal("deadbeef", expected_session="cao-session")
+            (herdr.return_value.unregister_terminal).assert_not_called()
+            fifo.stop_reader.assert_not_called()
+            status_mon.clear_terminal.assert_not_called()
+            backend.kill_window.assert_not_called()
+            provider.cleanup_provider.assert_not_called()
+            conditional.assert_not_called()
+
+    def test_row_appearing_on_row_absent_path_is_preserved_as_replacement(self):
+        # Row-absent recovery: the entry window kill is generation-scoped by
+        # name, but if a terminal ROW appears mid-teardown it can only be a
+        # replacement incarnation — every later step refuses.
+        calls = {"n": 0}
+
+        def side_effect(_tid):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None  # row absent at entry
+            return self._metadata(self.REPLACEMENT_GEN)
+
+        patches = self._patches(side_effect)
+        with (
+            patches[0],
+            patches[1] as conditional,
+            patches[2] as provider,
+            patches[3] as fifo,
+            patches[4] as status_mon,
+            patches[5] as herdr,
+            patches[6] as backend,
+        ):
+            backend.window_exists.return_value = False
+            with pytest.raises(ValueError, match="row appeared during row-absent"):
+                delete_terminal(
+                    "deadbeef",
+                    expected_generation=self.GEN,
+                    expected_session="cao-session",
+                )
+            (herdr.return_value.unregister_terminal).assert_not_called()
+            provider.cleanup_provider.assert_not_called()
+            conditional.assert_not_called()
 
 
 class TestDeferredInitFailureNotification:

@@ -14,6 +14,14 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 class TestCreateTerminalCleanup:
     """Test error cleanup paths in create_terminal."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_clear_session_env(self):
+        """These tests exercise cleanup orchestration, not the env store;
+        stub the (strict, cond-0050) pre-clear/teardown clear so they do not
+        depend on a migrated DB."""
+        with patch("cli_agent_orchestrator.services.terminal_service.clear_session_env"):
+            yield
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
@@ -350,6 +358,14 @@ class TestCreateTerminalSessionCleanupGuard:
     Ensures cleanup only kills sessions that THIS call actually created,
     preventing destruction of pre-existing sessions on error.
     """
+
+    @pytest.fixture(autouse=True)
+    def _patch_clear_session_env(self):
+        """These tests exercise the session_created guard, not the env store;
+        stub the (strict, cond-0050) pre-clear/teardown clear so they do not
+        depend on a migrated DB."""
+        with patch("cli_agent_orchestrator.services.terminal_service.clear_session_env"):
+            yield
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")

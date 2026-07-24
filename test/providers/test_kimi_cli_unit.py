@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.base import ProviderPreflightBlocked
 from cli_agent_orchestrator.providers.kimi_cli import (
     ANSI_CODE_PATTERN,
     ERROR_PATTERN,
@@ -93,6 +94,26 @@ class TestKimiCliProviderInitialization:
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         with pytest.raises(TimeoutError, match="Kimi CLI initialization"):
             await provider.initialize()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
+    async def test_managed_update_prompt_blocks_without_keystrokes(self, mock_backend):
+        backend = mock_backend.return_value
+        backend.get_history.return_value = (
+            "Skip reminders for version 1.2.3\n[Enter] Upgrade now  [s] Skip"
+        )
+        provider = KimiCliProvider(
+            "term-1",
+            "session-1",
+            "window-1",
+            expected_model="kimi-code/k3",
+            expected_effort="max",
+        )
+
+        with pytest.raises(ProviderPreflightBlocked, match="zero input was sent"):
+            await provider._wait_for_managed_ready(1.0)
+
+        backend.send_keys.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")

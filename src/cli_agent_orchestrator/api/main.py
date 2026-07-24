@@ -25,6 +25,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -72,6 +73,23 @@ from cli_agent_orchestrator.graph.providers import get_provider
 from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.managed_launch import (
+    PROTOCOL_VERSION as MANAGED_LAUNCH_PROTOCOL_VERSION,
+)
+from cli_agent_orchestrator.models.managed_launch import (
+    ManagedLaunchAdmitRequest,
+    ManagedLaunchCleanupRequest,
+    ManagedLaunchObservationRequest,
+    ManagedLaunchReserveRequest,
+    ManagedLaunchRouteAttestRequest,
+)
+from cli_agent_orchestrator.models.managed_launch_v2 import (
+    ManagedDestructiveRequest,
+    ManagedLaunchV2AdmitRequest,
+    ManagedLaunchV2BindRequest,
+    ManagedLaunchV2ReserveRequest,
+    ManagedV2FenceInstallRequest,
+)
 from cli_agent_orchestrator.models.memory import (
     MemoryKey,
     MemoryScope,
@@ -92,7 +110,10 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.services import (
+    companion_receipts,
     flow_service,
+    managed_launch,
+    managed_launch_v2,
     secret_gate,
     session_service,
     terminal_service,
@@ -114,7 +135,11 @@ from cli_agent_orchestrator.services.install_service import InstallResult, insta
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
-from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
+from cli_agent_orchestrator.services.terminal_service import (
+    OutputMode,
+    TerminalGenerationMismatchError,
+    TerminalInputBlockedError,
+)
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -519,6 +544,14 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(terminal_service.reattach_existing_output_pipelines)
     except Exception:
         logger.warning("output-pipeline reattach failed", exc_info=True)
+
+    # Restart recovery: drop persisted session-env rows whose tmux session no
+    # longer exists (torn down while the server was dead); live-session rows
+    # are retained so post-restart windows keep receiving the forwarded env.
+    try:
+        await asyncio.to_thread(terminal_service.reconcile_session_env)
+    except Exception:
+        logger.warning("session-env reconcile failed", exc_info=True)
 
     # Start temporary OpenCode inbox poller. GH #115 tracks replacing this
     # provider-specific wakeup path with a unified delivery engine.
@@ -1476,6 +1509,573 @@ async def delete_session(
         )
 
 
+def _managed_launch_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, managed_launch.ManagedLaunchNotFound):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if isinstance(exc, managed_launch.ManagedLaunchConflict):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+
+
+@app.get("/managed-launch/capabilities")
+async def managed_launch_capabilities(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Return the exact versioned companion surface; absence means fail closed."""
+    return {
+        "protocol_version": MANAGED_LAUNCH_PROTOCOL_VERSION,
+        "reservation_query": True,
+        "reservation_reconcile": True,
+        "no_task_launch": True,
+        "generation_bound_readiness": True,
+        "idempotent_task_admission": True,
+        "generation_bound_negative": True,
+        "generation_bound_cancel": True,
+        "generation_bound_cleanup": True,
+        "provider_submission_receipt": True,
+        "provider_native_exact_session_receipts": True,
+        "zero_task_route_attestation": True,
+        "pinned_provider_executable": True,
+        "trusted_project_root_providers": ["codex"],
+        "readiness_providers": ["codex", "kimi_cli"],
+    }
+
+
+@app.post("/managed-launch/reservations", status_code=status.HTTP_201_CREATED)
+async def reserve_managed_launch(
+    body: ManagedLaunchReserveRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        record, created = await asyncio.to_thread(managed_launch.reserve, body)
+        return {"created": created, **record}
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/attest-route")
+async def attest_managed_launch_route(
+    body: ManagedLaunchRouteAttestRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(managed_launch.attest_route, body)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.get("/managed-launch/reservations/{reservation_id}")
+async def get_managed_launch(
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(managed_launch.get, reservation_id)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/reconcile")
+async def reconcile_managed_launch(
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(managed_launch.reconcile, reservation_id)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/launch")
+async def launch_managed_generation(
+    request: Request,
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await managed_launch.launch_reserved(
+            reservation_id, registry=get_plugin_registry(request)
+        )
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/observations")
+async def append_managed_launch_observation(
+    reservation_id: str,
+    body: ManagedLaunchObservationRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(managed_launch.append_observation, reservation_id, body)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+async def _append_managed_terminal_evidence(
+    reservation_id: str,
+    body: ManagedLaunchObservationRequest,
+    expected_kind: str,
+) -> Dict[str, Any]:
+    if body.kind != expected_kind:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"endpoint requires kind={expected_kind}",
+        )
+    try:
+        return await asyncio.to_thread(managed_launch.append_observation, reservation_id, body)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/negative")
+async def record_managed_launch_negative(
+    reservation_id: str,
+    body: ManagedLaunchObservationRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Record generation-bound proof that task delivery never started."""
+    return await _append_managed_terminal_evidence(reservation_id, body, "negative")
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/cancel")
+async def cancel_managed_launch(
+    reservation_id: str,
+    body: ManagedLaunchObservationRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Cancel a pre-admission generation by immutable reservation identity."""
+    return await _append_managed_terminal_evidence(reservation_id, body, "cancelled")
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/admit")
+async def admit_managed_task(
+    request: Request,
+    reservation_id: str,
+    body: ManagedLaunchAdmitRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await managed_launch.admit_reserved(
+            reservation_id, body, registry=get_plugin_registry(request)
+        )
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/reservations/{reservation_id}/cleanup")
+async def cleanup_managed_generation(
+    request: Request,
+    reservation_id: str,
+    body: ManagedLaunchCleanupRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            managed_launch.cleanup_reserved,
+            reservation_id,
+            body,
+            registry=get_plugin_registry(request),
+        )
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Recovery control-plane surfaces (Lane B foundation)
+#
+# These endpoints expose the v2 managed-launch seam, the W13 fence RPC, the
+# conditional destructive endpoint, and the truthful capability negotiation
+# surface.  Every containment-dependent path stays fail-closed while the
+# deployed composition reports unproven — these surfaces advertise that
+# honestly rather than claiming recovery authority that does not exist.
+# ---------------------------------------------------------------------------
+
+
+def _provider_version_output(executable_name: str) -> Optional[str]:
+    """Live ``--version`` fact for one provider binary (None = unverified)."""
+    import shutil
+    import subprocess
+
+    binary = shutil.which(executable_name)
+    if not binary:
+        return None
+    try:
+        proc = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return proc.stdout.strip()
+
+
+def _load_route_proofs() -> "tuple[Dict[str, Any], Dict[str, Any]]":
+    """Provider-generated route receipts bound to live v2 reservations.
+
+    The capability surface's ONLY route-receipt provenance: expectations
+    come from the authority boundary (each live v2 reservation's journaled
+    request — pinned generation/model/effort — and its delivery journal's
+    journaled request digests); the loader authenticates each durable
+    receipt (content address + generation-key HMAC + pinned provider
+    version) and validates the typed contract against those expectations.
+    Any failure yields no receipts (fail closed, no automated authority).
+    """
+    import json as _json
+
+    from cli_agent_orchestrator.clients.database import (
+        ManagedLaunchV2ReservationModel,
+        SessionLocal,
+    )
+    from cli_agent_orchestrator.constants import CAO_HOME_DIR
+    from cli_agent_orchestrator.services import route_receipts
+
+    expected_routes: Dict[str, Dict[str, Any]] = {}
+    expected_digests: Dict[str, Any] = {}
+    with SessionLocal() as db:
+        rows = (
+            db.query(ManagedLaunchV2ReservationModel)
+            .filter(ManagedLaunchV2ReservationModel.state.in_(("bound", "admitting", "admitted")))
+            .order_by(ManagedLaunchV2ReservationModel.updated_at.desc())
+            .all()
+        )
+    for row in rows:
+        provider = route_receipts.capability_provider(str(row.provider))
+        if provider is None or provider in expected_routes:
+            continue
+        try:
+            request = _json.loads(str(row.request_json))
+        except ValueError:
+            continue
+        model = request.get("expected_model")
+        effort = request.get("expected_effort")
+        if not isinstance(model, str) or not model or not isinstance(effort, str) or not effort:
+            continue
+        generation = str(row.generation)
+        digests = route_receipts.journaled_request_digests(
+            CAO_HOME_DIR / "managed-provider-sessions" / str(row.reservation_id),
+            str(row.obligation_generation),
+        )
+        if not digests:
+            continue
+        expected_routes[provider] = {
+            "generation": generation,
+            "model": model,
+            "effort": effort,
+        }
+        expected_digests[provider] = digests
+    proofs = route_receipts.load_valid_route_proofs(
+        state_dir=CAO_HOME_DIR / "recovery",
+        expected_routes=expected_routes,
+        expected_input_digests=expected_digests,
+    )
+    expectations = {
+        provider: {"model": route["model"], "effort": route["effort"]}
+        for provider, route in expected_routes.items()
+    }
+    return proofs, expectations
+
+
+@app.get("/managed/recovery-capabilities")
+async def managed_recovery_capabilities(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """The truthful negotiation surface: absence/unknown means fail closed."""
+    from pathlib import Path
+
+    from cli_agent_orchestrator.constants import CAO_HOME_DIR
+    from cli_agent_orchestrator.services import kimi_acp_proof, recovery_capabilities
+
+    # Version facts come from the live binaries — never hardcoded strings;
+    # runtime drift removes the capability.  The Kimi identity claim
+    # additionally requires the validated durable ACP new→kill→load proof.
+    versions = {
+        "codex": await asyncio.to_thread(_provider_version_output, "codex"),
+        "claude": await asyncio.to_thread(_provider_version_output, "claude"),
+        "kimi": await asyncio.to_thread(_provider_version_output, "kimi"),
+    }
+    kimi_proof = None
+    import shutil
+
+    kimi_bin = shutil.which("kimi")
+    if kimi_bin and versions["kimi"]:
+        try:
+            kimi_proof = await asyncio.to_thread(
+                kimi_acp_proof.load_valid_proof,
+                state_dir=CAO_HOME_DIR / "recovery",
+                kimi_binary=Path(kimi_bin),
+                version_output=versions["kimi"],
+            )
+        except Exception:  # noqa: BLE001 - absence of proof means disabled
+            kimi_proof = None
+    # Route authority derives only from provider-generated, authenticated,
+    # durable route receipts bound to live v2 reservations — never from
+    # caller-shaped dictionaries (cond-0069 closure).
+    try:
+        route_proofs, route_expectations = await asyncio.to_thread(_load_route_proofs)
+    except Exception:  # noqa: BLE001 - absence of proof means disabled
+        route_proofs, route_expectations = {}, {}
+    return await asyncio.to_thread(
+        recovery_capabilities.build_capabilities,
+        provider_versions=versions,
+        kimi_acp_proof=kimi_proof,
+        route_proofs=route_proofs,
+        route_expectations=route_expectations,
+    )
+
+
+@app.post("/managed-launch/v2/reservations", status_code=status.HTTP_201_CREATED)
+async def reserve_managed_launch_v2(
+    body: ManagedLaunchV2ReserveRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        record, created = await asyncio.to_thread(managed_launch_v2.reserve, body)
+        return {"created": created, **record}
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.get("/managed-launch/v2/reservations/{reservation_id}")
+async def get_managed_launch_v2(
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(managed_launch_v2.get, reservation_id)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/launch")
+async def launch_managed_launch_v2(
+    request: Request,
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await managed_launch_v2.launch_reserved(
+            reservation_id, registry=get_plugin_registry(request)
+        )
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/bind")
+async def bind_managed_launch_v2(
+    reservation_id: str,
+    body: ManagedLaunchV2BindRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(managed_launch_v2.bind_native, reservation_id, body)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/admit")
+async def admit_managed_launch_v2(
+    request: Request,
+    reservation_id: str,
+    body: ManagedLaunchV2AdmitRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    from cli_agent_orchestrator.services import generation_fence
+
+    try:
+        return await managed_launch_v2.admit_reserved(
+            reservation_id, body, registry=get_plugin_registry(request)
+        )
+    except generation_fence.FencedError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/resume")
+async def resume_managed_launch_v2(
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    # Resume admission stays fail-closed while the containment composition is
+    # unproven; the fork seam journals the refusal fact.
+    try:
+        return await asyncio.to_thread(
+            managed_launch_v2.attempt_resume, reservation_id, containment_proven=False
+        )
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/fence")
+async def install_managed_fence(
+    body: ManagedV2FenceInstallRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """The W13 fence-install RPC (conductor → fork).
+
+    The fork resolves the generation's vintage and current fencing token
+    from its own durable state — never from the caller — so a request
+    naming a superseded or v1 generation gets the truthful outcome.
+    """
+    from cli_agent_orchestrator.constants import COMPANION_DIR
+    from cli_agent_orchestrator.services import generation_fence, heartbeat_store
+
+    def _install() -> Dict[str, Any]:
+        import json as _json
+
+        from cli_agent_orchestrator.clients import database
+
+        vintage: Optional[str] = None
+        superseded = False
+        fencing_token_id = "unissued"
+        row_terminal_id: Optional[str] = None
+        with database.SessionLocal() as db:
+            row = (
+                db.query(database.ManagedLaunchV2ReservationModel)
+                .filter(
+                    database.ManagedLaunchV2ReservationModel.generation == body.terminal_generation
+                )
+                .first()
+            )
+            if row is not None:
+                # Identity binding: the body's terminal, generation,
+                # obligation, attempt, and the current fencing token must
+                # all match the fork-owned reservation row BEFORE any
+                # acknowledgement, and the row's terminal — never the
+                # caller's — drives the state path.
+                if body.terminal_id != row.terminal_id:
+                    return {
+                        "schema": "cao-w13-fence-resp-v1",
+                        "outcome": "unknown-generation",
+                        "fence_receipt_sha256": None,
+                    }
+                if body.obligation_generation != row.obligation_generation:
+                    raise generation_fence.FenceRequestError(
+                        "fence obligation_generation does not match the reservation row"
+                    )
+                binding = _json.loads(str(row.binding_json)) if row.binding_json else None
+                if binding is not None and body.attempt_id != binding.get("attempt_id"):
+                    raise generation_fence.FenceRequestError(
+                        "fence attempt_id does not match the journaled native binding"
+                    )
+                vintage = "v2"
+                row_terminal_id = str(row.terminal_id)
+                fencing_record = heartbeat_store.current_fencing_record(
+                    COMPANION_DIR, row_terminal_id
+                )
+                if fencing_record is not None:
+                    token = (fencing_record.get("current_token") or {}).get("id")
+                    if token:
+                        fencing_token_id = token
+                    # A fencing token issued for a *different* generation of
+                    # the same terminal means this generation was superseded.
+                    if fencing_record.get("generation") != body.terminal_generation:
+                        superseded = True
+            else:
+                legacy = (
+                    db.query(database.TerminalModel)
+                    .filter(database.TerminalModel.generation == body.terminal_generation)
+                    .first()
+                )
+                if legacy is not None:
+                    vintage = "v1"
+        if vintage is None:
+            # The fork has no such generation in any store it owns.
+            return {
+                "schema": "cao-w13-fence-resp-v1",
+                "outcome": "unknown-generation",
+                "fence_receipt_sha256": None,
+            }
+        return generation_fence.install_fence(
+            COMPANION_DIR,
+            terminal_id=row_terminal_id if row_terminal_id is not None else body.terminal_id,
+            generation=body.terminal_generation,
+            vintage=vintage,
+            superseded=superseded,
+            request=body.model_dump(mode="json", by_alias=True),
+            fencing_token_id=fencing_token_id,
+        )
+
+    try:
+        return await asyncio.to_thread(_install)
+    except generation_fence.FenceError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@app.post("/managed/destructive")
+async def execute_conditional_destructive(
+    request: Request,
+    body: ManagedDestructiveRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """The single conditional endpoint for fork destructive effects."""
+    from cli_agent_orchestrator.constants import COMPANION_DIR
+    from cli_agent_orchestrator.services.destructive_endpoint import (
+        DestructiveEndpoint,
+        DestructiveError,
+        DestructiveIntent,
+        DestructiveRefused,
+    )
+
+    def _execute() -> Dict[str, Any]:
+        from cli_agent_orchestrator.services.containment import ContainmentComposition
+
+        record = managed_launch_v2.get(body.reservation_id)
+
+        def _effect() -> str:
+            deleted = terminal_service.delete_terminal(
+                body.terminal_id,
+                registry=get_plugin_registry(request),
+                expected_generation=body.generation,
+                expected_session=record["session_name"],
+                # This teardown is the endpoint's effect: the heartbeat,
+                # binding/fence, dual-exit, and containment decisions were
+                # made and the single-use intent consumed by
+                # DestructiveEndpoint.execute before this call.
+                via_destructive_endpoint=True,
+            )
+            if not deleted:
+                raise DestructiveError("teardown returned without a no-survivor proof")
+            return "terminal-torn-down"
+
+        # Containment truth comes from the live composition (unproven by
+        # default), never from the request; the containment requirement is
+        # derived server-side from the effect class, and the endpoint
+        # fails closed on any non-ACTIVE heartbeat reading absent a
+        # durable dual-exit proof.
+        endpoint = DestructiveEndpoint(
+            companion_dir=COMPANION_DIR,
+            containment_proven=lambda: ContainmentComposition().status() == "proven",
+        )
+        return endpoint.execute(
+            DestructiveIntent(
+                intent_id=body.intent_id,
+                kind=body.kind,
+                terminal_id=body.terminal_id,
+                generation=body.generation,
+                reservation_id=body.reservation_id,
+                attempt_id=body.attempt_id,
+                fencing_token_id=body.fencing_token_id,
+            ),
+            _effect,
+        )
+
+    try:
+        return await asyncio.to_thread(_execute)
+    except DestructiveRefused as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except DestructiveError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
 @app.post(
     "/sessions/{session_name}/terminals",
     response_model=Terminal,
@@ -1623,6 +2223,68 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get terminal: {str(e)}",
         )
+
+
+# --- Structured companion surfaces (final conformance §20.2f P1-7/P1-10) ------
+#
+# Observation/receipt only: the §17.2 user-prompt lifecycle, the §18.2
+# refusal receipt, the §18.9 per-turn route identity, and the §19.5
+# message-turn acknowledgement. Every surface is bound to the terminal's
+# exact live generation; a stale/wrong-generation or absent record is a 204
+# (no observation), never stale data. Unknown/unsupported providers simply
+# never produce records, so they fail closed to 204 as well.
+
+
+def _live_terminal_generation(terminal_id: str) -> Optional[str]:
+    metadata = terminal_service.get_terminal_metadata(terminal_id)
+    if not isinstance(metadata, dict):
+        return None
+    return metadata.get("generation")
+
+
+@app.get("/terminals/{terminal_id}/user-prompt")
+async def get_terminal_user_prompt(terminal_id: TerminalId):
+    """The pending provider-native structured user prompt ``{prompt_id, text,
+    choices[]}`` for the terminal's exact live generation, or 204."""
+    prompt = companion_receipts.get_prompt(terminal_id, _live_terminal_generation(terminal_id))
+    if prompt is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return prompt
+
+
+@app.get("/terminals/{terminal_id}/refusal")
+async def get_terminal_refusal(terminal_id: TerminalId):
+    """The pending provider-native structured refusal receipt ``{refusal_id,
+    identity, turn_id, generation}`` for the exact live generation, or 204."""
+    refusal = companion_receipts.get_refusal(terminal_id, _live_terminal_generation(terminal_id))
+    if refusal is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return refusal
+
+
+@app.get("/terminals/{terminal_id}/route")
+async def get_terminal_route(terminal_id: TerminalId):
+    """The provider-native per-turn route receipt ``{provider, model, effort,
+    generation, receipt_id, turn_id}`` for the exact live generation, or 204."""
+    route = companion_receipts.get_route(terminal_id, _live_terminal_generation(terminal_id))
+    if route is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return route
+
+
+@app.get("/terminals/{terminal_id}/inbox/messages/{message_id}/turn-receipt")
+async def get_inbox_message_turn_receipt(terminal_id: TerminalId, message_id: str):
+    """The provider-native ``terminal_queued → submitted`` acknowledgement for
+    one exact inbox message, bound to message id, the receiver's exact live
+    generation, and the provider session/turn — or 204 when no provider-native
+    submission has been recorded (an ordinary inbox ``delivered``/terminal
+    paste is never an acknowledgement)."""
+    ack = companion_receipts.get_message_ack(
+        terminal_id, _live_terminal_generation(terminal_id), message_id
+    )
+    if ack is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return ack
 
 
 @app.get("/terminals/{terminal_id}/memory-context")
@@ -2438,21 +3100,35 @@ async def export_graph_endpoint(
 async def delete_terminal(
     request: Request,
     terminal_id: TerminalId,
+    expected_generation: Optional[str] = None,
+    expected_session: Optional[str] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
-    """Delete a terminal."""
+    """Delete a terminal, optionally only its exact reserved generation.
+
+    With ``expected_generation``/``expected_session`` the delete is a
+    compare-and-delete: a mismatched or replacement incarnation is preserved
+    and reported as 409 ambiguity, never deleted (spec §20.2d(2))."""
     try:
         # delete_terminal is fully synchronous: blocking tmux kills, a
         # full-history scrollback snapshot capture, and DB writes. Off the
         # loop so a stalled tmux/FIFO op bounds its blast radius to this one
         # request instead of wedging the whole server (issue #382 fixed this
         # for DELETE /sessions; the per-terminal path had the same hazard).
+        conditional: Dict[str, Any] = {}
+        if expected_generation is not None:
+            conditional["expected_generation"] = expected_generation
+        if expected_session is not None:
+            conditional["expected_session"] = expected_session
         success = await asyncio.to_thread(
             terminal_service.delete_terminal,
             terminal_id,
             registry=get_plugin_registry(request),
+            **conditional,
         )
         return {"success": success}
+    except TerminalGenerationMismatchError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:

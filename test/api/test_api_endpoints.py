@@ -978,6 +978,49 @@ class TestDeleteTerminal:
         assert response.status_code == 500
         assert "Failed to delete terminal" in response.json()["detail"]
 
+    def test_delete_terminal_generation_mismatch_is_409(self, client):
+        """DELETE with expected_generation: a replacement incarnation is a
+        preserved 409 ambiguity, never a delete (spec §20.2d(2))."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            TerminalGenerationMismatchError,
+        )
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.side_effect = TerminalGenerationMismatchError(
+                "terminal abcd1234 generation mismatch"
+            )
+
+            response = client.delete(
+                "/terminals/abcd1234?expected_generation=g-old&expected_session=cao-p"
+            )
+
+        assert response.status_code == 409
+        assert "generation mismatch" in response.json()["detail"]
+        mock_svc.delete_terminal.assert_called_once_with(
+            "abcd1234",
+            registry=ANY,
+            expected_generation="g-old",
+            expected_session="cao-p",
+        )
+
+    def test_delete_terminal_exact_generation_passes(self, client):
+        """DELETE with matching expected_generation deletes exactly it."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.return_value = True
+
+            response = client.delete(
+                "/terminals/abcd1234?expected_generation=g-1&expected_session=cao-p"
+            )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        mock_svc.delete_terminal.assert_called_once_with(
+            "abcd1234",
+            registry=ANY,
+            expected_generation="g-1",
+            expected_session="cao-p",
+        )
+
 
 # ── flow_daemon ──────────────────────────────────────────────────────
 
