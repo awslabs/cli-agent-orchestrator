@@ -11,11 +11,11 @@ import pytest
 from cli_agent_orchestrator.services.managed_event_renderer import ManagedEventRenderer
 from cli_agent_orchestrator.services.managed_provider_bridge import (
     BridgeError,
-    _RpcProcess,
     _authorize_operator_peer,
     _operator_command,
     _operator_console,
     _render_provider_diagnostic,
+    _RpcProcess,
     _send_socket_response,
 )
 
