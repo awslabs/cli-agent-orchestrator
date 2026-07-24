@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 
@@ -71,6 +71,8 @@ class AgentProfile(BaseModel):
     tools: Optional[List[str]] = Field(default=None)
     toolAliases: Optional[Dict[str, str]] = None
     allowedTools: Optional[List[str]] = None
+    # CAO-native KAS explicit deny list. The KAS adapter applies deny after allow.
+    deniedTools: Optional[List[str]] = None
     toolsSettings: Optional[Dict[str, Any]] = None
     resources: Optional[List[str]] = None
     hooks: Optional[Dict[str, Any]] = None
@@ -101,3 +103,10 @@ class AgentProfile(BaseModel):
     # example one created by `hermes profile alias <profile>`). When omitted,
     # the Hermes provider launches the default `hermes` command.
     hermesProfile: Optional[str] = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_denied_tools_engine(self) -> "AgentProfile":
+        """Prevent a KAS-only deny policy from being silently ignored."""
+        if self.deniedTools and self.engine != KiroEngine.KAS:
+            raise ValueError("deniedTools requires engine: kas")
+        return self

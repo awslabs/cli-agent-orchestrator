@@ -45,6 +45,11 @@
       "items": {"type": "string"},
       "description": "CAO tool vocabulary allowlist."
     },
+    "deniedTools": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "KAS-only CAO tool vocabulary deny list. Explicit denies override grants."
+    },
     "mcpServers": {
       "type": "object",
       "description": "MCP server configurations for additional tools.",
@@ -110,5 +115,14 @@
       "type": "boolean"
     }
   },
+  "allOf": [
+    {
+      "if": {"required": ["deniedTools"]},
+      "then": {
+        "required": ["engine"],
+        "properties": {"engine": {"const": "kas"}}
+      }
+    }
+  ],
   "additionalProperties": false
 }

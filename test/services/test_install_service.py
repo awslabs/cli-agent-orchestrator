@@ -267,7 +267,7 @@ class TestInstallAgent:
         # persisted=True prefers the stable PATH launcher.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
 
-    def test_install_rejects_kas_profile_before_writing_kiro_config(
+    def test_install_writes_kas_profile_only_when_policy_is_representable(
         self, install_paths: dict[str, Path]
     ) -> None:
         profile_path = install_paths["local_store_dir"] / "kas-agent.md"
@@ -284,9 +284,41 @@ class TestInstallAgent:
 
         result = install_agent("kas-agent", "kiro_cli")
 
-        assert result.success is False
-        assert "Cedar" in result.message
+        assert result.success is True
+        assert result.agent_file == str(install_paths["kiro_dir"] / "kas-agent.kas.json")
         assert not (install_paths["kiro_dir"] / "kas-agent.json").exists()
+        kas_config = json.loads((install_paths["kiro_dir"] / "kas-agent.kas.json").read_text())
+        assert kas_config["tools"] == ["fs_read"]
+        assert kas_config["permissions"]["rules"][0].startswith("permit(")
+        assert "allowedTools" not in kas_config
+        assert "toolsSettings" not in kas_config
+
+    def test_failed_kas_install_does_not_write_kas_or_alter_v2_artifact(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        v2_path = install_paths["kiro_dir"] / "kas-agent.json"
+        v2_path.write_text('{"existing":"v2"}', encoding="utf-8")
+        profile_path = install_paths["local_store_dir"] / "kas-agent.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-agent\n"
+            "description: KAS agent\n"
+            "engine: kas\n"
+            "allowedTools: [fs_read]\n"
+            "toolsSettings:\n"
+            "  fs_read:\n"
+            "    allowedPaths: [/synthetic]\n"
+            "---\n"
+            "KAS profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-agent", "kiro_cli")
+
+        assert result.success is False
+        assert "unsupported-settings" in result.message
+        assert not (install_paths["kiro_dir"] / "kas-agent.kas.json").exists()
+        assert v2_path.read_text(encoding="utf-8") == '{"existing":"v2"}'
 
     def test_install_sets_env_vars_before_profile_loading(
         self, install_paths: dict[str, Path]

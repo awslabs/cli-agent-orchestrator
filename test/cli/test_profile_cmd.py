@@ -117,6 +117,10 @@ class TestValidateFrontmatter:
         msgs = _validate_frontmatter({"name": "x", "engine": "v3"})
         assert any("[error]" in msg and "engine" in msg for msg in msgs)
 
+    def test_denied_tools_requires_kas_engine(self):
+        msgs = _validate_frontmatter({"name": "x", "engine": "v2", "deniedTools": ["fs_write"]})
+        assert any("[error]" in msg and "engine" in msg for msg in msgs)
+
     def test_missing_name(self):
         meta = {"description": "no name"}
         msgs = _validate_frontmatter(meta)
@@ -206,6 +210,89 @@ class TestAgentsValidateCommand:
     def test_validate_not_found(self, runner: CliRunner):
         result = runner.invoke(profile, ["validate", "nonexistent.md"])
         assert result.exit_code == 1
+
+
+class TestAgentsLintCommand:
+    """Kiro migration lint is redacted and read-only."""
+
+    def test_lint_human_reports_engine_policy_and_cedar(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "kas-lint.md"
+        source.write_text(
+            "---\n"
+            "name: kas-lint\n"
+            "description: KAS lint\n"
+            "engine: kas\n"
+            "allowedTools: [fs_read]\n"
+            "---\n"
+            "Sensitive prompt body.\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(profile, ["lint", str(source)])
+
+        assert result.exit_code == 0
+        assert "Engine:        kas" in result.output
+        assert "Policy source: allowedTools" in result.output
+        assert "Cedar rules:" in result.output
+        assert "Generation:    safe" in result.output
+        assert "Sensitive prompt body" not in result.output
+
+    def test_lint_json_is_redacted_and_does_not_write(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "redacted.md"
+        source.write_text(
+            "---\n"
+            "name: redacted\n"
+            "description: Redacted lint\n"
+            "engine: kas\n"
+            "allowedTools: ['@service/query']\n"
+            "mcpServers:\n"
+            "  service:\n"
+            "    command: synthetic-mcp\n"
+            "    env:\n"
+            "      API_TOKEN: should-never-appear\n"
+            "---\n"
+            "Prompt secret should-never-appear.\n",
+            encoding="utf-8",
+        )
+        before = set(tmp_path.iterdir())
+
+        result = runner.invoke(profile, ["lint", str(source), "--json"])
+
+        assert result.exit_code == 0
+        report = json.loads(result.output)
+        assert report["generation_safe"] is True
+        assert report["kas_visible_tools"] == ["mcp::service::query"]
+        assert "should-never-appear" not in result.output
+        assert set(tmp_path.iterdir()) == before
+
+    def test_lint_reports_unsupported_settings_without_writing(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "blocked.md"
+        source.write_text(
+            "---\n"
+            "name: blocked\n"
+            "description: Blocked lint\n"
+            "engine: kas\n"
+            "allowedTools: [fs_read]\n"
+            "toolsSettings:\n"
+            "  fs_read:\n"
+            "    deniedPaths: [/synthetic]\n"
+            "---\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(profile, ["lint", str(source), "--json"])
+
+        assert result.exit_code == 0
+        report = json.loads(result.output)
+        assert report["generation_safe"] is False
+        assert report["unsupported"] == ["unsupported-settings"]
+        assert not list(tmp_path.glob("*.json"))
 
 
 class TestAgentsRemoveCommand:

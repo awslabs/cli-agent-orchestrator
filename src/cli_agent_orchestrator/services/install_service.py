@@ -21,10 +21,15 @@ from cli_agent_orchestrator.constants import (
     SKILLS_DIR,
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
-from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.services.kiro_profiles import (
+    atomic_write_text,
+    kiro_artifact_path,
+    render_kiro_kas,
+    render_kiro_v2,
+)
 from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
@@ -340,42 +345,25 @@ def install_agent(
         safe_filename = profile.name.replace("/", "__")
 
         if provider == ProviderType.KIRO_CLI.value:
-            if profile.engine == KiroEngine.KAS:
-                raise ValueError(
-                    "Kiro KAS profiles cannot be installed in Phase 0: CAO cannot "
-                    "render KAS profiles or translate allowedTools/toolsSettings to Cedar. "
-                    "Set engine: v2 or wait for a later migration phase."
-                )
-            KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             # Kiro natively supports skill:// resources with progressive loading
             # (metadata at startup, full content on demand).
             kiro_resources = [
                 f"file://{context_file.absolute()}",
                 f"skill://{SKILLS_DIR}/**/SKILL.md",
             ]
-            raw_prompt = (
-                profile.prompt.strip() if profile.prompt and profile.prompt.strip() else None
-            )
-            kiro_agent_config = KiroAgentConfig(
-                name=profile.name,
-                description=profile.description,
-                tools=profile.tools if profile.tools is not None else ["*"],
-                allowedTools=allowed_tools,
-                resources=kiro_resources,
-                prompt=raw_prompt,
-                # Raise the cao-mcp-server tool-call timeout so kiro doesn't
-                # cancel long handoff RPCs client-side (see helper docstring).
-                mcpServers=_inject_kiro_mcp_timeout(profile.mcpServers),
-                toolAliases=profile.toolAliases,
-                toolsSettings=profile.toolsSettings,
-                hooks=profile.hooks,
-                model=profile.model,
-            )
-            agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
-            agent_file.write_text(
-                kiro_agent_config.model_dump_json(indent=2, exclude_none=True),
-                encoding="utf-8",
-            )
+            mcp_servers = _inject_kiro_mcp_timeout(profile.mcpServers)
+            engine = profile.engine or KiroEngine.V2
+            agent_file = kiro_artifact_path(KIRO_AGENTS_DIR, safe_filename, engine)
+            if engine == KiroEngine.KAS:
+                rendered, _ = render_kiro_kas(profile, kiro_resources, mcp_servers)
+            else:
+                rendered = render_kiro_v2(
+                    profile,
+                    allowed_tools,
+                    kiro_resources,
+                    mcp_servers,
+                )
+            atomic_write_text(agent_file, rendered)
 
         elif provider == ProviderType.COPILOT_CLI.value:
             COPILOT_AGENTS_DIR.mkdir(parents=True, exist_ok=True)

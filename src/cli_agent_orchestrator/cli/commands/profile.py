@@ -15,6 +15,7 @@ from jsonschema import Draft202012Validator
 from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR, ROLE_TOOL_DEFAULTS
 from cli_agent_orchestrator.utils.agent_profiles import (
     list_agent_profiles,
+    parse_agent_profile_text,
 )
 
 # Known deprecated frontmatter fields that should trigger warnings.
@@ -242,6 +243,47 @@ def validate_cmd(name_or_path: str):
 
     if any(msg.startswith("[error]") for msg in messages):
         raise click.exceptions.Exit(1)
+
+
+@profile.command("lint")
+@click.argument("name_or_path")
+@click.option("--json", "as_json", is_flag=True, help="Output the redacted report as JSON.")
+def lint_cmd(name_or_path: str, as_json: bool):
+    """Report Kiro engine and KAS migration readiness without writing files."""
+    profile_text = _read_profile_text(name_or_path)
+    if profile_text is None:
+        raise click.ClickException(f"Profile '{name_or_path}' not found.")
+
+    try:
+        parsed = frontmatter.loads(profile_text)
+        fallback_name = parsed.metadata.get("name") or Path(name_or_path).stem
+        agent_profile = parse_agent_profile_text(profile_text, str(fallback_name))
+        from cli_agent_orchestrator.services.kiro_profile_lint import lint_kiro_profile
+
+        result = lint_kiro_profile(agent_profile)
+    except Exception as exc:
+        raise click.ClickException(f"Kiro profile lint failed: {exc}") from exc
+
+    if as_json:
+        click.echo(json.dumps(result.model_dump(mode="json"), indent=2))
+        return
+
+    visible = ", ".join(result.kas_visible_tools) or "(none)"
+    click.echo(f"Profile:       {result.profile}")
+    click.echo(f"Engine:        {result.resolved_engine.value}")
+    click.echo(f"Policy source: {result.policy_source}")
+    click.echo(f"V2 artifact:   {result.v2_artifact}")
+    click.echo(f"KAS artifact:  {result.kas_artifact}")
+    click.echo(f"KAS tools:     {visible}")
+    click.echo(
+        "Cedar rules:  "
+        f"{result.cedar.allow_rules} allow, {result.cedar.hard_deny_rules} hard deny"
+    )
+    click.echo(f"Generation:    {'safe' if result.generation_safe else 'blocked'}")
+    if result.unsupported:
+        click.echo(f"Unsupported:   {', '.join(result.unsupported)}")
+    if result.diagnostic:
+        click.echo(f"Diagnostic:    {result.diagnostic}")
 
 
 @profile.command("remove")
