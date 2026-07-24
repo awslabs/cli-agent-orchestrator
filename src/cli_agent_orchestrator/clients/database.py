@@ -230,6 +230,14 @@ class ManagedLaunchV2ReservationModel(Base):
     # boundary reconciles against the same bytes.
     bind_intent_json = Column(Text, nullable=True)
     admission_json = Column(Text, nullable=True)
+    # The resolved execution mode ('native_tui' | 'acp') and the
+    # precedence level that supplied it.  Nullable on purpose: a row
+    # written before the execution-mode contract existed carries NULL,
+    # and NULL reads back as legacy ACP.  It must never read as native —
+    # a native guard that accepted "mode absent" would treat every
+    # historical ACP generation as an attachable native session.
+    execution_mode = Column(Text, nullable=True)
+    execution_mode_source = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
     updated_at = Column(Text, nullable=False)
 
@@ -258,6 +266,53 @@ class ManagedLaunchV2TerminalModel(Base):
     pane_id = Column(Text, nullable=True)
     window_id = Column(Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
+
+
+class NativeSessionAttachmentModel(Base):
+    """Exclusive, crash-safe ownership of one provider-native session.
+
+    Keyed by ``(provider, native_session_id)`` — the provider's own
+    session identity, not any CAO-side name — so exactly one owner can
+    be attached to a given provider session at a time regardless of how
+    many terminals, generations, or execution modes reference it.
+
+    The owner tuple is ``(terminal_id, generation, execution_mode,
+    pane_id, process_identity)``.  ``execution_mode`` is part of the
+    owner precisely so an ACP bridge and a native TUI can never both
+    hold the same provider session: a second attach in the other mode
+    sees a live owner and is refused rather than silently multiplexed.
+
+    Rows are written with the intent BEFORE the provider is launched, so
+    a crash at any point leaves a durable claim that recovery must
+    adjudicate.  ``ambiguous`` is a frozen terminal-for-automation
+    state: it preserves the owner and is never auto-released.
+    """
+
+    __tablename__ = "native_session_attachments"
+
+    provider = Column(Text, primary_key=True)
+    native_session_id = Column(Text, primary_key=True)
+    state = Column(Text, nullable=False)
+    owner_terminal_id = Column(Text, nullable=False)
+    owner_generation = Column(Text, nullable=False)
+    owner_execution_mode = Column(Text, nullable=False)
+    owner_pane_id = Column(Text, nullable=True)
+    # Canonical JSON of the owning OS process identity (pid + an
+    # start-time/lineage marker).  A bare pid is not identity: pids are
+    # recycled, and a recycled pid would forge a survivor.
+    owner_process_identity_json = Column(Text, nullable=True)
+    # Canonical JSON of the journaled acquire intent, written before any
+    # provider I/O so a crash between intent and launch is adjudicable.
+    intent_json = Column(Text, nullable=False)
+    # Canonical JSON of the accepted no-survivor proof that permitted the
+    # last release.  Retained as evidence; never cleared by a later claim.
+    release_proof_json = Column(Text, nullable=True)
+    ambiguity_reason = Column(Text, nullable=True)
+    # Monotonic per-row counter; every CAS transition bumps it so a
+    # lost-update race is detectable rather than silently last-write-wins.
+    epoch = Column(Integer, nullable=False, default=0)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
 
 
 class FlowModel(Base):
@@ -335,6 +390,7 @@ def init_db() -> None:
     _migrate_workflow_run()
     _migrate_workflow_run_step()
     _migrate_session_env()
+    _migrate_native_session_attachments()
     _migrate_managed_launch_reservations()
     _migrate_managed_launch_v2()
 
@@ -676,6 +732,48 @@ def _migrate_session_env() -> None:
             )
     except Exception as e:  # noqa: BLE001 — read path fails closed instead
         logger.debug(f"session_env migration skipped: {e}")
+
+
+def _migrate_native_session_attachments() -> None:
+    """Create the native-session attachment store on older databases.
+
+    ``Base.metadata.create_all`` covers fresh databases via
+    ``NativeSessionAttachmentModel``; this idempotent migration covers
+    databases created before native execution mode existed. The DDL is
+    byte-compatible with the ORM model so both paths yield one schema.
+
+    Failure is surfaced rather than swallowed: every native attachment
+    operation fails closed when this table cannot be read, and a native
+    launch that cannot record exclusive ownership must never proceed to
+    attach a provider session.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS native_session_attachments ("
+                "provider TEXT NOT NULL, "
+                "native_session_id TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "owner_terminal_id TEXT NOT NULL, "
+                "owner_generation TEXT NOT NULL, "
+                "owner_execution_mode TEXT NOT NULL, "
+                "owner_pane_id TEXT, "
+                "owner_process_identity_json TEXT, "
+                "intent_json TEXT NOT NULL, "
+                "release_proof_json TEXT, "
+                "ambiguity_reason TEXT, "
+                "epoch INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL, "
+                "PRIMARY KEY (provider, native_session_id)"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 - the operation path fails closed
+        logger.warning(f"native-session attachment migration failed: {e}")
 
 
 def _migrate_managed_launch_reservations() -> None:

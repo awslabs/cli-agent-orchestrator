@@ -45,9 +45,11 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
     ManagedLaunchV2BindRequest,
     ManagedLaunchV2ReserveRequest,
 )
+from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import (
     generation_fence,
     heartbeat_store,
+    native_attachment,
     recovery_receipts,
 )
 from cli_agent_orchestrator.services.destructive_endpoint import write_binding_record
@@ -96,9 +98,31 @@ def _parse_json(value: Optional[str], default: Any) -> Any:
         raise ManagedLaunchUnavailable("managed-launch v2 record contains invalid JSON") from exc
 
 
+def _mode_record(row: Any) -> dict[str, Any]:
+    """The execution-mode fields of a row, tolerant of pre-contract rows.
+
+    ``getattr`` with a ``None`` default rather than attribute access: a
+    row loaded from a database that predates these columns has no such
+    attribute, and that absence is exactly the legacy case the mode
+    readers are built to classify as ACP.
+    """
+    return {
+        "execution_mode": getattr(row, "execution_mode", None),
+        "execution_mode_source": getattr(row, "execution_mode_source", None),
+    }
+
+
 def _row_dict(row: Any) -> dict[str, Any]:
     admission = _parse_json(row.admission_json, None)
+    mode_record = _mode_record(row)
     return {
+        # Projected through the mode readers, never read raw: every
+        # public and durable surface therefore shows a concrete mode,
+        # and a legacy row projects as ACP with source 'legacy' instead
+        # of a null that a downstream guard might read as "either".
+        "execution_mode": em.mode_of_record(mode_record),
+        "execution_mode_source": em.source_of_record(mode_record),
+        "is_legacy_execution_mode": em.is_legacy_row(mode_record),
         "protocol_version": PROTOCOL_VERSION_V2,
         "protocol_vintage": row.protocol_vintage,
         "reservation_id": row.reservation_id,
@@ -166,6 +190,55 @@ def _validate_reserve_identity(request: ManagedLaunchV2ReserveRequest) -> dict[s
     return payload
 
 
+#: Request keys introduced after the v2 reservation surface shipped.  A
+#: reservation written before they existed simply has no such key.
+_ADDITIVE_REQUEST_KEYS = ("execution_mode", "worker_class")
+
+
+def _request_matches(stored_json: str, incoming: dict[str, Any]) -> bool:
+    """Whether a replayed reserve carries the same immutable request.
+
+    An exact byte match is the normal case.  The one accommodation is
+    the upgrade boundary: a reservation written before the
+    execution-mode contract has no mode keys at all, and treating that
+    absence as "a different request" would turn an ordinary idempotent
+    replay into a hard conflict for every in-flight reservation across a
+    deploy.  So an absent stored key compares equal to an *unspecified*
+    incoming value — and only to that.  A caller that now explicitly
+    asks for a mode really is presenting a different request, and still
+    conflicts.
+    """
+    if stored_json == _canonical_json(incoming):
+        return True
+    stored = _parse_json(stored_json, None)
+    if not isinstance(stored, dict):
+        return False
+    normalized = dict(stored)
+    for key in _ADDITIVE_REQUEST_KEYS:
+        if key not in normalized and incoming.get(key) is None:
+            normalized[key] = None
+    return _canonical_json(normalized) == _canonical_json(incoming)
+
+
+def _resolve_reserve_mode(request: ManagedLaunchV2ReserveRequest) -> em.ExecutionModeResolution:
+    """Resolve the mode at reservation time — before any provider I/O.
+
+    Reserve is the earliest point at which the mode is knowable and the
+    last one that is still free of provider effects, so an unresolvable
+    or contradictory mode fails here with nothing launched.  Resolution
+    failures surface as ``ManagedLaunchConflict`` so callers keep the
+    single managed-launch error family instead of having to catch a
+    second, unrelated one.
+    """
+    try:
+        return em.resolve(
+            launch_input=request.execution_mode,
+            worker_class=request.worker_class,
+        )
+    except em.ExecutionModeError as exc:
+        raise ManagedLaunchConflict(str(exc)) from exc
+
+
 def _allocate_terminal_id(db: Any) -> str:
     for _ in range(128):
         candidate = generate_terminal_id()
@@ -188,15 +261,25 @@ def reserve(request: ManagedLaunchV2ReserveRequest) -> tuple[dict[str, Any], boo
     """Create or idempotently return one immutable v2 reservation."""
     payload = _validate_reserve_identity(request)
     request_json = _canonical_json(payload)
+    resolution = _resolve_reserve_mode(request)
     nonce_digest = hashlib.sha256(request.launch_nonce.encode()).hexdigest()
     try:
         with database.SessionLocal() as db:
             existing = _query(db, request.reservation_id)
             if existing is not None:
-                if existing.request_json != request_json:
+                if not _request_matches(existing.request_json, payload):
                     raise ManagedLaunchConflict(
                         "reservation_id is already bound to a different request"
                     )
+                # The reserved mode is immutable. A replay that restates
+                # a different mode is refused rather than adopted, so a
+                # reservation can never change branch under a retry.
+                em_existing = _mode_record(existing)
+                if not em.is_legacy_row(em_existing):
+                    try:
+                        em.assert_immutable(em.mode_of_record(em_existing), request.execution_mode)
+                    except em.ExecutionModeError as exc:
+                        raise ManagedLaunchConflict(str(exc)) from exc
                 return _row_dict(existing), False
             now = _now()
             row = database.ManagedLaunchV2ReservationModel(
@@ -216,6 +299,8 @@ def reserve(request: ManagedLaunchV2ReserveRequest) -> tuple[dict[str, Any], boo
                 launch_nonce_digest=nonce_digest,
                 state="reserved",
                 request_json=request_json,
+                execution_mode=resolution.mode,
+                execution_mode_source=resolution.source,
                 created_at=now,
                 updated_at=now,
             )
@@ -228,7 +313,7 @@ def reserve(request: ManagedLaunchV2ReserveRequest) -> tuple[dict[str, Any], boo
     except IntegrityError:
         with database.SessionLocal() as db:
             existing = _query(db, request.reservation_id)
-            if existing is None or existing.request_json != request_json:
+            if existing is None or not _request_matches(existing.request_json, payload):
                 raise ManagedLaunchConflict("concurrent reservation conflict")
             return _row_dict(existing), False
     except Exception as exc:  # noqa: BLE001 - fail closed at the store boundary
@@ -473,6 +558,16 @@ def bind_native(reservation_id: str, request: ManagedLaunchV2BindRequest) -> dic
                 raise ManagedLaunchConflict(
                     f"native bind requires state 'launching', not {row.state!r}"
                 )
+            # The reserved mode is the mode of record for this bind. A
+            # caller that restates a different one is refused here,
+            # before any binding bytes are computed: modes are separate
+            # launch branches and a bind must never cross them.
+            try:
+                bound_mode = em.assert_immutable(
+                    em.mode_of_record(_mode_record(row)), request.execution_mode
+                )
+            except em.ExecutionModeError as exc:
+                raise ManagedLaunchConflict(str(exc)) from exc
 
             intent = _parse_json(row.bind_intent_json, None)
             if intent is not None:
@@ -491,13 +586,19 @@ def bind_native(reservation_id: str, request: ManagedLaunchV2BindRequest) -> dic
                         "provider-native readiness receipt"
                     )
                 _validate_readiness_for_bind(row, receipt)
-                intent = _build_bind_intent(db, row, reservation_id, request, receipt)
+                intent = _build_bind_intent(db, row, reservation_id, request, receipt, bound_mode)
                 # Journal the intent BEFORE the immutable external
                 # publication; this commit is the recoverable boundary.
                 row.bind_intent_json = _canonical_json(intent)
                 row.updated_at = _now()
                 db.commit()
                 db.refresh(row)
+            # Checked on both the fresh and the reconciled path, from the
+            # journaled binding rather than the live receipt, so a retry
+            # re-validates the exact session it is about to publish.
+            _assert_session_not_foreign_held(
+                row, intent["binding"]["native_session_id"], bound_mode
+            )
             _reconcile_and_complete_bind(db, row, reservation_id, intent)
             return _row_dict(row)
     except ManagedLaunchError:
@@ -506,12 +607,71 @@ def bind_native(reservation_id: str, request: ManagedLaunchV2BindRequest) -> dic
         raise ManagedLaunchUnavailable(f"native bind failed: {exc}") from exc
 
 
+def _assert_session_not_foreign_held(row: Any, native_session_id: str, bound_mode: str) -> None:
+    """Refuse a bind whose provider session another owner already holds.
+
+    A provider session is a single-writer resource: two attachments
+    interleave turns undetectably, and neither side can tell that the
+    transcript it is reading contains another controller's work.  This is
+    the bind-time half of that guarantee — it refuses to bind a
+    generation onto a session that a *different* live owner holds, and
+    refuses in either direction across modes, since ACP and the native
+    TUI must never attach to one provider session at the same time.
+
+    Deliberately a *check*, not a claim.  This function does not declare
+    an attachment, because at bind time the ACP bootstrap that minted the
+    session is still holding it — admission itself flows through that
+    bridge.  Declaring ownership here would require asserting
+    ``bootstrap_detached_before_launch``, which is false at this point,
+    so the claim belongs to the later native-launch step where that
+    obligation is genuinely true.  Recording a false obligation would
+    corrupt the very evidence the attachment store exists to hold.
+
+    A frozen ``ambiguous`` row refuses unconditionally: ambiguity means
+    the owner is precisely what could not be established, and binding
+    into that is the double-attach this exists to prevent.
+    """
+    held = native_attachment.get(row.provider, native_session_id)
+    if held is None:
+        return
+    if held["state"] == native_attachment.AMBIGUOUS:
+        raise ManagedLaunchConflict(
+            f"{row.provider} session {native_session_id} has a frozen ambiguous "
+            f"attachment ({held.get('ambiguity_reason')!r}); refusing to bind onto a "
+            "session whose owner could not be established"
+        )
+    if held["state"] not in native_attachment.LIVE_STATES:
+        return
+    owner = held["owner"]
+    if owner["terminal_id"] == row.terminal_id and owner["generation"] == row.generation:
+        # The same generation re-binding its own session. Still not a free
+        # pass: the recorded owner mode must match the mode being bound,
+        # so a generation cannot switch branch under a retry.
+        try:
+            em.assert_same_mode(
+                owner["execution_mode"],
+                bound_mode,
+                context=f"bind of {row.provider} session {native_session_id}",
+            )
+        except em.ExecutionModeError as exc:
+            raise ManagedLaunchConflict(str(exc)) from exc
+        return
+    raise ManagedLaunchConflict(
+        f"{row.provider} session {native_session_id} is already held in "
+        f"{owner['execution_mode']!r} mode by terminal={owner['terminal_id']} "
+        f"generation={owner['generation']}; a {bound_mode!r} bind for "
+        f"terminal={row.terminal_id} generation={row.generation} would be a second "
+        "concurrent attachment to one provider session"
+    )
+
+
 def _build_bind_intent(
     db: Any,
     row: Any,
     reservation_id: str,
     request: ManagedLaunchV2BindRequest,
     receipt: dict[str, Any],
+    bound_mode: str,
 ) -> dict[str, Any]:
     """Compute the exact bind intent (payload bytes + token) for one attempt."""
     terminal = (
@@ -614,6 +774,12 @@ def _build_bind_intent(
         attested_at=created_at,
     )
     route_payload_digest = recovery_receipts.payload_digest(route_payload)
+    # Both receipts carry the execution mode, and the binding digest an
+    # admit call must present is computed over the binding — so a
+    # receipt minted under one mode cannot satisfy admission under the
+    # other.  This is the concrete reason the tag lives in the receipt
+    # rather than only in the row: the row can be re-read, but the
+    # digest is what the admission actually checks.
     binding_record = {
         "schema": "cao-generation-binding-v1",
         "reservation_id": reservation_id,
@@ -623,6 +789,7 @@ def _build_bind_intent(
         "launch_nonce_digest": row.launch_nonce_digest,
         "fencing_token_id": token.id,
         "provider": row.provider,
+        "execution_mode": bound_mode,
         "native_session_id": receipt["provider_session_id"],
         "assigned_policy_sha256": receipt.get("profile_sha256"),
         "route_payload_sha256": route_payload_digest,
@@ -631,6 +798,7 @@ def _build_bind_intent(
     binding = {
         "schema": "cao-managed-v2-native-binding-v1",
         "attempt_id": request.attempt_id,
+        "execution_mode": bound_mode,
         "native_session_id": receipt["provider_session_id"],
         "provider_version": receipt["provider_version"],
         "issuance_source": _ISSUANCE_SOURCES[row.provider],
@@ -718,6 +886,13 @@ def _reconcile_and_complete_bind(
             assigned_policy_sha256=expected_record["assigned_policy_sha256"],
             route_payload_sha256=expected_record["route_payload_sha256"],
             bound_at=expected_record["bound_at"],
+            # Read from the journaled record, not recomputed, so the
+            # published bytes always equal the bytes a later reconcile
+            # compares against.  ``.get`` because an intent journaled
+            # before the execution-mode contract has no such key: that
+            # record must publish exactly as it was journaled, without a
+            # mode grafted on.
+            execution_mode=expected_record.get("execution_mode"),
         )
     row.binding_json = _canonical_json(intent["binding"])
     row.state = "bound"
