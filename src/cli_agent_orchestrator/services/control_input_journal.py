@@ -67,9 +67,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
     AMBIGUOUS,
-    REASON_OWNER_LOST,
+    REASON_OWNER_LOST_BEFORE_WRITE,
+    REASON_OWNER_LOST_MID_WRITE,
     REFUSED,
+    is_reattemptable,
     is_valid_pane_id,
+    outcome_for_reason,
 )
 
 CONTROL_INPUT_JOURNAL_SCHEMA_VERSION = 1
@@ -540,6 +543,28 @@ class ControlInputJournal:
         enter_attempted: Optional[bool] = None,
         evidence_digest: Optional[str] = None,
     ) -> ControlInputRecord:
+        # A reason is bound to exactly one outcome, so a reason that
+        # disagrees with the state being recorded is refused before it
+        # can reach the record.  The dangerous direction is a post-attempt
+        # reason ('response-lost', 'write-incomplete') recorded as
+        # 'refused': the record would then license a caller to re-send
+        # bytes that may already have landed.  Checked here rather than at
+        # each mark_* so no future entry point can bypass it.
+        if reason_code is not None:
+            expected = outcome_for_reason(reason_code)
+            actual = _STATE_OUTCOMES.get(to_state)
+            if actual is not None and expected != actual:
+                hazard = (
+                    "a post-attempt uncertainty recorded as a refusal would license a "
+                    "duplicate write"
+                    if is_reattemptable(actual)
+                    else "a provable refusal recorded as uncertain strands a request "
+                    "that never reached the pane"
+                )
+                raise ControlInputTransitionRefused(
+                    f"reason {reason_code!r} carries outcome {expected!r} and cannot be "
+                    f"recorded as {to_state!r} (outcome {actual!r}); {hazard}"
+                )
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -715,11 +740,15 @@ class ControlInputJournal:
             try:
                 if record.state == INTENT:
                     resolved.append(
-                        self.mark_refused(record.request_id, reason_code=REASON_OWNER_LOST)
+                        self.mark_refused(
+                            record.request_id, reason_code=REASON_OWNER_LOST_BEFORE_WRITE
+                        )
                     )
                 else:
                     resolved.append(
-                        self.mark_ambiguous(record.request_id, reason_code=REASON_OWNER_LOST)
+                        self.mark_ambiguous(
+                            record.request_id, reason_code=REASON_OWNER_LOST_MID_WRITE
+                        )
                     )
             except ControlInputTransitionRefused:
                 # A concurrent sweeper or the owner itself resolved this

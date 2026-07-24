@@ -47,12 +47,14 @@ _PANE_CONTROL_FIELDS = 7
 # control cannot produce a single unbounded argv.
 _LITERAL_CHUNK_CHARS = 1024
 
-# Bytes that must never appear in literal control text: ESC would let a
-# payload synthesise its own escape sequences (including the very paste
-# sentinels this path exists to eliminate), and CR/LF would submit at a
-# point the caller did not choose.  The control contract is one line
-# plus one explicit Enter.
-_ILLEGAL_LITERAL_CHARS = ("\x1b", "\r", "\n")
+# Bytes that must never appear in literal control text: ESC and its
+# single-byte C1 CSI equivalent U+009B would both let a payload
+# synthesise its own escape sequences (including the very paste sentinels
+# this path exists to eliminate), and CR/LF would submit at a point the
+# caller did not choose.  The control contract is one line plus one
+# explicit Enter.  Screening ESC alone would leave the 8-bit spelling as
+# a working way to write the identical bytes.
+_ILLEGAL_LITERAL_CHARS = ("\x1b", "\x9b", "\r", "\n")
 
 
 @dataclass(frozen=True)

@@ -165,7 +165,19 @@ class TestSendLiteralLineEmitsNoSentinels:
             # buffer for a sentinel to be wrapped around.
             assert "input" not in invocation[1]
 
-    @pytest.mark.parametrize("sentinel", ["\x1b[200~", "\x1b[201~"])
+    @pytest.mark.parametrize(
+        "sentinel",
+        [
+            "\x1b[200~",
+            "\x1b[201~",
+            # The single-byte C1 spelling of the same two sequences.  A
+            # terminal in 8-bit mode reads them identically, so screening
+            # only the ESC form leaves a working way to smuggle the
+            # framing through.
+            "\x9b200~",
+            "\x9b201~",
+        ],
+    )
     def test_sentinel_bearing_text_is_rejected_before_any_write(
         self, client, mock_subprocess, sentinel
     ):
@@ -178,7 +190,7 @@ class TestSendLiteralLineEmitsNoSentinels:
 class TestSendLiteralLineRejects:
     """Every refusal happens before the first write, so nothing is emitted."""
 
-    @pytest.mark.parametrize("char", ["\n", "\r", "\x1b"])
+    @pytest.mark.parametrize("char", ["\n", "\r", "\x1b", "\x9b"])
     def test_rejects_control_characters(self, client, mock_subprocess, char):
         with pytest.raises(ValueError, match="must not contain"):
             client.send_literal_line("%263", f"line one{char}line two")

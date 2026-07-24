@@ -36,12 +36,34 @@ Failure mode prevented: without a shared closed vocabulary, a caller
 that loses a response has no honest answer available and reaches for the
 ordinary input path, which is exactly how one requested control becomes
 two delivered ones.
+
+Reconciliation with the conductor client: the request digest here is
+byte-identical to ``conduct/lib/control_input.py``'s ``request_digest``
+— same domain string, same fixed field order, same nine identity fields,
+same canonical encoder rules.  That is deliberate and it is not a
+convenience.  Two independently-reasonable digests would each be correct
+in isolation and would disagree only when a conflict actually needed
+detecting, so the divergence would surface as a spurious rebind refusal
+on exactly the request whose identity mattered most.  The definition is
+therefore adopted from the side that committed it first rather than
+re-derived here.
+
+The physical write target — tmux pane id, window id, and pane pid — is
+deliberately *not* in the preimage.  The client has never been told those
+values, so a preimage containing them is one only the server can compute:
+it would look like agreement and fail only under conflict, which is worse
+than no digest at all.  They are instead mandatory server-side identity,
+resolved from the terminal and re-verified under the pane lease before the
+first byte, and recorded as their own binding columns in the journal.  A
+pane that moved is therefore still a refusal and still a rebind; it is
+just decided by re-verification against tmux rather than by a hash of
+facts the caller could only have guessed.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Optional, Union
+from typing import Any, Dict, Mapping, Optional, Union
 
 from cli_agent_orchestrator.services.canonical_json import build_canonical, canonical_sha256
 
@@ -80,31 +102,72 @@ REASON_CONTROL_ROUTE_ABSENT = "control-route-absent"
 REASON_PROTOCOL_MISMATCH = "protocol-mismatch"
 REASON_RESPONSE_LOST = "response-lost"
 REASON_WRITE_INCOMPLETE = "write-incomplete"
-# The process that owned an in-flight request is gone.  It resolves a
-# stranded request to whichever outcome the durable record can still
-# prove, which is not always the same outcome — see the journal.
-REASON_OWNER_LOST = "owner-lost"
+# The process that owned an in-flight request died.  Two reasons rather
+# than one, because the durable record proves two different things
+# depending on where it died, and a single reason would have to be read
+# alongside the state to know which.  A reason that cannot be trusted on
+# its own is exactly the hazard the outcome binding below exists to
+# remove.
+REASON_OWNER_LOST_BEFORE_WRITE = "owner-lost-before-write"
+REASON_OWNER_LOST_MID_WRITE = "owner-lost-mid-write"
 
-CONTROL_INPUT_REASON_CODES = frozenset(
-    {
-        REASON_UNKNOWN_TERMINAL,
-        REASON_IDENTITY_MISMATCH,
-        REASON_STALE_GENERATION,
-        REASON_LINEAGE_UNPROVEN,
-        REASON_PANE_DEAD,
-        REASON_PANE_BUSY,
-        REASON_ILLEGAL_CONTROL_BYTES,
-        REASON_MULTILINE_REJECTED,
-        REASON_PROVIDER_UNSUPPORTED,
-        REASON_MANAGED_ACP_PANE,
-        REASON_REQUEST_REBOUND,
-        REASON_CONTROL_ROUTE_ABSENT,
-        REASON_PROTOCOL_MISMATCH,
-        REASON_RESPONSE_LOST,
-        REASON_WRITE_INCOMPLETE,
-        REASON_OWNER_LOST,
-    }
-)
+# Every reason is bound to the one outcome it can honestly carry.
+#
+# The binding is the enforcement point for the rule that makes
+# REATTEMPTABLE_OUTCOMES safe: a refusal is decided before the first
+# byte.  ``response-lost`` and ``write-incomplete`` describe *post*-
+# attempt uncertainty, so carrying either with ``refused`` would license
+# a caller to re-send bytes that may already have reached the pane —
+# precisely the double delivery this lane exists to prevent.  Binding
+# them to ``ambiguous`` here means no call site can make that mistake,
+# including one written later by someone who never read this comment.
+REASON_OUTCOMES: "dict[str, str]" = {
+    REASON_UNKNOWN_TERMINAL: REFUSED,
+    REASON_IDENTITY_MISMATCH: REFUSED,
+    REASON_STALE_GENERATION: REFUSED,
+    REASON_LINEAGE_UNPROVEN: REFUSED,
+    REASON_PANE_DEAD: REFUSED,
+    REASON_PANE_BUSY: REFUSED,
+    REASON_ILLEGAL_CONTROL_BYTES: REFUSED,
+    REASON_MULTILINE_REJECTED: REFUSED,
+    REASON_PROVIDER_UNSUPPORTED: REFUSED,
+    REASON_MANAGED_ACP_PANE: REFUSED,
+    REASON_REQUEST_REBOUND: REFUSED,
+    REASON_OWNER_LOST_BEFORE_WRITE: REFUSED,
+    REASON_CONTROL_ROUTE_ABSENT: UNSUPPORTED,
+    REASON_PROTOCOL_MISMATCH: UNSUPPORTED,
+    REASON_RESPONSE_LOST: AMBIGUOUS,
+    REASON_WRITE_INCOMPLETE: AMBIGUOUS,
+    REASON_OWNER_LOST_MID_WRITE: AMBIGUOUS,
+}
+
+CONTROL_INPUT_REASON_CODES = frozenset(REASON_OUTCOMES)
+
+# No reason may license a re-attempt unless its outcome does.  Asserted
+# at import so the two tables can never drift apart unnoticed.
+assert all(outcome in CONTROL_INPUT_OUTCOMES for outcome in REASON_OUTCOMES.values())
+
+
+def outcome_for_reason(reason_code: str) -> str:
+    """The one outcome ``reason_code`` may be reported with.
+
+    Raises:
+        ValueError: The reason is not in the closed set.  An unknown
+            reason is refused rather than defaulted, because every
+            default is wrong in one direction: defaulting to ``refused``
+            invents a licence to retry, and defaulting to ``ambiguous``
+            strands a request that was genuinely never written.
+    """
+    try:
+        return REASON_OUTCOMES[reason_code]
+    except KeyError:
+        raise ValueError(f"Unknown control-input reason code: {reason_code!r}") from None
+
+
+def is_reattemptable(outcome: str) -> bool:
+    """Whether a caller may send this control again."""
+    return outcome in REATTEMPTABLE_OUTCOMES
+
 
 # --- Control target identity ---------------------------------------------
 
@@ -122,42 +185,134 @@ def is_valid_pane_id(pane_id: object) -> bool:
     return isinstance(pane_id, str) and PANE_ID_PATTERN.fullmatch(pane_id) is not None
 
 
-def control_input_request_sha256(
-    *,
-    request_id: str,
-    terminal_id: str,
-    pane_id: str,
-    window_id: str,
-    pane_pid: int,
-    generation: Optional[str],
-    text: str,
-    submit: bool,
-) -> str:
-    """Digest binding one request id to the exact control it authorises.
+# --- The request digest ---------------------------------------------------
 
-    The digest covers the target identity as well as the payload, so a
-    replayed request id carrying the same text but pointed at a different
-    pane is as detectable as one carrying different text.  Both are the
-    same failure: a control the operator authorised once being applied
-    somewhere, or to something, they did not authorise.
+# Domain separation for the request digest.  Deliberately a different
+# string from CONTROL_INPUT_PROTOCOL, so the same bytes under a different
+# purpose cannot collide with a control-input request digest and so
+# domain separation cannot be satisfied by accident.
+CONTROL_INPUT_DIGEST_DOMAIN = "cao-control-input-request-v1"
 
-    Computed identically by the client that asks and the server that
-    records, over the canonical encoding, so the two can compare digests
-    without agreeing on a serializer.
+# Schema of the wire request, versioned separately from the protocol
+# identifier because the digest's field set may need to move without the
+# protocol name moving.
+CONTROL_INPUT_REQUEST_SCHEMA_VERSION = 1
+
+# The identity a request may be bound to, in the fixed order the digest
+# encodes.  Every field is named explicitly and an absent expectation is
+# written as an explicit null rather than omitted: a request that expects
+# nothing and a request whose expectation was dropped in transit must not
+# produce the same digest.
+IDENTITY_FIELDS = (
+    "terminal_id",
+    "terminal_incarnation",
+    "terminal_generation",
+    "pane_birth_id",
+    "provider_process_id",
+    "provider",
+    "native_session_id",
+    "execution_mode",
+    "session_name",
+)
+
+# Fixed field order for the digest preimage.  Never lexicographic: the
+# order is part of the contract each side reproduces.
+REQUEST_DIGEST_FIELD_ORDER = (
+    "domain",
+    "schema_version",
+    "control_id",
+    "text",
+    "enter",
+    "expected_identity",
+)
+
+
+def normalize_expected_identity(identity: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Return the expectation in fixed field order, absences as null.
+
+    An unknown key is refused rather than ignored, because a misspelled
+    field name silently becomes "no expectation for the field I meant":
+    the request would bind to nothing and be accepted against the wrong
+    pane, which is the exact outcome identity binding exists to prevent.
     """
+    if identity is None:
+        identity = {}
+    if not isinstance(identity, Mapping):
+        raise ValueError(f"expected_identity must be a mapping, got {type(identity).__name__}")
+    unknown = sorted(key for key in identity if key not in IDENTITY_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"unknown expected-identity field(s) {unknown!r}; known fields are "
+            f"{list(IDENTITY_FIELDS)!r}. Rejected rather than ignored: an ignored "
+            "misspelling silently drops the binding."
+        )
+    normalized: Dict[str, Any] = {}
+    for name in IDENTITY_FIELDS:
+        value = identity.get(name)
+        if value is None:
+            normalized[name] = None
+        elif isinstance(value, bool):
+            raise ValueError(f"expected-identity field {name!r} must not be a boolean")
+        elif isinstance(value, int):
+            if value < 0:
+                raise ValueError(
+                    f"expected-identity field {name!r} must be non-negative, got {value!r}"
+                )
+            normalized[name] = value
+        elif isinstance(value, str):
+            if value == "":
+                raise ValueError(
+                    f"expected-identity field {name!r} is an empty string; use an absent "
+                    "field to mean 'no expectation'"
+                )
+            normalized[name] = value
+        else:
+            raise ValueError(
+                f"expected-identity field {name!r} must be a string, a non-negative "
+                f"integer, or absent; got {type(value).__name__}"
+            )
+    return normalized
+
+
+def control_input_request_digest(
+    *,
+    control_id: str,
+    text: str,
+    enter: bool,
+    expected_identity: Optional[Mapping[str, Any]],
+    schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
+) -> str:
+    """Digest binding one control id to the exact control it authorises.
+
+    The preimage is one canonical object in :data:`REQUEST_DIGEST_FIELD_ORDER`,
+    SHA-256 over its exact bytes.  It covers the target identity as well
+    as the payload, so a replayed control id carrying the same text but
+    pointed at a different pane is as detectable as one carrying
+    different text.  Both are the same failure: a control the operator
+    authorised once being applied somewhere, or to something, they did
+    not authorise.
+
+    Only wire fields participate.  Anything either side keeps privately —
+    a journal's own bookkeeping, a client's command classification — is
+    excluded, because a digest one side cannot reproduce is worse than no
+    digest: it looks like agreement and fails only under conflict.
+
+    This is byte-identical to the conductor's ``request_digest``; see the
+    reconciliation note in the module docstring.
+    """
+    if not isinstance(enter, bool):
+        raise ValueError(f"enter must be a bool, got {type(enter).__name__}")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise ValueError("request schema_version must be an integer")
     return canonical_sha256(
         build_canonical(
             [
-                ("protocol", CONTROL_INPUT_PROTOCOL),
-                ("schema_version", CONTROL_INPUT_SCHEMA_VERSION),
-                ("request_id", request_id),
-                ("terminal_id", terminal_id),
-                ("pane_id", pane_id),
-                ("window_id", window_id),
-                ("pane_pid", pane_pid),
-                ("generation", generation),
+                ("domain", CONTROL_INPUT_DIGEST_DOMAIN),
+                ("schema_version", schema_version),
+                ("control_id", control_id),
                 ("text", text),
-                ("submit", submit),
+                ("enter", enter),
+                ("expected_identity", normalize_expected_identity(expected_identity)),
             ]
         )
     )
@@ -171,7 +326,21 @@ def control_input_request_sha256(
 # composer.  The control path never emits them under any condition.
 BRACKETED_PASTE_START = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
-BRACKETED_PASTE_SENTINELS = (BRACKETED_PASTE_START, BRACKETED_PASTE_END)
+
+# The same two sequences in their single-byte C1 CSI spelling.  U+009B is
+# the 8-bit form of ``ESC [``, and a terminal in 8-bit mode treats the two
+# spellings identically.  Screening only the ESC form would leave the C1
+# form as a working way to smuggle the identical framing through — and a
+# screen with a known bypass is not a screen.
+BRACKETED_PASTE_START_C1 = "\x9b200~"
+BRACKETED_PASTE_END_C1 = "\x9b201~"
+
+BRACKETED_PASTE_SENTINELS = (
+    BRACKETED_PASTE_START,
+    BRACKETED_PASTE_END,
+    BRACKETED_PASTE_START_C1,
+    BRACKETED_PASTE_END_C1,
+)
 
 
 def contains_bracketed_paste_sentinel(text: Union[str, bytes]) -> bool:
@@ -183,7 +352,14 @@ def contains_bracketed_paste_sentinel(text: Union[str, bytes]) -> bool:
     remainder is interpreted as keystrokes rather than pasted text.
     """
     if isinstance(text, bytes):
-        return any(sentinel.encode() in text for sentinel in BRACKETED_PASTE_SENTINELS)
+        # Two encodings per sentinel.  A byte stream that came off a
+        # terminal carries C1 as the raw byte 0x9b, while the same text
+        # encoded as UTF-8 carries it as 0xc2 0x9b.  Screening only one
+        # spelling would leave the other as a working bypass.
+        return any(
+            sentinel.encode("utf-8") in text or sentinel.encode("latin-1") in text
+            for sentinel in BRACKETED_PASTE_SENTINELS
+        )
     return any(sentinel in text for sentinel in BRACKETED_PASTE_SENTINELS)
 
 

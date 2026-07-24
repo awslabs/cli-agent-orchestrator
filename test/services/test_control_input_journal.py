@@ -22,12 +22,13 @@ from cli_agent_orchestrator.services import control_input_journal as journal_mod
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
     AMBIGUOUS,
-    REASON_OWNER_LOST,
+    REASON_OWNER_LOST_BEFORE_WRITE,
+    REASON_OWNER_LOST_MID_WRITE,
     REASON_PANE_BUSY,
     REASON_RESPONSE_LOST,
     REASON_WRITE_INCOMPLETE,
     REFUSED,
-    control_input_request_sha256,
+    control_input_request_digest,
 )
 from cli_agent_orchestrator.services.control_input_journal import (
     DELIVERED,
@@ -53,16 +54,20 @@ WINDOW = "@3"
 PANE_PID = 4242
 
 
-def _sha(text="/model opus", pane_id=PANE, generation="gen-1"):
-    return control_input_request_sha256(
-        request_id=REQ,
-        terminal_id=TERMINAL,
-        pane_id=pane_id,
-        window_id=WINDOW,
-        pane_pid=PANE_PID,
-        generation=generation,
+def _sha(text="/model opus", generation="gen-1"):
+    """The digest over the wire request both sides can compute.
+
+    The physical target — pane, window, pid — is deliberately absent: it
+    is resolved and re-verified by the server, and a client cannot
+    reproduce a digest over facts it has never been told.  The binding
+    columns below carry it instead, which is why a pane change is still
+    a rebind without touching this digest.
+    """
+    return control_input_request_digest(
+        control_id=REQ,
         text=text,
-        submit=True,
+        enter=True,
+        expected_identity={"terminal_id": TERMINAL, "terminal_generation": generation},
     )
 
 
@@ -188,7 +193,7 @@ class TestIntentBeforeIO:
         "override",
         [
             {"request_sha256": _sha(text="/model haiku")},
-            {"pane_id": "%18", "request_sha256": _sha(pane_id="%18")},
+            {"pane_id": "%18"},
             {"terminal_id": "term-other"},
             {"window_id": "@9"},
             {"pane_pid": 9999},
@@ -203,12 +208,25 @@ class TestIntentBeforeIO:
         assert journal.get(REQ).state == INTENT
         assert len(journal.get(REQ).events) == 1
 
-    def test_the_digest_binds_target_as_well_as_payload(self):
-        """Same text, different pane, must not share a digest."""
-        assert _sha(pane_id="%17") != _sha(pane_id="%18")
+    def test_the_digest_binds_payload_and_declared_identity(self):
+        """Same id, different control or different terminal, different digest."""
         assert _sha(text="/model opus") != _sha(text="/model haiku")
         assert _sha(generation="gen-1") != _sha(generation="gen-2")
         assert _sha() == _sha()
+
+    def test_the_physical_target_is_bound_without_being_digested(self, journal):
+        """A moved pane is a rebind even though the digest never saw it.
+
+        The client digests what it declared; the server owns the pane,
+        window, and pid it resolved.  Enforcing the physical target
+        through the binding columns rather than the preimage is what lets
+        both sides compute the same digest without the client having to
+        know tmux facts it was never told.
+        """
+        journal.open_intent(_binding())
+        with pytest.raises(ControlInputRebound):
+            journal.open_intent(_binding(pane_id="%18"))
+        assert journal.get(REQ).pane_id == PANE
 
     @pytest.mark.parametrize(
         "override",
@@ -366,6 +384,54 @@ class TestOutcomes:
         assert record.as_dict()["outcome"] == ACCEPTED
 
 
+class TestReasonOutcomeBinding:
+    """A reason may never be filed under an outcome it cannot support.
+
+    The state machine already stops a claimed write from being recorded
+    as refused.  That protects the fork's own call sites and nothing
+    else: a reason code travels on the wire, and a caller that keys off
+    the reason rather than the state can still be handed
+    ``refused``/``response-lost`` by some other implementation.  Binding
+    the two in the contract and checking the binding here closes the gap
+    at the layer the wire actually shares.
+    """
+
+    @pytest.mark.parametrize("reason", [REASON_RESPONSE_LOST, REASON_WRITE_INCOMPLETE])
+    def test_post_attempt_uncertainty_cannot_be_recorded_as_a_refusal(self, journal, reason):
+        """Refused licenses a re-send; these reasons cannot prove it is safe."""
+        journal.open_intent(_binding())
+        with pytest.raises(ControlInputTransitionRefused) as excinfo:
+            journal.mark_refused(REQ, reason_code=reason)
+        assert "duplicate" in str(excinfo.value)
+        assert journal.get(REQ).state == INTENT
+
+    def test_owner_loss_mid_write_cannot_be_recorded_as_a_refusal(self, journal):
+        journal.open_intent(_binding())
+        with pytest.raises(ControlInputTransitionRefused):
+            journal.mark_refused(REQ, reason_code=REASON_OWNER_LOST_MID_WRITE)
+
+    def test_a_pre_write_reason_cannot_be_recorded_as_ambiguous(self, journal):
+        """Understating what is known strands a request that never ran."""
+        journal.open_intent(_binding())
+        journal.claim_write(REQ)
+        with pytest.raises(ControlInputTransitionRefused):
+            journal.mark_ambiguous(REQ, reason_code=REASON_PANE_BUSY)
+
+    def test_an_unknown_reason_is_refused_rather_than_stored(self, journal):
+        """A free-text reason is a vocabulary the other side cannot read."""
+        journal.open_intent(_binding())
+        with pytest.raises(ValueError):
+            journal.mark_refused(REQ, reason_code="something-went-wrong")
+        assert journal.get(REQ).state == INTENT
+
+    def test_the_bound_reasons_still_record_normally(self, journal):
+        journal.open_intent(_binding())
+        journal.claim_write(REQ)
+        record = journal.mark_ambiguous(REQ, reason_code=REASON_RESPONSE_LOST)
+        assert record.outcome == AMBIGUOUS
+        assert record.reason_code == REASON_RESPONSE_LOST
+
+
 class TestResponseLoss:
     def test_a_lost_response_is_resolved_by_request_id(self, journal, db_path):
         """The whole point: ask, do not guess and re-send."""
@@ -435,7 +501,7 @@ class TestCrashWindow:
         assert [r.request_id for r in resolved] == [REQ]
         record = sweeper.get(REQ)
         assert record.outcome == REFUSED
-        assert record.reason_code == REASON_OWNER_LOST
+        assert record.reason_code == REASON_OWNER_LOST_BEFORE_WRITE
 
     def test_stranded_write_resolves_to_ambiguous(self, db_path):
         """The owner had the right to write; nothing durable says it did not."""
@@ -447,7 +513,7 @@ class TestCrashWindow:
         sweeper.sweep_stranded(owner_alive=lambda pid: False)
         record = sweeper.get(REQ)
         assert record.outcome == AMBIGUOUS
-        assert record.reason_code == REASON_OWNER_LOST
+        assert record.reason_code == REASON_OWNER_LOST_MID_WRITE
 
     def test_a_genuinely_dead_owner_is_detected_without_injection(self, db_path):
         """The default liveness probe, not just the test double."""
