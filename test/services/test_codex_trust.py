@@ -17,8 +17,10 @@ from cli_agent_orchestrator.services.codex_trust import (
 
 
 def test_supported_codex_version_is_exactly_0145_0():
-    # cond-0093 regression: the fail-closed gate pins exactly codex-cli
-    # 0.145.0 — never a range, minimum, or wildcard.
+    # The fail-closed gate pins exactly one codex-cli banner — currently
+    # 0.145.0 — never a range, minimum, or wildcard. Move the constant and
+    # this test together, and only after a version-specific app-server
+    # protocol audit of the methods the bridge and trust probe use.
     assert codex_trust.SUPPORTED_CODEX_VERSION == "codex-cli 0.145.0"
 
 
@@ -129,8 +131,9 @@ def test_probe_fails_closed_on_version_drift(tmp_path, monkeypatch):
 
 
 def test_probe_fails_closed_on_previous_pin_0144_6(tmp_path, monkeypatch):
-    # cond-0093 regression: the retired 0.144.6 pin must now fail closed —
-    # the gate is an exact-version check, never a range or a minimum.
+    # The previously pinned banner (0.144.6) must fail closed once the pin
+    # has moved: the gate is an exact-version check, never a range or a
+    # minimum.
     target = tmp_path / "worktree"
     target.mkdir()
     monkeypatch.setattr(

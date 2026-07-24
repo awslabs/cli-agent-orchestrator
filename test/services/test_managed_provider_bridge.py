@@ -148,8 +148,8 @@ def _fake_codex_executable(tmp_path, request, banner: str):
 
 
 def test_codex_version_gate_accepts_exact_0145_0(tmp_path, monkeypatch):
-    # cond-0093 regression: the real fail-closed gate (no _version stub)
-    # accepts the pinned codex-cli 0.145.0 banner exactly.
+    # The real fail-closed gate (no _version stub) accepts the pinned
+    # codex-cli 0.145.0 banner exactly.
     request = _request(tmp_path)
     executable = _fake_codex_executable(tmp_path, request, "codex-cli 0.145.0")
     monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
@@ -159,9 +159,8 @@ def test_codex_version_gate_accepts_exact_0145_0(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("banner", ["codex-cli 0.144.6", "codex-cli 0.145.1", "codex 0.145.0"])
 def test_codex_version_gate_fails_closed_off_pin(tmp_path, monkeypatch, banner):
-    # cond-0093 regression: the retired pin, an adjacent patch, and a
-    # renamed banner all fail closed — the gate is exact, never a range,
-    # minimum, or prefix match.
+    # The retired pin, an adjacent patch, and a renamed banner all fail
+    # closed — the gate is exact, never a range, minimum, or prefix match.
     request = _request(tmp_path)
     executable = _fake_codex_executable(tmp_path, request, banner)
     monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
