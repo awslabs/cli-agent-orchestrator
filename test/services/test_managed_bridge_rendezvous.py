@@ -472,7 +472,9 @@ def test_stale_cleanup_refuses_foreign_socket_path_takeover(rendezvous_env, tmp_
     owned_server.close()
     target["socket"].unlink()
     foreign_server = _bind_path(target["socket"])
-    foreign_inode = target["socket"].lstat().st_ino
+    foreign_info = target["socket"].lstat()
+    foreign_inode = foreign_info.st_ino
+    assert bridge._socket_identity_record(foreign_info) != socket_identity
     try:
         with pytest.raises(bridge.BridgeError, match="socket-identity-collision"):
             bridge.cleanup_stale_rendezvous(

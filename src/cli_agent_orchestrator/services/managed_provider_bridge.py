@@ -391,11 +391,19 @@ class RendezvousVerification:
 
     record: dict[str, Any]
     sidecar_identity: tuple[int, int, int, int, int, int, int]
-    socket_identity: tuple[int, int, int, int]
+    socket_identity: tuple[int, int, int, int, int, int, int]
 
 
-def _stat_identity(info: os.stat_result) -> tuple[int, int, int, int]:
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid)
+def _stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
 
 
 def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
@@ -416,19 +424,33 @@ def _socket_identity_record(info: os.stat_result) -> dict[str, int]:
         "st_ino": info.st_ino,
         "st_mode": info.st_mode,
         "st_uid": info.st_uid,
+        "st_size": info.st_size,
+        "st_mtime_ns": info.st_mtime_ns,
+        "st_ctime_ns": info.st_ctime_ns,
     }
 
 
 def _validate_socket_identity(value: Any) -> Optional[dict[str, int]]:
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != {"st_dev", "st_ino", "st_mode", "st_uid"}:
+    if not isinstance(value, dict) or set(value) != {
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    }:
         raise BridgeError("socket-binding-record-malformed")
     if any(not isinstance(item, int) or isinstance(item, bool) for item in value.values()):
         raise BridgeError("socket-binding-record-malformed")
     if (
         value["st_dev"] < 0
         or value["st_ino"] <= 0
+        or value["st_size"] < 0
+        or value["st_mtime_ns"] < 0
+        or value["st_ctime_ns"] < 0
         or not stat.S_ISSOCK(value["st_mode"])
         or value["st_uid"] != os.getuid()
         or stat.S_IMODE(value["st_mode"]) != 0o600
