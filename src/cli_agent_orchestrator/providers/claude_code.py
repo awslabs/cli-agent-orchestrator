@@ -7,6 +7,8 @@ import logging
 import os
 import re
 import shlex
+import stat
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -25,6 +27,13 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_sta
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+# Serializes concurrent _ensure_skip_bypass_prompt_setting() read-modify-writes to
+# ~/.claude/settings.json -- after the async conversion, N concurrent inits can run this
+# in N threads (via asyncio.to_thread), and an unlocked read-modify-write can race: one
+# thread reads while another is mid-write, decodes a truncated file, falls back to {}, and
+# clobbers the user's global settings with just the one key.
+_SETTINGS_WRITE_LOCK = threading.Lock()
 
 # Sentinel so _build_claude_command can tell "caller passed no profile, load it"
 # from "caller explicitly passed None" (native/missing profile). initialize()
@@ -436,26 +445,44 @@ class ClaudeCodeProvider(BaseProvider):
         ``skipDangerousModePermissionPrompt: true`` is persisted in
         ``~/.claude/settings.json``.  CAO already uses the flag intentionally,
         so the confirmation is redundant and blocks initialization.
+
+        After the async conversion, N concurrent inits may run this
+        read-modify-write in N threads. ``_SETTINGS_WRITE_LOCK`` serializes
+        our own threads (in-process only: a second cao-server process, or
+        Claude Code itself, writing between our read and ``os.replace`` is
+        still a last-writer-wins lost update); ``os.replace`` only guarantees
+        no torn reads for anything outside CAO.
         """
         settings_path = Path.home() / ".claude" / "settings.json"
-        settings: dict = {}
-        if settings_path.exists():
-            try:
-                with open(settings_path) as f:
-                    settings = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
+        with _SETTINGS_WRITE_LOCK:
+            settings: dict = {}
+            existing_mode: Optional[int] = None
+            if settings_path.exists():
+                existing_mode = stat.S_IMODE(os.stat(settings_path).st_mode)
+                try:
+                    with open(settings_path) as f:
+                        settings = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-        if settings.get("skipDangerousModePermissionPrompt") is True:
-            return
+            if settings.get("skipDangerousModePermissionPrompt") is True:
+                return
 
-        settings["skipDangerousModePermissionPrompt"] = True
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(settings_path, "w") as f:
-            json.dump(settings, f, indent=2)
+            settings["skipDangerousModePermissionPrompt"] = True
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = settings_path.with_suffix(".json.tmp")
+            # Preserve the existing file's mode (or default to 0600 for a
+            # freshly-created settings file, since it may carry `env`/
+            # `apiKeyHelper` secrets) -- the tmp file would otherwise pick up
+            # the process umask (typically 0644) and os.replace would make
+            # the target adopt that on every launch that toggles this flag.
+            with open(tmp_path, "w") as f:
+                json.dump(settings, f, indent=2)
+            os.chmod(tmp_path, existing_mode if existing_mode is not None else 0o600)
+            os.replace(tmp_path, settings_path)
         logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
 
-    def _handle_startup_prompts(
+    async def _handle_startup_prompts(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
     ) -> None:
         """Auto-accept startup prompts that may appear before the REPL is ready.
@@ -487,6 +514,28 @@ class ClaudeCodeProvider(BaseProvider):
         any prompt has been observed, only ``outer_timeout`` can end the loop;
         the idle-gap clock starts only once a prompt has actually been handled.
 
+        harness-control#215: this method is awaited directly from initialize(),
+        which itself runs on cao-server's single asyncio event loop (uvicorn is
+        started with no ``workers=``, so there is exactly one). Every
+        tmux-backed call here (``get_history``/``send_keys``/``send_special_key``)
+        is a blocking subprocess exec, and every sleep used to be a plain
+        ``time.sleep`` — which blocks the WHOLE OS thread, not just this
+        coroutine. Under N concurrent ``POST /sessions`` calls, that froze
+        every other in-flight request (including other terminals' own
+        wait_for_shell/initialize/wait_until_status, and unrelated endpoints
+        like GET /health) for as long as this loop ran, turning N-way-concurrent
+        session creation into a fully serial queue whose wall-clock length
+        scaled with N — live-reproduced: 18 concurrent creates against this
+        exact method clustered at ~56.5s each (vs. ~18-35s at N=6-12, ~18s at
+        N=1), converging on CAO's own 60s provider_init_timeout purely from
+        this self-inflicted queueing, not from Claude Code itself being slow
+        (a plain, CAO-uninvolved `claude --remote-control` launch reached its
+        own equivalent trust-dialog prompt in low single-digit seconds under
+        the identical real host load). All blocking calls are now offloaded to
+        a worker thread via asyncio.to_thread and all sleeps are
+        asyncio.sleep, so this coroutine yields the event loop instead of
+        freezing it.
+
         Args:
             idle_gap: Seconds of no-new-prompt quiet that ends the loop. Defaults
                 to the ``startup_prompt_handler_timeout`` setting.
@@ -511,9 +560,11 @@ class ClaudeCodeProvider(BaseProvider):
             if any_prompt_handled and now - last_prompt_time >= idle_gap:
                 return  # no new prompt within the idle gap — startup settled
 
-            output = get_backend().get_history(self.session_name, self.window_name)
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
             if not output:
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
@@ -526,16 +577,22 @@ class ClaudeCodeProvider(BaseProvider):
                 logger.info("Bypass permissions prompt detected, auto-accepting")
                 # Send Down arrow to move cursor to "Yes, I accept", then Enter.
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_keys(
-                    self.session_name, self.window_name, "\x1b[B", enter_count=0
+                await asyncio.to_thread(
+                    get_backend().send_keys,
+                    self.session_name,
+                    self.window_name,
+                    "\x1b[B",
+                    enter_count=0,
                 )
-                time.sleep(0.5)
+                await asyncio.sleep(0.5)
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                )
                 bypass_accepted = True
                 any_prompt_handled = True
                 last_prompt_time = time.monotonic()  # reset idle timer — trust prompt may follow
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
             # 2) Handle workspace trust prompt
@@ -544,7 +601,9 @@ class ClaudeCodeProvider(BaseProvider):
 
                 logger.info("Workspace trust prompt detected, auto-accepting")
                 status_monitor.notify_input_sent(self.terminal_id)
-                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                await asyncio.to_thread(
+                    get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                )
                 return
 
             # 3) Claude Code fully started — no prompts needed.
@@ -564,7 +623,7 @@ class ClaudeCodeProvider(BaseProvider):
                 logger.info("Claude Code started without prompts")
                 return
 
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
 
     async def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
@@ -581,7 +640,11 @@ class ClaudeCodeProvider(BaseProvider):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Prevent bypass permissions dialog from appearing (settings-based fix).
-        self._ensure_skip_bypass_prompt_setting()
+        # harness-control#215 self-ROAST finding: this does blocking file I/O
+        # (~/.claude/settings.json read+write) directly on the event loop this
+        # coroutine runs on -- small in practice, but offloaded for the same
+        # reason as the calls below, so nothing in initialize() blocks the loop.
+        await asyncio.to_thread(self._ensure_skip_bypass_prompt_setting)
 
         # Build properly escaped command string
         command = self._build_claude_command(profile)
@@ -589,13 +652,18 @@ class ClaudeCodeProvider(BaseProvider):
         # Send Claude Code command using the backend. Arm the StatusMonitor
         # stickiness gate so the launching command can drive a fresh
         # PROCESSING transition past any stale ready latch.
+        # harness-control#215: offloaded to a thread (see _handle_startup_prompts'
+        # own docstring) so this single subprocess exec can't add to the
+        # same event-loop-blocking pileup under concurrent session creation.
         status_monitor.notify_input_sent(self.terminal_id)
-        get_backend().send_keys(self.session_name, self.window_name, command)
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, command
+        )
 
         # Handle startup prompts (bypass permissions + workspace trust).
         # Pass the resolved timeout as the outer cap so a containerized profile's
         # longer init budget also governs the startup-prompt handler.
-        self._handle_startup_prompts(outer_timeout=init_timeout)
+        await self._handle_startup_prompts(outer_timeout=init_timeout)
 
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
