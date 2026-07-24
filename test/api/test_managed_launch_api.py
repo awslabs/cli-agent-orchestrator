@@ -76,6 +76,10 @@ def test_capability_handshake_is_exact_and_versioned(client):
         # absent until a native launch branch exists, so a consumer that
         # gates a native claim on this list is fail-closed by default.
         "execution_modes": ["acp"],
+        # The v2 surface reserves any resolvable mode but launches
+        # only what it has a branch for, so the two permissions are
+        # advertised separately.
+        "v2_launchable_execution_modes": ["acp"],
     }
 
 
@@ -99,6 +103,27 @@ def test_advertisement_follows_the_support_set_when_it_widens(client, monkeypatc
     advertised = client.get("/managed-launch/capabilities").json()["execution_modes"]
 
     assert advertised == ["acp", "native_tui"]
+
+
+def test_v2_launchable_modes_are_read_from_the_v2_surface(client, monkeypatch):
+    """v2 publishes what it can launch, independently of what v1 supports.
+
+    Kept distinct because the two surfaces gain their native branches at
+    different times; a consumer reading one for the other would be
+    fail-open for whichever lands second.
+    """
+    from cli_agent_orchestrator.services import managed_launch_v2
+
+    body = client.get("/managed-launch/capabilities").json()
+    assert body["v2_launchable_execution_modes"] == list(
+        managed_launch_v2.LAUNCHABLE_EXECUTION_MODES
+    )
+
+    monkeypatch.setattr(managed_launch_v2, "LAUNCHABLE_EXECUTION_MODES", ("acp", "native_tui"))
+    widened = client.get("/managed-launch/capabilities").json()
+    assert widened["v2_launchable_execution_modes"] == ["acp", "native_tui"]
+    # Widening v2 must not move the v1 advertisement.
+    assert widened["execution_modes"] == ["acp"]
 
 
 def test_reserve_query_reconcile_and_cancel_round_trip(client, isolated_memory_db, tmp_path):

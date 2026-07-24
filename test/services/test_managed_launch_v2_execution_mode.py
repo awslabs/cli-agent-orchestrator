@@ -942,3 +942,90 @@ def test_manifest_reports_no_attachment_before_one_is_declared(
     entry = run_manifest.build("run-0001")["entries"][0]
     assert entry["native_session_id"] == SESSION_ID
     assert entry["attachment"] is None
+
+
+# --------------------------------------------------------------------
+# The launch branch gate
+# --------------------------------------------------------------------
+#
+# ``reserve`` deliberately admits ``native_tui``: a reservation is a
+# durable statement of intent that ``bind_native`` and the run manifest
+# make about sessions this surface did not start.  ``launch_reserved``,
+# by contrast, has exactly one branch — it starts the ACP bridge — so it
+# must refuse any mode it cannot actually run.  Without that refusal,
+# reserving ``worker_class="persistent"`` (which the resolver defaults to
+# native) and calling ``launch_reserved`` would put an ACP bridge under a
+# reservation row, binding receipt, run manifest, and public status that
+# all say ``native_tui``.
+
+
+class _ClaimReached(RuntimeError):
+    """Sentinel proving control reached the claim, i.e. passed the gate."""
+
+
+@pytest.mark.asyncio
+async def test_launch_refuses_a_mode_it_has_no_branch_for(
+    isolated_memory_db, worktree, tmp_path, monkeypatch
+):
+    record, _ = v2.reserve(_reserve_request(worktree, tmp_path, worker_class="persistent"))
+    assert record["execution_mode"] == em.NATIVE_TUI
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("a native reservation must never reach the ACP launch path")
+
+    monkeypatch.setattr(v2, "claim_launch", _explode)
+
+    with pytest.raises(ManagedLaunchConflict, match="no launch branch"):
+        await v2.launch_reserved(record["reservation_id"])
+
+
+@pytest.mark.asyncio
+async def test_a_refused_launch_leaves_the_reservation_exactly_as_it_was(
+    isolated_memory_db, worktree, tmp_path
+):
+    """The refusal must not strand the row in ``launching``.
+
+    A reservation parked in ``launching`` reads as "a launch is in
+    flight" to every later reader, including the idempotent replay in
+    ``claim_launch``, so refusing after the claim would trade a silent
+    mode swap for a permanently unlaunchable reservation.
+    """
+    record, _ = v2.reserve(_reserve_request(worktree, tmp_path, execution_mode="native_tui"))
+
+    with pytest.raises(ManagedLaunchConflict):
+        await v2.launch_reserved(record["reservation_id"])
+
+    after = v2.get(record["reservation_id"])
+    assert after["state"] == "reserved"
+    assert after["execution_mode"] == em.NATIVE_TUI
+    assert after["terminal_id"] == record["terminal_id"]
+
+
+@pytest.mark.asyncio
+async def test_an_acp_reservation_still_passes_the_gate(
+    isolated_memory_db, worktree, tmp_path, monkeypatch
+):
+    """The gate must be a mode check, not a blanket refusal.
+
+    Proven by letting the claim raise a sentinel: reaching it means the
+    gate admitted ACP and handed control to the real launch path.
+    """
+    record, _ = v2.reserve(_reserve_request(worktree, tmp_path, execution_mode="acp"))
+
+    def _sentinel(reservation_id):
+        raise _ClaimReached()
+
+    monkeypatch.setattr(v2, "claim_launch", _sentinel)
+
+    with pytest.raises(_ClaimReached):
+        await v2.launch_reserved(record["reservation_id"])
+
+
+def test_the_launchable_set_is_exactly_what_has_a_branch():
+    """A one-line reminder that this tuple is a claim about real code.
+
+    It is the last step of building the native branch, never a
+    precondition for it: widening it without a branch in
+    ``launch_reserved`` reintroduces the silent ACP fallback.
+    """
+    assert v2.LAUNCHABLE_EXECUTION_MODES == (em.ACP,)

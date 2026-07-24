@@ -1568,6 +1568,16 @@ async def managed_launch_capabilities(
         # therefore fail-closed for free, with no second source of truth
         # to keep in sync.
         "execution_modes": list(managed_launch.SUPPORTED_EXECUTION_MODES),
+        # The v2 surface separates the two questions this key pair
+        # answers.  It *reserves* any resolvable mode, because a
+        # reservation is a durable statement of intent about a session
+        # whose process the caller may start itself; it *launches* only
+        # modes it has a real branch for.  A consumer that gated a native
+        # launch on the reserve side would be reading the wrong
+        # permission, so the launchable set is published separately and
+        # read from the surface's own tuple for the same
+        # no-second-source-of-truth reason as above.
+        "v2_launchable_execution_modes": list(managed_launch_v2.LAUNCHABLE_EXECUTION_MODES),
     }
 
 

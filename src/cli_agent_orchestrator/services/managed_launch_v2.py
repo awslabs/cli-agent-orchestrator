@@ -220,6 +220,29 @@ def _request_matches(stored_json: str, incoming: dict[str, Any]) -> bool:
     return _canonical_json(normalized) == _canonical_json(incoming)
 
 
+#: Modes ``launch_reserved`` has a real launch branch for.
+#:
+#: Reserving a mode and launching one are separate questions here, and
+#: only the second is gated.  A reservation is a durable statement of
+#: intent that ``bind_native`` and the run manifest are entitled to make
+#: about a session whose process this surface did not start; refusing
+#: native *reservations* would delete that vocabulary.  What must never
+#: happen is a reservation that says ``native_tui`` whose process is the
+#: ACP bridge, so the refusal sits at the one call that would otherwise
+#: start that process.
+#:
+#: The distinction matters because the resolver defaults several worker
+#: classes to native: without this gate, reserving
+#: ``worker_class="persistent"`` and calling ``launch_reserved`` would be
+#: enough to get an ACP bridge under a reservation row, binding receipt,
+#: run manifest, and public status that all say ``native_tui`` — and
+#: every one of those is evidence a consumer is entitled to trust.
+#:
+#: Adding ``em.NATIVE_TUI`` here is therefore the *last* step of building
+#: the native branch below, never a precondition for it.
+LAUNCHABLE_EXECUTION_MODES: tuple[str, ...] = (em.ACP,)
+
+
 def _resolve_reserve_mode(request: ManagedLaunchV2ReserveRequest) -> em.ExecutionModeResolution:
     """Resolve the mode at reservation time — before any provider I/O.
 
@@ -1086,6 +1109,22 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
         request_bridge,
         write_request,
     )
+
+    # Gate the mode before claiming, not after.  ``claim_launch`` moves
+    # the reservation to ``launching``, and a refusal raised past that
+    # point would strand the row in a state that says a launch is in
+    # flight when none is.  Read-then-claim leaves an unlaunchable
+    # reservation exactly as it was.
+    # ``get`` projects through the mode readers, so this is always a
+    # concrete mode — a legacy row reads ACP rather than null.
+    reserved_mode = str(get(reservation_id)["execution_mode"])
+    if reserved_mode not in LAUNCHABLE_EXECUTION_MODES:
+        raise ManagedLaunchConflict(
+            f"reservation {reservation_id} is bound to execution_mode {reserved_mode!r}, "
+            f"which this surface has no launch branch for; launchable modes are "
+            f"{list(LAUNCHABLE_EXECUTION_MODES)}. Refusing rather than starting the ACP "
+            "bridge under a reservation that says otherwise"
+        )
 
     record, should_launch = claim_launch(reservation_id)
     if not should_launch:
