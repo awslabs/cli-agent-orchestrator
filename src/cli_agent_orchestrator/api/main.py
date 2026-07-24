@@ -14,6 +14,7 @@ import termios
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional, cast
 
@@ -113,6 +114,7 @@ from cli_agent_orchestrator.security.auth import (
 )
 from cli_agent_orchestrator.services import (
     companion_receipts,
+    control_input_service,
     flow_service,
     managed_launch,
     managed_launch_v2,
@@ -434,6 +436,30 @@ class ManagedSessionOperationRequest(BaseModel):
     config_id: Optional[str] = None
     value: Optional[str] = None
     instruction: Optional[str] = None
+
+
+class ControlInputRequest(BaseModel):
+    """One identity-bound control, typed literally into a provider composer.
+
+    Every field a caller can state about the target lives in
+    ``expected_identity`` and is checked before the first byte, so a
+    control aimed at a terminal that has since been replaced is refused
+    rather than delivered somewhere plausible.
+    """
+
+    control_id: str
+    text: str
+    # Stated, never inferred from the text.  Submitting is the
+    # irreversible half of a control, and a default that guessed would
+    # make the caller's intent unreadable from the request.
+    enter: bool = True
+    expected_identity: Optional[Dict[str, Any]] = None
+    request_digest: Optional[str] = None
+    protocol: Optional[str] = None
+    # Bounded on purpose.  An unbounded wait converts a truthful
+    # "the pane is busy, nothing was written, try again" into a request
+    # that may never answer.
+    lease_timeout: float = Field(default=0.0, ge=0.0, le=5.0)
 
 
 class InstallAgentProfileRequest(BaseModel):
@@ -2450,6 +2476,110 @@ async def query_managed_terminal_operation(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
     return {"receipt": receipt}
+
+
+# --- Identity-bound control input --------------------------------------------
+#
+# A control is a literal line plus one explicit Enter, typed into exactly
+# one pane by exactly one writer, or refused with a typed reason that says
+# what is provable.  It is a separate surface from ordinary delivery
+# because it makes a promise ordinary delivery cannot: no bracketed-paste
+# framing under any condition, identity re-verified under the write lease,
+# and at-most-once across a lost response.
+#
+# There is deliberately no fallback anywhere in this surface.  A caller
+# that cannot get a control delivered here is told so; it is never quietly
+# downgraded to a paste or to raw keys, because a control the operator
+# believes was delivered once must not arrive twice or as different bytes.
+
+
+@app.get("/control-input/capabilities")
+async def get_control_input_capabilities() -> Dict[str, Any]:
+    """What this server's control-input surface implements.
+
+    Exists because support cannot be discovered by trying: a probe that
+    succeeds has already typed into somebody's composer.  A server that
+    predates this protocol has no such route, and the resulting 404 is
+    the signal a client resolves to a typed ``unsupported``.
+    """
+    return control_input_service.control_input_capabilities()
+
+
+@app.get("/control-input/{control_id}")
+async def get_control_input_result(
+    control_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """What happened to one control, for a caller whose reply was lost.
+
+    Keyed by control id alone rather than by terminal: the id is the
+    journal's key, and a terminal-scoped lookup would answer "nothing was
+    written" to a caller that named the wrong terminal for a control that
+    was in fact written.
+    """
+    try:
+        result = await asyncio.to_thread(control_input_service.lookup_control_input, control_id)
+    except control_input_service.ControlInputRequestInvalid as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    return JSONResponse(status_code=result.http_status, content=result.as_response())
+
+
+@app.get("/terminals/{terminal_id}/control-identity")
+async def get_terminal_control_identity(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """This server's own view of a terminal's control identity.
+
+    A caller cannot bind a control to a pane it has never been told
+    about.  This is where it learns the declarable identity — including
+    the pane birth id — so its ``expected_identity`` can name the target
+    it actually means rather than trusting the server to pick.
+    """
+    resolved = await asyncio.to_thread(control_input_service.resolve_control_identity, terminal_id)
+    if resolved is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no terminal {terminal_id!r} is known to this server",
+        )
+    return resolved.as_dict()
+
+
+@app.post("/terminals/{terminal_id}/control-input")
+async def send_terminal_control_input(
+    terminal_id: TerminalId,
+    body: ControlInputRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """Type one control into one pane, once, or say truthfully why not.
+
+    Answers 200 with a typed outcome for every terminal-level failure,
+    including an unknown terminal.  A 404 here is reserved for the route
+    being absent altogether, which is what an older server returns and
+    what a client must read as ``unsupported`` rather than as "wrong
+    terminal" — the two demand opposite actions.
+    """
+    try:
+        result = await asyncio.to_thread(
+            partial(
+                control_input_service.deliver_control_input,
+                terminal_id,
+                control_id=body.control_id,
+                text=body.text,
+                enter=body.enter,
+                expected_identity=body.expected_identity,
+                request_digest=body.request_digest,
+                protocol=body.protocol,
+                lease_timeout=body.lease_timeout,
+            )
+        )
+    except control_input_service.ControlInputRequestInvalid as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    return JSONResponse(status_code=result.http_status, content=result.as_response())
 
 
 @app.post("/terminals/{terminal_id}/input")

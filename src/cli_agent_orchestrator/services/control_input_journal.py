@@ -14,12 +14,26 @@ missing an edge:
     intent  -> writing               this caller claimed the write
     writing -> delivered             tmux acked every write
     writing -> ambiguous             a write failed, or the owner died
+    refused -> intent                the same control, re-attempted
 
 There is no ``writing -> refused``.  Once the write is claimed, no
 evidence available afterwards can prove the pane received nothing, so
 the journal is structurally incapable of recording the comfortable
 answer.  That absence is the point: ``refused`` means zero bytes, and
 callers are entitled to act on it.
+
+``refused -> intent`` is the other side of that same coin.  A refusal
+tells the caller it may send the control again; if the record then
+refused every re-arrival by replaying the old answer, that permission
+would be worthless and the transient refusals — a busy pane above all —
+would be permanent.  The edge is safe for exactly the reason the
+refusal is actionable: a refused record proves zero bytes, so re-arming
+it cannot resurrect a write that already happened.  It is taken only
+when the re-arriving binding is byte-identical, so it re-attempts the
+same control rather than admitting a new one under a used id, and the
+append-only event log keeps every refusal that preceded it.
+``delivered`` and ``ambiguous`` stay terminal, because neither can make
+that proof.
 
 At-most-once comes from ``claim_write``, which is a compare-and-swap on
 the durable record inside one ``BEGIN IMMEDIATE`` transaction.  Exactly
@@ -87,7 +101,8 @@ STATE_AMBIGUOUS = "ambiguous"
 
 TERMINAL_STATES = frozenset({DELIVERED, STATE_REFUSED, STATE_AMBIGUOUS})
 
-# Note the absent (writing, refused) edge; see the module docstring.
+# Note the absent (writing, refused) edge, and that (refused, intent) is
+# the only edge leaving a terminal state; see the module docstring.
 LEGAL_TRANSITIONS = frozenset(
     {
         (None, INTENT),
@@ -95,6 +110,7 @@ LEGAL_TRANSITIONS = frozenset(
         (INTENT, WRITING),
         (WRITING, DELIVERED),
         (WRITING, STATE_AMBIGUOUS),
+        (STATE_REFUSED, INTENT),
     }
 )
 
@@ -361,7 +377,11 @@ class ControlInputJournal:
 
         Idempotent for an identical re-arrival: a client that retried the
         HTTP request after a lost response gets the existing record, with
-        no second event and no second write claim.
+        no second event and no second write claim.  The one exception is
+        a record in ``refused``, which is re-armed to ``intent`` so the
+        re-attempt the refusal promised can actually happen; see the
+        module docstring for why that is safe and why no other state
+        gets the same treatment.
 
         Raises:
             ControlInputRebound: The id is bound to a different control.
@@ -370,8 +390,8 @@ class ControlInputJournal:
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT terminal_id, pane_id, window_id, pane_pid, generation, request_sha256 "
-                "FROM control_input_request WHERE request_id=?",
+                "SELECT terminal_id, pane_id, window_id, pane_pid, generation, "
+                "request_sha256, state FROM control_input_request WHERE request_id=?",
                 (binding.request_id,),
             ).fetchone()
             if row is not None:
@@ -395,6 +415,29 @@ class ControlInputJournal:
                     raise ControlInputRebound(
                         f"request id {binding.request_id!r} is already bound to a "
                         "different control target or different request bytes"
+                    )
+                if str(row[6]) == STATE_REFUSED:
+                    moment = _now()
+                    # The old refusal's evidence is cleared from the live
+                    # row rather than carried forward: it describes an
+                    # attempt that is over, and leaving it attached would
+                    # make the re-armed request look like it had already
+                    # failed.  The event log keeps it.
+                    conn.execute(
+                        "UPDATE control_input_request SET state=?, reason_code=NULL, "
+                        "chunks_sent=NULL, enter_attempted=NULL, owner_pid=?, "
+                        "owner_token=?, updated_at=? WHERE request_id=? AND state=?",
+                        (
+                            INTENT,
+                            self._owner_pid,
+                            self._owner_token,
+                            moment,
+                            binding.request_id,
+                            STATE_REFUSED,
+                        ),
+                    )
+                    self._append_event(
+                        conn, binding.request_id, STATE_REFUSED, INTENT, None, moment
                     )
                 conn.commit()
                 return self.get(binding.request_id)
@@ -479,13 +522,22 @@ class ControlInputJournal:
         request_id: str,
         *,
         chunks_sent: Optional[int] = None,
+        enter_attempted: Optional[bool] = None,
         evidence_digest: Optional[str] = None,
     ) -> ControlInputRecord:
-        """tmux accepted every write, including the submitting Enter."""
+        """tmux accepted every write, including any submitting Enter.
+
+        ``enter_attempted`` is recorded here and not inferred, because a
+        control sent with ``enter=False`` is delivered without ever being
+        submitted.  A record that omitted it could not answer the only
+        question a caller replaying a lost response actually has: whether
+        the provider has already started acting on the control.
+        """
         return self._transition(
             request_id,
             to_state=DELIVERED,
             chunks_sent=chunks_sent,
+            enter_attempted=enter_attempted,
             evidence_digest=evidence_digest,
         )
 

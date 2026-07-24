@@ -915,7 +915,7 @@ class TmuxClient:
             return None
         return matches[0]
 
-    def send_literal_line(self, pane_id: str, text: str, submit: bool = True) -> None:
+    def send_literal_line(self, pane_id: str, text: str, submit: bool = True) -> int:
         """Write ``text`` to ``pane_id`` as literal bytes, then one Enter.
 
         The control path's only write primitive.  It never loads or pastes
@@ -937,6 +937,13 @@ class TmuxClient:
             pane_id: Immutable tmux pane id (``%N``).
             text: Single-line literal text, free of ESC, CR and LF.
             submit: Send one explicit Enter after the text.
+
+        Returns:
+            The number of literal writes tmux accepted, not counting the
+            Enter.  Returned rather than left for the caller to recompute
+            from the chunk size: the caller journals this number as its
+            record of what reached the pane, and a recomputation would
+            silently stop matching the moment the chunking here changed.
 
         Raises:
             ValueError: The pane id or text violates the control contract.
@@ -990,6 +997,7 @@ class TmuxClient:
                 chunks_sent=chunks_sent,
                 enter_attempted=True,
             )
+        return chunks_sent
 
     @staticmethod
     def _run_literal_write(argv: List[str], *, chunks_sent: int, enter_attempted: bool) -> None:

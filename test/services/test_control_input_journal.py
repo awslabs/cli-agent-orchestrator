@@ -107,14 +107,25 @@ class TestStateMachineShape:
         """The absent edge is the contract: refused means zero bytes."""
         assert (WRITING, STATE_REFUSED) not in LEGAL_TRANSITIONS
 
-    def test_transitions_are_exactly_the_documented_five(self):
+    def test_transitions_are_exactly_the_documented_six(self):
         assert LEGAL_TRANSITIONS == {
             (None, INTENT),
             (INTENT, STATE_REFUSED),
             (INTENT, WRITING),
             (WRITING, DELIVERED),
             (WRITING, STATE_AMBIGUOUS),
+            (STATE_REFUSED, INTENT),
         }
+
+    def test_only_a_refusal_may_leave_a_terminal_state(self):
+        """Re-arming is licensed by proof, not by convenience.
+
+        A refused record proves zero bytes, so re-attempting it cannot
+        duplicate a write.  Neither other terminal state can make that
+        proof, so neither gets an edge out.
+        """
+        leaving = {edge for edge in LEGAL_TRANSITIONS if edge[0] in TERMINAL_STATES}
+        assert leaving == {(STATE_REFUSED, INTENT)}
 
     def test_in_flight_states_license_no_outcome(self):
         """'In flight' is truthful; inventing an outcome for it is not."""
@@ -466,6 +477,80 @@ class TestResponseLoss:
             WRITING,
             DELIVERED,
         ]
+
+
+class TestRefusalIsReattemptable:
+    """A refusal that could not be acted on would not be a refusal.
+
+    ``refused`` is the one outcome that licenses sending the control
+    again.  If the record then answered every re-arrival with the stored
+    refusal, that licence would be void and a transient cause — a busy
+    pane above all — would be permanent for that control id.
+    """
+
+    def test_a_refused_record_is_rearmed_by_an_identical_re_arrival(self, journal):
+        journal.open_intent(_binding())
+        journal.mark_refused(REQ, reason_code=REASON_PANE_BUSY)
+        assert journal.get(REQ).outcome == REFUSED
+
+        record = journal.open_intent(_binding())
+        assert record.state == INTENT
+        assert record.outcome is None
+        # The stale refusal is cleared from the live row: it describes an
+        # attempt that is over, and a re-armed request that still carried
+        # it would look like it had already failed.
+        assert record.reason_code is None
+        assert journal.claim_write(REQ).granted
+
+    def test_re_arming_preserves_the_refusal_in_the_event_log(self, journal):
+        """The append-only log is what keeps re-arming honest."""
+        journal.open_intent(_binding())
+        journal.mark_refused(REQ, reason_code=REASON_PANE_BUSY)
+        journal.open_intent(_binding())
+
+        events = journal.get(REQ).events
+        assert [e["to_state"] for e in events] == [INTENT, STATE_REFUSED, INTENT]
+        assert events[1]["reason_code"] == REASON_PANE_BUSY
+
+    def test_a_delivered_record_is_never_rearmed(self, journal):
+        """Delivered cannot prove zero bytes, so it stays terminal."""
+        journal.open_intent(_binding())
+        journal.claim_write(REQ)
+        journal.mark_delivered(REQ, chunks_sent=1, enter_attempted=True)
+
+        record = journal.open_intent(_binding())
+        assert record.state == DELIVERED
+        assert not journal.claim_write(REQ).granted
+
+    def test_an_ambiguous_record_is_never_rearmed(self, journal):
+        journal.open_intent(_binding())
+        journal.claim_write(REQ)
+        journal.mark_ambiguous(REQ, reason_code=REASON_WRITE_INCOMPLETE, chunks_sent=1)
+
+        record = journal.open_intent(_binding())
+        assert record.state == STATE_AMBIGUOUS
+        assert not journal.claim_write(REQ).granted
+
+    def test_re_arming_requires_a_byte_identical_binding(self, journal):
+        """Re-arming re-attempts one control; it does not free the id."""
+        journal.open_intent(_binding())
+        journal.mark_refused(REQ, reason_code=REASON_PANE_BUSY)
+
+        with pytest.raises(ControlInputRebound):
+            journal.open_intent(_binding(request_sha256=_sha(text="/clear")))
+        with pytest.raises(ControlInputRebound):
+            journal.open_intent(_binding(pane_id="%99"))
+        assert journal.get(REQ).state == STATE_REFUSED
+
+    def test_a_rearmed_record_is_owned_by_the_reattempting_server(self, journal, db_path):
+        """Otherwise a sweep would treat the live re-attempt as stranded."""
+        journal.open_intent(_binding())
+        journal.mark_refused(REQ, reason_code=REASON_PANE_BUSY)
+
+        retry_server = ControlInputJournal(db_path)
+        retry_server.open_intent(_binding())
+        assert retry_server.get(REQ).owner_token == retry_server.owner_token
+        assert retry_server.sweep_stranded(owner_alive=lambda pid: False) == []
 
 
 class TestCrashWindow:
