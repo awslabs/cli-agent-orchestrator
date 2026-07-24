@@ -79,7 +79,7 @@ def test_capability_handshake_is_exact_and_versioned(client):
         # The v2 surface reserves any resolvable mode but launches
         # only what it has a branch for, so the two permissions are
         # advertised separately.
-        "v2_launchable_execution_modes": ["acp"],
+        "v2_launchable_execution_modes": ["acp", "native_tui"],
     }
 
 
@@ -119,11 +119,13 @@ def test_v2_launchable_modes_are_read_from_the_v2_surface(client, monkeypatch):
         managed_launch_v2.LAUNCHABLE_EXECUTION_MODES
     )
 
-    monkeypatch.setattr(managed_launch_v2, "LAUNCHABLE_EXECUTION_MODES", ("acp", "native_tui"))
-    widened = client.get("/managed-launch/capabilities").json()
-    assert widened["v2_launchable_execution_modes"] == ["acp", "native_tui"]
-    # Widening v2 must not move the v1 advertisement.
-    assert widened["execution_modes"] == ["acp"]
+    monkeypatch.setattr(managed_launch_v2, "LAUNCHABLE_EXECUTION_MODES", ("acp",))
+    narrowed = client.get("/managed-launch/capabilities").json()
+    assert narrowed["v2_launchable_execution_modes"] == ["acp"]
+    # The two surfaces advertise independently: v2 carries a native
+    # launch branch and v1 does not, so the handshake must be able to
+    # show one without the other.
+    assert narrowed["execution_modes"] == ["acp"]
 
 
 def test_reserve_query_reconcile_and_cancel_round_trip(client, isolated_memory_db, tmp_path):

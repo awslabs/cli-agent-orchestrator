@@ -63,13 +63,25 @@ from cli_agent_orchestrator.services.provider_contracts import (
     ProviderContractError,
     check_pinned_version,
 )
-from cli_agent_orchestrator.utils.terminal import generate_terminal_id
+from cli_agent_orchestrator.utils.terminal import generate_terminal_id, managed_window_name
 
 logger = logging.getLogger(__name__)
 
 _READINESS_RECEIPT_KINDS = {
     "codex": "codex-thread-start",
     "kimi_cli": "kimi-acp-session-new",
+}
+#: Readiness receipt kinds for native-TUI generations.
+#:
+#: The kind strings are disjoint from the ACP table above by design, so
+#: "an ACP receipt can never satisfy a native bind" is structural rather
+#: than a rule someone has to remember to check.  The two modes prove
+#: readiness by different evidence — ACP by a provider transcript, native
+#: by an attached pane running the bound session — and a receipt from the
+#: wrong one is not weaker evidence, it is evidence about a different
+#: thing entirely.
+_NATIVE_TUI_READINESS_RECEIPT_KINDS = {
+    "kimi_cli": "kimi-native-tui-attached",
 }
 _ISSUANCE_SOURCES = {
     "codex": "app_server_thread_start",
@@ -239,8 +251,23 @@ def _request_matches(stored_json: str, incoming: dict[str, Any]) -> bool:
 #: every one of those is evidence a consumer is entitled to trust.
 #:
 #: Adding ``em.NATIVE_TUI`` here is therefore the *last* step of building
-#: the native branch below, never a precondition for it.
-LAUNCHABLE_EXECUTION_MODES: tuple[str, ...] = (em.ACP,)
+#: the native branch below, never a precondition for it — and it is added
+#: here now because ``_launch_native_tui`` exists: a native reservation
+#: mints its own provider session, starts the provider's own TUI as the
+#: pane's primary process, and publishes its own readiness receipt,
+#: without the ACP bridge being involved at any point.
+#:
+#: The v1 surface's ``SUPPORTED_EXECUTION_MODES`` deliberately does *not*
+#: gain native TUI alongside this.  That surface still has no native
+#: branch, and the capability endpoint publishes the two sets separately
+#: precisely so one can advertise a mode the other cannot run.
+LAUNCHABLE_EXECUTION_MODES: tuple[str, ...] = (em.ACP, em.NATIVE_TUI)
+
+#: Providers with a native-TUI launch branch, which is a narrower claim
+#: than "providers this surface can launch".  Native TUI needs a pre-turn
+#: session id the provider will resume by id; a provider without both is
+#: refused rather than launched into an unresumable pane.
+NATIVE_TUI_PROVIDERS: frozenset[str] = frozenset({"kimi_cli"})
 
 
 def _resolve_reserve_mode(request: ManagedLaunchV2ReserveRequest) -> em.ExecutionModeResolution:
@@ -499,9 +526,19 @@ def _mark_launch_failed_bridge(
 
 
 def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
-    """Accept only the exact provider-native readiness receipt for this row."""
+    """Accept only the exact provider-native readiness receipt for this row.
+
+    The allowlist is selected by the row's *bound* mode, never by what the
+    receipt says about itself, so a receipt cannot nominate the table that
+    would accept it.
+    """
     request = _parse_json(row.request_json, {})
-    expected_kind = _READINESS_RECEIPT_KINDS.get(row.provider)
+    kinds = (
+        _NATIVE_TUI_READINESS_RECEIPT_KINDS
+        if em.mode_of_record(_mode_record(row)) == em.NATIVE_TUI
+        else _READINESS_RECEIPT_KINDS
+    )
+    expected_kind = kinds.get(row.provider)
     if expected_kind is None or receipt.get("provider_receipt_kind") != expected_kind:
         raise ManagedLaunchConflict(
             f"readiness receipt kind is not the allowlisted provider-native kind: "
@@ -1178,6 +1215,13 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
     except Exception as exc:  # noqa: BLE001 - no provider I/O occurred
         return _mark_preflight_blocked(reservation_id, str(exc))
 
+    # The two modes diverge here and nowhere earlier: everything above is
+    # reservation identity and the durable request, which both modes need
+    # in exactly the same shape.  Below this line they share no code, so
+    # neither can partially become the other.
+    if reserved_mode == em.NATIVE_TUI:
+        return await _launch_native_tui(reservation_id, record, bridge_request)
+
     try:
         await terminal_service.create_terminal(
             provider=record["provider"],
@@ -1237,6 +1281,268 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             reservation_id, "exact provider session did not return a readiness receipt"
         )
     return get(reservation_id)
+
+
+class _V2NativePane:
+    """The reserved v2 pane, with the provider's own TUI as its argv.
+
+    Exists so the native launch reuses the ordinary v2 terminal creation
+    path — registry journalling, the reserved terminal id, the persisted
+    row, the pane-process verification — instead of reaching for tmux
+    directly and leaving a running provider that no v2 record describes.
+
+    ``create_pane`` is synchronous because the launch ordering it belongs
+    to is; it hands the coroutine back to the loop it was started from.
+    That is safe here and only here: the launch runs in a worker thread,
+    so the loop is idle while this blocks, and it cannot be the loop's own
+    thread waiting on itself.
+    """
+
+    def __init__(self, *, record: dict[str, Any], request: dict[str, Any], loop, registry) -> None:
+        self._record = record
+        self._request = request
+        self._loop = loop
+        self._registry = registry
+        self._window = managed_window_name(record["terminal_id"], record["generation"])
+
+    def create_pane(self, *, argv: Any) -> str:
+        import asyncio
+
+        return asyncio.run_coroutine_threadsafe(self._create(list(argv)), self._loop).result()
+
+    async def _create(self, argv: list[str]) -> str:
+        from cli_agent_orchestrator.services import terminal_service
+
+        await terminal_service.create_terminal(
+            provider=self._record["provider"],
+            agent_profile=self._record["agent_profile"],
+            session_name=self._record["session_name"],
+            new_session=False,
+            working_directory=self._record["working_directory"],
+            registry=self._registry,
+            caller_id=self._record["caller_id"],
+            defer_init=False,
+            initial_message=None,
+            reserved_terminal_id=self._record["terminal_id"],
+            terminal_generation=self._record["generation"],
+            trusted_project_root=self._record["trusted_project_root"],
+            expected_model=self._request["expected_model"],
+            expected_effort=self._request["expected_effort"],
+            preserve_on_init_failure=True,
+            # The TUI is the pane's OWN argv. Nothing is typed into a
+            # shell, so there is no window in which a partially-typed
+            # command line could be interrupted into something else.
+            managed_native_command=argv,
+            protocol_vintage="v2",
+        )
+        return self._window
+
+    def observe(self) -> Any:
+        from cli_agent_orchestrator.services import native_tui_launch, terminal_service
+
+        return native_tui_launch.TmuxNativePane(
+            terminal_service.get_backend(),
+            session_name=self._record["session_name"],
+            window_name=self._window,
+            terminal_id=self._record["terminal_id"],
+        ).observe()
+
+
+async def _launch_native_tui(
+    reservation_id: str,
+    record: dict[str, Any],
+    bridge_request: dict[str, Any],
+    *,
+    registry=None,
+) -> dict[str, Any]:
+    """Launch one reserved generation as a provider-native TUI.
+
+    The ordering is the point.  A provider session is minted first, by a
+    conversation that sends no turn and is proven dead before anything
+    else happens; only then is exclusive ownership of that session
+    claimed; only then does a pane start.  Every failure below leaves the
+    reservation blocked with zero task bytes admitted — the bootstrap
+    submits none by construction, and the TUI is never typed into.
+
+    ``preflight_blocked`` here means "no task bytes crossed", which is
+    what a caller needs to know, not "no process ran" — a failed native
+    launch may well have started and ended a provider process.
+    """
+    import asyncio
+
+    from cli_agent_orchestrator.services import kimi_native_bootstrap, native_tui_launch
+    from cli_agent_orchestrator.services.managed_provider_bridge import (
+        BRIDGE_VERSION,
+        native_child_environment,
+        provider_version_banner,
+        publish_native_ready_state,
+    )
+
+    provider = record["provider"]
+    if provider not in NATIVE_TUI_PROVIDERS:
+        # Refused rather than quietly launched some other way: the whole
+        # value of a closed mode is that an unsupported combination stops
+        # instead of finding a path that "works".
+        return _mark_preflight_blocked(
+            reservation_id,
+            f"provider {provider!r} has no native TUI launch branch; native providers are "
+            f"{sorted(NATIVE_TUI_PROVIDERS)}",
+        )
+
+    request = record["request"]
+    executable = bridge_request["provider_executable"]
+    digest = bridge_request["provider_executable_sha256"]
+
+    try:
+        version_output = await asyncio.to_thread(provider_version_banner, bridge_request)
+        environment = native_child_environment(bridge_request)
+    except Exception as exc:  # noqa: BLE001 - nothing was started
+        return _mark_preflight_blocked(reservation_id, f"native preflight failed: {exc}")
+
+    try:
+        bootstrap = await asyncio.to_thread(
+            _mint_native_session,
+            kimi_native_bootstrap,
+            executable=executable,
+            digest=digest,
+            version_output=version_output,
+            environment=environment,
+            record=record,
+            request=request,
+        )
+    except Exception as exc:  # noqa: BLE001 - no turn was ever submitted
+        return _mark_preflight_blocked(reservation_id, f"native session bootstrap failed: {exc}")
+
+    try:
+        intent = kimi_native_bootstrap.bootstrap_intent(
+            bootstrap, note=f"v2 native launch of reservation {reservation_id}"
+        )
+        transport = _V2NativePane(
+            record=record,
+            request=request,
+            loop=asyncio.get_running_loop(),
+            registry=registry,
+        )
+        outcome = await asyncio.to_thread(
+            native_tui_launch.start,
+            provider=provider,
+            native_session_id=bootstrap["native_session_id"],
+            terminal_id=record["terminal_id"],
+            generation=record["generation"],
+            execution_mode=em.NATIVE_TUI,
+            intent=intent,
+            binary=executable,
+            binary_sha256=digest,
+            transport=transport,
+        )
+    except Exception as exc:  # noqa: BLE001 - the attachment store holds the detail
+        return _mark_preflight_blocked(reservation_id, f"native TUI launch refused: {exc}")
+
+    try:
+        await asyncio.to_thread(
+            publish_native_ready_state,
+            reservation_id,
+            _native_readiness_receipt(
+                record=record,
+                request=request,
+                bootstrap=bootstrap,
+                outcome=outcome,
+                version_output=version_output,
+                bridge_version=BRIDGE_VERSION,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - a pane exists but bind cannot read it
+        return _mark_preflight_blocked(
+            reservation_id, f"native readiness receipt could not be published: {exc}"
+        )
+    return get(reservation_id)
+
+
+def _mint_native_session(
+    bootstrap_module: Any,
+    *,
+    executable: str,
+    digest: str,
+    version_output: str,
+    environment: dict[str, str],
+    record: dict[str, Any],
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    """Mint the provider session and prove the minting process exited."""
+    transport = bootstrap_module.StdioAcpBootstrap(
+        kimi_binary=executable,
+        env=environment,
+        working_directory=record["working_directory"],
+    )
+    receipt: dict[str, Any] = bootstrap_module.mint_session(
+        kimi_binary=executable,
+        binary_sha256=digest,
+        version_output=version_output,
+        working_directory=record["working_directory"],
+        model=request["expected_model"],
+        effort=request["expected_effort"],
+        transport=transport,
+    )
+    return receipt
+
+
+def _native_readiness_receipt(
+    *,
+    record: dict[str, Any],
+    request: dict[str, Any],
+    bootstrap: dict[str, Any],
+    outcome: dict[str, Any],
+    version_output: str,
+    bridge_version: str,
+) -> dict[str, Any]:
+    """The readiness receipt a native generation offers to ``bind_native``.
+
+    Carries no provider transcript digest, because there is no provider
+    transcript: the bootstrap sent nothing and the TUI is a terminal, not
+    a protocol.  What stands in its place is stronger for this mode — the
+    exact argv digest that started the pane, and the observed process
+    identity of the pane running it.  Both are checkable against the
+    durable attachment record, which a self-reported transcript is not.
+
+    The route is the bootstrap's read-back value rather than the
+    reservation's request, so a session that silently settled elsewhere
+    fails the exact-route check instead of being certified by it.
+    """
+    return {
+        "bridge_version": bridge_version,
+        "reservation_id": record["reservation_id"],
+        "terminal_id": record["terminal_id"],
+        "generation": record["generation"],
+        "provider": record["provider"],
+        "agent_profile": record["agent_profile"],
+        "model": bootstrap["model"],
+        "effort": bootstrap["effort"],
+        "working_directory": record["working_directory"],
+        "receipt_id": bootstrap["native_session_id"],
+        "provider_session_id": bootstrap["native_session_id"],
+        "provider_version": version_output,
+        "provider_receipt_kind": _NATIVE_TUI_READINESS_RECEIPT_KINDS[record["provider"]],
+        "model_input_ready": True,
+        "execution_mode": em.NATIVE_TUI,
+        "native_launch_outcome": outcome["outcome"],
+        "launch_argv_sha256": outcome["launch_argv_sha256"],
+        "pane_handle": outcome.get("pane_handle"),
+        # Read from the attachment's ``owner`` rather than restated from
+        # the observation: the identity that matters is the one the
+        # exclusive-ownership store actually recorded, because that is
+        # what a later no-survivor proof will have to name.
+        "process_identity": ((outcome.get("attachment") or {}).get("owner") or {}).get(
+            "process_identity"
+        ),
+        "acquisition_receipt_sha256": hashlib.sha256(
+            _canonical_json(bootstrap).encode("utf-8")
+        ).hexdigest(),
+        # Echoed from the reservation's own request, not restated: an
+        # unexpected drift must fail the exact-route check rather than be
+        # papered over here.
+        "expected_model": request["expected_model"],
+        "expected_effort": request["expected_effort"],
+    }
 
 
 async def admit_reserved(

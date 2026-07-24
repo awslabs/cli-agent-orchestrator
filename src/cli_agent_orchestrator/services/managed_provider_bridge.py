@@ -236,6 +236,66 @@ def _provider_child_environment(request: dict[str, Any]) -> dict[str, str]:
     return _provider_env(_provider_route_environment(request))
 
 
+def native_child_environment(request: dict[str, Any]) -> dict[str, str]:
+    """The provider child environment for a native-TUI launch.
+
+    Deliberately the *same* composition the ACP bridge gives its own
+    provider child.  A native worker that inherited a different (or
+    ambient) environment could resolve a different route, credential, or
+    config file than the mode it is replacing, and the difference would
+    only show up as inexplicably different behaviour between two modes
+    that are supposed to be interchangeable.
+    """
+    return _provider_child_environment(request)
+
+
+def provider_version_banner(request: dict[str, Any], *, timeout: float = 5.0) -> str:
+    """Read the installed provider's ``--version`` in the child environment.
+
+    Run in the child environment rather than the caller's, because the
+    version that matters is the one the worker will actually run — a
+    version probe under different config or PATH can report a binary
+    other than the one about to start.
+    """
+    executable = request["provider_executable"]
+    if not os.path.isabs(executable) or os.path.realpath(executable) != executable:
+        raise BridgeError("provider executable must be a canonical absolute path")
+    proc = subprocess.run(
+        [executable, "--version"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=_provider_child_environment(request),
+    )
+    if proc.returncode != 0:
+        raise BridgeError(f"provider --version exited {proc.returncode}")
+    return (proc.stdout or proc.stderr or "").strip()
+
+
+def publish_native_ready_state(reservation_id: str, readiness: dict[str, Any]) -> None:
+    """Publish the durable ready state for a native-TUI generation.
+
+    The native TUI owns its own pane and runs no bridge, so nothing else
+    would ever write this file — yet ``bind_native`` reads readiness from
+    exactly here regardless of mode.  Writing the same durable record
+    keeps bind mode-blind: it validates whatever receipt it finds against
+    the mode-specific allowlist, instead of growing a second source of
+    truth that could disagree with the first.
+
+    Written through the same atomic replace the bridge uses, so a crash
+    mid-write leaves the previous state rather than a truncated one.
+    """
+    _atomic_json(
+        paths(reservation_id)["state"],
+        {
+            "bridge_version": BRIDGE_VERSION,
+            "state": "ready",
+            "readiness": readiness,
+            "published_at": _now(),
+        },
+    )
+
+
 def _bind_bridge_environment(request: dict[str, Any]) -> dict[str, Any]:
     """Scrub the bridge and bind the final provider child environment."""
     global _BOUND_PROVIDER_ENV

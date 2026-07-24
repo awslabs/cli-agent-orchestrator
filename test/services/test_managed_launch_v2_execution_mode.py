@@ -89,24 +89,52 @@ def _reserve_request(worktree, tmp_path, **changes):
     return ManagedLaunchV2ReserveRequest(**payload)
 
 
+#: A native reservation names a provider that actually has a native
+#: branch.  Pairing ``native_tui`` with a provider that has none would be
+#: testing a combination the launch path refuses outright.
+#: ``trusted_project_root`` is a codex-only field, so a kimi reservation
+#: must leave it unset rather than inherit the codex default.
+_NATIVE_PROVIDER = {"provider": "kimi_cli", "trusted_project_root": None}
+_NATIVE = {"execution_mode": "native_tui", **_NATIVE_PROVIDER}
+
+#: Per-provider readiness evidence.  The native kind is deliberately
+#: distinct from the ACP kind, so a receipt from one mode cannot satisfy
+#: a bind in the other.
+_PROVIDER_FIXTURES = {
+    "codex": {"version": "0.145.0", "acp_kind": "codex-thread-start", "native_kind": None},
+    "kimi_cli": {
+        "version": "0.29.0",
+        "acp_kind": "kimi-acp-session-new",
+        "native_kind": "kimi-native-tui-attached",
+    },
+}
+
+
 def _ready_bridge_state(record, monkeypatch):
+    fixture = _PROVIDER_FIXTURES[record["provider"]]
+    native = record["execution_mode"] == "native_tui"
     receipt = {
         "bridge_version": BRIDGE_VERSION,
         "receipt_id": SESSION_ID,
         "provider_session_id": SESSION_ID,
-        "provider_receipt_kind": "codex-thread-start",
-        "provider_transcript_sha256": "a" * 64,
-        "provider_version": "0.145.0",
+        "provider_receipt_kind": fixture["native_kind"] if native else fixture["acp_kind"],
+        "provider_version": fixture["version"],
         "model_input_ready": True,
         "reservation_id": record["reservation_id"],
         "terminal_id": record["terminal_id"],
         "generation": record["generation"],
-        "provider": "codex",
-        "agent_profile": "reviewer-sol-max",
-        "model": "gpt-5.6-sol",
-        "effort": "xhigh",
+        "provider": record["provider"],
+        "agent_profile": record["agent_profile"],
+        "model": record["request"]["expected_model"],
+        "effort": record["request"]["expected_effort"],
         "working_directory": record["working_directory"],
     }
+    # A native generation has no provider transcript to digest; the argv
+    # that started its pane is the evidence that stands in its place.
+    if native:
+        receipt["launch_argv_sha256"] = "b" * 64
+    else:
+        receipt["provider_transcript_sha256"] = "a" * 64
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
         lambda rid: {"state": "ready", "readiness": receipt},
@@ -497,7 +525,7 @@ def test_migration_journals_the_added_columns(tmp_path):
 def test_bind_tags_both_receipts_with_the_execution_mode(
     isolated_memory_db, worktree, tmp_path, monkeypatch
 ):
-    _request, record = _launched(worktree, tmp_path, monkeypatch, execution_mode="native_tui")
+    _request, record = _launched(worktree, tmp_path, monkeypatch, **_NATIVE)
     bound = v2.bind_native(record["reservation_id"], _bind_request(record))
 
     assert bound["execution_mode"] == em.NATIVE_TUI
@@ -554,7 +582,7 @@ def test_bind_refuses_a_restated_mode_that_disagrees(
 def test_bind_accepts_a_restated_mode_that_agrees(
     isolated_memory_db, worktree, tmp_path, monkeypatch
 ):
-    _request, record = _launched(worktree, tmp_path, monkeypatch, execution_mode="native_tui")
+    _request, record = _launched(worktree, tmp_path, monkeypatch, **_NATIVE)
     bound = v2.bind_native(
         record["reservation_id"], _bind_request(record, execution_mode="native_tui")
     )
@@ -565,7 +593,9 @@ def test_bind_without_a_restated_mode_uses_the_reserved_one(
     isolated_memory_db, worktree, tmp_path, monkeypatch
 ):
     """Silence is not a change: an un-restated bind keeps the reserved mode."""
-    _request, record = _launched(worktree, tmp_path, monkeypatch, worker_class="persistent")
+    _request, record = _launched(
+        worktree, tmp_path, monkeypatch, worker_class="persistent", **_NATIVE_PROVIDER
+    )
     bound = v2.bind_native(record["reservation_id"], _bind_request(record))
     assert bound["binding"]["execution_mode"] == em.NATIVE_TUI
 
@@ -591,7 +621,7 @@ def test_published_record_matches_the_journaled_record_exactly(
     other turns every crash-resumed bind into a permanent refusal to
     complete.
     """
-    _request, record = _launched(worktree, tmp_path, monkeypatch, execution_mode="native_tui")
+    _request, record = _launched(worktree, tmp_path, monkeypatch, **_NATIVE)
     v2.bind_native(record["reservation_id"], _bind_request(record))
 
     with database.SessionLocal() as db:
@@ -612,7 +642,7 @@ def test_published_record_matches_the_journaled_record_exactly(
 def test_native_bind_reconciles_after_a_crash_before_publication(
     isolated_memory_db, worktree, tmp_path, monkeypatch
 ):
-    _request, record = _launched(worktree, tmp_path, monkeypatch, execution_mode="native_tui")
+    _request, record = _launched(worktree, tmp_path, monkeypatch, **_NATIVE)
     attempt_id = str(uuid.uuid4())
     real_write = v2.write_binding_record
 
@@ -914,10 +944,10 @@ def test_manifest_digest_changes_when_a_mode_changes(isolated_memory_db, worktre
 def test_manifest_carries_the_binding_mode_and_attachment(
     isolated_memory_db, worktree, tmp_path, monkeypatch
 ):
-    _request, record = _launched(worktree, tmp_path, monkeypatch, execution_mode="native_tui")
+    _request, record = _launched(worktree, tmp_path, monkeypatch, **_NATIVE)
     v2.bind_native(record["reservation_id"], _bind_request(record))
     native_attachment.declare(
-        provider="codex",
+        provider=record["provider"],
         native_session_id=SESSION_ID,
         terminal_id=record["terminal_id"],
         generation=record["generation"],
@@ -967,7 +997,18 @@ class _ClaimReached(RuntimeError):
 async def test_launch_refuses_a_mode_it_has_no_branch_for(
     isolated_memory_db, worktree, tmp_path, monkeypatch
 ):
-    record, _ = v2.reserve(_reserve_request(worktree, tmp_path, worker_class="persistent"))
+    """A reservation whose mode has no branch is refused, never rerouted.
+
+    Both modes now have branches, so the withheld-branch case is staged
+    by narrowing the launchable set.  That is the state this gate exists
+    for: the mode vocabulary is closed and shared, but a given surface
+    may only have built some of it, and the missing part must refuse
+    rather than fall through to whichever branch does exist.
+    """
+    monkeypatch.setattr(v2, "LAUNCHABLE_EXECUTION_MODES", (em.ACP,))
+    record, _ = v2.reserve(
+        _reserve_request(worktree, tmp_path, worker_class="persistent", **_NATIVE_PROVIDER)
+    )
     assert record["execution_mode"] == em.NATIVE_TUI
 
     def _explode(*args, **kwargs):
@@ -981,7 +1022,7 @@ async def test_launch_refuses_a_mode_it_has_no_branch_for(
 
 @pytest.mark.asyncio
 async def test_a_refused_launch_leaves_the_reservation_exactly_as_it_was(
-    isolated_memory_db, worktree, tmp_path
+    isolated_memory_db, worktree, tmp_path, monkeypatch
 ):
     """The refusal must not strand the row in ``launching``.
 
@@ -990,7 +1031,8 @@ async def test_a_refused_launch_leaves_the_reservation_exactly_as_it_was(
     ``claim_launch``, so refusing after the claim would trade a silent
     mode swap for a permanently unlaunchable reservation.
     """
-    record, _ = v2.reserve(_reserve_request(worktree, tmp_path, execution_mode="native_tui"))
+    monkeypatch.setattr(v2, "LAUNCHABLE_EXECUTION_MODES", (em.ACP,))
+    record, _ = v2.reserve(_reserve_request(worktree, tmp_path, **_NATIVE))
 
     with pytest.raises(ManagedLaunchConflict):
         await v2.launch_reserved(record["reservation_id"])
@@ -1022,10 +1064,42 @@ async def test_an_acp_reservation_still_passes_the_gate(
 
 
 def test_the_launchable_set_is_exactly_what_has_a_branch():
-    """A one-line reminder that this tuple is a claim about real code.
+    """This tuple is a claim about real code, not about the vocabulary.
 
-    It is the last step of building the native branch, never a
-    precondition for it: widening it without a branch in
-    ``launch_reserved`` reintroduces the silent ACP fallback.
+    Native TUI belongs here only because ``_launch_native_tui`` exists
+    and is reached; widening it ahead of a branch is what reintroduces
+    the silent ACP fallback.
     """
-    assert v2.LAUNCHABLE_EXECUTION_MODES == (em.ACP,)
+    assert v2.LAUNCHABLE_EXECUTION_MODES == (em.ACP, em.NATIVE_TUI)
+    assert callable(v2._launch_native_tui)
+
+
+def test_the_v1_surface_does_not_inherit_the_native_advertisement():
+    """Two surfaces, two claims: only the one with a branch may say so.
+
+    The v1 managed-launch surface still mints its session over the ACP
+    bridge and has no step that starts a provider terminal.  Its
+    advertised set must therefore stay narrower than v2's, and the
+    capability endpoint publishes them separately for exactly that
+    reason.
+    """
+    from cli_agent_orchestrator.services import managed_launch as v1
+
+    assert v1.SUPPORTED_EXECUTION_MODES == (em.ACP,)
+    assert em.NATIVE_TUI in v2.LAUNCHABLE_EXECUTION_MODES
+
+
+def test_only_providers_with_a_native_branch_may_launch_native():
+    """Mode support and provider support are separate claims.
+
+    A native reservation for a provider with no native branch must stop,
+    not fall back: the mode gate above would pass it, so the provider
+    gate is the one that catches it.
+    """
+    assert v2.NATIVE_TUI_PROVIDERS == frozenset({"kimi_cli"})
+    assert set(v2._NATIVE_TUI_READINESS_RECEIPT_KINDS) == v2.NATIVE_TUI_PROVIDERS
+    # Disjoint from the ACP kinds, so neither table can accept the other's
+    # evidence by accident.
+    assert not set(v2._NATIVE_TUI_READINESS_RECEIPT_KINDS.values()) & set(
+        v2._READINESS_RECEIPT_KINDS.values()
+    )
