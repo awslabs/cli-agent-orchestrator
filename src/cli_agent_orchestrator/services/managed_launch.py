@@ -30,6 +30,7 @@ from cli_agent_orchestrator.models.managed_launch import (
     ManagedLaunchRouteAttestRequest,
 )
 from cli_agent_orchestrator.services import companion_receipts
+from cli_agent_orchestrator.services import execution_mode as em
 
 logger = logging.getLogger(__name__)
 from cli_agent_orchestrator.utils.terminal import generate_terminal_id, managed_window_name
@@ -68,9 +69,134 @@ def _parse_json(value: Optional[str], default: Any) -> Any:
         raise ManagedLaunchUnavailable("managed-launch record contains invalid JSON") from exc
 
 
+#: The execution modes this surface can actually *run* today.
+#:
+#: This is deliberately the set of modes with a real launch path, not the
+#: set of modes the vocabulary can name.  It is what the capability
+#: endpoint advertises, so the advertisement cannot claim a branch that
+#: does not exist: a caller which trusts the advertisement and asks for a
+#: mode it names must get that mode, not a silent substitution.
+#:
+#: Native TUI is absent because this surface has no native launch branch —
+#: it mints a provider session over the bounded ACP bridge and has no step
+#: that starts, owns, or resumes a human-visible provider terminal.  Adding
+#: ``execution_mode.NATIVE_TUI`` here is the last step of building that
+#: branch, never a precondition for it, and doing so early would turn every
+#: native request into an ACP launch wearing a native label.
+SUPPORTED_EXECUTION_MODES: tuple[str, ...] = (em.ACP,)
+
+#: Request keys introduced after this surface shipped.  A reservation
+#: written before they existed simply has no such key.
+_ADDITIVE_REQUEST_KEYS = ("execution_mode", "worker_class")
+
+
+def _resolve_execution_mode(
+    request: ManagedLaunchReserveRequest,
+) -> em.ExecutionModeResolution:
+    """Resolve and admit the requested mode, before any provider effect.
+
+    Reserve is the earliest point at which the mode is knowable and the
+    last one still free of provider effects, so a mode this surface
+    cannot honour is refused here with nothing launched and nothing
+    persisted.
+
+    Refusing is the whole point.  The alternative — accepting a native
+    request and running ACP — would produce a reservation whose recorded
+    request says one thing and whose behaviour is another, and the
+    request echo a caller verifies against would confirm the lie rather
+    than catch it.  A caller can only rely on that echo if an accepted
+    mode is a mode that will actually run.
+    """
+    try:
+        resolution = em.resolve(
+            launch_input=request.execution_mode,
+            worker_class=request.worker_class,
+        )
+    except em.ExecutionModeError as exc:
+        raise ManagedLaunchConflict(str(exc)) from exc
+    if resolution.mode not in SUPPORTED_EXECUTION_MODES:
+        raise ManagedLaunchConflict(
+            f"execution_mode {resolution.mode!r} (from {resolution.source}) is not "
+            f"supported by this managed-launch surface; supported modes are "
+            f"{list(SUPPORTED_EXECUTION_MODES)}"
+        )
+    return resolution
+
+
+def _mode_projection(request: Any) -> dict[str, Any]:
+    """The mode of record for a reservation, derived from its request.
+
+    Derived rather than stored: the request is immutable once reserved,
+    so resolving from it is deterministic and can never drift from what
+    the caller actually asked for.
+
+    A request persisted before this contract existed has neither key.
+    That row is **legacy ACP** and can never be reinterpreted as native —
+    a guard that read "mode absent" as native would treat every
+    historical generation as an attachable native session.  It is
+    reported with source ``legacy`` so a consumer can tell "predates the
+    contract" from "the caller named nothing", which resolve to the same
+    mode by different routes.
+    """
+    if not isinstance(request, dict) or not any(k in request for k in _ADDITIVE_REQUEST_KEYS):
+        return {
+            "execution_mode": em.ACP,
+            "execution_mode_source": em.SOURCE_LEGACY,
+            "is_legacy_execution_mode": True,
+        }
+    try:
+        resolution = em.resolve(
+            launch_input=request.get("execution_mode"),
+            worker_class=request.get("worker_class"),
+        )
+    except em.ExecutionModeError as exc:
+        # A stored request that no longer resolves means durable
+        # corruption or a rollback from a newer binary.  Fail closed
+        # rather than fall back to ACP: the reservation may have been
+        # accepted, and answered for, under a mode this binary cannot
+        # reconstruct.
+        raise ManagedLaunchUnavailable(
+            f"managed-launch record has an unresolvable execution mode: {exc}"
+        ) from exc
+    return {
+        "execution_mode": resolution.mode,
+        "execution_mode_source": resolution.source,
+        "is_legacy_execution_mode": False,
+    }
+
+
+def _request_matches(stored_json: str, incoming: dict[str, Any]) -> bool:
+    """Whether a replayed reserve carries the same immutable request.
+
+    An exact byte match is the normal case.  The one accommodation is the
+    upgrade boundary: a reservation written before the execution-mode
+    fields existed has no such keys at all, and treating that absence as
+    "a different request" would turn an ordinary idempotent replay into a
+    hard conflict for every reservation in flight across a deploy.  So an
+    absent stored key compares equal to an *unspecified* incoming value —
+    and only to that.  A caller that now explicitly asks for a mode
+    really is presenting a different request, and still conflicts.
+    """
+    if stored_json == _canonical_json(incoming):
+        return True
+    stored = _parse_json(stored_json, None)
+    if not isinstance(stored, dict):
+        return False
+    normalized = dict(stored)
+    for key in _ADDITIVE_REQUEST_KEYS:
+        if key not in normalized and incoming.get(key) is None:
+            normalized[key] = None
+    return _canonical_json(normalized) == _canonical_json(incoming)
+
+
 def _row_dict(row: Any) -> dict[str, Any]:
     negative = _parse_json(row.negative_json, None)
+    request = _parse_json(row.request_json, {})
     return {
+        # Projected on every public read so a consumer never has to infer
+        # a mode from a provider name or from an absent field.  Always
+        # concrete: a legacy reservation reads as ACP, never as null.
+        **_mode_projection(request),
         "protocol_version": PROTOCOL_VERSION,
         "reservation_id": row.reservation_id,
         "terminal_id": row.terminal_id,
@@ -82,7 +208,11 @@ def _row_dict(row: Any) -> dict[str, Any]:
         "working_directory": row.working_directory,
         "trusted_project_root": row.trusted_project_root,
         "state": row.state,
-        "request": _parse_json(row.request_json, {}),
+        # The faithful echo of the immutable request as the caller sent
+        # it: an omitted mode echoes as null, never as the resolved
+        # default.  A caller verifies this against what it sent; the
+        # resolved mode in force is the top-level ``execution_mode``.
+        "request": request,
         "observations": _parse_json(row.observations_json, []),
         "readiness": _parse_json(row.readiness_json, None),
         "admission": _parse_json(row.admission_json, None),
@@ -279,6 +409,9 @@ def _validate_request_identity(request: ManagedLaunchReserveRequest) -> dict[str
         )
     if not os.path.isabs(request.provider_executable):
         raise ManagedLaunchConflict("provider_executable must be an absolute path")
+    # Resolved and admitted before the payload is built, so an
+    # unsupported or contradictory mode fails with nothing persisted.
+    _resolve_execution_mode(request)
     return request.model_dump(mode="json")
 
 
@@ -312,7 +445,7 @@ def reserve(request: ManagedLaunchReserveRequest) -> tuple[dict[str, Any], bool]
         with database.SessionLocal() as db:
             existing = _query(db, request.reservation_id)
             if existing is not None:
-                if existing.request_json != request_json:
+                if not _request_matches(existing.request_json, payload):
                     raise ManagedLaunchConflict(
                         "reservation_id is already bound to a different request"
                     )
@@ -345,7 +478,7 @@ def reserve(request: ManagedLaunchReserveRequest) -> tuple[dict[str, Any], bool]
         # by the caller's idempotency key; never allocate a second generation.
         with database.SessionLocal() as db:
             existing = _query(db, request.reservation_id)
-            if existing is None or existing.request_json != request_json:
+            if existing is None or not _request_matches(existing.request_json, payload):
                 raise ManagedLaunchConflict("concurrent reservation conflict")
             return _row_dict(existing), False
     except Exception as exc:  # noqa: BLE001 - fail closed at the store boundary
