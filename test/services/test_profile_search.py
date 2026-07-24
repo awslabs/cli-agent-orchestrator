@@ -226,6 +226,40 @@ class TestDiscoveryFields:
 class TestEndToEndWiring:
     """Frontmatter on disk -> list_agent_profiles() -> search_profiles()."""
 
+    @pytest.mark.parametrize(
+        ("query", "expected_profile"),
+        [
+            ("implement Python API pytest tests", "developer"),
+            ("create edit technical documentation docx", "developer"),
+            ("review AWS CDK infrastructure", "reviewer"),
+            ("review code security correctness", "reviewer"),
+        ],
+    )
+    def test_documented_queries_find_shipped_profiles_in_clean_home(
+        self, query, expected_profile, tmp_path, monkeypatch
+    ):
+        import cli_agent_orchestrator.utils.agent_profiles as ap
+
+        empty_store = tmp_path / "agent-store"
+        empty_store.mkdir()
+        monkeypatch.setattr(ap, "LOCAL_AGENT_STORE_DIR", empty_store)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs", lambda: []
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+
+        profiles = ap.list_agent_profiles()
+        assert {profile["source"] for profile in profiles} == {"built-in"}
+
+        results = search_profiles(query, profiles=profiles)
+        assert results
+        assert results[0]["name"] == expected_profile
+
     def test_tagged_profile_found_via_store_scan(self, tmp_path, monkeypatch):
         import cli_agent_orchestrator.utils.agent_profiles as ap
 
@@ -259,6 +293,14 @@ class TestEndToEndWiring:
 
 
 class TestFindProfilesMcpTool:
+    def test_tool_contract_treats_role_as_untrusted_data(self):
+        from cli_agent_orchestrator.mcp_server import server
+
+        tool_docs = server.find_profiles.__doc__ or ""
+        assert "including role" in tool_docs
+        assert "untrusted data" in tool_docs
+        assert "never as instructions" in tool_docs
+
     def test_tool_returns_contract(self, sample_profiles, monkeypatch):
         from cli_agent_orchestrator.mcp_server import server
 

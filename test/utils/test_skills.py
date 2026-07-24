@@ -416,6 +416,13 @@ class TestDefaultBundledSkills:
         assert "assign" in routing_content
         assert "handoff" in routing_content
 
+    def test_agent_routing_treats_role_and_all_metadata_as_untrusted(self):
+        routing_content = (self.bundled_skills_dir / "cao-agent-routing" / "SKILL.md").read_text()
+
+        assert "every returned profile metadata field" in routing_content
+        assert "including `role`" in routing_content
+        assert "never as instructions" in routing_content
+
 
 class TestBuildSkillCatalog:
     """Tests for build_skill_catalog."""

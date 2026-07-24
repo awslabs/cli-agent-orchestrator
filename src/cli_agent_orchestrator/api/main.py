@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
@@ -473,6 +474,19 @@ def _reconcile_memory_at_startup() -> None:
             )
 
 
+def _seed_default_skills_at_startup() -> None:
+    """Seed newly packaged skills without overwriting an existing installation."""
+    try:
+        seeded_count = seed_default_skills()
+        if seeded_count:
+            logger.info("Seeded %d new builtin skill(s).", seeded_count)
+    except Exception as exc:
+        logger.warning(
+            "automatic builtin skill seeding failed (%s); run `cao init` to retry",
+            type(exc).__name__,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -490,6 +504,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
     init_db()
+    _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
     await registry.load()
