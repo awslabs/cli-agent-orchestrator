@@ -1,8 +1,10 @@
 """Init command for CLI Agent Orchestrator CLI."""
 
+import errno
 import shutil
 from importlib import resources
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import click
 
@@ -12,7 +14,7 @@ from cli_agent_orchestrator.services.memory_reconciliation import reconcile_memo
 
 
 def seed_default_skills() -> int:
-    """Seed builtin skills (cao-supervisor-protocols, cao-worker-protocols) into the local skill store."""
+    """Seed packaged builtin skills into the local skill store."""
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     bundled_skills = resources.files("cli_agent_orchestrator.skills")
     seeded_count = 0
@@ -26,7 +28,18 @@ def seed_default_skills() -> int:
             continue
 
         with resources.as_file(skill_dir) as source_dir:
-            shutil.copytree(Path(source_dir), destination_dir)
+            with TemporaryDirectory(
+                prefix=f".{skill_dir.name}.",
+                dir=SKILLS_DIR,
+            ) as staging_root:
+                staged_dir = Path(staging_root) / skill_dir.name
+                shutil.copytree(Path(source_dir), staged_dir)
+                try:
+                    staged_dir.rename(destination_dir)
+                except OSError as exc:
+                    if exc.errno in (errno.EEXIST, errno.ENOTEMPTY) and destination_dir.exists():
+                        continue
+                    raise
         seeded_count += 1
 
     return seeded_count

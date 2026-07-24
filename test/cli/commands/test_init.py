@@ -1,5 +1,8 @@
 """Tests for the init CLI command."""
 
+import errno
+import os
+import shutil
 import uuid
 from pathlib import Path
 from unittest.mock import patch
@@ -245,3 +248,71 @@ class TestSeedDefaultSkills:
         assert (skill_store / "beta" / "SKILL.md").exists()
         assert first_seed_count == 1
         assert second_seed_count == 1
+
+    def test_seed_default_skills_retries_after_interrupted_copy(self, tmp_path, monkeypatch):
+        """A failed staged copy must not leave a partial final destination."""
+        bundled_root = tmp_path / "bundled"
+        _create_bundled_skill(bundled_root, "alpha", "Alpha skill")
+
+        skill_store = tmp_path / "skill-store"
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.init.SKILLS_DIR", skill_store)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.init.resources.files", lambda _: bundled_root
+        )
+
+        def interrupted_copy(source, destination):
+            destination.mkdir(parents=True)
+            (destination / "partial.txt").write_text("incomplete")
+            raise OSError("interrupted copy")
+
+        with monkeypatch.context() as interrupted:
+            interrupted.setattr(
+                "cli_agent_orchestrator.cli.commands.init.shutil.copytree",
+                interrupted_copy,
+            )
+            with pytest.raises(OSError, match="interrupted copy"):
+                seed_default_skills()
+
+        assert not (skill_store / "alpha").exists()
+        assert list(skill_store.iterdir()) == []
+
+        abandoned_stage = skill_store / ".alpha.abandoned" / "alpha"
+        abandoned_stage.mkdir(parents=True)
+        (abandoned_stage / "partial.txt").write_text("abandoned")
+
+        seeded_count = seed_default_skills()
+
+        assert seeded_count == 1
+        assert (skill_store / "alpha" / "SKILL.md").is_file()
+        assert (skill_store / "alpha" / "extra.txt").read_text() == "extra"
+        assert (abandoned_stage / "partial.txt").read_text() == "abandoned"
+
+    def test_seed_default_skills_preserves_concurrent_winner(self, tmp_path, monkeypatch):
+        """A completed destination that wins the publish race must be preserved."""
+        bundled_root = tmp_path / "bundled"
+        _create_bundled_skill(bundled_root, "alpha", "Bundled alpha")
+
+        skill_store = tmp_path / "skill-store"
+        destination = skill_store / "alpha"
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.init.SKILLS_DIR", skill_store)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.init.resources.files", lambda _: bundled_root
+        )
+
+        def concurrent_rename(source, target):
+            assert Path(target) == destination
+            destination.mkdir()
+            (destination / "SKILL.md").write_text(
+                "---\nname: alpha\ndescription: Concurrent winner\n---\n"
+            )
+            (destination / "winner.txt").write_text("preserve me")
+            raise FileExistsError(errno.EEXIST, "destination exists", target)
+
+        monkeypatch.setattr(os, "rename", concurrent_rename)
+
+        seeded_count = seed_default_skills()
+
+        assert seeded_count == 0
+        assert "Concurrent winner" in (destination / "SKILL.md").read_text()
+        assert (destination / "winner.txt").read_text() == "preserve me"
+        assert not (destination / "extra.txt").exists()
