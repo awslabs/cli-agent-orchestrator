@@ -11,6 +11,7 @@ replay is refused, and report provenance completes (one-use consumption).
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -25,30 +26,70 @@ import pytest
 from cli_agent_orchestrator import constants
 from cli_agent_orchestrator.services import actor_broker, heartbeat_store
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
+from cli_agent_orchestrator.services import provider_launcher
+from cli_agent_orchestrator.services import resource_registry as rr
 
 
 @pytest.fixture
-def short_root():
+def short_root(monkeypatch):
     with tempfile.TemporaryDirectory(prefix="lb-act-") as root:
-        yield Path(root)
+        root_path = Path(root)
+        subprocess.run(["git", "init", "-q"], cwd=root_path, check=True)
+        (root_path / "identity.txt").write_text("actor-channel\n", encoding="utf-8")
+        subprocess.run(["git", "add", "identity.txt"], cwd=root_path, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=actor-channel-test",
+                "-c",
+                "user.email=actor-channel@example.test",
+                "commit",
+                "-qm",
+                "identity",
+            ],
+            cwd=root_path,
+            check=True,
+        )
+        monkeypatch.setattr(bridge, "RENDEZVOUS_ROOT", root_path / "runtime")
+        rr.reset_resource_registry()
+        rr.get_resource_registry(root_path / "registry.sqlite")
+        try:
+            yield root_path
+        finally:
+            rr.reset_resource_registry()
 
 
-def _target(root):
+def _identity(root, terminal_id, generation):
+    return bridge.launch_binding_identity(
+        project="test-project",
+        task_id=str(uuid.uuid4()),
+        terminal_id=terminal_id,
+        terminal_generation=generation,
+        working_directory=str(root.resolve()),
+        actor="cafebabe",
+    )
+
+
+def _target(root, identity, reservation_id):
+    bridge_root = root / "bridge" / reservation_id
     target = {
-        "root": root / "bridge",
-        "state": root / "bridge" / "state.json",
-        "socket": root / "bridge" / "bridge.sock",
+        "root": bridge_root,
+        "state": bridge_root / "state.json",
     }
+    target.update(bridge.rendezvous_paths(identity))
     target["root"].mkdir(parents=True)
     return target
 
 
-def _call(target, command, timeout=30.0):
+def _call(target, identity, command, timeout=30.0):
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         client.settimeout(timeout)
         client.connect(str(target["socket"]))
-        client.sendall(json.dumps(command).encode() + b"\n")
+        client.sendall(
+            json.dumps({"rendezvous_identity": identity, "request": command}).encode() + b"\n"
+        )
         raw = bytearray()
         while b"\n" not in raw:
             block = client.recv(65536)
@@ -86,12 +127,15 @@ def live_bridge(short_root, monkeypatch):
     heartbeat_store.issue_fencing_token(
         constants.COMPANION_DIR, terminal_id, generation, str(uuid.uuid4())
     )
-    # Keep this test's state root registry-free; registry-first bridge
-    # resources have their own dedicated coverage.
-    monkeypatch.setattr(bridge, "_declare_bridge_resources", lambda *a: None)
-    monkeypatch.setattr(bridge, "_mark_bridge_resource_created", lambda *a: None)
-    monkeypatch.setattr(bridge, "_deregister_bridge_resources", lambda *a, **k: None)
-    target = _target(short_root)
+    identity = _identity(short_root, terminal_id, generation)
+    request = {
+        "reservation_id": str(uuid.uuid4()),
+        "provider": "codex",
+        "terminal_id": terminal_id,
+        "generation": generation,
+        "rendezvous_identity": identity,
+    }
+    target = _target(short_root, identity, request["reservation_id"])
     captured: dict = {}
 
     class RealLauncherSession:
@@ -104,6 +148,7 @@ def live_bridge(short_root, monkeypatch):
         def initialize(self):
             argv = bridge._launcher_argv(
                 target["socket"],
+                identity,
                 [sys.executable, "-c", "import time; time.sleep(120)"],
             )
             self.rpc = bridge._RpcProcess(argv)
@@ -126,11 +171,6 @@ def live_bridge(short_root, monkeypatch):
 
     monkeypatch.setattr(bridge, "_ProviderSession", RealLauncherSession)
     monkeypatch.setattr(bridge, "_build_actor_broker", _capturing_build)
-    request = {
-        "provider": "codex",
-        "terminal_id": terminal_id,
-        "generation": generation,
-    }
     server = threading.Thread(target=bridge._serve, args=(request, target), daemon=True)
     server.start()
     for _ in range(300):
@@ -139,8 +179,14 @@ def live_bridge(short_root, monkeypatch):
         time.sleep(0.01)
     else:
         raise AssertionError("bridge socket never appeared")
+    for _ in range(300):
+        if "session" in captured:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("provider session never became ready")
     try:
-        yield target, captured, generation
+        yield target, captured, generation, identity
     finally:
         # Reliable teardown: the real launcher + provider child are real
         # subprocesses; never leak them past the test.
@@ -150,9 +196,9 @@ def live_bridge(short_root, monkeypatch):
 
 
 def test_issuance_via_provider_channel_and_provenance(live_bridge):
-    target, captured, generation = live_bridge
+    target, captured, generation, identity = live_bridge
 
-    response = _call(target, _assertion_command())
+    response = _call(target, identity, _assertion_command())
 
     assert response["ok"] is True, response
     assert response["issued_via"] == "provider-channel"
@@ -176,17 +222,17 @@ def test_issuance_via_provider_channel_and_provenance(live_bridge):
 
 
 def test_conductor_and_foreign_peers_never_issue_directly(live_bridge):
-    target, captured, _ = live_bridge
+    target, captured, _, identity = live_bridge
 
     # A foreign same-UID process (this test process) cannot open the
     # provider-originated channel: kernel lineage refuses it.
-    refused = _call(target, {"op": "provider-channel", "pid": 0})
+    refused = _call(target, identity, {"op": "provider-channel", "pid": 0})
     assert refused["ok"] is False
     assert "outside the live provider process tree" in refused["error"]
 
     # The genuine channel is still bound and still issues (the failed
     # foreign attempt did not displace it).
-    response = _call(target, _assertion_command())
+    response = _call(target, identity, _assertion_command())
     assert response["ok"] is True
     assert response["issued_via"] == "provider-channel"
 
@@ -202,14 +248,17 @@ def test_conductor_and_foreign_peers_never_issue_directly(live_bridge):
 
 
 def test_second_channel_bind_is_refused(live_bridge):
-    target, captured, _ = live_bridge
+    target, captured, _, identity = live_bridge
     # Even an in-tree peer cannot bind a second channel for the generation:
     # a child of the real launcher attempts the bind.
     script = (
         "import json, socket, sys\n"
         "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
         f"s.connect({str(target['socket'])!r})\n"
-        "s.sendall(json.dumps({'op': 'provider-channel', 'pid': 0}).encode() + b'\\n')\n"
+        f"identity = {identity!r}\n"
+        "wire = {'rendezvous_identity': identity, "
+        "'request': {'op': 'provider-channel', 'pid': 0}}\n"
+        "s.sendall(json.dumps(wire).encode() + b'\\n')\n"
         "print(s.recv(65536).decode().splitlines()[0])\n"
     )
     launcher_pid = captured["session"].rpc.proc.pid
@@ -238,9 +287,19 @@ def test_launcher_proxies_stdio_and_acks_issue_requests(short_root):
         "sys.stdout.buffer.flush()\n"
     )
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock_path = str(short_root / "b.sock")
+    identity = _identity(short_root, "a1b2c3d4", str(uuid.uuid4()))
+    rendezvous = bridge.rendezvous_paths(identity)
+    sock_path = str(rendezvous["socket"])
+    descriptor = bridge._acquire_binding_claim(rendezvous["binding"], identity)
     server.bind(sock_path)
+    rendezvous["socket"].chmod(0o600)
     server.listen(1)
+    bridge._publish_socket_claim(
+        descriptor,
+        rendezvous["binding"],
+        rendezvous["socket"],
+        identity,
+    )
     proc = None
     try:
         proc = subprocess.Popen(
@@ -251,6 +310,8 @@ def test_launcher_proxies_stdio_and_acks_issue_requests(short_root):
                 "cli_agent_orchestrator.services.provider_launcher",
                 "--socket",
                 sock_path,
+                "--identity-json",
+                json.dumps(identity, sort_keys=True, separators=(",", ":")),
                 "--",
                 sys.executable,
                 "-c",
@@ -264,8 +325,9 @@ def test_launcher_proxies_stdio_and_acks_issue_requests(short_root):
         try:
             conn.settimeout(30.0)
             hello = json.loads(conn.makefile().readline())
-            assert hello["op"] == "provider-channel"
-            assert hello["pid"] == proc.pid
+            assert hello["rendezvous_identity"] == identity
+            assert hello["request"]["op"] == "provider-channel"
+            assert hello["request"]["pid"] == proc.pid
             conn.sendall(
                 json.dumps({"op": "issue-request", "request_id": "rid-1"}).encode() + b"\n"
             )
@@ -281,6 +343,174 @@ def test_launcher_proxies_stdio_and_acks_issue_requests(short_root):
         assert proc.wait(timeout=30) == 0
     finally:
         server.close()
+        os.close(descriptor)
         if proc is not None and proc.poll() is None:
             proc.kill()
             proc.wait(timeout=10)
+
+
+def test_launcher_refuses_before_provider_spawn_without_exact_binding(short_root, monkeypatch):
+    identity = _identity(short_root, "a1b2c3d4", str(uuid.uuid4()))
+    socket_path = bridge.rendezvous_paths(identity)["socket"]
+    spawned = []
+
+    def _unexpected_spawn(*args, **kwargs):
+        spawned.append((args, kwargs))
+        raise AssertionError("provider child must not start before binding verification")
+
+    monkeypatch.setattr(provider_launcher.subprocess, "Popen", _unexpected_spawn)
+
+    result = provider_launcher.main(
+        [
+            "--socket",
+            str(socket_path),
+            "--identity-json",
+            json.dumps(identity, sort_keys=True, separators=(",", ":")),
+            "--",
+            "/bin/false",
+        ]
+    )
+
+    assert result == 1
+    assert spawned == []
+
+
+def test_launcher_connect_swap_sends_zero_handshake_bytes(short_root, monkeypatch):
+    identity = _identity(short_root, "a1b2c3d4", str(uuid.uuid4()))
+    rendezvous = bridge.rendezvous_paths(identity)
+    descriptor = bridge._acquire_binding_claim(rendezvous["binding"], identity)
+    real_socket = socket.socket
+    owned_server = real_socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    owned_server.bind(str(rendezvous["socket"]))
+    rendezvous["socket"].chmod(0o600)
+    owned_server.listen(1)
+    bridge._publish_socket_claim(
+        descriptor,
+        rendezvous["binding"],
+        rendezvous["socket"],
+        identity,
+    )
+    foreign: dict[str, socket.socket] = {}
+
+    class _SwappingSocket:
+        def __init__(self, *args, **kwargs):
+            self._socket = real_socket(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._socket, name)
+
+        def connect(self, path):
+            rendezvous["socket"].unlink()
+            foreign_server = real_socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            foreign_server.bind(path)
+            Path(path).chmod(0o600)
+            foreign_server.listen(1)
+            foreign["server"] = foreign_server
+            self._socket.connect(path)
+
+        def close(self):
+            self._socket.close()
+
+    monkeypatch.setattr(provider_launcher.socket, "socket", _SwappingSocket)
+    assert provider_launcher._open_channel(str(rendezvous["socket"]), identity) is None
+
+    foreign_server = foreign["server"]
+    foreign_server.settimeout(2)
+    connection, _ = foreign_server.accept()
+    try:
+        connection.settimeout(2)
+        assert connection.recv(65536) == b""
+    finally:
+        connection.close()
+        foreign_server.close()
+        owned_server.close()
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("drift", ["socket-swap", "head-drift"])
+def test_launcher_rechecks_claim_and_head_at_provider_popen_boundary(
+    short_root, monkeypatch, drift
+):
+    identity = _identity(short_root, "a1b2c3d4", str(uuid.uuid4()))
+    rendezvous = bridge.rendezvous_paths(identity)
+    descriptor = bridge._acquire_binding_claim(rendezvous["binding"], identity)
+    owned_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    owned_server.bind(str(rendezvous["socket"]))
+    rendezvous["socket"].chmod(0o600)
+    owned_server.listen(1)
+    verification = bridge._publish_socket_claim(
+        descriptor,
+        rendezvous["binding"],
+        rendezvous["socket"],
+        identity,
+    )
+    foreign_server = None
+
+    class _Channel:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    channel = _Channel()
+    if drift == "socket-swap":
+        rendezvous["socket"].unlink()
+        foreign_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        foreign_server.bind(str(rendezvous["socket"]))
+        rendezvous["socket"].chmod(0o600)
+        foreign_server.listen(1)
+    else:
+        (short_root / "head-drift.txt").write_text("drift\n", encoding="utf-8")
+        subprocess.run(["git", "add", "head-drift.txt"], cwd=short_root, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=actor-channel-test",
+                "-c",
+                "user.email=actor-channel@example.test",
+                "commit",
+                "-qm",
+                "drift",
+            ],
+            cwd=short_root,
+            check=True,
+        )
+
+    monkeypatch.setattr(
+        provider_launcher,
+        "_open_channel",
+        lambda *_: (channel, verification),
+    )
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def _unexpected_spawn(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args")
+        if isinstance(argv, list) and argv and argv[0] == "git":
+            return real_popen(*args, **kwargs)
+        spawned.append((args, kwargs))
+        raise AssertionError("provider Popen must not cross a drifted launch boundary")
+
+    monkeypatch.setattr(provider_launcher.subprocess, "Popen", _unexpected_spawn)
+    try:
+        result = provider_launcher.main(
+            [
+                "--socket",
+                str(rendezvous["socket"]),
+                "--identity-json",
+                json.dumps(identity, sort_keys=True, separators=(",", ":")),
+                "--",
+                "/bin/false",
+            ]
+        )
+        assert result == 1
+        assert spawned == []
+        assert channel.closed is True
+        if foreign_server is not None:
+            assert rendezvous["socket"].exists()
+    finally:
+        owned_server.close()
+        if foreign_server is not None:
+            foreign_server.close()
+        os.close(descriptor)

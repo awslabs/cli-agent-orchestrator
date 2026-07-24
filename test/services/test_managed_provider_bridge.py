@@ -11,7 +11,7 @@ def _request(tmp_path, *, provider="codex", model="gpt-5.6-sol", effort="xhigh")
     executable = tmp_path / provider
     executable.write_text("provider")
     executable.chmod(0o755)
-    return {
+    request = {
         "bridge_version": bridge.BRIDGE_VERSION,
         "reservation_id": "11111111-1111-4111-8111-111111111111",
         "terminal_id": "deadbeef",
@@ -25,6 +25,17 @@ def _request(tmp_path, *, provider="codex", model="gpt-5.6-sol", effort="xhigh")
         "provider_executable": str(executable),
         "provider_executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
     }
+    request["rendezvous_identity"] = {
+        "project": "test-project",
+        "task_id": "test-task",
+        "terminal_id": request["terminal_id"],
+        "terminal_generation": request["generation"],
+        "worktree_realpath": str(tmp_path),
+        "repository": "test-repository",
+        "head": "1" * 40,
+        "actor": "cafebabe",
+    }
+    return request
 
 
 def _admission(request):

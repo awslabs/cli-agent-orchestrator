@@ -11,6 +11,8 @@ manifest is complete and non-vacuous.
 from __future__ import annotations
 
 import os
+import socket
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -54,6 +56,42 @@ def cleanup_env(tmp_path, monkeypatch):
 class _NullManager:
     def __getattr__(self, name):
         return lambda *a, **k: None
+
+
+def _bridge_request(
+    *,
+    reservation_id: str,
+    terminal_id: str,
+    generation: str,
+    worktree: Path,
+) -> dict[str, object]:
+    """A complete canonical rendezvous request for bridge wiring tests."""
+    return {
+        "reservation_id": reservation_id,
+        "terminal_id": terminal_id,
+        "generation": generation,
+        "provider": "codex",
+        "rendezvous_identity": {
+            "project": "registry-first-tests",
+            "task_id": reservation_id,
+            "terminal_id": terminal_id,
+            "terminal_generation": generation,
+            "worktree_realpath": str(worktree.resolve()),
+            "repository": "cli-agent-orchestrator",
+            "head": "1" * 40,
+            "actor": "registry-first-tests",
+        },
+    }
+
+
+def _bridge_target(bridge, root: Path, request: dict[str, object]) -> dict[str, Path]:
+    target = {
+        "root": root,
+        "request": root / "request.json",
+        "state": root / "state.json",
+    }
+    target.update(bridge.rendezvous_paths(request["rendezvous_identity"]))
+    return target
 
 
 def test_aged_owned_log_survives_and_unowned_is_collected(cleanup_env):
@@ -251,18 +289,18 @@ def test_register_v2_terminal_resources_covers_manifest_kinds(tmp_path, monkeypa
 
         reservation_id = str(uuid.uuid4())
         root = tmp_path / "managed-provider-sessions" / reservation_id
-        target = {
-            "root": root,
-            "state": root / "state.json",
-            "socket": root / "bridge.sock",
-        }
+        runtime = Path(tempfile.mkdtemp(prefix="cao-rf-", dir="/tmp"))
+        monkeypatch.setattr(bridge, "RENDEZVOUS_ROOT", runtime)
+        request = _bridge_request(
+            reservation_id=reservation_id,
+            terminal_id=terminal_id,
+            generation=generation,
+            worktree=tmp_path,
+        )
+        target = _bridge_target(bridge, root, request)
         bridge._declare_bridge_resources(
             target,
-            {
-                "reservation_id": reservation_id,
-                "terminal_id": terminal_id,
-                "generation": generation,
-            },
+            request,
         )
         registry = rr.get_resource_registry()
         missing = rr.verify_runtime_wiring(registry, terminal_id=terminal_id, generation=generation)
@@ -330,16 +368,15 @@ def test_bridge_resources_register_and_deregister(tmp_path, monkeypatch):
         generation = str(uuid.uuid4())
         root = tmp_path / "managed-provider-sessions" / reservation_id
         root.mkdir(parents=True)
-        target = {
-            "root": root,
-            "state": root / "state.json",
-            "socket": root / "bridge.sock",
-        }
-        request = {
-            "reservation_id": reservation_id,
-            "terminal_id": "a1b2c3d4",
-            "generation": generation,
-        }
+        runtime = Path(tempfile.mkdtemp(prefix="cao-rf-", dir="/tmp"))
+        monkeypatch.setattr(bridge, "RENDEZVOUS_ROOT", runtime)
+        request = _bridge_request(
+            reservation_id=reservation_id,
+            terminal_id="a1b2c3d4",
+            generation=generation,
+            worktree=tmp_path,
+        )
+        target = _bridge_target(bridge, root, request)
         # Declaration comes BEFORE any bridge physical construction: the
         # reservation root already exists (write_request creates it in the
         # launcher process) but is NOT the bridge-state resource — the
@@ -362,7 +399,17 @@ def test_bridge_resources_register_and_deregister(tmp_path, monkeypatch):
         assert by_kind["socket"]["lifecycle_state"] == "declared"
         assert by_kind["db_row_set"]["lifecycle_state"] == "declared"
         # The socket and journal appear later: observed creation.
-        target["socket"].write_text("", encoding="utf-8")
+        _, descriptor = bridge._claim_rendezvous(request, target)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(target["socket"]))
+        target["socket"].chmod(0o600)
+        server.listen(1)
+        bridge._publish_socket_claim(
+            descriptor,
+            target["binding"],
+            target["socket"],
+            request["rendezvous_identity"],
+        )
         (root / "delivery-journal.db").write_text("", encoding="utf-8")
         bridge._mark_bridge_resource_created(target, request, "socket")
         bridge._mark_bridge_journal_created(target, request)
@@ -379,6 +426,8 @@ def test_bridge_resources_register_and_deregister(tmp_path, monkeypatch):
         assert all(e["lifecycle_state"] == "deleted" for e in entries)
         for entry in entries:
             assert not Path(entry["desired_fs_path"]).exists()
+        server.close()
+        os.close(descriptor)
     finally:
         rr.reset_resource_registry()
 
@@ -545,17 +594,18 @@ def test_bridge_serve_declares_before_physical_construction(monkeypatch):
         home.mkdir()
         monkeypatch.setattr("cli_agent_orchestrator.constants.CAO_HOME_DIR", home)
         monkeypatch.setattr(bridge, "BRIDGE_ROOT", base / "managed-provider-sessions")
+        monkeypatch.setattr(bridge, "RENDEZVOUS_ROOT", base / "rendezvous")
         rr.reset_resource_registry()
         try:
             reservation_id = str(uuid.uuid4())
             generation = str(uuid.uuid4())
             terminal_id = "a1b2c3d4"
-            request = {
-                "reservation_id": reservation_id,
-                "terminal_id": terminal_id,
-                "generation": generation,
-                "provider": "codex",
-            }
+            request = _bridge_request(
+                reservation_id=reservation_id,
+                terminal_id=terminal_id,
+                generation=generation,
+                worktree=base,
+            )
             # The production launcher envelope: write_request creates the
             # reservation root (and request.json) before the bridge starts.
             target = bridge.write_request(reservation_id, request)
@@ -592,6 +642,7 @@ def test_bridge_serve_declares_before_physical_construction(monkeypatch):
                     pass
 
             monkeypatch.setattr(bridge, "_ProviderSession", _InitFailure)
+            monkeypatch.setattr(bridge, "verify_launch_binding_identity", lambda *_: None)
 
             assert bridge._serve(request, target) == 1
 
@@ -650,19 +701,28 @@ def test_bridge_teardown_never_synthesizes_absence(tmp_path, monkeypatch):
         generation = str(uuid.uuid4())
         root = tmp_path / "managed-provider-sessions" / reservation_id
         root.mkdir(parents=True)
-        target = {
-            "root": root,
-            "state": root / "state.json",
-            "socket": root / "bridge.sock",
-        }
-        request = {
-            "reservation_id": reservation_id,
-            "terminal_id": "a1b2c3d4",
-            "generation": generation,
-        }
+        runtime = Path(tempfile.mkdtemp(prefix="cao-rf-", dir="/tmp"))
+        monkeypatch.setattr(bridge, "RENDEZVOUS_ROOT", runtime)
+        request = _bridge_request(
+            reservation_id=reservation_id,
+            terminal_id="a1b2c3d4",
+            generation=generation,
+            worktree=tmp_path,
+        )
+        target = _bridge_target(bridge, root, request)
         bridge._declare_bridge_resources(target, request)
         target["state"].write_text("{}", encoding="utf-8")
-        target["socket"].write_text("", encoding="utf-8")
+        _, descriptor = bridge._claim_rendezvous(request, target)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(target["socket"]))
+        target["socket"].chmod(0o600)
+        server.listen(1)
+        bridge._publish_socket_claim(
+            descriptor,
+            target["binding"],
+            target["socket"],
+            request["rendezvous_identity"],
+        )
         bridge._mark_bridge_resource_created(target, request, "bridge_state")
         bridge._mark_bridge_resource_created(target, request, "socket")
         registry = rr.get_resource_registry()
@@ -692,6 +752,8 @@ def test_bridge_teardown_never_synthesizes_absence(tmp_path, monkeypatch):
             if e["lifecycle_state"] == "deleted" and e["desired_fs_path"]
         ]
         assert all(not Path(e["desired_fs_path"]).exists() for e in deleted)
+        server.close()
+        os.close(descriptor)
     finally:
         rr.reset_resource_registry()
 
@@ -716,22 +778,36 @@ def test_bridge_hard_crash_leaves_durable_declarations():
         # <home>/.aws/.../bridge.sock must stay within the macOS limit.
         env["HOME"] = str(base)
         env["PYTHONPATH"] = str(repo_root / "src")
+        env["CAO_BRIDGE_TEST_BASE"] = str(base)
         for var in ("AUTH0_DOMAIN", "AUTH0_AUDIENCE", "CAO_AUTH_JWKS_URI"):
             env.pop(var, None)
         child = textwrap.dedent("""
             import os
             import sys
+            from pathlib import Path
             from unittest.mock import patch
 
             from cli_agent_orchestrator.services import (
                 managed_provider_bridge as bridge,
             )
 
+            base = Path(os.environ["CAO_BRIDGE_TEST_BASE"])
+            bridge.RENDEZVOUS_ROOT = base / "rendezvous"
             request = {
                 "reservation_id": "crash-res",
                 "terminal_id": "c1a5c0de",
                 "generation": "generation-crash-probe",
                 "provider": "codex",
+                "rendezvous_identity": {
+                    "project": "registry-first-tests",
+                    "task_id": "crash-res",
+                    "terminal_id": "c1a5c0de",
+                    "terminal_generation": "generation-crash-probe",
+                    "worktree_realpath": os.path.realpath(base),
+                    "repository": "cli-agent-orchestrator",
+                    "head": "1" * 40,
+                    "actor": "registry-first-tests",
+                },
             }
             target = bridge.write_request("crash-res", request)
 
@@ -749,7 +825,10 @@ def test_bridge_hard_crash_leaves_durable_declarations():
                     pass
 
 
-            with patch.object(bridge, "_ProviderSession", CrashDuringInitialize):
+            with (
+                patch.object(bridge, "_ProviderSession", CrashDuringInitialize),
+                patch.object(bridge, "verify_launch_binding_identity", lambda *_: None),
+            ):
                 bridge._serve(request, target)
             os._exit(99)
             """)
@@ -766,16 +845,18 @@ def test_bridge_hard_crash_leaves_durable_declarations():
         cao_home = base / ".aws" / "cli-agent-orchestrator"
         root = cao_home / "managed-provider-sessions" / "crash-res"
         state_path = root / "state.json"
-        socket_path = root / "bridge.sock"
         registry_path = cao_home / "resource-registry.sqlite"
         # The physical artifacts survive the hard crash for reconciliation…
         assert state_path.exists(), "state file must survive the hard crash"
-        assert socket_path.exists(), "bound socket path must survive the hard crash"
         # …and the durable registry rows already exist to discover them.
         assert registry_path.exists(), "declarations must be committed before the crash"
         registry = rr.ResourceRegistry(registry_path)
         entries = registry.enumerate(terminal_id="c1a5c0de", generation="generation-crash-probe")
         by_kind = {e["kind"]: e for e in entries}
+        socket_path = Path(by_kind["socket"]["desired_fs_path"])
+        binding_path = socket_path.with_suffix(".json")
+        assert socket_path.exists(), "bound socket path must survive the hard crash"
+        assert binding_path.exists(), "full-tuple binding sidecar must survive the hard crash"
         assert set(by_kind) == {"socket", "bridge_state", "db_row_set"}
         assert by_kind["bridge_state"]["lifecycle_state"] == "created"
         assert by_kind["bridge_state"]["desired_fs_path"] == str(state_path)

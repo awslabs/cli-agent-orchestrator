@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import hashlib
 import json
 import logging
@@ -19,11 +20,13 @@ import os
 import pathlib
 import re
 import socket
+import stat
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -49,6 +52,21 @@ logger = logging.getLogger(__name__)
 
 BRIDGE_VERSION = "cao-native-provider-bridge-v1"
 BRIDGE_ROOT = CAO_HOME_DIR / "managed-provider-sessions"
+RENDEZVOUS_ROOT = pathlib.Path("/tmp") / f"cao-managed-bridge-{os.getuid()}"
+RENDEZVOUS_SCHEMA = "cao-managed-bridge-rendezvous-v1"
+RENDEZVOUS_DIGEST_DOMAIN = "cao-managed-bridge-rendezvous-v1"
+RENDEZVOUS_IDENTITY_FIELDS = (
+    "project",
+    "task_id",
+    "terminal_id",
+    "terminal_generation",
+    "worktree_realpath",
+    "repository",
+    "head",
+    "actor",
+)
+_RENDEZVOUS_DIGEST_WIDTH = 16
+_AF_UNIX_SAFE_PATH_BYTES = 100
 
 # P1-9 (spec §20.2d(7)): provider/bridge child processes run under a MINIMAL
 # allowlisted environment built fresh — never the ambient server/tmux
@@ -127,7 +145,11 @@ def _provider_env(overrides: Optional[dict[str, str]] = None) -> dict[str, str]:
     return env
 
 
-def _launcher_argv(socket_path: pathlib.Path, provider_argv: list[str]) -> list[str]:
+def _launcher_argv(
+    socket_path: pathlib.Path,
+    binding_identity: dict[str, str],
+    provider_argv: list[str],
+) -> list[str]:
     """Wrap the provider argv with the provider-originated launcher shim.
 
     The launcher becomes the recorded provider process (the actor broker's
@@ -143,6 +165,8 @@ def _launcher_argv(socket_path: pathlib.Path, provider_argv: list[str]) -> list[
         "cli_agent_orchestrator.services.provider_launcher",
         "--socket",
         str(socket_path),
+        "--identity-json",
+        _canonical(binding_identity).decode("utf-8"),
         "--",
         *provider_argv,
     ]
@@ -163,14 +187,163 @@ class SubmitUncertain(BridgeError):
     """
 
 
-def paths(reservation_id: str) -> dict[str, pathlib.Path]:
-    root = BRIDGE_ROOT / reservation_id
+def _git_launch_identity(working_directory: str) -> tuple[str, str]:
+    """Resolve the repository and exact head used by the launch tuple."""
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                working_directory,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                "HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BridgeError(f"worktree repository identity is unreadable: {exc}") from exc
+    lines = completed.stdout.splitlines()
+    if completed.returncode != 0 or len(lines) != 2:
+        raise BridgeError("worktree repository identity is unreadable")
+    common_dir, head = lines
+    if not re.fullmatch(r"[a-f0-9]{40}", head):
+        raise BridgeError("worktree head is not a full lowercase hex OID")
+    common_path = pathlib.Path(common_dir)
+    repository_root = common_path.parent if common_path.name == ".git" else common_path
+    repository = repository_root.name
+    if not repository:
+        raise BridgeError("worktree repository name is empty")
+    return repository, head
+
+
+def launch_binding_identity(
+    *,
+    project: str,
+    task_id: str,
+    terminal_id: str,
+    terminal_generation: str,
+    working_directory: str,
+    actor: str,
+) -> dict[str, str]:
+    """Build the complete canonical tuple before any provider effect."""
+    worktree = os.path.realpath(working_directory)
+    if worktree != working_directory or not os.path.isdir(worktree):
+        raise BridgeError("worktree_realpath must be an existing canonical directory")
+    repository, head = _git_launch_identity(worktree)
+    identity = {
+        "project": project,
+        "task_id": task_id,
+        "terminal_id": terminal_id,
+        "terminal_generation": terminal_generation,
+        "worktree_realpath": worktree,
+        "repository": repository,
+        "head": head,
+        "actor": actor,
+    }
+    return _validate_binding_identity(identity)
+
+
+def verify_launch_binding_identity(identity: dict[str, str]) -> None:
+    """Re-prove the repository/worktree pin at a provider-effect boundary."""
+    identity = _validate_binding_identity(identity)
+    worktree = identity["worktree_realpath"]
+    if not os.path.isdir(worktree) or os.path.realpath(worktree) != worktree:
+        raise BridgeError("bridge rendezvous worktree identity drifted")
+    repository, head = _git_launch_identity(worktree)
+    if repository != identity["repository"] or head != identity["head"]:
+        raise BridgeError("bridge rendezvous repository/head identity drifted")
+
+
+def _validate_binding_identity(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != set(RENDEZVOUS_IDENTITY_FIELDS):
+        raise BridgeError("bridge rendezvous identity is incomplete or malformed")
+    identity: dict[str, str] = {}
+    invalid: list[str] = []
+    for field in RENDEZVOUS_IDENTITY_FIELDS:
+        item = value.get(field)
+        if not isinstance(item, str) or not item:
+            invalid.append(field)
+        else:
+            identity[field] = item
+    if invalid:
+        raise BridgeError(f"bridge rendezvous identity has empty fields: {invalid}")
+    if os.path.realpath(identity["worktree_realpath"]) != identity["worktree_realpath"]:
+        raise BridgeError("bridge rendezvous worktree identity is not canonical")
+    if not re.fullmatch(r"[a-f0-9]{40}", identity["head"]):
+        raise BridgeError("bridge rendezvous head is not a full lowercase hex OID")
+    return identity
+
+
+def binding_identity(request: dict[str, Any]) -> dict[str, str]:
+    return _validate_binding_identity(request.get("rendezvous_identity"))
+
+
+def _rendezvous_canonical_bytes(identity: dict[str, str]) -> bytes:
+    """Normative §4.3 bytes: domain first, fixed tuple order, one newline."""
+    identity = _validate_binding_identity(identity)
+    value = {"domain": RENDEZVOUS_DIGEST_DOMAIN}
+    value.update((field, identity[field]) for field in RENDEZVOUS_IDENTITY_FIELDS)
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def _rendezvous_digest(identity: dict[str, str]) -> str:
+    return hashlib.sha256(_rendezvous_canonical_bytes(identity)).hexdigest()
+
+
+def _rendezvous_key(identity: dict[str, str]) -> str:
+    return f"sk-{_rendezvous_digest(identity)[:_RENDEZVOUS_DIGEST_WIDTH]}"
+
+
+def _secure_rendezvous_root() -> pathlib.Path:
+    try:
+        RENDEZVOUS_ROOT.mkdir(mode=0o700, parents=False, exist_ok=True)
+        info = RENDEZVOUS_ROOT.lstat()
+    except OSError as exc:
+        raise BridgeError(f"bridge rendezvous runtime directory is unavailable: {exc}") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise BridgeError("bridge rendezvous runtime directory is not owner-only")
+    return RENDEZVOUS_ROOT
+
+
+def rendezvous_paths(identity: dict[str, str]) -> dict[str, pathlib.Path]:
+    identity = _validate_binding_identity(identity)
+    root = _secure_rendezvous_root()
+    key = _rendezvous_key(identity)
+    socket_path = root / f"{key}.sock"
+    if len(os.fsencode(socket_path)) > _AF_UNIX_SAFE_PATH_BYTES:
+        raise BridgeError("bridge rendezvous path exceeds the safe AF_UNIX bound")
     return {
+        "rendezvous_root": root,
+        "socket": socket_path,
+        "binding": root / f"{key}.json",
+    }
+
+
+def paths(reservation_id: str, request: Optional[dict[str, Any]] = None) -> dict[str, pathlib.Path]:
+    root = BRIDGE_ROOT / reservation_id
+    target = {
         "root": root,
         "request": root / "request.json",
         "state": root / "state.json",
-        "socket": root / "bridge.sock",
     }
+    if request is None:
+        try:
+            request = json.loads(target["request"].read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            request = None
+    if request is not None:
+        target.update(rendezvous_paths(binding_identity(request)))
+    return target
 
 
 def _canonical(value: Any) -> bytes:
@@ -210,6 +383,380 @@ def _atomic_json(path: pathlib.Path, value: Any) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+
+
+@dataclass(frozen=True)
+class RendezvousVerification:
+    """Pinned sidecar + socket filesystem identity from one exact verification."""
+
+    record: dict[str, Any]
+    sidecar_identity: tuple[int, int, int, int, int, int, int]
+    socket_identity: tuple[int, int, int, int, int, int, int]
+
+
+def _stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _socket_identity_record(info: os.stat_result) -> dict[str, int]:
+    return {
+        "st_dev": info.st_dev,
+        "st_ino": info.st_ino,
+        "st_mode": info.st_mode,
+        "st_uid": info.st_uid,
+        "st_size": info.st_size,
+        "st_mtime_ns": info.st_mtime_ns,
+        "st_ctime_ns": info.st_ctime_ns,
+    }
+
+
+def _validate_socket_identity(value: Any) -> Optional[dict[str, int]]:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    }:
+        raise BridgeError("socket-binding-record-malformed")
+    if any(not isinstance(item, int) or isinstance(item, bool) for item in value.values()):
+        raise BridgeError("socket-binding-record-malformed")
+    if (
+        value["st_dev"] < 0
+        or value["st_ino"] <= 0
+        or value["st_size"] < 0
+        or value["st_mtime_ns"] < 0
+        or value["st_ctime_ns"] < 0
+        or not stat.S_ISSOCK(value["st_mode"])
+        or value["st_uid"] != os.getuid()
+        or stat.S_IMODE(value["st_mode"]) != 0o600
+    ):
+        raise BridgeError("socket-binding-record-malformed")
+    return dict(value)
+
+
+def _binding_record(
+    identity: dict[str, str],
+    *,
+    socket_identity: Optional[dict[str, int]] = None,
+) -> dict[str, Any]:
+    identity = _validate_binding_identity(identity)
+    socket_identity = _validate_socket_identity(socket_identity)
+    return {
+        "schema": RENDEZVOUS_SCHEMA,
+        "rendezvous_key": _rendezvous_key(identity),
+        "binding_identity": identity,
+        "binding_identity_sha256": _rendezvous_digest(identity),
+        "socket_identity": socket_identity,
+    }
+
+
+def _read_binding_record_descriptor(descriptor: int) -> tuple[dict[str, Any], os.stat_result]:
+    try:
+        info = os.fstat(descriptor)
+    except OSError as exc:
+        raise BridgeError(f"socket-binding-record-malformed: {exc}") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise BridgeError("socket-binding-record-malformed")
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        raw = bytearray()
+        while True:
+            block = os.read(descriptor, 65536)
+            if not block:
+                break
+            raw.extend(block)
+            if len(raw) > 1024 * 1024:
+                raise BridgeError("socket-binding-record-malformed")
+        record = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BridgeError("socket-binding-record-malformed") from exc
+    try:
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise BridgeError(f"socket-binding-record-malformed: {exc}") from exc
+    if _file_identity(after) != _file_identity(info):
+        raise BridgeError("socket-binding-record-replaced")
+    if not isinstance(record, dict) or set(record) != {
+        "schema",
+        "rendezvous_key",
+        "binding_identity",
+        "binding_identity_sha256",
+        "socket_identity",
+    }:
+        raise BridgeError("socket-binding-record-malformed")
+    try:
+        identity = _validate_binding_identity(record["binding_identity"])
+        socket_identity = _validate_socket_identity(record["socket_identity"])
+    except BridgeError as exc:
+        raise BridgeError("socket-binding-record-malformed") from exc
+    expected = _binding_record(identity, socket_identity=socket_identity)
+    if record != expected:
+        raise BridgeError("socket-binding-record-malformed")
+    return record, after
+
+
+def _open_binding_record(
+    path: pathlib.Path, *, writable: bool = False
+) -> tuple[int, dict[str, Any], os.stat_result]:
+    flags = os.O_RDWR if writable else os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        raise BridgeError("socket-binding-record-absent") from None
+    except OSError as exc:
+        raise BridgeError(f"socket-binding-record-malformed: {exc}") from exc
+    try:
+        record, info = _read_binding_record_descriptor(descriptor)
+        for _ in range(2):
+            path_info = path.lstat()
+            if _file_identity(path_info) != _file_identity(info):
+                raise BridgeError("socket-binding-record-replaced")
+        return descriptor, record, info
+    except FileNotFoundError:
+        os.close(descriptor)
+        raise BridgeError("socket-binding-record-replaced") from None
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _read_binding_record(path: pathlib.Path) -> dict[str, Any]:
+    descriptor, record, _ = _open_binding_record(path)
+    os.close(descriptor)
+    return record
+
+
+def verify_rendezvous_binding(
+    socket_path: pathlib.Path | str,
+    expected_identity: dict[str, str],
+    *,
+    expected: Optional[RendezvousVerification] = None,
+) -> RendezvousVerification:
+    """Pin the full tuple and exact sidecar/socket inode before use."""
+    expected_identity = _validate_binding_identity(expected_identity)
+    socket_path = pathlib.Path(socket_path)
+    try:
+        root_info = socket_path.parent.lstat()
+    except OSError as exc:
+        raise BridgeError(f"bridge rendezvous runtime directory is unavailable: {exc}") from exc
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_ISLNK(root_info.st_mode)
+        or root_info.st_uid != os.getuid()
+        or stat.S_IMODE(root_info.st_mode) != 0o700
+        or socket_path.name != f"{_rendezvous_key(expected_identity)}.sock"
+        or len(os.fsencode(socket_path)) > _AF_UNIX_SAFE_PATH_BYTES
+    ):
+        raise BridgeError("socket-identity-collision")
+    descriptor, record, sidecar_info = _open_binding_record(socket_path.with_suffix(".json"))
+    try:
+        if record["binding_identity"] != expected_identity:
+            raise BridgeError("socket-identity-collision")
+        recorded_socket = record["socket_identity"]
+        if recorded_socket is None:
+            raise BridgeError("socket-binding-not-ready")
+        try:
+            socket_info = socket_path.lstat()
+        except FileNotFoundError:
+            raise BridgeError("socket-binding-not-ready") from None
+        if (
+            _socket_identity_record(socket_info) != recorded_socket
+            or not stat.S_ISSOCK(socket_info.st_mode)
+            or socket_info.st_uid != os.getuid()
+            or stat.S_IMODE(socket_info.st_mode) != 0o600
+        ):
+            raise BridgeError("socket-identity-collision")
+        result = RendezvousVerification(
+            record=record,
+            sidecar_identity=_file_identity(sidecar_info),
+            socket_identity=_stat_identity(socket_info),
+        )
+        if expected is not None and result != expected:
+            raise BridgeError("socket-rendezvous-replaced")
+        return result
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: pathlib.Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_binding_record_descriptor(
+    descriptor: int,
+    identity: dict[str, str],
+    *,
+    socket_identity: Optional[dict[str, int]] = None,
+) -> None:
+    payload = _canonical(_binding_record(identity, socket_identity=socket_identity)) + b"\n"
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    os.ftruncate(descriptor, 0)
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise BridgeError("socket binding record write made no progress")
+        view = view[written:]
+    os.fsync(descriptor)
+
+
+def _create_binding_record(path: pathlib.Path, identity: dict[str, str]) -> None:
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        record = _read_binding_record(path)
+        if record["binding_identity"] == identity:
+            raise BridgeError("duplicate-live-bridge-identity") from None
+        raise BridgeError("socket-identity-collision") from None
+    except OSError as exc:
+        raise BridgeError(f"socket binding record creation failed: {exc}") from exc
+    try:
+        os.fchmod(descriptor, 0o600)
+        _write_binding_record_descriptor(descriptor, identity)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(path.parent)
+
+
+def _acquire_binding_claim(path: pathlib.Path, identity: dict[str, str]) -> int:
+    """Acquire/recover one process-pinned claim; a live claimant refuses."""
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    created = False
+    try:
+        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise BridgeError(f"socket-binding-record-malformed: {exc}") from exc
+    except OSError as exc:
+        raise BridgeError(f"socket binding record creation failed: {exc}") from exc
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BridgeError("duplicate-live-bridge-identity") from None
+        if created:
+            os.fchmod(descriptor, 0o600)
+            _write_binding_record_descriptor(descriptor, identity)
+            _fsync_directory(path.parent)
+        else:
+            record, descriptor_info = _read_binding_record_descriptor(descriptor)
+            try:
+                path_info = path.lstat()
+            except FileNotFoundError:
+                raise BridgeError("socket-binding-record-replaced") from None
+            if _file_identity(path_info) != _file_identity(descriptor_info):
+                raise BridgeError("socket-binding-record-replaced")
+            if record["binding_identity"] != identity:
+                raise BridgeError("socket-identity-collision")
+            if record["socket_identity"] is not None:
+                raise BridgeError("duplicate-live-bridge-identity")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _publish_socket_claim(
+    descriptor: int,
+    binding_path: pathlib.Path,
+    socket_path: pathlib.Path,
+    identity: dict[str, str],
+) -> RendezvousVerification:
+    """Bind the exact socket inode/type into the locked O_EXCL sidecar."""
+    _, descriptor_info = _read_binding_record_descriptor(descriptor)
+    try:
+        binding_info = binding_path.lstat()
+        socket_info = socket_path.lstat()
+    except FileNotFoundError:
+        raise BridgeError("socket rendezvous disappeared before publication") from None
+    if _file_identity(binding_info) != _file_identity(descriptor_info):
+        raise BridgeError("socket-binding-record-replaced")
+    socket_identity = _socket_identity_record(socket_info)
+    _validate_socket_identity(socket_identity)
+    _write_binding_record_descriptor(
+        descriptor,
+        identity,
+        socket_identity=socket_identity,
+    )
+    return verify_rendezvous_binding(socket_path, identity)
+
+
+def _compare_unlink_socket(
+    path: pathlib.Path,
+    identity: dict[str, str],
+    verification: RendezvousVerification,
+) -> None:
+    """Immediate inode/type compare-delete; replacement always survives."""
+    verify_rendezvous_binding(path, identity, expected=verification)
+    info = path.lstat()
+    if _stat_identity(info) != verification.socket_identity or not stat.S_ISSOCK(info.st_mode):
+        raise BridgeError("socket-rendezvous-replaced")
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
+def _compare_unlink_binding(
+    path: pathlib.Path,
+    identity: dict[str, str],
+    *,
+    expected: Optional[RendezvousVerification] = None,
+) -> None:
+    descriptor, record, info = _open_binding_record(path)
+    try:
+        if record["binding_identity"] != identity:
+            raise BridgeError("socket-identity-collision")
+        if expected is not None and _file_identity(info) != expected.sidecar_identity:
+            raise BridgeError("socket-binding-record-replaced")
+        path_info = path.lstat()
+        if _file_identity(path_info) != _file_identity(info):
+            raise BridgeError("socket-binding-record-replaced")
+        path.unlink()
+        _fsync_directory(path.parent)
+    finally:
+        os.close(descriptor)
 
 
 def _file_digest_or_absent(path: pathlib.Path) -> str:
@@ -325,7 +872,8 @@ def _profile_material(agent_profile: str, terminal_id: str) -> dict[str, Any]:
 
 
 def write_request(reservation_id: str, request: dict[str, Any]) -> dict[str, pathlib.Path]:
-    target = paths(reservation_id)
+    identity = binding_identity(request)
+    target = paths(reservation_id, request)
     target["root"].mkdir(mode=0o700, parents=True, exist_ok=True)
     if target["request"].exists():
         existing = json.loads(target["request"].read_text(encoding="utf-8"))
@@ -333,6 +881,8 @@ def write_request(reservation_id: str, request: dict[str, Any]) -> dict[str, pat
             raise BridgeError("managed provider request identity changed")
     else:
         _atomic_json(target["request"], request)
+    if binding_identity(request) != identity:
+        raise BridgeError("managed provider request rendezvous identity changed")
     return target
 
 
@@ -352,7 +902,9 @@ def read_state(reservation_id: str) -> Optional[dict[str, Any]]:
 def request_bridge(
     reservation_id: str, request: dict[str, Any], *, timeout: float = 30.0
 ) -> dict[str, Any]:
-    socket_path = paths(reservation_id)["socket"]
+    target = paths(reservation_id)
+    socket_path = target["socket"]
+    identity = binding_identity(json.loads(target["request"].read_text(encoding="utf-8")))
     deadline = time.monotonic() + timeout
     response: Any = None
     last_error: Optional[BaseException] = None
@@ -360,8 +912,39 @@ def request_bridge(
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.settimeout(max(0.1, deadline - time.monotonic()))
         try:
+            try:
+                verification = verify_rendezvous_binding(socket_path, identity)
+            except BridgeError as exc:
+                retryable = str(exc) in {
+                    "socket-binding-record-absent",
+                    "socket-binding-not-ready",
+                }
+                if not retryable or (
+                    str(exc) == "socket-binding-record-absent"
+                    and (socket_path.exists() or socket_path.is_symlink())
+                ):
+                    raise
+                state = read_state(reservation_id)
+                if state and state.get("state") == "preflight_blocked":
+                    raise BridgeError(
+                        str(state.get("error") or "managed provider failed before socket readiness")
+                    ) from exc
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
             client.connect(str(socket_path))
-            client.sendall(_canonical(request) + b"\n")
+            # The pathname may be replaced between verification and
+            # connect. Re-pin the identical sidecar/socket inodes before
+            # sending even the identity handshake to the connected peer.
+            verify_rendezvous_binding(socket_path, identity, expected=verification)
+            client.sendall(
+                _canonical(
+                    {
+                        "rendezvous_identity": identity,
+                        "request": request,
+                    }
+                )
+                + b"\n"
+            )
             received = bytearray()
             while b"\n" not in received:
                 block = client.recv(65536)
@@ -689,7 +1272,11 @@ class _ProviderSession:
                 argv.extend(["-c", f"{prefix}.env.{key}={_toml_scalar(item['value'])}"])
             argv.extend(["-c", f"{prefix}.tool_timeout_sec=600.0"])
         argv.extend(["app-server", "--stdio"])
-        argv = _launcher_argv(paths(self.request["reservation_id"])["socket"], argv)
+        argv = _launcher_argv(
+            paths(self.request["reservation_id"], self.request)["socket"],
+            binding_identity(self.request),
+            argv,
+        )
         config_path = pathlib.Path(os.path.expanduser("~/.codex/config.toml"))
         config_before = _file_digest_or_absent(config_path)
         self.rpc = _RpcProcess(
@@ -761,7 +1348,11 @@ class _ProviderSession:
         # request, applied over the minimal allowlisted environment.
         env = _provider_env({"KIMI_MODEL_THINKING_EFFORT": self.request["effort"]})
         self.rpc = _RpcProcess(
-            _launcher_argv(paths(self.request["reservation_id"])["socket"], [kimi_bin, "acp"]),
+            _launcher_argv(
+                paths(self.request["reservation_id"], self.request)["socket"],
+                binding_identity(self.request),
+                [kimi_bin, "acp"],
+            ),
             env=env,
             companion_identity=self._companion_identity(),
         )
@@ -1236,8 +1827,9 @@ def _bridge_resources(
     envelope, removed best-effort at teardown without a registry claim.
     """
     reservation_id = request["reservation_id"]
+    socket_entry_id = target["socket"].name
     return (
-        ("socket", f"{reservation_id}/bridge.sock", str(target["socket"])),
+        ("socket", socket_entry_id, str(target["socket"])),
         ("bridge_state", f"{reservation_id}/state.json", str(target["state"])),
         (
             "db_row_set",
@@ -1255,20 +1847,38 @@ def _declare_bridge_resources(target: dict[str, pathlib.Path], request: dict[str
     provider initialization leaves discoverable declared entries for
     reconciliation — never physical artifacts with no registry row.
     Declaration is intent-only: nothing is marked ``created`` here, even
-    if a stale artifact already occupies the path.  Creation is receipted
-    by ``_mark_bridge_resource_created`` / ``_mark_bridge_journal_created``
-    only against the exact observed identity.  Re-declaration after a
-    crash converges on the live entry for the same generation instead of
-    conflicting.
+    if a stale artifact already occupies the path.  An exact still-declared
+    row is a recoverable crash prefix and converges; every other live row is
+    refused. Creation is receipted only after the exact artifact exists.
     """
     from cli_agent_orchestrator.services import resource_registry as rr
 
     registry = rr.get_resource_registry()
     actor = "managed_provider_bridge._serve"
+    identity = binding_identity(request)
     for kind, entry_id, fs_path in _bridge_resources(target, request):
+        binding = identity if kind == "socket" else None
         existing = registry.resolve_fs_path(fs_path)
-        if existing is not None and existing["generation"] == request["generation"]:
-            continue  # converge after a crash: the live entry is already ours
+        if existing is not None:
+            exact = (
+                existing.get("entry_id") == entry_id
+                and existing.get("kind") == kind
+                and existing.get("protocol_vintage") == "v2"
+                and existing.get("terminal_id") == request["terminal_id"]
+                and existing.get("generation") == request["generation"]
+                and existing.get("owner") == "fork"
+                and existing.get("ownership") == "owned"
+                and existing.get("constructor_id") == actor
+                and existing.get("deleter_id") == actor
+                and existing.get("rollback_rule") == "generation-isolated"
+                and existing.get("desired_fs_path") == fs_path
+                and existing.get("binding_identity") == binding
+            )
+            if kind == "socket" and existing.get("binding_identity") != identity:
+                raise BridgeError("socket-identity-collision")
+            if exact and existing.get("lifecycle_state") == "declared":
+                continue
+            raise BridgeError("duplicate-live-bridge-identity")
         registry.declare(
             entry_id=entry_id,
             kind=kind,
@@ -1282,6 +1892,7 @@ def _declare_bridge_resources(target: dict[str, pathlib.Path], request: dict[str
             rollback_rule="generation-isolated",
             actor_id=actor,
             desired_fs_path=fs_path,
+            binding_identity=binding,
         )
 
 
@@ -1305,13 +1916,18 @@ def _mark_bridge_resource_created(
     registry = rr.get_resource_registry()
     entry = registry.resolve(entry_id)
     if entry["lifecycle_state"] == "declared" and pathlib.Path(fs_path).exists():
+        observed: dict[str, Any] = {"observed_fs_path": fs_path}
+        if kind == "socket":
+            verification = verify_rendezvous_binding(
+                pathlib.Path(fs_path),
+                binding_identity(request),
+            )
+            observed["observed_fs_identity"] = verification.record["socket_identity"]
         registry.register_created(
             entry_id,
             actor_id=actor,
-            observed={"observed_fs_path": fs_path},
-            existence_receipt_digest=rr.receipt_digest(
-                {"entry_id": entry_id, "observed_fs_path": fs_path}
-            ),
+            observed=observed,
+            existence_receipt_digest=rr.receipt_digest({"entry_id": entry_id, **observed}),
         )
 
 
@@ -1377,6 +1993,12 @@ def _deregister_bridge_resources(
 
     def _remove(fs_path: str) -> None:
         path = pathlib.Path(fs_path)
+        if path == target["socket"]:
+            identity = binding_identity(request)
+            verification = verify_rendezvous_binding(path, identity)
+            _compare_unlink_socket(path, identity, verification)
+            _compare_unlink_binding(target["binding"], identity, expected=verification)
+            return
         with contextlib.suppress(OSError):
             path.unlink()
         with contextlib.suppress(OSError):
@@ -1387,6 +2009,13 @@ def _deregister_bridge_resources(
             import shutil
 
             shutil.rmtree(path, ignore_errors=True)
+
+    def _path_present(path: pathlib.Path) -> bool:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return False
+        return True
 
     for entry in entries:
         if entry["constructor_id"] != actor:
@@ -1401,14 +2030,35 @@ def _deregister_bridge_resources(
         )
         try:
             if state == "declared":
-                if fs_path and pathlib.Path(fs_path).exists():
+                path = pathlib.Path(fs_path) if fs_path else None
+                present = path is not None and _path_present(path)
+                if path == target["socket"] and not present and _path_present(target["binding"]):
+                    # A crash after sidecar creation but before bind leaves
+                    # no socket. Compare-delete only the exact full tuple;
+                    # malformed or foreign state preserves artifact and row.
+                    identity = binding_identity(request)
+                    record = _read_binding_record(target["binding"])
+                    if (
+                        record["binding_identity"] != identity
+                        or record["socket_identity"] is not None
+                    ):
+                        raise BridgeError("socket-identity-collision")
+                    _compare_unlink_binding(target["binding"], identity)
+                if present:
+                    observed: dict[str, Any] = {"observed_fs_path": fs_path}
+                    if path == target["socket"]:
+                        verification = verify_rendezvous_binding(
+                            path,
+                            binding_identity(request),
+                        )
+                        observed["observed_fs_identity"] = verification.record["socket_identity"]
                     # Created but never receipt-marked: discover, then drain.
                     registry.register_created(
                         entry_id,
                         actor_id=actor,
-                        observed={"observed_fs_path": fs_path},
+                        observed=observed,
                         existence_receipt_digest=rr.receipt_digest(
-                            {"entry_id": entry_id, "observed_fs_path": fs_path}
+                            {"entry_id": entry_id, **observed}
                         ),
                     )
                     state = "created"
@@ -1426,7 +2076,7 @@ def _deregister_bridge_resources(
                 continue
             if fs_path:
                 _remove(fs_path)
-            if not fs_path or not pathlib.Path(fs_path).exists():
+            if not fs_path or not _path_present(pathlib.Path(fs_path)):
                 registry.delete(entry_id, actor_id=actor, verified_absence_digest=absence)
             else:
                 logger.warning(
@@ -1441,6 +2091,59 @@ def _deregister_bridge_resources(
         (target["root"] / "request.json").unlink()
     with contextlib.suppress(OSError):
         target["root"].rmdir()
+
+
+def rendezvous_resource_presence(entry: dict[str, Any]) -> Optional[bool]:
+    """Return exact-tuple presence; malformed/foreign state is unknown."""
+    identity = entry.get("binding_identity")
+    fs_path = entry.get("desired_fs_path")
+    if not isinstance(identity, dict) or not isinstance(fs_path, str):
+        return None
+    socket_path = pathlib.Path(fs_path)
+    binding_path = socket_path.with_suffix(".json")
+    socket_exists = socket_path.exists() or socket_path.is_symlink()
+    binding_exists = binding_path.exists() or binding_path.is_symlink()
+    if not socket_exists and not binding_exists:
+        return False
+    try:
+        verify_rendezvous_binding(socket_path, identity)
+    except BridgeError:
+        return None
+    return True
+
+
+def cleanup_stale_rendezvous(
+    entry: dict[str, Any],
+    *,
+    terminal_id: str,
+    generation: str,
+) -> None:
+    """Compare-delete one exact tuple after generation-bound teardown proof.
+
+    The caller is the v2 terminal teardown path, which is reachable only
+    after the destructive endpoint has verified and consumed the exact
+    generation's no-survivor proof. The registry row must already be closed;
+    a live, mismatched, malformed, or unbound row yields zero unlink.
+    """
+    if (
+        entry.get("kind") != "socket"
+        or entry.get("terminal_id") != terminal_id
+        or entry.get("generation") != generation
+        or entry.get("lifecycle_state") != "closed"
+    ):
+        raise BridgeError("stale rendezvous cleanup lacks proven-dead exact ownership")
+    identity = _validate_binding_identity(entry.get("binding_identity"))
+    if identity["terminal_id"] != terminal_id or identity["terminal_generation"] != generation:
+        raise BridgeError("stale rendezvous registry binding mismatch")
+    socket_path = pathlib.Path(entry["desired_fs_path"])
+    expected = rendezvous_paths(identity)
+    if socket_path != expected["socket"] or entry.get("observed_fs_path") != str(socket_path):
+        raise BridgeError("stale rendezvous path binding mismatch")
+    verification = verify_rendezvous_binding(socket_path, identity)
+    if entry.get("observed_fs_identity") != verification.record["socket_identity"]:
+        raise BridgeError("stale rendezvous registry socket identity mismatch")
+    _compare_unlink_socket(socket_path, identity, verification)
+    _compare_unlink_binding(expected["binding"], identity, expected=verification)
 
 
 def _handle_actor_assertion(
@@ -1599,6 +2302,73 @@ def _write_route_receipt(
         logger.warning("route receipt publication failed", exc_info=True)
 
 
+def _claim_rendezvous(
+    request: dict[str, Any], target: dict[str, pathlib.Path]
+) -> tuple[dict[str, str], int]:
+    """Acquire/recover the O_EXCL record only after exact registry intent."""
+    identity = binding_identity(request)
+    expected = rendezvous_paths(identity)
+    if target.get("socket") != expected["socket"] or target.get("binding") != expected["binding"]:
+        raise BridgeError("bridge rendezvous target does not match the launch tuple")
+
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    registry = rr.get_resource_registry()
+    try:
+        existing = registry.resolve(expected["socket"].name)
+    except rr.RegistryNotFound:
+        raise BridgeError("socket rendezvous lacks registry-first ownership") from None
+    exact_registry_claim = (
+        existing.get("kind") == "socket"
+        and existing.get("protocol_vintage") == "v2"
+        and existing.get("terminal_id") == request["terminal_id"]
+        and existing.get("generation") == request["generation"]
+        and existing.get("owner") == "fork"
+        and existing.get("ownership") == "owned"
+        and existing.get("constructor_id") == "managed_provider_bridge._serve"
+        and existing.get("desired_fs_path") == str(expected["socket"])
+        and existing.get("binding_identity") == identity
+        and existing.get("lifecycle_state") == "declared"
+    )
+    if not exact_registry_claim:
+        if existing.get("binding_identity") != identity:
+            raise BridgeError("socket-identity-collision")
+        raise BridgeError("duplicate-live-bridge-identity")
+    socket_exists = expected["socket"].exists() or expected["socket"].is_symlink()
+    binding_exists = expected["binding"].exists() or expected["binding"].is_symlink()
+    if socket_exists and not binding_exists:
+        raise BridgeError("socket-binding-record-absent")
+    if socket_exists:
+        record = _read_binding_record(expected["binding"])
+        if record["binding_identity"] != identity:
+            raise BridgeError("socket-identity-collision")
+        raise BridgeError("duplicate-live-bridge-identity")
+    descriptor = _acquire_binding_claim(expected["binding"], identity)
+    return identity, descriptor
+
+
+def _record_handshake_refusal(
+    target: dict[str, pathlib.Path],
+    state: dict[str, Any],
+    *,
+    observed: Any,
+    reason: str,
+) -> None:
+    refusals = state.setdefault("handshake_refusals", [])
+    refusals.append(
+        {
+            "at": _now(),
+            "reason": reason,
+            "observed_identity_sha256": (
+                hashlib.sha256(_canonical(observed)).hexdigest()
+                if isinstance(observed, dict)
+                else None
+            ),
+        }
+    )
+    _atomic_json(target["state"], state)
+
+
 def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
     state = {
         "bridge_version": BRIDGE_VERSION,
@@ -1607,28 +2377,34 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
         "first_seen_at": time.time(),
         "readiness": None,
         "submission": None,
+        "handshake_refusals": [],
     }
     session: Optional[_ProviderSession] = None
-    registered = False
+    claimed = False
+    claim_descriptor: Optional[int] = None
     blocked = False
-    with contextlib.suppress(FileNotFoundError):
-        target["socket"].unlink()
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         # Registry-first, declaration-before-construction: the bridge's
-        # own socket/state/journal identities are durably declared BEFORE
-        # any physical v2 artifact is written or bound, so a hard crash in
-        # the provider-initialization window leaves discoverable declared
-        # entries — never unregistered state/socket orphans (fail-closed,
-        # like the v2 terminal constructor).
+        # own socket/state/journal identities are durably declared before
+        # the O_EXCL sidecar. Exact declared prefixes are crash-recoverable;
+        # there is no sidecar-without-row crash window.
         _declare_bridge_resources(target, request)
-        registered = True
+        identity, claim_descriptor = _claim_rendezvous(request, target)
+        claimed = True
         _atomic_json(target["state"], state)
         _mark_bridge_resource_created(target, request, "bridge_state")
         session = _ProviderSession(request)
+        verify_launch_binding_identity(identity)
         server.bind(str(target["socket"]))
         os.chmod(target["socket"], 0o600)
         server.listen(8)
+        _publish_socket_claim(
+            claim_descriptor,
+            target["binding"],
+            target["socket"],
+            identity,
+        )
         _mark_bridge_resource_created(target, request, "socket")
         readiness = session.initialize()
         session._scan_companion_events()
@@ -1700,10 +2476,38 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                     connection.close()
                     raise BridgeError("bridge request exceeded 4 MiB")
             try:
-                command = json.loads(bytes(raw).split(b"\n", 1)[0])
+                envelope = json.loads(bytes(raw).split(b"\n", 1)[0])
             except json.JSONDecodeError as exc:
+                _record_handshake_refusal(
+                    target,
+                    state,
+                    observed=None,
+                    reason="connection-handshake-malformed",
+                )
                 with connection:
                     connection.sendall(_canonical({"ok": False, "error": str(exc)}) + b"\n")
+                continue
+            observed_identity = (
+                envelope.get("rendezvous_identity") if isinstance(envelope, dict) else None
+            )
+            command = envelope.get("request") if isinstance(envelope, dict) else None
+            if observed_identity != identity or not isinstance(command, dict):
+                _record_handshake_refusal(
+                    target,
+                    state,
+                    observed=observed_identity,
+                    reason="connection-handshake-identity-mismatch",
+                )
+                with connection:
+                    connection.sendall(
+                        _canonical(
+                            {
+                                "ok": False,
+                                "error": "connection-handshake-identity-mismatch",
+                            }
+                        )
+                        + b"\n"
+                    )
                 continue
             if isinstance(command, dict) and command.get("op") == "provider-channel":
                 # The provider-originated channel: kernel-verified to the
@@ -1872,21 +2676,29 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                 connection.sendall(_canonical(response) + b"\n")
     except Exception as exc:  # noqa: BLE001 - persist fail-closed state
         state.update({"state": "preflight_blocked", "error": str(exc)})
-        _atomic_json(target["state"], state)
+        preserve_live_duplicate = False
+        if not claimed and str(exc) == "duplicate-live-bridge-identity":
+            try:
+                record = _read_binding_record(target["binding"])
+                preserve_live_duplicate = record["binding_identity"] == binding_identity(request)
+            except BridgeError:
+                pass
+        if not preserve_live_duplicate:
+            _atomic_json(target["state"], state)
         print(f"[managed-provider-blocked] {exc}", file=sys.stderr, flush=True)
         blocked = True
         return 1
     finally:
         server.close()
-        with contextlib.suppress(FileNotFoundError):
-            target["socket"].unlink()
         if session is not None:
             session.close()
-        if registered:
+        if claimed:
             # Controlled failure keeps the state file as the launcher's
             # diagnostic (its row stays closed, present and discoverable);
             # every other resource converges to real absence.
             _deregister_bridge_resources(target, request, retain_state=blocked)
+        if claim_descriptor is not None:
+            os.close(claim_descriptor)
     return 0
 
 

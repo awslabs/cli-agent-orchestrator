@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -21,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
+from cli_agent_orchestrator.services import resource_registry as rr
 from cli_agent_orchestrator.services.delivery_journal import (
     DeliveryJournal,
     DeliveryTransitionRefused,
@@ -28,40 +30,72 @@ from cli_agent_orchestrator.services.delivery_journal import (
 
 
 @pytest.fixture
-def short_root():
+def short_root(monkeypatch):
     # AF_UNIX paths are length-capped; pytest's tmp_path is too deep on
     # macOS for a bridge socket, so the bridge root lives under /tmp.
     with tempfile.TemporaryDirectory(prefix="lb-amb-") as root:
-        yield Path(root)
+        root_path = Path(root)
+        subprocess.run(["git", "init", "-q"], cwd=root_path, check=True)
+        (root_path / "identity.txt").write_text("submit-ambiguity\n", encoding="utf-8")
+        subprocess.run(["git", "add", "identity.txt"], cwd=root_path, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=submit-ambiguity-test",
+                "-c",
+                "user.email=submit-ambiguity@example.test",
+                "commit",
+                "-qm",
+                "identity",
+            ],
+            cwd=root_path,
+            check=True,
+        )
+        monkeypatch.setattr(bridge, "RENDEZVOUS_ROOT", root_path / "runtime")
+        rr.reset_resource_registry()
+        rr.get_resource_registry(root_path / "registry.sqlite")
+        try:
+            yield root_path
+        finally:
+            rr.reset_resource_registry()
 
 
-def _target(root):
+def _target(root, request):
+    bridge_root = root / "bridge" / request["reservation_id"]
     target = {
-        "root": root / "bridge",
-        "state": root / "bridge" / "state.json",
-        "socket": root / "bridge" / "bridge.sock",
+        "root": bridge_root,
+        "state": bridge_root / "state.json",
     }
+    target.update(bridge.rendezvous_paths(request["rendezvous_identity"]))
     target["root"].mkdir(parents=True)
     return target
 
 
-def _request(**overrides):
+def _request(root, **overrides):
     request = {
+        "reservation_id": str(uuid.uuid4()),
         "provider": "codex",
         "terminal_id": "a1b2c3d4",
         "generation": "generation-delivery",
         "obligation_generation": "obligation-delivery",
     }
     request.update(overrides)
+    request["rendezvous_identity"] = bridge.launch_binding_identity(
+        project="test-project",
+        task_id=request["reservation_id"],
+        terminal_id=request["terminal_id"],
+        terminal_generation=request["generation"],
+        working_directory=str(root.resolve()),
+        actor="cafebabe",
+    )
     return request
 
 
 def _serve_in_thread(request, target, monkeypatch=None):
     if monkeypatch is not None:
-        # The registry-first bridge registration is exercised in its own
-        # dedicated tests; these tests keep the state root registry-free.
-        monkeypatch.setattr(bridge, "_declare_bridge_resources", lambda *a: None)
-        monkeypatch.setattr(bridge, "_mark_bridge_resource_created", lambda *a: None)
+        # The loop stays live for the assertion; suppress only its eventual
+        # daemon-thread teardown, never the production registry-first claim.
         monkeypatch.setattr(bridge, "_deregister_bridge_resources", lambda *a, **k: None)
     server = threading.Thread(target=bridge._serve, args=(request, target), daemon=True)
     server.start()
@@ -72,11 +106,19 @@ def _serve_in_thread(request, target, monkeypatch=None):
     raise AssertionError("bridge socket never appeared")
 
 
-def _call(target, command):
+def _call(target, request, command):
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         client.connect(str(target["socket"]))
-        client.sendall(json.dumps(command).encode() + b"\n")
+        client.sendall(
+            json.dumps(
+                {
+                    "rendezvous_identity": request["rendezvous_identity"],
+                    "request": command,
+                }
+            ).encode()
+            + b"\n"
+        )
         raw = bytearray()
         while b"\n" not in raw:
             block = client.recv(65536)
@@ -140,11 +182,12 @@ def test_uncertain_admit_records_submit_ambiguous_via_real_serve(
     short_root, response_lost, monkeypatch
 ):
     marker, calls = response_lost
-    target = _target(short_root)
+    request = _request(short_root)
+    target = _target(short_root, request)
     delivery_id = str(uuid.uuid4())
-    _serve_in_thread(_request(), target, monkeypatch)
+    _serve_in_thread(request, target, monkeypatch)
 
-    response = _call(target, {"op": "admit", "delivery_id": delivery_id})
+    response = _call(target, request, {"op": "admit", "delivery_id": delivery_id})
 
     assert response["ok"] is False
     assert "submit-ambiguous" in response["error"]
@@ -167,11 +210,12 @@ def test_submit_ambiguous_survives_reopen_and_retry_never_replays(
     short_root, response_lost, monkeypatch
 ):
     marker, calls = response_lost
-    target = _target(short_root)
+    request = _request(short_root)
+    target = _target(short_root, request)
     delivery_id = str(uuid.uuid4())
-    _serve_in_thread(_request(), target, monkeypatch)
+    _serve_in_thread(request, target, monkeypatch)
 
-    first = _call(target, {"op": "admit", "delivery_id": delivery_id})
+    first = _call(target, request, {"op": "admit", "delivery_id": delivery_id})
     assert first["ok"] is False
 
     # Crash/reconcile: a fresh journal handle over the same durable file
@@ -182,7 +226,7 @@ def test_submit_ambiguous_survives_reopen_and_retry_never_replays(
 
     # A retry over a fresh connection is refused and never replays the
     # provider call (no second effect, no downgrade to terminal_queued).
-    retry = _call(target, {"op": "admit", "delivery_id": delivery_id})
+    retry = _call(target, request, {"op": "admit", "delivery_id": delivery_id})
     assert retry["ok"] is False
     assert calls == ["admit"], "the provider turn must not be resubmitted"
     record = reopened.get("obligation-delivery", delivery_id)
@@ -201,11 +245,12 @@ def test_pre_boundary_refusal_is_not_marked_ambiguous(short_root, monkeypatch):
         "_ProviderSession",
         lambda request: _PreBoundarySession(request, short_root / "m", calls),
     )
-    target = _target(short_root)
+    request = _request(short_root)
+    target = _target(short_root, request)
     delivery_id = str(uuid.uuid4())
-    _serve_in_thread(_request(), target, monkeypatch)
+    _serve_in_thread(request, target, monkeypatch)
 
-    response = _call(target, {"op": "admit", "delivery_id": delivery_id})
+    response = _call(target, request, {"op": "admit", "delivery_id": delivery_id})
 
     assert response["ok"] is False
     journal = DeliveryJournal(target["root"] / "delivery-journal.db")
@@ -221,11 +266,12 @@ def test_uncertain_deliver_records_submit_ambiguous_via_real_serve(
     short_root, response_lost, monkeypatch
 ):
     _, calls = response_lost
-    target = _target(short_root)
+    request = _request(short_root)
+    target = _target(short_root, request)
     message_id = str(uuid.uuid4())
-    _serve_in_thread(_request(), target, monkeypatch)
+    _serve_in_thread(request, target, monkeypatch)
 
-    response = _call(target, {"op": "deliver", "message_id": message_id})
+    response = _call(target, request, {"op": "deliver", "message_id": message_id})
 
     assert response["ok"] is False
     assert calls == ["deliver"]

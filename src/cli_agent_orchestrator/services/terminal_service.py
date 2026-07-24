@@ -411,6 +411,12 @@ def _v2_resource_presence(
     """
     kind = entry["kind"]
     fs_path = entry.get("desired_fs_path")
+    if kind == "socket" and entry.get("binding_identity") is not None:
+        from cli_agent_orchestrator.services.managed_provider_bridge import (
+            rendezvous_resource_presence,
+        )
+
+        return rendezvous_resource_presence(entry)
     if fs_path:
         return Path(fs_path).exists()
     if kind in ("tmux_window", "provider_instance", "pipe_pane"):
@@ -483,6 +489,17 @@ def _remove_v2_resource(entry: dict[str, Any], terminal_id: str) -> None:
     session) — here they are only ever probed, never removed.
     """
     fs_path = entry.get("desired_fs_path")
+    if entry["kind"] == "socket" and entry.get("binding_identity") is not None:
+        from cli_agent_orchestrator.services.managed_provider_bridge import (
+            cleanup_stale_rendezvous,
+        )
+
+        cleanup_stale_rendezvous(
+            entry,
+            terminal_id=terminal_id,
+            generation=entry["generation"],
+        )
+        return
     if fs_path:
         with contextlib.suppress(OSError):
             Path(fs_path).unlink()
@@ -596,6 +613,7 @@ def _deregister_v2_terminal_resources(
                 state = "draining"
             if state == "draining":
                 registry.close(entry_id, actor_id=deleter)
+                entry = registry.resolve(entry_id)
             _remove_v2_resource(entry, terminal_id)
             if _v2_resource_presence(entry, terminal_id, session_name) is False:
                 registry.delete(

@@ -35,7 +35,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 
 def _read_available(stream, size: int) -> bytes:
@@ -113,14 +113,35 @@ def _channel_loop(sock: socket.socket) -> None:
                     return
 
 
-def _open_channel(socket_path: str) -> Optional[socket.socket]:
+def _open_channel(
+    socket_path: str, binding_identity: dict[str, str]
+) -> Optional[tuple[socket.socket, Any]]:
     """Connect to the generation-private bridge socket as the provider peer."""
+    from cli_agent_orchestrator.services.managed_provider_bridge import (
+        BridgeError,
+        verify_rendezvous_binding,
+    )
+
     sock: Optional[socket.socket] = None
+    verification: Any = None
     for _ in range(200):
         try:
+            # Re-read the O_EXCL binding immediately before every connect
+            # attempt; never carry an earlier verification across retries.
+            verification = verify_rendezvous_binding(socket_path, binding_identity)
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.connect(socket_path)
+            # A pathname swap during connect gets no handshake bytes.
+            verify_rendezvous_binding(
+                socket_path,
+                binding_identity,
+                expected=verification,
+            )
             break
+        except BridgeError:
+            if sock is not None:
+                sock.close()
+            return None
         except OSError:
             if sock is not None:
                 sock.close()
@@ -128,39 +149,90 @@ def _open_channel(socket_path: str) -> Optional[socket.socket]:
             time.sleep(0.05)
     if sock is None:
         return None
-    hello = {"op": "provider-channel", "pid": os.getpid()}
+    if verification is None:
+        sock.close()
+        return None
+    hello = {
+        "rendezvous_identity": binding_identity,
+        "request": {"op": "provider-channel", "pid": os.getpid()},
+    }
     try:
         sock.sendall(json.dumps(hello).encode() + b"\n")
+        # Pin the same claim on both sides of the handshake send. A later
+        # provider spawn may rely only on this unchanged channel/claim pair.
+        verify_rendezvous_binding(
+            socket_path,
+            binding_identity,
+            expected=verification,
+        )
     except OSError:
         sock.close()
         return None
-    return sock
+    except BridgeError:
+        sock.close()
+        return None
+    return sock, verification
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", required=True)
+    parser.add_argument("--identity-json", required=True)
     parser.add_argument(
         "provider_argv",
         nargs=argparse.REMAINDER,
         help="the real provider argv after --",
     )
     args = parser.parse_args(argv)
+    try:
+        binding_identity = json.loads(args.identity_json)
+    except json.JSONDecodeError:
+        parser.error("--identity-json must be valid JSON")
+    if not isinstance(binding_identity, dict):
+        parser.error("--identity-json must name an object")
     provider_argv = list(args.provider_argv)
     if provider_argv and provider_argv[0] == "--":
         provider_argv = provider_argv[1:]
     if not provider_argv:
         parser.error("the real provider argv is required after --")
 
-    child = subprocess.Popen(
-        provider_argv,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        # The child's stderr is inherited verbatim: the bridge's provider
-        # stderr log line stream is unchanged by the shim.
-        stderr=None,
-        env=dict(os.environ),
+    # Verify the full rendezvous tuple and establish the provider-originated
+    # channel before the real provider child can have any effect.
+    opened = _open_channel(args.socket, binding_identity)
+    if opened is None:
+        return 1
+    channel, verification = opened
+    from cli_agent_orchestrator.services.managed_provider_bridge import (
+        BridgeError,
+        verify_launch_binding_identity,
+        verify_rendezvous_binding,
     )
+
+    try:
+        # This is the actual provider-effect boundary: both the repository
+        # HEAD and the exact sidecar/socket inodes must still match the
+        # channel established above. Drift refuses before real-provider Popen.
+        verify_launch_binding_identity(binding_identity)
+        verify_rendezvous_binding(
+            args.socket,
+            binding_identity,
+            expected=verification,
+        )
+        child = subprocess.Popen(
+            provider_argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            # The child's stderr is inherited verbatim: the bridge's provider
+            # stderr log line stream is unchanged by the shim.
+            stderr=None,
+            env=dict(os.environ),
+        )
+    except BridgeError:
+        channel.close()
+        return 1
+    except Exception:
+        channel.close()
+        raise
 
     def _forward_signal(signum, frame):  # noqa: ARG001 - signal handler shape
         if child.poll() is None:
@@ -169,15 +241,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _forward_signal)
     signal.signal(signal.SIGINT, _forward_signal)
 
-    channel = _open_channel(args.socket)
-    if channel is not None:
-        threading.Thread(target=_channel_loop, args=(channel,), daemon=True).start()
+    threading.Thread(target=_channel_loop, args=(channel,), daemon=True).start()
 
     threading.Thread(target=_pump_stdin, args=(child,), daemon=True).start()
     _pump_stdout(child)
     returncode = child.wait()
-    if channel is not None:
-        channel.close()
+    channel.close()
     return returncode
 
 

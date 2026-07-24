@@ -31,6 +31,10 @@ class ManagedLaunchReserveRequest(BaseModel):
     provider: str = Field(min_length=1)
     agent_profile: str = Field(min_length=1)
     caller_id: str = Field(pattern=r"^[a-f0-9]{8}$")
+    # Immutable orchestration identity is present before the no-task launch
+    # so the bridge rendezvous binds the exact later admission context.
+    project: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
     working_directory: str = Field(min_length=1)
     trusted_project_root: Optional[str] = None
     expected_model: str = Field(min_length=1)
