@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 
 import pytest
 
@@ -211,6 +213,41 @@ def test_kimi_receipt_never_promotes_client_rpc_id_to_provider_identity(tmp_path
     assert submission["provider_turn_id"] == "provider-step-opaque"
     assert ":rpc:" not in submission["receipt_id"]
     assert submission["provider_accepted"] is True
+
+
+def test_kimi_inventory_names_match_final_provider_child_environment(tmp_path, monkeypatch):
+    request = _request(tmp_path, provider="kimi_cli", model="kimi-code/k3", effort="max")
+    wire = tmp_path / "wire.jsonl"
+    wire.write_text("")
+    isolated_environment = {
+        "HOME": "/home/kimi",
+        "PATH": "/ambient/bin",
+        "KIMI_CODE_HOME": "/provider/kimi",
+        "KIMI_MODEL_THINKING_EFFORT": "low",
+        "CODEX_HOME": "/foreign/codex",
+    }
+    monkeypatch.setattr(os, "environ", isolated_environment)
+    monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", None)
+    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+    monkeypatch.setattr(bridge, "_RpcProcess", _KimiRpc)
+    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "0.29.0")
+    monkeypatch.setattr(bridge, "_kimi_wire_path", lambda *_: wire)
+
+    inventory = bridge._bind_bridge_environment(request)
+    session = bridge._ProviderSession(request)
+    session.initialize()
+    child_environment = session.rpc.env
+
+    assert inventory["names"] == sorted(child_environment)
+    assert (
+        inventory["names_sha256"]
+        == bridge._environment_inventory("kimi_cli", list(child_environment))["names_sha256"]
+    )
+    assert child_environment["KIMI_MODEL_THINKING_EFFORT"] == "max"
+    assert "CODEX_HOME" not in child_environment
+    serialized = json.dumps(inventory, sort_keys=True)
+    assert "max" not in serialized
+    assert "/provider/kimi" not in serialized
 
 
 def test_kimi_turn_receipt_comes_from_structured_provider_journal(tmp_path):

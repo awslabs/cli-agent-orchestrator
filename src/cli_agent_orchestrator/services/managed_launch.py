@@ -664,7 +664,10 @@ def append_observation(
                     "observations_json": _canonical_json(observations),
                     "updated_at": _now(),
                 }
-                if request.kind in {"negative", "cancelled"}:
+                if (
+                    request.kind in {"negative", "cancelled"}
+                    and row.state != "launch-failed-bridge"
+                ):
                     if row.state in {"admitting", "admitted"}:
                         raise ManagedLaunchConflict(
                             f"{request.kind} evidence cannot supersede task admission"
@@ -678,7 +681,6 @@ def append_observation(
                         "launching",
                         "ready",
                         "preflight_blocked",
-                        "launch-failed-bridge",
                         "negative",
                         "cancelled",
                     }:

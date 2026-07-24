@@ -419,6 +419,44 @@ def test_observation_append_is_idempotent(isolated_memory_db, tmp_path):
     assert len(first["observations"]) == 1
 
 
+@pytest.mark.parametrize("kind", ["negative", "cancelled"])
+def test_observation_cannot_replace_launch_failure_terminal_proof(
+    isolated_memory_db, tmp_path, kind
+):
+    request = _reserve_request(tmp_path)
+    managed_launch.reserve(request)
+    record, should_launch = managed_launch.claim_launch(request.reservation_id)
+    assert should_launch
+    bridge_state = _launch_failure_state(record, request)
+    failed = managed_launch.mark_launch_failed_bridge(request.reservation_id, bridge_state)
+    terminal_proof = {
+        "state": failed["state"],
+        "admission": deepcopy(failed["admission"]),
+        "negative": deepcopy(failed["negative"]),
+        "launch_failure": deepcopy(failed["launch_failure"]),
+    }
+    observation = ManagedLaunchObservationRequest(
+        protocol_version=PROTOCOL_VERSION,
+        observation_id=str(uuid.uuid4()),
+        kind=kind,
+        terminal_id=record["terminal_id"],
+        generation=record["generation"],
+        provider=record["provider"],
+        agent_profile=record["agent_profile"],
+        model=request.expected_model,
+        effort=request.expected_effort,
+        evidence_digest="d" * 64,
+        detail="late observation after exact launch failure finalization",
+    )
+
+    observed = managed_launch.append_observation(request.reservation_id, observation)
+
+    assert {key: observed[key] for key in terminal_proof} == terminal_proof
+    assert observed["state"] == "launch-failed-bridge"
+    assert observed["observations"][-1]["observation_id"] == observation.observation_id
+    assert observed["observations"][-1]["kind"] == kind
+
+
 def test_concurrent_observations_are_append_only(isolated_memory_db, tmp_path):
     request = _reserve_request(tmp_path)
     record, _ = managed_launch.reserve(request)

@@ -211,6 +211,31 @@ def _provider_env(overrides: Optional[dict[str, str]] = None) -> dict[str, str]:
     return env
 
 
+def _provider_route_environment(request: dict[str, Any]) -> dict[str, str]:
+    """Return route controls pinned by the immutable launch request."""
+    if request["provider"] == "kimi_cli":
+        effort = request.get("effort")
+        if not isinstance(effort, str) or not effort:
+            raise BridgeError("Kimi managed launch requires a pinned effort")
+        return {"KIMI_MODEL_THINKING_EFFORT": effort}
+    return {}
+
+
+def _provider_child_environment(request: dict[str, Any]) -> dict[str, str]:
+    """Compose the exact environment passed to the provider child."""
+    return _provider_env(_provider_route_environment(request))
+
+
+def _bind_bridge_environment(request: dict[str, Any]) -> dict[str, Any]:
+    """Scrub the bridge and bind the final provider child environment."""
+    global _BOUND_PROVIDER_ENV
+
+    _prune_bridge_environment(request["provider"])
+    provider_env = _provider_child_environment(request)
+    _BOUND_PROVIDER_ENV = provider_env
+    return _environment_inventory(request["provider"], list(provider_env))
+
+
 def _launcher_argv(
     socket_path: pathlib.Path,
     binding_identity: dict[str, str],
@@ -1414,6 +1439,7 @@ class _ProviderSession:
         self.kimi_wire_path: Optional[pathlib.Path] = None
         self._companion_scan_index = 0
         self._current_turn_id: Optional[str] = None
+        self.provider_io_started = False
         # Per-session provider-turn ordinal (1-based), incremented only on a
         # natively accepted turn; the route receipt's event_sequence.
         self._turn_sequence = 0
@@ -1454,12 +1480,13 @@ class _ProviderSession:
             != self.request["provider_executable_sha256"]
         ):
             raise BridgeError("provider executable digest changed after reservation")
+        self.provider_io_started = True
         proc = subprocess.run(
             [executable, "--version"],
             capture_output=True,
             text=True,
             timeout=5,
-            env=_provider_env(),
+            env=_provider_child_environment(self.request),
         )
         actual = proc.stdout.strip()
         if proc.returncode != 0 or actual != expected:
@@ -1491,8 +1518,11 @@ class _ProviderSession:
         )
         config_path = pathlib.Path(os.path.expanduser("~/.codex/config.toml"))
         config_before = _file_digest_or_absent(config_path)
+        self.provider_io_started = True
         self.rpc = _RpcProcess(
-            argv, env=_provider_env(), companion_identity=self._companion_identity()
+            argv,
+            env=_provider_child_environment(self.request),
+            companion_identity=self._companion_identity(),
         )
         initialize_request = {
             "clientInfo": {"name": "cao-managed-native", "version": BRIDGE_VERSION}
@@ -1557,8 +1587,9 @@ class _ProviderSession:
         kimi_bin = self.request["provider_executable"]
         version = self._version(kimi_bin, SUPPORTED_KIMI_VERSION)
         # Route control (thinking effort) comes ONLY from the reservation
-        # request, applied over the minimal allowlisted environment.
-        env = _provider_env({"KIMI_MODEL_THINKING_EFFORT": self.request["effort"]})
+        # request and is part of the final inventoried child environment.
+        env = _provider_child_environment(self.request)
+        self.provider_io_started = True
         self.rpc = _RpcProcess(
             _launcher_argv(
                 paths(self.request["reservation_id"], self.request)["socket"],
@@ -2646,7 +2677,7 @@ def _scope_direct_serve_environment(serve: Callable[..., int]) -> Callable[..., 
 
         ambient_environment = dict(os.environ)
         try:
-            direct_inventory = _prune_bridge_environment(request["provider"])
+            direct_inventory = _bind_bridge_environment(request)
             return serve(request, target, environment_inventory=direct_inventory)
         finally:
             global _BOUND_PROVIDER_ENV
@@ -2982,7 +3013,11 @@ def _serve(
             exc,
             environment_inventory,
             provider_io_started=bool(
-                session is not None and getattr(session, "rpc", None) is not None
+                session is not None
+                and (
+                    getattr(session, "provider_io_started", False)
+                    or getattr(session, "rpc", None) is not None
+                )
             ),
         )
         state.update(
@@ -3029,7 +3064,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # The provider is pinned in the immutable request.  Compose and scrub at
     # this actual pane-process launch boundary before the unchanged guard in
     # _serve; foreign supervisor controls never reach the target provider.
-    environment_inventory = _prune_bridge_environment(request["provider"])
+    environment_inventory = _bind_bridge_environment(request)
     return _serve(request, target, environment_inventory=environment_inventory)
 
 

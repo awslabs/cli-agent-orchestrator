@@ -776,6 +776,79 @@ def test_direct_bridge_serves_do_not_retain_provider_environment(monkeypatch):
             rr.reset_resource_registry()
 
 
+def test_failed_provider_version_probe_records_provider_io(monkeypatch):
+    """A completed provider subprocess attempt is provider I/O even when
+    initialization fails before the RPC client is assigned."""
+    import hashlib
+    import json
+    import tempfile
+
+    from cli_agent_orchestrator.services import managed_provider_bridge as bridge
+
+    with tempfile.TemporaryDirectory(prefix="lb-version-", dir="/tmp") as root_arg:
+        base = Path(root_arg).resolve()
+        home = base / "cao-home"
+        home.mkdir()
+        executable = base / "codex"
+        executable.write_text("provider", encoding="utf-8")
+        executable.chmod(0o755)
+        profile_sha256 = "a" * 64
+        monkeypatch.setattr("cli_agent_orchestrator.constants.CAO_HOME_DIR", home)
+        monkeypatch.setattr(bridge, "BRIDGE_ROOT", base / "managed-provider-sessions")
+        monkeypatch.setattr(bridge, "RENDEZVOUS_ROOT", base / "rendezvous")
+        monkeypatch.setattr(bridge, "verify_launch_binding_identity", lambda *_: None)
+        monkeypatch.setattr(
+            bridge,
+            "_profile_material",
+            lambda *_: {
+                "profile": object(),
+                "profile_sha256": profile_sha256,
+                "allowed_tools": ["*"],
+                "system_prompt": "",
+                "mcp_servers": [],
+            },
+        )
+
+        class _FailedVersion:
+            returncode = 7
+            stdout = "unexpected-version"
+
+        monkeypatch.setattr(bridge.subprocess, "run", lambda *_args, **_kwargs: _FailedVersion())
+        rr.reset_resource_registry()
+        try:
+            request = _bridge_request(
+                reservation_id=str(uuid.uuid4()),
+                terminal_id="c1d2e3f4",
+                generation=str(uuid.uuid4()),
+                worktree=base,
+            )
+            request.update(
+                {
+                    "bridge_version": bridge.BRIDGE_VERSION,
+                    "agent_profile": "reviewer",
+                    "profile_sha256": profile_sha256,
+                    "model": "gpt-5.6-sol",
+                    "effort": "high",
+                    "working_directory": str(base),
+                    "provider_executable": str(executable),
+                    "provider_executable_sha256": hashlib.sha256(
+                        executable.read_bytes()
+                    ).hexdigest(),
+                }
+            )
+            target = bridge.write_request(request["reservation_id"], request)
+
+            assert bridge._serve(request, target) == 1
+
+            state = json.loads(target["state"].read_text(encoding="utf-8"))
+            assert state["state"] == "launch-failed-bridge"
+            assert state["launch_failure"]["provider_io_started"] is True
+            assert state["launch_failure"]["task_bytes_submitted"] is False
+            assert "unsupported provider version" in state["error"]
+        finally:
+            rr.reset_resource_registry()
+
+
 def test_bridge_teardown_never_synthesizes_absence(tmp_path, monkeypatch):
     """A bridge resource that cannot be physically removed keeps its row:
     the registry records deletion only against a real absence probe."""
