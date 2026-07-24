@@ -60,6 +60,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from test.fixtures.tmux_server import AMBIENT_SERVER_VARS
 from types import ModuleType
 from typing import Any, Callable, Iterator, Mapping, Optional
 
@@ -179,10 +180,20 @@ def _subprocess_env(
     developer's exported ``AUTH0_DOMAIN`` doesn't accidentally enable auth in
     the no-auth variant), then applies the standard test overrides plus any
     ``extra`` knobs.
+
+    The ambient tmux variables go too. A server started from inside a tmux
+    pane inherits ``TMUX``, and every unqualified ``tmux`` the subprocess
+    runs then resolves against *that* server — the operator's, holding
+    real work — regardless of any temporary directory the fixture set.
+    Stripping them here makes the subprocess's tmux target a decision the
+    fixture makes explicitly (see ``test.fixtures.tmux_server``) rather
+    than one it inherits.
     """
     env = os.environ.copy()
     for leaked in ("AUTH0_DOMAIN", "AUTH0_AUDIENCE", "CAO_AUTH_JWKS_URI"):
         env.pop(leaked, None)
+    for ambient in AMBIENT_SERVER_VARS:
+        env.pop(ambient, None)
 
     env.update(
         {
