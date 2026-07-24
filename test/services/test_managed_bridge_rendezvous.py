@@ -110,6 +110,68 @@ def test_rendezvous_digest_uses_domain_fixed_order_and_trailing_newline(rendezvo
     assert bridge._rendezvous_key(identity) == f"sk-{digest[:16]}"
 
 
+@pytest.mark.parametrize(
+    "changes,error",
+    [
+        ({"task_id": ""}, "empty fields"),
+        ({"worktree_realpath": "/tmp/../tmp"}, "not canonical"),
+        ({"head": "NOT-A-FULL-LOWERCASE-OID"}, "not a full lowercase hex OID"),
+    ],
+)
+def test_binding_identity_rejects_ambiguous_full_tuple_fields(tmp_path, changes, error):
+    with pytest.raises(bridge.BridgeError, match=error):
+        bridge._validate_binding_identity(_identity(tmp_path, **changes))
+
+    with pytest.raises(bridge.BridgeError, match="incomplete or malformed"):
+        bridge._validate_binding_identity({"terminal_id": "a1b2c3d4"})
+
+
+def test_launch_binding_refuses_a_missing_canonical_worktree(tmp_path):
+    identity = _identity(tmp_path, worktree_realpath=str(tmp_path / "missing"))
+
+    with pytest.raises(bridge.BridgeError, match="worktree identity drifted"):
+        bridge.verify_launch_binding_identity(identity)
+
+
+def test_rendezvous_root_and_path_bounds_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "RENDEZVOUS_ROOT", tmp_path / "missing" / "runtime")
+    with pytest.raises(bridge.BridgeError, match="runtime directory is unavailable"):
+        bridge._secure_rendezvous_root()
+
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir(mode=0o755)
+    runtime_root.chmod(0o755)
+    monkeypatch.setattr(bridge, "RENDEZVOUS_ROOT", runtime_root)
+    with pytest.raises(bridge.BridgeError, match="not owner-only"):
+        bridge._secure_rendezvous_root()
+
+    runtime_root.chmod(0o700)
+    monkeypatch.setattr(bridge, "_AF_UNIX_SAFE_PATH_BYTES", 1)
+    with pytest.raises(bridge.BridgeError, match="exceeds the safe AF_UNIX bound"):
+        bridge.rendezvous_paths(_identity(tmp_path))
+
+
+def test_socket_identity_record_rejects_malformed_or_unsafe_shapes():
+    with pytest.raises(bridge.BridgeError, match="socket-binding-record-malformed"):
+        bridge._validate_socket_identity({})
+
+    wrong_type = {
+        "st_dev": 1,
+        "st_ino": 1,
+        "st_mode": 0,
+        "st_uid": 1,
+        "st_size": 0,
+        "st_mtime_ns": 1,
+        "st_ctime_ns": True,
+    }
+    with pytest.raises(bridge.BridgeError, match="socket-binding-record-malformed"):
+        bridge._validate_socket_identity(wrong_type)
+
+    wrong_type["st_ctime_ns"] = 1
+    with pytest.raises(bridge.BridgeError, match="socket-binding-record-malformed"):
+        bridge._validate_socket_identity(wrong_type)
+
+
 def test_long_cond0081_worktree_kept_exact_while_socket_is_bounded(
     rendezvous_env, tmp_path, monkeypatch
 ):
