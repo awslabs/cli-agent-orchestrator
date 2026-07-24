@@ -113,14 +113,24 @@ def _channel_loop(sock: socket.socket) -> None:
                     return
 
 
-def _open_channel(socket_path: str) -> Optional[socket.socket]:
+def _open_channel(socket_path: str, binding_identity: dict[str, str]) -> Optional[socket.socket]:
     """Connect to the generation-private bridge socket as the provider peer."""
+    from cli_agent_orchestrator.services.managed_provider_bridge import (
+        BridgeError,
+        verify_rendezvous_binding,
+    )
+
     sock: Optional[socket.socket] = None
     for _ in range(200):
         try:
+            # Re-read the O_EXCL binding immediately before every connect
+            # attempt; never carry an earlier verification across retries.
+            verify_rendezvous_binding(socket_path, binding_identity)
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.connect(socket_path)
             break
+        except BridgeError:
+            return None
         except OSError:
             if sock is not None:
                 sock.close()
@@ -128,7 +138,10 @@ def _open_channel(socket_path: str) -> Optional[socket.socket]:
             time.sleep(0.05)
     if sock is None:
         return None
-    hello = {"op": "provider-channel", "pid": os.getpid()}
+    hello = {
+        "rendezvous_identity": binding_identity,
+        "request": {"op": "provider-channel", "pid": os.getpid()},
+    }
     try:
         sock.sendall(json.dumps(hello).encode() + b"\n")
     except OSError:
@@ -140,27 +153,43 @@ def _open_channel(socket_path: str) -> Optional[socket.socket]:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", required=True)
+    parser.add_argument("--identity-json", required=True)
     parser.add_argument(
         "provider_argv",
         nargs=argparse.REMAINDER,
         help="the real provider argv after --",
     )
     args = parser.parse_args(argv)
+    try:
+        binding_identity = json.loads(args.identity_json)
+    except json.JSONDecodeError:
+        parser.error("--identity-json must be valid JSON")
+    if not isinstance(binding_identity, dict):
+        parser.error("--identity-json must name an object")
     provider_argv = list(args.provider_argv)
     if provider_argv and provider_argv[0] == "--":
         provider_argv = provider_argv[1:]
     if not provider_argv:
         parser.error("the real provider argv is required after --")
 
-    child = subprocess.Popen(
-        provider_argv,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        # The child's stderr is inherited verbatim: the bridge's provider
-        # stderr log line stream is unchanged by the shim.
-        stderr=None,
-        env=dict(os.environ),
-    )
+    # Verify the full rendezvous tuple and establish the provider-originated
+    # channel before the real provider child can have any effect.
+    channel = _open_channel(args.socket, binding_identity)
+    if channel is None:
+        return 1
+    try:
+        child = subprocess.Popen(
+            provider_argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            # The child's stderr is inherited verbatim: the bridge's provider
+            # stderr log line stream is unchanged by the shim.
+            stderr=None,
+            env=dict(os.environ),
+        )
+    except Exception:
+        channel.close()
+        raise
 
     def _forward_signal(signum, frame):  # noqa: ARG001 - signal handler shape
         if child.poll() is None:
@@ -169,15 +198,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGTERM, _forward_signal)
     signal.signal(signal.SIGINT, _forward_signal)
 
-    channel = _open_channel(args.socket)
-    if channel is not None:
-        threading.Thread(target=_channel_loop, args=(channel,), daemon=True).start()
+    threading.Thread(target=_channel_loop, args=(channel,), daemon=True).start()
 
     threading.Thread(target=_pump_stdin, args=(child,), daemon=True).start()
     _pump_stdout(child)
     returncode = child.wait()
-    if channel is not None:
-        channel.close()
+    channel.close()
     return returncode
 
 

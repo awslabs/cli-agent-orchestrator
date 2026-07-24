@@ -1101,6 +1101,7 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
     from cli_agent_orchestrator.services import terminal_service
     from cli_agent_orchestrator.services.managed_provider_bridge import (
         BRIDGE_VERSION,
+        launch_binding_identity,
         profile_digest,
         read_state,
         request_bridge,
@@ -1122,6 +1123,14 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
         # P1-9 (§20.2f): the provider executable is the reservation-pinned
         # absolute identity — never a PATH resolution.
         provider_executable, provider_digest = _executable_identity(request)
+        rendezvous_identity = launch_binding_identity(
+            project=os.path.basename(record["working_directory"]),
+            task_id=record["reservation_id"],
+            terminal_id=record["terminal_id"],
+            terminal_generation=record["generation"],
+            working_directory=record["working_directory"],
+            actor=record["caller_id"],
+        )
         bridge_request = {
             "bridge_version": BRIDGE_VERSION,
             "reservation_id": reservation_id,
@@ -1135,6 +1144,7 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             "working_directory": record["working_directory"],
             "provider_executable": provider_executable,
             "provider_executable_sha256": provider_digest,
+            "rendezvous_identity": rendezvous_identity,
         }
         write_request(reservation_id, bridge_request)
     except Exception as exc:  # noqa: BLE001 - no provider I/O occurred

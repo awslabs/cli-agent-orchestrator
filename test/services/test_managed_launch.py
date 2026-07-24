@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -42,6 +43,26 @@ def _reserve_request(tmp_path, **changes):
     }
     payload.update(changes)
     return ManagedLaunchReserveRequest(**payload)
+
+
+def _commit_fixture_worktree(tmp_path) -> None:
+    """Give launch tests a real repository/head for the rendezvous tuple."""
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "fake-provider"], cwd=tmp_path, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=managed-launch-test",
+            "-c",
+            "user.email=managed-launch@example.test",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
 
 
 def _admit_request(message="review the exact head", **changes):
@@ -425,6 +446,7 @@ async def test_launch_reserved_uses_exact_provider_bridge_before_readiness(
     isolated_memory_db, tmp_path, monkeypatch
 ):
     request = _reserve_request(tmp_path)
+    _commit_fixture_worktree(tmp_path)
     record, _ = managed_launch.reserve(request)
     calls = []
 
@@ -481,6 +503,7 @@ async def test_kimi_launch_uses_exact_provider_bridge_route(
         expected_model="kimi-code/k3",
         expected_effort="max",
     )
+    _commit_fixture_worktree(tmp_path)
     record, _ = managed_launch.reserve(request)
     calls = []
 

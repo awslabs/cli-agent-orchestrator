@@ -801,6 +801,7 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
     from cli_agent_orchestrator.services import terminal_service
     from cli_agent_orchestrator.services.managed_provider_bridge import (
         BRIDGE_VERSION,
+        launch_binding_identity,
         profile_digest,
         read_state,
         request_bridge,
@@ -819,6 +820,14 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
         with open(executable, "rb") as handle:
             if hashlib.sha256(handle.read()).hexdigest() != digest:
                 raise ManagedLaunchConflict("provider executable digest drifted from the pin")
+        rendezvous_identity = launch_binding_identity(
+            project=request.get("project") or record["run_id"],
+            task_id=record["task_id"] or record["run_id"],
+            terminal_id=record["terminal_id"],
+            terminal_generation=record["generation"],
+            working_directory=record["working_directory"],
+            actor=record["caller_id"],
+        )
         bridge_request = {
             "bridge_version": BRIDGE_VERSION,
             "reservation_id": reservation_id,
@@ -843,6 +852,7 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             "run_id": record["run_id"],
             "obligation_generation": record["obligation_generation"],
             "assigned_policy_sha256": profile_digest(record["agent_profile"]),
+            "rendezvous_identity": rendezvous_identity,
         }
         write_request(reservation_id, bridge_request)
     except Exception as exc:  # noqa: BLE001 - no provider I/O occurred

@@ -36,6 +36,7 @@ supporting common table expressions inside trigger programs.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import uuid
@@ -108,6 +109,7 @@ CREATE TABLE resource (
   ownership TEXT NOT NULL CHECK (ownership IN ('owned','external','shared')),
   desired_fs_path TEXT, desired_db_key TEXT,
   desired_tmux_name TEXT, desired_memory_key TEXT,
+  binding_identity_json TEXT,
   observed_fs_path TEXT, observed_db_key TEXT,
   observed_tmux_id TEXT, observed_pid INTEGER, observed_memory_key TEXT,
   constructor_id TEXT NOT NULL, monitor_id TEXT, deleter_id TEXT NOT NULL,
@@ -274,6 +276,11 @@ class ResourceRegistry:
                 "r.entry_id = NEW.entry_id) BEGIN SELECT RAISE(ABORT,"
                 "'resource rows are history; never replaced'); END;"
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(resource)")}
+            if "binding_identity_json" not in columns:
+                # Additive schema-v1 migration: old readers use named columns
+                # or SELECT * dicts and tolerate this nullable binding field.
+                conn.execute("ALTER TABLE resource ADD COLUMN binding_identity_json TEXT")
             conn.commit()
         except sqlite3.Error as exc:
             conn.rollback()
@@ -359,6 +366,13 @@ class ResourceRegistry:
 
     def _entry_dict(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         entry = dict(row)
+        raw_binding = entry.pop("binding_identity_json", None)
+        try:
+            entry["binding_identity"] = json.loads(raw_binding) if raw_binding is not None else None
+        except json.JSONDecodeError as exc:
+            raise RegistryError(
+                f"registry entry {row['entry_id']} has malformed binding identity"
+            ) from exc
         entry["depends_on"] = [
             r[0]
             for r in conn.execute(
@@ -450,6 +464,7 @@ class ResourceRegistry:
         desired_db_key: Optional[str] = None,
         desired_tmux_name: Optional[str] = None,
         desired_memory_key: Optional[str] = None,
+        binding_identity: Optional[dict[str, str]] = None,
         monitor_id: Optional[str] = None,
         depends_on: tuple[str, ...] = (),
         consumer_ids: tuple[str, ...] = (),
@@ -482,6 +497,11 @@ class ResourceRegistry:
                         "resource stays discoverable across the create-to-capture "
                         "crash window"
                     )
+        binding_identity_json = (
+            json.dumps(binding_identity, sort_keys=True, separators=(",", ":"))
+            if binding_identity is not None
+            else None
+        )
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -490,9 +510,10 @@ class ResourceRegistry:
             conn.execute(
                 "INSERT INTO resource(entry_id, kind, protocol_vintage, terminal_id, "
                 "generation, owner, ownership, desired_fs_path, desired_db_key, "
-                "desired_tmux_name, desired_memory_key, constructor_id, monitor_id, "
-                "deleter_id, lifecycle_state, state_seq, rollback_rule) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'declared',1,?)",
+                "desired_tmux_name, desired_memory_key, binding_identity_json, "
+                "constructor_id, monitor_id, deleter_id, lifecycle_state, state_seq, "
+                "rollback_rule) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'declared',1,?)",
                 (
                     entry_id,
                     kind,
@@ -505,6 +526,7 @@ class ResourceRegistry:
                     desired_db_key,
                     desired_tmux_name,
                     desired_memory_key,
+                    binding_identity_json,
                     constructor_id,
                     monitor_id,
                     deleter_id,
@@ -865,12 +887,12 @@ _BRIDGE = "managed_provider_bridge._serve"
 _TS_DECLARE = f"{_TS}:328"  # registry.declare in _register_v2_terminal_resources
 _TS_MARK = f"{_TS}:376"  # registry.register_created in _mark_v2_resource_created
 _TS_MONITOR = f"{_TS}:344"  # registry.monitor in _register_v2_terminal_resources
-_TS_DELETE = f"{_TS}:601"  # registry.delete in _deregister_v2_terminal_resources
+_TS_DELETE = f"{_TS}:619"  # registry.delete in _deregister_v2_terminal_resources
 _CS_RESOLVE = f"{_CS}:112"  # registry.resolve_fs_path in cleanup_old_data
-_BR_DECLARE = f"{_BR}:1272"  # registry.declare in _declare_bridge_resources
-_BR_MARK = f"{_BR}:1308"  # registry.register_created in _mark_bridge_resource_created
-_BR_JOURNAL_MARK = f"{_BR}:1334"  # registry.register_created in _mark_bridge_journal_created
-_BR_DELETE = f"{_BR}:1430"  # registry.delete in _deregister_bridge_resources
+_BR_DECLARE = f"{_BR}:1571"  # registry.declare in _declare_bridge_resources
+_BR_MARK = f"{_BR}:1608"  # registry.register_created in _mark_bridge_resource_created
+_BR_JOURNAL_MARK = f"{_BR}:1634"  # registry.register_created in _mark_bridge_journal_created
+_BR_DELETE = f"{_BR}:1753"  # registry.delete in _deregister_bridge_resources
 
 _MANIFEST_SPEC: tuple[tuple[str, str, str, str], ...] = (
     # --- terminal log artifacts (constructor + generation deleter + retention)
