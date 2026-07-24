@@ -7,14 +7,13 @@ Design decisions:
 - One herdr session, workspaces per CAO session (labeled cao-<name>)
 - terminal_id is the stable identifier; pane_id is resolved before each operation
 - Resolution cache with 5s TTL reduces redundant herdr pane list calls
-- CAO_TERMINAL_ID and CAO_SESSION_NAME injected via command prefix
+- CAO_TERMINAL_ID and CAO_SESSION_NAME injected natively via ``--env`` at create
 """
 
 import json
 import logging
 import os
 import re
-import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -36,6 +35,7 @@ _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
         "tab",
         "pane",
         "session",
+        "api",
     }
 )
 
@@ -53,6 +53,7 @@ _SAFE_ARG_RE = re.compile(r"^[\w\-./: =,@(){}\[\]\"'\\~+#]+$", re.UNICODE)
 _HERDR_ALLOWED_FLAGS = frozenset(
     {
         "--cwd",
+        "--env",
         "--format",
         "--label",
         "--lines",
@@ -98,14 +99,39 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
         structural_args = args[:3]
     else:
         structural_args = args
+    prev_was_env = False
     for arg in structural_args:
         if not _SAFE_ARG_RE.fullmatch(arg):
-            raise ValueError(f"herdr argument contains unsafe characters: {arg!r}")
+            # A rejected --env value may be a secret; redact it in the error.
+            shown = _redact_env_values(["--env", arg])[1] if prev_was_env else repr(arg)
+            raise ValueError(f"herdr argument contains unsafe characters: {shown}")
         if arg.startswith("--") and arg not in _HERDR_ALLOWED_FLAGS:
             raise ValueError(
                 f"herdr flag '{arg}' not in allowlist: " f"{sorted(_HERDR_ALLOWED_FLAGS)}"
             )
+        prev_was_env = arg == "--env"
     return list(args)
+
+
+def _redact_env_values(args: List[str]) -> List[str]:
+    """Return a display copy of herdr args with ``--env`` values redacted.
+
+    Operator-forwarded env values may be secrets. Any token immediately
+    following ``--env`` is reduced to ``KEY=<redacted>`` (or ``<redacted>`` if
+    it has no ``=``), so a create failure/timeout or sanitizer rejection never
+    surfaces the raw value in an exception, log, or HTTP error detail.
+    """
+    redacted: List[str] = []
+    prev_was_env = False
+    for arg in args:
+        if prev_was_env:
+            key = arg.split("=", 1)[0] if "=" in arg else ""
+            redacted.append(f"{key}=<redacted>" if key else "<redacted>")
+            prev_was_env = False
+        else:
+            redacted.append(arg)
+            prev_was_env = arg == "--env"
+    return redacted
 
 
 # Cache TTL for pane_id resolution (seconds).
@@ -113,6 +139,12 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
 # _resolve_workspace_id(). _resolve_pane_id_from_window() never caches pane_ids —
 # herdr renumbers panes on deletion, so it resolves the pane fresh every call.
 _PANE_CACHE_TTL = 5.0
+
+# Staleness bound for the durable pane_id map (seconds). Herdr public pane_ids
+# are stable except across a full server restart, so a generous TTL is a cheap
+# safety net: within it, map hits are instant; after it (or on a miss) a single
+# `api snapshot` refresh rebuilds the whole map, self-healing a stale entry.
+_PANE_ID_MAP_TTL = 30.0
 
 
 class HerdrBackend(TerminalBackend):
@@ -139,6 +171,12 @@ class HerdrBackend(TerminalBackend):
         self._herdr_session = herdr_session
         # Resolution cache: terminal_id → (pane_id, timestamp)
         self._pane_cache: Dict[str, tuple[str, float]] = {}
+        # Durable map: terminal_id → pane_id, rebuilt from `api snapshot`.
+        # Public IDs are stable except across a full herdr server restart.
+        self._pane_id_map: Dict[str, str] = {}
+        # Timestamp of the last successful map rebuild; bounds map staleness
+        # against a herdr restart via _PANE_ID_MAP_TTL (0.0 => never built).
+        self._pane_id_map_ts: float = 0.0
         # Workspace cache: session_name → (workspace_id, timestamp)
         self._workspace_cache: Dict[str, tuple[str, float]] = {}
         self._ensure_session_running()
@@ -167,16 +205,17 @@ class HerdrBackend(TerminalBackend):
         except ValueError as e:
             raise TerminalBackendError(f"herdr argument validation failed: {e}") from e
         cmd = ["herdr", "--session", self._herdr_session] + sanitized
-        # Redact only send-text/run payloads from error messages to avoid
-        # leaking sensitive terminal input. Other commands keep full args
-        # for debuggability.
+        # Build a redacted display form for error messages. Two sensitive
+        # sources: send-text/run payloads (terminal input) and --env values
+        # (operator-forwarded, potentially secret). Never let either reach an
+        # exception, log, or HTTP error detail.
         has_payload = (
             len(sanitized) >= 3 and sanitized[0] == "pane" and sanitized[1] in ("send-text", "run")
         )
         if has_payload:
             cmd_display = cmd[:6] + ["<redacted>"]
         else:
-            cmd_display = cmd
+            cmd_display = _redact_env_values(cmd)
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if check and result.returncode != 0:
@@ -255,6 +294,9 @@ class HerdrBackend(TerminalBackend):
         args = ["workspace", "create", "--label", session_name]
         if working_directory:
             args.extend(["--cwd", working_directory])
+        # Inject CAO identity + operator-forwarded env natively via --env
+        # (replaces the former shell ``export`` send-text injection).
+        args.extend(self._build_env_args(terminal_id, session_name, extra_env))
 
         result = self._run_herdr(args)
 
@@ -271,18 +313,18 @@ class HerdrBackend(TerminalBackend):
         except (json.JSONDecodeError, KeyError):
             pass  # Non-fatal; we can resolve later
 
-        # Parse root pane_id from the create response for env injection
+        # Parse root pane_id from the create response to seed the pane cache.
         new_pane_id = self._parse_new_pane_id(result.stdout)
 
         # Label the root tab so it shows the CAO window name in herdr TUI.
         if root_tab_id:
             self._run_herdr(["tab", "rename", root_tab_id, window_name], check=False)
 
-        # Inject CAO env vars into the initial pane so agents and cao info can
-        # identify the terminal/session (mirrors TmuxClient env injection).
-        self._inject_env_vars(
-            session_name, window_name, terminal_id, pane_id=new_pane_id, extra_env=extra_env
-        )
+        # Seed the pane cache so get_pane_id() keeps its fast path (formerly
+        # seeded via the send-text env path). R4 will replace this cache with a
+        # snapshot map.
+        if new_pane_id:
+            self._pane_cache[terminal_id] = (new_pane_id, time.time())
 
         logger.info(f"Created herdr workspace: {session_name} in {working_directory}")
         return window_name
@@ -354,16 +396,20 @@ class HerdrBackend(TerminalBackend):
         args = ["tab", "create", "--workspace", workspace_id, "--label", window_name]
         if working_directory:
             args.extend(["--cwd", working_directory])
+        # Inject CAO identity + operator-forwarded env natively via --env
+        # (replaces the former shell ``export`` send-text injection).
+        args.extend(self._build_env_args(terminal_id, session_name, extra_env))
 
         result = self._run_herdr(args)
 
         # Parse the new pane_id directly from the create response
         new_pane_id = self._parse_new_pane_id(result.stdout)
 
-        # Inject CAO env vars using the known pane_id (no list scan needed)
-        self._inject_env_vars(
-            session_name, window_name, terminal_id, pane_id=new_pane_id, extra_env=extra_env
-        )
+        # Seed the pane cache so get_pane_id() keeps its fast path (formerly
+        # seeded via the send-text env path). R4 will replace this cache with a
+        # snapshot map.
+        if new_pane_id:
+            self._pane_cache[terminal_id] = (new_pane_id, time.time())
 
         if window_shell is not None and new_pane_id is not None:
             # Wait for shell startup before sending the initial command.
@@ -609,9 +655,15 @@ class HerdrBackend(TerminalBackend):
     def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
         """Resolve CAO terminal_id to herdr pane_id.
 
-        Prefers the _pane_cache (populated by _inject_env_vars at create time).
-        Falls back to live label-based resolution (_resolve_workspace_id ->
-        _resolve_tab_id -> pane list) if session/window given.
+        Prefers the durable ``_pane_id_map`` (rebuilt from ``api snapshot``).
+        Herdr 0.7.x public pane_ids are stable except across a full server
+        restart, so a hit is returned directly and a miss triggers a single
+        snapshot refresh before retrying the map. Only if the map still cannot
+        resolve the terminal does resolution fall back to the legacy
+        ``_pane_cache`` fast path and label-based window resolution
+        (``_resolve_workspace_id`` -> ``_resolve_tab_id`` -> pane list). The
+        legacy fallback is retained for reversibility and removed in a
+        follow-up once the durable map is proven.
 
         Args:
             terminal_id: CAO UUID terminal identifier
@@ -624,17 +676,73 @@ class HerdrBackend(TerminalBackend):
         Raises:
             TerminalNotFoundError: If pane cannot be resolved
         """
-        # Fast path: pane_id was cached by _inject_env_vars
+        # Durable map (rebuilt from api snapshot). Trust a hit only while the map
+        # is fresh; herdr IDs are stable except across a server restart, which
+        # this TTL bounds — a stale entry expires and the next lookup refreshes.
+        if (
+            time.time() - self._pane_id_map_ts
+        ) < _PANE_ID_MAP_TTL and terminal_id in self._pane_id_map:
+            return self._pane_id_map[terminal_id]
+        # Map is stale (or a miss). Rebuild, then trust it ONLY if the rebuild
+        # succeeded — _refresh_pane_id_map leaves the timestamp untouched on
+        # failure, so re-check freshness here. Without this re-gate a failed
+        # refresh would return the very entry we just judged expired, defeating
+        # the self-healing this TTL exists to provide (fall through to the
+        # label-based fallback instead).
+        self._refresh_pane_id_map()
+        if (
+            time.time() - self._pane_id_map_ts
+        ) < _PANE_ID_MAP_TTL and terminal_id in self._pane_id_map:
+            return self._pane_id_map[terminal_id]
+
+        # Legacy fallback (removed in a follow-up once the map is proven):
         if terminal_id in self._pane_cache:
             pane_id, cached_at = self._pane_cache[terminal_id]
             if time.time() - cached_at < _PANE_CACHE_TTL:
                 return pane_id
-
-        # Fallback: resolve via window mapping if session/window provided
         if session_name and window_name:
             return self._resolve_pane_id_from_window(session_name, window_name)
 
         raise TerminalNotFoundError(terminal_id)
+
+    def _refresh_pane_id_map(self) -> None:
+        """Rebuild terminal_id -> pane_id from a live `api snapshot`.
+
+        Public IDs are stable except across a full herdr server restart, so this
+        is only needed on a miss (or at reconcile time), not per-call.
+
+        On any failure — non-zero exit, a raising ``_run_herdr`` (subprocess
+        timeout / missing binary surface as ``TerminalBackendError``; other
+        ``OSError`` subtypes can surface directly), or an unparseable snapshot —
+        the map and its timestamp are left unchanged. This keeps a failed
+        refresh from marking a stale map as fresh and from propagating out of
+        ``get_pane_id`` (which would skip the legacy fallback). ``_pane_id_map_ts``
+        is stamped only after a successful rebuild.
+        """
+        try:
+            result = self._run_herdr(["api", "snapshot"], check=False)
+            if result.returncode != 0:
+                return
+            data = self._parse_herdr_json(result.stdout)
+            snapshot = data.get("snapshot", data)
+            if not isinstance(snapshot, dict):
+                return
+            self._pane_id_map = {
+                p["terminal_id"]: p["pane_id"]
+                for p in snapshot.get("panes", [])
+                if p.get("terminal_id") and p.get("pane_id")
+            }
+            self._pane_id_map_ts = time.time()
+        except (
+            TerminalBackendError,
+            subprocess.SubprocessError,
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            AttributeError,
+            TypeError,
+        ):
+            return
 
     # --- Pipe-pane (no-op for herdr) ---
 
@@ -711,94 +819,50 @@ class HerdrBackend(TerminalBackend):
         except (json.JSONDecodeError, KeyError, TypeError):
             return None
 
-    def _inject_env_vars(
+    def _build_env_args(
         self,
-        session_name: str,
-        window_name: str,
         terminal_id: str,
-        pane_id: Optional[str] = None,
+        session_name: str,
         extra_env: Optional[Dict[str, str]] = None,
-    ) -> None:
-        """Inject CAO env vars (and operator-forwarded vars) into the pane.
+    ) -> List[str]:
+        """Build ``--env KEY=VALUE`` argument pairs for a create command.
 
-        Called after create_session/create_window to export env vars into the
-        pane's shell so agents and `cao info` can identify the terminal/session.
-        Operator-supplied ``extra_env`` (from ``cao launch --env``) is forwarded
-        too, filtered with the same rules TmuxClient applies to its ``-e`` argv
-        so the launch-env contract behaves identically across backends.
+        Operator-forwarded vars are merged first, filtered with the same policy
+        TmuxClient applies to its ``-e`` argv (blocked prefixes, per-value byte
+        cap). The two CAO identity vars are assigned LAST so an operator
+        ``--env CAO_TERMINAL_ID=...`` cannot override the real terminal identity
+        (mirrors TmuxClient, which forces these to win). Native ``--env``
+        replaces the former shell ``export`` injection, removing the
+        command-line injection surface.
 
-        Args:
-            session_name: CAO session name
-            window_name: Window name (kept for signature symmetry / logging)
-            terminal_id: Terminal identifier to inject
-            pane_id: Pane ID from the create response. If None, falls back to
-                pane list scan (less reliable under concurrency).
-            extra_env: Operator-forwarded env vars from ``cao launch --env``.
+        Note: on herdr, env VALUES pass through the herdr arg sanitizer, which
+        rejects shell metacharacters and control chars. A value containing e.g.
+        ``$ ; | & ! * ? < >`` will fail terminal creation on herdr (fail-closed),
+        whereas the tmux backend accepts such values. This is an intentional,
+        safety-conservative divergence; operator env values on herdr must be
+        sanitizer-safe.
         """
-        try:
-            # Use provided pane_id if available (from create response)
-            target_pane_id = pane_id
-            if not target_pane_id:
-                # Fallback: scan pane list for last pane in workspace.
-                # NOTE: under concurrent creates in the same workspace this can
-                # pick the wrong (most-recent) pane. It only fires when the create
-                # response lacked a pane_id; the pane_id param is the primary path.
-                workspace_id = self._resolve_workspace_id(session_name)
-                result = self._run_herdr(["pane", "list"])
-                data = self._parse_herdr_json(result.stdout)
-                panes = data.get("panes", []) if isinstance(data, dict) else data
-                for p in panes:
-                    if p.get("workspace_id") == workspace_id:
-                        target_pane_id = str(p["pane_id"])
-
-            if target_pane_id:
-                # Cache the mapping
-                self._pane_cache[terminal_id] = (target_pane_id, time.time())
-                # Build export command: CAO identity vars first, then any
-                # operator-forwarded vars. terminal_id/session_name come from
-                # CAO internals (safe); extra_env values are operator-supplied,
-                # so quote them to keep the shell export injection-safe.
-                exports = [
-                    f"export CAO_TERMINAL_ID={terminal_id}",
-                    f"export CAO_SESSION_NAME={session_name}",
-                ]
-                exports.extend(self._build_extra_env_exports(extra_env))
-                env_cmd = "; ".join(exports)
-                self._run_herdr(["pane", "send-text", target_pane_id, env_cmd])
-                self._run_herdr(["pane", "send-keys", target_pane_id, "Enter"])
-        except (TerminalBackendError, json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Failed to inject env vars for {terminal_id}: {e}")
-
-    @staticmethod
-    def _build_extra_env_exports(extra_env: Optional[Dict[str, str]]) -> List[str]:
-        """Return shell ``export`` statements for operator-forwarded env vars.
-
-        Applies the same safety filtering TmuxClient uses for its ``-e`` argv
-        (blocked provider prefixes, per-value byte cap) so ``cao launch --env``
-        forwards the same set of vars under herdr as under tmux. Values are
-        shell-quoted because herdr injects via ``pane send-text`` (a shell
-        command line), unlike tmux's exec-style ``-e KEY=VALUE`` argv.
-        """
-        if not extra_env:
-            return []
-
-        # Reuse the tmux filtering policy so the two backends cannot drift.
         from cli_agent_orchestrator.clients.tmux import TmuxClient
 
-        exports: List[str] = []
-        for key, value in extra_env.items():
+        env: Dict[str, str] = {}
+        for key, value in (extra_env or {}).items():
             if TmuxClient._is_blocked_env_key(key):
                 logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
                 continue
             if len(value.encode("utf-8")) >= TmuxClient._MAX_ENV_VALUE_BYTES:
-                logger.warning(
-                    "Dropping forwarded env var %s -- value exceeds %d bytes",
-                    key,
-                    TmuxClient._MAX_ENV_VALUE_BYTES,
-                )
+                logger.warning("Dropping forwarded env var %s -- exceeds byte cap", key)
                 continue
-            exports.append(f"export {key}={shlex.quote(value)}")
-        return exports
+            env[key] = value
+
+        # CAO identity vars are assigned last so operator-forwarded --env cannot
+        # override them (mirrors TmuxClient, which forces these to win).
+        env["CAO_TERMINAL_ID"] = terminal_id
+        env["CAO_SESSION_NAME"] = session_name
+
+        args: List[str] = []
+        for key, value in env.items():
+            args.extend(["--env", f"{key}={value}"])
+        return args
 
     def _resolve_tab_id(self, session_name: str, workspace_id: str, window_name: str) -> str:
         """Resolve window_name to its herdr tab_id in the given workspace.

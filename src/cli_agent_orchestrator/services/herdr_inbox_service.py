@@ -1,12 +1,15 @@
 """HerdrInboxService — socket event-based inbox delivery for herdr backend.
 
 Replaces the pipe-pane + file watchdog approach with herdr's native socket API.
-Subscribes to pane.agent_status_changed events and delivers pending inbox
-messages when a pane transitions to idle or done.
+Subscribes to a broadcast pane.updated event (whose payload carries
+agent_status) and delivers pending inbox messages when a pane transitions to
+idle or done.
 
 Design:
 - Maintains a pane_id → terminal_id map for managed panes
-- Subscribes per-pane (wildcard support is unverified; see design.md)
+- Subscribes once to a broadcast pane.updated (no pane_id) covering all panes,
+  so a newly registered pane's events already arrive — registration updates the
+  map only and never re-subscribes or forces a reconnect
 - Reconnects with exponential backoff on socket disconnect
 - Supplements with periodic pane read for kiro-cli (working >30s check)
 """
@@ -68,11 +71,9 @@ class HerdrInboxService:
         self._workspace_to_session: Dict[str, str] = {}  # workspace_id → session_name
 
         # Connection state
-        self._connected = False
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._backoff = _BACKOFF_BASE
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @staticmethod
     def _default_socket_path(session_name: str = "cao") -> str:
@@ -111,21 +112,6 @@ class HerdrInboxService:
 
         logger.info(f"Registered terminal {terminal_id} (pane={pane_id}, kiro={is_kiro})")
 
-        # Start streaming events for the new pane by forcing a reconnect.
-        #
-        # herdr (0.6.8) resets the entire connection when it receives a SECOND
-        # events.subscribe on a connection that already has an active
-        # subscription, and it exposes no incremental "add subscription" API.
-        # So we cannot subscribe the new pane on the live connection — instead we
-        # close the socket, and _socket_loop reconnects and rebuilds the single
-        # combined subscription (all panes + lifecycle) in one call.
-        #
-        # register_terminal() may be called from a synchronous/non-event-loop
-        # thread, so we schedule the reconnect onto the captured loop via
-        # run_coroutine_threadsafe instead of create_task.
-        if self._connected and self._loop is not None:
-            asyncio.run_coroutine_threadsafe(self._force_reconnect(), self._loop)
-
     def unregister_terminal(self, terminal_id: str) -> None:
         """Remove a terminal from managed set.
 
@@ -141,7 +127,6 @@ class HerdrInboxService:
 
     async def start(self) -> None:
         """Start the event loop: wait for first terminal, then connect and listen."""
-        self._loop = asyncio.get_running_loop()
         # Run DB cleanup before starting the socket loop so ghost records from
         # prior server runs are removed even when no terminals are registered yet.
         await self._startup_db_cleanup()
@@ -157,53 +142,32 @@ class HerdrInboxService:
         Runs once at server startup before any pane registrations.  Cannot
         rely on _pane_to_terminal (empty at startup) or _workspace_to_session
         (populated later by _reconcile).  Builds the workspace map directly
-        from herdr workspace list.
+        from a herdr api snapshot.
         """
         from cli_agent_orchestrator.clients.database import (
             delete_terminal,
             list_terminals_by_session,
         )
 
-        ws_result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "workspace", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if ws_result.returncode != 0:
-            logger.debug("Startup DB cleanup: herdr workspace list failed, skipping")
+        snapshot = self._fetch_snapshot()
+        if snapshot is None:
+            logger.debug("Startup DB cleanup: no snapshot, skipping")
             return
 
-        try:
-            ws_data = json.loads(ws_result.stdout)
-            workspaces = ws_data.get("result", {}).get("workspaces", [])
-            workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Startup DB cleanup: failed to parse workspace list: {e}")
-            return
+        # workspace_id -> label (= CAO session name). Skip malformed records.
+        workspace_to_session = {
+            ws["workspace_id"]: ws["label"]
+            for ws in snapshot.get("workspaces", [])
+            if ws.get("workspace_id") and ws.get("label")
+        }
 
-        tab_result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "tab", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if tab_result.returncode != 0:
-            logger.debug("Startup DB cleanup: herdr tab list failed, skipping")
-            return
-
-        try:
-            tab_data = json.loads(tab_result.stdout)
-            tabs = tab_data.get("result", {}).get("tabs", [])
-            live_tabs_by_workspace: Dict[str, set] = {}
-            for tab in tabs:
-                ws_id = tab.get("workspace_id", "")
-                label = tab.get("label", "")
-                if ws_id and label:
-                    live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Startup DB cleanup: failed to parse tab list: {e}")
-            return
+        # workspace_id -> set of live tab labels (= CAO window names)
+        live_tabs_by_workspace: Dict[str, set] = {}
+        for tab in snapshot.get("tabs", []):
+            ws_id = tab.get("workspace_id", "")
+            label = tab.get("label", "")
+            if ws_id and label:
+                live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
 
         deleted = 0
         for ws_id, session_name in workspace_to_session.items():
@@ -253,15 +217,14 @@ class HerdrInboxService:
 
             try:
                 await self._connect()
-                self._connected = True
 
                 # Reconcile map against live herdr state before subscribing
                 await self._reconcile()
 
-                # Subscribe to everything in ONE events.subscribe call: every
-                # managed pane's agent-status plus the lifecycle events. herdr
-                # resets the connection on a second events.subscribe, so this
-                # must be a single combined call.
+                # Subscribe to everything in ONE events.subscribe call: a single
+                # broadcast pane.updated (no pane_id) plus the lifecycle events.
+                # herdr resets the connection on a second events.subscribe, so
+                # this must be a single combined call.
                 await self._subscribe_all_events()
 
                 self._backoff = _BACKOFF_BASE  # Reset backoff after successful setup
@@ -271,12 +234,54 @@ class HerdrInboxService:
 
             except (ConnectionError, OSError, asyncio.IncompleteReadError) as e:
                 logger.warning(f"Herdr socket disconnected: {e}")
-                self._connected = False
 
                 # Exponential backoff
                 logger.info(f"Reconnecting in {self._backoff}s...")
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * _BACKOFF_MULTIPLIER, _BACKOFF_MAX)
+
+    def _fetch_snapshot(self) -> Optional[dict]:
+        """Return herdr's full live session snapshot in one socket call.
+
+        `herdr api snapshot` returns result.snapshot with panes[]/tabs[]/
+        workspaces[]. Each pane carries pane_id, terminal_id, agent_status,
+        tab_id, workspace_id; each tab carries tab_id, label, workspace_id;
+        each workspace carries workspace_id, label. Replaces the former
+        pane-list + workspace-list + tab-list subprocess fan-out.
+
+        Returns None on any failure (non-zero exit, timeout, missing binary,
+        or malformed output). This is the single entry point all snapshot reads
+        route through, so it swallows the same broad error set as the file's
+        other herdr-subprocess helpers rather than letting one bad response
+        kill the socket loop.
+        """
+        try:
+            result = subprocess.run(
+                ["herdr", "--session", self._herdr_session, "api", "snapshot"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                # repr() the stderr: it can echo user-controlled labels/args and
+                # may contain newlines/control chars that would otherwise forge
+                # log lines. Matches the escaping used elsewhere in the codebase.
+                logger.warning("Snapshot: `api snapshot` failed: %r", result.stderr)
+                return None
+            snapshot = json.loads(result.stdout)["result"]["snapshot"]
+            if not isinstance(snapshot, dict):
+                logger.warning("Snapshot: result.snapshot is not a dict; ignoring")
+                return None
+            return snapshot
+        except (
+            subprocess.SubprocessError,
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+        ) as e:
+            logger.warning(f"Snapshot: failed to fetch/parse: {e}")
+            return None
 
     async def _reconcile(self) -> None:
         """Reconcile _pane_to_terminal map against live herdr state.
@@ -288,87 +293,58 @@ class HerdrInboxService:
         from cli_agent_orchestrator.clients.database import (
             delete_terminal,
             get_terminal_metadata,
+            list_terminals_by_session,
         )
 
-        # Get live panes from herdr
-        result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "pane", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            logger.warning(f"Reconcile: herdr pane list failed: {result.stderr}")
+        # One socket call replaces the former pane-list + workspace-list +
+        # tab-list subprocess fan-out. All three data structures below are derived
+        # from this single snapshot.
+        snapshot = self._fetch_snapshot()
+        if snapshot is None:
+            logger.warning("Reconcile: no snapshot, skipping")
             return
 
-        try:
-            data = json.loads(result.stdout)
-            panes = data.get("result", {}).get("panes", [])
-            live_pane_ids = {p["pane_id"] for p in panes}
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Reconcile: failed to parse pane list: {e}")
-            return
+        # Live pane_ids (from snapshot.panes).
+        live_pane_ids = {p["pane_id"] for p in snapshot.get("panes", []) if p.get("pane_id")}
 
-        # Build workspace_id -> session_name mapping
-        ws_result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "workspace", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if ws_result.returncode == 0:
-            try:
-                ws_data = json.loads(ws_result.stdout)
-                workspaces = ws_data.get("result", {}).get("workspaces", [])
-                self._workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
-            except (json.JSONDecodeError, KeyError):
-                pass
+        # workspace_id -> label (= CAO session name), from snapshot.workspaces.
+        # Skip malformed records (missing id/label) rather than letting a
+        # KeyError escape _reconcile and kill the socket loop — matches the
+        # defensive .get() style used in the tabs loop below.
+        self._workspace_to_session = {
+            ws["workspace_id"]: ws["label"]
+            for ws in snapshot.get("workspaces", [])
+            if ws.get("workspace_id") and ws.get("label")
+        }
+
+        # workspace_id -> set of live tab labels (= CAO window names), from
+        # snapshot.tabs.
+        live_tabs_by_workspace: Dict[str, set] = {}
+        for tab in snapshot.get("tabs", []):
+            ws_id = tab.get("workspace_id", "")
+            label = tab.get("label", "")
+            if ws_id and label:
+                live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
 
         # DB cross-check: find terminals in DB whose tab no longer exists in herdr.
         # This catches ghost records from previous server runs where _pane_to_terminal
         # starts empty (so the stale-pane diff below produces nothing).
-        tab_result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "tab", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if tab_result.returncode == 0:
-            try:
-                tab_data = json.loads(tab_result.stdout)
-                tabs = tab_data.get("result", {}).get("tabs", [])
-                # Build: workspace_id -> set of live tab labels
-                live_tabs_by_workspace: Dict[str, set] = {}
-                for tab in tabs:
-                    ws_id = tab.get("workspace_id", "")
-                    label = tab.get("label", "")
-                    if ws_id and label:
-                        live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
-
-                from cli_agent_orchestrator.clients.database import (
-                    delete_terminal,
-                    list_terminals_by_session,
-                )
-
-                for ws_id, session_name in self._workspace_to_session.items():
-                    live_labels = live_tabs_by_workspace.get(ws_id, set())
-                    db_terminals = list_terminals_by_session(session_name)
-                    for term in db_terminals:
-                        window = term.get("tmux_window", "")
-                        if window and window not in live_labels:
-                            logger.info(
-                                f"Reconcile: deleting ghost terminal {term['id']} "
-                                f"({session_name}:{window}) — tab not in herdr"
-                            )
-                            try:
-                                delete_terminal(term["id"])
-                            except Exception as e:
-                                logger.warning(
-                                    f"Reconcile: failed to delete ghost terminal "
-                                    f"{term['id']}: {e}"
-                                )
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.warning(f"Reconcile: failed to parse tab list: {e}")
+        for ws_id, session_name in self._workspace_to_session.items():
+            live_labels = live_tabs_by_workspace.get(ws_id, set())
+            db_terminals = list_terminals_by_session(session_name)
+            for term in db_terminals:
+                window = term.get("tmux_window", "")
+                if window and window not in live_labels:
+                    logger.info(
+                        f"Reconcile: deleting ghost terminal {term['id']} "
+                        f"({session_name}:{window}) — tab not in herdr"
+                    )
+                    try:
+                        delete_terminal(term["id"])
+                    except Exception as e:
+                        logger.warning(
+                            f"Reconcile: failed to delete ghost terminal {term['id']}: {e}"
+                        )
 
         # Find stale panes: stored pane_id no longer in herdr's live pane list.
         #
@@ -486,25 +462,23 @@ class HerdrInboxService:
     async def _subscribe_all_events(self) -> None:
         """Subscribe to all events in a SINGLE events.subscribe call.
 
-        herdr (0.6.8) resets the entire connection when it receives a second
+        herdr (0.7.5) resets the entire connection when it receives a second
         events.subscribe on a connection that already has an active
-        subscription. So every subscription this service needs — one
-        pane.agent_status_changed per managed pane (pane_id is required; herdr
-        rejects the wildcard form with invalid_request) plus the pane.closed and
-        workspace.closed lifecycle events — must be sent together in one call.
+        subscription, so this must remain exactly one events.subscribe per
+        connection.
 
-        The pane_id → terminal_id mapping in _pane_to_terminal is already current:
-        a socket disconnect does not change pane_ids (only a herdr server restart
-        compacts them), and _reconcile() has already pruned stale panes before
-        this runs.
+        The subscription is a broadcast pane.updated (sent with NO pane_id):
+        herdr streams it for every pane and its payload carries agent_status,
+        so a single broadcast subscription replaces the former per-pane
+        pane.agent_status_changed subscriptions. This is independent of
+        _pane_to_terminal — no per-pane enumeration is needed. The pane.closed
+        and workspace.closed lifecycle events are sent in the same call.
         """
-        subscriptions: list = [
-            {"type": "pane.agent_status_changed", "pane_id": pane_id}
-            for pane_id in self._pane_to_terminal
+        subscriptions = [
+            {"type": "pane.updated"},
+            {"type": "pane.closed"},
+            {"type": "workspace.closed"},
         ]
-        subscriptions.append({"type": "pane.closed"})
-        subscriptions.append({"type": "workspace.closed"})
-
         message = {
             "id": "sub_all",
             "method": "events.subscribe",
@@ -512,26 +486,9 @@ class HerdrInboxService:
         }
         await self._send(message)
         logger.info(
-            f"Subscribed to {len(self._pane_to_terminal)} pane(s) + lifecycle events "
-            f"in one events.subscribe call"
+            "Subscribed to broadcast pane.updated + lifecycle events "
+            "in one events.subscribe call"
         )
-
-    async def _force_reconnect(self) -> None:
-        """Close the socket so _socket_loop reconnects and rebuilds the subscription.
-
-        This is how a newly registered pane starts streaming events: herdr has no
-        incremental subscribe, and a second events.subscribe on the live
-        connection would reset it. Closing the writer makes the blocked
-        readline() in _event_loop return EOF, which raises ConnectionError and
-        drives _socket_loop through a fresh connect + combined re-subscribe.
-        """
-        writer = self._writer
-        if writer is None:
-            return
-        try:
-            writer.close()
-        except Exception as e:
-            logger.debug(f"Force reconnect: writer close raised (ignored): {e}")
 
     async def _event_loop(self) -> None:
         """Listen for events and dispatch delivery."""
@@ -561,8 +518,15 @@ class HerdrInboxService:
                 continue
 
             data = event.get("data", {})
-            pane_id = data.get("pane_id", "")
-            status = data.get("agent_status", "")
+            # Broadcast pane.updated nests the pane under data.pane; retired
+            # agent-status events used top-level data. Fall back to data, and
+            # guard against a null/non-dict pane so one malformed event cannot
+            # escape the loop and kill delivery.
+            pane_obj = data.get("pane") or data
+            if not isinstance(pane_obj, dict):
+                pane_obj = {}
+            pane_id = pane_obj.get("pane_id", "")
+            status = pane_obj.get("agent_status", "")
 
             # Only process events for managed panes
             terminal_id = self._pane_to_terminal.get(pane_id)
@@ -670,10 +634,10 @@ class HerdrInboxService:
             #
             # herdr (0.6.8) reuses compact pane_ids when a tab is killed and a
             # new tab takes the same index, AND replays the ENTIRE pane_closed
-            # history on every fresh events.subscribe (which register_terminal
-            # triggers via _force_reconnect). So a replayed close for an OLD
-            # incarnation of this pane_id arrives mapped to the terminal that now
-            # occupies the reused index — deleting a live terminal.
+            # history on every fresh events.subscribe (e.g. after a reconnect on
+            # socket disconnect). So a replayed close for an OLD incarnation of
+            # this pane_id arrives mapped to the terminal that now occupies the
+            # reused index — deleting a live terminal.
             #
             # The tab label (tmux_window) is unique per incarnation, so confirm
             # the label is genuinely gone from herdr before deleting. If the

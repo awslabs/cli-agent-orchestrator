@@ -146,9 +146,9 @@ class TestHerdrBackendCommands:
 
     @patch("subprocess.run")
     def test_create_session_calls_workspace_create(self, mock_run, backend):
-        """create_session should call herdr workspace create with --label and inject env."""
-        # Include root_pane.pane_id so _parse_new_pane_id succeeds and _inject_env_vars
-        # uses the known pane_id directly (no fallback pane list scan needed).
+        """create_session should call herdr workspace create with --label and native --env."""
+        # Include root_pane.pane_id so _parse_new_pane_id succeeds and the pane
+        # cache is seeded directly from the create response (no list scan needed).
         ws_create_resp = _completed(
             json.dumps(
                 {
@@ -168,13 +168,11 @@ class TestHerdrBackendCommands:
         mock_run.side_effect = [
             ws_create_resp,  # workspace create
             _completed(),  # tab rename (root tab labeled with window_name)
-            _completed(),  # pane send-text (env export)
-            _completed(),  # pane send-keys Enter
         ]
 
         backend.create_session("cao-myproj", "window-0", "tid1", "/home/user/project")
 
-        # First call should be workspace create
+        # First call should be workspace create, carrying env natively via --env
         cmd = mock_run.call_args_list[0][0][0]
         assert cmd[:3] == ["herdr", "--session", "cao"]
         assert "workspace" in cmd
@@ -183,15 +181,14 @@ class TestHerdrBackendCommands:
         assert "cao-myproj" in cmd
         assert "--cwd" in cmd
         assert "/home/user/project" in cmd
-        # Env injection should have sent the export command (call index 2)
-        env_cmd = mock_run.call_args_list[2][0][0]
-        assert "send-text" in env_cmd
-        assert "CAO_TERMINAL_ID=tid1" in env_cmd[-1]
-        assert "CAO_SESSION_NAME=cao-myproj" in env_cmd[-1]
+        # Env is injected natively as --env KEY=VALUE argv pairs (no send-text).
+        assert "--env" in cmd
+        assert "CAO_TERMINAL_ID=tid1" in cmd
+        assert "CAO_SESSION_NAME=cao-myproj" in cmd
 
     @staticmethod
     def _workspace_create_resp():
-        """workspace create response carrying a root pane_id for env injection."""
+        """workspace create response carrying a root pane_id for cache seeding."""
         return _completed(
             json.dumps(
                 {
@@ -211,12 +208,10 @@ class TestHerdrBackendCommands:
 
     @patch("subprocess.run")
     def test_create_session_forwards_extra_env(self, mock_run, backend):
-        """extra_env from cao launch --env is exported into the pane (shell-quoted)."""
+        """extra_env from cao launch --env is forwarded natively as --env argv pairs."""
         mock_run.side_effect = [
             self._workspace_create_resp(),  # workspace create
             _completed(),  # tab rename
-            _completed(),  # pane send-text (env export)
-            _completed(),  # pane send-keys Enter
         ]
 
         backend.create_session(
@@ -227,19 +222,17 @@ class TestHerdrBackendCommands:
             extra_env={"AWS_REGION": "us-west-2", "MNEMOSYNE_DIR": "/root/mn"},
         )
 
-        env_cmd = mock_run.call_args_list[2][0][0][-1]
-        assert "export AWS_REGION=us-west-2" in env_cmd
-        assert "export MNEMOSYNE_DIR=/root/mn" in env_cmd
+        cmd = mock_run.call_args_list[0][0][0]
+        assert "AWS_REGION=us-west-2" in cmd
+        assert "MNEMOSYNE_DIR=/root/mn" in cmd
         # CAO identity vars still present
-        assert "CAO_TERMINAL_ID=tid1" in env_cmd
+        assert "CAO_TERMINAL_ID=tid1" in cmd
 
     @patch("subprocess.run")
     def test_create_session_drops_blocked_and_oversized_env(self, mock_run, backend):
         """Blocked-prefix and oversized extra_env values are filtered out (tmux parity)."""
         mock_run.side_effect = [
             self._workspace_create_resp(),
-            _completed(),
-            _completed(),
             _completed(),
         ]
 
@@ -255,18 +248,23 @@ class TestHerdrBackendCommands:
             },
         )
 
-        env_cmd = mock_run.call_args_list[2][0][0][-1]
-        assert "CLAUDE_SECRET" not in env_cmd
-        assert "BIG=" not in env_cmd
-        assert "export OK=kept" in env_cmd
+        cmd = mock_run.call_args_list[0][0][0]
+        joined = " ".join(cmd)
+        assert "CLAUDE_SECRET" not in joined
+        assert "BIG=" not in joined
+        assert "OK=kept" in cmd
 
     @patch("subprocess.run")
-    def test_create_session_quotes_env_values(self, mock_run, backend):
-        """Operator-supplied values are shell-quoted to stay injection-safe."""
+    def test_create_session_env_value_is_single_argv_token(self, mock_run, backend):
+        """Native --env passes each value as one literal argv token (no shell, no quoting).
+
+        Under the former shell ``export`` path a value containing a space needed
+        ``shlex.quote`` to avoid word-splitting/injection. With native --env the
+        value is a single argv element handed to subprocess with shell=False, so
+        it travels verbatim and cannot break out — the injection surface is gone.
+        """
         mock_run.side_effect = [
             self._workspace_create_resp(),
-            _completed(),
-            _completed(),
             _completed(),
         ]
 
@@ -275,12 +273,33 @@ class TestHerdrBackendCommands:
             "window-0",
             "tid1",
             "/home/user/project",
-            extra_env={"DANGER": "a; rm -rf /"},
+            extra_env={"AWS_PROFILE": "my profile"},
         )
 
-        env_cmd = mock_run.call_args_list[2][0][0][-1]
-        # shlex.quote wraps the value so the embedded "; rm" cannot break out.
-        assert "export DANGER='a; rm -rf /'" in env_cmd
+        cmd = mock_run.call_args_list[0][0][0]
+        # The space-containing value is one argv token, unquoted, and never
+        # wrapped in a shell ``export`` statement.
+        assert "AWS_PROFILE=my profile" in cmd
+        assert not any("export" in tok for tok in cmd)
+
+    @patch("subprocess.run")
+    def test_create_session_rejects_metachar_env_value_on_herdr(self, mock_run, backend):
+        """Documents the intentional fail-closed divergence from tmux: herdr env
+        values must be sanitizer-safe (no shell metacharacters).
+
+        The value ``p@ss$word`` contains ``$``, which the herdr arg sanitizer
+        (_SAFE_ARG_RE) rejects. _run_herdr wraps the sanitizer's ValueError as a
+        TerminalBackendError, so create_session raises before ever reaching
+        subprocess.run for the workspace create. The tmux backend, by contrast,
+        would accept the same value. Keeping herdr strict is a deliberate,
+        safety-conservative choice, and this test pins it so it can't silently
+        change.
+        """
+        # create should not even reach subprocess for the workspace create if the
+        # env value is rejected during arg sanitization.
+        with pytest.raises((ValueError, TerminalBackendError)):
+            backend.create_session("cao-x", "win-0", "tid1", "/tmp", extra_env={"TOK": "p@ss$word"})
+        mock_run.assert_not_called()
 
     @patch("subprocess.run")
     def test_create_window_forwards_extra_env(self, mock_run, backend):
@@ -303,9 +322,7 @@ class TestHerdrBackendCommands:
         )
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
-            tab_create_resp,  # tab create
-            _completed(),  # pane send-text (env export)
-            _completed(),  # pane send-keys Enter
+            tab_create_resp,  # tab create (carries --env natively)
         ]
 
         backend.create_window(
@@ -315,8 +332,11 @@ class TestHerdrBackendCommands:
             extra_env={"AWS_REGION": "eu-central-1"},
         )
 
-        send_text_call = next(c[0][0] for c in mock_run.call_args_list if "send-text" in c[0][0])
-        assert "export AWS_REGION=eu-central-1" in send_text_call[-1]
+        tab_create_call = next(c[0][0] for c in mock_run.call_args_list if "create" in c[0][0])
+        assert "--env" in tab_create_call
+        assert "AWS_REGION=eu-central-1" in tab_create_call
+        # CAO identity vars ride along on the same tab create argv.
+        assert "CAO_TERMINAL_ID=tid2" in tab_create_call
 
     @patch("subprocess.run")
     def test_kill_session_calls_workspace_close(self, mock_run, backend):
@@ -671,6 +691,104 @@ class TestMultiPaneResolution:
         assert result == "w1-2"
 
 
+# --- Durable snapshot-backed pane_id map ---
+
+
+def test_get_pane_id_fresh_map_hit_skips_refresh(monkeypatch):
+    import time as _t
+
+    from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+    backend = HerdrBackend.__new__(HerdrBackend)
+    backend._herdr_session = "cao"
+    backend._pane_cache = {}
+    backend._pane_id_map = {"term_a": "w1:p1"}
+    backend._pane_id_map_ts = _t.time()  # fresh
+    called = {"n": 0}
+    monkeypatch.setattr(
+        backend, "_refresh_pane_id_map", lambda: called.__setitem__("n", called["n"] + 1)
+    )
+    assert backend.get_pane_id("term_a") == "w1:p1"
+    assert called["n"] == 0  # fresh hit, no refresh
+
+
+def test_get_pane_id_stale_map_refreshes(monkeypatch):
+    """A real herdr restart = populated-but-stale map. The TTL must expire the
+    stale entry and trigger a refresh that returns the new pane_id."""
+    from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+    backend = HerdrBackend.__new__(HerdrBackend)
+    backend._herdr_session = "cao"
+    backend._pane_cache = {}
+    backend._pane_id_map = {"term_a": "w1:p1"}  # stale id from before restart
+    backend._pane_id_map_ts = 0.0  # far in the past => stale (> TTL)
+
+    def fake_refresh():
+        # A successful refresh rebuilds the map AND stamps the timestamp fresh
+        # (mirrors the real _refresh_pane_id_map success path).
+        backend._pane_id_map = {"term_a": "w2:p5"}  # fresh id post-restart
+        backend._pane_id_map_ts = time.time()
+
+    monkeypatch.setattr(backend, "_refresh_pane_id_map", fake_refresh)
+
+    # Stale hit must NOT be returned; refresh fires and yields the new id.
+    assert backend.get_pane_id("term_a") == "w2:p5"
+
+
+def test_get_pane_id_failed_refresh_does_not_return_stale_entry(monkeypatch):
+    """P2: if refresh FAILS (map + ts left unchanged), an already-expired entry
+    must NOT be returned — get_pane_id must fall through to the label fallback,
+    not hand back the stale pane the TTL just judged too old."""
+    from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+    backend = HerdrBackend.__new__(HerdrBackend)
+    backend._herdr_session = "cao"
+    backend._pane_cache = {}
+    backend._pane_id_map = {"term_a": "stale:pane"}  # expired entry
+    backend._pane_id_map_ts = 0.0  # far past => stale
+
+    # Failed refresh: real _refresh_pane_id_map preserves map + ts on failure.
+    monkeypatch.setattr(backend, "_refresh_pane_id_map", lambda: None)
+    # Label fallback resolves the true current pane.
+    monkeypatch.setattr(backend, "_resolve_pane_id_from_window", lambda s, w: "w9:p9")
+
+    result = backend.get_pane_id("term_a", session_name="cao-x", window_name="win-0")
+    assert result == "w9:p9"  # NOT "stale:pane"
+
+
+def test_refresh_pane_id_map_builds_from_snapshot(backend):
+    """Direct coverage of the real parse path + `api snapshot` invocation."""
+    snap = {
+        "id": "cli:api:snapshot",
+        "result": {
+            "snapshot": {
+                "panes": [
+                    {"pane_id": "w1:p1", "terminal_id": "term_a"},
+                    {"pane_id": "w1:p2", "terminal_id": "term_b"},
+                    {"pane_id": "w1:p3"},  # missing terminal_id -> skipped
+                ]
+            }
+        },
+    }
+    with patch.object(backend, "_run_herdr", return_value=_completed(json.dumps(snap))) as mock_run:
+        backend._refresh_pane_id_map()
+    assert backend._pane_id_map == {"term_a": "w1:p1", "term_b": "w1:p2"}
+    assert backend._pane_id_map_ts > 0
+    # invoked `api snapshot`
+    assert mock_run.call_args[0][0] == ["api", "snapshot"]
+
+
+def test_refresh_pane_id_map_survives_error(backend):
+    """A failing/raising snapshot leaves the map and ts unchanged, no raise."""
+    backend._pane_id_map = {"term_x": "w9:p9"}
+    backend._pane_id_map_ts = 0.0
+    from cli_agent_orchestrator.backends.base import TerminalBackendError
+
+    with patch.object(backend, "_run_herdr", side_effect=TerminalBackendError("timeout")):
+        backend._refresh_pane_id_map()  # must not raise
+    assert backend._pane_id_map == {"term_x": "w9:p9"}  # unchanged
+
+
 # --- Session socket path ---
 
 
@@ -789,9 +907,7 @@ class TestCreateWindowWindowShell:
         )
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
-            tab_create_resp,  # tab create
-            _completed(),  # pane send-text (env export)
-            _completed(),  # pane send-keys Enter
+            tab_create_resp,  # tab create (env injected natively via --env)
             _completed(),  # pane run
         ]
 
@@ -830,9 +946,7 @@ class TestCreateWindowWindowShell:
         pane_run_fail.stderr = "pane not found"
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
-            tab_create_resp,  # tab create
-            _completed(),  # pane send-text (env export)
-            _completed(),  # pane send-keys Enter
+            tab_create_resp,  # tab create (env injected natively via --env)
             pane_run_fail,  # pane run (fails)
         ]
 
@@ -1057,3 +1171,109 @@ class TestSanitizeHerdrArgs:
         result = _sanitize_herdr_args(original)
         assert result == original
         assert result is not original
+
+    def test_sanitize_allows_env_flag(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        args = ["tab", "create", "--workspace", "w1", "--env", "CAO_TERMINAL_ID=term_x"]
+        assert _sanitize_herdr_args(args) == args
+
+    def test_sanitize_rejects_env_value_with_newline(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError, match="unsafe characters"):
+            _sanitize_herdr_args(["tab", "create", "--env", "K=line1\nline2"])
+
+
+# --- _build_env_args (native --env argument construction) ---
+
+
+class TestBuildEnvArgs:
+    """Tests for _build_env_args, which builds native ``--env KEY=VALUE`` pairs."""
+
+    def test_build_env_args_includes_identity_and_filters_blocked(self):
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        backend = HerdrBackend.__new__(HerdrBackend)  # no __init__ (avoids server spawn)
+        pairs = backend._build_env_args(
+            terminal_id="term_x",
+            session_name="sess-a",
+            extra_env={"AWS_REGION": "us-west-2", "CLAUDE_SECRET": "x"},
+        )
+        assert "--env" in pairs
+        joined = " ".join(pairs)
+        assert "CAO_TERMINAL_ID=term_x" in joined
+        assert "CAO_SESSION_NAME=sess-a" in joined
+        assert "AWS_REGION=us-west-2" in joined
+        # CLAUDE_SECRET matches a blocked prefix and must be dropped.
+        assert all("CLAUDE_SECRET" not in tok for tok in pairs)
+
+    def test_build_env_args_identity_wins_over_extra_env(self):
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        backend = HerdrBackend.__new__(HerdrBackend)
+        pairs = backend._build_env_args(
+            terminal_id="real-tid",
+            session_name="cao-proj",
+            extra_env={"CAO_TERMINAL_ID": "spoofed", "CAO_SESSION_NAME": "evil"},
+        )
+        # Reconstruct the final KEY=VALUE for each var (last write wins on herdr's
+        # side, and our builder must emit the real identity, not the spoof).
+        joined = pairs
+        assert "CAO_TERMINAL_ID=real-tid" in joined
+        assert "CAO_TERMINAL_ID=spoofed" not in joined
+        assert "CAO_SESSION_NAME=cao-proj" in joined
+        assert "CAO_SESSION_NAME=evil" not in joined
+
+
+class TestEnvValueRedaction:
+    """P1: operator-forwarded --env values are secrets; they must never appear
+    raw in an exception, log, or HTTP error detail."""
+
+    def test_redact_env_values_masks_value_keeps_key(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _redact_env_values
+
+        out = _redact_env_values(
+            ["herdr", "tab", "create", "--env", "API_TOKEN=s3cr3t-token", "--label", "w"]
+        )
+        assert "API_TOKEN=<redacted>" in out
+        assert all("s3cr3t-token" not in tok for tok in out)
+        # non-env structural args are preserved
+        assert "--label" in out and "w" in out
+
+    def test_redact_env_value_without_equals(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _redact_env_values
+
+        out = _redact_env_values(["--env", "weirdtoken"])
+        assert out == ["--env", "<redacted>"]
+
+    def test_run_herdr_command_failure_redacts_env_value(self, backend):
+        """A non-zero create must not leak the env value in TerminalBackendError."""
+        with patch("subprocess.run", return_value=_completed("", returncode=1)):
+            with pytest.raises(TerminalBackendError) as exc:
+                backend._run_herdr(
+                    ["tab", "create", "--env", "API_TOKEN=s3cr3t-token", "--label", "w"]
+                )
+        msg = str(exc.value)
+        assert "s3cr3t-token" not in msg
+        assert "API_TOKEN=<redacted>" in msg
+
+    def test_run_herdr_timeout_redacts_env_value(self, backend):
+        """A create timeout must not leak the env value."""
+        import subprocess as _sp
+
+        with patch("subprocess.run", side_effect=_sp.TimeoutExpired(cmd="herdr", timeout=30)):
+            with pytest.raises(TerminalBackendError) as exc:
+                backend._run_herdr(["tab", "create", "--env", "API_TOKEN=s3cr3t-token"])
+        assert "s3cr3t-token" not in str(exc.value)
+
+    def test_sanitizer_rejection_redacts_env_value(self):
+        """A rejected --env value (shell metachar) must be redacted in the error,
+        not interpolated raw."""
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError) as exc:
+            _sanitize_herdr_args(["tab", "create", "--env", "API_TOKEN=s3cr3t$token"])
+        msg = str(exc.value)
+        assert "s3cr3t$token" not in msg
+        assert "<redacted>" in msg
