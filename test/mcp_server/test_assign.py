@@ -174,9 +174,10 @@ class TestAssignSenderIdInjection:
     The tool-call itself returns as soon as the tmux window/DB row exist.
     """
 
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_appends_sender_id_when_injection_enabled(self, mock_create):
+    def test_assign_appends_sender_id_when_injection_enabled(self, mock_create, _nudge):
         """When injection is enabled, assign should pass a message with the
         sender ID suffix as ``initial_message`` to _create_terminal."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
@@ -199,9 +200,10 @@ class TestAssignSenderIdInjection:
 
         assert kwargs["initial_message_orchestration_type"] == OrchestrationType.ASSIGN
 
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_no_suffix_when_injection_disabled(self, mock_create):
+    def test_assign_no_suffix_when_injection_disabled(self, mock_create, _nudge):
         """When injection is disabled, assign should pass the message unchanged."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
@@ -264,9 +266,10 @@ class TestAssignSenderIdInjection:
         assert result["terminal_id"] is None
         assert "Assignment failed" in result["message"]
 
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_suffix_is_appended_not_prepended(self, mock_create):
+    def test_assign_suffix_is_appended_not_prepended(self, mock_create, _nudge):
         """The sender ID should be a suffix, not a prefix."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
@@ -281,9 +284,10 @@ class TestAssignSenderIdInjection:
         assert sent_message.startswith(original)
         assert sent_message.index("[Assigned by terminal") > len(original)
 
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_returns_fast_success_message(self, mock_create):
+    def test_assign_returns_fast_success_message(self, mock_create, _nudge):
         """Regression: assign() should tell the LLM the worker is initializing
         in the background, not claim the message has been delivered."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
