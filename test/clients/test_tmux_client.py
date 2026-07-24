@@ -46,6 +46,54 @@ class TestResolveAndValidateWorkingDirectory:
             tmux._resolve_and_validate_working_directory("/nonexistent/dir/xyz")
 
 
+class TestTerminalBoundWindowIdentity:
+    @staticmethod
+    def _candidate(tmux):
+        pane = MagicMock()
+        pane.pane_id = "%9"
+        pane.pane_pid = "101"
+        window = MagicMock()
+        window.window_id = "@7"
+        window.active_pane = pane
+        session = MagicMock()
+        session.windows.get.return_value = window
+        tmux.server.sessions.get.return_value = session
+        return window
+
+    def test_requires_process_lineage_terminal_binding(self, tmux):
+        self._candidate(tmux)
+        with (
+            patch.object(tmux, "_descendant_processes", return_value=[101, 102]),
+            patch.object(
+                tmux,
+                "_process_has_terminal_id",
+                side_effect=lambda pid, terminal_id: pid == 102 and terminal_id == "abcd1234",
+            ),
+        ):
+            result = tmux.terminal_bound_window_identity("abcd1234", "cao-session", "supervisor")
+
+        assert result == {"pane_id": "%9", "window_id": "@7"}
+
+    def test_wrong_or_reused_pane_is_not_proof(self, tmux):
+        self._candidate(tmux)
+        with (
+            patch.object(tmux, "_descendant_processes", return_value=[101, 102]),
+            patch.object(tmux, "_process_has_terminal_id", return_value=False),
+        ):
+            result = tmux.terminal_bound_window_identity("abcd1234", "cao-session", "supervisor")
+
+        assert result is None
+
+    def test_partial_identity_is_not_returned(self, tmux):
+        window = self._candidate(tmux)
+        window.window_id = None
+        with patch.object(tmux, "_descendant_processes") as descendants:
+            result = tmux.terminal_bound_window_identity("abcd1234", "cao-session", "supervisor")
+
+        assert result is None
+        descendants.assert_not_called()
+
+
 # ── create_session ───────────────────────────────────────────────────
 
 

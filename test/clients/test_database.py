@@ -14,6 +14,7 @@ from cli_agent_orchestrator.clients.database import (
     FlowModel,
     InboxModel,
     TerminalModel,
+    backfill_terminal_identity_if_missing,
     create_flow,
     create_inbox_message,
     create_terminal,
@@ -105,6 +106,49 @@ class TestTerminalOperations:
         result = get_terminal_metadata("nonexistent")
 
         assert result is None
+
+    def test_backfill_terminal_identity_is_atomic_write_once(self, test_db):
+        with test_db() as db:
+            db.add(
+                TerminalModel(
+                    id="test123",
+                    tmux_session="cao-session",
+                    tmux_window="window-0",
+                    provider="codex",
+                )
+            )
+            db.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            assert backfill_terminal_identity_if_missing("test123", "%9", "@7") is True
+            assert backfill_terminal_identity_if_missing("test123", "%10", "@8") is False
+
+        with test_db() as db:
+            terminal = db.query(TerminalModel).filter_by(id="test123").one()
+            assert terminal.pane_id == "%9"
+            assert terminal.window_id == "@7"
+
+    def test_backfill_refuses_partial_legacy_row(self, test_db):
+        with test_db() as db:
+            db.add(
+                TerminalModel(
+                    id="test123",
+                    tmux_session="cao-session",
+                    tmux_window="window-0",
+                    provider="codex",
+                    pane_id="%existing",
+                    window_id=None,
+                )
+            )
+            db.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            assert backfill_terminal_identity_if_missing("test123", "%9", "@7") is False
+
+        with test_db() as db:
+            terminal = db.query(TerminalModel).filter_by(id="test123").one()
+            assert terminal.pane_id == "%existing"
+            assert terminal.window_id is None
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_update_last_active(self, mock_session_class):

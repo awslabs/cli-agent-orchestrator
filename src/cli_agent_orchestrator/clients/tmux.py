@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -616,6 +617,106 @@ class TmuxClient:
             return {"pane_id": str(pane_id), "window_id": str(window_id)}
         except Exception as e:
             logger.error(f"Failed to resolve window identity for {session_name}:{window_name}: {e}")
+            return None
+
+    @staticmethod
+    def _descendant_processes(root_pid: int) -> Optional[List[int]]:
+        """Return a bounded process tree rooted at ``root_pid``.
+
+        A failed or oversized observation is ambiguous and therefore returns
+        ``None`` rather than supplying partial ownership evidence.
+        """
+        ps = shutil.which("ps")
+        if not ps:
+            return None
+        try:
+            result = subprocess.run(
+                [os.path.realpath(ps), "-axo", "pid=,ppid="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        children: Dict[int, List[int]] = {}
+        try:
+            for line in result.stdout.splitlines():
+                pid_text, parent_text = line.split()
+                children.setdefault(int(parent_text), []).append(int(pid_text))
+        except (ValueError, TypeError):
+            return None
+        observed = [root_pid]
+        cursor = 0
+        while cursor < len(observed):
+            observed.extend(children.get(observed[cursor], ()))
+            cursor += 1
+            if len(observed) > 64:
+                return None
+        return observed
+
+    @staticmethod
+    def _process_has_terminal_id(pid: int, terminal_id: str) -> bool:
+        """Read one process environment without logging it."""
+        proc_environ = f"/proc/{pid}/environ"
+        try:
+            with open(proc_environ, "rb") as fh:
+                values = fh.read().split(b"\0")
+        except OSError:
+            ps = shutil.which("ps")
+            if not ps:
+                return False
+            try:
+                result = subprocess.run(
+                    [os.path.realpath(ps), "eww", "-p", str(pid), "-o", "command="],
+                    capture_output=True,
+                    timeout=2,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            if result.returncode != 0:
+                return False
+            values = re.split(rb"[ \0]", result.stdout)
+        expected = f"CAO_TERMINAL_ID={terminal_id}".encode()
+        return expected in values
+
+    def terminal_bound_window_identity(
+        self, terminal_id: str, session_name: str, window_name: str
+    ) -> Optional[Dict[str, str]]:
+        """Resolve a legacy pane only with live process-lineage ownership proof.
+
+        The stored window name locates a candidate; it is never the proof.  At
+        least one process rooted in the candidate pane must carry the exact
+        CAO terminal identity injected when that terminal was created.
+        """
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                return None
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                return None
+            pane = window.active_pane
+            pane_id = getattr(pane, "pane_id", None) if pane else None
+            pane_pid = getattr(pane, "pane_pid", None) if pane else None
+            window_id = getattr(window, "window_id", None)
+            if not pane_id or not pane_pid or not window_id:
+                return None
+            processes = self._descendant_processes(int(pane_pid))
+            if processes is None or not any(
+                self._process_has_terminal_id(pid, terminal_id) for pid in processes
+            ):
+                return None
+            return {"pane_id": str(pane_id), "window_id": str(window_id)}
+        except (TypeError, ValueError, AttributeError) as exc:
+            logger.warning(
+                "Could not prove terminal-bound identity for %s: %s",
+                terminal_id,
+                exc,
+            )
             return None
 
     def session_exists(self, session_name: str) -> bool:

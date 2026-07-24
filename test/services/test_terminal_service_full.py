@@ -1601,6 +1601,145 @@ class TestGetTerminal:
         assert result["id"] == "test1234"
         assert result["status"] == TerminalStatus.IDLE.value
 
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service." "backfill_terminal_identity_if_missing",
+        return_value=True,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_terminal_backfills_proven_legacy_identity(
+        self,
+        mock_get_metadata,
+        mock_status_monitor,
+        mock_backfill,
+        mock_get_backend,
+    ):
+        legacy = {
+            "id": "test1234",
+            "tmux_window": "developer-abcd",
+            "provider": "codex",
+            "tmux_session": "cao-session",
+            "agent_profile": "supervisor",
+            "pane_id": None,
+            "window_id": None,
+            "last_active": datetime.now(),
+        }
+        refreshed = {**legacy, "pane_id": "%9", "window_id": "@7"}
+        mock_get_metadata.side_effect = [legacy, refreshed]
+        mock_get_backend.return_value.terminal_bound_window_identity.return_value = {
+            "pane_id": "%9",
+            "window_id": "@7",
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        result = get_terminal("test1234")
+
+        assert result["pane_id"] == "%9"
+        assert result["window_id"] == "@7"
+        mock_backfill.assert_called_once_with("test1234", "%9", "@7")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service." "backfill_terminal_identity_if_missing"
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_terminal_leaves_unproven_legacy_identity_null(
+        self,
+        mock_get_metadata,
+        mock_status_monitor,
+        mock_backfill,
+        mock_get_backend,
+    ):
+        mock_get_metadata.return_value = {
+            "id": "test1234",
+            "tmux_window": "developer-abcd",
+            "provider": "codex",
+            "tmux_session": "cao-session",
+            "agent_profile": "supervisor",
+            "pane_id": None,
+            "window_id": None,
+            "last_active": datetime.now(),
+        }
+        mock_get_backend.return_value.terminal_bound_window_identity.return_value = None
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        result = get_terminal("test1234")
+
+        assert result["pane_id"] is None
+        assert result["window_id"] is None
+        mock_backfill.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service." "backfill_terminal_identity_if_missing",
+        return_value=False,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_terminal_losing_backfill_race_stays_unbound(
+        self,
+        mock_get_metadata,
+        mock_status_monitor,
+        mock_backfill,
+        mock_get_backend,
+    ):
+        mock_get_metadata.return_value = {
+            "id": "test1234",
+            "tmux_window": "developer-abcd",
+            "provider": "codex",
+            "tmux_session": "cao-session",
+            "agent_profile": "supervisor",
+            "pane_id": None,
+            "window_id": None,
+            "last_active": datetime.now(),
+        }
+        mock_get_backend.return_value.terminal_bound_window_identity.return_value = {
+            "pane_id": "%9",
+            "window_id": "@7",
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        result = get_terminal("test1234")
+
+        assert result["pane_id"] is None
+        assert result["window_id"] is None
+        mock_backfill.assert_called_once_with("test1234", "%9", "@7")
+        assert mock_get_metadata.call_count == 1
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service." "backfill_terminal_identity_if_missing"
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_terminal_never_repairs_partial_identity(
+        self,
+        mock_get_metadata,
+        mock_status_monitor,
+        mock_backfill,
+        mock_get_backend,
+    ):
+        mock_get_metadata.return_value = {
+            "id": "test1234",
+            "tmux_window": "developer-abcd",
+            "provider": "codex",
+            "tmux_session": "cao-session",
+            "agent_profile": "supervisor",
+            "pane_id": "%existing",
+            "window_id": None,
+            "last_active": datetime.now(),
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        result = get_terminal("test1234")
+
+        assert result["pane_id"] == "%existing"
+        assert result["window_id"] is None
+        mock_get_backend.assert_not_called()
+        mock_backfill.assert_not_called()
+
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_not_found(self, mock_get_metadata):
         """Test getting non-existent terminal."""

@@ -85,6 +85,11 @@ class TmuxBackend(TerminalBackend):
     def window_identity(self, session_name: str, window_name: str) -> Optional[Dict[str, str]]:
         return self._client.window_identity(session_name, window_name)
 
+    def terminal_bound_window_identity(
+        self, terminal_id: str, session_name: str, window_name: str
+    ) -> Optional[Dict[str, str]]:
+        return self._client.terminal_bound_window_identity(terminal_id, session_name, window_name)
+
     def create_window_with_argv(
         self,
         session_name: str,

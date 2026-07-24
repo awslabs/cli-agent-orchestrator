@@ -980,6 +980,30 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         }
 
 
+def backfill_terminal_identity_if_missing(terminal_id: str, pane_id: str, window_id: str) -> bool:
+    """Write both legacy identity fields once, only while both remain null."""
+    if not pane_id or not window_id:
+        return False
+    with SessionLocal() as db:
+        updated = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.pane_id.is_(None),
+                TerminalModel.window_id.is_(None),
+            )
+            .update(
+                {
+                    TerminalModel.pane_id: pane_id,
+                    TerminalModel.window_id: window_id,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return updated == 1
+
+
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List all terminals in a tmux session."""
     with SessionLocal() as db:

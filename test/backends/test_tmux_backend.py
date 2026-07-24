@@ -106,6 +106,17 @@ class TestTmuxBackendDelegation:
         assert backend.kill_window("cao-test", "window-0") is True
         mock_client.kill_window.assert_called_once_with("cao-test", "window-0")
 
+    def test_terminal_bound_window_identity_delegates(self, backend, mock_client):
+        mock_client.terminal_bound_window_identity.return_value = {
+            "pane_id": "%4",
+            "window_id": "@3",
+        }
+        result = backend.terminal_bound_window_identity("abcd1234", "cao-test", "window-0")
+        assert result == {"pane_id": "%4", "window_id": "@3"}
+        mock_client.terminal_bound_window_identity.assert_called_once_with(
+            "abcd1234", "cao-test", "window-0"
+        )
+
     def test_send_keys_delegates(self, backend, mock_client):
         backend.send_keys("cao-test", "window-0", "hello", enter_count=2)
         mock_client.send_keys.assert_called_once_with(
