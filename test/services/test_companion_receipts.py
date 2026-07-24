@@ -24,7 +24,7 @@ def test_route_receipt_generation_bound(store):
         effort="max",
         receipt_id="thread-1",
         turn_id="turn-1",
-        provider_version="0.144.6",
+        provider_version="0.145.0",
     )
     route = companion_receipts.get_route("term-1", GEN)
     assert route["provider"] == "codex"

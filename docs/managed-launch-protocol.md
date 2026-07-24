@@ -64,7 +64,7 @@ projects={"/canonical/worktree"={trust_level="trusted"}}
 Before terminal launch, a zero-turn app-server probe verifies the exact project
 key has `sessionFlags` provenance, verifies the resolved model and reasoning
 effort, starts no turn, and confirms `~/.codex/config.toml` is byte-unchanged.
-This proof is version-bound to `codex-cli 0.144.6`; any other version is
+This proof is version-bound to `codex-cli 0.145.0`; any other version is
 rejected. If a trust prompt still appears, the managed provider sends zero
 prompt keystrokes and records a preflight-blocked outcome.
 

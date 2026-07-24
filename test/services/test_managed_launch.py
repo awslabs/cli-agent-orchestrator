@@ -107,7 +107,7 @@ def _ready_receipt_for(record, request):
         "provider_transcript_sha256": "a" * 64,
         # P1-8 (final conformance §20.2f): the complete readiness schema —
         # provider version + explicit model-input-ready are mandatory.
-        "provider_version": "0.144.6",
+        "provider_version": "0.145.0",
         "model_input_ready": True,
         "reservation_id": request.reservation_id,
         "terminal_id": record["terminal_id"],
@@ -1096,7 +1096,7 @@ def test_ready_and_admission_publish_exact_companion_receipts(
     route = companion_receipts.get_route(record["terminal_id"], record["generation"])
     assert route["receipt_id"] == "provider-session-ready-opaque"
     assert route["turn_id"] == "provider-session-ready-opaque"
-    assert route["provider_version"] == "0.144.6"
+    assert route["provider_version"] == "0.145.0"
     assert route["generation"] == record["generation"]
     # a replacement generation is never served this receipt
     assert companion_receipts.get_route(record["terminal_id"], str(uuid.uuid4())) is None
