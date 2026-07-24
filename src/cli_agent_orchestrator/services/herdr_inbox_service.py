@@ -263,7 +263,10 @@ class HerdrInboxService:
                 timeout=10,
             )
             if result.returncode != 0:
-                logger.warning(f"Snapshot: `api snapshot` failed: {result.stderr}")
+                # repr() the stderr: it can echo user-controlled labels/args and
+                # may contain newlines/control chars that would otherwise forge
+                # log lines. Matches the escaping used elsewhere in the codebase.
+                logger.warning("Snapshot: `api snapshot` failed: %r", result.stderr)
                 return None
             snapshot = json.loads(result.stdout)["result"]["snapshot"]
             if not isinstance(snapshot, dict):

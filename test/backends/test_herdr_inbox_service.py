@@ -64,20 +64,31 @@ class TestHerdrInboxServiceRegisterReconnect:
 
     def test_register_while_connected_does_not_touch_socket(self):
         """With broadcast subscription, a newly registered pane's events already
-        arrive — registration must NOT close the socket or write anything."""
+        arrive — registration must NOT close the socket, write, or schedule a
+        reconnect coroutine."""
+        import asyncio
+
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         writer = MagicMock()
         service._writer = writer
+        # Simulate a live connection with a captured loop, the state under which
+        # the removed force-reconnect used to fire.
+        service._connected = True
+        service._loop = MagicMock()
 
-        service.register_terminal("tid1", "w1:p1", is_kiro=False)
+        # Behavioral assertion: registration must not schedule ANY coroutine onto
+        # the loop. This is the real contract (not a private-name check) and it is
+        # non-vacuous — writer.close/write alone pass even if a coroutine is merely
+        # scheduled on an un-run loop, so assert on the scheduling call itself.
+        with patch.object(asyncio, "run_coroutine_threadsafe") as mock_schedule:
+            service.register_terminal("tid1", "w1:p1", is_kiro=False)
+            mock_schedule.assert_not_called()
 
         assert service._pane_to_terminal["w1:p1"] == "tid1"
         writer.close.assert_not_called()
         writer.write.assert_not_called()
-        # Guard against re-introducing the removed force-reconnect: registration
-        # must not schedule any coroutine. (writer.close/write above pass
-        # vacuously if a coroutine is merely scheduled on an un-run loop, so
-        # assert on the scheduling itself.)
+        # Belt-and-braces: the force-reconnect method is gone entirely, so it
+        # cannot be reintroduced without also updating this guard.
         assert not hasattr(service, "_force_reconnect")
 
     def test_register_before_start_does_not_reconnect(self):
