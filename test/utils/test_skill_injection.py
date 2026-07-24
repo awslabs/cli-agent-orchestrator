@@ -1,7 +1,6 @@
 """Tests for skill injection utilities."""
 
 import logging
-import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -147,20 +146,24 @@ class TestRefreshAgentMdPrompt:
         "cli_agent_orchestrator.utils.skill_injection.build_skill_catalog",
         return_value="## Skills",
     )
-    def test_writes_atomically_with_os_replace(self, _mock_catalog, tmp_path):
+    def test_writes_atomically_no_temp_file_left_behind(self, _mock_catalog, tmp_path):
+        """The write goes through locked_atomic_rewrite: no .tmp leftovers,
+        content lands correctly, regardless of the exact temp filename used
+        internally (unique per-call, unlike the old fixed ``.tmp`` suffix).
+        """
         md_path = tmp_path / "developer.agent.md"
         _write_agent_md(md_path, "developer", "Developer", "Body")
-        temp_path = md_path.with_suffix(".md.tmp")
 
         profile = AgentProfile(name="developer", description="Developer", prompt="Prompt")
 
-        with patch(
-            "cli_agent_orchestrator.utils.skill_injection.os.replace", wraps=os.replace
-        ) as mock_replace:
-            skill_injection.refresh_agent_md_prompt(md_path, profile)
+        skill_injection.refresh_agent_md_prompt(md_path, profile)
 
-        mock_replace.assert_called_once_with(temp_path, md_path)
-        assert not temp_path.exists()
+        assert _read_agent_md_body(md_path) == "Prompt\n\n## Skills"
+        # The sidecar ``.lock`` file is expected to persist (it is reused
+        # across calls, not a per-write temp file); only ``.tmp`` files must
+        # never survive.
+        leftover_tmp = [p for p in tmp_path.iterdir() if ".tmp" in p.name]
+        assert leftover_tmp == []
 
     @patch(
         "cli_agent_orchestrator.utils.skill_injection.build_skill_catalog",
