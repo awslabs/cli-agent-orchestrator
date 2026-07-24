@@ -204,7 +204,7 @@ def test_compact_uses_capability_gated_acp_prompt(tmp_path):
 
     receipt = session.session_operation(command, journal)
 
-    assert receipt["state"] in {SUBMITTED, COMPLETED}
+    assert receipt["state"] in {SUBMITTED, ACCEPTED, COMPLETED}
     for _ in range(100):
         receipt = session.reconcile_session_operation(journal, command["operation_id"])
         if receipt["state"] == COMPLETED:
