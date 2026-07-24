@@ -34,6 +34,10 @@ class Terminal(BaseModel):
     caller_id: Optional[str] = Field(
         None, description="Terminal that created this one via handoff/assign (callback target)"
     )
+    pane_id: Optional[str] = Field(None, description="Server-recorded immutable tmux pane identity")
+    window_id: Optional[str] = Field(
+        None, description="Server-recorded immutable tmux window identity"
+    )
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"

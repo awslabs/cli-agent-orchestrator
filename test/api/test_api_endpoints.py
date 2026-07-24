@@ -720,6 +720,8 @@ class TestGetTerminal:
             "session_name": "test-session",
             "provider": "kiro_cli",
             "agent_profile": "developer",
+            "pane_id": "%125",
+            "window_id": "@42",
         }
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.get_terminal.return_value = mock_terminal_dict
@@ -730,6 +732,8 @@ class TestGetTerminal:
         data = response.json()
         assert data["id"] == "abcd1234"
         assert data["provider"] == "kiro_cli"
+        assert data["pane_id"] == "%125"
+        assert data["window_id"] == "@42"
         mock_svc.get_terminal.assert_called_once_with("abcd1234")
 
     def test_get_terminal_not_found(self, client):
