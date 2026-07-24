@@ -1130,6 +1130,13 @@ def test_deliver_inbox_via_bridge_exact_binding(isolated_memory_db, tmp_path, mo
     # live managed bridge; anything else falls back WITHOUT an ack.
     request = _reserve_request(tmp_path)
     record = _ready_record(request)
+    admission = _admit_request()
+    admitting, _ = managed_launch.claim_admission(request.reservation_id, admission)
+    record = managed_launch.complete_admission(
+        request.reservation_id,
+        admission.delivery_id,
+        _submission_receipt(admitting, admission),
+    )
     calls = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.managed_provider_bridge.request_bridge",

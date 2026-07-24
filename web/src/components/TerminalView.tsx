@@ -1,8 +1,9 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { X, Terminal as TermIcon } from 'lucide-react'
+import { api } from '../api'
 
 interface TerminalViewProps {
   terminalId: string
@@ -19,6 +20,83 @@ const DEFAULT_LINE_HEIGHT = Math.round(TERMINAL_FONT_SIZE * 1.2)
 
 export function TerminalView({ terminalId, provider, agentProfile, onClose }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
+  const managedRef = useRef<boolean | null>(null)
+  const [managed, setManaged] = useState(false)
+  const [generation, setGeneration] = useState<string | undefined>()
+  const [message, setMessage] = useState('')
+  const [model, setModel] = useState('')
+  const [effort, setEffort] = useState('')
+  const [controlBusy, setControlBusy] = useState(false)
+  const [controlStatus, setControlStatus] = useState('')
+
+  useEffect(() => {
+    managedRef.current = null
+    api.getManagedControl(terminalId)
+      .then(result => {
+        managedRef.current = result.managed
+        setManaged(result.managed)
+        setGeneration(result.generation)
+      })
+      .catch(() => {
+        // Unknown control identity is not proof this is an ordinary TUI.
+        // Keep terminal input fail-closed rather than pasting into a possibly
+        // managed bridge pane when the identity lookup is unavailable.
+        managedRef.current = null
+        setManaged(false)
+        setGeneration(undefined)
+        setControlStatus('terminal control identity unavailable')
+      })
+  }, [terminalId])
+
+  const runManagedOperation = async (body: {
+    action: string
+    message?: string
+    config_id?: string
+    value?: string
+    instruction?: string
+  }) => {
+    const operationId = crypto.randomUUID()
+    setControlBusy(true)
+    setControlStatus(`${body.action}: submitting…`)
+    try {
+      const response = await api.beginManagedOperation(terminalId, {
+        ...body,
+        operation_id: operationId,
+        generation,
+      })
+      const state = String(response.receipt.state || 'unknown')
+      const reason = response.receipt.reason_code || response.receipt.reason_detail
+      setControlStatus(`${body.action}: ${state}${reason ? ` — ${String(reason)}` : ''}`)
+      if (body.action === 'route-query') {
+        const result = response.receipt.result as Record<string, unknown> | undefined
+        if (result?.model) setModel(String(result.model))
+        if (result?.effort) setEffort(String(result.effort))
+      }
+      if (body.action === 'follow-up' && response.success) setMessage('')
+    } catch (error) {
+      // The request may have crossed the provider boundary before the HTTP
+      // response was lost. Query the same durable operation; never invent a
+      // second ID and repeat a potentially accepted effect.
+      try {
+        const reconciled = await api.queryManagedOperation(
+          terminalId,
+          operationId,
+          generation,
+        )
+        const state = String(reconciled.receipt.state || 'unknown')
+        const reason = reconciled.receipt.reason_code || reconciled.receipt.reason_detail
+        setControlStatus(
+          `${body.action}: ${state}${reason ? ` — ${String(reason)}` : ''}`,
+        )
+      } catch {
+        setControlStatus(
+          `${body.action}: response unavailable; operation ${operationId} retained for reconciliation`,
+        )
+      }
+    } finally {
+      setControlBusy(false)
+    }
+  }
 
   useEffect(() => {
     const el = containerRef.current
@@ -178,7 +256,11 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     // onData handles ALL input including paste — xterm.js
     // receives pasted text through the browser's input system
     term.onData((data) => {
-      if (ws.readyState === WebSocket.OPEN) {
+      // A managed pane is a rendered view of a private provider RPC stream.
+      // Its stdin is deliberately not a provider input channel; controls use
+      // the exact generation-bound API above.  Hold input while managed status
+      // is unresolved so an early paste cannot leak into the wrong transport.
+      if (managedRef.current === false && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'input', data }))
       }
     })
@@ -225,6 +307,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
           <span className="text-sm font-mono text-gray-300">{terminalId}</span>
           {provider && <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">{provider}</span>}
           {agentProfile && <span className="text-xs text-emerald-400 bg-emerald-900/30 px-2 py-0.5 rounded">{agentProfile}</span>}
+          {managed && <span className="text-xs text-cyan-300 bg-cyan-900/30 px-2 py-0.5 rounded">Managed ACP · read-only transcript</span>}
         </div>
         <div className="flex items-center gap-3">
           <span className="text-[10px] text-gray-600">Click X to close</span>
@@ -237,6 +320,87 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
           </button>
         </div>
       </div>
+      {managed && (
+        <div className="shrink-0 border-b border-gray-700/50 bg-gray-950 px-4 py-2 space-y-2">
+          <div className="flex gap-2">
+            <input
+              value={message}
+              onChange={event => setMessage(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter' && message.trim() && !controlBusy) {
+                  void runManagedOperation({ action: 'follow-up', message: message.trim() })
+                }
+              }}
+              placeholder="Send a provider-native follow-up…"
+              className="min-w-0 flex-1 rounded border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none"
+            />
+            <button
+              disabled={controlBusy || !message.trim()}
+              onClick={() => void runManagedOperation({ action: 'follow-up', message: message.trim() })}
+              className="rounded bg-emerald-700 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+            >
+              Send
+            </button>
+            <button
+              disabled={controlBusy}
+              onClick={() => void runManagedOperation({ action: 'cancel' })}
+              className="rounded bg-amber-700 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+            >
+              Cancel turn
+            </button>
+            <button
+              disabled={controlBusy}
+              onClick={() => void runManagedOperation({ action: 'compact' })}
+              className="rounded bg-indigo-700 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+            >
+              Compact
+            </button>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              disabled={controlBusy}
+              onClick={() => void runManagedOperation({ action: 'route-query' })}
+              className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
+            >
+              Query route
+            </button>
+            <input
+              value={model}
+              onChange={event => setModel(event.target.value)}
+              placeholder="model"
+              className="w-56 rounded border border-gray-700 bg-gray-900 px-2 py-1 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none"
+            />
+            <button
+              disabled={controlBusy || !model.trim()}
+              onClick={() => void runManagedOperation({ action: 'route-set', config_id: 'model', value: model.trim() })}
+              className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
+            >
+              Set model
+            </button>
+            <input
+              value={effort}
+              onChange={event => setEffort(event.target.value)}
+              placeholder="effort"
+              className="w-32 rounded border border-gray-700 bg-gray-900 px-2 py-1 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none"
+            />
+            <button
+              disabled={controlBusy || !effort.trim()}
+              onClick={() => void runManagedOperation({ action: 'route-set', config_id: 'thinking', value: effort.trim() })}
+              className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
+            >
+              Set effort
+            </button>
+            <button
+              disabled={controlBusy}
+              onClick={() => void runManagedOperation({ action: 'resume-status' })}
+              className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
+            >
+              Resume status
+            </button>
+            <span className="min-w-0 truncate text-[11px] text-gray-500">{controlStatus}</span>
+          </div>
+        </div>
+      )}
       {/* Terminal — absolute positioning gives xterm.js real pixel dimensions to measure */}
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
         <div ref={containerRef} style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }} />

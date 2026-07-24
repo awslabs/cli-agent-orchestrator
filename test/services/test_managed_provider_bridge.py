@@ -290,6 +290,8 @@ def test_deliver_inbox_records_exact_provider_turn_ack(tmp_path, monkeypatch):
     command = {
         "op": "deliver",
         "reservation_id": request["reservation_id"],
+        "terminal_id": request["terminal_id"],
+        "generation": request["generation"],
         "message_id": "msg-1",
         "message": "ping",
         "message_sha256": hashlib.sha256(b"ping").hexdigest(),
@@ -531,6 +533,8 @@ def _v2_session(tmp_path, monkeypatch):
     session.rpc = object()
     session.provider_session_id = "thread_provider_opaque"
     session.readiness = {"provider_version": "0.145.0"}
+    session.current_model = request["model"]
+    session.current_effort = request["effort"]
     session._current_turn_id = None
     session._heartbeat_producer = None
     session.kimi_wire_path = None

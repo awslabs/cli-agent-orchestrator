@@ -83,6 +83,7 @@ class InboxService:
         # falls through to the ordinary paste path, from which NO
         # acknowledgement is ever inferred.
         remaining = []
+        managed_identity = managed_launch.managed_control_identity(terminal_id)
         for message in messages:
             if managed_launch.deliver_inbox_via_bridge(
                 terminal_id,
@@ -99,6 +100,18 @@ class InboxService:
                 remaining.append(message)
         messages = remaining
         if not messages:
+            return
+        if managed_identity is not None:
+            # A managed bridge owns provider stdin.  If native delivery is
+            # temporarily unavailable, preserve the inbox rows as pending;
+            # falling through to terminal paste would write into a renderer
+            # pane that cannot acknowledge or safely consume the message.
+            logger.info(
+                "Preserving %d pending message(s) for managed terminal %s; "
+                "provider-native delivery is not currently available",
+                len(messages),
+                terminal_id,
+            )
             return
 
         status = status_monitor.get_status(terminal_id)

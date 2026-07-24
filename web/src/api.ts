@@ -206,6 +206,34 @@ export const api = {
     fetchJSON<{ output: string; mode: string }>(`/terminals/${id}/output?mode=${mode}`),
   sendInput: (id: string, message: string) =>
     fetchJSON<{ success: boolean }>(`/terminals/${id}/input?message=${encodeURIComponent(message)}`, { method: 'POST' }),
+  getManagedControl: (id: string) =>
+    fetchJSON<{ managed: boolean; generation?: string; provider?: string }>(`/terminals/${id}/managed-control`),
+  beginManagedOperation: (
+    id: string,
+    body: {
+      action: string
+      operation_id: string
+      generation?: string
+      message?: string
+      config_id?: string
+      value?: string
+      instruction?: string
+    }
+  ) =>
+    fetchJSON<{ success: boolean; receipt: Record<string, unknown> }>(
+      `/terminals/${id}/managed-operations`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        timeoutMs: 50000,
+      }
+    ),
+  queryManagedOperation: (id: string, operationId: string, generation?: string) =>
+    fetchJSON<{ receipt: Record<string, unknown> }>(
+      `/terminals/${id}/managed-operations/${encodeURIComponent(operationId)}${generation ? `?generation=${encodeURIComponent(generation)}` : ''}`,
+      { timeoutMs: 35000 }
+    ),
   exitTerminal: (id: string) =>
     fetchJSON<{ success: boolean }>(`/terminals/${id}/exit`, { method: 'POST' }),
   deleteTerminal: (id: string) => fetchJSON<{ success: boolean }>(`/terminals/${id}`, { method: 'DELETE' }),

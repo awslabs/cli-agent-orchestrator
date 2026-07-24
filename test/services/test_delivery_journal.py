@@ -83,6 +83,18 @@ def test_provider_accept_then_bridge_death_window(journal):
     assert [e["to_state"] for e in record["events"]][-1] == "submit-ambiguous"
 
 
+def test_certain_pre_submit_refusal_can_retry_same_message(journal):
+    journal.open_intent(OB, CB, REQ)
+    journal.mark_terminal_queued(OB, CB)
+    refused = journal.mark_submit_refused(OB, CB)
+    assert refused["state"] == "submit-refused"
+
+    queued = journal.mark_terminal_queued(OB, CB)
+    assert queued["state"] == "terminal_queued"
+    journal.mark_submitted(OB, CB)
+    assert journal.mark_submit_acked(OB, CB)["state"] == "submit-acked"
+
+
 def test_idempotent_rearrival_records_nothing_twice(journal):
     journal.open_intent(OB, CB, REQ)
     journal.mark_terminal_queued(OB, CB)

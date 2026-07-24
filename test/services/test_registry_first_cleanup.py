@@ -412,13 +412,21 @@ def test_bridge_resources_register_and_deregister(tmp_path, monkeypatch):
             request["rendezvous_identity"],
         )
         (root / "delivery-journal.db").write_text("", encoding="utf-8")
+        (root / "session-control-journal.db").write_text("", encoding="utf-8")
         bridge._mark_bridge_resource_created(target, request, "socket")
         bridge._mark_bridge_journal_created(target, request)
-        by_kind = {
-            e["kind"]: e for e in registry.enumerate(terminal_id="a1b2c3d4", generation=generation)
-        }
+        bridge._mark_control_journal_created(target, request)
+        entries = registry.enumerate(terminal_id="a1b2c3d4", generation=generation)
+        by_kind = {e["kind"]: e for e in entries}
         assert by_kind["socket"]["lifecycle_state"] == "created"
-        assert by_kind["db_row_set"]["lifecycle_state"] == "created"
+        bridge_journals = [
+            entry
+            for entry in entries
+            if entry["kind"] == "db_row_set"
+            and entry["constructor_id"] == "managed_provider_bridge._serve"
+        ]
+        assert len(bridge_journals) == 2
+        assert all(entry["lifecycle_state"] == "created" for entry in bridge_journals)
         # Deregistration physically removes the artifacts and only then
         # records verified absence.
         bridge._deregister_bridge_resources(target, request)

@@ -206,9 +206,11 @@ class TestTerminalOperations:
         mock_terminal.agent_profile = "developer"
         mock_terminal.last_active = datetime.now()
 
-        mock_query = MagicMock()
-        mock_query.filter.return_value.all.return_value = [mock_terminal]
-        mock_session.query.return_value = mock_query
+        legacy_query = MagicMock()
+        legacy_query.filter.return_value.all.return_value = [mock_terminal]
+        managed_query = MagicMock()
+        managed_query.filter.return_value.all.return_value = []
+        mock_session.query.side_effect = [legacy_query, managed_query]
         mock_session_class.return_value = mock_session
 
         result = list_terminals_by_session("cao-session")

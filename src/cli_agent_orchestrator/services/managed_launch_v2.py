@@ -934,6 +934,7 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
         )
         bridge_request = {
             "bridge_version": BRIDGE_VERSION,
+            "controller_pid": os.getpid(),
             "reservation_id": reservation_id,
             "terminal_id": record["terminal_id"],
             "generation": record["generation"],

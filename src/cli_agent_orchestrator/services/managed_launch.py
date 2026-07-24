@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.managed_launch import (
@@ -1040,21 +1040,18 @@ def deliver_inbox_via_bridge(
     from cli_agent_orchestrator.services.managed_provider_bridge import request_bridge
 
     try:
-        with database.SessionLocal() as db:
-            row = (
-                db.query(database.ManagedLaunchReservationModel)
-                .filter(database.ManagedLaunchReservationModel.terminal_id == terminal_id)
-                .one_or_none()
-            )
-        if row is None or row.state not in {"ready", "admitted"}:
+        identity = managed_control_identity(terminal_id)
+        if identity is None or identity["state"] != "admitted":
             return False
-        reservation_id = str(row.reservation_id)
+        reservation_id = identity["reservation_id"]
         request_bridge(
             reservation_id,
             {
                 "bridge_version": "cao-native-provider-bridge-v1",
                 "op": "deliver",
                 "reservation_id": reservation_id,
+                "terminal_id": identity["terminal_id"],
+                "generation": identity["generation"],
                 "message_id": str(message_id),
                 "message": message,
                 "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
@@ -1070,6 +1067,133 @@ def deliver_inbox_via_bridge(
             exc_info=True,
         )
         return False
+
+
+def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:
+    """Resolve an exact managed generation without pane-name inference."""
+    with database.SessionLocal() as db:
+        row = (
+            db.query(database.ManagedLaunchReservationModel)
+            .filter(database.ManagedLaunchReservationModel.terminal_id == terminal_id)
+            .one_or_none()
+        )
+        try:
+            row_v2 = (
+                db.query(database.ManagedLaunchV2ReservationModel)
+                .filter(database.ManagedLaunchV2ReservationModel.terminal_id == terminal_id)
+                .one_or_none()
+            )
+        except OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            row_v2 = None
+        if row is not None and row_v2 is not None:
+            raise ManagedLaunchConflict(
+                f"ambiguous managed terminal identity across protocol vintages: {terminal_id}"
+            )
+        if row is not None:
+            return {
+                "reservation_id": str(row.reservation_id),
+                "terminal_id": str(row.terminal_id),
+                "generation": str(row.generation),
+                "provider": str(row.provider),
+                "state": str(row.state),
+                "controllable": str(row.state) == "admitted",
+                "vintage": "v1",
+            }
+        if row_v2 is not None:
+            return {
+                "reservation_id": str(row_v2.reservation_id),
+                "terminal_id": str(row_v2.terminal_id),
+                "generation": str(row_v2.generation),
+                "provider": str(row_v2.provider),
+                "state": str(row_v2.state),
+                "controllable": str(row_v2.state) == "admitted",
+                "vintage": "v2",
+            }
+    return None
+
+
+def begin_managed_session_operation(
+    terminal_id: str,
+    *,
+    operation_id: str,
+    action: str,
+    generation: Optional[str] = None,
+    timeout: float = 45.0,
+    **payload: Any,
+) -> dict[str, Any]:
+    """Submit one semantic human control to the exact provider generation."""
+    from cli_agent_orchestrator.services.managed_provider_bridge import request_bridge
+
+    identity = managed_control_identity(terminal_id)
+    if identity is None:
+        raise ManagedLaunchNotFound(f"live managed terminal not found: {terminal_id}")
+    if identity["controllable"] is not True:
+        raise ManagedLaunchConflict(
+            f"managed terminal is not controllable from state {identity['state']!r}"
+        )
+    if generation is not None and generation != identity["generation"]:
+        raise ManagedLaunchConflict("stale managed terminal generation")
+    if not operation_id or not action:
+        raise ManagedLaunchConflict("operation_id and action are required")
+    command = {
+        "bridge_version": "cao-native-provider-bridge-v1",
+        "op": "session.op.begin",
+        "operation_id": operation_id,
+        "action": action,
+        "reservation_id": identity["reservation_id"],
+        "terminal_id": identity["terminal_id"],
+        "generation": identity["generation"],
+        **payload,
+    }
+    try:
+        response = request_bridge(identity["reservation_id"], command, timeout=timeout)
+    except Exception as exc:
+        raise ManagedLaunchUnavailable(f"managed session control unavailable: {exc}") from exc
+    receipt = response.get("receipt")
+    if not isinstance(receipt, dict):
+        raise ManagedLaunchUnavailable("managed bridge omitted the session-operation receipt")
+    return receipt
+
+
+def query_managed_session_operation(
+    terminal_id: str,
+    *,
+    operation_id: str,
+    generation: Optional[str] = None,
+) -> dict[str, Any]:
+    """Passively query an operation; never retry its provider effect."""
+    from cli_agent_orchestrator.services.managed_provider_bridge import request_bridge
+
+    identity = managed_control_identity(terminal_id)
+    if identity is None:
+        raise ManagedLaunchNotFound(f"live managed terminal not found: {terminal_id}")
+    if identity["controllable"] is not True:
+        raise ManagedLaunchConflict(
+            f"managed terminal is not controllable from state {identity['state']!r}"
+        )
+    if generation is not None and generation != identity["generation"]:
+        raise ManagedLaunchConflict("stale managed terminal generation")
+    try:
+        response = request_bridge(
+            identity["reservation_id"],
+            {
+                "bridge_version": "cao-native-provider-bridge-v1",
+                "op": "session.op.query",
+                "operation_id": operation_id,
+                "reservation_id": identity["reservation_id"],
+                "terminal_id": identity["terminal_id"],
+                "generation": identity["generation"],
+            },
+            timeout=30.0,
+        )
+    except Exception as exc:
+        raise ManagedLaunchUnavailable(f"managed session control query unavailable: {exc}") from exc
+    receipt = response.get("receipt")
+    if not isinstance(receipt, dict):
+        raise ManagedLaunchUnavailable("managed bridge omitted the session-operation receipt")
+    return receipt
 
 
 def cleanup_reserved(
@@ -1273,6 +1397,7 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
         )
         bridge_request = {
             "bridge_version": BRIDGE_VERSION,
+            "controller_pid": os.getpid(),
             "reservation_id": reservation_id,
             "terminal_id": record["terminal_id"],
             "generation": record["generation"],

@@ -17,6 +17,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
 )
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
@@ -983,7 +984,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List all terminals in a tmux session."""
     with SessionLocal() as db:
         terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
-        return [
+        result = [
             {
                 "id": t.id,
                 "tmux_session": t.tmux_session,
@@ -994,6 +995,30 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
             }
             for t in terminals
         ]
+        try:
+            managed = (
+                db.query(ManagedLaunchV2TerminalModel)
+                .filter(ManagedLaunchV2TerminalModel.tmux_session == tmux_session)
+                .all()
+            )
+        except OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            managed = []
+        result.extend(
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "last_active": t.last_active,
+                "generation": t.generation,
+                "protocol_vintage": "v2",
+            }
+            for t in managed
+        )
+        return result
 
 
 def update_last_active(terminal_id: str) -> bool:

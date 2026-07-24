@@ -38,12 +38,32 @@ from cli_agent_orchestrator.providers.codex import (
     _validate_config_key,
     render_trusted_project_override,
 )
-from cli_agent_orchestrator.services import companion_receipts
+from cli_agent_orchestrator.services import actor_broker, companion_receipts
 from cli_agent_orchestrator.services.codex_trust import (
     SUPPORTED_CODEX_VERSION,
     _contains_session_flags,
 )
 from cli_agent_orchestrator.services.kimi_route import SUPPORTED_KIMI_VERSION, _current_option
+from cli_agent_orchestrator.services.managed_event_renderer import ManagedEventRenderer
+from cli_agent_orchestrator.services.managed_session_control import (
+    ACCEPTED as CONTROL_ACCEPTED,
+)
+from cli_agent_orchestrator.services.managed_session_control import (
+    AMBIGUOUS as CONTROL_AMBIGUOUS,
+)
+from cli_agent_orchestrator.services.managed_session_control import (
+    COMPLETED as CONTROL_COMPLETED,
+)
+from cli_agent_orchestrator.services.managed_session_control import (
+    QUEUED as CONTROL_QUEUED,
+)
+from cli_agent_orchestrator.services.managed_session_control import (
+    REFUSED as CONTROL_REFUSED,
+)
+from cli_agent_orchestrator.services.managed_session_control import (
+    SUBMITTED as CONTROL_SUBMITTED,
+)
+from cli_agent_orchestrator.services.managed_session_control import SessionControlJournal
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
@@ -276,6 +296,15 @@ class SubmitUncertain(BridgeError):
     accepted the turn; callers MUST durably record ``submit-ambiguous``
     evidence rather than asserting either submission or non-submission.
     """
+
+
+class SessionOperationRefused(BridgeError):
+    """A typed managed-session control refusal made before provider I/O."""
+
+    def __init__(self, code: str, detail: str):
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
 
 
 def _git_launch_identity(working_directory: str) -> tuple[str, str]:
@@ -1213,6 +1242,213 @@ def request_bridge(
     return response
 
 
+def _operator_command(line: str) -> tuple[Optional[str], dict[str, Any]]:
+    """Translate one terminal-console line into a semantic session operation."""
+    text = line.strip()
+    if not text:
+        return None, {}
+    if text == "/help":
+        return "help", {}
+    if text == "/cancel":
+        return "cancel", {}
+    if text == "/route":
+        return "route-query", {}
+    if text == "/resume-status":
+        return "resume-status", {}
+    if text.startswith("/operation ") or text.startswith("/op "):
+        operation_id = text.split(maxsplit=1)[1].strip()
+        if operation_id:
+            return "operation-query", {"operation_id": operation_id}
+    if text == "/compact" or text.startswith("/compact "):
+        instruction = text[len("/compact") :].strip()
+        return "compact", ({"instruction": instruction} if instruction else {})
+    if text.startswith("/model "):
+        return "route-set", {
+            "config_id": "model",
+            "value": text[len("/model ") :].strip(),
+        }
+    if text.startswith("/effort "):
+        return "route-set", {
+            "config_id": "thinking",
+            "value": text[len("/effort ") :].strip(),
+        }
+    if text.startswith("/send "):
+        return "follow-up", {"message": text[len("/send ") :]}
+    if text.startswith("/"):
+        return "invalid-command", {"command": text}
+    return "follow-up", {"message": line.rstrip("\r\n")}
+
+
+def _operator_console(request: dict[str, Any]) -> None:
+    """Keep the managed worker directly steerable from its terminal pane."""
+    print(
+        "[operator] ready for input; type a message or /help "
+        "(commands: /cancel, /compact, /route, /model, /effort, "
+        "/resume-status, /operation)",
+        flush=True,
+    )
+    for line in sys.stdin:
+        action, payload = _operator_command(line)
+        if action is None:
+            continue
+        if action == "help":
+            print(
+                "[operator] messages create provider-native follow-up turns; "
+                "/cancel interrupts the active turn; /compact [instruction] compacts; "
+                "/route queries the route; /model VALUE and /effort VALUE change it; "
+                "/resume-status checks the persisted provider session; "
+                "/operation ID reconciles an exact operation after response loss; "
+                "/send TEXT sends prompt text that begins with a slash",
+                flush=True,
+            )
+            continue
+        if action == "invalid-command":
+            print(
+                f"[operator] unknown local command: {payload['command']}; "
+                "use /help or /send TEXT",
+                flush=True,
+            )
+            continue
+        if action == "operation-query":
+            operation_id = payload["operation_id"]
+            command = {
+                "bridge_version": BRIDGE_VERSION,
+                "op": "session.op.query",
+                "operation_id": operation_id,
+                "reservation_id": request["reservation_id"],
+                "terminal_id": request["terminal_id"],
+                "generation": request["generation"],
+            }
+            try:
+                response = request_bridge(request["reservation_id"], command, timeout=30.0)
+                receipt = response.get("receipt") or {}
+                state = receipt.get("state", "unknown")
+                print(
+                    f"\n[operator] operation {operation_id} is {state}",
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - operator-visible typed failure
+                print(
+                    f"\n[operator] operation {operation_id} could not be reconciled: {exc}",
+                    flush=True,
+                )
+            continue
+        operation_id = f"terminal-{uuid.uuid4()}"
+        command = {
+            "bridge_version": BRIDGE_VERSION,
+            "op": "session.op.begin",
+            "operation_id": operation_id,
+            "action": action,
+            "reservation_id": request["reservation_id"],
+            "terminal_id": request["terminal_id"],
+            "generation": request["generation"],
+            **payload,
+        }
+        try:
+            response = request_bridge(
+                request["reservation_id"],
+                command,
+                timeout=16 * 60 if action == "compact" else 75.0,
+            )
+            receipt = response.get("receipt") or {}
+            state = receipt.get("state", "unknown")
+            detail = receipt.get("reason_detail")
+            suffix = f": {detail}" if isinstance(detail, str) and detail else ""
+            print(
+                f"\n[operator] {action} {state} " f"(operation {operation_id}){suffix}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - operator-visible typed failure
+            # The begin request may have crossed the provider boundary before
+            # its response was lost. Reconcile the SAME durable operation ID;
+            # never turn a console retry into a second provider turn.
+            query = {
+                "bridge_version": BRIDGE_VERSION,
+                "op": "session.op.query",
+                "operation_id": operation_id,
+                "reservation_id": request["reservation_id"],
+                "terminal_id": request["terminal_id"],
+                "generation": request["generation"],
+            }
+            try:
+                response = request_bridge(request["reservation_id"], query, timeout=30.0)
+                receipt = response.get("receipt") or {}
+                state = receipt.get("state", "unknown")
+                print(
+                    f"\n[operator] {action} response was lost, but operation "
+                    f"{operation_id} is {state}; do not resend it",
+                    flush=True,
+                )
+            except Exception as query_exc:  # noqa: BLE001 - exact ambiguity is visible
+                print(
+                    f"\n[operator] {action} outcome is unresolved "
+                    f"(operation {operation_id}): {exc}; reconciliation failed: "
+                    f"{query_exc}. Do not resend; use /operation {operation_id}",
+                    flush=True,
+                )
+
+
+def _send_socket_response(connection: socket.socket, response: dict[str, Any]) -> bool:
+    """Reply to one operator without letting response loss kill the bridge."""
+    try:
+        payload = _canonical(response) + b"\n"
+    except Exception:  # noqa: BLE001 - serialization is connection-local
+        logger.warning("managed operator response could not be serialized", exc_info=True)
+        return False
+    try:
+        connection.sendall(payload)
+        return True
+    except OSError:
+        logger.info(
+            "managed operator disconnected before receiving its response",
+            exc_info=True,
+        )
+        return False
+
+
+def _authorize_operator_peer(
+    connection: socket.socket, request: dict[str, Any]
+) -> actor_broker.PeerCredentials:
+    """Allow semantic controls only from this bridge or its pinned controller.
+
+    The provider process tree runs under the operator's UID and can read the
+    rendezvous envelope, so socket mode and request fields are not authority.
+    Kernel peer credentials provide the non-forgeable process identity.  The
+    controller PID is pinned before the provider is launched and never enters
+    the provider environment; the bridge PID covers its local operator console.
+    """
+    try:
+        peer = actor_broker.peer_credentials(connection)
+    except Exception as exc:  # noqa: BLE001 - peer identity fails closed
+        raise BridgeError(f"managed operator peer identity unavailable: {exc}") from exc
+    controller_pid = request.get("controller_pid")
+    allowed_pids = {os.getpid()}
+    if isinstance(controller_pid, int) and controller_pid > 0:
+        allowed_pids.add(controller_pid)
+    if peer.uid != os.getuid() or peer.pid not in allowed_pids:
+        raise BridgeError("managed operator peer is not the pinned conductor or bridge process")
+    return peer
+
+
+def _render_provider_diagnostic(line: str) -> Optional[str]:
+    """Return one bounded human diagnostic, never a raw JSON payload."""
+    diagnostic = line.strip()
+    if not diagnostic:
+        return None
+    try:
+        parsed = json.loads(diagnostic)
+    except json.JSONDecodeError:
+        return diagnostic[:500]
+    if isinstance(parsed, dict):
+        message = parsed.get("message")
+        if not isinstance(message, str):
+            error = parsed.get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+        if isinstance(message, str) and message:
+            return message[:500]
+    return "structured detail suppressed"
+
+
 class _RpcProcess:
     def __init__(
         self,
@@ -1243,6 +1479,7 @@ class _RpcProcess:
         self._notifications: list[dict[str, Any]] = []
         self._next_id = 1
         self._closed_error: Optional[str] = None
+        self._renderer = ManagedEventRenderer(provider="managed")
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
 
@@ -1324,7 +1561,7 @@ class _RpcProcess:
                 try:
                     item = json.loads(line)
                 except json.JSONDecodeError:
-                    print(line.rstrip(), flush=True)
+                    print("[provider protocol] unparseable output suppressed", flush=True)
                     continue
                 if not isinstance(item, dict):
                     continue
@@ -1336,7 +1573,10 @@ class _RpcProcess:
                         self._responses[item["id"]] = item
                     else:
                         self._notifications.append(item)
-                        print(json.dumps(item, sort_keys=True), flush=True)
+                        rendered = self._renderer.render(item)
+                        if rendered:
+                            sys.stdout.write(rendered)
+                            sys.stdout.flush()
                     self._condition.notify_all()
         finally:
             with self._condition:
@@ -1346,7 +1586,9 @@ class _RpcProcess:
     def _read_stderr(self) -> None:
         assert self.proc.stderr is not None
         for line in self.proc.stderr:
-            print(f"[provider stderr] {line.rstrip()}", flush=True)
+            diagnostic = _render_provider_diagnostic(line)
+            if diagnostic is not None:
+                print(f"[provider diagnostic] {diagnostic}", flush=True)
 
     def start_request(self, method: str, params: dict[str, Any]) -> int:
         with self._condition:
@@ -1439,6 +1681,11 @@ class _ProviderSession:
         self.kimi_wire_path: Optional[pathlib.Path] = None
         self._companion_scan_index = 0
         self._current_turn_id: Optional[str] = None
+        self._active_prompt_request_id: Optional[int] = None
+        self._active_prompt_lock = threading.Lock()
+        self.current_model = request["model"]
+        self.current_effort = request["effort"]
+        self._config_options: list[dict[str, Any]] = []
         self.provider_io_started = False
         # Per-session provider-turn ordinal (1-based), incremented only on a
         # natively accepted turn; the route receipt's event_sequence.
@@ -1460,17 +1707,36 @@ class _ProviderSession:
             "generation": self.request["generation"],
             "provider": self.request["provider"],
             "agent_profile": self.request["agent_profile"],
-            "model": self.request["model"],
-            "effort": self.request["effort"],
+            # Receipts attest the route that actually crossed the provider
+            # boundary.  These normally equal the reservation route; using
+            # live values makes any unexpected pre-admission drift fail the
+            # launch store's exact-route validation instead of certifying it.
+            "model": self.current_model,
+            "effort": self.current_effort,
             "working_directory": self.request["working_directory"],
         }
 
     def initialize(self) -> dict[str, Any]:
         if self.provider == "codex":
-            return self._initialize_codex()
-        if self.provider == "kimi_cli":
-            return self._initialize_kimi()
-        raise BridgeError(f"unsupported managed provider {self.provider!r}")
+            readiness = self._initialize_codex()
+        elif self.provider == "kimi_cli":
+            readiness = self._initialize_kimi()
+        else:
+            raise BridgeError(f"unsupported managed provider {self.provider!r}")
+        print(
+            "[managed worker] "
+            f"provider={self.provider} terminal={self.request['terminal_id']} "
+            f"generation={self.request['generation']} "
+            f"session={self.provider_session_id} "
+            f"model={self.current_model} effort={self.current_effort}",
+            flush=True,
+        )
+        print(
+            "[managed worker] readable ACP view; use managed controls for input "
+            "(raw terminal keystrokes are disabled)",
+            flush=True,
+        )
+        return readiness
 
     def _version(self, executable: str, expected: str) -> str:
         if not os.path.isabs(executable) or os.path.realpath(executable) != executable:
@@ -1642,6 +1908,11 @@ class _ProviderSession:
             != self.request["effort"]
         ):
             raise BridgeError("Kimi exact session resolved the wrong route")
+        self._config_options = (
+            [dict(option) for option in options if isinstance(option, dict)]
+            if isinstance(options, list)
+            else []
+        )
         self.provider_session_id = session_id
         self.kimi_wire_path = _kimi_wire_path(session_id)
         transcript = {
@@ -1675,8 +1946,8 @@ class _ProviderSession:
                 "threadId": self.provider_session_id,
                 "input": [{"type": "text", "text": message}],
                 "clientUserMessageId": client_message_id,
-                "model": self.request["model"],
-                "effort": self.request["effort"],
+                "model": self.current_model,
+                "effort": self.current_effort,
                 "cwd": self.request["working_directory"],
                 "approvalPolicy": "never",
             }
@@ -1703,6 +1974,13 @@ class _ProviderSession:
             return turn_id, "codex-turn-start", evidence
         if self.kimi_wire_path is None:
             raise BridgeError("Kimi exact session journal is unavailable")
+        with self._active_prompt_lock:
+            if self._active_prompt_request_id is not None:
+                raise SessionOperationRefused(
+                    "turn_busy",
+                    "the Kimi session already has an active foreground turn; "
+                    "cancel it or wait for completion before sending another prompt",
+                )
         params = {
             "sessionId": self.provider_session_id,
             "prompt": [{"type": "text", "text": message}],
@@ -1725,6 +2003,13 @@ class _ProviderSession:
             first_update = self.rpc.wait_notification(
                 accepted, start_index=start_index, timeout=30.0
             )
+            with self._active_prompt_lock:
+                self._active_prompt_request_id = rpc_id
+            threading.Thread(
+                target=self._watch_kimi_prompt_completion,
+                args=(rpc_id,),
+                daemon=True,
+            ).start()
         except Exception as exc:
             # The session/prompt request may have crossed the provider
             # boundary before the failure: the outcome is unknowable —
@@ -1741,6 +2026,21 @@ class _ProviderSession:
         }
         self._turn_sequence += 1
         return turn_start["uuid"], "kimi-session-update", evidence
+
+    def _watch_kimi_prompt_completion(self, request_id: int) -> None:
+        """Clear the active-turn guard only on the prompt's native response."""
+        assert self.rpc is not None
+        try:
+            result = self.rpc.wait_response(request_id, timeout=30 * 24 * 60 * 60)
+            stop_reason = result.get("stopReason")
+            if isinstance(stop_reason, str):
+                print(f"\n[turn completed] {stop_reason}\n", flush=True)
+        except Exception as exc:  # noqa: BLE001 - the control surface reports loss
+            print(f"\n[turn completion unavailable] {exc}\n", flush=True)
+        finally:
+            with self._active_prompt_lock:
+                if self._active_prompt_request_id == request_id:
+                    self._active_prompt_request_id = None
 
     def _scan_companion_events(self) -> None:
         """§20.2f P1-10: record provider-native refusal receipts from the
@@ -1837,7 +2137,12 @@ class _ProviderSession:
         ordinary inbox ``delivered``/terminal paste."""
         if self.rpc is None or self.provider_session_id is None or self.readiness is None:
             raise BridgeError("provider native session is not ready")
-        if command.get("reservation_id") != self.request["reservation_id"]:
+        expected = {
+            "reservation_id": self.request["reservation_id"],
+            "terminal_id": self.request["terminal_id"],
+            "generation": self.request["generation"],
+        }
+        if any(command.get(key) != value for key, value in expected.items()):
             raise BridgeError("inbox delivery does not match the exact bridge generation")
         message = command.get("message")
         message_id = command.get("message_id")
@@ -1891,8 +2196,8 @@ class _ProviderSession:
             self.request["terminal_id"],
             self.request["generation"],
             provider=self.provider,
-            model=self.request["model"],
-            effort=self.request["effort"],
+            model=self.current_model,
+            effort=self.current_effort,
             receipt_id=provider_turn_id,
             turn_id=provider_turn_id,
             provider_version=(self.readiness or {}).get("provider_version"),
@@ -1911,6 +2216,507 @@ class _ProviderSession:
             "provider_accepted": True,
             "submitted_at": submitted_at,
         }
+
+    def _available_command_names(self) -> set[str]:
+        if self.rpc is None:
+            return set()
+        notifications, _ = self.rpc.notifications_since(0)
+        names: set[str] = set()
+        for item in notifications:
+            if item.get("method") != "session/update":
+                continue
+            update = (item.get("params") or {}).get("update") or {}
+            if update.get("sessionUpdate") != "available_commands_update":
+                continue
+            names = set()
+            for command in update.get("availableCommands") or []:
+                if isinstance(command, dict) and isinstance(command.get("name"), str):
+                    names.add(command["name"])
+        return names
+
+    def _control_receipt(self, operation: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **operation,
+            "reservation_id": self.request["reservation_id"],
+            "terminal_id": self.request["terminal_id"],
+            "generation": self.request["generation"],
+            "provider": self.provider,
+            "provider_session_id": self.provider_session_id,
+            "model": self.current_model,
+            "effort": self.current_effort,
+        }
+
+    def _refuse_control(
+        self,
+        journal: SessionControlJournal,
+        operation_id: str,
+        code: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        operation = journal.get(operation_id)
+        if operation["state"] not in {CONTROL_QUEUED, CONTROL_SUBMITTED, CONTROL_ACCEPTED}:
+            return self._control_receipt(operation)
+        return self._control_receipt(
+            journal.transition(
+                operation_id,
+                CONTROL_REFUSED,
+                reason_code=code,
+                reason_detail=detail,
+            )
+        )
+
+    def _complete_control(
+        self,
+        journal: SessionControlJournal,
+        operation_id: str,
+        *,
+        result: Optional[dict[str, Any]] = None,
+        evidence_digest: Optional[str] = None,
+    ) -> dict[str, Any]:
+        operation = journal.get(operation_id)
+        if operation["state"] == CONTROL_QUEUED:
+            operation = journal.transition(operation_id, CONTROL_SUBMITTED)
+        if operation["state"] == CONTROL_SUBMITTED:
+            operation = journal.transition(
+                operation_id,
+                CONTROL_ACCEPTED,
+                evidence_digest=evidence_digest,
+            )
+        if operation["state"] == CONTROL_ACCEPTED:
+            operation = journal.transition(
+                operation_id,
+                CONTROL_COMPLETED,
+                result=result,
+                evidence_digest=evidence_digest,
+            )
+        return self._control_receipt(operation)
+
+    def reconcile_session_operation(
+        self, journal: SessionControlJournal, operation_id: str
+    ) -> dict[str, Any]:
+        """Passively close accepted prompt/cancel controls after native turn end."""
+        operation = journal.get(operation_id)
+        if (
+            self.provider == "kimi_cli"
+            and operation["state"] == CONTROL_ACCEPTED
+            and operation["action"]
+            in {
+                "follow-up",
+                "cancel",
+            }
+        ):
+            with self._active_prompt_lock:
+                active = self._active_prompt_request_id is not None
+            if not active:
+                operation = journal.transition(
+                    operation_id,
+                    CONTROL_COMPLETED,
+                    result={"native_turn_active": False},
+                )
+        return self._control_receipt(operation)
+
+    def _watch_compact_operation(
+        self,
+        journal: SessionControlJournal,
+        operation_id: str,
+        request_id: int,
+        params: dict[str, Any],
+        start_index: int,
+    ) -> None:
+        """Observe compact acceptance/completion without blocking controls."""
+        assert self.rpc is not None
+        try:
+            self.rpc.wait_notification(
+                lambda item: (
+                    item.get("method") == "session/update"
+                    and (item.get("params") or {}).get("sessionId") == self.provider_session_id
+                ),
+                start_index=start_index,
+                timeout=30.0,
+            )
+            journal.transition(
+                operation_id,
+                CONTROL_ACCEPTED,
+                evidence_digest=_digest(params),
+            )
+            result = self.rpc.wait_response(request_id, timeout=15 * 60)
+            journal.transition(
+                operation_id,
+                CONTROL_COMPLETED,
+                result=result,
+                evidence_digest=_digest(result),
+            )
+        except Exception as exc:  # noqa: BLE001 - journal exact uncertainty
+            current = journal.get(operation_id)
+            if current["state"] in {CONTROL_SUBMITTED, CONTROL_ACCEPTED}:
+                with contextlib.suppress(Exception):
+                    journal.transition(
+                        operation_id,
+                        CONTROL_AMBIGUOUS,
+                        reason_code="compact_outcome_ambiguous",
+                        reason_detail=str(exc),
+                    )
+        finally:
+            with self._active_prompt_lock:
+                if self._active_prompt_request_id == request_id:
+                    self._active_prompt_request_id = None
+
+    def session_operation(
+        self, command: dict[str, Any], journal: SessionControlJournal
+    ) -> dict[str, Any]:
+        """Execute one exact, journaled semantic control against this session."""
+        if self.rpc is None or self.provider_session_id is None or self.readiness is None:
+            raise BridgeError("provider native session is not ready")
+        expected = {
+            "reservation_id": self.request["reservation_id"],
+            "terminal_id": self.request["terminal_id"],
+            "generation": self.request["generation"],
+        }
+        if any(command.get(key) != value for key, value in expected.items()):
+            raise BridgeError("session operation does not match the exact bridge generation")
+        operation_id = command.get("operation_id")
+        action = command.get("action")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise BridgeError("session operation omitted operation_id")
+        if not isinstance(action, str) or not action:
+            raise BridgeError("session operation omitted action")
+        existing = journal.get(operation_id)
+        if existing["state"] != CONTROL_QUEUED:
+            return self.reconcile_session_operation(journal, operation_id)
+
+        if action == "route-query":
+            return self._complete_control(
+                journal,
+                operation_id,
+                result={
+                    "model": self.current_model,
+                    "effort": self.current_effort,
+                    "config_options": self._config_options,
+                    "capabilities": {
+                        "follow_up": True,
+                        "cancel": True,
+                        "route_query": True,
+                        "route_set": self.provider == "kimi_cli",
+                        "compact": (
+                            self.provider == "kimi_cli"
+                            and "compact" in self._available_command_names()
+                        ),
+                        "resume_status": self.provider == "kimi_cli",
+                    },
+                },
+            )
+
+        if action == "resume":
+            return self._refuse_control(
+                journal,
+                operation_id,
+                "resume_requires_new_generation",
+                "resume is a launch-time rebind operation and cannot replace the live generation",
+            )
+
+        if action == "resume-status":
+            if self.provider != "kimi_cli":
+                return self._refuse_control(
+                    journal,
+                    operation_id,
+                    "capability_unsupported",
+                    "this provider does not expose session/list on the managed bridge",
+                )
+            journal.transition(operation_id, CONTROL_SUBMITTED)
+            try:
+                listed = self.rpc.request(
+                    "session/list",
+                    {"cwd": self.request["working_directory"]},
+                    timeout=30.0,
+                )
+            except Exception as exc:
+                return self._control_receipt(
+                    journal.transition(
+                        operation_id,
+                        CONTROL_AMBIGUOUS,
+                        reason_code="provider_response_unavailable",
+                        reason_detail=str(exc),
+                    )
+                )
+            match = next(
+                (
+                    item
+                    for item in listed.get("sessions") or []
+                    if isinstance(item, dict) and item.get("sessionId") == self.provider_session_id
+                ),
+                None,
+            )
+            return self._complete_control(
+                journal,
+                operation_id,
+                result={"resumable_session": match},
+                evidence_digest=_digest(listed),
+            )
+
+        if action == "cancel":
+            with self._active_prompt_lock:
+                active_request = self._active_prompt_request_id
+            if self.provider == "kimi_cli":
+                if active_request is None:
+                    return self._refuse_control(
+                        journal,
+                        operation_id,
+                        "turn_not_active",
+                        "the Kimi session has no active foreground turn to cancel",
+                    )
+                journal.transition(operation_id, CONTROL_SUBMITTED)
+                try:
+                    self.rpc.notify(
+                        "session/cancel",
+                        {"sessionId": self.provider_session_id},
+                    )
+                except Exception as exc:
+                    return self._control_receipt(
+                        journal.transition(
+                            operation_id,
+                            CONTROL_AMBIGUOUS,
+                            reason_code="cancel_delivery_ambiguous",
+                            reason_detail=str(exc),
+                        )
+                    )
+                return self._control_receipt(
+                    journal.transition(
+                        operation_id,
+                        CONTROL_ACCEPTED,
+                        result={"cancelled_provider_request_id": active_request},
+                    )
+                )
+            if not self._current_turn_id:
+                return self._refuse_control(
+                    journal,
+                    operation_id,
+                    "turn_not_active",
+                    "the Codex session has no observed turn to interrupt",
+                )
+            journal.transition(operation_id, CONTROL_SUBMITTED)
+            try:
+                result = self.rpc.request(
+                    "turn/interrupt",
+                    {
+                        "threadId": self.provider_session_id,
+                        "turnId": self._current_turn_id,
+                    },
+                    timeout=30.0,
+                )
+            except Exception as exc:
+                return self._control_receipt(
+                    journal.transition(
+                        operation_id,
+                        CONTROL_AMBIGUOUS,
+                        reason_code="cancel_outcome_ambiguous",
+                        reason_detail=str(exc),
+                    )
+                )
+            return self._complete_control(
+                journal,
+                operation_id,
+                result=result,
+                evidence_digest=_digest(result),
+            )
+
+        if action == "route-set":
+            if self.provider != "kimi_cli":
+                return self._refuse_control(
+                    journal,
+                    operation_id,
+                    "capability_unsupported",
+                    "route changes are not enabled for this provider version",
+                )
+            with self._active_prompt_lock:
+                if self._active_prompt_request_id is not None:
+                    return self._refuse_control(
+                        journal,
+                        operation_id,
+                        "turn_busy",
+                        "route changes require an idle Kimi foreground turn",
+                    )
+            config_id = command.get("config_id")
+            value = command.get("value")
+            if config_id not in {"model", "thinking"} or not isinstance(value, str) or not value:
+                return self._refuse_control(
+                    journal,
+                    operation_id,
+                    "invalid_route",
+                    "route-set requires config_id model|thinking and a non-empty value",
+                )
+            journal.transition(operation_id, CONTROL_SUBMITTED)
+            try:
+                result = self.rpc.request(
+                    "session/set_config_option",
+                    {
+                        "sessionId": self.provider_session_id,
+                        "configId": config_id,
+                        "value": value,
+                    },
+                    timeout=30.0,
+                )
+            except Exception as exc:
+                detail = str(exc)
+                state = (
+                    CONTROL_REFUSED if "provider request failed:" in detail else CONTROL_AMBIGUOUS
+                )
+                return self._control_receipt(
+                    journal.transition(
+                        operation_id,
+                        state,
+                        reason_code=(
+                            "route_refused"
+                            if state == CONTROL_REFUSED
+                            else "route_outcome_ambiguous"
+                        ),
+                        reason_detail=detail,
+                    )
+                )
+            options = result.get("configOptions")
+            category = "model" if config_id == "model" else "thought_level"
+            if _current_option(options, category=category, option_id=config_id) != value:
+                return self._control_receipt(
+                    journal.transition(
+                        operation_id,
+                        CONTROL_REFUSED,
+                        reason_code="route_not_applied",
+                        reason_detail="provider response did not attest the requested route value",
+                        evidence_digest=_digest(result),
+                    )
+                )
+            self._config_options = (
+                [dict(option) for option in options if isinstance(option, dict)]
+                if isinstance(options, list)
+                else []
+            )
+            if config_id == "model":
+                self.current_model = value
+            else:
+                self.current_effort = value
+            return self._complete_control(
+                journal,
+                operation_id,
+                result={
+                    "config_id": config_id,
+                    "value": value,
+                    "config_options": self._config_options,
+                },
+                evidence_digest=_digest(result),
+            )
+
+        if action == "compact":
+            if self.provider != "kimi_cli" or "compact" not in self._available_command_names():
+                return self._refuse_control(
+                    journal,
+                    operation_id,
+                    "capability_unsupported",
+                    "the provider did not advertise the compact ACP command",
+                )
+            with self._active_prompt_lock:
+                if self._active_prompt_request_id is not None:
+                    return self._refuse_control(
+                        journal,
+                        operation_id,
+                        "turn_busy",
+                        "compaction requires an idle foreground turn",
+                    )
+            instruction = command.get("instruction")
+            if instruction is not None and not isinstance(instruction, str):
+                return self._refuse_control(
+                    journal,
+                    operation_id,
+                    "invalid_instruction",
+                    "compact instruction must be text",
+                )
+            prompt = "/compact" + (
+                f" {instruction.strip()}" if instruction and instruction.strip() else ""
+            )
+            params = {
+                "sessionId": self.provider_session_id,
+                "prompt": [{"type": "text", "text": prompt}],
+            }
+            journal.transition(operation_id, CONTROL_SUBMITTED)
+            start_index = self.rpc.notification_count()
+            try:
+                # The generation lock covers only the native submission.  A
+                # watcher observes acceptance/completion afterwards so cancel,
+                # query, inbox reconciliation, and fencing remain available.
+                with self._admission_critical_section():
+                    request_id = self.rpc.start_request("session/prompt", params)
+                    with self._active_prompt_lock:
+                        self._active_prompt_request_id = request_id
+                threading.Thread(
+                    target=self._watch_compact_operation,
+                    args=(journal, operation_id, request_id, params, start_index),
+                    daemon=True,
+                    name=f"cao-compact-{operation_id}",
+                ).start()
+            except Exception as exc:
+                return self._control_receipt(
+                    journal.transition(
+                        operation_id,
+                        CONTROL_AMBIGUOUS,
+                        reason_code="compact_submission_ambiguous",
+                        reason_detail=str(exc),
+                    )
+                )
+            return self._control_receipt(journal.get(operation_id))
+
+        if action == "follow-up":
+            message = command.get("message")
+            if not isinstance(message, str) or not message.strip():
+                return self._refuse_control(
+                    journal,
+                    operation_id,
+                    "message_empty",
+                    "follow-up requires a non-empty message",
+                )
+            journal.transition(operation_id, CONTROL_SUBMITTED)
+            try:
+                turn_id, kind, evidence = self._submit_provider_turn(
+                    message,
+                    client_message_id=operation_id,
+                    meta={
+                        "caoSessionOperationId": operation_id,
+                        "caoGeneration": self.request["generation"],
+                        "caoMessageSha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                    },
+                )
+            except SessionOperationRefused as exc:
+                return self._refuse_control(journal, operation_id, exc.code, exc.detail)
+            except Exception as exc:
+                return self._control_receipt(
+                    journal.transition(
+                        operation_id,
+                        CONTROL_AMBIGUOUS,
+                        reason_code="prompt_outcome_ambiguous",
+                        reason_detail=str(exc),
+                    )
+                )
+            self._current_turn_id = turn_id
+            receipt = {
+                "provider_turn_id": turn_id,
+                "provider_receipt_kind": kind,
+                "provider_transcript_sha256": _digest(evidence),
+                "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            }
+            _write_route_receipt(self, self.request, command, receipt, operation_id)
+            return self._control_receipt(
+                journal.transition(
+                    operation_id,
+                    CONTROL_ACCEPTED,
+                    provider_turn_id=turn_id,
+                    result=receipt,
+                    evidence_digest=_digest(evidence),
+                )
+            )
+
+        return self._refuse_control(
+            journal,
+            operation_id,
+            "capability_unsupported",
+            f"unsupported managed-session action {action!r}",
+        )
 
     def close(self) -> None:
         if self.rpc is not None:
@@ -2080,6 +2886,11 @@ def _bridge_resources(
             f"{reservation_id}/delivery-journal.db",
             str(target["root"] / "delivery-journal.db"),
         ),
+        (
+            "db_row_set",
+            f"{reservation_id}/session-control-journal.db",
+            str(target["root"] / "session-control-journal.db"),
+        ),
     )
 
 
@@ -2201,6 +3012,29 @@ def _mark_bridge_journal_created(target: dict[str, pathlib.Path], request: dict[
             )
     except (rr.RegistryError, KeyError):
         pass  # never declared (tests bypassing registration): nothing to mark
+
+
+def _mark_control_journal_created(target: dict[str, pathlib.Path], request: dict[str, Any]) -> None:
+    """Mark the lazily constructed session-control journal as created."""
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    actor = "managed_provider_bridge._serve"
+    try:
+        entry_id = f"{request['reservation_id']}/session-control-journal.db"
+        fs_path = str(target["root"] / "session-control-journal.db")
+        registry = rr.get_resource_registry()
+        entry = registry.resolve(entry_id)
+        if entry["lifecycle_state"] == "declared" and pathlib.Path(fs_path).exists():
+            registry.register_created(
+                entry_id,
+                actor_id=actor,
+                observed={"observed_fs_path": fs_path},
+                existence_receipt_digest=rr.receipt_digest(
+                    {"entry_id": entry_id, "observed_fs_path": fs_path}
+                ),
+            )
+    except (rr.RegistryError, KeyError):
+        pass
 
 
 def _deregister_bridge_resources(
@@ -2533,10 +3367,10 @@ def _write_route_receipt(
             generation=request["generation"],
             terminal_id=request["terminal_id"],
             delivery_id=delivery_id,
-            expected_model=request["model"],
-            expected_effort=request["effort"],
-            observed_model=request["model"],
-            observed_effort=request["effort"],
+            expected_model=session.current_model,
+            expected_effort=session.current_effort,
+            observed_model=session.current_model,
+            observed_effort=session.current_effort,
             protocol=route_receipts.protocol_version(provider),
             event_sequence=session._turn_sequence,
             model_input_digest=_digest(command),
@@ -2741,6 +3575,18 @@ def _serve(
         _mark_bridge_resource_created(target, request, "socket")
         readiness = session.initialize()
         session._scan_companion_events()
+        if sys.stdin.isatty():
+            operator_console = threading.Thread(
+                target=_operator_console,
+                args=(request,),
+                daemon=True,
+                name=f"cao-operator-{request['terminal_id']}",
+            )
+            operator_console.start()
+        readiness["operator_surface"] = {
+            "terminal_input": bool(sys.stdin.isatty()),
+            "semantic_socket": True,
+        }
         state.update({"state": "ready", "readiness": readiness})
         _atomic_json(target["state"], state)
         # Lane-B production wiring: the generation-private UDS accept path
@@ -2749,9 +3595,11 @@ def _serve(
         # call. Neither capability existed before this wiring.
         broker = _build_actor_broker(request, session)
         journal: Any = None
+        control_journal: Optional[SessionControlJournal] = None
         print(
             f"[managed-provider-ready] provider={request['provider']} "
-            f"session={readiness['provider_session_id']} generation={request['generation']}",
+            f"session={readiness['provider_session_id']} generation={request['generation']} "
+            "input=terminal+semantic-api",
             flush=True,
         )
         # The provider-originated issuance channel: exactly one connection
@@ -2799,15 +3647,25 @@ def _serve(
 
         while True:
             connection, _ = server.accept()
+            # A local peer must not be able to monopolize the single
+            # accept loop by opening a request and withholding its newline.
+            # Long-lived provider channels clear this handshake deadline
+            # once their complete envelope has been decoded.
+            connection.settimeout(5.0)
             raw = bytearray()
-            while b"\n" not in raw:
-                block = connection.recv(65536)
-                if not block:
-                    break
-                raw.extend(block)
-                if len(raw) > 4 * 1024 * 1024:
-                    connection.close()
-                    raise BridgeError("bridge request exceeded 4 MiB")
+            try:
+                while b"\n" not in raw:
+                    block = connection.recv(65536)
+                    if not block:
+                        break
+                    raw.extend(block)
+                    if len(raw) > 4 * 1024 * 1024:
+                        raise BridgeError("bridge request exceeded 4 MiB")
+            except Exception as exc:  # noqa: BLE001 - connection-local containment
+                with connection:
+                    _send_socket_response(connection, {"ok": False, "error": str(exc)})
+                continue
+            connection.settimeout(None)
             try:
                 envelope = json.loads(bytes(raw).split(b"\n", 1)[0])
             except json.JSONDecodeError as exc:
@@ -2818,7 +3676,7 @@ def _serve(
                     reason="connection-handshake-malformed",
                 )
                 with connection:
-                    connection.sendall(_canonical({"ok": False, "error": str(exc)}) + b"\n")
+                    _send_socket_response(connection, {"ok": False, "error": str(exc)})
                 continue
             observed_identity = (
                 envelope.get("rendezvous_identity") if isinstance(envelope, dict) else None
@@ -2832,14 +3690,12 @@ def _serve(
                     reason="connection-handshake-identity-mismatch",
                 )
                 with connection:
-                    connection.sendall(
-                        _canonical(
-                            {
-                                "ok": False,
-                                "error": "connection-handshake-identity-mismatch",
-                            }
-                        )
-                        + b"\n"
+                    _send_socket_response(
+                        connection,
+                        {
+                            "ok": False,
+                            "error": "connection-handshake-identity-mismatch",
+                        },
                     )
                 continue
             if isinstance(command, dict) and command.get("op") == "provider-channel":
@@ -2883,6 +3739,13 @@ def _serve(
                 continue
             with connection:
                 try:
+                    if command.get("op") in {
+                        "admit",
+                        "deliver",
+                        "session.op.begin",
+                        "session.op.query",
+                    }:
+                        _authorize_operator_peer(connection, request)
                     if command.get("op") == "status":
                         response = {"ok": True, **state}
                     elif command.get("op") == "admit":
@@ -2960,7 +3823,10 @@ def _serve(
                         # P1-7 (§20.2f): exact provider-native inbox message
                         # submission; the acknowledgement is recorded by
                         # deliver_inbox into the companion store.
-                        obligation = request.get("obligation_generation")
+                        # V1 and v2 both need an at-most-once retry boundary.
+                        # V2 has an explicit obligation generation; the exact
+                        # terminal generation is the equivalent v1 identity.
+                        obligation = request.get("obligation_generation") or request["generation"]
                         message_id = command.get("message_id")
                         journaled = (
                             bool(obligation) and isinstance(message_id, str) and bool(message_id)
@@ -2973,10 +3839,62 @@ def _serve(
 
                                 journal = DeliveryJournal(target["root"] / "delivery-journal.db")
                                 _mark_bridge_journal_created(target, request)
-                            journal.open_intent(obligation, message_id, _digest(command))
-                            journal.mark_terminal_queued(obligation, message_id)
+                            existing = None
+                            with contextlib.suppress(Exception):
+                                existing = journal.get(obligation, message_id)
+                            ack = companion_receipts.get_message_ack(
+                                request["terminal_id"],
+                                request["generation"],
+                                message_id,
+                            )
+                            if ack is not None:
+                                if ack.get("message_sha256") != command.get("message_sha256"):
+                                    raise BridgeError(
+                                        "existing provider acknowledgement is bound to "
+                                        "different inbox bytes"
+                                    )
+                                # Reconcile a response-loss prefix from durable
+                                # provider evidence without submitting again.
+                                if existing is None:
+                                    journal.open_intent(obligation, message_id, _digest(command))
+                                    journal.mark_terminal_queued(obligation, message_id)
+                                    journal.mark_submitted(obligation, message_id)
+                                    journal.mark_submit_acked(obligation, message_id)
+                                elif existing["state"] == "terminal_queued":
+                                    journal.mark_submitted(obligation, message_id)
+                                    journal.mark_submit_acked(obligation, message_id)
+                                elif existing["state"] == "submitted":
+                                    journal.mark_submit_acked(obligation, message_id)
+                                response = {"ok": True, "receipt": ack}
+                                _send_socket_response(connection, response)
+                                continue
+                            if existing is not None:
+                                if existing["state"] == "submit-refused":
+                                    journal.mark_terminal_queued(obligation, message_id)
+                                else:
+                                    raise BridgeError(
+                                        "inbox delivery already crossed its durable boundary "
+                                        f"with state {existing['state']!r}; refusing blind replay"
+                                    )
+                            else:
+                                journal.open_intent(obligation, message_id, _digest(command))
+                                journal.mark_terminal_queued(obligation, message_id)
                         try:
                             receipt = session.deliver_inbox(command)
+                        except SessionOperationRefused as exc:
+                            if journaled:
+                                journal.mark_submit_refused(
+                                    obligation,
+                                    message_id,
+                                    evidence_digest=_digest(
+                                        {
+                                            "kind": "provider-pre-submit-refusal",
+                                            "code": exc.code,
+                                            "detail": exc.detail,
+                                        }
+                                    ),
+                                )
+                            raise BridgeError(f"{exc.code}: {exc.detail}") from exc
                         except SubmitUncertain as exc:
                             # Response loss after the provider boundary:
                             # record submit-ambiguous durably before
@@ -3002,11 +3920,106 @@ def _serve(
                             journal.mark_submit_acked(obligation, message_id)
                         _write_route_receipt(session, request, command, receipt, message_id)
                         response = {"ok": True, "receipt": receipt}
+                    elif command.get("op") == "session.op.begin":
+                        operation_id = command.get("operation_id")
+                        action = command.get("action")
+                        if not isinstance(operation_id, str) or not operation_id:
+                            raise BridgeError("session operation omitted operation_id")
+                        if not isinstance(action, str) or not action:
+                            raise BridgeError("session operation omitted action")
+                        if any(
+                            command.get(key) != request[key]
+                            for key in ("reservation_id", "terminal_id", "generation")
+                        ):
+                            raise BridgeError(
+                                "session operation does not match the exact bridge generation"
+                            )
+                        if control_journal is None:
+                            control_journal = SessionControlJournal(
+                                target["root"] / "session-control-journal.db"
+                            )
+                            _mark_control_journal_created(target, request)
+                        operation = control_journal.begin(
+                            operation_id=operation_id,
+                            terminal_id=request["terminal_id"],
+                            generation=request["generation"],
+                            action=action,
+                            request_sha256=_digest(command),
+                            provider=request["provider"],
+                            provider_session_id=str(session.provider_session_id),
+                        )
+                        if (
+                            operation["state"] == CONTROL_QUEUED
+                            and state["submission"] is None
+                            and action in {"follow-up", "compact", "route-set"}
+                        ):
+                            receipt = session._refuse_control(
+                                control_journal,
+                                operation_id,
+                                "task_not_admitted",
+                                "mutating controls are unavailable until the reserved "
+                                "task has a provider-native admission receipt",
+                            )
+                        elif operation["state"] == CONTROL_QUEUED:
+                            try:
+                                if action == "compact":
+                                    receipt = session.session_operation(command, control_journal)
+                                else:
+                                    with session._admission_critical_section():
+                                        receipt = session.session_operation(
+                                            command, control_journal
+                                        )
+                            except Exception as exc:  # noqa: BLE001 - journal exact outcome
+                                current = control_journal.get(operation_id)
+                                if current["state"] == CONTROL_QUEUED:
+                                    receipt = session._refuse_control(
+                                        control_journal,
+                                        operation_id,
+                                        "generation_fenced",
+                                        str(exc),
+                                    )
+                                elif current["state"] in {
+                                    CONTROL_SUBMITTED,
+                                    CONTROL_ACCEPTED,
+                                }:
+                                    receipt = session._control_receipt(
+                                        control_journal.transition(
+                                            operation_id,
+                                            CONTROL_AMBIGUOUS,
+                                            reason_code="control_outcome_ambiguous",
+                                            reason_detail=str(exc),
+                                        )
+                                    )
+                                else:
+                                    receipt = session._control_receipt(current)
+                        else:
+                            receipt = session.reconcile_session_operation(
+                                control_journal, operation_id
+                            )
+                        response = {"ok": True, "receipt": receipt}
+                    elif command.get("op") == "session.op.query":
+                        operation_id = command.get("operation_id")
+                        if not isinstance(operation_id, str) or not operation_id:
+                            raise BridgeError("session operation query omitted operation_id")
+                        if any(
+                            command.get(key) != request[key]
+                            for key in ("reservation_id", "terminal_id", "generation")
+                        ):
+                            raise BridgeError(
+                                "session operation query does not match the exact bridge generation"
+                            )
+                        journal_path = target["root"] / "session-control-journal.db"
+                        if control_journal is None:
+                            if not journal_path.exists():
+                                raise BridgeError("unknown managed-session operation")
+                            control_journal = SessionControlJournal(journal_path)
+                        receipt = session.reconcile_session_operation(control_journal, operation_id)
+                        response = {"ok": True, "receipt": receipt}
                     else:
                         raise BridgeError("unsupported managed bridge operation")
                 except Exception as exc:  # noqa: BLE001 - structured socket failure
                     response = {"ok": False, "error": str(exc)}
-                connection.sendall(_canonical(response) + b"\n")
+                _send_socket_response(connection, response)
     except Exception as exc:  # noqa: BLE001 - persist fail-closed state
         failure = _launch_failure(
             request,

@@ -912,15 +912,15 @@ _BRIDGE = "managed_provider_bridge._serve"
 # ``_mark_bridge_resource_created`` / ``_mark_bridge_journal_created``,
 # and deletes in ``_deregister_bridge_resources`` only after a real
 # absence probe.
-_TS_DECLARE = f"{_TS}:328"  # registry.declare in _register_v2_terminal_resources
-_TS_MARK = f"{_TS}:376"  # registry.register_created in _mark_v2_resource_created
-_TS_MONITOR = f"{_TS}:344"  # registry.monitor in _register_v2_terminal_resources
-_TS_DELETE = f"{_TS}:619"  # registry.delete in _deregister_v2_terminal_resources
+_TS_DECLARE = f"{_TS}:343"  # registry.declare in _register_v2_terminal_resources
+_TS_MARK = f"{_TS}:391"  # registry.register_created in _mark_v2_resource_created
+_TS_MONITOR = f"{_TS}:359"  # registry.monitor in _register_v2_terminal_resources
+_TS_DELETE = f"{_TS}:634"  # registry.delete in _deregister_v2_terminal_resources
 _CS_RESOLVE = f"{_CS}:112"  # registry.resolve_fs_path in cleanup_old_data
-_BR_DECLARE = f"{_BR}:2126"  # registry.declare in _declare_bridge_resources
-_BR_MARK = f"{_BR}:2170"  # registry.register_created in _mark_bridge_resource_created
-_BR_JOURNAL_MARK = f"{_BR}:2194"  # registry.register_created in _mark_bridge_journal_created
-_BR_DELETE = f"{_BR}:2324"  # registry.delete in _deregister_bridge_resources
+_BR_DECLARE = f"{_BR}:2937"  # registry.declare in _declare_bridge_resources
+_BR_MARK = f"{_BR}:2981"  # registry.register_created in _mark_bridge_resource_created
+_BR_JOURNAL_MARK = f"{_BR}:3005"  # registry.register_created in _mark_bridge_journal_created
+_BR_DELETE = f"{_BR}:3158"  # registry.delete in _deregister_bridge_resources
 
 _MANIFEST_SPEC: tuple[tuple[str, str, str, str], ...] = (
     # --- terminal log artifacts (constructor + generation deleter + retention)

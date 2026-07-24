@@ -42,6 +42,7 @@ STATE_TERMINAL_QUEUED = "terminal_queued"
 STATE_SUBMITTED = "submitted"
 STATE_SUBMIT_ACKED = "submit-acked"
 STATE_SUBMIT_AMBIGUOUS = "submit-ambiguous"
+STATE_SUBMIT_REFUSED = "submit-refused"
 STATE_CONSUMER_ACKED = "consumer-acked"
 
 # The legal transition set; anything else is refused with zero mutation.
@@ -56,6 +57,11 @@ LEGAL_TRANSITIONS = frozenset(
         (STATE_ACCEPTED, STATE_TERMINAL_QUEUED),
         (STATE_TERMINAL_QUEUED, STATE_SUBMITTED),
         (STATE_TERMINAL_QUEUED, STATE_SUBMIT_AMBIGUOUS),
+        # A provider-native busy/refusal proven to occur before submission is
+        # retryable. Events remain append-only; only the current state cycles
+        # back to queued when the same logical message is tried later.
+        (STATE_TERMINAL_QUEUED, STATE_SUBMIT_REFUSED),
+        (STATE_SUBMIT_REFUSED, STATE_TERMINAL_QUEUED),
         (STATE_SUBMITTED, STATE_SUBMIT_ACKED),
         (STATE_SUBMITTED, STATE_SUBMIT_AMBIGUOUS),
         (STATE_SUBMIT_ACKED, STATE_CONSUMER_ACKED),
@@ -332,6 +338,20 @@ class DeliveryJournal:
             obligation_generation,
             logical_callback_id,
             to_state=STATE_SUBMIT_AMBIGUOUS,
+            evidence_digest=evidence_digest,
+        )
+
+    def mark_submit_refused(
+        self,
+        obligation_generation: str,
+        logical_callback_id: str,
+        evidence_digest: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Record a certain pre-submission refusal; the same message may retry."""
+        return self._transition(
+            obligation_generation,
+            logical_callback_id,
+            to_state=STATE_SUBMIT_REFUSED,
             evidence_digest=evidence_digest,
         )
 

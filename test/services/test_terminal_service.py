@@ -5,8 +5,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.services.terminal_service import (
+    TerminalInputBlockedError,
     exit_terminal_cli,
     get_working_directory,
+    send_input,
     send_special_key,
 )
 
@@ -271,3 +273,29 @@ class TestExitTerminalCli:
         mock_pm.get_provider.return_value = None
         with pytest.raises(ValueError, match="Provider not found"):
             exit_terminal_cli("deadbeef")
+
+
+def test_managed_terminal_refuses_raw_input_at_shared_sink():
+    with (
+        patch(
+            "cli_agent_orchestrator.services.managed_launch.managed_control_identity",
+            return_value={"terminal_id": "deadbeef", "generation": "gen-1"},
+        ),
+        patch(f"{_TS}.get_backend") as backend,
+    ):
+        with pytest.raises(TerminalInputBlockedError, match="generation-bound"):
+            send_input("deadbeef", "do not paste this")
+    backend.assert_not_called()
+
+
+def test_managed_terminal_refuses_raw_special_keys_at_shared_sink():
+    with (
+        patch(
+            "cli_agent_orchestrator.services.managed_launch.managed_control_identity",
+            return_value={"terminal_id": "deadbeef", "generation": "gen-1"},
+        ),
+        patch(f"{_TS}.get_backend") as backend,
+    ):
+        with pytest.raises(TerminalInputBlockedError, match="raw tmux keys"):
+            send_special_key("deadbeef", "C-c")
+    backend.assert_not_called()

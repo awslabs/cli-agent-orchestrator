@@ -29,6 +29,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from sqlalchemy.exc import OperationalError
+
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
@@ -120,6 +122,19 @@ class DestructiveEndpointRequiredError(TerminalGenerationMismatchError):
 
 
 _SHELL_COMMANDS = frozenset({"sh", "bash", "zsh", "dash", "fish", "csh", "tcsh", "ksh", "login"})
+
+
+def _get_terminal_metadata_any(terminal_id: str) -> Optional[Dict[str, Any]]:
+    """Resolve legacy or v2 metadata; an uninstalled v2 surface is absent."""
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata is not None:
+        return metadata
+    try:
+        return get_terminal_metadata_v2(terminal_id)
+    except OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        return None
 
 
 def _verify_managed_pane_process(session_name: str, window_name: str) -> None:
@@ -1557,7 +1572,7 @@ def _schedule_deferred_init(
 def get_terminal(terminal_id: str) -> Dict:
     """Get terminal data."""
     try:
-        metadata = get_terminal_metadata(terminal_id)
+        metadata = _get_terminal_metadata_any(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
@@ -1596,7 +1611,7 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         Exception: If unable to query working directory
     """
     try:
-        metadata = get_terminal_metadata(terminal_id)
+        metadata = _get_terminal_metadata_any(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
@@ -1625,7 +1640,18 @@ def send_input(
     bracketed paste triggers multi-line mode).
     """
     try:
-        metadata = get_terminal_metadata(terminal_id)
+        # Managed panes are human-readable renderers over a private native-RPC
+        # bridge.  Raw tmux input would target the bridge console/transport, not
+        # the provider's semantic input API.  Enforce this at the shared sink so
+        # a forgotten caller cannot reintroduce paste-based steering.
+        from cli_agent_orchestrator.services import managed_launch
+
+        if managed_launch.managed_control_identity(terminal_id) is not None:
+            raise TerminalInputBlockedError(
+                f"Terminal {terminal_id} is managed; use a generation-bound "
+                "managed session operation instead of tmux input"
+            )
+        metadata = _get_terminal_metadata_any(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
@@ -1765,7 +1791,13 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         ValueError: If terminal not found
     """
     try:
-        metadata = get_terminal_metadata(terminal_id)
+        from cli_agent_orchestrator.services import managed_launch
+
+        if managed_launch.managed_control_identity(terminal_id) is not None:
+            raise TerminalInputBlockedError(
+                f"Terminal {terminal_id} is managed; raw tmux keys are disabled"
+            )
+        metadata = _get_terminal_metadata_any(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
@@ -1842,7 +1874,7 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     _ESCALATION_STEPS = [200, 500, 1000, 5000]
 
     try:
-        metadata = get_terminal_metadata(terminal_id)
+        metadata = _get_terminal_metadata_any(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 

@@ -11,6 +11,7 @@ import signal
 import struct
 import subprocess
 import termios
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +45,7 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
     get_terminal_metadata,
+    get_terminal_metadata_v2,
     init_db,
 )
 from cli_agent_orchestrator.constants import (
@@ -420,6 +422,18 @@ class WorkingDirectoryResponse(BaseModel):
     working_directory: Optional[str] = Field(
         description="Current working directory of the terminal, or None if unavailable"
     )
+
+
+class ManagedSessionOperationRequest(BaseModel):
+    """One semantic control for an exact managed provider generation."""
+
+    action: str
+    operation_id: str
+    generation: Optional[str] = None
+    message: Optional[str] = None
+    config_id: Optional[str] = None
+    value: Optional[str] = None
+    instruction: Optional[str] = None
 
 
 class InstallAgentProfileRequest(BaseModel):
@@ -2331,16 +2345,129 @@ async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDire
         )
 
 
+@app.get("/terminals/{terminal_id}/managed-control")
+async def get_managed_terminal_control(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Identify the exact managed generation backing a human control surface."""
+    identity = await asyncio.to_thread(managed_launch.managed_control_identity, terminal_id)
+    return {"managed": identity is not None, **(identity or {})}
+
+
+@app.post("/terminals/{terminal_id}/managed-operations")
+async def begin_managed_terminal_operation(
+    terminal_id: TerminalId,
+    body: ManagedSessionOperationRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    allowed = {
+        "follow-up",
+        "cancel",
+        "route-query",
+        "route-set",
+        "compact",
+        "resume",
+        "resume-status",
+    }
+    if body.action not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"unsupported managed-session action {body.action!r}",
+        )
+    payload = {
+        key: value
+        for key, value in {
+            "message": body.message,
+            "config_id": body.config_id,
+            "value": body.value,
+            "instruction": body.instruction,
+        }.items()
+        if value is not None
+    }
+    try:
+        receipt = await asyncio.to_thread(
+            managed_launch.begin_managed_session_operation,
+            terminal_id,
+            operation_id=body.operation_id,
+            action=body.action,
+            generation=body.generation,
+            timeout=16 * 60 if body.action == "compact" else 45.0,
+            **payload,
+        )
+    except managed_launch.ManagedLaunchNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except managed_launch.ManagedLaunchConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except managed_launch.ManagedLaunchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    return {"success": receipt.get("state") in {"accepted", "completed"}, "receipt": receipt}
+
+
+@app.get("/terminals/{terminal_id}/managed-operations/{operation_id}")
+async def query_managed_terminal_operation(
+    terminal_id: TerminalId,
+    operation_id: str,
+    generation: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    try:
+        receipt = await asyncio.to_thread(
+            managed_launch.query_managed_session_operation,
+            terminal_id,
+            operation_id=operation_id,
+            generation=generation,
+        )
+    except managed_launch.ManagedLaunchNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except managed_launch.ManagedLaunchConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except managed_launch.ManagedLaunchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    return {"receipt": receipt}
+
+
 @app.post("/terminals/{terminal_id}/input")
 async def send_terminal_input(
     request: Request,
     terminal_id: TerminalId,
     message: str,
+    operation_id: Optional[str] = None,
     sender_id: Optional[str] = None,
     orchestration_type: Optional[OrchestrationType] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     try:
+        managed_identity = await asyncio.to_thread(
+            managed_launch.managed_control_identity, terminal_id
+        )
+        if managed_identity is not None:
+            if not operation_id:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        "managed input requires a caller-retained operation_id; "
+                        "use the managed-operations endpoint"
+                    ),
+                )
+            receipt = await asyncio.to_thread(
+                managed_launch.begin_managed_session_operation,
+                terminal_id,
+                operation_id=operation_id,
+                action="follow-up",
+                generation=managed_identity["generation"],
+                message=message,
+            )
+            if receipt.get("state") not in {"accepted", "completed"}:
+                raise TerminalInputBlockedError(
+                    f"managed follow-up {receipt.get('state')}: "
+                    f"{receipt.get('reason_code') or receipt.get('reason_detail') or 'not accepted'}"
+                )
+            return {"success": True, "managed": True, "receipt": receipt}
         # send_input is blocking tmux I/O (bracketed paste + key sends). Run it
         # off the event loop so a slow tmux call can't freeze every other
         # request — including /health and concurrent assign/handoff. Same
@@ -2354,6 +2481,8 @@ async def send_terminal_input(
             orchestration_type=orchestration_type,
         )
         return {"success": success}
+    except HTTPException:
+        raise
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
@@ -2382,9 +2511,19 @@ async def send_terminal_key(
         )
 
     try:
+        managed_identity = await asyncio.to_thread(
+            managed_launch.managed_control_identity, terminal_id
+        )
+        if managed_identity is not None:
+            raise TerminalInputBlockedError(
+                "raw tmux keys are disabled for managed provider sessions; "
+                "use the generation-bound managed controls"
+            )
         # Blocking tmux send-keys — off the loop.
         success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
+    except TerminalInputBlockedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -2420,9 +2559,20 @@ async def exit_terminal(
 ) -> Dict:
     """Send provider-specific exit command to terminal."""
     try:
+        identity = await asyncio.to_thread(managed_launch.managed_control_identity, terminal_id)
+        if identity is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "raw CLI exit is disabled for managed provider sessions; "
+                    "use exact-generation managed cancel or lifecycle cleanup"
+                ),
+            )
         # Blocking tmux I/O — off the loop.
         await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
         return {"success": True}
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3269,10 +3419,16 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
 
     await websocket.accept()
 
-    metadata = get_terminal_metadata(terminal_id)
+    managed_identity = await asyncio.to_thread(managed_launch.managed_control_identity, terminal_id)
+    metadata = (
+        get_terminal_metadata_v2(terminal_id)
+        if managed_identity is not None and managed_identity.get("vintage") == "v2"
+        else get_terminal_metadata(terminal_id)
+    )
     if not metadata:
         await websocket.close(code=4004, reason="Terminal not found")
         return
+    managed_terminal = managed_identity is not None
 
     # Defence-in-depth: re-validate the names from the DB before they
     # flow into a tmux subprocess argument. The POST /sessions handler
@@ -3370,6 +3526,8 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                 msg = await websocket.receive_text()
                 payload = json.loads(msg)
                 if payload.get("type") == "input":
+                    if managed_terminal:
+                        continue
                     raw = payload["data"].encode()
                     # Write in chunks to avoid overflowing the PTY buffer
                     chunk_size = 1024
