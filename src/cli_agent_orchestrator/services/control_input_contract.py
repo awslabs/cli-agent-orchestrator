@@ -40,7 +40,10 @@ two delivered ones.
 
 from __future__ import annotations
 
+import re
 from typing import Optional, Union
+
+from cli_agent_orchestrator.services.canonical_json import build_canonical, canonical_sha256
 
 CONTROL_INPUT_PROTOCOL = "cao-control-input-v1"
 CONTROL_INPUT_SCHEMA_VERSION = 1
@@ -77,6 +80,10 @@ REASON_CONTROL_ROUTE_ABSENT = "control-route-absent"
 REASON_PROTOCOL_MISMATCH = "protocol-mismatch"
 REASON_RESPONSE_LOST = "response-lost"
 REASON_WRITE_INCOMPLETE = "write-incomplete"
+# The process that owned an in-flight request is gone.  It resolves a
+# stranded request to whichever outcome the durable record can still
+# prove, which is not always the same outcome — see the journal.
+REASON_OWNER_LOST = "owner-lost"
 
 CONTROL_INPUT_REASON_CODES = frozenset(
     {
@@ -95,8 +102,66 @@ CONTROL_INPUT_REASON_CODES = frozenset(
         REASON_PROTOCOL_MISMATCH,
         REASON_RESPONSE_LOST,
         REASON_WRITE_INCOMPLETE,
+        REASON_OWNER_LOST,
     }
 )
+
+# --- Control target identity ---------------------------------------------
+
+# A tmux pane id is '%' followed by a decimal counter.  Anything else is
+# refused before it can reach a '-t' argument, where ':' and '.' are
+# target delimiters and a leading '-' is an option.  The write primitive,
+# the arbiter, and the journal share this one definition so they cannot
+# disagree about what a legal control target is — a pane the arbiter
+# would lock but the writer would reject, or the reverse, is a hole.
+PANE_ID_PATTERN = re.compile(r"^%[0-9]{1,10}$")
+
+
+def is_valid_pane_id(pane_id: object) -> bool:
+    """Whether ``pane_id`` is a syntactically legal tmux pane id."""
+    return isinstance(pane_id, str) and PANE_ID_PATTERN.fullmatch(pane_id) is not None
+
+
+def control_input_request_sha256(
+    *,
+    request_id: str,
+    terminal_id: str,
+    pane_id: str,
+    window_id: str,
+    pane_pid: int,
+    generation: Optional[str],
+    text: str,
+    submit: bool,
+) -> str:
+    """Digest binding one request id to the exact control it authorises.
+
+    The digest covers the target identity as well as the payload, so a
+    replayed request id carrying the same text but pointed at a different
+    pane is as detectable as one carrying different text.  Both are the
+    same failure: a control the operator authorised once being applied
+    somewhere, or to something, they did not authorise.
+
+    Computed identically by the client that asks and the server that
+    records, over the canonical encoding, so the two can compare digests
+    without agreeing on a serializer.
+    """
+    return canonical_sha256(
+        build_canonical(
+            [
+                ("protocol", CONTROL_INPUT_PROTOCOL),
+                ("schema_version", CONTROL_INPUT_SCHEMA_VERSION),
+                ("request_id", request_id),
+                ("terminal_id", terminal_id),
+                ("pane_id", pane_id),
+                ("window_id", window_id),
+                ("pane_pid", pane_pid),
+                ("generation", generation),
+                ("text", text),
+                ("submit", submit),
+            ]
+        )
+    )
+
 
 # --- Bracketed-paste sentinels -------------------------------------------
 

@@ -40,6 +40,89 @@ class TestProtocolIdentity:
             assert reason in contract.CONTROL_INPUT_REASON_CODES
 
 
+class TestPaneIdValidation:
+    """One definition of a legal control target, shared by every layer.
+
+    A pane the arbiter would lock but the writer would reject — or the
+    reverse — is a hole, so the writer, the arbiter, and the journal all
+    ask this function.
+    """
+
+    @pytest.mark.parametrize("pane_id", ["%0", "%1", "%42", "%1234567890"])
+    def test_accepts_tmux_pane_ids(self, pane_id):
+        assert contract.is_valid_pane_id(pane_id) is True
+
+    @pytest.mark.parametrize(
+        "pane_id",
+        [
+            "",
+            "%",
+            "0",
+            "42",
+            "%4a",
+            "%-1",
+            "@1",
+            "$1",
+            "%1:2",  # ':' is a tmux target delimiter
+            "%1.0",  # '.' is a tmux target delimiter
+            "-t",  # would be read as an option, not a target
+            "%1 %2",
+            "%12345678901",  # longer than any real pane counter
+            "%1\n",
+            None,
+            42,
+            b"%1",
+        ],
+    )
+    def test_rejects_anything_a_target_argument_could_misread(self, pane_id):
+        assert contract.is_valid_pane_id(pane_id) is False
+
+
+class TestRequestDigest:
+    """The digest is the request id's binding to one exact control."""
+
+    @staticmethod
+    def _digest(**overrides):
+        fields = {
+            "request_id": "req-1",
+            "terminal_id": "term-1",
+            "pane_id": "%7",
+            "window_id": "@2",
+            "pane_pid": 1234,
+            "generation": "gen-1",
+            "text": "/model opus",
+            "submit": True,
+        }
+        fields.update(overrides)
+        return contract.control_input_request_sha256(**fields)
+
+    def test_is_deterministic(self):
+        assert self._digest() == self._digest()
+        assert len(self._digest()) == 64
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"request_id": "req-2"},
+            {"terminal_id": "term-2"},
+            {"pane_id": "%8"},
+            {"window_id": "@3"},
+            {"pane_pid": 4321},
+            {"generation": "gen-2"},
+            {"generation": None},
+            {"text": "/model haiku"},
+            {"submit": False},
+        ],
+    )
+    def test_every_bound_field_changes_the_digest(self, override):
+        """Same text aimed at a different pane is a different control."""
+        assert self._digest(**override) != self._digest()
+
+    def test_owner_loss_is_a_named_reason(self):
+        """A stranded request resolves with a reason, not a bare state."""
+        assert contract.REASON_OWNER_LOST in contract.CONTROL_INPUT_REASON_CODES
+
+
 class TestBracketedPasteSentinels:
     def test_sentinels_are_the_decset_2004_sequences(self):
         assert contract.BRACKETED_PASTE_START == "\x1b[200~"

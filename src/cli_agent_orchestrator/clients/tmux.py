@@ -15,6 +15,7 @@ import libtmux
 from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
 from cli_agent_orchestrator.services.control_input_contract import (
     contains_bracketed_paste_sentinel,
+    is_valid_pane_id,
 )
 from cli_agent_orchestrator.utils.path_validation import (
     BLOCKED_SYSTEM_DIRECTORIES,
@@ -41,11 +42,6 @@ _PANE_CONTROL_FORMAT = "\t".join(
     )
 )
 _PANE_CONTROL_FIELDS = 7
-
-# tmux pane ids are '%' followed by a decimal counter.  Anything else is
-# rejected before it can reach a '-t' argument, where ':' and '.' would
-# be parsed as target delimiters and a leading '-' as an option.
-_VALID_PANE_ID = re.compile(r"^%[0-9]{1,10}$")
 
 # Literal control text is written in bounded chunks so one oversized
 # control cannot produce a single unbounded argv.
@@ -107,7 +103,7 @@ def _parse_pane_control_record(line: str) -> Optional[PaneControlIdentity]:
     if len(fields) != _PANE_CONTROL_FIELDS:
         return None
     pane_id, window_id, pane_pid, bracket_flag, dead_flag, session_name, window_name = fields
-    if not _VALID_PANE_ID.fullmatch(pane_id) or not window_id.startswith("@"):
+    if not is_valid_pane_id(pane_id) or not window_id.startswith("@"):
         return None
     try:
         pid = int(pane_pid)
@@ -949,7 +945,7 @@ class TmuxClient:
         # Defence-in-depth at the sink: the service layer rejects these
         # payloads with a typed outcome, but the primitive must not be
         # able to emit them even when called directly.
-        if not _VALID_PANE_ID.fullmatch(pane_id):
+        if not is_valid_pane_id(pane_id):
             raise ValueError(f"Invalid pane_id: {pane_id!r}")
         if contains_bracketed_paste_sentinel(text):
             raise ValueError("Literal control text must not contain bracketed-paste sentinels")
