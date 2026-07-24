@@ -234,6 +234,36 @@ def test_post_export_happy_path(client, stub_test_sink):
     assert stub_test_sink.call_count == 1
 
 
+def test_post_export_projection_timeout_returns_structured_504_without_exporting(
+    client, stub_test_sink, monkeypatch
+):
+    @providers_base.register_provider("slow-export-provider")
+    class _SlowExportProvider(GraphProvider):
+        async def project(self, **filters: Any) -> GraphView:
+            await asyncio.sleep(1.0)
+            return GraphView(nodes=[], edges=[])
+
+    original = api_main._project_graph_with_timeout
+
+    async def _short_timeout(inst, filters, *, provider, timeout_s=90.0):
+        return await original(inst, filters, provider=provider, timeout_s=0.01)
+
+    monkeypatch.setattr(api_main, "_project_graph_with_timeout", _short_timeout)
+
+    resp = client.post(
+        "/graph/slow-export-provider/export",
+        json={"sink": "stub-test-sink", "dest": "/tmp/x", "options": {}},
+    )
+
+    assert resp.status_code == 504
+    detail = resp.json()["detail"]
+    assert detail["kind"] == "graph_projection_timeout"
+    assert detail["provider"] == "slow-export-provider"
+    assert detail["timeout_s"] == 0.01
+    assert detail["metadata"]["graph_projection_timeout"] is True
+    stub_test_sink.assert_not_called()
+
+
 def test_post_export_unregistered_sink_404(client):
     """An unregistered sink name is a 404."""
     resp = client.post(

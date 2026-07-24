@@ -257,7 +257,10 @@ def get_server_settings() -> Dict[str, Any]:
 def get_memory_settings() -> Dict[str, Any]:
     """Get memory-related settings.
 
-    Precedence per key: CAO_* env var > settings.json > built-in default.
+    Precedence for most keys: CAO_* env var > settings.json > built-in
+    default. ``memory.lint_enabled`` intentionally uses
+    ``is_memory_lint_enabled()`` fail-closed semantics instead: any explicit
+    false in persisted settings or ``CAO_MEMORY_LINT_ENABLED`` disables lint.
 
     ``enabled`` defaults to ``True`` (opt-out) to preserve current shipping
     behavior. Setting it to ``False`` disables all memory subsystem

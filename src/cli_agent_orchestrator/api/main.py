@@ -2703,7 +2703,7 @@ async def export_graph_endpoint(
         )
 
     try:
-        view = await prov.project(**filters)
+        view = await _project_graph_with_timeout(prov, filters, provider=provider)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
