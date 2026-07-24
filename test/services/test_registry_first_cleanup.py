@@ -688,6 +688,94 @@ def test_bridge_serve_declares_before_physical_construction(monkeypatch):
             rr.reset_resource_registry()
 
 
+def test_direct_bridge_serves_do_not_retain_provider_environment(monkeypatch):
+    """Sequential in-process serves bind fresh provider state per launch.
+
+    The first launch's provider-only controls and HOME must not reach the
+    second launch, while the production fail-closed bridge environment stays
+    scrubbed during both serves.
+    """
+    import json
+    import tempfile
+
+    from cli_agent_orchestrator.services import managed_provider_bridge as bridge
+
+    with tempfile.TemporaryDirectory(prefix="lb-env-", dir="/tmp") as root_arg:
+        base = Path(root_arg)
+        home = base / "cao-home"
+        home.mkdir()
+        monkeypatch.setattr("cli_agent_orchestrator.constants.CAO_HOME_DIR", home)
+        monkeypatch.setattr(bridge, "BRIDGE_ROOT", base / "managed-provider-sessions")
+        monkeypatch.setattr(bridge, "RENDEZVOUS_ROOT", base / "rendezvous")
+        monkeypatch.setattr(bridge, "verify_launch_binding_identity", lambda *_: None)
+        observed: list[dict[str, dict[str, str]]] = []
+
+        class _InitFailure:
+            def __init__(self, _request):
+                observed.append(
+                    {
+                        "bridge": dict(os.environ),
+                        "provider": bridge._provider_env(),
+                    }
+                )
+
+            def initialize(self):
+                raise bridge.BridgeError("expected direct-serve stop")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(bridge, "_ProviderSession", _InitFailure)
+        rr.reset_resource_registry()
+        try:
+            requests = [
+                _bridge_request(
+                    reservation_id=str(uuid.uuid4()),
+                    terminal_id=terminal_id,
+                    generation=str(uuid.uuid4()),
+                    worktree=base,
+                )
+                for terminal_id in ("a1b2c3d4", "b1c2d3e4")
+            ]
+
+            monkeypatch.setenv("HOME", "/home/first")
+            monkeypatch.setenv("CODEX_FIRST_ONLY", "first-secret")
+            first_target = bridge.write_request(requests[0]["reservation_id"], requests[0])
+            assert bridge._serve(requests[0], first_target) == 1
+            first_state = json.loads(first_target["state"].read_text(encoding="utf-8"))
+            assert bridge._BOUND_PROVIDER_ENV is None
+            assert os.environ["HOME"] == "/home/first"
+
+            monkeypatch.setenv("HOME", "/home/second")
+            monkeypatch.delenv("CODEX_FIRST_ONLY")
+            monkeypatch.setenv("CODEX_SECOND_ONLY", "second-secret")
+            second_target = bridge.write_request(requests[1]["reservation_id"], requests[1])
+            assert bridge._serve(requests[1], second_target) == 1
+            second_state = json.loads(second_target["state"].read_text(encoding="utf-8"))
+
+            assert observed[0]["bridge"]["HOME"] == "/home/first"
+            assert "CODEX_FIRST_ONLY" not in observed[0]["bridge"]
+            assert observed[0]["provider"]["HOME"] == "/home/first"
+            assert observed[0]["provider"]["CODEX_FIRST_ONLY"] == "first-secret"
+            assert observed[1]["bridge"]["HOME"] == "/home/second"
+            assert "CODEX_SECOND_ONLY" not in observed[1]["bridge"]
+            assert observed[1]["provider"]["HOME"] == "/home/second"
+            assert observed[1]["provider"]["CODEX_SECOND_ONLY"] == "second-secret"
+            assert "CODEX_FIRST_ONLY" not in observed[1]["provider"]
+
+            first_names = first_state["environment_inventory"]["names"]
+            second_names = second_state["environment_inventory"]["names"]
+            assert "CODEX_FIRST_ONLY" in first_names
+            assert "CODEX_FIRST_ONLY" not in second_names
+            assert "CODEX_SECOND_ONLY" in second_names
+            assert "first-secret" not in json.dumps(first_state["environment_inventory"])
+            assert "second-secret" not in json.dumps(second_state["environment_inventory"])
+            assert bridge._BOUND_PROVIDER_ENV is None
+            assert os.environ["HOME"] == "/home/second"
+        finally:
+            rr.reset_resource_registry()
+
+
 def test_bridge_teardown_never_synthesizes_absence(tmp_path, monkeypatch):
     """A bridge resource that cannot be physically removed keeps its row:
     the registry records deletion only against a real absence probe."""

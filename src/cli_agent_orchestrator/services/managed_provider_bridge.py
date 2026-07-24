@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import functools
 import hashlib
 import json
 import logging
@@ -2630,14 +2631,42 @@ def launch_failure_evidence_digest(failure: dict[str, Any]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _scope_direct_serve_environment(serve: Callable[..., int]) -> Callable[..., int]:
+    """Restore process state for direct calls that do not pre-bind an inventory."""
+
+    @functools.wraps(serve)
+    def scoped(
+        request: dict[str, Any],
+        target: dict[str, pathlib.Path],
+        *,
+        environment_inventory: Optional[dict[str, Any]] = None,
+    ) -> int:
+        if environment_inventory is not None:
+            return serve(request, target, environment_inventory=environment_inventory)
+
+        ambient_environment = dict(os.environ)
+        try:
+            direct_inventory = _prune_bridge_environment(request["provider"])
+            return serve(request, target, environment_inventory=direct_inventory)
+        finally:
+            global _BOUND_PROVIDER_ENV
+            _BOUND_PROVIDER_ENV = None
+            os.environ.clear()
+            os.environ.update(ambient_environment)
+
+    return scoped
+
+
+@_scope_direct_serve_environment
 def _serve(
     request: dict[str, Any],
     target: dict[str, pathlib.Path],
     *,
     environment_inventory: Optional[dict[str, Any]] = None,
 ) -> int:
+    """Serve one bridge launch under its already-bound provider environment."""
     if environment_inventory is None:
-        environment_inventory = _prune_bridge_environment(request["provider"])
+        raise BridgeError("managed bridge environment inventory is not bound")
     state = {
         "bridge_version": BRIDGE_VERSION,
         "request_sha256": _digest(request),
