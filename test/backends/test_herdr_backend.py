@@ -724,12 +724,36 @@ def test_get_pane_id_stale_map_refreshes(monkeypatch):
     backend._pane_id_map_ts = 0.0  # far in the past => stale (> TTL)
 
     def fake_refresh():
+        # A successful refresh rebuilds the map AND stamps the timestamp fresh
+        # (mirrors the real _refresh_pane_id_map success path).
         backend._pane_id_map = {"term_a": "w2:p5"}  # fresh id post-restart
+        backend._pane_id_map_ts = time.time()
 
     monkeypatch.setattr(backend, "_refresh_pane_id_map", fake_refresh)
 
     # Stale hit must NOT be returned; refresh fires and yields the new id.
     assert backend.get_pane_id("term_a") == "w2:p5"
+
+
+def test_get_pane_id_failed_refresh_does_not_return_stale_entry(monkeypatch):
+    """P2: if refresh FAILS (map + ts left unchanged), an already-expired entry
+    must NOT be returned — get_pane_id must fall through to the label fallback,
+    not hand back the stale pane the TTL just judged too old."""
+    from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+    backend = HerdrBackend.__new__(HerdrBackend)
+    backend._herdr_session = "cao"
+    backend._pane_cache = {}
+    backend._pane_id_map = {"term_a": "stale:pane"}  # expired entry
+    backend._pane_id_map_ts = 0.0  # far past => stale
+
+    # Failed refresh: real _refresh_pane_id_map preserves map + ts on failure.
+    monkeypatch.setattr(backend, "_refresh_pane_id_map", lambda: None)
+    # Label fallback resolves the true current pane.
+    monkeypatch.setattr(backend, "_resolve_pane_id_from_window", lambda s, w: "w9:p9")
+
+    result = backend.get_pane_id("term_a", session_name="cao-x", window_name="win-0")
+    assert result == "w9:p9"  # NOT "stale:pane"
 
 
 def test_refresh_pane_id_map_builds_from_snapshot(backend):
@@ -1200,3 +1224,56 @@ class TestBuildEnvArgs:
         assert "CAO_TERMINAL_ID=spoofed" not in joined
         assert "CAO_SESSION_NAME=cao-proj" in joined
         assert "CAO_SESSION_NAME=evil" not in joined
+
+
+class TestEnvValueRedaction:
+    """P1: operator-forwarded --env values are secrets; they must never appear
+    raw in an exception, log, or HTTP error detail."""
+
+    def test_redact_env_values_masks_value_keeps_key(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _redact_env_values
+
+        out = _redact_env_values(
+            ["herdr", "tab", "create", "--env", "API_TOKEN=s3cr3t-token", "--label", "w"]
+        )
+        assert "API_TOKEN=<redacted>" in out
+        assert all("s3cr3t-token" not in tok for tok in out)
+        # non-env structural args are preserved
+        assert "--label" in out and "w" in out
+
+    def test_redact_env_value_without_equals(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _redact_env_values
+
+        out = _redact_env_values(["--env", "weirdtoken"])
+        assert out == ["--env", "<redacted>"]
+
+    def test_run_herdr_command_failure_redacts_env_value(self, backend):
+        """A non-zero create must not leak the env value in TerminalBackendError."""
+        with patch("subprocess.run", return_value=_completed("", returncode=1)):
+            with pytest.raises(TerminalBackendError) as exc:
+                backend._run_herdr(
+                    ["tab", "create", "--env", "API_TOKEN=s3cr3t-token", "--label", "w"]
+                )
+        msg = str(exc.value)
+        assert "s3cr3t-token" not in msg
+        assert "API_TOKEN=<redacted>" in msg
+
+    def test_run_herdr_timeout_redacts_env_value(self, backend):
+        """A create timeout must not leak the env value."""
+        import subprocess as _sp
+
+        with patch("subprocess.run", side_effect=_sp.TimeoutExpired(cmd="herdr", timeout=30)):
+            with pytest.raises(TerminalBackendError) as exc:
+                backend._run_herdr(["tab", "create", "--env", "API_TOKEN=s3cr3t-token"])
+        assert "s3cr3t-token" not in str(exc.value)
+
+    def test_sanitizer_rejection_redacts_env_value(self):
+        """A rejected --env value (shell metachar) must be redacted in the error,
+        not interpolated raw."""
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError) as exc:
+            _sanitize_herdr_args(["tab", "create", "--env", "API_TOKEN=s3cr3t$token"])
+        msg = str(exc.value)
+        assert "s3cr3t$token" not in msg
+        assert "<redacted>" in msg

@@ -99,14 +99,39 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
         structural_args = args[:3]
     else:
         structural_args = args
+    prev_was_env = False
     for arg in structural_args:
         if not _SAFE_ARG_RE.fullmatch(arg):
-            raise ValueError(f"herdr argument contains unsafe characters: {arg!r}")
+            # A rejected --env value may be a secret; redact it in the error.
+            shown = _redact_env_values(["--env", arg])[1] if prev_was_env else repr(arg)
+            raise ValueError(f"herdr argument contains unsafe characters: {shown}")
         if arg.startswith("--") and arg not in _HERDR_ALLOWED_FLAGS:
             raise ValueError(
                 f"herdr flag '{arg}' not in allowlist: " f"{sorted(_HERDR_ALLOWED_FLAGS)}"
             )
+        prev_was_env = arg == "--env"
     return list(args)
+
+
+def _redact_env_values(args: List[str]) -> List[str]:
+    """Return a display copy of herdr args with ``--env`` values redacted.
+
+    Operator-forwarded env values may be secrets. Any token immediately
+    following ``--env`` is reduced to ``KEY=<redacted>`` (or ``<redacted>`` if
+    it has no ``=``), so a create failure/timeout or sanitizer rejection never
+    surfaces the raw value in an exception, log, or HTTP error detail.
+    """
+    redacted: List[str] = []
+    prev_was_env = False
+    for arg in args:
+        if prev_was_env:
+            key = arg.split("=", 1)[0] if "=" in arg else ""
+            redacted.append(f"{key}=<redacted>" if key else "<redacted>")
+            prev_was_env = False
+        else:
+            redacted.append(arg)
+            prev_was_env = arg == "--env"
+    return redacted
 
 
 # Cache TTL for pane_id resolution (seconds).
@@ -180,16 +205,17 @@ class HerdrBackend(TerminalBackend):
         except ValueError as e:
             raise TerminalBackendError(f"herdr argument validation failed: {e}") from e
         cmd = ["herdr", "--session", self._herdr_session] + sanitized
-        # Redact only send-text/run payloads from error messages to avoid
-        # leaking sensitive terminal input. Other commands keep full args
-        # for debuggability.
+        # Build a redacted display form for error messages. Two sensitive
+        # sources: send-text/run payloads (terminal input) and --env values
+        # (operator-forwarded, potentially secret). Never let either reach an
+        # exception, log, or HTTP error detail.
         has_payload = (
             len(sanitized) >= 3 and sanitized[0] == "pane" and sanitized[1] in ("send-text", "run")
         )
         if has_payload:
             cmd_display = cmd[:6] + ["<redacted>"]
         else:
-            cmd_display = cmd
+            cmd_display = _redact_env_values(cmd)
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if check and result.returncode != 0:
@@ -653,11 +679,20 @@ class HerdrBackend(TerminalBackend):
         # Durable map (rebuilt from api snapshot). Trust a hit only while the map
         # is fresh; herdr IDs are stable except across a server restart, which
         # this TTL bounds — a stale entry expires and the next lookup refreshes.
-        map_fresh = (time.time() - self._pane_id_map_ts) < _PANE_ID_MAP_TTL
-        if map_fresh and terminal_id in self._pane_id_map:
+        if (
+            time.time() - self._pane_id_map_ts
+        ) < _PANE_ID_MAP_TTL and terminal_id in self._pane_id_map:
             return self._pane_id_map[terminal_id]
+        # Map is stale (or a miss). Rebuild, then trust it ONLY if the rebuild
+        # succeeded — _refresh_pane_id_map leaves the timestamp untouched on
+        # failure, so re-check freshness here. Without this re-gate a failed
+        # refresh would return the very entry we just judged expired, defeating
+        # the self-healing this TTL exists to provide (fall through to the
+        # label-based fallback instead).
         self._refresh_pane_id_map()
-        if terminal_id in self._pane_id_map:
+        if (
+            time.time() - self._pane_id_map_ts
+        ) < _PANE_ID_MAP_TTL and terminal_id in self._pane_id_map:
             return self._pane_id_map[terminal_id]
 
         # Legacy fallback (removed in a follow-up once the map is proven):
