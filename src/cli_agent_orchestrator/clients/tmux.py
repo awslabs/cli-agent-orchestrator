@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shutil
 import subprocess
 import time
 import uuid
@@ -17,6 +18,25 @@ from cli_agent_orchestrator.utils.path_validation import (
 from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 
 logger = logging.getLogger(__name__)
+
+_TMUX_BINARY: Optional[str] = None
+
+
+def tmux_binary() -> str:
+    """The absolute canonical tmux executable, resolved once and reused.
+
+    P1-9 (final conformance §20.2f): the managed campaign path's tmux
+    invocation is wholly absolute — a per-call PATH lookup (or a mid-run PATH
+    change) can never redirect managed window creation to a different binary.
+    Fails closed when tmux is not resolvable at all.
+    """
+    global _TMUX_BINARY
+    if _TMUX_BINARY is None:
+        resolved = shutil.which("tmux")
+        if not resolved:
+            raise RuntimeError("tmux executable is not resolvable")
+        _TMUX_BINARY = os.path.realpath(resolved)
+    return _TMUX_BINARY
 
 
 class TmuxClient:
@@ -242,6 +262,42 @@ class TmuxClient:
         except Exception as e:
             logger.error(f"Failed to create window in session {session_name}: {e}")
             raise
+
+    def create_window_with_argv(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        argv: List[str],
+        working_directory: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Create a window running ``argv`` as the pane's OWN process.
+
+        tmux >= 3.2 executes a multi-argument command directly — no shell is
+        ever started and nothing is typed into one (the zero-keystroke managed
+        bridge contract). Older tmux rejects the extra arguments, which fails
+        closed here. Raises on any failure: the managed caller never degrades
+        to typing a command into a shell."""
+        if not argv or not all(isinstance(item, str) and "\x00" not in item for item in argv):
+            raise ValueError("argv must be a non-empty list of NUL-free strings")
+        if not os.path.isabs(argv[0]):
+            raise ValueError("argv executable must be an absolute path")
+        working_directory = self._resolve_and_validate_working_directory(working_directory)
+        window_env: dict[str, str] = {}
+        self._merge_extra_env(window_env, extra_env)
+        window_env["CAO_TERMINAL_ID"] = terminal_id
+        cmd = [tmux_binary(), "new-window", "-d", "-n", window_name, "-c", working_directory]
+        for key, value in window_env.items():
+            cmd += ["-e", f"{key}={value}"]
+        cmd += ["-t", session_name, "--", *argv]
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"tmux could not create the managed window process atomically: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        return window_name
 
     def send_keys(
         self,
@@ -532,6 +588,35 @@ class TmuxClient:
         except Exception as e:
             logger.error(f"Failed to kill window {session_name}:{window_name}: {e}")
             return False
+
+    def window_exists(self, session_name: str, window_name: str) -> bool:
+        """Check the exact tmux window without swallowing lookup failures."""
+        session = self.server.sessions.get(session_name=session_name)
+        if not session:
+            return False
+        return session.windows.get(window_name=window_name) is not None
+
+    def window_identity(self, session_name: str, window_name: str) -> Optional[Dict[str, str]]:
+        """Server-owned immutable tmux identity of a window: its tmux-assigned
+        ``window_id`` (``@N``) and active ``pane_id`` (``%N``). Unlike window
+        names these are immutable for the resource's life — the only tmux
+        facts an attestation may bind a terminal to."""
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                return None
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                return None
+            pane = window.active_pane
+            pane_id = getattr(pane, "pane_id", None) if pane else None
+            window_id = getattr(window, "window_id", None)
+            if not pane_id or not window_id:
+                return None
+            return {"pane_id": str(pane_id), "window_id": str(window_id)}
+        except Exception as e:
+            logger.error(f"Failed to resolve window identity for {session_name}:{window_name}: {e}")
+            return None
 
     def session_exists(self, session_name: str) -> bool:
         """Check if session exists."""

@@ -23,7 +23,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
-from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services import managed_launch, terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
@@ -74,6 +74,44 @@ class InboxService:
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:
+            return
+
+        # P1-7 (final conformance §20.2f): for a receiver with a live managed
+        # provider session, deliver each exact message through its provider
+        # bridge — the provider's own model-turn acceptance is recorded as the
+        # durable submitted acknowledgement. Anything the bridge cannot take
+        # falls through to the ordinary paste path, from which NO
+        # acknowledgement is ever inferred.
+        remaining = []
+        managed_identity = managed_launch.managed_control_identity(terminal_id)
+        for message in messages:
+            if managed_launch.deliver_inbox_via_bridge(
+                terminal_id,
+                message_id=message.id,
+                message=message.message,
+                sender_id=message.sender_id,
+            ):
+                update_message_status(message.id, MessageStatus.DELIVERED)
+                logger.info(
+                    f"Delivered message {message.id} to terminal {terminal_id} "
+                    "via the managed provider bridge (provider-native ack)"
+                )
+            else:
+                remaining.append(message)
+        messages = remaining
+        if not messages:
+            return
+        if managed_identity is not None:
+            # A managed bridge owns provider stdin.  If native delivery is
+            # temporarily unavailable, preserve the inbox rows as pending;
+            # falling through to terminal paste would write into a renderer
+            # pane that cannot acknowledge or safely consume the message.
+            logger.info(
+                "Preserving %d pending message(s) for managed terminal %s; "
+                "provider-native delivery is not currently available",
+                len(messages),
+                terminal_id,
+            )
             return
 
         status = status_monitor.get_status(terminal_id)

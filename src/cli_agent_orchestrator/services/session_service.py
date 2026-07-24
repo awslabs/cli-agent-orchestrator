@@ -149,6 +149,8 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
 
         # Drop the per-session forwarded-env mapping (issue #248). Safe
         # even when no vars were forwarded — the helper is a no-op then.
+        # Strict (cond-0050): a delete that cannot complete durably raises
+        # rather than leaving a stale row behind to be silently inherited.
         clear_session_env(session_name)
 
         result["deleted"].append(session_name)

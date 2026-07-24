@@ -1,8 +1,9 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { X, Terminal as TermIcon } from 'lucide-react'
+import { api } from '../api'
 
 interface TerminalViewProps {
   terminalId: string
@@ -11,8 +12,91 @@ interface TerminalViewProps {
   onClose: () => void
 }
 
+const TERMINAL_FONT_SIZE = 14
+
+// Fallback row height (px) used only when the container has not been laid out
+// yet, so a touch delta can still be turned into whole wheel notches.
+const DEFAULT_LINE_HEIGHT = Math.round(TERMINAL_FONT_SIZE * 1.2)
+
 export function TerminalView({ terminalId, provider, agentProfile, onClose }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
+  const managedRef = useRef<boolean | null>(null)
+  const [managed, setManaged] = useState(false)
+  const [generation, setGeneration] = useState<string | undefined>()
+  const [message, setMessage] = useState('')
+  const [model, setModel] = useState('')
+  const [effort, setEffort] = useState('')
+  const [controlBusy, setControlBusy] = useState(false)
+  const [controlStatus, setControlStatus] = useState('')
+
+  useEffect(() => {
+    managedRef.current = null
+    api.getManagedControl(terminalId)
+      .then(result => {
+        managedRef.current = result.managed
+        setManaged(result.managed)
+        setGeneration(result.generation)
+      })
+      .catch(() => {
+        // Unknown control identity is not proof this is an ordinary TUI.
+        // Keep terminal input fail-closed rather than pasting into a possibly
+        // managed bridge pane when the identity lookup is unavailable.
+        managedRef.current = null
+        setManaged(false)
+        setGeneration(undefined)
+        setControlStatus('terminal control identity unavailable')
+      })
+  }, [terminalId])
+
+  const runManagedOperation = async (body: {
+    action: string
+    message?: string
+    config_id?: string
+    value?: string
+    instruction?: string
+  }) => {
+    const operationId = crypto.randomUUID()
+    setControlBusy(true)
+    setControlStatus(`${body.action}: submitting…`)
+    try {
+      const response = await api.beginManagedOperation(terminalId, {
+        ...body,
+        operation_id: operationId,
+        generation,
+      })
+      const state = String(response.receipt.state || 'unknown')
+      const reason = response.receipt.reason_code || response.receipt.reason_detail
+      setControlStatus(`${body.action}: ${state}${reason ? ` — ${String(reason)}` : ''}`)
+      if (body.action === 'route-query') {
+        const result = response.receipt.result as Record<string, unknown> | undefined
+        if (result?.model) setModel(String(result.model))
+        if (result?.effort) setEffort(String(result.effort))
+      }
+      if (body.action === 'follow-up' && response.success) setMessage('')
+    } catch (error) {
+      // The request may have crossed the provider boundary before the HTTP
+      // response was lost. Query the same durable operation; never invent a
+      // second ID and repeat a potentially accepted effect.
+      try {
+        const reconciled = await api.queryManagedOperation(
+          terminalId,
+          operationId,
+          generation,
+        )
+        const state = String(reconciled.receipt.state || 'unknown')
+        const reason = reconciled.receipt.reason_code || reconciled.receipt.reason_detail
+        setControlStatus(
+          `${body.action}: ${state}${reason ? ` — ${String(reason)}` : ''}`,
+        )
+      } catch {
+        setControlStatus(
+          `${body.action}: response unavailable; operation ${operationId} retained for reconciliation`,
+        )
+      }
+    } finally {
+      setControlBusy(false)
+    }
+  }
 
   useEffect(() => {
     const el = containerRef.current
@@ -20,7 +104,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
 
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 14,
+      fontSize: TERMINAL_FONT_SIZE,
       fontFamily: 'JetBrains Mono, Menlo, Monaco, Consolas, monospace',
       scrollback: 10000,
       theme: {
@@ -42,6 +126,93 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     const fitAddon = new FitAddon()
     term.loadAddon(fitAddon)
     term.open(el)
+
+    // Touch-scroll support. xterm.js core forwards DOM `wheel` events as
+    // mouse-wheel escape sequences whenever the attached app is in
+    // mouse-tracking mode (here: tmux with `mouse on`), which is why a desktop
+    // mouse wheel scrolls the terminal. xterm has no touch handling, so a finger
+    // swipe on a phone produces no wheel event and nothing scrolls. Translate a
+    // single-finger vertical swipe into synthetic `wheel` events dispatched onto
+    // xterm's root element, driving that same already-working path so the swipe
+    // produces the same kind of mouse-wheel report the server already acts on.
+    // (Equivalent in effect to a desktop wheel — not necessarily byte-identical,
+    // since coordinates and delta encoding differ; see the caveats below.)
+    //
+    // Emit line-mode deltas (DOM_DELTA_LINE, one notch per row of travel) rather
+    // than pixel deltas: xterm 6 treats a small pixel-mode wheel delta as a
+    // trackpad and damps it to ~0.3 of a line, which would make touch scrolling
+    // roughly 3x too slow. The line-mode path bypasses that damping, so one row
+    // of finger travel scrolls one line.
+    //
+    // Scope/caveats (kept deliberately minimal; both worth noting upstream):
+    //   - Mouse-tracking only. This scrolls when the attached app is in
+    //     mouse-tracking mode (tmux `mouse on`, or alt-buffer apps that report
+    //     the wheel). In a plain shell the synthetic event reaches no listener —
+    //     xterm's own scrollback viewport listens on a descendant element, not
+    //     term.element — so a swipe does nothing there.
+    //   - Single pane. The synthetic wheel carries default coordinates (col 1,
+    //     row 1), so a multi-pane tmux layout routes every swipe to the
+    //     top-left pane rather than the pane under the finger.
+    // Desktop behavior is untouched (touch-only listeners).
+    const wheelTarget = term.element ?? el
+
+    // Row height in px, so a swipe distance maps to a matching number of wheel
+    // notches. Derived from the live geometry (no private xterm internals);
+    // falls back to a font-size estimate before the first layout.
+    const rowHeight = (): number => {
+      const rows = term.rows
+      const height = el.clientHeight
+      return rows > 0 && height > 0 ? height / rows : DEFAULT_LINE_HEIGHT
+    }
+
+    let touchY: number | null = null
+    let scrollAcc = 0
+
+    const onTouchStart = (ev: TouchEvent) => {
+      if (ev.touches.length !== 1) {
+        touchY = null
+        return
+      }
+      touchY = ev.touches[0].clientY
+      scrollAcc = 0
+    }
+
+    const onTouchMove = (ev: TouchEvent) => {
+      if (touchY === null || ev.touches.length !== 1) return
+      const y = ev.touches[0].clientY
+      // Finger moving up (clientY decreasing) scrolls toward newer output,
+      // matching a downward mouse-wheel notch.
+      scrollAcc += touchY - y
+      touchY = y
+      const lineH = rowHeight()
+      while (Math.abs(scrollAcc) >= lineH) {
+        const dir = scrollAcc > 0 ? 1 : -1
+        // One line-mode notch per row of accumulated travel. The pixel
+        // accumulator (lineH per notch) sets the cadence; DOM_DELTA_LINE keeps
+        // xterm 6 from damping the delta as a trackpad gesture.
+        wheelTarget.dispatchEvent(
+          new WheelEvent('wheel', {
+            deltaY: dir,
+            deltaMode: WheelEvent.DOM_DELTA_LINE,
+            bubbles: true,
+            cancelable: true,
+          })
+        )
+        scrollAcc -= dir * lineH
+      }
+      // Stop the browser from panning the page / rubber-banding instead.
+      ev.preventDefault()
+    }
+
+    const endTouch = () => {
+      touchY = null
+      scrollAcc = 0
+    }
+
+    el.addEventListener('touchstart', onTouchStart, { passive: true })
+    el.addEventListener('touchmove', onTouchMove, { passive: false })
+    el.addEventListener('touchend', endTouch, { passive: true })
+    el.addEventListener('touchcancel', endTouch, { passive: true })
 
     // Connect WebSocket
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -85,7 +256,11 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     // onData handles ALL input including paste — xterm.js
     // receives pasted text through the browser's input system
     term.onData((data) => {
-      if (ws.readyState === WebSocket.OPEN) {
+      // A managed pane is a rendered view of a private provider RPC stream.
+      // Its stdin is deliberately not a provider input channel; controls use
+      // the exact generation-bound API above.  Hold input while managed status
+      // is unresolved so an early paste cannot leak into the wrong transport.
+      if (managedRef.current === false && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'input', data }))
       }
     })
@@ -114,6 +289,10 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       cancelAnimationFrame(initialFit)
       clearTimeout(resizeTimer)
       resizeObserver.disconnect()
+      el.removeEventListener('touchstart', onTouchStart)
+      el.removeEventListener('touchmove', onTouchMove)
+      el.removeEventListener('touchend', endTouch)
+      el.removeEventListener('touchcancel', endTouch)
       ws.close()
       term.dispose()
     }
@@ -128,6 +307,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
           <span className="text-sm font-mono text-gray-300">{terminalId}</span>
           {provider && <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">{provider}</span>}
           {agentProfile && <span className="text-xs text-emerald-400 bg-emerald-900/30 px-2 py-0.5 rounded">{agentProfile}</span>}
+          {managed && <span className="text-xs text-cyan-300 bg-cyan-900/30 px-2 py-0.5 rounded">Managed ACP · read-only transcript</span>}
         </div>
         <div className="flex items-center gap-3">
           <span className="text-[10px] text-gray-600">Click X to close</span>
@@ -140,6 +320,87 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
           </button>
         </div>
       </div>
+      {managed && (
+        <div className="shrink-0 border-b border-gray-700/50 bg-gray-950 px-4 py-2 space-y-2">
+          <div className="flex gap-2">
+            <input
+              value={message}
+              onChange={event => setMessage(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter' && message.trim() && !controlBusy) {
+                  void runManagedOperation({ action: 'follow-up', message: message.trim() })
+                }
+              }}
+              placeholder="Send a provider-native follow-up…"
+              className="min-w-0 flex-1 rounded border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none"
+            />
+            <button
+              disabled={controlBusy || !message.trim()}
+              onClick={() => void runManagedOperation({ action: 'follow-up', message: message.trim() })}
+              className="rounded bg-emerald-700 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+            >
+              Send
+            </button>
+            <button
+              disabled={controlBusy}
+              onClick={() => void runManagedOperation({ action: 'cancel' })}
+              className="rounded bg-amber-700 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+            >
+              Cancel turn
+            </button>
+            <button
+              disabled={controlBusy}
+              onClick={() => void runManagedOperation({ action: 'compact' })}
+              className="rounded bg-indigo-700 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+            >
+              Compact
+            </button>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              disabled={controlBusy}
+              onClick={() => void runManagedOperation({ action: 'route-query' })}
+              className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
+            >
+              Query route
+            </button>
+            <input
+              value={model}
+              onChange={event => setModel(event.target.value)}
+              placeholder="model"
+              className="w-56 rounded border border-gray-700 bg-gray-900 px-2 py-1 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none"
+            />
+            <button
+              disabled={controlBusy || !model.trim()}
+              onClick={() => void runManagedOperation({ action: 'route-set', config_id: 'model', value: model.trim() })}
+              className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
+            >
+              Set model
+            </button>
+            <input
+              value={effort}
+              onChange={event => setEffort(event.target.value)}
+              placeholder="effort"
+              className="w-32 rounded border border-gray-700 bg-gray-900 px-2 py-1 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none"
+            />
+            <button
+              disabled={controlBusy || !effort.trim()}
+              onClick={() => void runManagedOperation({ action: 'route-set', config_id: 'thinking', value: effort.trim() })}
+              className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
+            >
+              Set effort
+            </button>
+            <button
+              disabled={controlBusy}
+              onClick={() => void runManagedOperation({ action: 'resume-status' })}
+              className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
+            >
+              Resume status
+            </button>
+            <span className="min-w-0 truncate text-[11px] text-gray-500">{controlStatus}</span>
+          </div>
+        </div>
+      )}
       {/* Terminal — absolute positioning gives xterm.js real pixel dimensions to measure */}
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
         <div ref={containerRef} style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }} />

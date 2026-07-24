@@ -65,6 +65,20 @@ def generate_window_name(agent_profile: str) -> str:
     return validate_tmux_name(f"{agent_profile}-{uuid.uuid4().hex[:4]}", "window_name")
 
 
+def managed_window_name(terminal_id: str, generation: str) -> str:
+    """Return the deterministic window identity for one managed incarnation."""
+    if not re.fullmatch(r"[a-f0-9]{8}", terminal_id):
+        raise ValueError("managed terminal_id must be exactly 8 lowercase hex characters")
+    try:
+        generation_id = uuid.UUID(generation)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("managed generation must be a UUID") from exc
+    return validate_tmux_name(
+        f"managed-{terminal_id}-{generation_id.hex[:12]}",
+        "window_name",
+    )
+
+
 def _resolve_window(terminal_id: str) -> "tuple[str, str] | None":
     """Resolve (session_name, window_name) for a terminal from its provider.
 

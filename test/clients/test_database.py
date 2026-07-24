@@ -206,9 +206,11 @@ class TestTerminalOperations:
         mock_terminal.agent_profile = "developer"
         mock_terminal.last_active = datetime.now()
 
-        mock_query = MagicMock()
-        mock_query.filter.return_value.all.return_value = [mock_terminal]
-        mock_session.query.return_value = mock_query
+        legacy_query = MagicMock()
+        legacy_query.filter.return_value.all.return_value = [mock_terminal]
+        managed_query = MagicMock()
+        managed_query.filter.return_value.all.return_value = []
+        mock_session.query.side_effect = [legacy_query, managed_query]
         mock_session_class.return_value = mock_session
 
         result = list_terminals_by_session("cao-session")
@@ -691,6 +693,124 @@ class TestInitDb:
         mock_base.metadata.create_all.assert_called_once()
 
 
+class TestInitDbOldBinaryGate:
+    """The configured exact-old-binary gate precedes any v2 surface creation.
+
+    Production regression (P1): ``init_db`` must never create the v2 ORM
+    surface through the unconditional ``create_all`` — v2 tables come only
+    from the gated transactional migration — and a REQUIRED gate refusal
+    must propagate out of ``init_db`` instead of being logged and
+    swallowed.
+    """
+
+    @pytest.fixture
+    def isolated_init_db(self, tmp_path, monkeypatch):
+        """Bind the module engine/session/DB file to a per-test SQLite file."""
+        import sqlite3
+
+        from cli_agent_orchestrator import constants
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "init.sqlite"
+        engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
+        monkeypatch.setattr(db_mod, "engine", engine)
+        monkeypatch.setattr(
+            db_mod,
+            "SessionLocal",
+            sessionmaker(autocommit=False, autoflush=False, bind=engine),
+        )
+        monkeypatch.setattr(db_mod, "DB_DIR", tmp_path)
+        monkeypatch.setattr(constants, "DATABASE_FILE", db_file)
+
+        def v2_tables():
+            with sqlite3.connect(str(db_file)) as conn:
+                return sorted(
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name LIKE 'managed_launch_v2%'"
+                    )
+                )
+
+        return v2_tables
+
+    def test_required_gate_refusal_propagates_before_v2_surface(
+        self, isolated_init_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import old_binary_rig, vintage_migration
+
+        monkeypatch.setenv("CAO_OLD_BINARY_GATE", "require")
+        hostile = old_binary_rig.RigVerdict(
+            zero_visibility=False, violations=("v2 access",), surfaces_checked=7
+        )
+        monkeypatch.setattr(
+            old_binary_rig, "prove_old_binary_invisibility", lambda **_kwargs: hostile
+        )
+
+        with pytest.raises(vintage_migration.OldBinaryGateRefused):
+            init_db()
+
+        assert isolated_init_db() == [], (
+            "a required gate refusal must abort initialization BEFORE any "
+            "v2-capable metadata operation creates the v2 surface"
+        )
+
+    def test_required_gate_pass_creates_v2_only_through_migration(
+        self, isolated_init_db, monkeypatch, tmp_path
+    ):
+        import sqlite3
+
+        from cli_agent_orchestrator.services import old_binary_rig
+
+        monkeypatch.setenv("CAO_OLD_BINARY_GATE", "require")
+        passing = old_binary_rig.RigVerdict(zero_visibility=True, violations=(), surfaces_checked=7)
+        monkeypatch.setattr(
+            old_binary_rig, "prove_old_binary_invisibility", lambda **_kwargs: passing
+        )
+
+        init_db()
+
+        assert isolated_init_db() == [
+            "managed_launch_v2_reservations",
+            "managed_launch_v2_terminals",
+        ]
+        # The v2 surface came through the gated transactional migration,
+        # journaled with the gate outcome — never the bare create_all.
+        from cli_agent_orchestrator import constants
+
+        with sqlite3.connect(str(constants.DATABASE_FILE)) as conn:
+            detail = conn.execute(
+                "SELECT detail FROM v2_migration_journal ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()[0]
+        assert '"zero_visibility": true' in detail
+
+    def test_ungated_init_creates_v2_through_migration(self, isolated_init_db, monkeypatch):
+        monkeypatch.delenv("CAO_OLD_BINARY_GATE", raising=False)
+
+        init_db()
+
+        assert isolated_init_db() == [
+            "managed_launch_v2_reservations",
+            "managed_launch_v2_terminals",
+        ]
+
+    def test_create_all_excludes_v2_orm_tables(self):
+        """The unconditional create_all metadata list names no v2 table."""
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        names = {
+            table.name
+            for table in Base.metadata.sorted_tables
+            if table.name not in db_mod._V2_ORM_TABLE_NAMES
+        }
+        assert "managed_launch_v2_reservations" not in names
+        assert "managed_launch_v2_terminals" not in names
+        assert db_mod._V2_ORM_TABLE_NAMES == {
+            "managed_launch_v2_reservations",
+            "managed_launch_v2_terminals",
+        }
+
+
 class TestTerminalsSchemaMigration:
     """Tests for the terminals-table column-add migration (caller_id, issue #284)."""
 
@@ -859,3 +979,105 @@ class TestProjectAliasMigration:
         with sqlite3.connect(str(db_file)) as conn:
             rows = conn.execute("SELECT alias, project_id FROM project_aliases").fetchall()
         assert rows == [("a1", "p1")], "current-schema table must be left intact"
+
+
+class TestSessionEnvMigration:
+    """Tests for the session_env table migration (issue #248 durability)."""
+
+    def _legacy_db(self, tmp_path):
+        """A DB created before the session_env table existed (other migrated
+        tables present, no session_env)."""
+        import sqlite3
+
+        db_file = tmp_path / "legacy.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute("CREATE TABLE terminals (id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL)")
+            conn.commit()
+        return db_file
+
+    def test_migration_creates_table_with_exact_schema(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = self._legacy_db(tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        db_mod._migrate_session_env()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            cols = conn.execute("PRAGMA table_info(session_env)").fetchall()
+        # PRAGMA row: (cid, name, type, notnull, dflt_value, pk).
+        schema = {c[1]: (c[2].upper(), c[3], c[5]) for c in cols}
+        assert schema == {
+            "session_name": ("TEXT", 0, 1),
+            "env_vars": ("TEXT", 1, 0),
+            "updated_at": ("TEXT", 1, 0),
+        }
+
+    def test_migration_is_idempotent_and_preserves_rows(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = self._legacy_db(tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        db_mod._migrate_session_env()
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "INSERT INTO session_env VALUES ('cao-x', '{\"A\": \"1\"}', '2026-07-21T00:00:00Z')"
+            )
+            conn.commit()
+        db_mod._migrate_session_env()  # second run — must not raise or clobber
+
+        with sqlite3.connect(str(db_file)) as conn:
+            rows = conn.execute("SELECT session_name, env_vars FROM session_env").fetchall()
+        assert rows == [("cao-x", '{"A": "1"}')]
+
+    def test_fresh_model_schema_matches_raw_migration_ddl(self):
+        """create_all (fresh DBs) and the raw migration (old DBs) must produce
+        the same columns/types so reads behave identically on both paths."""
+        from sqlalchemy.schema import CreateTable
+
+        from cli_agent_orchestrator.clients.database import SessionEnvModel
+
+        ddl = str(CreateTable(SessionEnvModel.__table__).compile())
+        assert "session_name TEXT" in ddl
+        assert "env_vars TEXT NOT NULL" in ddl
+        assert "updated_at TEXT NOT NULL" in ddl
+        assert "PRIMARY KEY (session_name)" in ddl
+
+    def test_downgrade_harmless_new_db_with_old_migrations(self, tmp_path, monkeypatch):
+        """Old code on a new DB: the extra session_env table is ignored by the
+        pre-existing migrations and its rows are left untouched."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = self._legacy_db(tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE session_env ("
+                "session_name TEXT PRIMARY KEY, env_vars TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO session_env VALUES ('cao-x', '{\"A\": \"1\"}', '2026-07-21T00:00:00Z')"
+            )
+            conn.commit()
+
+        # The pre-existing raw migrations (what "old code" runs) ignore the table.
+        db_mod._migrate_terminals_schema()
+        db_mod._migrate_memory_indexes()
+        db_mod._migrate_project_aliases_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            rows = conn.execute("SELECT session_name, env_vars FROM session_env").fetchall()
+        assert rows == [("cao-x", '{"A": "1"}')]

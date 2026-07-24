@@ -579,3 +579,74 @@ class TestRun:
                 pass
 
         mock_to_thread.assert_awaited_once_with(svc.deliver_pending, "abc123", registry=None)
+
+
+class TestManagedBridgeDelivery:
+    """P1-7 (final conformance §20.2f): a receiver with a live managed
+    provider session gets exact provider-native turn delivery (and its
+    acknowledgement); anything else uses the ordinary path with NO ack
+    inferred from paste."""
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.managed_launch")
+    def test_managed_receiver_delivers_via_bridge_never_paste(
+        self, mock_managed, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_managed.deliver_inbox_via_bridge.return_value = True
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        mock_managed.deliver_inbox_via_bridge.assert_called_once_with(
+            "term-1", message_id=1, message="hello", sender_id="sender-1"
+        )
+        mock_term_svc.send_input.assert_not_called()
+        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.managed_launch")
+    def test_bridge_unavailable_falls_back_to_paste_without_ack(
+        self, mock_managed, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_managed.deliver_inbox_via_bridge.return_value = False
+        mock_managed.managed_control_identity.return_value = None
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
+        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.managed_launch")
+    def test_managed_bridge_unavailable_preserves_pending_never_pastes(
+        self, mock_managed, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_managed.deliver_inbox_via_bridge.return_value = False
+        mock_managed.managed_control_identity.return_value = {
+            "terminal_id": "term-1",
+            "generation": "generation-1",
+            "state": "ready",
+            "controllable": True,
+        }
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_not_called()
+        mock_update.assert_not_called()

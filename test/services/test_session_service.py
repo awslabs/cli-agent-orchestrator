@@ -173,6 +173,7 @@ class TestGetSession:
 class TestDeleteSession:
     """Tests for delete_session function."""
 
+    @patch("cli_agent_orchestrator.services.session_service.clear_session_env")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -181,6 +182,7 @@ class TestDeleteSession:
         mock_get_backend,
         mock_list_terminals,
         mock_delete_terminal,
+        mock_clear_session_env,
     ):
         """Test deleting session successfully.
 
@@ -202,12 +204,17 @@ class TestDeleteSession:
         assert mock_delete_terminal.call_count == 2
         mock_delete_terminal.assert_any_call("terminal1", registry=ANY)
         mock_delete_terminal.assert_any_call("terminal2", registry=ANY)
+        # The forwarded-env mapping is dropped via the (separately tested,
+        # strict) store helper — mocked here so this orchestration test does
+        # not depend on a migrated DB.
+        mock_clear_session_env.assert_called_once_with("cao-test")
 
+    @patch("cli_agent_orchestrator.services.session_service.clear_session_env")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_when_backend_session_already_gone(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal, mock_clear_session_env
     ):
         """Backend session already gone — delete_session should not raise and not
         call kill_session, but still tear down each terminal via delete_terminal."""
@@ -219,12 +226,14 @@ class TestDeleteSession:
         assert result == {"deleted": ["cao-test"], "errors": []}
         mock_get_backend.return_value.kill_session.assert_not_called()
         mock_delete_terminal.assert_called_once_with("terminal1", registry=ANY)
+        mock_clear_session_env.assert_called_once_with("cao-test")
 
+    @patch("cli_agent_orchestrator.services.session_service.clear_session_env")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_no_terminals(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal, mock_clear_session_env
     ):
         """Test deleting session with no terminals."""
         mock_get_backend.return_value.session_exists.return_value = True
@@ -235,6 +244,7 @@ class TestDeleteSession:
         assert result == {"deleted": ["cao-test"], "errors": []}
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
         mock_delete_terminal.assert_not_called()
+        mock_clear_session_env.assert_called_once_with("cao-test")
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -246,11 +256,12 @@ class TestDeleteSession:
         with pytest.raises(Exception, match="Database error"):
             delete_session("cao-test")
 
+    @patch("cli_agent_orchestrator.services.session_service.clear_session_env")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_continues_when_terminal_cleanup_fails(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal, mock_clear_session_env
     ):
         """Test that delete_session continues even when terminal teardown fails for some terminals."""
         mock_get_backend.return_value.session_exists.return_value = True
@@ -275,11 +286,12 @@ class TestDeleteSession:
         # All three terminal teardowns were attempted
         assert mock_delete_terminal.call_count == 3
 
+    @patch("cli_agent_orchestrator.services.session_service.clear_session_env")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_cleans_up_each_terminal(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal, mock_clear_session_env
     ):
         """Test that delete_session tears down every terminal in the session via delete_terminal."""
         mock_get_backend.return_value.session_exists.return_value = True

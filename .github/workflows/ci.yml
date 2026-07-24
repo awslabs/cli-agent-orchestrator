@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, conductor-deploy]
   pull_request:
-    branches: [main]
+    branches: [main, conductor-deploy]
 
 permissions:
   contents: read
@@ -21,6 +21,15 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Fetch the pinned old-binary (H_B) ancestor
+        # The exact-H_B old-binary gate tests invoke `git archive` against
+        # the pinned deployed-base ancestor; the default depth-1 PR checkout
+        # does not contain that object. Fetch exactly it (deterministic) and
+        # assert the exact SHA is present before the test jobs run.
+        run: |
+          git fetch --depth=1 origin e473d3b50eb307d1a6e179ec209aeb2bd3e58dcb
+          git rev-parse --verify e473d3b50eb307d1a6e179ec209aeb2bd3e58dcb^{commit}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -104,6 +113,13 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Fetch the pinned old-binary (H_B) ancestor
+        # Same pinned-ancestor requirement as the unit-test job: the backend
+        # coverage run includes the exact-H_B old-binary gate tests.
+        run: |
+          git fetch --depth=1 origin e473d3b50eb307d1a6e179ec209aeb2bd3e58dcb
+          git rev-parse --verify e473d3b50eb307d1a6e179ec209aeb2bd3e58dcb^{commit}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
