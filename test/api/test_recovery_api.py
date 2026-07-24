@@ -56,6 +56,7 @@ def _reserve_payload(worktree, tmp_path, **changes):
         "obligation_generation": "obgen-7c2e4a1b",
         "task_id": "self-heal-demo-task",
         "run_id": "run-0001",
+        "delivery_id": str(uuid.uuid4()),
         "launch_nonce": NONCE,
     }
     payload.update(changes)

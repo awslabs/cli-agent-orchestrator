@@ -47,6 +47,7 @@ class ManagedLaunchV2ReserveRequest(BaseModel):
     task_id: Optional[str] = None
     run_id: str
     project: Optional[str] = None
+    delivery_id: str
     launch_nonce: str
 
     @field_validator("project")
@@ -62,6 +63,11 @@ class ManagedLaunchV2ReserveRequest(BaseModel):
     @field_validator("reservation_id")
     @classmethod
     def _reservation_uuid(cls, value: str) -> str:
+        return _uuid_text(value)
+
+    @field_validator("delivery_id")
+    @classmethod
+    def _delivery_uuid(cls, value: str) -> str:
         return _uuid_text(value)
 
     @field_validator("caller_id")

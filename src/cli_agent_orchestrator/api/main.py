@@ -1536,6 +1536,11 @@ async def managed_launch_capabilities(
         "provider_native_exact_session_receipts": True,
         "zero_task_route_attestation": True,
         "pinned_provider_executable": True,
+        "reservation_bound_delivery_id": True,
+        "provider_bound_bridge_environment": True,
+        "bridge_environment_inventory": "names-only-sha256",
+        "post_allocation_bridge_failure_finalization": True,
+        "launch_failure_evidence_schema": "cao-managed-bridge-launch-failure-v1",
         "trusted_project_root_providers": ["codex"],
         "readiness_providers": ["codex", "kimi_cli"],
     }

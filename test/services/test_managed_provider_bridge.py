@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 
 import pytest
 
@@ -16,6 +18,7 @@ def _request(tmp_path, *, provider="codex", model="gpt-5.6-sol", effort="xhigh")
         "reservation_id": "11111111-1111-4111-8111-111111111111",
         "terminal_id": "deadbeef",
         "generation": "22222222-2222-4222-8222-222222222222",
+        "delivery_id": "33333333-3333-4333-8333-333333333333",
         "provider": provider,
         "agent_profile": "reviewer",
         "profile_sha256": "a" * 64,
@@ -45,7 +48,7 @@ def _admission(request):
         "reservation_id": request["reservation_id"],
         "terminal_id": request["terminal_id"],
         "generation": request["generation"],
-        "delivery_id": "33333333-3333-4333-8333-333333333333",
+        "delivery_id": request["delivery_id"],
         "message": message,
         "message_sha256": hashlib.sha256(message.encode()).hexdigest(),
         "sender_id": "cafebabe",
@@ -212,6 +215,41 @@ def test_kimi_receipt_never_promotes_client_rpc_id_to_provider_identity(tmp_path
     assert submission["provider_accepted"] is True
 
 
+def test_kimi_inventory_names_match_final_provider_child_environment(tmp_path, monkeypatch):
+    request = _request(tmp_path, provider="kimi_cli", model="kimi-code/k3", effort="max")
+    wire = tmp_path / "wire.jsonl"
+    wire.write_text("")
+    isolated_environment = {
+        "HOME": "/home/kimi",
+        "PATH": "/ambient/bin",
+        "KIMI_CODE_HOME": "/provider/kimi",
+        "KIMI_MODEL_THINKING_EFFORT": "low",
+        "CODEX_HOME": "/foreign/codex",
+    }
+    monkeypatch.setattr(os, "environ", isolated_environment)
+    monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", None)
+    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+    monkeypatch.setattr(bridge, "_RpcProcess", _KimiRpc)
+    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "0.29.0")
+    monkeypatch.setattr(bridge, "_kimi_wire_path", lambda *_: wire)
+
+    inventory = bridge._bind_bridge_environment(request)
+    session = bridge._ProviderSession(request)
+    session.initialize()
+    child_environment = session.rpc.env
+
+    assert inventory["names"] == sorted(child_environment)
+    assert (
+        inventory["names_sha256"]
+        == bridge._environment_inventory("kimi_cli", list(child_environment))["names_sha256"]
+    )
+    assert child_environment["KIMI_MODEL_THINKING_EFFORT"] == "max"
+    assert "CODEX_HOME" not in child_environment
+    serialized = json.dumps(inventory, sort_keys=True)
+    assert "max" not in serialized
+    assert "/provider/kimi" not in serialized
+
+
 def test_kimi_turn_receipt_comes_from_structured_provider_journal(tmp_path):
     wire = tmp_path / "wire.jsonl"
     wire.write_text(
@@ -371,21 +409,101 @@ def test_provider_error_items_become_generation_bound_refusal_receipts(tmp_path,
 
 
 def test_bridge_environment_is_pruned_to_minimal_allowlist(monkeypatch):
-    # P1-9 (final conformance §20.2f): the bridge's OWN environment becomes
-    # the fresh minimal allowlist — unrelated ambient variables (incl.
-    # protected conductor/route variables) never leak through it, and PATH is
-    # the fixed minimal value, never inherited.
+    # The bridge and provider child are both composed from bounded inputs.
+    # Foreign provider controls are removed before the fail-closed guard,
+    # while the target provider retains only its own non-route controls.
+    import json
     import os
 
-    monkeypatch.setenv("HOME", "/home/test")
-    monkeypatch.setenv("UNRELATED_AMBIENT_VARIABLE", "x")
-    monkeypatch.setenv("CONDUCT_DEV_ALLOW_ABSENT_DEPLOY_RECEIPT", "1")
-    monkeypatch.setenv("PATH", "/hostile/bin:/usr/bin")
-    bridge._prune_bridge_environment()
-    assert os.environ.get("UNRELATED_AMBIENT_VARIABLE") is None
-    assert os.environ.get("CONDUCT_DEV_ALLOW_ABSENT_DEPLOY_RECEIPT") is None
-    assert os.environ.get("HOME") == "/home/test"
-    assert os.environ.get("PATH") == bridge._MINIMAL_PATH
+    ambient = {
+        "HOME": "/home/test",
+        "PATH": "/hostile/bin:/usr/bin",
+        "CAO_TERMINAL_ID": "deadbeef",
+        "CAO_CONDUCTOR_SHIM_DIR": "/pinned/shim",
+        "CAO_WORKFLOW_RUN_ID": "run-1",
+        "CODEX_CI": "1",
+        "CODEX_MANAGED_BY_NPM": "1",
+        "CODEX_MANAGED_PACKAGE_ROOT": "/secret/codex",
+        "CODEX_THREAD_ID": "thread-secret",
+        "KIMI_CODE_HOME": "/provider/kimi",
+        "KIMI_PROVIDER_TOKEN": "provider-secret",
+        "CONDUCT_DEV_ALLOW_ABSENT_DEPLOY_RECEIPT": "1",
+        "UNRELATED_AMBIENT_VARIABLE": "x",
+    }
+    bridge_env, provider_env, inventory = bridge._provider_bound_environments("kimi_cli", ambient)
+
+    assert bridge_env == {
+        "HOME": "/home/test",
+        "PATH": f"/pinned/shim:{bridge._MINIMAL_PATH}",
+        "CAO_TERMINAL_ID": "deadbeef",
+        "CAO_CONDUCTOR_SHIM_DIR": "/pinned/shim",
+        "CAO_WORKFLOW_RUN_ID": "run-1",
+    }
+    assert provider_env == {
+        **bridge_env,
+        "KIMI_CODE_HOME": "/provider/kimi",
+        "KIMI_PROVIDER_TOKEN": "provider-secret",
+    }
+    for name in (
+        "CODEX_CI",
+        "CODEX_MANAGED_BY_NPM",
+        "CODEX_MANAGED_PACKAGE_ROOT",
+        "CODEX_THREAD_ID",
+        "CONDUCT_DEV_ALLOW_ABSENT_DEPLOY_RECEIPT",
+        "UNRELATED_AMBIENT_VARIABLE",
+    ):
+        assert name not in bridge_env
+        assert name not in provider_env
+        assert name not in inventory["names"]
+    serialized_inventory = json.dumps(inventory, sort_keys=True)
+    assert "provider-secret" not in serialized_inventory
+    assert "/provider/kimi" not in serialized_inventory
+
+    # Exercise the destructive launch-boundary scrub against an isolated
+    # environment mapping so this test never alters the pytest process.
+    isolated_environment = dict(ambient)
+    monkeypatch.setattr(os, "environ", isolated_environment)
+    monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", None)
+    assert bridge._prune_bridge_environment("kimi_cli") == inventory
+    assert dict(os.environ) == bridge_env
+    bridge._assert_bridge_environment()
+
+
+def test_bridge_guard_refuses_controls_injected_after_scrub(monkeypatch):
+    import os
+
+    ambient = {
+        "HOME": "/home/test",
+        "CODEX_CI": "1",
+        "CODEX_THREAD_ID": "thread-secret",
+    }
+    monkeypatch.setattr(os, "environ", ambient)
+    monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", None)
+    bridge._prune_bridge_environment("kimi_cli")
+    os.environ["CODEX_THREAD_ID"] = "injected-after-scrub"
+
+    with pytest.raises(bridge.BridgeError, match="CODEX_THREAD_ID"):
+        bridge._assert_bridge_environment()
+
+
+def test_write_request_refuses_missing_or_changed_delivery_before_disk_io(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "BRIDGE_ROOT", tmp_path / "bridge-root")
+    monkeypatch.setattr(bridge, "_secure_rendezvous_root", lambda: bridge.pathlib.Path("/tmp"))
+    request = _request(tmp_path)
+    missing = dict(request)
+    missing.pop("delivery_id")
+
+    with pytest.raises(bridge.BridgeError, match="canonical delivery_id"):
+        bridge.write_request(request["reservation_id"], missing)
+    assert not (bridge.BRIDGE_ROOT / request["reservation_id"]).exists()
+
+    bridge.write_request(request["reservation_id"], request)
+    changed = {
+        **request,
+        "delivery_id": "44444444-4444-4444-8444-444444444444",
+    }
+    with pytest.raises(bridge.BridgeError, match="identity changed"):
+        bridge.write_request(request["reservation_id"], changed)
 
 
 # -- P1 bridge wiring regressions (fence atomicity, heartbeat producer) ------
@@ -559,7 +677,7 @@ def test_admission_holds_fence_lock_across_provider_io(tmp_path, monkeypatch):
     import pytest
 
     with pytest.raises(bridge.BridgeError, match="sealed"):
-        session.admit({**admission, "delivery_id": "44444444-4444-4444-8444-444444444444"})
+        session.admit(admission)
     assert submitted == [admission["message"]]
 
 
