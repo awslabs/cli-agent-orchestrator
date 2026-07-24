@@ -68,10 +68,12 @@ RENDEZVOUS_IDENTITY_FIELDS = (
 _RENDEZVOUS_DIGEST_WIDTH = 16
 _AF_UNIX_SAFE_PATH_BYTES = 100
 
-# P1-9 (spec §20.2d(7)): provider/bridge child processes run under a MINIMAL
-# allowlisted environment built fresh — never the ambient server/tmux
-# environment. Protected conductor state, quota-bypass, and route-control
-# variables are rejected; PATH is a fixed minimal value, not inherited.
+# Provider and bridge child processes run under a minimal provider-bound
+# environment built fresh, never the ambient server/tmux environment. System
+# and conductor contributions are kept separate from the target provider
+# namespace: foreign provider controls are scrubbed before the fail-closed
+# guard, while target-provider controls are held only for that provider's
+# child process.
 _PROVIDER_ENV_ALLOWLIST = frozenset(
     {
         "HOME",
@@ -89,10 +91,20 @@ _PROVIDER_ENV_ALLOWLIST = frozenset(
         "DISPLAY",
         "XDG_RUNTIME_DIR",
         "DO_NOT_TRACK",
-        "KIMI_CODE_HOME",
     }
 )
 _MINIMAL_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+_CONDUCTOR_ENV_EXACT = frozenset({"CAO_TERMINAL_ID", "ZDOTDIR"})
+_CONDUCTOR_ENV_PREFIXES = ("CAO_CONDUCTOR_", "CAO_WORKFLOW_")
+_PROVIDER_CONTROL_PREFIXES = {
+    "codex": ("CODEX_",),
+    "kimi_cli": ("KIMI_",),
+    "claude_code": ("CLAUDE_", "ANTHROPIC_"),
+}
+_BRIDGE_ENV_INVENTORY_SCHEMA = "cao-managed-bridge-environment-v1"
+LAUNCH_FAILURE_SCHEMA = "cao-managed-bridge-launch-failure-v1"
+LAUNCH_FAILURE_DIGEST_DOMAIN = "cao-managed-bridge-launch-failure-evidence-v1"
+_BOUND_PROVIDER_ENV: Optional[dict[str, str]] = None
 
 # Variables that must never steer a managed provider from the ambient
 # environment: quota bypass, conductor control, and route control. Route
@@ -123,24 +135,77 @@ def _assert_bridge_environment() -> None:
         )
 
 
-def _prune_bridge_environment() -> None:
-    """Replace the bridge's OWN environment with the fresh minimal allowlist.
+def _environment_inventory(provider: str, names: list[str]) -> dict[str, Any]:
+    """Return auditable names-only environment metadata.
 
-    P1-9 (final conformance §20.2f): the bridge process must not inherit
-    unrelated ambient variables merely because its provider child is pruned.
-    After this runs, the bridge and everything it spawns see only the
-    allowlisted variables and the fixed minimal PATH. Runs after
-    ``_assert_bridge_environment`` so a protected leak still fails closed
-    (with the offending names) instead of being silently dropped."""
-    fresh = _provider_env()
+    Values may include credentials or provider-specific configuration and
+    must never enter the launch journal.  The digest is over the canonical
+    provider-bound name inventory only.
+    """
+    payload = {
+        "schema": _BRIDGE_ENV_INVENTORY_SCHEMA,
+        "provider": provider,
+        "names": sorted(names),
+    }
+    return {**payload, "names_sha256": _digest(payload)}
+
+
+def _provider_bound_environments(
+    provider: str,
+    ambient: Optional[dict[str, str]] = None,
+) -> tuple[dict[str, str], dict[str, str], dict[str, Any]]:
+    """Compose bridge/provider environments from pinned provider-bound rules.
+
+    The bridge receives the system base and non-secret conductor routing
+    contributions.  The provider child additionally receives only its own
+    control namespace.  Foreign provider namespaces never cross this seam.
+    Ambient route controls still do not override the reservation-pinned route.
+    """
+    if provider not in _PROVIDER_CONTROL_PREFIXES:
+        raise BridgeError(f"unsupported managed provider {provider!r}")
+    source = dict(os.environ if ambient is None else ambient)
+    bridge_env = {name: source[name] for name in _PROVIDER_ENV_ALLOWLIST if name in source}
+    # PATH stays bounded.  Preserve only the conductor-declared shim prefix;
+    # the remainder is the fixed system base, never arbitrary ambient PATH.
+    shim_dir = source.get("CAO_CONDUCTOR_SHIM_DIR")
+    if shim_dir and os.path.isabs(shim_dir):
+        bridge_env["PATH"] = f"{shim_dir}:{_MINIMAL_PATH}"
+    else:
+        bridge_env["PATH"] = _MINIMAL_PATH
+    for name, value in source.items():
+        if name in _CONDUCTOR_ENV_EXACT or any(
+            name.startswith(prefix) for prefix in _CONDUCTOR_ENV_PREFIXES
+        ):
+            bridge_env[name] = value
+
+    provider_env = dict(bridge_env)
+    for name, value in source.items():
+        if any(name.startswith(prefix) for prefix in _PROVIDER_CONTROL_PREFIXES[provider]):
+            # Route control comes only from the immutable reservation and is
+            # added explicitly by the provider adapter.
+            if name not in _PROTECTED_ENV_EXACT:
+                provider_env[name] = value
+    inventory = _environment_inventory(provider, list(provider_env))
+    return bridge_env, provider_env, inventory
+
+
+def _prune_bridge_environment(provider: str) -> dict[str, Any]:
+    """Scrub the bridge before the unchanged fail-closed guard runs."""
+    global _BOUND_PROVIDER_ENV
+    bridge_env, provider_env, inventory = _provider_bound_environments(provider)
+    _BOUND_PROVIDER_ENV = provider_env
     os.environ.clear()
-    os.environ.update(fresh)
+    os.environ.update(bridge_env)
+    return inventory
 
 
 def _provider_env(overrides: Optional[dict[str, str]] = None) -> dict[str, str]:
-    """The minimal allowlisted environment for provider child processes."""
-    env = {name: os.environ[name] for name in _PROVIDER_ENV_ALLOWLIST if name in os.environ}
-    env["PATH"] = _MINIMAL_PATH
+    """The provider-bound environment for provider child processes."""
+    if _BOUND_PROVIDER_ENV is None:
+        env = {name: os.environ[name] for name in _PROVIDER_ENV_ALLOWLIST if name in os.environ}
+        env["PATH"] = _MINIMAL_PATH
+    else:
+        env = dict(_BOUND_PROVIDER_ENV)
     env.update(overrides or {})
     return env
 
@@ -872,6 +937,13 @@ def _profile_material(agent_profile: str, terminal_id: str) -> dict[str, Any]:
 
 
 def write_request(reservation_id: str, request: dict[str, Any]) -> dict[str, pathlib.Path]:
+    delivery_id = request.get("delivery_id")
+    try:
+        canonical_delivery_id = str(uuid.UUID(delivery_id))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise BridgeError("managed provider request requires a canonical delivery_id") from exc
+    if delivery_id != canonical_delivery_id:
+        raise BridgeError("managed provider request delivery_id is not canonical")
     identity = binding_identity(request)
     target = paths(reservation_id, request)
     target["root"].mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -897,6 +969,139 @@ def read_state(reservation_id: str) -> Optional[dict[str, Any]]:
     if not isinstance(value, dict) or value.get("bridge_version") != BRIDGE_VERSION:
         raise BridgeError("managed provider state has an unknown schema")
     return value
+
+
+def validate_launch_failure(
+    state: Any,
+    *,
+    reservation_id: str,
+    terminal_id: str,
+    generation: str,
+    delivery_id: str,
+    provider: str,
+) -> dict[str, Any]:
+    """Validate exact, names-only bridge failure evidence before a CAS."""
+    if not isinstance(state, dict) or state.get("state") != "launch-failed-bridge":
+        raise BridgeError("bridge state is not a launch-failed-bridge record")
+    failure = state.get("launch_failure")
+    if not isinstance(failure, dict):
+        raise BridgeError("bridge launch failure evidence is missing")
+    required_fields = {
+        "schema",
+        "evidence_digest_domain",
+        "evidence_sha256",
+        "outcome",
+        "reservation_id",
+        "terminal_id",
+        "generation",
+        "delivery_id",
+        "error_class",
+        "error_sha256",
+        "log_evidence_sha256",
+        "environment_inventory",
+        "task_delivery",
+        "provider_io_started",
+        "task_bytes_submitted",
+        "failed_at",
+    }
+    expected = {
+        "outcome": "launch-failed-bridge",
+        "reservation_id": reservation_id,
+        "terminal_id": terminal_id,
+        "generation": generation,
+        "delivery_id": delivery_id,
+        "task_bytes_submitted": False,
+    }
+    mismatches = {
+        key: {"expected": value, "observed": failure.get(key)}
+        for key, value in expected.items()
+        if failure.get(key) != value
+    }
+    if set(failure) != required_fields:
+        mismatches["fields"] = {
+            "expected": sorted(required_fields),
+            "observed": sorted(failure),
+        }
+    task_delivery = failure.get("task_delivery")
+    if task_delivery != {
+        "delivery_id": delivery_id,
+        "status": "never-submitted",
+    }:
+        mismatches["task_delivery"] = {
+            "expected": {"delivery_id": delivery_id, "status": "never-submitted"},
+            "observed": task_delivery,
+        }
+    if state.get("readiness") is not None or state.get("submission") is not None:
+        mismatches["provider_receipts"] = {
+            "expected": None,
+            "observed": {
+                "readiness": state.get("readiness"),
+                "submission": state.get("submission"),
+            },
+        }
+    inventory = failure.get("environment_inventory")
+    if not isinstance(inventory, dict) or set(inventory) != {
+        "schema",
+        "provider",
+        "names",
+        "names_sha256",
+    }:
+        mismatches["environment_inventory"] = {
+            "expected": "names-only inventory",
+            "observed": inventory,
+        }
+    else:
+        names = inventory.get("names")
+        names_valid = isinstance(names, list) and all(
+            isinstance(name, str) and bool(name) for name in names
+        )
+        inventory_payload = {
+            "schema": _BRIDGE_ENV_INVENTORY_SCHEMA,
+            "provider": provider,
+            "names": names,
+        }
+        if (
+            inventory.get("schema") != _BRIDGE_ENV_INVENTORY_SCHEMA
+            or inventory.get("provider") != provider
+            or not names_valid
+            or (names_valid and names != sorted(set(names)))
+            or inventory.get("names_sha256") != _digest(inventory_payload)
+            or state.get("environment_inventory") != inventory
+        ):
+            mismatches["environment_inventory"] = {
+                "expected": "canonical provider-bound names-only inventory",
+                "observed": inventory,
+            }
+    for digest_field in ("error_sha256", "log_evidence_sha256", "evidence_sha256"):
+        value = failure.get(digest_field)
+        if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value):
+            mismatches[digest_field] = {
+                "expected": "64 lowercase hex characters",
+                "observed": value,
+            }
+    if (
+        failure.get("schema") != LAUNCH_FAILURE_SCHEMA
+        or failure.get("evidence_digest_domain") != LAUNCH_FAILURE_DIGEST_DOMAIN
+        or failure.get("evidence_sha256") != launch_failure_evidence_digest(failure)
+        or not isinstance(failure.get("error_class"), str)
+        or not failure["error_class"]
+        or not isinstance(failure.get("provider_io_started"), bool)
+        or not isinstance(failure.get("failed_at"), str)
+        or not failure["failed_at"]
+    ):
+        mismatches["failure_schema"] = {
+            "expected": (
+                f"{LAUNCH_FAILURE_SCHEMA} with canonical "
+                f"{LAUNCH_FAILURE_DIGEST_DOMAIN} proof and error_class"
+            ),
+            "observed": failure.get("schema"),
+        }
+    if mismatches:
+        raise BridgeError(
+            "bridge launch failure identity/evidence mismatch: "
+            + json.dumps(mismatches, sort_keys=True, separators=(",", ":"))
+        )
+    return failure
 
 
 def request_bridge(
@@ -925,7 +1130,10 @@ def request_bridge(
                 ):
                     raise
                 state = read_state(reservation_id)
-                if state and state.get("state") == "preflight_blocked":
+                if state and state.get("state") in {
+                    "preflight_blocked",
+                    "launch-failed-bridge",
+                }:
                     raise BridgeError(
                         str(state.get("error") or "managed provider failed before socket readiness")
                     ) from exc
@@ -958,7 +1166,10 @@ def request_bridge(
         except (FileNotFoundError, ConnectionRefusedError) as exc:
             last_error = exc
             state = read_state(reservation_id)
-            if state and state.get("state") == "preflight_blocked":
+            if state and state.get("state") in {
+                "preflight_blocked",
+                "launch-failed-bridge",
+            }:
                 raise BridgeError(
                     str(state.get("error") or "managed provider failed before socket readiness")
                 ) from exc
@@ -1534,6 +1745,7 @@ class _ProviderSession:
             "reservation_id": self.request["reservation_id"],
             "terminal_id": self.request["terminal_id"],
             "generation": self.request["generation"],
+            "delivery_id": self.request["delivery_id"],
         }
         if any(request.get(key) != value for key, value in expected.items()):
             raise BridgeError("admission does not match the exact bridge generation")
@@ -2369,7 +2581,63 @@ def _record_handshake_refusal(
     _atomic_json(target["state"], state)
 
 
-def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
+def _launch_failure(
+    request: dict[str, Any],
+    exc: BaseException,
+    environment_inventory: dict[str, Any],
+    *,
+    provider_io_started: bool,
+) -> dict[str, Any]:
+    """Build the exact, no-task-I/O bridge failure evidence."""
+    diagnostic = f"[managed-provider-blocked] {exc}\n"
+    failure = {
+        "schema": LAUNCH_FAILURE_SCHEMA,
+        "evidence_digest_domain": LAUNCH_FAILURE_DIGEST_DOMAIN,
+        "outcome": "launch-failed-bridge",
+        "reservation_id": request["reservation_id"],
+        "terminal_id": request["terminal_id"],
+        "generation": request["generation"],
+        "delivery_id": request["delivery_id"],
+        "error_class": type(exc).__name__,
+        "error_sha256": hashlib.sha256(str(exc).encode("utf-8")).hexdigest(),
+        "log_evidence_sha256": hashlib.sha256(diagnostic.encode("utf-8")).hexdigest(),
+        "environment_inventory": environment_inventory,
+        "task_delivery": {
+            "delivery_id": request["delivery_id"],
+            "status": "never-submitted",
+        },
+        "provider_io_started": provider_io_started,
+        "task_bytes_submitted": False,
+        "failed_at": _now(),
+    }
+    return {
+        **failure,
+        "evidence_sha256": launch_failure_evidence_digest(failure),
+    }
+
+
+def launch_failure_evidence_digest(failure: dict[str, Any]) -> str:
+    """Digest the canonical proof without a self-referential digest field.
+
+    Exact bytes are ``UTF8(domain) + NUL + canonical-json(payload)`` where
+    canonical JSON is UTF-8, sorted keys, compact separators, no newline, and
+    ``payload`` is the complete failure object with ``evidence_sha256``
+    removed.
+    """
+    payload = dict(failure)
+    payload.pop("evidence_sha256", None)
+    raw = LAUNCH_FAILURE_DIGEST_DOMAIN.encode("utf-8") + b"\0" + _canonical(payload)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _serve(
+    request: dict[str, Any],
+    target: dict[str, pathlib.Path],
+    *,
+    environment_inventory: Optional[dict[str, Any]] = None,
+) -> int:
+    if environment_inventory is None:
+        environment_inventory = _prune_bridge_environment(request["provider"])
     state = {
         "bridge_version": BRIDGE_VERSION,
         "request_sha256": _digest(request),
@@ -2378,6 +2646,7 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
         "readiness": None,
         "submission": None,
         "handshake_refusals": [],
+        "environment_inventory": environment_inventory,
     }
     session: Optional[_ProviderSession] = None
     claimed = False
@@ -2394,6 +2663,10 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
         claimed = True
         _atomic_json(target["state"], state)
         _mark_bridge_resource_created(target, request, "bridge_state")
+        # Provider-bound composition already scrubbed the inherited tmux
+        # environment. Keep the guard as the last line before provider
+        # construction and I/O.
+        _assert_bridge_environment()
         session = _ProviderSession(request)
         verify_launch_binding_identity(identity)
         server.bind(str(target["socket"]))
@@ -2675,7 +2948,21 @@ def _serve(request: dict[str, Any], target: dict[str, pathlib.Path]) -> int:
                     response = {"ok": False, "error": str(exc)}
                 connection.sendall(_canonical(response) + b"\n")
     except Exception as exc:  # noqa: BLE001 - persist fail-closed state
-        state.update({"state": "preflight_blocked", "error": str(exc)})
+        failure = _launch_failure(
+            request,
+            exc,
+            environment_inventory,
+            provider_io_started=bool(
+                session is not None and getattr(session, "rpc", None) is not None
+            ),
+        )
+        state.update(
+            {
+                "state": "launch-failed-bridge",
+                "error": str(exc),
+                "launch_failure": failure,
+            }
+        )
         preserve_live_duplicate = False
         if not claimed and str(exc) == "duplicate-live-bridge-identity":
             try:
@@ -2706,13 +2993,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--reservation-id", required=True)
     args = parser.parse_args(argv)
-    _assert_bridge_environment()
-    _prune_bridge_environment()
     target = paths(args.reservation_id)
     request = json.loads(target["request"].read_text(encoding="utf-8"))
     if request.get("reservation_id") != args.reservation_id:
         raise BridgeError("bridge request reservation identity mismatch")
-    return _serve(request, target)
+    # The provider is pinned in the immutable request.  Compose and scrub at
+    # this actual pane-process launch boundary before the unchanged guard in
+    # _serve; foreign supervisor controls never reach the target provider.
+    environment_inventory = _prune_bridge_environment(request["provider"])
+    return _serve(request, target, environment_inventory=environment_inventory)
 
 
 if __name__ == "__main__":

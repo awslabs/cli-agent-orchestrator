@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import subprocess
 import uuid
+from copy import deepcopy
 
 import pytest
 
@@ -16,11 +17,14 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
     ManagedLaunchV2ReserveRequest,
 )
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
+from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services.managed_launch import (
     ManagedLaunchConflict,
     ManagedLaunchNotFound,
 )
 from cli_agent_orchestrator.services.managed_provider_bridge import BRIDGE_VERSION
+
+DELIVERY_ID = "33333333-3333-4333-8333-333333333333"
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +65,7 @@ def _reserve_request(worktree, tmp_path, **changes):
         "obligation_generation": "obgen-7c2e4a1b",
         "task_id": "self-heal-demo-task",
         "run_id": "run-0001",
+        "delivery_id": DELIVERY_ID,
         "launch_nonce": "n" * 40,
     }
     payload.update(changes)
@@ -154,6 +159,67 @@ def test_claim_launch_single_winner(isolated_memory_db, worktree, tmp_path):
         v2.claim_launch(str(uuid.uuid4()))
 
 
+def test_v2_delivery_identity_is_required_and_launch_failure_is_idempotent(
+    isolated_memory_db, worktree, tmp_path
+):
+    payload = _reserve_request(worktree, tmp_path).model_dump(mode="json")
+    payload.pop("delivery_id")
+    with pytest.raises(ValueError):
+        ManagedLaunchV2ReserveRequest(**payload)
+
+    request = _reserve_request(worktree, tmp_path)
+    v2.reserve(request)
+    record, should_launch = v2.claim_launch(request.reservation_id)
+    assert should_launch
+    inventory = bridge._environment_inventory("codex", ["HOME", "PATH"])
+    failure = bridge._launch_failure(
+        {
+            "reservation_id": record["reservation_id"],
+            "terminal_id": record["terminal_id"],
+            "generation": record["generation"],
+            "delivery_id": request.delivery_id,
+        },
+        bridge.BridgeError("provider initialization failed"),
+        inventory,
+        provider_io_started=False,
+    )
+    state = {
+        "state": "launch-failed-bridge",
+        "readiness": None,
+        "submission": None,
+        "environment_inventory": inventory,
+        "launch_failure": failure,
+    }
+    failed = v2._mark_launch_failed_bridge(request.reservation_id, state)
+    repeated = v2._mark_launch_failed_bridge(request.reservation_id, state)
+    assert failed == repeated
+    assert failed["state"] == "launch-failed-bridge"
+    assert failed["admission"]["delivery_id"] == request.delivery_id
+    assert failed["admission"]["status"] == "never-submitted"
+    assert (
+        failed["admission"]["failure_evidence_sha256"]
+        == failed["launch_failure"]["evidence_sha256"]
+    )
+
+    second = _reserve_request(
+        worktree,
+        tmp_path,
+        delivery_id="55555555-5555-4555-8555-555555555555",
+    )
+    v2.reserve(second)
+    second_record, _ = v2.claim_launch(second.reservation_id)
+    bad_state = deepcopy(state)
+    bad_state["launch_failure"]["reservation_id"] = second.reservation_id
+    bad_state["launch_failure"]["terminal_id"] = second_record["terminal_id"]
+    bad_state["launch_failure"]["generation"] = second_record["generation"]
+    bad_state["launch_failure"]["delivery_id"] = DELIVERY_ID
+    with pytest.raises(ManagedLaunchConflict, match="identity/evidence mismatch"):
+        v2._mark_launch_failed_bridge(second.reservation_id, bad_state)
+    unchanged = v2.get(second.reservation_id)
+    assert unchanged["state"] == "launching"
+    assert unchanged["admission"] is None
+
+
 def test_bind_journals_native_bound(isolated_memory_db, worktree, tmp_path, monkeypatch):
     request = _reserve_request(worktree, tmp_path)
     record, _ = v2.reserve(request)
@@ -205,7 +271,7 @@ def _admit_request(record, digest, **changes):
     message = "review the exact head"
     payload = {
         "protocol_version": PROTOCOL_VERSION_V2,
-        "delivery_id": str(uuid.uuid4()),
+        "delivery_id": DELIVERY_ID,
         "message": message,
         "message_sha256": hashlib.sha256(message.encode()).hexdigest(),
         "sender_id": "deadbeef",
@@ -259,6 +325,14 @@ def test_admission_lifecycle_and_ambiguity(isolated_memory_db, worktree, tmp_pat
     bound = v2.bind_native(record["reservation_id"], _bind_request(record))
     digest = v2.native_binding_digest(bound)
     admit = _admit_request(bound, digest)
+    wrong_delivery = _admit_request(
+        bound,
+        digest,
+        delivery_id="44444444-4444-4444-8444-444444444444",
+    )
+    with pytest.raises(ManagedLaunchConflict, match="immutable"):
+        v2.claim_admission(record["reservation_id"], wrong_delivery)
+    assert v2.get(record["reservation_id"])["admission"] is None
     claimed, should_send = v2.claim_admission(record["reservation_id"], admit)
     assert should_send and claimed["state"] == "admitting"
     again, send_again = v2.claim_admission(record["reservation_id"], admit)

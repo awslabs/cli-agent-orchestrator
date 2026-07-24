@@ -70,6 +70,7 @@ def _bridge_request(
         "reservation_id": reservation_id,
         "terminal_id": terminal_id,
         "generation": generation,
+        "delivery_id": str(uuid.uuid4()),
         "provider": "codex",
         "rendezvous_identity": {
             "project": "registry-first-tests",
@@ -669,7 +670,7 @@ def test_bridge_serve_declares_before_physical_construction(monkeypatch):
             assert not target["socket"].exists()
             assert target["state"].exists(), "the preflight diagnostic survives"
             persisted = json.loads(target["state"].read_text(encoding="utf-8"))
-            assert persisted["state"] == "preflight_blocked"
+            assert persisted["state"] == "launch-failed-bridge"
             assert "provider initialization failed" in persisted["error"]
             final = {
                 e["kind"]: e
@@ -796,8 +797,9 @@ def test_bridge_hard_crash_leaves_durable_declarations():
             request = {
                 "reservation_id": "crash-res",
                 "terminal_id": "c1a5c0de",
-                "generation": "generation-crash-probe",
-                "provider": "codex",
+                    "generation": "generation-crash-probe",
+                    "delivery_id": "33333333-3333-4333-8333-333333333333",
+                    "provider": "codex",
                 "rendezvous_identity": {
                     "project": "registry-first-tests",
                     "task_id": "crash-res",

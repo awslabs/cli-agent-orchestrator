@@ -917,10 +917,10 @@ _TS_MARK = f"{_TS}:376"  # registry.register_created in _mark_v2_resource_create
 _TS_MONITOR = f"{_TS}:344"  # registry.monitor in _register_v2_terminal_resources
 _TS_DELETE = f"{_TS}:619"  # registry.delete in _deregister_v2_terminal_resources
 _CS_RESOLVE = f"{_CS}:112"  # registry.resolve_fs_path in cleanup_old_data
-_BR_DECLARE = f"{_BR}:1882"  # registry.declare in _declare_bridge_resources
-_BR_MARK = f"{_BR}:1926"  # registry.register_created in _mark_bridge_resource_created
-_BR_JOURNAL_MARK = f"{_BR}:1950"  # registry.register_created in _mark_bridge_journal_created
-_BR_DELETE = f"{_BR}:2080"  # registry.delete in _deregister_bridge_resources
+_BR_DECLARE = f"{_BR}:2094"  # registry.declare in _declare_bridge_resources
+_BR_MARK = f"{_BR}:2138"  # registry.register_created in _mark_bridge_resource_created
+_BR_JOURNAL_MARK = f"{_BR}:2162"  # registry.register_created in _mark_bridge_journal_created
+_BR_DELETE = f"{_BR}:2292"  # registry.delete in _deregister_bridge_resources
 
 _MANIFEST_SPEC: tuple[tuple[str, str, str, str], ...] = (
     # --- terminal log artifacts (constructor + generation deleter + retention)

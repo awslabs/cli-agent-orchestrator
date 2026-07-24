@@ -35,6 +35,11 @@ class ManagedLaunchReserveRequest(BaseModel):
     # so the bridge rendezvous binds the exact later admission context.
     project: str = Field(min_length=1)
     task_id: str = Field(min_length=1)
+    # The caller preallocates delivery identity before launch so a fatal
+    # post-allocation bridge exit can finalize that exact delivery as never
+    # submitted in the same reservation transaction. Missing identity fails
+    # request validation before reservation/provider effects.
+    delivery_id: str
     working_directory: str = Field(min_length=1)
     trusted_project_root: Optional[str] = None
     expected_model: str = Field(min_length=1)
@@ -50,6 +55,11 @@ class ManagedLaunchReserveRequest(BaseModel):
     @classmethod
     def _validate_reservation_id(cls, value: str) -> str:
         return _uuid_text(value, "reservation_id")
+
+    @field_validator("delivery_id")
+    @classmethod
+    def _validate_delivery_id(cls, value: str) -> str:
+        return _uuid_text(value, "delivery_id")
 
     @field_validator("provider_executable_sha256")
     @classmethod

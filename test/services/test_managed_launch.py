@@ -5,6 +5,7 @@ import os
 import subprocess
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,8 @@ from cli_agent_orchestrator.models.managed_launch import (
 from cli_agent_orchestrator.services import managed_launch
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services.managed_provider_bridge import BRIDGE_VERSION
+
+DELIVERY_ID = "33333333-3333-4333-8333-333333333333"
 
 
 def _reserve_request(tmp_path, **changes):
@@ -38,6 +41,7 @@ def _reserve_request(tmp_path, **changes):
         "caller_id": "deadbeef",
         "project": "test-project",
         "task_id": "test-task",
+        "delivery_id": DELIVERY_ID,
         "working_directory": str(tmp_path),
         "trusted_project_root": str(tmp_path),
         "expected_model": "gpt-5.6-sol",
@@ -72,7 +76,7 @@ def _commit_fixture_worktree(tmp_path) -> None:
 def _admit_request(message="review the exact head", **changes):
     payload = {
         "protocol_version": PROTOCOL_VERSION,
-        "delivery_id": str(uuid.uuid4()),
+        "delivery_id": DELIVERY_ID,
         "message": message,
         "message_sha256": hashlib.sha256(message.encode()).hexdigest(),
         "sender_id": "deadbeef",
@@ -155,6 +159,29 @@ def _submission_receipt(record, admission):
     }
 
 
+def _launch_failure_state(record, request, detail="ambient bridge control rejected"):
+    inventory = bridge._environment_inventory("codex", ["HOME", "PATH"])
+    failure = bridge._launch_failure(
+        {
+            "reservation_id": record["reservation_id"],
+            "terminal_id": record["terminal_id"],
+            "generation": record["generation"],
+            "delivery_id": request.delivery_id,
+        },
+        bridge.BridgeError(detail),
+        inventory,
+        provider_io_started=False,
+    )
+    return {
+        "bridge_version": BRIDGE_VERSION,
+        "state": "launch-failed-bridge",
+        "readiness": None,
+        "submission": None,
+        "environment_inventory": inventory,
+        "launch_failure": failure,
+    }
+
+
 def test_reserve_is_idempotent_and_queryable(isolated_memory_db, tmp_path):
     request = _reserve_request(tmp_path)
     first, created = managed_launch.reserve(request)
@@ -174,6 +201,70 @@ def test_reservation_id_cannot_be_rebound(isolated_memory_db, tmp_path):
     changed = request.model_copy(update={"expected_effort": "high"})
     with pytest.raises(managed_launch.ManagedLaunchConflict):
         managed_launch.reserve(changed)
+
+
+def test_delivery_identity_is_required_and_cannot_be_rebound(isolated_memory_db, tmp_path):
+    payload = _reserve_request(tmp_path).model_dump(mode="json")
+    payload.pop("delivery_id")
+    with pytest.raises(ValueError):
+        ManagedLaunchReserveRequest(**payload)
+
+    request = _reserve_request(tmp_path)
+    managed_launch.reserve(request)
+    changed = request.model_copy(update={"delivery_id": "44444444-4444-4444-8444-444444444444"})
+    with pytest.raises(managed_launch.ManagedLaunchConflict):
+        managed_launch.reserve(changed)
+
+
+def test_launch_failure_finalizes_exact_delivery_once_and_rejects_tampering(
+    isolated_memory_db, tmp_path
+):
+    request = _reserve_request(tmp_path)
+    managed_launch.reserve(request)
+    record, should_launch = managed_launch.claim_launch(request.reservation_id)
+    assert should_launch
+    bridge_state = _launch_failure_state(record, request)
+
+    failed = managed_launch.mark_launch_failed_bridge(request.reservation_id, bridge_state)
+    repeated = managed_launch.mark_launch_failed_bridge(request.reservation_id, bridge_state)
+    assert failed == repeated
+    assert failed["state"] == "launch-failed-bridge"
+    assert failed["admission"] == {
+        "schema": "cao-managed-launch-delivery-terminal-v1",
+        "delivery_id": request.delivery_id,
+        "status": "never-submitted",
+        "reservation_id": request.reservation_id,
+        "terminal_id": record["terminal_id"],
+        "generation": record["generation"],
+        "failure_evidence_sha256": failed["launch_failure"]["evidence_sha256"],
+        "finalized_at": failed["launch_failure"]["failed_at"],
+    }
+    assert failed["negative"] == failed["launch_failure"]
+    assert failed["observations"][-1]["failure"] == failed["launch_failure"]
+    assert (
+        bridge.validate_launch_failure(
+            bridge_state,
+            reservation_id=request.reservation_id,
+            terminal_id=record["terminal_id"],
+            generation=record["generation"],
+            delivery_id=request.delivery_id,
+            provider="codex",
+        )
+        == failed["launch_failure"]
+    )
+
+    second_request = _reserve_request(tmp_path, delivery_id="55555555-5555-4555-8555-555555555555")
+    managed_launch.reserve(second_request)
+    second_record, _ = managed_launch.claim_launch(second_request.reservation_id)
+    tampered = _launch_failure_state(second_record, second_request)
+    tampered = deepcopy(tampered)
+    tampered["launch_failure"]["generation"] = str(uuid.uuid4())
+    with pytest.raises(managed_launch.ManagedLaunchConflict, match="identity/evidence mismatch"):
+        managed_launch.mark_launch_failed_bridge(second_request.reservation_id, tampered)
+    unchanged = managed_launch.get(second_request.reservation_id)
+    assert unchanged["state"] == "launching"
+    assert unchanged["admission"] is None
+    assert unchanged["observations"] == []
 
 
 def test_trusted_root_must_equal_canonical_worktree(isolated_memory_db, tmp_path):
@@ -221,6 +312,10 @@ def test_admission_requires_readiness_and_is_idempotent(isolated_memory_db, tmp_
         managed_launch.claim_admission(request.reservation_id, admission)
 
     _ready_record(request)
+    wrong_delivery = _admit_request(delivery_id="44444444-4444-4444-8444-444444444444")
+    with pytest.raises(managed_launch.ManagedLaunchConflict, match="immutable"):
+        managed_launch.claim_admission(request.reservation_id, wrong_delivery)
+    assert managed_launch.get(request.reservation_id)["admission"] is None
     claimed, should_send = managed_launch.claim_admission(request.reservation_id, admission)
     duplicate, should_send_again = managed_launch.claim_admission(request.reservation_id, admission)
     assert should_send is True
@@ -516,6 +611,47 @@ async def test_launch_reserved_uses_exact_provider_bridge_before_readiness(
     written = calls[0][2]
     assert written["rendezvous_identity"]["project"] == request.project
     assert written["rendezvous_identity"]["task_id"] == request.task_id
+    assert written["delivery_id"] == request.delivery_id
+
+
+@pytest.mark.asyncio
+async def test_launch_reserved_finalizes_durable_bridge_failure_without_readiness_wait(
+    isolated_memory_db, tmp_path, monkeypatch
+):
+    request = _reserve_request(tmp_path)
+    _commit_fixture_worktree(tmp_path)
+    record, _ = managed_launch.reserve(request)
+    failure_state = _launch_failure_state(record, request)
+    calls = []
+
+    monkeypatch.setattr(managed_launch, "_executable_identity", lambda _: ("/provider", "d" * 64))
+    monkeypatch.setattr(bridge, "profile_digest", lambda _: "e" * 64)
+    monkeypatch.setattr(
+        bridge,
+        "write_request",
+        lambda reservation_id, body: calls.append(("write", reservation_id, body)),
+    )
+    monkeypatch.setattr(bridge, "read_state", lambda reservation_id: failure_state)
+
+    async def fail_create_terminal(**kwargs):
+        calls.append(("create", kwargs))
+        raise RuntimeError("bridge process exited before readiness")
+
+    def must_not_wait_for_readiness(*args, **kwargs):
+        calls.append(("readiness-wait", args, kwargs))
+        raise AssertionError("durable launch failure must bypass the readiness timeout")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.create_terminal",
+        fail_create_terminal,
+    )
+    monkeypatch.setattr(bridge, "request_bridge", must_not_wait_for_readiness)
+
+    failed = await managed_launch.launch_reserved(request.reservation_id)
+    assert failed["state"] == "launch-failed-bridge"
+    assert failed["admission"]["status"] == "never-submitted"
+    assert failed["admission"]["delivery_id"] == request.delivery_id
+    assert [call[0] for call in calls] == ["write", "create"]
 
 
 @pytest.mark.asyncio
@@ -566,6 +702,7 @@ async def test_v1_long_worktree_uses_exact_admission_identity_in_bounded_launche
 
     identity = written["body"]["rendezvous_identity"]
     assert result["state"] == "ready"
+    assert written["body"]["delivery_id"] == request.delivery_id
     assert identity["project"] == request.project
     assert identity["task_id"] == request.task_id
     assert identity["task_id"] != request.reservation_id

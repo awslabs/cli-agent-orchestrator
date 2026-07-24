@@ -56,6 +56,7 @@ def _request(worktree: Path, **identity_changes):
         "reservation_id": str(uuid.uuid4()),
         "terminal_id": identity["terminal_id"],
         "generation": identity["terminal_generation"],
+        "delivery_id": str(uuid.uuid4()),
         "provider": "codex",
         "rendezvous_identity": identity,
     }
@@ -667,5 +668,5 @@ def test_bridge_rechecks_head_immediately_before_socket_bind(rendezvous_env, tmp
     assert initialized == []
     assert not target["socket"].exists()
     state = json.loads(target["state"].read_text(encoding="utf-8"))
-    assert state["state"] == "preflight_blocked"
+    assert state["state"] == "launch-failed-bridge"
     assert "repository/head identity drifted" in state["error"]

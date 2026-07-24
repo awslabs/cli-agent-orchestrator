@@ -69,6 +69,7 @@ def _parse_json(value: Optional[str], default: Any) -> Any:
 
 
 def _row_dict(row: Any) -> dict[str, Any]:
+    negative = _parse_json(row.negative_json, None)
     return {
         "protocol_version": PROTOCOL_VERSION,
         "reservation_id": row.reservation_id,
@@ -85,7 +86,8 @@ def _row_dict(row: Any) -> dict[str, Any]:
         "observations": _parse_json(row.observations_json, []),
         "readiness": _parse_json(row.readiness_json, None),
         "admission": _parse_json(row.admission_json, None),
-        "negative": _parse_json(row.negative_json, None),
+        "negative": negative,
+        "launch_failure": negative if row.state == "launch-failed-bridge" else None,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -388,6 +390,7 @@ def claim_launch(reservation_id: str) -> tuple[dict[str, Any], bool]:
                 "launching",
                 "ready",
                 "preflight_blocked",
+                "launch-failed-bridge",
                 "admitting",
                 "admitted",
                 "cancelled",
@@ -526,6 +529,113 @@ def mark_preflight_blocked(
         raise ManagedLaunchUnavailable(f"preflight evidence persistence failed: {exc}") from exc
 
 
+def mark_launch_failed_bridge(
+    reservation_id: str,
+    bridge_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Atomically finalize the fork-owned launch and bound delivery identity.
+
+    The bridge state is durable before this transaction.  The CAS binds all
+    four immutable identities and writes the reservation outcome plus the
+    fork-owned never-submitted delivery record together.
+    """
+    from cli_agent_orchestrator.services.managed_provider_bridge import (
+        BridgeError,
+        validate_launch_failure,
+    )
+
+    try:
+        with database.SessionLocal() as db:
+            row = _query(db, reservation_id)
+            if row is None:
+                raise ManagedLaunchNotFound(f"reservation not found: {reservation_id}")
+            request = _parse_json(row.request_json, {})
+            delivery_id = request.get("delivery_id")
+            if not isinstance(delivery_id, str) or not delivery_id:
+                raise ManagedLaunchConflict(
+                    "launch failure finalization requires the immutable reservation delivery_id"
+                )
+            try:
+                failure = validate_launch_failure(
+                    bridge_state,
+                    reservation_id=row.reservation_id,
+                    terminal_id=row.terminal_id,
+                    generation=row.generation,
+                    delivery_id=delivery_id,
+                    provider=row.provider,
+                )
+            except BridgeError as exc:
+                raise ManagedLaunchConflict(str(exc)) from exc
+            delivery = {
+                "schema": "cao-managed-launch-delivery-terminal-v1",
+                "delivery_id": delivery_id,
+                "status": "never-submitted",
+                "reservation_id": row.reservation_id,
+                "terminal_id": row.terminal_id,
+                "generation": row.generation,
+                "failure_evidence_sha256": failure["evidence_sha256"],
+                "finalized_at": failure["failed_at"],
+            }
+            observation = {
+                "kind": "launch-failed-bridge",
+                "reservation_id": row.reservation_id,
+                "terminal_id": row.terminal_id,
+                "generation": row.generation,
+                "delivery_id": delivery_id,
+                "failure": failure,
+            }
+            if row.state == "launch-failed-bridge":
+                observations = _parse_json(row.observations_json, [])
+                if (
+                    _parse_json(row.admission_json, None) != delivery
+                    or not observations
+                    or observations[-1] != observation
+                ):
+                    raise ManagedLaunchConflict(
+                        "launch-failed-bridge evidence changed after finalization"
+                    )
+                return _row_dict(row)
+            if row.state != "launching":
+                raise ManagedLaunchConflict(
+                    f"bridge launch failure cannot finalize state {row.state!r}"
+                )
+            prior_observations = row.observations_json
+            observations = _parse_json(prior_observations, [])
+            observations.append(observation)
+            updated = (
+                db.query(database.ManagedLaunchReservationModel)
+                .filter(
+                    database.ManagedLaunchReservationModel.reservation_id == reservation_id,
+                    database.ManagedLaunchReservationModel.terminal_id == row.terminal_id,
+                    database.ManagedLaunchReservationModel.generation == row.generation,
+                    database.ManagedLaunchReservationModel.state == "launching",
+                    database.ManagedLaunchReservationModel.readiness_json.is_(None),
+                    database.ManagedLaunchReservationModel.admission_json.is_(None),
+                    database.ManagedLaunchReservationModel.observations_json == prior_observations,
+                )
+                .update(
+                    {
+                        "state": "launch-failed-bridge",
+                        "admission_json": _canonical_json(delivery),
+                        "negative_json": _canonical_json(failure),
+                        "observations_json": _canonical_json(observations),
+                        "updated_at": _now(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            if updated != 1:
+                raise ManagedLaunchConflict(
+                    "launch failure lost the exact reservation/generation/delivery CAS"
+                )
+            return _row_dict(_query(db, reservation_id))
+    except ManagedLaunchError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ManagedLaunchUnavailable(f"bridge launch failure finalization failed: {exc}") from exc
+
+
 def append_observation(
     reservation_id: str, request: ManagedLaunchObservationRequest
 ) -> dict[str, Any]:
@@ -568,6 +678,7 @@ def append_observation(
                         "launching",
                         "ready",
                         "preflight_blocked",
+                        "launch-failed-bridge",
                         "negative",
                         "cancelled",
                     }:
@@ -621,6 +732,8 @@ def _adopt_durable_provider_fact(record: dict[str, Any]) -> dict[str, Any]:
                 generation=record["generation"],
                 receipt=receipt,
             )
+        if state.get("state") == "launch-failed-bridge":
+            return mark_launch_failed_bridge(record["reservation_id"], state)
         if state.get("state") == "preflight_blocked":
             return mark_preflight_blocked(
                 record["reservation_id"],
@@ -681,6 +794,10 @@ def claim_admission(
             if row is None:
                 raise ManagedLaunchNotFound(f"reservation not found: {reservation_id}")
             reservation_request = _parse_json(row.request_json, {})
+            if request.delivery_id != reservation_request.get("delivery_id"):
+                raise ManagedLaunchConflict(
+                    "delivery_id does not match the immutable reservation delivery identity"
+                )
             expected_context = {
                 "project": reservation_request.get("project"),
                 "task_id": reservation_request.get("task_id"),
@@ -990,6 +1107,7 @@ def cleanup_reserved(
                 return _row_dict(row)
             if row.state not in {
                 "preflight_blocked",
+                "launch-failed-bridge",
                 "negative",
                 "cancelled",
                 "cleanup_intended",
@@ -1166,6 +1284,7 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             "provider_executable_sha256": provider_digest,
             "project": request["project"],
             "task_id": request["task_id"],
+            "delivery_id": request["delivery_id"],
             "rendezvous_identity": rendezvous_identity,
         }
         write_request(reservation_id, bridge_request)
@@ -1203,6 +1322,12 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             ],
         )
     except Exception as exc:  # noqa: BLE001 - preserve and expose, never cleanup/retry
+        try:
+            state = read_state(reservation_id)
+        except Exception:  # noqa: BLE001 - generic startup evidence remains truthful
+            state = None
+        if state and state.get("state") == "launch-failed-bridge":
+            return mark_launch_failed_bridge(reservation_id, state)
         return mark_preflight_blocked(
             reservation_id,
             preflight_class="provider-startup-error",
@@ -1222,6 +1347,8 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
         except Exception as state_exc:  # noqa: BLE001 - preserve both failures
             state = None
             exc = ManagedLaunchUnavailable(f"{exc}; durable bridge state unreadable: {state_exc}")
+        if state and state.get("state") == "launch-failed-bridge":
+            return mark_launch_failed_bridge(reservation_id, state)
         if state and state.get("state") == "preflight_blocked":
             detail = str(state.get("error") or exc)
         else:
