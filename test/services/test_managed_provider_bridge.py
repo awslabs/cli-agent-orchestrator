@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pathlib
 
 import pytest
 
@@ -115,7 +116,7 @@ def test_codex_readiness_and_submission_share_exact_provider_process(tmp_path, m
     monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
     monkeypatch.setattr(bridge, "_RpcProcess", fake_rpc)
     monkeypatch.setattr(bridge, "_contains_session_flags", lambda _: True)
-    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "codex-cli 0.144.6")
+    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "codex-cli 0.145.0")
     monkeypatch.setattr(bridge, "_file_digest_or_absent", lambda _: "d" * 64)
 
     session = bridge._ProviderSession(request)
@@ -135,6 +136,37 @@ def test_codex_readiness_and_submission_share_exact_provider_process(tmp_path, m
         "thread/start",
         "turn/start",
     ]
+
+
+def _fake_codex_executable(tmp_path, request, banner: str):
+    # Rewrite the request's own executable path as an executable script.
+    executable = pathlib.Path(request["provider_executable"])
+    executable.write_text(f"#!/bin/sh\necho '{banner}'\n")
+    executable.chmod(0o755)
+    request["provider_executable_sha256"] = hashlib.sha256(executable.read_bytes()).hexdigest()
+    return executable
+
+
+def test_codex_version_gate_accepts_exact_0145_0(tmp_path, monkeypatch):
+    # The real fail-closed gate (no _version stub) accepts the pinned
+    # codex-cli 0.145.0 banner exactly.
+    request = _request(tmp_path)
+    executable = _fake_codex_executable(tmp_path, request, "codex-cli 0.145.0")
+    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+    session = bridge._ProviderSession(request)
+    assert session._version(str(executable), bridge.SUPPORTED_CODEX_VERSION) == "codex-cli 0.145.0"
+
+
+@pytest.mark.parametrize("banner", ["codex-cli 0.144.6", "codex-cli 0.145.1", "codex 0.145.0"])
+def test_codex_version_gate_fails_closed_off_pin(tmp_path, monkeypatch, banner):
+    # The retired pin, an adjacent patch, and a renamed banner all fail
+    # closed — the gate is exact, never a range, minimum, or prefix match.
+    request = _request(tmp_path)
+    executable = _fake_codex_executable(tmp_path, request, banner)
+    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+    session = bridge._ProviderSession(request)
+    with pytest.raises(bridge.BridgeError, match="unsupported provider version"):
+        session._version(str(executable), bridge.SUPPORTED_CODEX_VERSION)
 
 
 class _KimiRpc:
@@ -272,7 +304,7 @@ def _codex_session(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
     monkeypatch.setattr(bridge, "_RpcProcess", _CodexRpc)
     monkeypatch.setattr(bridge, "_contains_session_flags", lambda _: True)
-    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "codex-cli 0.144.6")
+    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "codex-cli 0.145.0")
     monkeypatch.setattr(bridge, "_file_digest_or_absent", lambda _: "d" * 64)
     session = bridge._ProviderSession(request)
     session.initialize()

@@ -36,7 +36,7 @@ def test_route_surface_exact_generation(client, companion):
         effort="max",
         receipt_id="thread-1",
         turn_id="turn-1",
-        provider_version="0.144.6",
+        provider_version="0.145.0",
     )
     response = client.get("/terminals/deadbeef/route")
     assert response.status_code == 200
@@ -46,7 +46,7 @@ def test_route_surface_exact_generation(client, companion):
     assert body["effort"] == "max"
     assert body["receipt_id"] == "thread-1"
     assert body["turn_id"] == "turn-1"
-    assert body["provider_version"] == "0.144.6"
+    assert body["provider_version"] == "0.145.0"
     assert body["generation"] == GEN
     # unknown terminal: no observation, never an error
     assert client.get("/terminals/cafebabe/route").status_code == 204
