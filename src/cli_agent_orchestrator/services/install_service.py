@@ -31,6 +31,7 @@ from cli_agent_orchestrator.utils.agent_profiles import (
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.opencode_config import (
+    OpenCodeAgentIdCollisionError,
     ensure_skills_symlink,
     remove_agent_tools,
     to_opencode_agent_id,
@@ -235,6 +236,88 @@ def _build_provider_config(
     )
 
 
+def _guard_opencode_agent_id_collision(source_name: str, profile_name: str) -> None:
+    """Fail loud if another installable profile shares this profile's agent id.
+
+    The installed OpenCode id derives from a profile's *resolved name*
+    (frontmatter ``name:``) via :func:`to_opencode_agent_id`, and that
+    derivation is many-to-one, so TWO distinct profile files can land on the
+    same ``<id>.md`` / ``agent.<id>`` — whichever installs second silently
+    overwrites the first. Two independent ways this happens:
+
+    * the non-injective ``'/'`` -> ``'__'`` rewrite (name ``"a/b"`` and a
+      literal ``"a__b"`` both yield id ``a__b``); and
+    * two different files carrying the *identical* frontmatter ``name:`` (same
+      resolved string -> same id).
+
+    Install runs one profile at a time, so this guard reconstructs the id-space
+    the way installs actually populate it:
+
+    * Discovery (:func:`list_agent_profiles`) keys profiles by file *stem*
+      (``source_name`` — never contains ``/``), which is the handle you pass to
+      ``cao install``.
+    * The installed id, however, derives from the profile's *resolved name*
+      (frontmatter ``name:``, which MAY contain ``/``), not the stem.
+
+    We resolve every OTHER installable profile's name and compare its id to the
+    one being installed. Candidates are excluded by *stem* identity
+    (``source_name``), so every remaining entry is a genuinely different file on
+    disk: any id match is a real collision — even when the two resolved names
+    are byte-for-byte identical. That same-resolved-name case must still be
+    caught, so the exclusion keys on stem (not resolved name) and the guard
+    raises :class:`OpenCodeAgentIdCollisionError` (a ``ValueError``) as soon as a
+    different file's id matches. The raised message names both profiles by stem
+    and resolved name so an operator can find and rename one.
+
+    Only collisions implicating the profile being installed block the install;
+    a pre-existing clash between two OTHER profiles is left alone. Discovery /
+    per-profile load failures are non-fatal: an unreadable candidate is skipped
+    rather than blocking a legitimate install (no worse than the pre-guard
+    silent-overwrite behaviour).
+    """
+    try:
+        from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
+
+        candidates = list_agent_profiles()
+    except Exception as exc:  # pragma: no cover - defensive, discovery is best-effort
+        logger.debug("Skipping OpenCode agent-id collision check: %s", exc)
+        return
+
+    target_id = to_opencode_agent_id(profile_name)
+    for candidate in candidates:
+        stem = candidate.get("name")
+        # Skip the profile being installed (by its stem/source handle) and any
+        # entry discovery flagged as not loadable — a name we could not install
+        # cannot actually collide on disk. Excluding by STEM (not resolved name)
+        # is what keeps reinstalling the same profile idempotent while still
+        # catching a *different* file that resolves to the same name.
+        if not stem or stem == source_name or not candidate.get("loadable", True):
+            continue
+        try:
+            raw = _read_agent_profile_source(stem)
+            resolved_name = parse_agent_profile_text(raw, stem).name
+        except Exception as exc:  # pragma: no cover - a bad sibling profile is not fatal
+            logger.debug("Skipping unreadable profile '%s' in collision check: %s", stem, exc)
+            continue
+        if to_opencode_agent_id(resolved_name) != target_id:
+            continue
+
+        # A genuinely different file (stem != source_name) whose resolved name
+        # maps to the same agent id. Raising here (keyed on stem, not resolved
+        # name) catches the same-resolved-name-different-file case that a plain
+        # name-string dedup would swallow.
+        raise OpenCodeAgentIdCollisionError(
+            f"OpenCode agent id '{target_id}' is produced by both the profile "
+            f"being installed ('{source_name}.md', name '{profile_name}') and "
+            f"the existing profile '{stem}.md' (name '{resolved_name}'). Two "
+            "distinct profiles cannot share an OpenCode agent id: they install "
+            f"to the same '{target_id}.md' file and 'agent.{target_id}' config "
+            "section, so the second would silently overwrite the first. Rename "
+            "one of these profiles (their frontmatter 'name:', after '/' -> "
+            "'__' rewriting, must differ)."
+        )
+
+
 def install_agent(
     source: str,
     provider: Optional[str] = None,
@@ -330,13 +413,26 @@ def install_agent(
             }
 
         unresolved_vars = sorted(set(re.findall(r"\$\{(\w+)\}", resolved_content)))
-        context_file = _write_context_file(profile.name, raw_content)
 
         mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
         allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
 
         agent_file: Optional[Path] = None
         safe_filename = profile.name.replace("/", "__")
+
+        # OpenCode collision guard must run BEFORE any destructive write. The
+        # guard prevents opencode_cli/agents/<id>.md from being overwritten when
+        # a second profile resolves to the same id, but that is only correct if
+        # AGENT_CONTEXT_DIR/<id>.md (the shared context file) is also protected.
+        # Running the guard here — before the context write — ensures a rejected
+        # install leaves ALL files (provider-specific AND shared) untouched. For
+        # non-opencode providers, the shared context file is written early (no
+        # guard needed); for opencode, it is written AFTER the guard passes.
+        if provider == ProviderType.OPENCODE_CLI.value:
+            _guard_opencode_agent_id_collision(agent_name, profile.name)
+            context_file = _write_context_file(profile.name, raw_content)
+        else:
+            context_file = _write_context_file(profile.name, raw_content)
 
         if provider == ProviderType.KIRO_CLI.value:
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -410,6 +506,7 @@ def install_agent(
                 mode="all",
                 permission=cao_tools_to_opencode_permission(allowed_tools),
             )
+
             agent_id = to_opencode_agent_id(profile.name)
             agent_file = OPENCODE_AGENTS_DIR / f"{agent_id}.md"
             agent_file.write_text(

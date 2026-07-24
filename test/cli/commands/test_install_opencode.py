@@ -508,6 +508,139 @@ class TestStaleMcpGrantsRemoved:
 
 
 # ---------------------------------------------------------------------------
+# Agent-id collision guard: '/' -> '__' derivation is not injective
+# ---------------------------------------------------------------------------
+
+
+class TestAgentIdCollisionGuard:
+    """Installing a profile whose id collides with another must fail loud.
+
+    The id derivation replaces '/' with '__', so a profile named ``a/b`` and a
+    literal profile named ``a__b`` both map to the ``a__b`` id — the second
+    install would silently overwrite the first's ``a__b.md`` file and
+    ``agent.a__b`` config. The guard turns that into a clean CLI error.
+    """
+
+    def test_real_collision_fails_and_names_both_profiles(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        store = install_workspace["local_store"]
+        # A sibling profile that literally occupies the "a__b" id.
+        _write_profile(store / "a__b.md", name="a__b")
+        # The profile we install has frontmatter name "a/b" -> id "a__b".
+        # File stem must be a legal source name; the '/' lives in frontmatter.
+        _write_profile(store / "slash-named.md", name="a/b")
+        # profile.name "a/b" → context path context_dir/a/b.md; pre-create the
+        # intermediate dir so the context write (which runs before the provider
+        # branch) doesn't fail before the collision guard is reached.
+        (install_workspace["context_dir"] / "a").mkdir(parents=True, exist_ok=True)
+
+        result = runner.invoke(install, ["slash-named", "--provider", "opencode_cli"])
+
+        assert result.exit_code == 0  # install_agent returns a failure result, not a crash
+        assert "Error:" in result.output
+        assert "a/b" in result.output and "a__b" in result.output
+        # The colliding profile must NOT have been written under the shared id.
+        # Only the pre-existing sibling (if installed) could own a__b.md; the
+        # slash-named install must be refused before writing.
+        assert not (install_workspace["agents_dir"] / "a__b.md").exists()
+
+    def test_same_resolved_name_different_stem_fails_and_preserves_first(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """Two distinct files with the IDENTICAL frontmatter name collide.
+
+        Both ``profile-one.md`` and ``profile-two.md`` carry ``name: shared-alias``,
+        so both resolve to the id ``shared-alias`` — the same ``shared-alias.md``
+        file and ``agent.shared-alias`` config section. The second install must
+        fail (naming both files/name) rather than silently overwrite the first.
+        This is the same-resolved-name-different-stem gap: the id derivation is
+        many-to-one on the *name* even without any '/' rewrite.
+        """
+        store = install_workspace["local_store"]
+        # Install the first profile while it is the only one on disk.
+        _write_profile(store / "profile-one.md", name="shared-alias", body="First agent body.")
+        r1 = runner.invoke(install, ["profile-one", "--provider", "opencode_cli"])
+        assert r1.exit_code == 0 and "Error:" not in r1.output
+        agent_file = install_workspace["agents_dir"] / "shared-alias.md"
+        assert agent_file.exists()
+        first_contents = agent_file.read_text()
+        assert "First agent body." in first_contents
+
+        # Also capture the shared context file from the first install.
+        context_file = install_workspace["context_dir"] / "shared-alias.md"
+        assert context_file.exists()
+        first_context = context_file.read_text()
+
+        # A second, DIFFERENT file later appears with the same resolved name.
+        _write_profile(store / "profile-two.md", name="shared-alias", body="Second agent body.")
+
+        # Second install (different file, same resolved name) must be refused.
+        r2 = runner.invoke(install, ["profile-two", "--provider", "opencode_cli"])
+        assert r2.exit_code == 0  # returns a failure result, not a crash
+        assert "Error:" in r2.output
+        # The error must name both offending profiles and the shared name.
+        assert "profile-one" in r2.output
+        assert "profile-two" in r2.output
+        assert "shared-alias" in r2.output
+        # The first install's file must be intact — NOT overwritten by the second.
+        assert agent_file.read_text() == first_contents
+        assert "Second agent body." not in agent_file.read_text()
+        # Regression check for caom-934: the shared context file must ALSO be
+        # preserved. Before the fix, the guard ran AFTER _write_context_file(),
+        # so the rejected second install would corrupt AGENT_CONTEXT_DIR/<id>.md
+        # even though opencode_cli/agents/<id>.md was protected.
+        assert context_file.read_text() == first_context
+        assert "Second agent body." not in context_file.read_text()
+
+    def test_reinstall_same_profile_stays_idempotent_despite_guard(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """Reinstalling the SAME profile (same stem) must not trip the guard.
+
+        The guard excludes candidates by stem, so a profile never collides with
+        itself even though discovery lists it with its own resolved name.
+        """
+        _write_profile(install_workspace["local_store"] / "test-agent.md", name="test-agent")
+
+        r1 = runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
+        r2 = runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
+
+        assert r1.exit_code == 0 and "Error:" not in r1.output
+        assert r2.exit_code == 0 and "Error:" not in r2.output
+        assert (install_workspace["agents_dir"] / "test-agent.md").exists()
+
+    def test_non_colliding_spaces_vs_dash_both_install(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """ "foo bar" and "foo-bar" do NOT collide (only '/' is rewritten)."""
+        store = install_workspace["local_store"]
+        _write_profile(store / "foo-space.md", name="foo bar")
+        _write_profile(store / "foo-dash.md", name="foo-bar")
+
+        r1 = runner.invoke(install, ["foo-space", "--provider", "opencode_cli"])
+        r2 = runner.invoke(install, ["foo-dash", "--provider", "opencode_cli"])
+
+        assert r1.exit_code == 0 and "Error:" not in r1.output
+        assert r2.exit_code == 0 and "Error:" not in r2.output
+        # Distinct ids => distinct files, both present.
+        assert (install_workspace["agents_dir"] / "foo bar.md").exists()
+        assert (install_workspace["agents_dir"] / "foo-bar.md").exists()
+
+    def test_normal_single_profile_install_unaffected(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """The guard is a no-op for an ordinary, non-colliding profile."""
+        _write_profile(install_workspace["local_store"] / "solo-agent.md", name="solo-agent")
+
+        result = runner.invoke(install, ["solo-agent", "--provider", "opencode_cli"])
+
+        assert result.exit_code == 0
+        assert "Error:" not in result.output
+        assert (install_workspace["agents_dir"] / "solo-agent.md").exists()
+
+
+# ---------------------------------------------------------------------------
 # Optional live smoke test: opencode agent list shows the installed agent
 # ---------------------------------------------------------------------------
 

@@ -37,8 +37,29 @@ def to_opencode_agent_id(profile_name: str) -> str:
     - the value passed to ``opencode --agent <id>`` at runtime
 
     Idempotent: inputs that contain no ``/`` are returned unchanged.
+
+    The ``/`` → ``__`` collapse is not injective: distinct profile names can
+    map to the same id (e.g. ``"a/b"`` and a literal ``"a__b"`` both become
+    ``"a__b"``). Because the id is used as a dict key on disk (the ``<id>.md``
+    filename and the ``agent.<id>`` section of ``opencode.json``), such a
+    collision silently cross-wires two profiles. The opencode install path
+    guards against this via ``_guard_opencode_agent_id_collision`` in
+    ``services/install_service.py``, which fails loud rather than overwriting.
+    Note names that differ only by spaces or punctuation (``"foo bar"`` vs
+    ``"foo-bar"``) do NOT collide here — only ``/`` is rewritten.
     """
     return profile_name.replace("/", "__")
+
+
+class OpenCodeAgentIdCollisionError(ValueError):
+    """Two distinct profile names collapse to the same OpenCode agent id.
+
+    Raised by the opencode install guard
+    (``_guard_opencode_agent_id_collision``). Subclasses ``ValueError`` so
+    existing ``except ValueError`` / broad handlers (e.g. ``install_agent``'s
+    ``except Exception``) surface it as a clean CLI error rather than a
+    traceback.
+    """
 
 
 def ensure_skills_symlink() -> None:
