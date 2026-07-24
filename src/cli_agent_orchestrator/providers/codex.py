@@ -273,11 +273,14 @@ class CodexProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # Explicit per-call override for profile.model, see _build_codex_command.
+        self._model = model
 
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
@@ -307,10 +310,14 @@ class CodexProvider(BaseProvider):
             command_parts = ["codex", "--yolo"]
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
-        if profile is not None:
-            if profile.model:
-                command_parts.extend(["--model", profile.model])
+        # self._model is an explicit per-call override (handoff/assign's own
+        # `model` parameter) and wins over the profile's own static model
+        # field when both are given; applies even with no profile at all.
+        resolved_model = self._model or (profile.model if profile else None)
+        if resolved_model:
+            command_parts.extend(["--model", resolved_model])
 
+        if profile is not None:
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
             system_prompt = self._apply_skill_prompt(system_prompt)
 

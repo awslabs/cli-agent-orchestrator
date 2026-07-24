@@ -159,6 +159,7 @@ async def create_terminal(
     defer_init: bool = False,
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    model: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -187,6 +188,12 @@ async def create_terminal(
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
             None for operator-launched terminals.
+        model: Explicit per-call model override, forwarded to the provider
+            (where supported -- see each provider's own __init__) ahead of
+            the agent profile's own static `model` field. Lets a caller
+            (e.g. MCP handoff/assign's own `model` parameter) pin a specific
+            model for one worker without needing a dedicated agent profile.
+            None = behavior unchanged (profile.model, if any, still applies).
 
     Returns:
         Terminal object with all metadata populated
@@ -357,7 +364,7 @@ async def create_terminal(
             agent_profile,
             allowed_tools,
             skill_prompt=skill_prompt,
-            model=profile.model if profile else None,
+            model=model or (profile.model if profile else None),
         )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not

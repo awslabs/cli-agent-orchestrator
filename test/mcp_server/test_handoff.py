@@ -366,6 +366,42 @@ class TestHandoffContextPropagation:
         assert "allowed_tools" not in payload
 
 
+class TestHandoffModelOverride:
+    """handoff's own `model` parameter -- an explicit per-call model override
+    for the worker, threaded through to the run-step payload."""
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_model_is_forwarded_in_payload(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("claude_code")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task", model="fable-5"))
+
+        assert result.success is True
+        payload = mock_requests.post.call_args[1]["json"]
+        assert payload["model"] == "fable-5"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_omitted_model_is_absent_from_payload(self, mock_provider, _nudge):
+        """No model given -> no 'model' key at all (not None), matching the
+        existing convention for every other optional field on this payload
+        (session_name/caller_id/allowed_tools/working_directory above)."""
+        mock_provider.return_value = _ctx("claude_code")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert result.success is True
+        payload = mock_requests.post.call_args[1]["json"]
+        assert "model" not in payload
+
+
 class TestResolveHandoffProvider:
     """_resolve_handoff_provider extracts the full supervisor context (not just
     the provider) from the supervisor terminal metadata."""
