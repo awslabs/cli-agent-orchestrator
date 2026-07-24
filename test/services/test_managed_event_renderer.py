@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from io import StringIO
 from unittest.mock import MagicMock
 
@@ -141,6 +142,69 @@ def test_rpc_process_pane_output_is_rendered_not_json(capsys):
     assert "Human output" in output
     assert json.dumps(item, sort_keys=True) not in output
     assert '"jsonrpc"' not in output
+
+
+def _rpc_process_without_child():
+    rpc = object.__new__(_RpcProcess)
+    rpc._condition = threading.Condition()
+    rpc._next_id = 1
+    rpc._responses = {}
+    rpc._notifications = []
+    rpc._closed_error = None
+    rpc._send = MagicMock()
+    return rpc
+
+
+def test_rpc_process_request_response_and_notification_edges():
+    rpc = _rpc_process_without_child()
+
+    request_id = rpc.start_request("session/prompt", {"message": "continue"})
+    assert request_id == 1
+    rpc._send.assert_called_once_with(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/prompt",
+            "params": {"message": "continue"},
+        }
+    )
+    rpc.notify("session/cancel", {"sessionId": "session-1"})
+    assert rpc._send.call_count == 2
+
+    rpc._responses[2] = {"result": {"ok": True}}
+    assert rpc.wait_response(2, 0.1) == {"ok": True}
+    rpc._responses[3] = {"error": {"code": -1}}
+    with pytest.raises(BridgeError, match="provider request failed"):
+        rpc.wait_response(3, 0.1)
+    rpc._responses[4] = {"unexpected": True}
+    with pytest.raises(BridgeError, match="omitted result"):
+        rpc.wait_response(4, 0.1)
+    rpc._responses[5] = {"result": ["not", "an", "object"]}
+    with pytest.raises(BridgeError, match="not an object"):
+        rpc.wait_response(5, 0.1)
+
+    rpc._notifications.extend([{"method": "ignored"}, {"method": "target"}])
+    assert (
+        rpc.wait_notification(
+            lambda item: item.get("method") == "target",
+            start_index=0,
+            timeout=0.1,
+        )["method"]
+        == "target"
+    )
+    assert rpc.notification_count() == 2
+    assert rpc.notifications_since(1) == ([{"method": "target"}], 2)
+
+    rpc._closed_error = "provider exited"
+    with pytest.raises(BridgeError, match="provider exited"):
+        rpc.wait_response(99, 0.1)
+    with pytest.raises(BridgeError, match="provider exited"):
+        rpc.wait_notification(lambda _item: False, start_index=2, timeout=0.1)
+    rpc._closed_error = None
+    with pytest.raises(BridgeError, match="timed out awaiting response"):
+        rpc.wait_response(100, 0)
+    with pytest.raises(BridgeError, match="no model-turn acceptance"):
+        rpc.wait_notification(lambda _item: False, start_index=2, timeout=0)
 
 
 def test_operator_console_translates_text_and_semantic_commands():

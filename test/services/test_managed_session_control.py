@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import itertools
 import threading
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -515,3 +517,210 @@ def test_compact_and_follow_up_typed_refusal_and_ambiguity_paths(tmp_path, monke
     ambiguous = _run_operation(journal, session, "follow-up", message="continue")
     assert ambiguous["state"] == AMBIGUOUS
     assert ambiguous["reason_code"] == "prompt_outcome_ambiguous"
+
+
+def test_session_operation_validation_unknown_action_and_close(tmp_path):
+    session = _session(_Rpc())
+    journal = SessionControlJournal(tmp_path / "control.db")
+
+    ready_rpc = session.rpc
+    session.rpc = None
+    with pytest.raises(bridge.BridgeError, match="native session is not ready"):
+        session.session_operation(_command("route-query"), journal)
+    session.rpc = ready_rpc
+
+    with pytest.raises(bridge.BridgeError, match="exact bridge generation"):
+        session.session_operation(
+            _command("route-query", generation="wrong-generation"),
+            journal,
+        )
+    with pytest.raises(bridge.BridgeError, match="omitted operation_id"):
+        session.session_operation(
+            {
+                "reservation_id": "reservation-1",
+                "terminal_id": "deadbeef",
+                "generation": "gen-1",
+                "action": "route-query",
+            },
+            journal,
+        )
+    with pytest.raises(bridge.BridgeError, match="omitted action"):
+        session.session_operation(
+            {
+                "reservation_id": "reservation-1",
+                "terminal_id": "deadbeef",
+                "generation": "gen-1",
+                "operation_id": "op-no-action",
+            },
+            journal,
+        )
+
+    unsupported = _run_operation(journal, session, "future-control")
+    assert unsupported["state"] == REFUSED
+    assert unsupported["reason_code"] == "capability_unsupported"
+
+    session.rpc = MagicMock()
+    session.close()
+    session.rpc.close.assert_called_once_with()
+
+
+def test_compact_submission_and_watcher_loss_are_durably_ambiguous(tmp_path, monkeypatch):
+    session = _session(_Rpc(commands=["compact"]))
+    journal = SessionControlJournal(tmp_path / "control.db")
+    monkeypatch.setattr(
+        session,
+        "_admission_critical_section",
+        lambda: contextlib.nullcontext(),
+    )
+
+    def submission_lost(*_args, **_kwargs):
+        raise TimeoutError("compact submission response lost")
+
+    session.rpc.start_request = submission_lost
+    receipt = _run_operation(journal, session, "compact")
+    assert receipt["state"] == AMBIGUOUS
+    assert receipt["reason_code"] == "compact_submission_ambiguous"
+
+    command = _command("compact")
+    command["operation_id"] = "op-compact-watcher"
+    _begin(journal, session, command)
+    journal.transition(command["operation_id"], SUBMITTED)
+    session._active_prompt_request_id = 41
+
+    def acceptance_lost(*_args, **_kwargs):
+        raise TimeoutError("compact acceptance response lost")
+
+    session.rpc.wait_notification = acceptance_lost
+    session._watch_compact_operation(
+        journal,
+        command["operation_id"],
+        41,
+        {"sessionId": "session-1"},
+        0,
+    )
+    operation = journal.get(command["operation_id"])
+    assert operation["state"] == AMBIGUOUS
+    assert operation["reason_code"] == "compact_outcome_ambiguous"
+    assert session._active_prompt_request_id is None
+
+
+def test_effort_route_and_generation_fence_paths(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services import generation_fence
+
+    session = _session(_Rpc())
+    journal = SessionControlJournal(tmp_path / "control.db")
+    session.rpc.request = lambda *_args, **_kwargs: {
+        "configOptions": [
+            {
+                "id": "thinking",
+                "category": "thought_level",
+                "currentValue": "high",
+            }
+        ]
+    }
+    receipt = _run_operation(
+        journal,
+        session,
+        "route-set",
+        config_id="thinking",
+        value="high",
+    )
+    assert receipt["state"] == COMPLETED
+    assert session.current_effort == "high"
+
+    monkeypatch.setattr(generation_fence, "assert_admission_open", lambda *_args: None)
+    session._assert_fence_open()
+
+    def fenced(*_args):
+        raise generation_fence.FencedError("generation is sealed")
+
+    monkeypatch.setattr(generation_fence, "assert_admission_open", fenced)
+    with pytest.raises(bridge.BridgeError, match="generation is sealed"):
+        session._assert_fence_open()
+
+
+def test_capability_filter_terminal_refusal_and_reconciliation_paths(tmp_path):
+    session = _session(_Rpc())
+    journal = SessionControlJournal(tmp_path / "control.db")
+
+    rpc = session.rpc
+    session.rpc = None
+    assert session._available_command_names() == set()
+    session.rpc = rpc
+    session.rpc.notifications_since = lambda _index: (
+        [
+            {"method": "future/event"},
+            {
+                "method": "session/update",
+                "params": {"update": {"sessionUpdate": "usage_update"}},
+            },
+            {
+                "method": "session/update",
+                "params": {
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": [
+                            {"name": "compact"},
+                            {"name": 42},
+                            "ignored",
+                        ],
+                    }
+                },
+            },
+        ],
+        3,
+    )
+    assert session._available_command_names() == {"compact"}
+
+    command = _command("future-control")
+    command["operation_id"] = "op-terminal-refusal"
+    _begin(journal, session, command)
+    refused = session._refuse_control(journal, command["operation_id"], "unsupported", "no")
+    assert refused["state"] == REFUSED
+    assert (
+        session._refuse_control(journal, command["operation_id"], "ignored", "ignored") == refused
+    )
+
+    follow_up = _command("follow-up", message="continue")
+    follow_up["operation_id"] = "op-reconcile-follow-up"
+    _begin(journal, session, follow_up)
+    journal.transition(follow_up["operation_id"], SUBMITTED)
+    journal.transition(follow_up["operation_id"], ACCEPTED)
+    receipt = session.reconcile_session_operation(journal, follow_up["operation_id"])
+    assert receipt["state"] == COMPLETED
+    assert receipt["result"] == {"native_turn_active": False}
+
+
+def test_inbox_validation_and_generation_fence_refusal(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services import generation_fence
+
+    session = _session(_Rpc())
+    message = "continue"
+    command = {
+        "reservation_id": "reservation-1",
+        "terminal_id": "deadbeef",
+        "generation": "gen-1",
+        "message": message,
+        "message_id": "message-1",
+        "message_sha256": hashlib.sha256(message.encode()).hexdigest(),
+    }
+
+    rpc = session.rpc
+    session.rpc = None
+    with pytest.raises(bridge.BridgeError, match="native session is not ready"):
+        session.deliver_inbox(command)
+    session.rpc = rpc
+
+    with pytest.raises(bridge.BridgeError, match="omitted the message"):
+        session.deliver_inbox({**command, "message": ""})
+    with pytest.raises(bridge.BridgeError, match="exact message id"):
+        session.deliver_inbox({**command, "message_id": ""})
+
+    @contextlib.contextmanager
+    def fenced_generation():
+        raise generation_fence.FencedError("generation was sealed")
+        yield
+
+    monkeypatch.setattr(session, "_admission_critical_section", fenced_generation)
+    with pytest.raises(bridge.BridgeError, match="generation was sealed"):
+        session.deliver_inbox(command)
