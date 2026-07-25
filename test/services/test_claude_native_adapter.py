@@ -25,7 +25,9 @@ assumed in a managed pane.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import uuid
 from pathlib import Path
 
@@ -36,6 +38,8 @@ from cli_agent_orchestrator.services import claude_native_control as control
 from cli_agent_orchestrator.services import claude_native_launch as launch
 from cli_agent_orchestrator.services import claude_native_readiness as readiness
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
+from cli_agent_orchestrator.services import native_attachment as na
+from cli_agent_orchestrator.services import native_tui_launch as ntl
 from cli_agent_orchestrator.services import provider_contracts
 
 PINNED = "2.1.220"
@@ -117,6 +121,206 @@ class TestChosenIdentity:
         argv = launch.build_resume_argv(session_id=session_id)
         form = provider_contracts.validate_resume_argv(provider_contracts.PROVIDER_CLAUDE, argv[1:])
         assert form.native_id == session_id
+
+
+class TestTheLaunchIntentTheStoreWillAccept:
+    """The intent the v2 Claude branch hands to the attachment store.
+
+    Worth its own test because the failure it guards against is silent
+    until launch: an intent the store refuses produces a reservation that
+    blocks at preflight with no pane, and nothing earlier in the pipeline
+    would have noticed.
+    """
+
+    def test_the_claude_launch_intent_is_one_the_attachment_store_accepts(self):
+        intent = v2._claude_bootstrap_intent(
+            {
+                "native_session_id": launch.mint_session_id(),
+                "id_source": "cli_session_id",
+                "provider_version": PINNED,
+                "working_directory": "/tmp",
+            },
+            reservation_id="reservation-1",
+        )
+
+        assert intent["schema"] == na.INTENT_SCHEMA
+        assert intent["acquisition_method"] == na.ACQUISITION_CHOSEN_SESSION_ID
+
+    def test_the_claude_specific_facts_survive_inside_the_receipt(self):
+        """The generic intent shape must not cost the provider's own facts."""
+        session_id = launch.mint_session_id()
+
+        intent = v2._claude_bootstrap_intent(
+            {
+                "native_session_id": session_id,
+                "id_source": "cli_session_id",
+                "provider_version": PINNED,
+                "working_directory": "/tmp",
+            },
+            reservation_id="reservation-2",
+        )
+
+        receipt = intent["acquisition_receipt"]
+        assert receipt["provider"] == "claude_code"
+        assert receipt["native_session_id"] == session_id
+        assert receipt["provider_version"] == PINNED
+        assert receipt["task_bytes_submitted"] is False
+        assert "reservation-2" in intent["note"]
+
+    def test_a_chosen_id_is_not_recorded_as_a_bootstrap_or_a_resume(self):
+        """Both of those describe acquiring an id the provider already had.
+
+        A bootstrap reads one back out of a transport and a resume names one
+        that exists; recording either for an id minted here would make the
+        journaled receipt say the session pre-dated its own launch.
+        """
+        assert na.ACQUISITION_CHOSEN_SESSION_ID not in (
+            na.ACQUISITION_ACP_BOOTSTRAP,
+            na.ACQUISITION_RESUME,
+        )
+        assert na.ACQUISITION_CHOSEN_SESSION_ID in na.ACQUISITION_METHODS
+
+
+class TestPerProviderArgvDispatch:
+    """Which argv a native launch builds is decided by provider, not shape.
+
+    The builder and its "does this bind exactly that session?" checker are
+    registered as a pair on purpose: a builder verified against another
+    provider's rules would construct a correct argv, pass, and mean
+    nothing.
+    """
+
+    def test_claude_dispatches_to_its_own_builder_for_each_launch_kind(self):
+        session_id = launch.mint_session_id()
+
+        new = ntl._claude_argv(
+            session_id=session_id,
+            binary="/usr/local/bin/claude",
+            extra_args=None,
+            launch_kind=ntl.LAUNCH_KIND_NEW,
+        )
+        resumed = ntl._claude_argv(
+            session_id=session_id,
+            binary="/usr/local/bin/claude",
+            extra_args=None,
+            launch_kind=ntl.LAUNCH_KIND_RESUME,
+        )
+
+        assert new == ["/usr/local/bin/claude", "--session-id", session_id]
+        assert resumed == ["/usr/local/bin/claude", "--resume", session_id]
+
+    def test_a_launch_kind_is_named_because_it_cannot_be_recovered(self):
+        """ "Is this the first launch?" is a fact only the caller holds.
+
+        Guessing it would mean sometimes resuming a session that was never
+        started — which on this build does not fail, it opens a picker.
+        """
+        assert ntl.LAUNCH_KINDS == (ntl.LAUNCH_KIND_NEW, ntl.LAUNCH_KIND_RESUME)
+
+    def test_a_claude_builder_error_surfaces_as_a_launch_refusal(self):
+        with pytest.raises(ntl.NativeLaunchInvalid):
+            ntl._claude_argv(
+                session_id="not-a-uuid",
+                binary="/usr/local/bin/claude",
+                extra_args=None,
+                launch_kind=ntl.LAUNCH_KIND_NEW,
+            )
+
+    def test_kimi_has_no_lawful_new_launch(self):
+        """Its session is minted by the ACP bootstrap before the TUI starts.
+
+        The opposite of Claude's: there the id is chosen and a first launch
+        creates the session; here the id is discovered and only a resume
+        exists.
+        """
+        with pytest.raises(ntl.NativeLaunchInvalid, match="only lawful launch form is a resume"):
+            ntl._kimi_argv(
+                session_id="session_9f21ac30",
+                binary="/usr/local/bin/kimi",
+                extra_args=None,
+                launch_kind=ntl.LAUNCH_KIND_NEW,
+            )
+
+    def test_kimi_builder_errors_surface_as_launch_refusals(self):
+        with pytest.raises(ntl.NativeLaunchInvalid):
+            ntl._kimi_argv(
+                session_id="",
+                binary="/usr/local/bin/kimi",
+                extra_args=None,
+                launch_kind=ntl.LAUNCH_KIND_RESUME,
+            )
+
+    def test_a_provider_with_no_adapter_is_refused_rather_than_defaulted(self):
+        with pytest.raises(ntl.NativeLaunchInvalid, match="no native-TUI argv binding"):
+            ntl._binder("codex")
+
+    def test_the_supported_set_is_read_from_the_registered_binders(self):
+        assert ntl.SUPPORTED_NATIVE_PROVIDERS == {"kimi_cli", "claude_code"}
+        for provider in ntl.SUPPORTED_NATIVE_PROVIDERS:
+            binder = ntl._binder(provider)
+            assert callable(binder["build"]) and callable(binder["binds_exactly"])
+
+
+class TestLaunchRefusesBeforeItClaims:
+    """Everything checkable is checked while a refusal still costs nothing.
+
+    Each of these runs before ``declare``, so the cost of being wrong is a
+    typed error rather than a claimed session with no pane behind it.
+    """
+
+    @staticmethod
+    def _binary(tmp_path):
+        path = tmp_path / "claude"
+        path.write_bytes(b"#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+        real = os.path.realpath(str(path))
+        return real, hashlib.sha256(Path(real).read_bytes()).hexdigest()
+
+    def _start(self, tmp_path, **overrides):
+        binary, digest = self._binary(tmp_path)
+        kwargs = {
+            "provider": "claude_code",
+            "native_session_id": launch.mint_session_id(),
+            "terminal_id": "terminal_4d7b",
+            "generation": "gen_1c0e",
+            "execution_mode": "native_tui",
+            "intent": {"schema": "unused-because-this-never-reaches-declare"},
+            "binary": binary,
+            "binary_sha256": digest,
+            "working_directory": os.path.realpath(str(tmp_path)),
+            "transport": object(),
+            "launch_kind": ntl.LAUNCH_KIND_NEW,
+        }
+        kwargs.update(overrides)
+        return ntl.start(**kwargs)
+
+    def test_an_acp_caller_reaching_the_native_branch_is_rejected(self, tmp_path):
+        """The two modes are separate branches and never fall back."""
+        with pytest.raises(ntl.NativeLaunchInvalid, match="refuses execution_mode"):
+            self._start(tmp_path, execution_mode="acp")
+
+    def test_an_unknown_launch_kind_is_refused(self, tmp_path):
+        with pytest.raises(ntl.NativeLaunchInvalid, match="launch_kind must be one of"):
+            self._start(tmp_path, launch_kind="whatever-seems-right")
+
+    def test_an_ambient_path_binary_is_refused(self, tmp_path):
+        """Which provider ran would depend on the pane's inherited PATH."""
+        with pytest.raises(ntl.NativeLaunchInvalid, match="canonical absolute path"):
+            self._start(tmp_path, binary="claude")
+
+    def test_a_digest_that_does_not_match_the_file_is_refused(self, tmp_path):
+        with pytest.raises(ntl.NativeLaunchInvalid):
+            self._start(tmp_path, binary_sha256="0" * 64)
+
+    def test_a_hand_written_intent_cannot_claim_a_session(self, tmp_path, isolated_memory_db):
+        """The attachment store accepts only an intent it built itself.
+
+        The intent is the set of obligations that module validates, so a
+        dict carrying its own schema would be a caller asserting them
+        instead of having them checked.
+        """
+        with pytest.raises(ntl.NativeLaunchInvalid, match="acquire_intent"):
+            self._start(tmp_path)
 
 
 class TestSessionStartReadiness:

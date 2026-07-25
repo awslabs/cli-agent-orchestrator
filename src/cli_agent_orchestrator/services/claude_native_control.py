@@ -626,6 +626,12 @@ def _open(
     operation_id = cast(str, binding["operation_id"])
     row_values = {
         **binding,
+        # Written from the module constant rather than taken from the
+        # binding, which does not carry one. The column is NOT NULL, so
+        # the store is what would catch a caller-supplied provider being
+        # absent — but it would catch it at the INSERT, which is after the
+        # point where this module still has a typed answer to give.
+        "provider": PROVIDER,
         "kind": kind,
         "state": INTENDED,
         "turn_id": turn_id,

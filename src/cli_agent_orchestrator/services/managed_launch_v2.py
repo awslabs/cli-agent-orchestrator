@@ -2581,17 +2581,35 @@ def _mint_claude_native_session(
 
 
 def _claude_bootstrap_intent(bootstrap: dict[str, Any], *, reservation_id: str) -> dict[str, Any]:
-    """The launch intent recorded against a chosen Claude identity."""
-    return {
-        "schema": CLAUDE_BOOTSTRAP_INTENT_SCHEMA,
-        "provider": "claude_code",
-        "native_session_id": bootstrap["native_session_id"],
-        "id_source": bootstrap["id_source"],
-        "provider_version": bootstrap["provider_version"],
-        "working_directory": bootstrap["working_directory"],
-        "note": f"v2 native launch of reservation {reservation_id}",
-        "task_bytes_submitted": False,
-    }
+    """The launch intent recorded against a chosen Claude identity.
+
+    Built by ``native_attachment.acquire_intent`` rather than assembled
+    here, because the attachment store accepts only an intent it built
+    itself: the intent is the set of obligations that module validates,
+    and a hand-written dict carrying its own schema is a caller asserting
+    those obligations instead of having them checked.  The Claude-specific
+    facts ride in ``acquisition_receipt``, which is exactly the field the
+    Kimi path uses for its bootstrap receipt.
+    """
+    return native_attachment.acquire_intent(
+        acquisition_method=native_attachment.ACQUISITION_CHOSEN_SESSION_ID,
+        acquisition_receipt={
+            "schema": CLAUDE_BOOTSTRAP_INTENT_SCHEMA,
+            "provider": "claude_code",
+            "native_session_id": bootstrap["native_session_id"],
+            "id_source": bootstrap["id_source"],
+            "provider_version": bootstrap["provider_version"],
+            "working_directory": bootstrap["working_directory"],
+            "task_bytes_submitted": False,
+        },
+        # A chosen id names a session that did not exist until this launch,
+        # so there is nothing prior for it to re-admit or replay. Asserted
+        # explicitly anyway: these are obligations the store checks, not
+        # descriptions it records.
+        admits_only_new_instructions=True,
+        replays_task_bytes=False,
+        note=f"v2 native launch of reservation {reservation_id}",
+    )
 
 
 def _mint_native_session(

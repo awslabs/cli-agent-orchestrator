@@ -337,3 +337,63 @@ class TestLiveResolution:
         )
 
         assert projection.live_terminals("cao-proj") == []
+
+
+class TestSingleTerminalLookup:
+    """One terminal by id, from whichever store holds it.
+
+    The lookup is vintage-aware for the same reason the listing is: a
+    managed v2 worker lives in a separate table by design, and a reader
+    that only knew about the v1 one would report it absent rather than
+    tell the truth about where it is.
+    """
+
+    def test_a_v1_row_is_found_and_projected(self, isolated_memory_db, backend):
+        backend({"%10": _pane()})
+        database.create_terminal(
+            terminal_id="1111bbbb",
+            tmux_session="cao-proj",
+            tmux_window="worker",
+            provider="claude_code",
+            pane_id="%10",
+            window_id="@10",
+            session_id="$1",
+            pane_pid=4242,
+            server_socket_path=SOCKET,
+        )
+
+        out = projection.project_terminal("1111bbbb")
+
+        assert out["terminal_id"] == "1111bbbb"
+        assert out["protocol_vintage"] == "v1"
+        assert out["lifecycle_state"] == projection.LIFECYCLE_LIVE
+
+    def test_a_terminal_in_neither_store_is_absent(self, isolated_memory_db, backend):
+        backend({})
+        assert projection.project_terminal("no-such-terminal") is None
+
+    def test_a_dead_v1_row_still_resolves_and_reports_its_lifecycle(
+        self, isolated_memory_db, backend
+    ):
+        """Absent is a fact about the pane, not about the record.
+
+        The row is still findable — that is what lets a human see *why* the
+        card is gone instead of the terminal simply vanishing.
+        """
+        backend({})
+        database.create_terminal(
+            terminal_id="2222cccc",
+            tmux_session="cao-proj",
+            tmux_window="worker",
+            provider="claude_code",
+            pane_id="%10",
+            window_id="@10",
+            session_id="$1",
+            pane_pid=4242,
+            server_socket_path=SOCKET,
+        )
+
+        out = projection.project_terminal("2222cccc")
+
+        assert out["lifecycle_state"] == projection.LIFECYCLE_DEAD
+        assert out["status"] == projection.LIFECYCLE_DEAD
