@@ -9,6 +9,8 @@ caller named.
 """
 
 import logging
+import os
+from pathlib import Path
 from subprocess import CompletedProcess
 from typing import List, Optional, Union
 from unittest.mock import call, patch
@@ -126,6 +128,37 @@ def mock_subprocess(answers):
     ):
         mock.run.side_effect = answers
         yield mock
+
+
+@pytest.fixture
+def aliased_socket(tmp_path):
+    """``(canonical, aliased)`` — one socket path spelled two ways.
+
+    A symlinked directory somewhere in a socket's path is the ordinary
+    case, not a curiosity: macOS reaches every ``/tmp`` socket through
+    one.  The two spellings must compare equal, or a write would be
+    refused to the very server it was bound to.
+
+    Built here rather than borrowed from the host.  Naming the platform's
+    own alias makes the property unprovable anywhere that alias does not
+    exist — on Linux ``/tmp`` and ``/private/tmp`` are simply two
+    different paths, so the assertion was false on the one platform CI
+    runs.  A real directory with a real symlink beside it holds
+    everywhere.
+    """
+    base = Path(os.path.realpath(tmp_path))
+    real = base / "tmux-real"
+    real.mkdir()
+    alias = base / "tmux-alias"
+    alias.symlink_to(real, target_is_directory=True)
+    canonical = str(real / "cao-fixture.sock")
+    aliased = str(alias / "cao-fixture.sock")
+    # Asserted, not assumed.  Were the two spellings ever one string, or
+    # were they to resolve apart, every test below would pass while
+    # proving nothing at all about normalisation.
+    assert aliased != canonical
+    assert os.path.realpath(aliased) == canonical
+    return canonical, aliased
 
 
 def _all_argv(mock_subprocess) -> list[list[str]]:
@@ -351,15 +384,20 @@ class TestSendLiteralLineChecksTheServer:
 
         assert not isinstance(excinfo.value, TmuxLiteralSendError)
 
-    def test_a_differently_spelled_path_is_the_same_server(self, client, mock_subprocess, answers):
-        """``/tmp`` is a symlink to ``/private/tmp`` on macOS.
+    def test_a_differently_spelled_path_is_the_same_server(
+        self, client, mock_subprocess, answers, aliased_socket
+    ):
+        """A symlinked directory in the path does not make it another server.
 
-        Both spellings name one socket, so comparing them as strings
-        would refuse a write to the very server it was bound to.
+        The write is bound through the alias and the pane answers with
+        the canonical spelling.  Both name one socket, so comparing them
+        as strings would refuse a write to the very server it was bound
+        to.
         """
-        answers.probe = _ok(_server_line("%263", "/private/tmp/tmux-501/cao-fixture.sock"))
+        canonical, aliased = aliased_socket
+        answers.probe = _ok(_server_line("%263", canonical))
 
-        _send(client, "%263", "/compact", expected_server_identity="/tmp/tmux-501/cao-fixture.sock")
+        _send(client, "%263", "/compact", expected_server_identity=aliased)
 
         assert len(_write_argv(mock_subprocess)) == 2
 
@@ -584,11 +622,14 @@ class TestObservePaneServerIdentity:
 
         assert client.observe_pane_server_identity("%263") is None
 
-    def test_the_reported_socket_is_canonical(self, client, mock_subprocess, answers):
+    def test_the_reported_socket_is_canonical(
+        self, client, mock_subprocess, answers, aliased_socket
+    ):
         """Reported in the form the comparison uses, so both sides agree."""
-        answers.probe = _ok(_server_line("%263", "/tmp/tmux-501/cao-fixture.sock"))
+        canonical, aliased = aliased_socket
+        answers.probe = _ok(_server_line("%263", aliased))
 
-        assert client.observe_pane_server_identity("%263") == SOCKET
+        assert client.observe_pane_server_identity("%263") == canonical
 
 
 class TestPaneControlIdentityLookup:
