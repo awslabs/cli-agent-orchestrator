@@ -1,4 +1,4 @@
-"""The v2 route-correct recovery surface (cond-0107).
+"""The v2 route-correct recovery surface.
 
 A v2 native preflight failure used to be a dead end: the reservation row
 carried ``state == preflight_blocked`` with its *cause discarded*, and no
@@ -285,8 +285,8 @@ class TestFinalizeNegative:
 class TestFinalizeNegativeFromBound:
     """A launch that dies after binding but before admitting.
 
-    That row is bound, so the older rule refused to finalize it, and §C
-    forbids reusing its generation — leaving it neither finalizable nor
+    That row is bound, so the older rule refused to finalize it, and a
+    generation is non-reusable once issued — leaving it neither finalizable nor
     replaceable, which wedges the run for good. Bind-before-admit is what
     makes the narrow exception provable: an admission journals its intent
     before it touches the transport, so a bound row carrying no admission

@@ -559,7 +559,7 @@ def test_a_working_directory_that_does_not_exist_is_refused(pinned_binary, tmp_p
 
 
 # --------------------------------------------------------------------------
-# No refusal leaves the already-spawned minter running (cond-0107)
+# No refusal leaves the already-spawned minter running
 #
 # The caller spawns the transport (`StdioAcpBootstrap.__init__` runs the
 # process) BEFORE mint_session is entered, so "refused before any provider

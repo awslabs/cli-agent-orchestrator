@@ -1,6 +1,6 @@
-"""Exact Kimi Code 0.29.1 support, with 0.29.0 retained (cond-0107).
+"""Exact Kimi Code 0.29.1 support, with 0.29.0 retained.
 
-The fork adds 0.29.1 as a *separate proven build*, not a range widening.
+0.29.1 is added as a *separate proven build*, not a range widening.
 This suite pins the three properties that support turns on:
 
 1.  every version gate (contract, route, bridge) accepts 0.29.1 and still

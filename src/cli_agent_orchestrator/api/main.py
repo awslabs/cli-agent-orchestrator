@@ -2006,7 +2006,7 @@ async def finalize_managed_launch_v2_negative(
     body: ManagedLaunchV2NegativeRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
-    """Finalize a proven zero-byte v2 preflight failure (cond-0107).
+    """Finalize a v2 reservation whose failure is proven to have sent no bytes.
 
     Idempotent and re-drivable with zero task/provider I/O. The presence of
     this route is itself the recovery-supported signal: a peer old enough to

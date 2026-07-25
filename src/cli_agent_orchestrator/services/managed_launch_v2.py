@@ -146,7 +146,8 @@ _RETRYABLE_REFUSAL_REASONS = frozenset({REFUSED_PROVIDER_NOT_YET_READY, REFUSED_
 #: recovery reads before it finalizes the generation: reason code, the
 #: redacted human detail, the exact reservation/terminal/generation
 #: identity, and ``task_bytes_submitted`` — always false in this state,
-#: because the v2 launch path submits no turn before it (issue cond-0107).
+#: because every path that reaches this state does so before the launch
+#: sequence has any turn to submit.
 PREFLIGHT_FAILURE_SCHEMA = "cao-managed-launch-v2-preflight-failure-v1"
 
 #: Machine-readable cause codes for a blocked generation.  The strings are
@@ -794,7 +795,7 @@ def _mark_launch_failed_bridge(
 
 
 # ---------------------------------------------------------------------------
-# Route-correct v2 recovery surface (cond-0107)
+# Route-correct v2 recovery surface
 #
 # A v2 preflight failure used to be a dead end: the row held ``state ==
 # preflight_blocked`` with its cause discarded, and there was no v2 verb to
@@ -815,8 +816,9 @@ def _mark_launch_failed_bridge(
 # transport, so a bound row with no admission has provably never reached the
 # write path and no task byte can have crossed.  Without this a launch that
 # died between bind and admit was unfinalizable: it could not be finalized
-# negative, and it could not be replaced either, because §C forbids reusing
-# its generation.  The generation stayed live forever and wedged the run.
+# negative, and it could not be replaced either, because a generation is
+# non-reusable once issued.  The generation stayed live forever and wedged
+# the run.
 #
 # ``admitting`` and ``admitted`` are never finalizable, and neither is a
 # bound row that does carry an admission: for those, "never submitted" is
@@ -844,7 +846,7 @@ def finalize_negative(
     it touches the transport, so a bound row without one has never reached
     the write path.  That case is not hypothetical — a launch that dies
     between bind and admit lands there, and before this it was unfinalizable
-    *and* unreplaceable, because §C forbids reusing the generation.
+    *and* unreplaceable, because a generation is non-reusable once issued.
 
     Everything else is refused, and refused for the same reason: for
     ``admitting``, ``admitted``, or a bound row that does carry an
