@@ -278,9 +278,7 @@ class TestSendKeysForcedBracketedPasteShellDetection:
     understand \\x1b[200~/\\x1b[201~, corrupting the first token of
     whatever's sent next."""
 
-    def test_wraps_when_pane_runs_a_real_tui(
-        self, client, mock_subprocess, mock_uuid, legacy_tmux
-    ):
+    def test_wraps_when_pane_runs_a_real_tui(self, client, mock_subprocess, mock_uuid, legacy_tmux):
         """Baseline: an actual TUI (e.g. Claude Code, running as `node`) on
         tmux < 3.7 still gets the existing unconditional bracket-wrap + -r
         delivery (the manual wrap is only valid pre-#413; see
