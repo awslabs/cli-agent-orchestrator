@@ -222,6 +222,28 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
             "PASTE_ENTER_SUPPRESS_WINDOW_MS = 120 and reset() clears it"
         ),
     },
+    # 0.29.1 is a *separate* proven entry, not a range widening: it was
+    # read from the installed 0.29.1 bundle (main.mjs sha256
+    # cba31835395ff75fa6b5bc9b81a7907c7d933e7e6a7d8ba53afac23dd0f5ab04),
+    # whose composer keybinds, submit normalization, and paste-burst
+    # window are byte-identical to 0.29.0.  Because the model-visible
+    # normalization is provably the same computation, it reuses
+    # NORMALIZATION_JOIN_LF_THEN_TRIM — the identifier names the proven
+    # behaviour, which both builds share, not the build.
+    "0.29.1": {
+        "keystroke": "C-j",
+        "burst_reset_keystroke": "End",
+        "submit_settle_seconds": 0.25,
+        "normalization": NORMALIZATION_JOIN_LF_THEN_TRIM,
+        "evidence": (
+            "installed 0.29.1 dist/main.mjs (sha256 cba31835395ff75fa6b5b"
+            "c9b81a7907c7d933e7e6a7d8ba53afac23dd0f5ab04) declares "
+            "tui.input.newLine defaultKeys ['shift+enter', 'ctrl+j'] with "
+            "tui.input.submit 'enter'; submitValue() computes "
+            "lines.join('\\n').trim(); PASTE_ENTER_SUPPRESS_WINDOW_MS = 120 "
+            "— byte-identical to the 0.29.0 composer facts"
+        ),
+    },
 }
 
 #: Characters ECMAScript ``String.prototype.trim`` removes: its

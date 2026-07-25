@@ -72,8 +72,10 @@ prompt keystrokes and records a preflight-blocked outcome.
 
 Managed Kimi launches run a zero-prompt ACP session before terminal launch.
 The structured `configOptions` response must resolve the assigned model and
-`thought_level` exactly. The proof is version-bound to Kimi Code CLI `0.29.0`,
-confirms `~/.kimi/config.toml` is byte-unchanged, and sends no `session/prompt`.
+`thought_level` exactly. The proof is version-bound to an exact Kimi Code CLI
+build — currently `0.29.1`, with `0.29.0` retained for already-minted sessions
+(exact set, never a range) — confirms `~/.kimi/config.toml` is byte-unchanged,
+and sends no `session/prompt`.
 The terminal generation is then launched with the same model forced by
 `--model` and the same effective effort forced by the invocation-only
 `KIMI_MODEL_THINKING_EFFORT` environment value. The outer readiness receipt

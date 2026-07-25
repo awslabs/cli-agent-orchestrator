@@ -11,7 +11,11 @@ import subprocess
 import time
 from typing import Any, Optional, cast
 
-SUPPORTED_KIMI_VERSION = "0.29.0"
+from cli_agent_orchestrator.services.provider_contracts import PROVIDER_KIMI, SUPPORTED_VERSIONS
+
+#: Exact Kimi builds this probe accepts, current first — never a range.
+#: 0.29.0 is retained alongside 0.29.1 for already-minted sessions.
+SUPPORTED_KIMI_VERSIONS = SUPPORTED_VERSIONS[PROVIDER_KIMI]
 PROBE_VERSION = "kimi-acp-route-v1"
 
 
@@ -141,9 +145,10 @@ def attest_kimi_route(
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise KimiRouteProbeError(f"could not execute Kimi version probe: {exc}") from exc
     version = version_proc.stdout.strip()
-    if version_proc.returncode != 0 or version != SUPPORTED_KIMI_VERSION:
+    if version_proc.returncode != 0 or version not in SUPPORTED_KIMI_VERSIONS:
         raise KimiRouteProbeError(
-            f"unsupported Kimi version {version!r}; expected {SUPPORTED_KIMI_VERSION!r}"
+            f"unsupported Kimi version {version!r}; expected one of "
+            f"{list(SUPPORTED_KIMI_VERSIONS)!r}"
         )
 
     config_path = user_config_path or pathlib.Path(os.path.expanduser("~/.kimi/config.toml"))

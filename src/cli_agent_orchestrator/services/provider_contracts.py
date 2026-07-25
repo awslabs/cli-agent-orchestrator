@@ -35,11 +35,33 @@ PROVIDER_KIMI = "kimi"
 PROVIDER_CLAUDE = "claude"
 PROVIDERS = (PROVIDER_CODEX, PROVIDER_KIMI, PROVIDER_CLAUDE)
 
+#: The single *current* pin per provider: the version a fresh mint/proof
+#: is expected to run, and the one a receipt records when it cannot read a
+#: more specific fact.  ``SUPPORTED_VERSIONS`` below is the acceptance
+#: authority; this map is the representative head of each accepted tuple.
 PINNED_VERSIONS = {
     PROVIDER_CODEX: "0.145.0",
-    PROVIDER_KIMI: "0.29.0",
+    PROVIDER_KIMI: "0.29.1",
     PROVIDER_CLAUDE: "2.1.218",
 }
+
+#: Every exact version accepted for a provider, current first.  A tuple of
+#: exact strings, never a range: which builds are proven is a fact about
+#: each specific build, and a range would silently assert something about
+#: builds nobody has read.  Kimi retains ``0.29.0`` so a session minted
+#: under it still validates after the binary is stage-verified up to
+#: ``0.29.1`` (installed bundle ``main.mjs`` sha256
+#: cba31835395ff75fa6b5bc9b81a7907c7d933e7e6a7d8ba53afac23dd0f5ab04).
+SUPPORTED_VERSIONS: dict[str, tuple[str, ...]] = {
+    PROVIDER_CODEX: ("0.145.0",),
+    PROVIDER_KIMI: ("0.29.1", "0.29.0"),
+    PROVIDER_CLAUDE: ("2.1.218",),
+}
+# The current pin must always be an accepted version — asserted here so the
+# two maps cannot silently drift apart.
+assert all(
+    PINNED_VERSIONS[provider] in versions for provider, versions in SUPPORTED_VERSIONS.items()
+)
 
 # The sole accepted pre-turn native-identity source per provider.
 NATIVE_ID_SOURCES = {
@@ -70,21 +92,37 @@ class ResumeFormRefused(ProviderContractError):
     """A forbidden or non-exact resume form was requested."""
 
 
+def normalized_version(installed_version: str) -> str:
+    """The first semver-shaped token in a ``<name> <version> ...`` banner.
+
+    ``"codex 0.145.0"``, ``"2.1.218 (Claude Code)"``, ``"kimi 0.29.1"`` all
+    yield the bare version; an absent one yields ``""``.  Exposed so a
+    caller can record the *actual* validated version rather than a pin
+    constant that may name the wrong one of several accepted builds.
+    """
+    for token in installed_version.strip().split():
+        if re.fullmatch(r"\d+\.\d+\.\d+", token):
+            return token
+    return ""
+
+
 def check_pinned_version(provider: str, installed_version: str) -> None:
-    """Fail closed on installed-version drift against the pinned contract."""
-    pinned = PINNED_VERSIONS.get(provider)
-    if pinned is None:
+    """Fail closed unless the installed version is an accepted exact pin.
+
+    Acceptance is exact-set membership, never a range: a provider may
+    accept more than one build (Kimi retains ``0.29.0`` alongside the
+    current ``0.29.1``), but every accepted version is a build that has
+    been read and proven, not a bound guessing at ones that have not.
+    """
+    accepted = SUPPORTED_VERSIONS.get(provider)
+    if accepted is None:
         raise ProviderContractError(f"unknown provider: {provider!r}")
-    # Accept the exact pin anywhere in a "<name> <version> ..." banner:
-    # the first semver-shaped token is the version fact ("codex 0.145.0",
-    # "2.1.218 (Claude Code)", "kimi 0.29.0" all parse).
-    tokens = installed_version.strip().split()
-    normalized = next((token for token in tokens if re.fullmatch(r"\d+\.\d+\.\d+", token)), "")
-    if normalized != pinned:
+    normalized = normalized_version(installed_version)
+    if normalized not in accepted:
         raise ProviderVersionDrift(
-            f"{provider} version drift: pinned {pinned}, installed "
-            f"{installed_version.strip()!r}; resume refuses (41) until the pinned "
-            "binary is stage-verified"
+            f"{provider} version drift: accepted {list(accepted)}, installed "
+            f"{installed_version.strip()!r}; resume refuses (41) until a "
+            "stage-verified pinned binary is installed"
         )
 
 
