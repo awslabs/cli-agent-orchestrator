@@ -44,6 +44,8 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
     PROTOCOL_VERSION_V2,
     ManagedLaunchV2AdmitRequest,
     ManagedLaunchV2BindRequest,
+    ManagedLaunchV2CleanupRequest,
+    ManagedLaunchV2NegativeRequest,
     ManagedLaunchV2ReserveRequest,
 )
 from cli_agent_orchestrator.services import execution_mode as em
@@ -52,6 +54,7 @@ from cli_agent_orchestrator.services import (
     heartbeat_store,
     native_attachment,
     recovery_receipts,
+    secret_gate,
 )
 from cli_agent_orchestrator.services.destructive_endpoint import write_binding_record
 from cli_agent_orchestrator.services.managed_launch import (
@@ -121,6 +124,26 @@ REFUSED_PANE_UNOBSERVABLE = "native_pane_unobservable"
 REFUSED_NATIVE_IDENTITY = "native_binding_identity_refused"
 _RETRYABLE_REFUSAL_REASONS = frozenset({REFUSED_PROVIDER_NOT_YET_READY, REFUSED_PANE_UNOBSERVABLE})
 
+#: The immutable, redacted evidence written when a generation reaches
+#: ``preflight_blocked``.  It is the single truthful cause a route-correct
+#: recovery reads before it finalizes the generation: reason code, the
+#: redacted human detail, the exact reservation/terminal/generation
+#: identity, and ``task_bytes_submitted`` — always false in this state,
+#: because the v2 launch path submits no turn before it (issue cond-0107).
+PREFLIGHT_FAILURE_SCHEMA = "cao-managed-launch-v2-preflight-failure-v1"
+
+#: Machine-readable cause codes for a blocked generation.  The strings are
+#: informative for a recovering conductor, not a gate; every one of them
+#: means the same delivery fact — zero task bytes crossed.
+PREFLIGHT_REASON_LAUNCH_REQUEST = "launch-request"
+PREFLIGHT_REASON_PROVIDER_UNSUPPORTED = "provider-unsupported"
+PREFLIGHT_REASON_NATIVE_PREFLIGHT = "native-preflight"
+PREFLIGHT_REASON_SESSION_BOOTSTRAP = "session-bootstrap"
+PREFLIGHT_REASON_TUI_LAUNCH_REFUSED = "tui-launch-refused"
+PREFLIGHT_REASON_READINESS = "readiness-receipt"
+PREFLIGHT_REASON_PROVIDER_LAUNCH = "provider-launch"
+PREFLIGHT_REASON_GENERIC = "native-generic"
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -189,6 +212,10 @@ def _row_dict(row: Any) -> dict[str, Any]:
             if row.state == "launch-failed-bridge" and isinstance(admission, dict)
             else None
         ),
+        # The immutable redacted zero-byte preflight evidence, surfaced on
+        # every GET and recovery verb so a route-correct recovery reads the
+        # cause without a second call.  None for any row that never blocked.
+        "preflight_failure": _parse_json(getattr(row, "preflight_failure_json", None), None),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -484,17 +511,55 @@ def claim_launch(reservation_id: str) -> tuple[dict[str, Any], bool]:
         raise ManagedLaunchUnavailable(f"managed-launch v2 claim failed: {exc}") from exc
 
 
-def _mark_preflight_blocked(reservation_id: str, detail: str) -> dict[str, Any]:
+def _build_preflight_failure(row: Any, *, reason: str, detail: str) -> dict[str, Any]:
+    """The redacted, identity-bound evidence for one blocked generation.
+
+    ``detail`` passes through the same credential gate the memory/export
+    paths use, so raw provider output — which can carry credentials —
+    never lands in a durable, GET-queryable record.  ``task_bytes_submitted``
+    is a constant here, not a caller claim: reaching this state means the
+    v2 launch path submitted no turn.
+    """
+    redacted, fired = secret_gate.redact_secrets(detail or "")
+    return {
+        "schema": PREFLIGHT_FAILURE_SCHEMA,
+        "reservation_id": row.reservation_id,
+        "terminal_id": row.terminal_id,
+        "generation": row.generation,
+        "obligation_generation": row.obligation_generation,
+        "provider": row.provider,
+        "reason": reason,
+        "detail": redacted,
+        "detail_redactions": fired,
+        "task_bytes_submitted": False,
+        "failed_at": _now(),
+    }
+
+
+def _mark_preflight_blocked(
+    reservation_id: str, detail: str, *, reason: str = PREFLIGHT_REASON_GENERIC
+) -> dict[str, Any]:
     try:
         with database.SessionLocal() as db:
             row = _query(db, reservation_id)
             if row is None:
                 raise ManagedLaunchNotFound(f"v2 reservation not found: {reservation_id}")
             if row.state == "preflight_blocked":
+                # Terminal and immutable: the first recorded cause stands.
+                # A re-driven launch that fails differently must never
+                # rewrite evidence a recovery may already have read.
                 return _row_dict(row)
             if row.state not in {"reserved", "launching"}:
                 raise ManagedLaunchConflict(f"preflight cannot block state {row.state!r}")
             row.state = "preflight_blocked"
+            # The evidence is written in the SAME transaction as the state,
+            # so the blocked state and its cause commit together or not at
+            # all — a persistence failure raises below (fail closed) and no
+            # blocked row is ever returned without its evidence.
+            if row.preflight_failure_json is None:
+                row.preflight_failure_json = _canonical_json(
+                    _build_preflight_failure(row, reason=reason, detail=detail)
+                )
             row.updated_at = _now()
             db.commit()
             db.refresh(row)
@@ -590,6 +655,183 @@ def _mark_launch_failed_bridge(
         raise ManagedLaunchUnavailable(
             f"v2 bridge launch failure finalization failed: {exc}"
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Route-correct v2 recovery surface (cond-0107)
+#
+# A v2 preflight failure used to be a dead end: the row held ``state ==
+# preflight_blocked`` with its cause discarded, and there was no v2 verb to
+# finalize it — so ``conduct spawn --recover`` reached for the v1 verbs,
+# received 404, and left the run and its breaker wedged.  These three verbs
+# are the v2-native, idempotent, re-drivable recovery surface.  All of them
+# operate only on the isolated v2 store, do zero task/provider I/O, and
+# refuse a generation that ever left the zero-byte states — a blocked
+# generation is finalized and replaced, never reused.
+# ---------------------------------------------------------------------------
+
+_NEGATIVE_FINALIZABLE_STATES = frozenset({"preflight_blocked", "negative"})
+
+
+def _assert_recovery_identity(row: Any, *, terminal_id: str, generation: str) -> None:
+    """Refuse a recovery verb whose identity is not this exact generation."""
+    if row.terminal_id != terminal_id or row.generation != generation:
+        raise ManagedLaunchConflict(
+            "recovery identity does not match the reservation "
+            "(terminal_id/generation); refusing before any state change"
+        )
+
+
+def finalize_negative(
+    reservation_id: str, request: ManagedLaunchV2NegativeRequest
+) -> dict[str, Any]:
+    """Finalize a proven zero-byte preflight failure: ``preflight_blocked`` → ``negative``.
+
+    Idempotent by construction: the transition is valid only from
+    ``preflight_blocked``, a no-op from ``negative``, and refused from any
+    live state (a bound/admitting/admitted generation may have crossed task
+    bytes, so a "never submitted" finalization would be a lie).  The first
+    finalization wins — a later call with a different ``finalize_id`` is an
+    idempotent success that does not rewrite the recorded finalization.
+
+    The stored ``preflight_failure`` evidence is preserved unchanged; this
+    verb records only that the zero-byte failure has been adopted and
+    finalized so the caller may release its breaker.
+    """
+    try:
+        with database.SessionLocal() as db:
+            row = _query(db, reservation_id)
+            if row is None:
+                raise ManagedLaunchNotFound(f"v2 reservation not found: {reservation_id}")
+            _assert_recovery_identity(
+                row, terminal_id=request.terminal_id, generation=request.generation
+            )
+            if request.obligation_generation != row.obligation_generation:
+                raise ManagedLaunchConflict(
+                    "recovery obligation_generation does not match the reservation row"
+                )
+            if row.state not in _NEGATIVE_FINALIZABLE_STATES:
+                raise ManagedLaunchConflict(
+                    f"zero-byte finalization requires state 'preflight_blocked', "
+                    f"not {row.state!r}"
+                )
+            if row.state == "negative":
+                # Already finalized: return the durable record unchanged so
+                # a re-driven recovery converges instead of double-writing.
+                return _row_dict(row)
+            redacted_reason, _fired = secret_gate.redact_secrets(request.reason or "")
+            negative = {
+                "schema": "cao-managed-launch-v2-negative-v1",
+                "finalize_id": request.finalize_id,
+                "terminal_id": row.terminal_id,
+                "generation": row.generation,
+                "obligation_generation": row.obligation_generation,
+                "reason": redacted_reason,
+                "task_bytes_submitted": False,
+                "finalized_at": _now(),
+            }
+            # A blocked generation never wrote a binding or admission, so
+            # both columns must still be NULL: the CAS proves nothing raced
+            # this finalization into a live state between the read and write.
+            updated = (
+                db.query(database.ManagedLaunchV2ReservationModel)
+                .filter(
+                    database.ManagedLaunchV2ReservationModel.reservation_id == reservation_id,
+                    database.ManagedLaunchV2ReservationModel.terminal_id == row.terminal_id,
+                    database.ManagedLaunchV2ReservationModel.generation == row.generation,
+                    database.ManagedLaunchV2ReservationModel.state == "preflight_blocked",
+                    database.ManagedLaunchV2ReservationModel.admission_json.is_(None),
+                    database.ManagedLaunchV2ReservationModel.binding_json.is_(None),
+                )
+                .update(
+                    {
+                        "state": "negative",
+                        "admission_json": _canonical_json(negative),
+                        "updated_at": _now(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            if updated != 1:
+                raise ManagedLaunchConflict(
+                    "v2 zero-byte finalization lost the exact preflight_blocked CAS"
+                )
+            return _row_dict(_query(db, reservation_id))
+    except ManagedLaunchError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ManagedLaunchUnavailable(f"v2 negative finalization failed: {exc}") from exc
+
+
+def reconcile(reservation_id: str) -> dict[str, Any]:
+    """Read-only adoption of durable v2 facts — never launches, sends, or deletes.
+
+    Returns the full row (including the immutable ``preflight_failure``
+    evidence), whether the fork-owned terminal record still exists, and
+    whether the row is past the point where a fresh launch could still be
+    claimed.  Safe to call any number of times.
+    """
+    record = get(reservation_id)
+    try:
+        with database.SessionLocal() as db:
+            terminal_present = (
+                db.query(database.ManagedLaunchV2TerminalModel)
+                .filter(
+                    database.ManagedLaunchV2TerminalModel.id == record["terminal_id"],
+                    database.ManagedLaunchV2TerminalModel.generation == record["generation"],
+                )
+                .first()
+                is not None
+            )
+    except Exception as exc:  # noqa: BLE001
+        raise ManagedLaunchUnavailable(f"v2 reconcile failed: {exc}") from exc
+    return {
+        **record,
+        "terminal_record_present": terminal_present,
+        "recovery_only": record["state"] != "reserved",
+    }
+
+
+def cleanup(reservation_id: str, request: ManagedLaunchV2CleanupRequest) -> dict[str, Any]:
+    """Release the fork-owned terminal record for a finalized zero-byte generation.
+
+    Idempotent by ``cleanup_id`` and by effect: removing an already-absent
+    terminal row is a success.  Valid only once the generation is finalized
+    (``negative``); refused while the generation is still live.  This
+    releases only the v2 terminal *metadata* row — it never tears down a
+    pane or process, which stays the destructive endpoint's job under its
+    own containment gate.
+    """
+    try:
+        with database.SessionLocal() as db:
+            row = _query(db, reservation_id)
+            if row is None:
+                raise ManagedLaunchNotFound(f"v2 reservation not found: {reservation_id}")
+            _assert_recovery_identity(
+                row, terminal_id=request.terminal_id, generation=request.generation
+            )
+            if row.state != "negative":
+                raise ManagedLaunchConflict(
+                    f"v2 cleanup requires the finalized state 'negative', not {row.state!r}"
+                )
+        removed = database.delete_terminal_v2_if_generation(request.terminal_id, request.generation)
+        record = get(reservation_id)
+        return {
+            **record,
+            "cleanup": {
+                "schema": "cao-managed-launch-v2-cleanup-v1",
+                "cleanup_id": request.cleanup_id,
+                "terminal_id": request.terminal_id,
+                "generation": request.generation,
+                "terminal_record_removed": removed,
+                "cleaned_at": _now(),
+            },
+        }
+    except ManagedLaunchError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ManagedLaunchUnavailable(f"v2 cleanup failed: {exc}") from exc
 
 
 def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
@@ -1741,7 +1983,9 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
         }
         write_request(reservation_id, bridge_request)
     except Exception as exc:  # noqa: BLE001 - no provider I/O occurred
-        return _mark_preflight_blocked(reservation_id, str(exc))
+        return _mark_preflight_blocked(
+            reservation_id, str(exc), reason=PREFLIGHT_REASON_LAUNCH_REQUEST
+        )
 
     # The two modes diverge here and nowhere earlier: everything above is
     # reservation identity and the durable request, which both modes need
@@ -1787,7 +2031,9 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             state = None
         if state and state.get("state") == "launch-failed-bridge":
             return _mark_launch_failed_bridge(reservation_id, state)
-        return _mark_preflight_blocked(reservation_id, str(exc))
+        return _mark_preflight_blocked(
+            reservation_id, str(exc), reason=PREFLIGHT_REASON_PROVIDER_LAUNCH
+        )
 
     try:
         status = await asyncio.to_thread(
@@ -1802,11 +2048,15 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             return _mark_launch_failed_bridge(reservation_id, state)
         detail = str((state or {}).get("error") or exc)
         return _mark_preflight_blocked(
-            reservation_id, f"exact provider readiness was not established: {detail}"
+            reservation_id,
+            f"exact provider readiness was not established: {detail}",
+            reason=PREFLIGHT_REASON_READINESS,
         )
     if status.get("state") != "ready" or not isinstance(status.get("readiness"), dict):
         return _mark_preflight_blocked(
-            reservation_id, "exact provider session did not return a readiness receipt"
+            reservation_id,
+            "exact provider session did not return a readiness receipt",
+            reason=PREFLIGHT_REASON_READINESS,
         )
     return get(reservation_id)
 
@@ -1915,6 +2165,7 @@ async def _launch_native_tui(
             reservation_id,
             f"provider {provider!r} has no native TUI launch branch; native providers are "
             f"{sorted(NATIVE_TUI_PROVIDERS)}",
+            reason=PREFLIGHT_REASON_PROVIDER_UNSUPPORTED,
         )
 
     request = record["request"]
@@ -1925,7 +2176,11 @@ async def _launch_native_tui(
         version_output = await asyncio.to_thread(provider_version_banner, bridge_request)
         environment = native_child_environment(bridge_request)
     except Exception as exc:  # noqa: BLE001 - nothing was started
-        return _mark_preflight_blocked(reservation_id, f"native preflight failed: {exc}")
+        return _mark_preflight_blocked(
+            reservation_id,
+            f"native preflight failed: {exc}",
+            reason=PREFLIGHT_REASON_NATIVE_PREFLIGHT,
+        )
 
     try:
         bootstrap = await asyncio.to_thread(
@@ -1939,7 +2194,11 @@ async def _launch_native_tui(
             request=request,
         )
     except Exception as exc:  # noqa: BLE001 - no turn was ever submitted
-        return _mark_preflight_blocked(reservation_id, f"native session bootstrap failed: {exc}")
+        return _mark_preflight_blocked(
+            reservation_id,
+            f"native session bootstrap failed: {exc}",
+            reason=PREFLIGHT_REASON_SESSION_BOOTSTRAP,
+        )
 
     try:
         intent = kimi_native_bootstrap.bootstrap_intent(
@@ -1965,7 +2224,11 @@ async def _launch_native_tui(
             transport=transport,
         )
     except Exception as exc:  # noqa: BLE001 - the attachment store holds the detail
-        return _mark_preflight_blocked(reservation_id, f"native TUI launch refused: {exc}")
+        return _mark_preflight_blocked(
+            reservation_id,
+            f"native TUI launch refused: {exc}",
+            reason=PREFLIGHT_REASON_TUI_LAUNCH_REFUSED,
+        )
 
     # Waited for here, at the only place that knows the pane just started,
     # and deliberately not at admission: a caller admits in a straight
@@ -2003,7 +2266,9 @@ async def _launch_native_tui(
         )
     except Exception as exc:  # noqa: BLE001 - a pane exists but bind cannot read it
         return _mark_preflight_blocked(
-            reservation_id, f"native readiness receipt could not be published: {exc}"
+            reservation_id,
+            f"native readiness receipt could not be published: {exc}",
+            reason=PREFLIGHT_REASON_READINESS,
         )
     return get(reservation_id)
 

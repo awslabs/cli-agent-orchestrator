@@ -58,6 +58,7 @@ _V2_RESERVATIONS_DDL = (
     "admission_json TEXT, "
     "execution_mode TEXT, "
     "execution_mode_source TEXT, "
+    "preflight_failure_json TEXT, "
     "created_at TEXT NOT NULL, "
     "updated_at TEXT NOT NULL"
     ")"
@@ -72,6 +73,7 @@ _V2_RESERVATIONS_ADDITIVE_COLUMNS = (
     ("bind_intent_json", "TEXT"),
     ("execution_mode", "TEXT"),
     ("execution_mode_source", "TEXT"),
+    ("preflight_failure_json", "TEXT"),
 )
 
 _V2_TERMINALS_DDL = (

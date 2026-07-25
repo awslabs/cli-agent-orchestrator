@@ -90,6 +90,8 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
     ManagedDestructiveRequest,
     ManagedLaunchV2AdmitRequest,
     ManagedLaunchV2BindRequest,
+    ManagedLaunchV2CleanupRequest,
+    ManagedLaunchV2NegativeRequest,
     ManagedLaunchV2ReserveRequest,
     ManagedV2FenceInstallRequest,
 )
@@ -1974,6 +1976,51 @@ async def resume_managed_launch_v2(
         return await asyncio.to_thread(
             managed_launch_v2.attempt_resume, reservation_id, containment_proven=False
         )
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/negative")
+async def finalize_managed_launch_v2_negative(
+    reservation_id: str,
+    body: ManagedLaunchV2NegativeRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Finalize a proven zero-byte v2 preflight failure (cond-0107).
+
+    Idempotent and re-drivable with zero task/provider I/O. The presence of
+    this route is itself the recovery-supported signal: a peer old enough to
+    lack it returns 404, which the caller reads as typed
+    ``recovery-unsupported`` (preserve the run and its breaker) — never a v1
+    fallback or a faked finalization.
+    """
+    try:
+        return await asyncio.to_thread(managed_launch_v2.finalize_negative, reservation_id, body)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/reconcile")
+async def reconcile_managed_launch_v2(
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Read-only adoption of durable v2 facts; never launches, sends, or deletes."""
+    try:
+        return await asyncio.to_thread(managed_launch_v2.reconcile, reservation_id)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/cleanup")
+async def cleanup_managed_launch_v2(
+    reservation_id: str,
+    body: ManagedLaunchV2CleanupRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Release the fork-owned v2 terminal record for a finalized generation."""
+    try:
+        return await asyncio.to_thread(managed_launch_v2.cleanup, reservation_id, body)
     except managed_launch.ManagedLaunchError as exc:
         raise _managed_launch_http_error(exc)
 

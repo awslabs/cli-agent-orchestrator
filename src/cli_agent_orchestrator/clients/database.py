@@ -245,6 +245,14 @@ class ManagedLaunchV2ReservationModel(Base):
     # historical ACP generation as an attachable native session.
     execution_mode = Column(Text, nullable=True)
     execution_mode_source = Column(Text, nullable=True)
+    # The immutable, redacted evidence for a generation that reached
+    # ``preflight_blocked`` — reason, redacted detail, the exact
+    # reservation/terminal/generation identity, and ``task_bytes_submitted``
+    # (always false in this state).  Written once, on the first transition
+    # into the blocked state, and never rewritten: recovery must read the
+    # original cause, not the last one to fail.  NULL for any row that
+    # never blocked.
+    preflight_failure_json = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
     updated_at = Column(Text, nullable=False)
 
