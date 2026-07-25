@@ -213,6 +213,177 @@ def _mode_record(row: Any) -> dict[str, Any]:
     }
 
 
+#: The provider-native readiness receipt kind published as a sibling of
+#: ``binding``, selected by the row's **bound mode** and provider — never
+#: by what a receipt says about itself, so a receipt cannot nominate the
+#: table that would accept it.
+#:
+#: Kimi native is deliberately absent, and its absence is meaningful
+#: rather than an omission. The two providers' readiness belongs to
+#: different evidence classes: Claude's is *provider-authored* — the
+#: SessionStart hook is the provider's own statement about itself — while
+#: Kimi's is an *observed attached pane* running the resumed session, with
+#: no hook and no provider statement anywhere in it. Minting a Kimi proof
+#: would mean relabelling this side's own pane observation as a provider
+#: claim, which is the manufactured-agreement failure the no-echo rule
+#: exists to prevent.
+_NATIVE_READINESS_SIBLING_SCHEMAS: dict[str, dict[str, str]] = {
+    em.NATIVE_TUI: {"claude_code": "cao-claude-native-readiness-v1"},
+}
+
+#: The only admissible reason in this lane for an object that carries no
+#: provider-authored proof. A closed vocabulary, so a consumer can branch
+#: on it rather than parse prose.
+PROOF_ABSENT_PROVIDER_AUTHORS_NONE = "provider-authors-no-readiness-proof"
+
+#: Fields the sibling publishes that only a running provider can author.
+#: Held as data so the completeness check below cannot drift from the set
+#: a consumer validates.
+_NATIVE_READINESS_OBSERVED_FIELDS = (
+    "session_start_hook_id",
+    "composer_state",
+    "pane_id",
+    "provider_process_id",
+    "observed_at",
+)
+
+
+def _published_process_id(process_identity: Any) -> Optional[str]:
+    """One process, rendered as the string the readiness sibling carries.
+
+    A bare pid is not identity — pids are recycled, so a stale one can
+    match an unrelated live process and forge a survivor, or match nothing
+    and forge a *no*-survivor. The start marker travels with it for that
+    reason; publishing the pid alone would hand a consumer exactly the
+    forgeable half.
+    """
+    if not isinstance(process_identity, dict):
+        return None
+    pid = process_identity.get("pid")
+    marker = process_identity.get("start_marker")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if not isinstance(marker, str) or not marker:
+        return None
+    return f"{pid}@{marker}"
+
+
+def _native_readiness_sibling(row: Any) -> Optional[dict[str, Any]]:
+    """The provider's own readiness proof, as a sibling of ``binding``.
+
+    The consumer of a native binding requires this receipt and refuses an
+    otherwise exact binding without it. Publishing it here closes a
+    response contract that was internally inconsistent: the proof existed,
+    durably, and the projection simply did not carry it.
+
+    **Every field comes from the reservation's own durable row or from a
+    provider observation. None is read from the request.** A field whose
+    only available source would be the request is not admissible as proof
+    — filling it would manufacture agreement between a claim and itself,
+    which is indistinguishable from verification to anyone downstream.
+
+    **Three states, not two.** The key is published *always*; an absent
+    key and a null one mean opposite things ("this peer cannot answer"
+    versus "this peer answered and there is nothing"), and a consumer is
+    entitled to wait through the second while refusing the first outright.
+    Within "answered" there are two further, distinct states:
+
+    * ``None`` — **if and only if** nothing is durably published yet. A
+      consumer reads this as not-yet and retries the same bind attempt.
+    * a *no-proof object* — readiness is durable, and this bound mode's
+      provider authors no readiness proof. Overloading ``None`` for this
+      would repeat the error the effort-observability table rejects: one
+      token that is true of one state and a lie about the other, leaving a
+      consumer polling a condition that can never clear and reporting a
+      timeout where the truth is a permanent gap.
+    * a *proof-bearing object* — readiness is durable and the provider
+      authored a statement about it.
+
+    Which object form is used is chosen by the bound mode's evidence class
+    as mapped per provider, never by anything the object says about
+    itself.
+    """
+    from cli_agent_orchestrator.services.managed_provider_bridge import read_state
+
+    mode = em.mode_of_record(_mode_record(row))
+    schema = _NATIVE_READINESS_SIBLING_SCHEMAS.get(mode, {}).get(row.provider)
+    try:
+        state = read_state(row.reservation_id)
+    except Exception as exc:  # noqa: BLE001 - unreadable is not "ready"
+        logger.warning(
+            "Could not read durable readiness for reservation %s: %s", row.reservation_id, exc
+        )
+        return None
+    receipt = (state or {}).get("readiness")
+    if (state or {}).get("state") != "ready" or not isinstance(receipt, dict):
+        return None
+
+    observation = receipt.get("model_input_ready_observation") or {}
+    if schema is None:
+        # Durable readiness whose provider authors no proof. Exactly these
+        # keys and no others: every provider-authored field is *absent*
+        # rather than null or empty, because a key whose only possible
+        # source would be invention must not exist in the object at all —
+        # a reader that finds it, even empty, has to decide whether it was
+        # attempted and failed, and there was nothing to attempt.
+        #
+        # ``schema`` is explicitly null rather than omitted: an omitted key
+        # is indistinguishable from a serialization bug, while a *string*
+        # would name a kind nobody defined, which is a refusal.
+        if mode != em.NATIVE_TUI or not bool(receipt.get("model_input_ready")):
+            return None
+        return {
+            "schema": None,
+            "proof_absent_reason": PROOF_ABSENT_PROVIDER_AUTHORS_NONE,
+            # Derived from the row's provider, carried so an operator can
+            # see which evidence class was applied without inferring it.
+            "provider_receipt_kind": _NATIVE_TUI_READINESS_RECEIPT_KINDS.get(row.provider),
+            "provider": row.provider,
+            "terminal_id": row.terminal_id,
+            "generation": row.generation,
+            "execution_mode": mode,
+            "input_ready": True,
+            "input_ready_observation": observation,
+        }
+    session_start = receipt.get("provider_session_start") or {}
+    sibling = {
+        # Identity, from the durable row. The bound mode decides the kind
+        # and is itself published, so a reader can check that the receipt
+        # it got is the one this mode calls for.
+        "schema": schema,
+        "provider": row.provider,
+        "terminal_id": row.terminal_id,
+        "generation": row.generation,
+        "execution_mode": em.mode_of_record(_mode_record(row)),
+        # The session the provider actually adopted, from the receipt's
+        # provider-session identity rather than from the id that was
+        # chosen for it — the two differ exactly when something went
+        # wrong, which is when this field matters.
+        "native_session_id": receipt.get("provider_session_id"),
+        # Provider-authored: the hook Claude itself wrote, naming the
+        # session it started.
+        "session_start_hook_id": session_start.get("session_id"),
+        # Observed: what the composer detector actually read off the pane,
+        # and when, and where.
+        "composer_state": observation.get("provider_status"),
+        "pane_id": observation.get("pane_id"),
+        "provider_process_id": _published_process_id(receipt.get("process_identity")),
+        "observed_at": observation.get("observed_at"),
+        "input_ready": bool(receipt.get("model_input_ready")),
+    }
+    # An incomplete proof is not a weaker proof; it is an absent one. A
+    # sibling published with holes would satisfy the "is it there?" half of
+    # a consumer's check while failing the half that matters, and the
+    # refusal would name a field rather than the real state, which is that
+    # readiness has not been established.
+    if not sibling["input_ready"] or not isinstance(sibling["native_session_id"], str):
+        return None
+    for field in _NATIVE_READINESS_OBSERVED_FIELDS:
+        if not isinstance(sibling.get(field), str) or not sibling[field]:
+            return None
+    return sibling
+
+
 def _row_dict(row: Any) -> dict[str, Any]:
     admission = _parse_json(row.admission_json, None)
     mode_record = _mode_record(row)
@@ -242,6 +413,21 @@ def _row_dict(row: Any) -> dict[str, Any]:
         "state": row.state,
         "request": _parse_json(row.request_json, {}),
         "binding": _parse_json(row.binding_json, None),
+        # A first-class sibling of ``binding``, never nested inside it: the
+        # binding digest both sides compute is taken over the binding
+        # object alone, so a sibling cannot move a byte of it, while a
+        # field added inside would silently change what admission is
+        # judged against.
+        #
+        # The key is published on EVERY row, in every state, including
+        # while the row is still launching and including for providers
+        # whose pair defines no receipt kind. Always-present is the whole
+        # discipline: a consumer reads an explicit null as "not yet" and
+        # waits, and an absent key as "this peer cannot answer" and
+        # refuses without waiting. Omitting the key when there is nothing
+        # to say would turn every ordinary not-yet-ready moment into a
+        # permanent refusal.
+        "native_readiness": _native_readiness_sibling(row),
         "bind_intent": _parse_json(getattr(row, "bind_intent_json", None), None),
         "admission": admission,
         "launch_failure": (
@@ -1156,7 +1342,6 @@ def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
         "generation": row.generation,
         "provider": row.provider,
         "agent_profile": row.agent_profile,
-        "model": request.get("expected_model"),
         "working_directory": row.working_directory,
     }
     mismatches = {
@@ -1164,6 +1349,25 @@ def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
         for key, value in expected.items()
         if receipt.get(key) != value
     }
+    # Model is compared outside the exact-equality set because a request
+    # and an observation are not always the same string. Kimi reads its
+    # route back as configured, so equality is right there. Claude reports
+    # a *resolved* id — an alias request for the latest model in a family
+    # comes back as the concrete member with a context-window suffix — so
+    # equality would refuse every correctly-routed Claude session. The
+    # family comparison is not looser: it refuses a different family, and
+    # a full-name request is still satisfied by exactly itself.
+    from cli_agent_orchestrator.services import claude_native_launch
+
+    expected_model = request.get("expected_model")
+    if row.provider == "claude_code":
+        model_ok = claude_native_launch.observed_model_matches(
+            str(expected_model or ""), receipt.get("model")
+        )
+    else:
+        model_ok = receipt.get("model") == expected_model
+    if not model_ok:
+        mismatches["model"] = {"expected": expected_model, "observed": receipt.get("model")}
     # Effort is compared through the effort vocabulary rather than by
     # string equality, because the route and a truthful receipt speak
     # different alphabets here: a provider-default route says
@@ -1175,9 +1379,23 @@ def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
     # relaxed: a receipt reporting a concrete effort for such a route is
     # still a mismatch, because it means the session settled somewhere
     # nobody selected.
+    #
+    # The observability is taken from the *declaration* for this (provider,
+    # model) pair, never from what the receipt says about itself — a
+    # receipt that could nominate its own comparison could always nominate
+    # the one it passes.
     expected_effort = request.get("expected_effort")
-    if not provider_contracts.effort_receipt_matches(expected_effort, receipt.get("effort")):
-        mismatches["effort"] = {"expected": expected_effort, "observed": receipt.get("effort")}
+    observability = provider_contracts.effort_observability(
+        row.provider, request.get("expected_model")
+    )
+    if not provider_contracts.effort_receipt_matches(
+        expected_effort, receipt.get("effort"), observability=observability
+    ):
+        mismatches["effort"] = {
+            "expected": expected_effort,
+            "observed": receipt.get("effort"),
+            "observability": observability,
+        }
     for field in ("receipt_id", "provider_session_id", "provider_version"):
         if not isinstance(receipt.get(field), str) or not receipt[field]:
             mismatches[field] = {"expected": "non-empty string", "observed": receipt.get(field)}
@@ -2529,7 +2747,15 @@ async def _launch_native_tui(
                 digest=digest,
             )
             launch_kind = native_tui_launch.LAUNCH_KIND_NEW
+            # The model is pinned on the launch argv itself. There is no
+            # later moment that could apply it: by the time anything could
+            # send a slash command the session is already running, and the
+            # first turn would have gone to whatever route the provider
+            # chose. The value was validated before the identity was
+            # minted, so this cannot introduce an unpinnable one.
             launch_extra_args = [
+                "--model",
+                bootstrap["requested_model"],
                 "--settings",
                 claude_native_readiness.settings_argument(readiness_hook["settings"]),
             ]
@@ -2627,6 +2853,29 @@ async def _launch_native_tui(
                 f"claude native readiness was never proven: {exc}",
                 reason=PREFLIGHT_REASON_READINESS,
             )
+        # The model analogue of the session-id check, on the same
+        # evidence and at the same moment. The hook the provider itself
+        # wrote names the model that is actually answering; comparing it
+        # to the pinned request is the only thing that can catch a launch
+        # that started on a different route, and it must happen before
+        # anything is admitted. Zero task bytes have crossed here, so a
+        # refusal costs a finalizable reservation rather than work spent
+        # on the wrong capability and quota pool.
+        observed_model = (session_start or {}).get("model")
+        if not claude_native_launch.observed_model_matches(
+            bootstrap["requested_model"], observed_model
+        ):
+            return _mark_preflight_blocked(
+                reservation_id,
+                (
+                    "the running Claude session is not on the requested route: requested "
+                    f"{bootstrap['requested_model']!r}, the provider's own session-start "
+                    f"proof observed {observed_model!r}. Refusing rather than admitting a "
+                    "task to a model nobody asked for"
+                ),
+                reason=PREFLIGHT_REASON_READINESS,
+            )
+        bootstrap["observed_model"] = claude_native_launch.normalize_observed_model(observed_model)
 
     # The post-proof boundary, and the only correct one. Before this point
     # the session id is what the launcher *intended* to run — a chosen uuid
@@ -2722,6 +2971,17 @@ def _mint_claude_native_session(
 
     check_pinned_version(_PINNED_PROVIDER["claude_code"], version_output)
 
+    # Pinned before the id is minted, for the same reason the version is:
+    # an unpinnable model is a refusal, and refusing after minting would
+    # leave a recorded identity for a session nobody was going to start.
+    # There is no default this side may choose — a launch without an
+    # explicit model runs on whatever the provider prefers, which is how a
+    # route requested as sonnet came up as a 1M Opus session.
+    try:
+        pinned_model = claude_native_launch.validate_requested_model(request["expected_model"])
+    except claude_native_launch.ClaudeNativeLaunchError as exc:
+        raise ManagedLaunchConflict(str(exc)) from exc
+
     native_session_id = claude_native_launch.mint_session_id()
     hook = claude_native_readiness.prepare(
         COMPANION_DIR, record["terminal_id"], record["generation"]
@@ -2739,8 +2999,32 @@ def _mint_claude_native_session(
         "provider_version": normalized_version(version_output),
         "binary_sha256": digest,
         "working_directory": record["working_directory"],
-        "model": request["expected_model"],
-        "effort": request["expected_effort"],
+        # The value the launch will pin, named as *requested* rather than
+        # as the route. Nothing has observed a model at this point — the
+        # provider has not been started — so a key called ``model`` here
+        # would be a claim about a session that does not exist. The
+        # observation arrives from the SessionStart proof and is checked
+        # against this before any task byte.
+        "requested_model": pinned_model,
+        "observed_model": None,
+        # An effort is requested and cannot be seen. Claude exposes no
+        # pre-turn effort surface — the same fact the route attestor
+        # already records when it declines to name one — so the request is
+        # kept, the observation is explicitly null, and the pair's
+        # declared observability says which of those two facts this is.
+        # Adopting the provider-default sentinel instead would be a
+        # different and false claim: that the model has no effort surface
+        # at all, which would silently discard a real requested effort.
+        "requested_effort": request["expected_effort"],
+        "observed_effort": None,
+        "effort_observability": provider_contracts.effort_observability(
+            "claude_code", pinned_model
+        ),
+        "effort_unobserved_reason": (
+            "Claude exposes no pre-turn effort surface: the value is settled by the "
+            "first turn, and this launch sends none. The requested effort is recorded "
+            "as requested; no effort was observed and none is claimed"
+        ),
         "readiness_path": str(hook["readiness_path"]),
         "task_bytes_submitted": False,
         "minted_at": _now(),
@@ -2907,8 +3191,28 @@ def _native_readiness_receipt(
         "generation": record["generation"],
         "provider": record["provider"],
         "agent_profile": record["agent_profile"],
-        "model": bootstrap["model"],
-        "effort": bootstrap["effort"],
+        # Observed, or explicitly absent — never the request wearing an
+        # observation's name. The Kimi bootstrap reads its route back off
+        # the session it configured, so ``model``/``effort`` there are
+        # genuine readings. The Claude bootstrap can read a model (the
+        # provider's session-start proof names it) and cannot read an
+        # effort at all, so it supplies the first and ``None`` for the
+        # second. A receipt that filled either from the reservation would
+        # certify a route by comparing a claim with itself.
+        "model": bootstrap.get("observed_model", bootstrap.get("model")),
+        "effort": bootstrap.get("observed_effort", bootstrap.get("effort")),
+        # The declared observability of this pair, carried so a reader can
+        # tell "no effort was requested" from "an effort was requested and
+        # cannot be seen yet" — different facts that a bare null would
+        # flatten into one.
+        "effort_observability": bootstrap.get(
+            "effort_observability",
+            provider_contracts.effort_observability(
+                record["provider"], bootstrap.get("model") or request["expected_model"]
+            ),
+        ),
+        "requested_effort": bootstrap.get("requested_effort", request["expected_effort"]),
+        "effort_unobserved_reason": bootstrap.get("effort_unobserved_reason"),
         "working_directory": record["working_directory"],
         "receipt_id": bootstrap["native_session_id"],
         "provider_session_id": bootstrap["native_session_id"],
