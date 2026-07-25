@@ -87,6 +87,22 @@ class TestRunStepEndpoint:
         assert resp.status_code == 200
         assert m_run.await_args.kwargs["model"] == "anthropic/claude-3.5-sonnet"
 
+    def test_explicit_model_null_is_accepted_same_as_omitted(self, client):
+        """Regression: Pydantic v2 does not run field_validators on a field
+        that falls back to its default (validate_default=False, the
+        default) -- so `model` omitted entirely never exercises
+        validate_model's `if v is None` branch. An explicit `"model": null`
+        in the request body does exercise it, and must be accepted exactly
+        like omitting the field."""
+        result = AgentStepResult(
+            terminal_id="abc12345", last_message="all done", status=TerminalStatus.COMPLETED
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(model=None))
+
+        assert resp.status_code == 200
+        assert m_run.await_args.kwargs["model"] is None
+
     def test_timeout_maps_to_504_with_structured_terminal_id(self, client):
         with patch(
             _RUN_STEP,

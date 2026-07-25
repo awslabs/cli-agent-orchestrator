@@ -166,14 +166,18 @@ class TestKiroCliProviderInitialization:
         profile.model = "claude-opus-4-6"
         mock_load_profile.return_value = profile
 
-        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer", model="fable-5")
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", model="fable-5"
+        )
 
         assert provider._get_profile_model() == "fable-5"
 
     def test_get_profile_model_explicit_override_applies_without_loading_profile(self):
         """An explicit override short-circuits before even attempting to
         load the CAO agent profile from disk."""
-        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer", model="fable-5")
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", model="fable-5"
+        )
 
         with patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile") as mock_load:
             result = provider._get_profile_model()
