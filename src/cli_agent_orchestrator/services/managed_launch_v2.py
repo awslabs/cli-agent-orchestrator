@@ -421,6 +421,11 @@ def _native_readiness_sibling(row: Any) -> Optional[dict[str, Any]]:
 def _row_dict(row: Any) -> dict[str, Any]:
     admission = _parse_json(row.admission_json, None)
     mode_record = _mode_record(row)
+    # The durable cleanup proof, and the only thing that may project
+    # ``cleaned``. Read with getattr so a row loaded by an older binary,
+    # or from a database predating the additive column, reads as
+    # not-cleaned rather than raising.
+    cleanup = _parse_json(getattr(row, "cleanup_json", None), None)
     return {
         # Projected through the mode readers, never read raw: every
         # public and durable surface therefore shows a concrete mode,
@@ -444,7 +449,27 @@ def _row_dict(row: Any) -> dict[str, Any]:
         "task_id": row.task_id,
         "run_id": row.run_id,
         "launch_nonce_digest": row.launch_nonce_digest,
-        "state": row.state,
+        # PROJECTED, not stored. A cleaned generation answers ``cleaned``
+        # while the row still holds the finalization verdict it actually
+        # reached, because these are two facts about different things: the
+        # verdict says how the generation ENDED, cleanup says what happened
+        # to its RESOURCES. Overwriting the durable state would erase which
+        # terminal outcome it had, and reservation history is immutable.
+        #
+        # It also keeps a safety gate honest without widening it: cleanup
+        # still requires a durable ``negative``, and because that string
+        # never changes, the gate keeps passing on retry exactly as
+        # written. A durable transition to ``cleaned`` would have forced
+        # that gate to accept a second state for no gain.
+        "state": "cleaned" if cleanup is not None else row.state,
+        # The durable state, unchanged, so nothing above is a claim a
+        # consumer has to take on trust: it can read the projection and the
+        # fact it was derived from in the same response.
+        "durable_state": row.state,
+        # The cleanup proof itself, always present as an explicit null
+        # before a cleanup, so a consumer distinguishes "not cleaned" from
+        # "this peer cannot say".
+        "cleanup": cleanup,
         "request": _parse_json(row.request_json, {}),
         "binding": _parse_json(row.binding_json, None),
         # A first-class sibling of ``binding``, never nested inside it: the
@@ -1411,12 +1436,30 @@ def reconcile(reservation_id: str) -> dict[str, Any]:
 def cleanup(reservation_id: str, request: ManagedLaunchV2CleanupRequest) -> dict[str, Any]:
     """Release the fork-owned terminal record for a finalized zero-byte generation.
 
-    Idempotent by ``cleanup_id`` and by effect: removing an already-absent
-    terminal row is a success.  Valid only once the generation is finalized
-    (``negative``); refused while the generation is still live.  This
-    releases only the v2 terminal *metadata* row — it never tears down a
-    pane or process, which stays the destructive endpoint's job under its
-    own containment gate.
+    Writes a durable cleanup record, once, first-writer-wins by
+    ``cleanup_id``. That record — not the absence of the terminal row — is
+    what projects the response's top-level ``state`` as ``cleaned``. An
+    absent row is not proof a cleanup happened: it can be missing for
+    having never existed, or for having been removed by something else, and
+    projecting from it would report a cleanup nobody performed.
+
+    ``cleaned`` is absorbing and idempotent. A retry with the same
+    ``cleanup_id`` replays the byte-identical stored proof — the same
+    ``cleaned_at``, the same ``terminal_record_removed`` — and performs no
+    second delete. It is the *answer* that has to be idempotent, not just
+    the effect: the answer is what crosses the boundary, and a consumer
+    that persists a different proof on a retry has persisted a different
+    fact. Recomputing it meant a retry after the first success reported
+    ``terminal_record_removed: false`` and a fresh timestamp, so which
+    proof a consumer stored depended on when it happened to ask.
+
+    A *different* ``cleanup_id`` against an already-cleaned generation is a
+    conflict, not a second cleanup.
+
+    Valid only once the generation is finalized (``negative``); refused
+    while it is still live. This releases only the v2 terminal *metadata*
+    row — it never tears down a pane or process, which stays the
+    destructive endpoint's job under its own containment gate.
     """
     try:
         with database.SessionLocal() as db:
@@ -1426,27 +1469,74 @@ def cleanup(reservation_id: str, request: ManagedLaunchV2CleanupRequest) -> dict
             _assert_recovery_identity(
                 row, terminal_id=request.terminal_id, generation=request.generation
             )
+            stored = _parse_json(getattr(row, "cleanup_json", None), None)
+            if stored is not None:
+                _assert_same_cleanup(stored, request)
+                # Absorbing: the stored proof is replayed exactly, and no
+                # second delete is attempted.
+                return _row_dict(row)
             if row.state != "negative":
                 raise ManagedLaunchConflict(
                     f"v2 cleanup requires the finalized state 'negative', not {row.state!r}"
                 )
-        removed = database.delete_terminal_v2_if_generation(request.terminal_id, request.generation)
-        record = get(reservation_id)
-        return {
-            **record,
-            "cleanup": {
-                "schema": "cao-managed-launch-v2-cleanup-v1",
-                "cleanup_id": request.cleanup_id,
-                "terminal_id": request.terminal_id,
-                "generation": request.generation,
-                "terminal_record_removed": removed,
-                "cleaned_at": _now(),
-            },
-        }
+
+        cleaned_at = _now()
+
+        def _build(terminal_record_removed: bool) -> str:
+            return _canonical_json(
+                {
+                    "schema": "cao-managed-launch-v2-cleanup-v1",
+                    "cleanup_id": request.cleanup_id,
+                    "terminal_id": request.terminal_id,
+                    "generation": request.generation,
+                    "terminal_record_removed": terminal_record_removed,
+                    "cleaned_at": cleaned_at,
+                }
+            )
+
+        database.record_v2_cleanup_first_writer(
+            reservation_id,
+            build_record=_build,
+            terminal_id=request.terminal_id,
+            generation=request.generation,
+        )
+        # Whether this call won or lost the race, the durable record is now
+        # the single account of the cleanup. A loser converges on the
+        # winner's proof when it carries the same id and conflicts when it
+        # does not — the same rule the replay path applies, so a race and a
+        # retry cannot be told apart by their outcome.
+        with database.SessionLocal() as db:
+            row = _query(db, reservation_id)
+            if row is None:
+                raise ManagedLaunchNotFound(f"v2 reservation not found: {reservation_id}")
+            stored = _parse_json(getattr(row, "cleanup_json", None), None)
+            if stored is None:
+                raise ManagedLaunchUnavailable(
+                    "v2 cleanup recorded no durable proof; refusing to report a "
+                    "cleanup that cannot be read back"
+                )
+            _assert_same_cleanup(stored, request)
+            return _row_dict(row)
     except ManagedLaunchError:
         raise
     except Exception as exc:  # noqa: BLE001
         raise ManagedLaunchUnavailable(f"v2 cleanup failed: {exc}") from exc
+
+
+def _assert_same_cleanup(stored: dict[str, Any], request: ManagedLaunchV2CleanupRequest) -> None:
+    """Refuse a second, different cleanup of an already-cleaned generation.
+
+    Named rather than inlined because the replay path and the lost-race
+    path must apply exactly the same rule: if they could differ, a caller
+    could learn which one it took from the outcome, and a race would stop
+    being indistinguishable from a retry.
+    """
+    if stored.get("cleanup_id") != request.cleanup_id:
+        raise ManagedLaunchConflict(
+            f"v2 generation is already cleaned under cleanup_id "
+            f"{stored.get('cleanup_id')!r}; {request.cleanup_id!r} would be a second "
+            "cleanup of one generation, not a retry of the first"
+        )
 
 
 def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:

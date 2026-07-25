@@ -22,10 +22,12 @@ Both the service docstring and the request model docstring say "Idempotent
 by ``cleanup_id``". Nothing reads or stores that field, so (3) and (4) are
 the docstring being false rather than a subtle edge.
 
-STATUS: these encode the *reproduction*, not yet the agreed semantics. The
-retained spec writer owes a short amendment naming the terminal state and
-where the proof is durably kept; the assertions marked below are the ones
-that must be reconciled with it before production changes.
+Reconciled to §24.12 / E(xi): the response PROJECTION says ``cleaned``,
+derived from a durable cleanup record written once (first-writer-wins by
+``cleanup_id``), while the durable finalization state stays ``negative``
+and remains readable. Absence of the terminal row never projects
+``cleaned``. A different ``cleanup_id`` is a conflict, not a second
+cleanup.
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
     ManagedLaunchV2ReserveRequest,
 )
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
+from cli_agent_orchestrator.services.managed_launch import ManagedLaunchConflict
 
 #: The state a cleaned generation is expected to reach. v1 uses exactly
 #: this string, and a consumer requiring it is why this issue was opened.
@@ -162,14 +165,25 @@ class TestWhatCleanupAlreadyDoesCorrectly:
         assert result["cleanup"]["schema"] == "cao-managed-launch-v2-cleanup-v1"
         assert result["cleanup"]["terminal_record_removed"] is True
 
-    def test_removing_an_already_absent_row_is_still_a_success(self, finalized):
-        """Idempotent by *effect*, which is the one kind it does have."""
-        v2.cleanup(finalized["reservation_id"], _cleanup_request(finalized, str(uuid.uuid4())))
-        again = v2.cleanup(
-            finalized["reservation_id"], _cleanup_request(finalized, str(uuid.uuid4()))
-        )
+    def test_a_retry_still_succeeds_and_no_longer_reports_a_false_removal(self, finalized):
+        """Supersedes the old "idempotent by effect" behaviour.
 
-        assert again["cleanup"]["terminal_record_removed"] is False
+        Before §24.12 a retry recomputed the proof, so the second call
+        reported ``terminal_record_removed: false`` -- truthfully about
+        *that* delete, and misleadingly about the cleanup. The removal is
+        now attributed permanently to the call that performed it, so a
+        retry replays ``true``.
+
+        The retry uses the SAME cleanup_id, because that is what a retry
+        is; a different id is a second cleanup and is refused elsewhere.
+        """
+        cleanup_id = str(uuid.uuid4())
+
+        first = v2.cleanup(finalized["reservation_id"], _cleanup_request(finalized, cleanup_id))
+        again = v2.cleanup(finalized["reservation_id"], _cleanup_request(finalized, cleanup_id))
+
+        assert first["cleanup"]["terminal_record_removed"] is True
+        assert again["cleanup"]["terminal_record_removed"] is True
 
     def test_it_still_refuses_a_generation_that_is_not_finalized(
         self, worktree, tmp_path, _companion, isolated_memory_db
@@ -307,23 +321,268 @@ class TestTheIdempotencyGap:
 
         assert replay["cleanup"] == first["cleanup"]
 
-    def test_a_second_distinct_cleanup_id_does_not_mint_a_rival_proof(self, finalized):
+    def test_a_second_distinct_cleanup_id_is_a_conflict(self, finalized):
         """Exactly one cleanup is authoritative for one generation.
 
-        Accepting a second id produces two equally valid-looking proofs for
-        the same generation, with no rule saying which one happened.
-
-        NOTE: whether a rival id should be REFUSED or should converge on
-        the stored proof is a semantic choice for the amendment. This
-        asserts only that it must not mint an independent second proof --
-        the part both options agree on.
+        §24.12 decided this direction: a different id is a conflict rather
+        than converging on the stored proof, because it is a second cleanup
+        of one generation, not a retry of the first.
         """
         first = v2.cleanup(
             finalized["reservation_id"], _cleanup_request(finalized, str(uuid.uuid4()))
         )["cleanup"]
 
-        second = v2.cleanup(
-            finalized["reservation_id"], _cleanup_request(finalized, str(uuid.uuid4()))
-        )["cleanup"]
+        with pytest.raises(ManagedLaunchConflict, match="already cleaned"):
+            v2.cleanup(finalized["reservation_id"], _cleanup_request(finalized, str(uuid.uuid4())))
 
-        assert second["cleanup_id"] == first["cleanup_id"]
+        assert v2.get(finalized["reservation_id"])["cleanup"] == first
+
+
+class TestHistoryIsNotRewritten:
+    """The projection must not cost the finalization verdict.
+
+    These are two facts about different things: the verdict says how the
+    generation ended, cleanup says what happened to its resources.
+    """
+
+    def test_the_durable_finalization_state_is_unchanged(self, finalized):
+        v2.cleanup(finalized["reservation_id"], _cleanup_request(finalized, str(uuid.uuid4())))
+
+        with database.SessionLocal() as db:
+            row = v2._query(db, finalized["reservation_id"])
+            assert row.state == "negative"
+
+    def test_the_finalization_outcome_is_still_readable_after_cleanup(self, finalized):
+        before = v2.get(finalized["reservation_id"])["admission"]
+
+        after = v2.cleanup(
+            finalized["reservation_id"], _cleanup_request(finalized, str(uuid.uuid4()))
+        )
+
+        assert after["admission"] == before
+        assert after["admission"]["finalized_from_state"] == "launching"
+        assert after["durable_state"] == "negative"
+
+    def test_the_negative_gate_still_passes_on_retry_unwidened(self, finalized):
+        """Why not overwriting the state also keeps a safety gate narrow.
+
+        The cleanup precondition is ``state == "negative"``. Because the
+        durable state never changes, that gate keeps passing on retry
+        exactly as written -- a durable transition to ``cleaned`` would
+        have forced it to accept a second state for no gain.
+        """
+        import inspect
+
+        assert 'row.state != "negative"' in inspect.getsource(v2.cleanup)
+
+        cleanup_id = str(uuid.uuid4())
+        v2.cleanup(finalized["reservation_id"], _cleanup_request(finalized, cleanup_id))
+        v2.cleanup(finalized["reservation_id"], _cleanup_request(finalized, cleanup_id))
+
+
+class TestTheProjectionDerivesFromTheRecordNotAbsence:
+    """The test that distinguishes a real fix from a convenient one."""
+
+    def test_a_missing_terminal_row_alone_never_projects_cleaned(self, finalized):
+        """An absent row is not proof a cleanup happened.
+
+        It can be missing for having never existed, or for having been
+        removed by something else. Projecting from it would report a
+        cleanup nobody performed -- and would make the proof a consumer
+        persists unfalsifiable.
+        """
+        database.delete_terminal_v2(finalized["terminal_id"])
+
+        projected = v2.get(finalized["reservation_id"])
+
+        assert projected["state"] == "negative"
+        assert projected["cleanup"] is None
+
+    def test_the_cleanup_key_is_an_explicit_null_before_any_cleanup(self, finalized):
+        """Always-present, so "not cleaned" differs from "cannot say"."""
+        projected = v2.get(finalized["reservation_id"])
+
+        assert "cleanup" in projected
+        assert projected["cleanup"] is None
+
+
+class TestConcurrentCleanupResolvesOneWayOnly:
+    """First-writer-wins, enforced at the write and not merely checked.
+
+    Two callers both read no durable record before either commits. The
+    write condition is ``cleanup_json IS NULL``, so exactly one commits;
+    the loser rolls back its delete with it, leaving the winner's
+    ``terminal_record_removed`` as the only account of what happened.
+    """
+
+    def test_two_concurrent_cleanups_produce_one_record(self, finalized, monkeypatch):
+        cleanup_id = str(uuid.uuid4())
+        other_id = str(uuid.uuid4())
+        real = database.record_v2_cleanup_first_writer
+        fired = []
+
+        def _interleaved(reservation_id, **kwargs):
+            # A rival cleanup commits in the window after this caller read
+            # no record and before it writes one.
+            if not fired:
+                fired.append(True)
+                real(
+                    reservation_id,
+                    build_record=lambda removed: v2._canonical_json(
+                        {
+                            "schema": "cao-managed-launch-v2-cleanup-v1",
+                            "cleanup_id": other_id,
+                            "terminal_id": finalized["terminal_id"],
+                            "generation": finalized["generation"],
+                            "terminal_record_removed": removed,
+                            "cleaned_at": "2026-07-25T00:00:00Z",
+                        }
+                    ),
+                    terminal_id=kwargs["terminal_id"],
+                    generation=kwargs["generation"],
+                )
+            return real(reservation_id, **kwargs)
+
+        monkeypatch.setattr(database, "record_v2_cleanup_first_writer", _interleaved)
+
+        # The loser must not silently succeed under its own id.
+        with pytest.raises(ManagedLaunchConflict, match="already cleaned"):
+            v2.cleanup(finalized["reservation_id"], _cleanup_request(finalized, cleanup_id))
+
+        stored = v2.get(finalized["reservation_id"])["cleanup"]
+        assert stored["cleanup_id"] == other_id
+        assert stored["terminal_record_removed"] is True
+
+    def test_the_losers_delete_is_rolled_back_with_its_write(self, finalized):
+        """The delete and the record share one transaction, both ways.
+
+        A loser that committed its delete while its record rolled back
+        would remove a row the winner's proof says it removed -- or worse,
+        remove one after a winner that recorded no removal, leaving the
+        durable proof describing a world that did not happen.
+
+        Set up so the rollback is the only thing that can save the row: a
+        record exists (so this caller loses) while the terminal row is
+        still present (so its delete has something to remove).
+        """
+        rival = v2._canonical_json(
+            {
+                "schema": "cao-managed-launch-v2-cleanup-v1",
+                "cleanup_id": str(uuid.uuid4()),
+                "terminal_id": finalized["terminal_id"],
+                "generation": finalized["generation"],
+                "terminal_record_removed": False,
+                "cleaned_at": "2026-07-25T00:00:00Z",
+            }
+        )
+        with database.SessionLocal() as db:
+            db.query(database.ManagedLaunchV2ReservationModel).filter(
+                database.ManagedLaunchV2ReservationModel.reservation_id
+                == finalized["reservation_id"]
+            ).update({"cleanup_json": rival}, synchronize_session=False)
+            db.commit()
+
+        won = database.record_v2_cleanup_first_writer(
+            finalized["reservation_id"],
+            build_record=lambda removed: v2._canonical_json({"never": "stored"}),
+            terminal_id=finalized["terminal_id"],
+            generation=finalized["generation"],
+        )
+
+        assert won is False
+        # The row the loser's delete had already matched must still be here.
+        assert database.get_terminal_metadata_v2(finalized["terminal_id"]) is not None
+        assert v2.get(finalized["reservation_id"])["cleanup"]["terminal_record_removed"] is False
+
+
+class TestResponseLoss:
+    """The answer must be idempotent, not only the effect.
+
+    The answer is what crosses the boundary: a consumer that persists a
+    different proof on a retry has persisted a different fact.
+    """
+
+    def test_the_retry_returns_a_byte_identical_proof(self, finalized):
+        """Compared field by field, not merely both succeeding."""
+        cleanup_id = str(uuid.uuid4())
+
+        issued = v2.cleanup(finalized["reservation_id"], _cleanup_request(finalized, cleanup_id))[
+            "cleanup"
+        ]
+        # The response is lost; the caller retries the identical request.
+        replayed = v2.cleanup(finalized["reservation_id"], _cleanup_request(finalized, cleanup_id))[
+            "cleanup"
+        ]
+
+        assert replayed == issued
+        assert replayed["cleaned_at"] == issued["cleaned_at"]
+        assert replayed["terminal_record_removed"] == issued["terminal_record_removed"]
+
+    def test_the_projection_is_stable_across_the_retry(self, finalized):
+        cleanup_id = str(uuid.uuid4())
+
+        first = v2.cleanup(finalized["reservation_id"], _cleanup_request(finalized, cleanup_id))
+        second = v2.cleanup(finalized["reservation_id"], _cleanup_request(finalized, cleanup_id))
+
+        assert first["state"] == second["state"] == CLEANED
+        assert first["durable_state"] == second["durable_state"] == "negative"
+
+
+class TestIdentityIsStillAsserted:
+    """Unchanged by this repair, and pinned so it stays that way."""
+
+    def test_a_foreign_generation_is_refused_before_anything_is_written(self, finalized):
+        bad = ManagedLaunchV2CleanupRequest(
+            protocol_version=PROTOCOL_VERSION_V2,
+            cleanup_id=str(uuid.uuid4()),
+            terminal_id=finalized["terminal_id"],
+            generation=str(uuid.uuid4()),
+            obligation_generation=finalized["obligation_generation"],
+        )
+
+        with pytest.raises(ManagedLaunchConflict):
+            v2.cleanup(finalized["reservation_id"], bad)
+
+        assert v2.get(finalized["reservation_id"])["cleanup"] is None
+        assert database.get_terminal_metadata_v2(finalized["terminal_id"]) is not None
+
+    def test_a_foreign_terminal_id_is_refused(self, finalized):
+        bad = ManagedLaunchV2CleanupRequest(
+            protocol_version=PROTOCOL_VERSION_V2,
+            cleanup_id=str(uuid.uuid4()),
+            terminal_id="ffffffff",
+            generation=finalized["generation"],
+            obligation_generation=finalized["obligation_generation"],
+        )
+
+        with pytest.raises(ManagedLaunchConflict):
+            v2.cleanup(finalized["reservation_id"], bad)
+
+        assert v2.get(finalized["reservation_id"])["cleanup"] is None
+
+
+class TestTheSchemaAdditionIsForwardOnly:
+    def test_the_column_is_declared_additive(self):
+        """An old binary must ignore the new column, not fail on it."""
+        from cli_agent_orchestrator.services import vintage_migration as vm
+
+        assert ("cleanup_json", "TEXT") in vm._V2_RESERVATIONS_ADDITIVE_COLUMNS
+
+    def test_a_row_without_the_column_reads_as_not_cleaned(self, finalized):
+        """A database predating the column projects negative, never cleaned."""
+
+        class _OldRow:
+            def __init__(self, real):
+                self._real = real
+
+            def __getattr__(self, name):
+                if name == "cleanup_json":
+                    raise AttributeError(name)
+                return getattr(self._real, name)
+
+        with database.SessionLocal() as db:
+            row = v2._query(db, finalized["reservation_id"])
+            projected = v2._row_dict(_OldRow(row))
+
+        assert projected["state"] == "negative"
+        assert projected["cleanup"] is None

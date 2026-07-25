@@ -649,13 +649,33 @@ class TestCleanup:
         assert out["cleanup"]["terminal_record_removed"] is True
         assert v2.reconcile(record["reservation_id"])["terminal_record_present"] is False
 
-    def test_is_idempotent_when_the_record_is_already_gone(
-        self, isolated_memory_db, worktree, tmp_path
-    ):
+    def test_a_retry_replays_the_byte_identical_proof(self, isolated_memory_db, worktree, tmp_path):
+        """Reconciled to §24.12, which names the old behaviour as a defect.
+
+        This previously asserted that a retry reports
+        ``terminal_record_removed: false`` -- truthful about *that* delete
+        and misleading about the cleanup, and it meant the proof a consumer
+        persisted depended on when it happened to ask. The removal is now
+        attributed permanently to the call that performed it.
+
+        A retry is the SAME ``cleanup_id``; a different one is a second
+        cleanup, asserted just below.
+        """
+        record = self._finalized_with_terminal(worktree, tmp_path)
+        request = _cleanup_request(record)
+
+        first = v2.cleanup(record["reservation_id"], request)
+        again = v2.cleanup(record["reservation_id"], request)
+
+        assert again["cleanup"] == first["cleanup"]
+        assert again["cleanup"]["terminal_record_removed"] is True
+
+    def test_a_different_cleanup_id_is_a_conflict(self, isolated_memory_db, worktree, tmp_path):
         record = self._finalized_with_terminal(worktree, tmp_path)
         v2.cleanup(record["reservation_id"], _cleanup_request(record))
-        again = v2.cleanup(record["reservation_id"], _cleanup_request(record))
-        assert again["cleanup"]["terminal_record_removed"] is False
+
+        with pytest.raises(ManagedLaunchConflict):
+            v2.cleanup(record["reservation_id"], _cleanup_request(record))
 
     def test_refused_before_finalization(self, isolated_memory_db, worktree, tmp_path):
         record = _reserve(worktree, tmp_path)

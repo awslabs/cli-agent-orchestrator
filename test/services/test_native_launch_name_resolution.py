@@ -68,6 +68,57 @@ def _bound_names(node: ast.AST) -> set[str]:
     return bound
 
 
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _own_scope_nodes(node: ast.AST) -> tuple[list[ast.Name], list[ast.AST]]:
+    """Split a function body into its OWN loads and its nested scopes.
+
+    Nested functions are not descended into here. They open a new scope in
+    which their parameters are bound and the enclosing function's locals
+    are free, so auditing them with the outer function's binding set
+    reports both as unresolved: the parameter is not an outer local, and
+    the closed-over name is not an inner one. Both readings are wrong, and
+    an audit that cannot be trusted on correct code stops being read.
+    """
+    loads: list[ast.Name] = []
+    nested: list[ast.AST] = []
+    stack = list(ast.iter_child_nodes(node))
+    while stack:
+        child = stack.pop()
+        if isinstance(child, _SCOPES):
+            nested.append(child)
+            # Decorators and default arguments DO evaluate in this scope,
+            # so they are audited here rather than with the nested body.
+            for outer in list(getattr(child, "decorator_list", [])) + list(
+                getattr(child.args, "defaults", []) or []
+            ):
+                stack.append(outer)
+            continue
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+            loads.append(child)
+        stack.extend(ast.iter_child_nodes(child))
+    return loads, nested
+
+
+def _audit(node, enclosing, module_name, module_scope, unresolved, name):
+    scope = enclosing | _bound_names(node)
+    loads, nested = _own_scope_nodes(node)
+    for load in loads:
+        if load.id in scope or load.id in module_scope:
+            continue
+        unresolved.append(f"{module_name}:{load.lineno} {name}() -> {load.id!r}")
+    for child in nested:
+        _audit(
+            child,
+            scope,
+            module_name,
+            module_scope,
+            unresolved,
+            getattr(child, "name", "<lambda>"),
+        )
+
+
 @pytest.mark.parametrize("module_name", AUDITED)
 def test_every_referenced_name_resolves(module_name):
     module = importlib.import_module(module_name)
@@ -77,14 +128,37 @@ def test_every_referenced_name_resolves(module_name):
 
     unresolved: list[str] = []
     for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        local = _bound_names(node)
-        for sub in ast.walk(node):
-            if not (isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load)):
-                continue
-            if sub.id in local or sub.id in module_scope:
-                continue
-            unresolved.append(f"{module_name}:{sub.lineno} {node.name}() -> {sub.id!r}")
+        # Only top-level-in-their-parent functions start an audit; nested
+        # ones are reached through their enclosing scope so they inherit it.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not any(
+            node in _own_scope_nodes(other)[1]
+            for other in ast.walk(tree)
+            if isinstance(other, _SCOPES) and other is not node
+        ):
+            _audit(node, set(), module_name, module_scope, unresolved, node.name)
 
     assert unresolved == [], "names referenced but never bound:\n" + "\n".join(unresolved)
+
+
+def test_the_audit_still_catches_a_genuinely_unbound_name():
+    """The fix for closures must not turn the gate off.
+
+    A nested scope now inherits its enclosing bindings, which is exactly
+    the change that could make everything resolve. This drives the audit
+    over a module that closes over one real name and references one that
+    was never bound anywhere, and requires it to report only the second.
+    """
+    source = (
+        "def outer():\n"
+        "    captured = 1\n"
+        "    def inner(param):\n"
+        "        return captured + param + never_bound\n"
+        "    return inner\n"
+    )
+    tree = ast.parse(source)
+    unresolved: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "outer":
+            _audit(node, set(), "probe", set(dir(builtins)), unresolved, node.name)
+
+    assert [u.split("-> ")[1] for u in unresolved] == ["'never_bound'"]

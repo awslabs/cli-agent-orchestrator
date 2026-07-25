@@ -279,6 +279,17 @@ class ManagedLaunchV2ReservationModel(Base):
     # boundary reconciles against the same bytes.
     bind_intent_json = Column(Text, nullable=True)
     admission_json = Column(Text, nullable=True)
+    #: The durable cleanup proof, written once by the first caller to clean
+    #: this generation. Additive and nullable: an old binary reading this
+    #: table ignores the column rather than failing on it, and an existing
+    #: row keeps its bytes.
+    #:
+    #: Its PRESENCE -- never the absence of the terminal row -- is what lets
+    #: a response project ``cleaned``. A missing terminal row is not proof a
+    #: cleanup happened: it can be absent for having never existed, or for
+    #: having been removed by something else, and projecting from that would
+    #: report a cleanup nobody performed.
+    cleanup_json = Column(Text, nullable=True)
     # The resolved execution mode ('native_tui' | 'acp') and the
     # precedence level that supplied it.  Nullable on purpose: a row
     # written before the execution-mode contract existed carries NULL,
@@ -1404,6 +1415,84 @@ def delete_terminal_v2_if_generation(terminal_id: str, generation: str) -> bool:
         )
         db.commit()
         return deleted > 0
+
+
+def record_v2_cleanup_first_writer(
+    reservation_id: str,
+    *,
+    build_record: Any,
+    terminal_id: str,
+    generation: str,
+) -> bool:
+    """Delete the v2 terminal row and record the cleanup proof, atomically.
+
+    ``build_record`` is called with the observed ``terminal_record_removed``
+    and returns the canonical proof bytes to store, so the value recorded is
+    the one this transaction actually observed rather than one the caller
+    guessed before the delete.
+
+    Returns True when this call was the first writer and both effects
+    landed, False when another writer already recorded a cleanup for this
+    reservation — in which case nothing here is written and no row is
+    deleted.
+
+    The two effects share one transaction because the proof states what
+    *this* call observed. Deleting first and recording second would leave a
+    crash window in which the row is gone and no record says so: the retry
+    would then observe an already-absent row and record
+    ``terminal_record_removed: false``, permanently attributing the removal
+    to nobody. Recording first and deleting second has the mirror problem —
+    a proof claiming a removal that never happened. Rolling both back
+    together is the only ordering where the proof cannot describe a world
+    that did not occur.
+
+    The write condition is ``cleanup_json IS NULL``, which is the
+    first-writer-wins rule stated where it is enforced rather than checked
+    beforehand and hoped for: two concurrent cleanups both read no record,
+    and exactly one of them commits.
+    """
+    with SessionLocal() as db:
+        deleted = (
+            db.query(ManagedLaunchV2TerminalModel)
+            .filter(
+                ManagedLaunchV2TerminalModel.id == terminal_id,
+                ManagedLaunchV2TerminalModel.generation == generation,
+            )
+            .delete(synchronize_session=False)
+        )
+        updated = (
+            db.query(ManagedLaunchV2ReservationModel)
+            .filter(
+                ManagedLaunchV2ReservationModel.reservation_id == reservation_id,
+                ManagedLaunchV2ReservationModel.cleanup_json.is_(None),
+            )
+            .update(
+                {
+                    "cleanup_json": build_record(deleted > 0),
+                    "updated_at": datetime.now().isoformat(),
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated != 1:
+            # Lost the race. The rollback also undoes the delete above, so
+            # the winner's recorded ``terminal_record_removed`` stays the
+            # only account of what happened to the row.
+            db.rollback()
+            return False
+        db.commit()
+        return True
+
+
+def v2_cleanup_record(reservation_id: str) -> Optional[str]:
+    """The durable cleanup proof for a reservation, or None."""
+    with SessionLocal() as db:
+        row = (
+            db.query(ManagedLaunchV2ReservationModel)
+            .filter(ManagedLaunchV2ReservationModel.reservation_id == reservation_id)
+            .first()
+        )
+        return None if row is None else row.cleanup_json
 
 
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
