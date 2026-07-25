@@ -658,3 +658,183 @@ class TestCrashWindow:
         assert [r.request_id for r in journal.in_flight()] == [REQ]
         journal.mark_refused(REQ, reason_code=REASON_PANE_BUSY)
         assert journal.in_flight() == []
+
+
+SOCKET = "/private/tmp/tmux-501/cao.sock"
+OTHER_SOCKET = "/private/tmp/tmux-501/somebody-elses.sock"
+
+
+def _v1_row(db_path, state, *, chunks_sent=None):
+    """A journal written before ``server_socket_path`` existed.
+
+    Built at the real v1 shape — the column is genuinely absent, not
+    present-and-null — so opening it exercises the additive migration
+    rather than a hand-made imitation of its result.  Only then does the
+    row look like what an upgraded operator actually has: a request that
+    was bound, and possibly already delivered, by a binary that had no
+    concept of which tmux server it was talking to.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript("""
+            CREATE TABLE control_input_request (
+              request_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL,
+              pane_id TEXT NOT NULL, window_id TEXT NOT NULL,
+              pane_pid INTEGER NOT NULL, generation TEXT,
+              request_sha256 TEXT NOT NULL, state TEXT NOT NULL,
+              reason_code TEXT, chunks_sent INTEGER, enter_attempted INTEGER,
+              owner_pid INTEGER NOT NULL, owner_token TEXT NOT NULL,
+              opened_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            ) WITHOUT ROWID;
+            """)
+        conn.execute(
+            "INSERT INTO control_input_request VALUES " "(?,?,?,?,?,?,?,?,NULL,?,NULL,?,?,?,?)",
+            (
+                REQ,
+                TERMINAL,
+                PANE,
+                WINDOW,
+                PANE_PID,
+                "gen-1",
+                _sha(),
+                state,
+                chunks_sent,
+                os.getpid(),
+                "v1-owner",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert "server_socket_path" not in _columns(db_path), "the v1 fixture is not v1"
+    return ControlInputJournal(db_path)
+
+
+def _columns(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return {row[1] for row in conn.execute("PRAGMA table_info(control_input_request)")}
+    finally:
+        conn.close()
+
+
+def _stored_socket(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT server_socket_path FROM control_input_request WHERE request_id=?",
+            (REQ,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+class TestMigratedRowsAreNotRebindings:
+    """A row from before the socket existed must still be the same request.
+
+    The upgrade is the dangerous moment.  Every stored row suddenly has a
+    null in a column that now participates in identity, while the clients
+    re-arriving against those rows have started stating a real value.  If
+    that difference reads as "a different control wearing this id", the
+    journal stops recognising its own delivered requests — and the one
+    thing it exists to prevent, a second write for a control the operator
+    authorised once, becomes reachable through the front door.
+    """
+
+    def test_a_delivered_v1_row_replays_instead_of_rebinding(self, db_path):
+        """The reported P1, at the state where it costs the most.
+
+        The request was really delivered.  A retry after a lost response
+        must be told exactly that, because the alternative — a rebound
+        error the caller reads as "this id is free, send it again" — is a
+        duplicate write of a control that already landed.
+        """
+        book = _v1_row(db_path, DELIVERED, chunks_sent=1)
+        record = book.open_intent(_binding(server_socket_path=SOCKET))
+
+        assert record.state == DELIVERED
+        assert record.outcome == ACCEPTED
+        assert record.chunks_sent == 1
+        # Nothing was re-armed: a delivered row has no path back to an
+        # attemptable state, so the retry cannot become a second write.
+        assert book.get(REQ).state == DELIVERED
+
+    def test_a_delivered_v1_row_does_not_adopt_the_socket_it_never_used(self, db_path):
+        """The write already happened, against a server nobody recorded.
+
+        Stamping the socket the *retry* names would convert "unknown" into
+        a stored fact, and every later comparison would trust it as though
+        the original delivery had been verified against it.
+        """
+        book = _v1_row(db_path, DELIVERED, chunks_sent=1)
+        book.open_intent(_binding(server_socket_path=SOCKET))
+        assert _stored_socket(db_path) is None
+
+    def test_an_ambiguous_v1_row_neither_rebinds_nor_adopts(self, db_path):
+        """Ambiguous means a write may have reached the pane."""
+        book = _v1_row(db_path, STATE_AMBIGUOUS)
+        record = book.open_intent(_binding(server_socket_path=SOCKET))
+        assert record.state == STATE_AMBIGUOUS
+        assert record.outcome == AMBIGUOUS
+        assert _stored_socket(db_path) is None
+
+    def test_a_pre_write_v1_row_adopts_the_socket_it_is_about_to_use(self, db_path):
+        """Before any byte, the socket describes the write to come.
+
+        Recording it here is what stops the row being permanently
+        unqualified — after this, the exact comparison below applies.
+        """
+        book = _v1_row(db_path, INTENT)
+        assert book.open_intent(_binding(server_socket_path=SOCKET)).state == INTENT
+        assert _stored_socket(db_path) == SOCKET
+
+        with pytest.raises(ControlInputRebound, match="different pane"):
+            book.open_intent(_binding(server_socket_path=OTHER_SOCKET))
+
+    def test_a_refused_v1_row_is_still_re_armed_and_adopts(self, db_path):
+        """Refused promises a re-attempt; the promise survives the upgrade."""
+        book = _v1_row(db_path, STATE_REFUSED)
+        assert book.open_intent(_binding(server_socket_path=SOCKET)).state == INTENT
+        assert _stored_socket(db_path) == SOCKET
+
+    def test_the_relaxation_does_not_swallow_a_real_rebinding(self, db_path):
+        """Only the socket is forgiven, and only when it was never stored."""
+        book = _v1_row(db_path, DELIVERED, chunks_sent=1)
+        for override in (
+            {"pane_id": "%99"},
+            {"window_id": "@9"},
+            {"pane_pid": 5151},
+            {"generation": "gen-2"},
+            {"request_sha256": _sha(text="/clear")},
+        ):
+            with pytest.raises(ControlInputRebound):
+                book.open_intent(_binding(server_socket_path=SOCKET, **override))
+
+
+class TestAStoredSocketStillBindsExactly:
+    """The column earns its place only if a present value is enforced."""
+
+    def test_the_same_pane_id_on_another_server_is_a_different_pane(self, journal):
+        journal.open_intent(_binding(server_socket_path=SOCKET))
+        with pytest.raises(ControlInputRebound, match="different pane"):
+            journal.open_intent(_binding(server_socket_path=OTHER_SOCKET))
+
+    def test_a_re_arrival_that_states_no_server_cannot_downgrade_the_binding(self, journal):
+        """Silence is not a match for a recorded server.
+
+        Accepting it would make "stop stating the socket" a way to reach
+        any pane sharing the id, which is the rebinding the column exists
+        to catch, reached by omission instead of by collision.
+        """
+        journal.open_intent(_binding(server_socket_path=SOCKET))
+        with pytest.raises(ControlInputRebound, match="different pane"):
+            journal.open_intent(_binding())
+
+    def test_an_identical_re_arrival_on_the_same_server_is_still_a_retry(self, journal):
+        first = journal.open_intent(_binding(server_socket_path=SOCKET))
+        again = journal.open_intent(_binding(server_socket_path=SOCKET))
+        assert (first.state, again.state) == (INTENT, INTENT)
+        assert [e["to_state"] for e in journal.get(REQ).events] == [INTENT]

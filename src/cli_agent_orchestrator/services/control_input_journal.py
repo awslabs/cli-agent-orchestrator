@@ -443,26 +443,12 @@ class ControlInputJournal:
                 (binding.request_id,),
             ).fetchone()
             if row is not None:
-                existing = (
-                    row[0],
-                    row[1],
-                    row[2],
-                    int(row[3]),
-                    row[4],
-                    row[5],
-                    row[6],
-                )
+                existing = (row[0], row[1], row[2], int(row[3]), row[5], row[6])
                 incoming = (
                     binding.terminal_id,
                     binding.pane_id,
                     binding.window_id,
                     binding.pane_pid,
-                    # In the comparison, so a re-arrival naming the same
-                    # pane id on a *different* tmux server is a rebound
-                    # rather than a retry. Without it the one identity that
-                    # distinguishes two panes that share an id would be the
-                    # one identity a re-used request id could change.
-                    binding.server_socket_path,
                     binding.generation,
                     binding.request_sha256,
                 )
@@ -471,7 +457,46 @@ class ControlInputJournal:
                         f"request id {binding.request_id!r} is already bound to a "
                         "different control target or different request bytes"
                     )
-                if str(row[7]) == STATE_REFUSED:
+                stored_socket, state = row[4], str(row[7])
+                # The socket is compared apart from the tuple above because
+                # a stored NULL is not a value that failed to match — it is
+                # a row written before schema 2 existed, when no request
+                # recorded a server at all. Comparing it as a value turns
+                # every migrated row into a rebound the moment the same
+                # request re-arrives from a client that can now state one,
+                # which would present an already-delivered request as a
+                # fresh one and invite the second write this journal exists
+                # to prevent.
+                #
+                # A stored socket that *is* present still has to match
+                # exactly: that is the case where two panes sharing an id on
+                # different servers would otherwise be one request id, and
+                # it is the reason the column was added.
+                if stored_socket is not None and stored_socket != binding.server_socket_path:
+                    raise ControlInputRebound(
+                        f"request id {binding.request_id!r} is bound to a pane on tmux "
+                        f"server {stored_socket!r}, and this re-arrival names "
+                        f"{binding.server_socket_path!r}; a pane id is unique only "
+                        "within one server, so this is a different pane"
+                    )
+                if stored_socket is None and binding.server_socket_path is not None:
+                    # Adopted only while nothing has been written yet. In
+                    # those states the socket describes the write this row
+                    # is about to authorize, so recording it qualifies the
+                    # row before it matters and closes the gap above for
+                    # every later re-arrival. On a row that has already
+                    # written -- delivered, writing, or ambiguous -- it is
+                    # withheld: the write went to whichever server answered
+                    # at the time, which this migrated row never recorded,
+                    # and stamping it now would turn an unknown into a
+                    # claim that a later exact comparison would trust.
+                    if state in (INTENT, STATE_REFUSED):
+                        conn.execute(
+                            "UPDATE control_input_request SET server_socket_path=? "
+                            "WHERE request_id=? AND server_socket_path IS NULL",
+                            (binding.server_socket_path, binding.request_id),
+                        )
+                if state == STATE_REFUSED:
                     moment = _now()
                     # The old refusal's evidence is cleared from the live
                     # row rather than carried forward: it describes an
