@@ -299,17 +299,23 @@ class KimiCliProvider(BaseProvider):
         if not self._temp_dir:
             self._temp_dir = tempfile.mkdtemp(prefix="cao_kimi_")
 
+        profile = None
         if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
+            except Exception as e:
+                raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
-                # self._model is an explicit per-call override (handoff/assign's
-                # own `model` parameter) and wins over the profile's own static
-                # model field when both are given.
-                resolved_model = self._model or profile.model
-                if resolved_model:
-                    command_parts.extend(["--model", resolved_model])
+        # self._model is an explicit per-call override (handoff/assign's own
+        # `model` parameter) and wins over the profile's own static model
+        # field when both are given; applies even with no profile at all
+        # (matches codex.py/hermes.py's own resolution shape).
+        resolved_model = self._model or (profile.model if profile else None)
+        if resolved_model:
+            command_parts.extend(["--model", resolved_model])
 
+        if profile is not None:
+            try:
                 # Build agent file from profile's system prompt.
                 # Kimi uses YAML agent files with a system_prompt_path pointing
                 # to a markdown file. We create both in the temp directory.
@@ -380,7 +386,10 @@ class KimiCliProvider(BaseProvider):
                     command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
 
             except Exception as e:
-                raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+                raise ProviderError(
+                    f"Failed to build kimi command from agent profile "
+                    f"'{self._agent_profile}': {e}"
+                )
 
         # cd to unique temp dir (per-directory lock) + set TERM for tmux compatibility
         kimi_cmd = shlex.join(command_parts)

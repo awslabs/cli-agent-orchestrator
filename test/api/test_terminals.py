@@ -253,6 +253,31 @@ class TestTerminalCreationWithWorkingDirectory:
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
             assert call_kwargs.get("model") is None
 
+    def test_create_terminal_rejects_malformed_model(self, client):
+        """PR #501 review: a malformed model (control char/newline/shell
+        metacharacter) must 400 at the request boundary rather than either
+        reaching terminal_service unvalidated or -- if it later raised
+        ValueError there -- being mismapped to a misleading 404 (this
+        endpoint's ValueError handler means "session/window not found")."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "model": "fable-5\nrm -rf /",
+                },
+            )
+
+            assert response.status_code == 400
+            mock_svc.create_terminal.assert_not_called()
+
     def test_create_terminal_rejects_malformed_caller_id(self, client):
         """caller_id is validated against the TerminalId pattern — IDs arrive
         from agent input and must not be persisted unvalidated."""

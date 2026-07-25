@@ -583,6 +583,21 @@ WORKFLOW_ENV_ALLOWLIST = frozenset(
 # accepted length is 64 via WORKFLOW_NAME_RE; this cap is the outer fence).
 WORKFLOW_ENV_VALUE_MAX_LEN = 256
 
+# Model-ID validation for the explicit per-call ``model`` override on
+# handoff/assign (issue reported via PR #501 review). The override reaches a
+# provider's own launch-command builder (e.g. Codex/Kimi's ``--model
+# <value>``) which is shlex-quoted before delivery, so classic word-splitting
+# injection is not reachable -- but a control character or newline surviving
+# quoting into the command string is still a delivery hazard (this codebase
+# already treats that class of input as one: claude_code.py escapes newlines
+# in system_prompt to prevent tmux paste-buffer chunking, and bash's own
+# bracketed-paste-safety is called out in tmux.py). No allowlist is needed
+# (unlike WORKFLOW_ENV_ALLOWLIST's fixed key set) since a model id is
+# free-form per-provider, but a conservative charset covers every real model
+# id across all nine providers, including OpenCode's "vendor/model" form.
+MODEL_ID_RE = r"^[A-Za-z0-9._:/-]+$"
+MODEL_ID_MAX_LEN = 128
+
 # Script-runner subprocess lifecycle (Bolt 3, U4/C1). Wall-clock bound + grace,
 # output ring-buffer cap, engine-owned scratch root for resume materialization.
 WORKFLOW_SCRIPT_TERM_GRACE = 5.0  # SIGTERM->SIGKILL grace (BR-10/11, NFR-REL-1)
