@@ -1033,13 +1033,30 @@ def get_terminal_group(terminal_id: str) -> Optional[List[str]]:
         return cast(List[str], _json.loads(terminal.group))
 
 
-def list_siblings_by_group_prefix(caller_id: str, prefix: List[str]) -> List[Dict[str, Any]]:
+def list_siblings_by_group_prefix(
+    caller_id: str,
+    prefix: List[str],
+    caller_session: Optional[str] = None,
+    cross_session: bool = False,
+) -> List[Dict[str, Any]]:
     """Return ``{id, group, metadata}`` for every OTHER terminal sharing ``prefix``.
 
     ``prefix`` is the caller's own group truncated to the (already-clamped)
     depth — this function does no clamping itself, it only matches. A
     candidate terminal with no group, or a group shorter than ``len(prefix)``,
     is excluded rather than compared partially or raising (#432).
+
+    Session-scoped by default (issue #432 design discussion, tedswinyar +
+    klabulan, 2026-07-17/18): ``caller_session`` (the caller's own
+    ``tmux_session``) is an implicit, non-bypassable first filter ON TOP of
+    the group-prefix match, unless ``cross_session=True`` is explicitly
+    passed. Without this, two unrelated CAO sessions that happen to reuse
+    the same ``group`` prefix (a naming collision, a copy-pasted template,
+    two features that picked the same tenant/project id) would silently
+    discover each other -- the same class of "implicitly-scoped state that
+    turns out not to be" mistake cited in that discussion's incident
+    history. Cross-session discovery is a legitimate use case and stays
+    available, just opt-in rather than the unstated default.
 
     ``group`` is stored JSON-encoded (see ``TerminalModel.group``), so the
     query prefilters with a SQL ``LIKE`` prefix match on that encoding before
@@ -1079,15 +1096,14 @@ def list_siblings_by_group_prefix(caller_id: str, prefix: List[str]) -> List[Dic
     # '["a", "b", "c"]'.
     like_prefix = _json.dumps(prefix)[:-1]
     with SessionLocal() as db:
-        rows = (
-            db.query(TerminalModel)
-            .filter(
-                TerminalModel.id != caller_id,
-                TerminalModel.group.isnot(None),
-                TerminalModel.group.startswith(like_prefix, autoescape=True),
-            )
-            .all()
+        query = db.query(TerminalModel).filter(
+            TerminalModel.id != caller_id,
+            TerminalModel.group.isnot(None),
+            TerminalModel.group.startswith(like_prefix, autoescape=True),
         )
+        if not cross_session and caller_session is not None:
+            query = query.filter(TerminalModel.tmux_session == caller_session)
+        rows = query.all()
         siblings = []
         for row in rows:
             try:

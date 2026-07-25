@@ -109,9 +109,18 @@ No `role` is needed — `allowedTools` is the full specification of what tools t
 | `web_fetch` | Fetch URLs / search the web | `WebFetch`, `WebSearch` | (not mapped) |
 | `@builtin` | Provider built-in capabilities | (internal) | (internal) |
 | `@cao-mcp-server` | CAO orchestration tools | `handoff`, `assign`, `send_message`, plus Hermes prompt answers via `answer_user_prompt` | Same |
+| `discovery` | Sibling discovery/metadata (`list_siblings`, `update_metadata`) | Same | Same |
 | `*` | Everything (unrestricted) | All tools | All tools |
 
 CAO translates these to each provider's native tool names automatically. You write one vocabulary; it works across supported providers.
+
+#### `discovery` is a separate opt-in, not part of `@cao-mcp-server`
+
+`discovery` gates `list_siblings`/`update_metadata` independently of `@cao-mcp-server`. A profile with `@cao-mcp-server` (handoff/assign/send_message) does **not** automatically get sibling discovery, and vice versa — none of the built-in roles (`supervisor`, `developer`, `reviewer`) include `discovery`; add it explicitly if a profile needs peer-to-peer discovery.
+
+This is deliberate (see the design discussion on [issue #432](https://github.com/awslabs/cli-agent-orchestrator/issues/432)): the supervisor/worker hierarchy `handoff`/`assign`/`send_message` are built around, and the flat peer layer `group`/`list_siblings`/`update_metadata` introduce, are two different communication topologies. A profile should be able to keep one without the other. See [Discovery Tool Coexistence](discovery-tool-coexistence.md) for the full rationale, the enforcement mechanism, and open follow-ups.
+
+**`group` is an organizational label, not a security boundary.** On a default install with auth disabled, a worker already has local shell access, so `discovery`/`group`/session-scoping provide no isolation guarantee even when used together — see [docs/api.md](api.md) and the coexistence write-up linked above.
 
 ### 3. `--yolo` — The Escape Hatch
 

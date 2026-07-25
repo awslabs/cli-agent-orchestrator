@@ -34,7 +34,6 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
-    get_terminal_group,
     get_terminal_metadata,
     list_siblings_by_group_prefix,
     update_last_active,
@@ -1017,7 +1016,9 @@ def update_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> boo
     return update_terminal_metadata(terminal_id, metadata)
 
 
-def list_siblings(caller_id: str, depth: Optional[int] = None) -> List[Dict[str, Any]]:
+def list_siblings(
+    caller_id: str, depth: Optional[int] = None, cross_session: bool = False
+) -> List[Dict[str, Any]]:
     """Resolve ``caller_id``'s own group and return matching sibling terminals.
 
     Depth is clamped server-side to ``[1, len(caller_group)]`` (#432): it can
@@ -1030,6 +1031,11 @@ def list_siblings(caller_id: str, depth: Optional[int] = None) -> List[Dict[str,
     A caller with no group set finds no siblings (participates in no
     discovery, per #432) rather than erroring.
 
+    Session-scoped by default (issue #432 design discussion): results are
+    additionally filtered to the caller's own ``tmux_session`` unless
+    ``cross_session=True`` is explicitly passed — see
+    ``list_siblings_by_group_prefix``'s own docstring for the full rationale.
+
     Returns:
         List of ``{id, group, metadata, status}`` dicts for every OTHER
         terminal whose group shares the resolved prefix. ``status`` is a
@@ -1041,14 +1047,18 @@ def list_siblings(caller_id: str, depth: Optional[int] = None) -> List[Dict[str,
         proactively, but callers should still expect sends to occasionally
         fail against a sibling that disappeared in that window.
     """
-    caller_group = get_terminal_group(caller_id)
+    caller_metadata = get_terminal_metadata(caller_id)
+    caller_group = caller_metadata.get("group") if caller_metadata else None
     if not caller_group:
         return []
+    caller_session = caller_metadata.get("tmux_session") if caller_metadata else None
     max_depth = len(caller_group)
     effective_depth = max_depth if depth is None else depth
     effective_depth = max(1, min(effective_depth, max_depth))
     prefix = caller_group[:effective_depth]
-    siblings = list_siblings_by_group_prefix(caller_id, prefix)
+    siblings = list_siblings_by_group_prefix(
+        caller_id, prefix, caller_session=caller_session, cross_session=cross_session
+    )
     for sibling in siblings:
         sibling["status"] = status_monitor.get_status(sibling["id"]).value
     return siblings

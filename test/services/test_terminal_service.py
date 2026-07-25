@@ -278,20 +278,20 @@ class TestListSiblingsDepthClamping:
     """#432: list_siblings() must clamp depth to [1, len(caller_group)] and
     never let a caller widen its own discovery scope.
 
-    ``get_terminal_group``/``list_siblings_by_group_prefix`` are mocked so
+    ``get_terminal_metadata``/``list_siblings_by_group_prefix`` are mocked so
     these tests isolate the clamping arithmetic itself (the actual prefix
     match is covered by the real-DB tests in
     test/clients/test_database.py::TestListSiblingsByGroupPrefix).
     """
 
     @patch(f"{_TS}.list_siblings_by_group_prefix")
-    @patch(f"{_TS}.get_terminal_group")
+    @patch(f"{_TS}.get_terminal_metadata")
     def test_caller_with_no_group_returns_empty_without_querying(
-        self, mock_get_group, mock_list_prefix
+        self, mock_get_metadata, mock_list_prefix
     ):
         """A caller with no group participates in no discovery (#432) --
         must short-circuit before ever calling the prefix-match query."""
-        mock_get_group.return_value = None
+        mock_get_metadata.return_value = {"group": None, "tmux_session": "cao-sess"}
 
         result = list_siblings("caller-1", depth=2)
 
@@ -299,74 +299,102 @@ class TestListSiblingsDepthClamping:
         mock_list_prefix.assert_not_called()
 
     @patch(f"{_TS}.list_siblings_by_group_prefix")
-    @patch(f"{_TS}.get_terminal_group")
-    def test_depth_none_defaults_to_full_own_group_length(self, mock_get_group, mock_list_prefix):
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_depth_none_defaults_to_full_own_group_length(
+        self, mock_get_metadata, mock_list_prefix
+    ):
         """Omitting depth means the widest scope the caller is allowed: its
         own full group."""
-        mock_get_group.return_value = ["tenant_1", "project_5", "folder_9"]
+        mock_get_metadata.return_value = {
+            "group": ["tenant_1", "project_5", "folder_9"],
+            "tmux_session": "cao-sess",
+        }
         mock_list_prefix.return_value = []
 
         list_siblings("caller-1", depth=None)
 
         mock_list_prefix.assert_called_once_with(
-            "caller-1", ["tenant_1", "project_5", "folder_9"]
+            "caller-1",
+            ["tenant_1", "project_5", "folder_9"],
+            caller_session="cao-sess",
+            cross_session=False,
         )
 
     @patch(f"{_TS}.list_siblings_by_group_prefix")
-    @patch(f"{_TS}.get_terminal_group")
-    def test_depth_wider_than_own_group_is_clamped_down(self, mock_get_group, mock_list_prefix):
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_depth_wider_than_own_group_is_clamped_down(self, mock_get_metadata, mock_list_prefix):
         """depth can never exceed len(caller_group) -- a caller cannot widen
         its own scope by asking for more than it has (#432)."""
-        mock_get_group.return_value = ["tenant_1", "project_5"]
+        mock_get_metadata.return_value = {
+            "group": ["tenant_1", "project_5"],
+            "tmux_session": "cao-sess",
+        }
         mock_list_prefix.return_value = []
 
         list_siblings("caller-1", depth=99)
 
-        mock_list_prefix.assert_called_once_with("caller-1", ["tenant_1", "project_5"])
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1", "project_5"], caller_session="cao-sess", cross_session=False
+        )
 
     @patch(f"{_TS}.list_siblings_by_group_prefix")
-    @patch(f"{_TS}.get_terminal_group")
-    def test_depth_within_range_uses_exact_prefix(self, mock_get_group, mock_list_prefix):
-        mock_get_group.return_value = ["tenant_1", "project_5", "folder_9"]
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_depth_within_range_uses_exact_prefix(self, mock_get_metadata, mock_list_prefix):
+        mock_get_metadata.return_value = {
+            "group": ["tenant_1", "project_5", "folder_9"],
+            "tmux_session": "cao-sess",
+        }
         mock_list_prefix.return_value = []
 
         list_siblings("caller-1", depth=2)
 
-        mock_list_prefix.assert_called_once_with("caller-1", ["tenant_1", "project_5"])
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1", "project_5"], caller_session="cao-sess", cross_session=False
+        )
 
     @patch(f"{_TS}.list_siblings_by_group_prefix")
-    @patch(f"{_TS}.get_terminal_group")
+    @patch(f"{_TS}.get_terminal_metadata")
     def test_depth_zero_is_clamped_up_to_one_defense_in_depth(
-        self, mock_get_group, mock_list_prefix
+        self, mock_get_metadata, mock_list_prefix
     ):
         """The API layer rejects depth=0 outright (422, see test_terminals.py).
         This asserts the service layer ALSO never treats an explicit 0 as an
         unscoped, all-terminals query if it's ever reached directly --
         defense in depth, not a documented public entry point for 0."""
-        mock_get_group.return_value = ["tenant_1", "project_5"]
+        mock_get_metadata.return_value = {
+            "group": ["tenant_1", "project_5"],
+            "tmux_session": "cao-sess",
+        }
         mock_list_prefix.return_value = []
 
         list_siblings("caller-1", depth=0)
 
-        mock_list_prefix.assert_called_once_with("caller-1", ["tenant_1"])
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1"], caller_session="cao-sess", cross_session=False
+        )
 
     @patch(f"{_TS}.list_siblings_by_group_prefix")
-    @patch(f"{_TS}.get_terminal_group")
-    def test_negative_depth_is_clamped_up_to_one(self, mock_get_group, mock_list_prefix):
-        mock_get_group.return_value = ["tenant_1", "project_5"]
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_negative_depth_is_clamped_up_to_one(self, mock_get_metadata, mock_list_prefix):
+        mock_get_metadata.return_value = {
+            "group": ["tenant_1", "project_5"],
+            "tmux_session": "cao-sess",
+        }
         mock_list_prefix.return_value = []
 
         list_siblings("caller-1", depth=-5)
 
-        mock_list_prefix.assert_called_once_with("caller-1", ["tenant_1"])
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1"], caller_session="cao-sess", cross_session=False
+        )
 
     @patch(f"{_TS}.status_monitor")
     @patch(f"{_TS}.list_siblings_by_group_prefix")
-    @patch(f"{_TS}.get_terminal_group")
+    @patch(f"{_TS}.get_terminal_metadata")
     def test_returns_prefix_match_results_unchanged(
-        self, mock_get_group, mock_list_prefix, mock_status_monitor
+        self, mock_get_metadata, mock_list_prefix, mock_status_monitor
     ):
-        mock_get_group.return_value = ["tenant_1"]
+        mock_get_metadata.return_value = {"group": ["tenant_1"], "tmux_session": "cao-sess"}
         mock_list_prefix.return_value = [{"id": "sib-1", "group": ["tenant_1"], "metadata": None}]
         mock_status_monitor.get_status.return_value = MagicMock(value="idle")
 
@@ -378,15 +406,15 @@ class TestListSiblingsDepthClamping:
 
     @patch(f"{_TS}.status_monitor")
     @patch(f"{_TS}.list_siblings_by_group_prefix")
-    @patch(f"{_TS}.get_terminal_group")
+    @patch(f"{_TS}.get_terminal_metadata")
     def test_status_is_a_live_snapshot_per_sibling(
-        self, mock_get_group, mock_list_prefix, mock_status_monitor
+        self, mock_get_metadata, mock_list_prefix, mock_status_monitor
     ):
         """tedswinyar, PR #433 review: siblings include a live status snapshot
         (point-in-time, not a delivery guarantee -- see the docstring) so a
         discovering agent can skip an obviously-finished sibling. Each
         sibling's status is looked up individually, not assumed uniform."""
-        mock_get_group.return_value = ["tenant_1"]
+        mock_get_metadata.return_value = {"group": ["tenant_1"], "tmux_session": "cao-sess"}
         mock_list_prefix.return_value = [
             {"id": "sib-1", "group": ["tenant_1"], "metadata": None},
             {"id": "sib-2", "group": ["tenant_1"], "metadata": None},
@@ -399,3 +427,30 @@ class TestListSiblingsDepthClamping:
         assert [s["status"] for s in result] == ["completed", "idle"]
         mock_status_monitor.get_status.assert_any_call("sib-1")
         mock_status_monitor.get_status.assert_any_call("sib-2")
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_cross_session_true_is_forwarded(self, mock_get_metadata, mock_list_prefix):
+        """cross_session=True is an explicit opt-in the caller must pass
+        through -- default is session-scoped (issue #432 design
+        discussion)."""
+        mock_get_metadata.return_value = {"group": ["tenant_1"], "tmux_session": "cao-sess"}
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=1, cross_session=True)
+
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1"], caller_session="cao-sess", cross_session=True
+        )
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_metadata")
+    def test_cross_session_defaults_to_false(self, mock_get_metadata, mock_list_prefix):
+        mock_get_metadata.return_value = {"group": ["tenant_1"], "tmux_session": "cao-sess"}
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=1)
+
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1"], caller_session="cao-sess", cross_session=False
+        )

@@ -1411,9 +1411,7 @@ class TestUpdateTerminalGroupEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.update_group.return_value = False
 
-            response = client.patch(
-                "/terminals/deadbeef/group", json={"group": ["tenant_1"]}
-            )
+            response = client.patch("/terminals/deadbeef/group", json={"group": ["tenant_1"]})
 
             assert response.status_code == 404
 
@@ -1421,9 +1419,7 @@ class TestUpdateTerminalGroupEndpoint:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.update_group.side_effect = Exception("db exploded")
 
-            response = client.patch(
-                "/terminals/abcd1234/group", json={"group": ["tenant_1"]}
-            )
+            response = client.patch("/terminals/abcd1234/group", json={"group": ["tenant_1"]})
 
             assert response.status_code == 500
             assert "Failed to update terminal group" in response.json()["detail"]
@@ -1466,9 +1462,7 @@ class TestUpdateTerminalMetadataEndpoint:
 
             assert response.status_code == 200
             assert response.json()["metadata"] == {"task": "writing tests"}
-            mock_svc.update_metadata.assert_called_once_with(
-                "abcd1234", {"task": "writing tests"}
-            )
+            mock_svc.update_metadata.assert_called_once_with("abcd1234", {"task": "writing tests"})
 
     def test_update_metadata_terminal_not_found(self, client):
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
@@ -1522,7 +1516,9 @@ class TestListSiblingsEndpoint:
             assert response.json() == [
                 {"id": "sib-1", "group": ["tenant_1"], "metadata": {"task": "x"}}
             ]
-            mock_svc.list_siblings.assert_called_once_with("abcd1234", depth=None)
+            mock_svc.list_siblings.assert_called_once_with(
+                "abcd1234", depth=None, cross_session=False
+            )
 
     def test_list_siblings_passes_depth_through(self, client):
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
@@ -1532,7 +1528,31 @@ class TestListSiblingsEndpoint:
             response = client.get("/terminals/abcd1234/siblings", params={"depth": 2})
 
             assert response.status_code == 200
-            mock_svc.list_siblings.assert_called_once_with("abcd1234", depth=2)
+            mock_svc.list_siblings.assert_called_once_with("abcd1234", depth=2, cross_session=False)
+
+    def test_list_siblings_cross_session_defaults_to_false(self, client):
+        """Issue #432 design discussion: session-scoped by default."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
+            mock_svc.list_siblings.return_value = []
+
+            client.get("/terminals/abcd1234/siblings")
+
+            mock_svc.list_siblings.assert_called_once_with(
+                "abcd1234", depth=None, cross_session=False
+            )
+
+    def test_list_siblings_cross_session_true_is_forwarded(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_terminal.return_value = _terminal_dict(group=["tenant_1"])
+            mock_svc.list_siblings.return_value = []
+
+            response = client.get("/terminals/abcd1234/siblings", params={"cross_session": "true"})
+
+            assert response.status_code == 200
+            mock_svc.list_siblings.assert_called_once_with(
+                "abcd1234", depth=None, cross_session=True
+            )
 
     def test_list_siblings_depth_zero_rejected(self, client):
         """#432: depth can never be 0 (an unscoped, all-terminals query) --

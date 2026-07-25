@@ -2450,6 +2450,17 @@ async def list_terminal_siblings(
             "than silently reinterpreted as an unscoped, all-terminals query."
         ),
     ),
+    cross_session: bool = Query(
+        default=False,
+        description=(
+            "Sibling discovery is session-scoped by default (issue #432 "
+            "design discussion, 2026-07-17/18): results are additionally "
+            "filtered to this terminal's own tmux session unless this is "
+            "explicitly set to true. Prevents two unrelated CAO sessions "
+            "that happen to reuse the same group prefix from silently "
+            "discovering each other."
+        ),
+    ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """List sibling terminals sharing a leading prefix of this terminal's own group (#432).
@@ -2462,6 +2473,13 @@ async def list_terminal_siblings(
     wider than its own group no matter what ``depth`` is passed. A terminal
     with no ``group`` set finds no siblings — it participates in no
     discovery — rather than erroring or matching everything.
+
+    Session-scoped by default: results are also filtered to this terminal's
+    own ``tmux_session`` unless ``cross_session=true`` is explicitly passed
+    (issue #432 design discussion). ``group`` is an organizational label,
+    not a security boundary — on a default install with auth disabled, a
+    worker already has local shell access, so nothing here provides tenant
+    isolation even with session scoping applied; see docs/api.md.
 
     Each result includes a ``status`` (tedswinyar, PR #433 review): a live,
     point-in-time snapshot, not a guarantee. A handoff terminal can still
@@ -2477,7 +2495,9 @@ async def list_terminal_siblings(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
     try:
-        return await asyncio.to_thread(terminal_service.list_siblings, terminal_id, depth=depth)
+        return await asyncio.to_thread(
+            terminal_service.list_siblings, terminal_id, depth=depth, cross_session=cross_session
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

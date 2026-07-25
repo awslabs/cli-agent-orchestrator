@@ -14,6 +14,7 @@ from pydantic import Field
 from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     DEFAULT_PROVIDER,
+    DISCOVERY_TOOL_MARKER,
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
@@ -1556,16 +1557,72 @@ def _own_terminal_id_or_error(action: str) -> Union[str, Dict[str, Any]]:
     return own_terminal_id
 
 
-def _list_siblings_impl(depth: Optional[int]) -> Dict[str, Any]:
+def _require_discovery_marker(own_terminal_id: str, action: str) -> Optional[Dict[str, Any]]:
+    """Enforce the discovery opt-in marker (issue #432 design discussion).
+
+    Sibling discovery (list_siblings/update_metadata) is deliberately NOT
+    bundled into @cao-mcp-server's all-or-nothing MCP-server-level grant --
+    a profile must additionally list ``"discovery"`` in its own
+    ``allowedTools`` (or be unrestricted) to use these two tools, even if it
+    already has orchestration tools. See
+    docs/discovery-tool-coexistence.md for the full rationale and why this
+    is enforced here (a runtime check inside the tool handler) rather than
+    by hiding the tool from the model entirely -- cao-mcp-server is one
+    process shared by every profile that wires it in, with no existing
+    mechanism to filter which of its tools a given caller sees.
+
+    Returns an error dict if the marker is missing (call this and return its
+    result immediately when non-None), or ``None`` if the caller is
+    authorized.
+    """
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=_mcp_timeout()
+        )
+        response.raise_for_status()
+        allowed_tools = response.json().get("allowed_tools")
+    except Exception as e:
+        # Fail closed: an unresolvable allowed_tools lookup must not silently
+        # grant discovery -- same posture as _own_terminal_id_or_error above.
+        return {
+            "success": False,
+            "error": f"Failed to {action}: could not resolve this terminal's allowed_tools: {e}",
+        }
+    # None (no role/allowedTools resolved at all) and "*" both mean
+    # unrestricted, matching resolve_allowed_tools' own semantics elsewhere.
+    if (
+        allowed_tools is not None
+        and "*" not in allowed_tools
+        and (DISCOVERY_TOOL_MARKER not in allowed_tools)
+    ):
+        return {
+            "success": False,
+            "error": (
+                f"Failed to {action}: this agent profile is not granted the "
+                f"'{DISCOVERY_TOOL_MARKER}' tool. Add '{DISCOVERY_TOOL_MARKER}' to "
+                "allowedTools to use sibling discovery (list_siblings/"
+                "update_metadata) -- see docs/tool-restrictions.md."
+            ),
+        }
+    return None
+
+
+def _list_siblings_impl(depth: Optional[int], cross_session: bool = False) -> Dict[str, Any]:
     """Implementation of list_siblings logic."""
     own_terminal_id = _own_terminal_id_or_error("list siblings")
     if isinstance(own_terminal_id, dict):
         return own_terminal_id
 
+    denied = _require_discovery_marker(own_terminal_id, "list siblings")
+    if denied is not None:
+        return denied
+
     try:
         params: Dict[str, Any] = {}
         if depth is not None:
             params["depth"] = depth
+        if cross_session:
+            params["cross_session"] = "true"
         response = requests.get(
             f"{API_BASE_URL}/terminals/{own_terminal_id}/siblings",
             params=params,
@@ -1585,6 +1642,10 @@ def _update_metadata_impl(metadata: Dict[str, Any]) -> Dict[str, Any]:
     own_terminal_id = _own_terminal_id_or_error("update metadata")
     if isinstance(own_terminal_id, dict):
         return own_terminal_id
+
+    denied = _require_discovery_marker(own_terminal_id, "update metadata")
+    if denied is not None:
+        return denied
 
     try:
         response = requests.patch(
@@ -1614,14 +1675,35 @@ async def list_siblings(
             "all-terminals query."
         ),
     ),
+    cross_session: bool = Field(
+        default=False,
+        description=(
+            "Discovery is scoped to your own tmux session by default -- set "
+            "this to true to also see matching siblings in OTHER CAO "
+            "sessions. Explicit opt-in only; two unrelated sessions that "
+            "happen to reuse the same group prefix must not silently "
+            "discover each other."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Discover sibling terminals sharing a leading prefix of your own group.
+
+    Requires the 'discovery' tool to be granted in your agent profile's
+    allowedTools -- sibling discovery is a separate opt-in from the
+    handoff/assign/send_message orchestration trio, not bundled into
+    @cao-mcp-server (see docs/tool-restrictions.md).
 
     Resolves your identity from your own CAO_TERMINAL_ID (never a value you
     pass in) and looks up your own persisted `group`. Returns the id, group,
     metadata, and status of every OTHER terminal whose group shares the
-    resolved prefix. If you have no group set, you have no siblings — this
-    is not an error.
+    resolved prefix AND is in your own tmux session, unless
+    cross_session=true. If you have no group set, you have no siblings —
+    this is not an error.
+
+    `group` is an organizational label, not a security boundary -- on a
+    default install with auth disabled, a worker already has local shell
+    access, so nothing here provides tenant isolation even with session
+    scoping applied.
 
     `status` is a live snapshot at call time, not a guarantee -- a sibling
     (especially a handoff terminal) can complete and delete itself between
@@ -1632,7 +1714,7 @@ async def list_siblings(
     Use this to find other agents working in the same project/folder/tenant,
     then message them with send_message using the returned id.
     """
-    return _list_siblings_impl(depth)
+    return _list_siblings_impl(depth, cross_session)
 
 
 @mcp.tool()
@@ -1650,10 +1732,17 @@ async def update_metadata(
 ) -> Dict[str, Any]:
     """Update your own terminal's metadata, visible to siblings via list_siblings.
 
+    Requires the 'discovery' tool to be granted in your agent profile's
+    allowedTools -- sibling discovery is a separate opt-in from the
+    handoff/assign/send_message orchestration trio, not bundled into
+    @cao-mcp-server (see docs/tool-restrictions.md).
+
     Use this so other agents in your group can see a short description of
     what you're currently working on without messaging you directly. Whole-
     dict replace, last-write-wins under concurrent calls -- not an
-    accumulating/merging store.
+    accumulating/merging store. Metadata you publish here is visible to any
+    sibling that can discover you -- treat it as you would any other
+    inter-agent message, not as private state.
     """
     return _update_metadata_impl(metadata)
 

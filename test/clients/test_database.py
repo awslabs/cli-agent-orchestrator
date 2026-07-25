@@ -943,6 +943,103 @@ class TestListSiblingsByGroupPrefix:
 
         assert [r["id"] for r in result] == ["literal-match"]
 
+    def test_session_scoped_by_default_excludes_other_sessions(self, test_db):
+        """Issue #432 design discussion (tedswinyar + klabulan, 2026-07-17/18):
+        sibling discovery is session-scoped by default -- two terminals in
+        DIFFERENT tmux sessions that happen to share a group prefix (a
+        naming collision, a copy-pasted template, two features reusing the
+        same tenant/project id) must NOT discover each other unless
+        cross_session=True is explicitly passed."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="same-session-sibling",
+                    tmux_session="cao-session-a",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+                TerminalModel(
+                    id="other-session-sibling",
+                    tmux_session="cao-session-b",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix(
+                "caller-1", ["tenant_1", "project_5"], caller_session="cao-session-a"
+            )
+
+        assert [r["id"] for r in result] == ["same-session-sibling"]
+
+    def test_cross_session_true_includes_other_sessions(self, test_db):
+        """cross_session=True is the explicit opt-in that restores the
+        previous (pre-#432-discussion) server-wide behavior."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="same-session-sibling",
+                    tmux_session="cao-session-a",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+                TerminalModel(
+                    id="other-session-sibling",
+                    tmux_session="cao-session-b",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix(
+                "caller-1",
+                ["tenant_1", "project_5"],
+                caller_session="cao-session-a",
+                cross_session=True,
+            )
+
+        assert {r["id"] for r in result} == {"same-session-sibling", "other-session-sibling"}
+
+    def test_no_caller_session_provided_does_not_filter_by_session(self, test_db):
+        """Backward-compatible default: omitting caller_session entirely
+        (the pre-existing call shape every other test in this class uses)
+        applies no session filter at all, rather than matching only
+        terminals with a null/empty session."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="session-a-sibling",
+                    tmux_session="cao-session-a",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1"]',
+                ),
+                TerminalModel(
+                    id="session-b-sibling",
+                    tmux_session="cao-session-b",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1"])
+
+        assert {r["id"] for r in result} == {"session-a-sibling", "session-b-sibling"}
+
 
 class TestInboxOperations:
     """Tests for inbox database operations."""
@@ -1412,7 +1509,7 @@ class TestTerminalsSchemaMigration:
 
         with sqlite3.connect(str(db_file)) as conn:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
-            rows = conn.execute("SELECT id, \"group\", \"metadata\" FROM terminals").fetchall()
+            rows = conn.execute('SELECT id, "group", "metadata" FROM terminals').fetchall()
         assert {"group", "metadata"} <= columns
         assert rows == [("abc12345", None, None)]
 
