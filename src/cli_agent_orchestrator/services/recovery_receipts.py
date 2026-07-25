@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Optional
 
+from cli_agent_orchestrator.services import provider_contracts
 from cli_agent_orchestrator.services.canonical_json import (
     CanonicalEncodingError,
     build_canonical,
@@ -237,14 +238,45 @@ def route_payload(
         _require(present == 0, "an unobserved route must carry no observed fields")
     elif authority_status == "observed":
         _require(present == 5, "an observed route requires all five observed fields")
+        # Effort agreement goes through the one judge that knows the three
+        # observability classes, never a local ``==``. A raw comparison
+        # here would be a second rule answering a question that already
+        # has an authority, and it would answer it worse: it cannot tell
+        # "no effort surface" from "an effort that cannot be read before
+        # the first turn", and it would read the provider-default sentinel
+        # sitting in the observed slot as agreement when nothing was
+        # observed at all.
         _require(
-            observed_model == assigned_model and observed_effort == assigned_effort,
+            observed_model == assigned_model
+            and provider_contracts.effort_receipt_matches(
+                assigned_effort,
+                observed_effort,
+                observability=provider_contracts.effort_observability_for_recovery_provider(
+                    provider, assigned_model
+                ),
+            ),
             "an observed route requires observation == assignment",
         )
     elif authority_status == "drifted":
         _require(present == 5, "a drifted route requires all five observed fields")
+        # Drift is the exact complement of agreement, so it must be decided
+        # by the same judge and simply negated. A second rule here does not
+        # merely duplicate the first, it disagrees with it: for a pair whose
+        # effort is unobservable, a receipt echoing the assigned effort into
+        # the observed slot is a claim nothing could have produced, which
+        # the agreement rule refuses -- while a raw ``!=`` reads the equal
+        # strings as agreement and refuses to call it drift. The tuple then
+        # satisfies neither status and the drift cannot be recorded at all,
+        # which is the one outcome a drift check exists to prevent.
         _require(
-            observed_model != assigned_model or observed_effort != assigned_effort,
+            observed_model != assigned_model
+            or not provider_contracts.effort_receipt_matches(
+                assigned_effort,
+                observed_effort,
+                observability=provider_contracts.effort_observability_for_recovery_provider(
+                    provider, assigned_model
+                ),
+            ),
             "a drifted route requires a mismatch against the assignment",
         )
     else:  # degraded

@@ -1164,7 +1164,56 @@ def _mark_launch_failed_bridge(
 # ``admitting`` and ``admitted`` are never finalizable, and neither is a
 # bound row that does carry an admission: for those, "never submitted" is
 # exactly the claim that cannot be proven.
-_NEGATIVE_FINALIZABLE_STATES = frozenset({"preflight_blocked", "bound", "negative"})
+#
+# ``launching`` joins them, and it corrects the paragraph above rather than
+# extending it. That text said a refusal "costs a finalizable reservation
+# and nothing else", which was not true of a launching row as built: with
+# no binding it was permanently unfinalizable *and* unreplaceable, which is
+# a worse outcome than the refusal it followed. Two live generations sat in
+# exactly that state. It is admissible if and only if the row carries no
+# binding, no bind intent and no admission — under exactly that condition
+# nothing could have delivered a task byte, because admission requires a
+# bind and no bind was ever published, so the negative states a fact rather
+# than assuming one.
+_NEGATIVE_FINALIZABLE_STATES = frozenset({"preflight_blocked", "launching", "bound", "negative"})
+
+#: The columns whose absence proves a ``launching`` generation never
+#: reached the write path. Named once because the read-time check and the
+#: CAS write condition must be the same set: if they could drift, a row
+#: could pass the read and be finalized on a weaker condition than the one
+#: that was proven.
+_LAUNCHING_ZERO_BYTE_COLUMNS = ("binding_json", "bind_intent_json", "admission_json")
+
+
+def _observed_pane_identity(db: Any, row: Any) -> Optional[dict[str, Any]]:
+    """The pane this generation was observed on, from its own v2 row.
+
+    Read from the durable row rather than re-observed here: this runs while
+    finalizing, and a fresh tmux observation would answer "what is there
+    now", which for a pane that has since died is a different question from
+    "what was this generation on". The finalization needs the second.
+
+    Returns ``None`` when the row is absent or its identity is partial. A
+    partial tuple is not published for the same reason it is not stored:
+    three of five fields is something a later check could pass against.
+    """
+    terminal = (
+        db.query(database.ManagedLaunchV2TerminalModel)
+        .filter(database.ManagedLaunchV2TerminalModel.id == row.terminal_id)
+        .first()
+    )
+    if terminal is None:
+        return None
+    identity = {
+        "server_socket_path": terminal.server_socket_path,
+        "session_id": terminal.v2_session_id,
+        "window_id": terminal.window_id,
+        "pane_id": terminal.pane_id,
+        "pane_pid": terminal.v2_pane_pid,
+    }
+    if any(value is None for value in identity.values()):
+        return None
+    return identity
 
 
 def _assert_recovery_identity(row: Any, *, terminal_id: str, generation: str) -> None:
@@ -1216,9 +1265,27 @@ def finalize_negative(
                 )
             if row.state not in _NEGATIVE_FINALIZABLE_STATES:
                 raise ManagedLaunchConflict(
-                    f"zero-byte finalization requires state 'preflight_blocked' or a "
+                    f"zero-byte finalization requires state 'preflight_blocked', a "
+                    f"'launching' row with no binding/bind intent/admission, or a "
                     f"'bound' row with no admission, not {row.state!r}"
                 )
+            if row.state == "launching":
+                present = [
+                    column
+                    for column in _LAUNCHING_ZERO_BYTE_COLUMNS
+                    if getattr(row, column) is not None
+                ]
+                if present:
+                    # Any one of these means the generation reached far
+                    # enough that "never submitted" is no longer a fact this
+                    # verb can read off the row. A bind intent counts: it is
+                    # journaled before the binding is published, so its
+                    # presence means a bind was in flight and may still land.
+                    raise ManagedLaunchConflict(
+                        "zero-byte finalization refused: the launching reservation "
+                        f"already carries {', '.join(present)}, so no-bytes-submitted "
+                        "cannot be proven from this state"
+                    )
             if row.state == "bound" and row.admission_json is not None:
                 # The row reached the write path. Whether a byte actually
                 # landed is exactly what an admission record exists to say,
@@ -1248,6 +1315,15 @@ def finalize_negative(
                 # auditing the finalization should not have to infer whether
                 # the launch died before its binding or after it.
                 "finalized_from_state": claimed_state,
+                # The pane this generation was observed on, carried into the
+                # finalization so a live pane stays reconcilable under its
+                # exact generation instead of being orphaned by the very call
+                # that closed its reservation. Preservation and finalizability
+                # are then the same thing rather than opposites: the
+                # generation is preserved *as* a typed negative naming what
+                # was observed. Null when nothing was observed -- absent is a
+                # different claim from unobserved, and only the row can say.
+                "observed_pane_identity": _observed_pane_identity(db, row),
                 "finalized_at": _now(),
             }
             # The CAS re-states, as a write condition, exactly the property
@@ -1265,7 +1341,17 @@ def finalize_negative(
                 database.ManagedLaunchV2ReservationModel.state == claimed_state,
                 database.ManagedLaunchV2ReservationModel.admission_json.is_(None),
             ]
-            if claimed_state == "preflight_blocked":
+            if claimed_state == "launching":
+                # The same three columns the read proved absent, re-stated as
+                # the write condition. A bind landing concurrently writes one
+                # of them, so it wins and this finalization loses; a bind
+                # arriving after finds the row negative and refuses. Exactly
+                # one of the two can succeed.
+                for column in _LAUNCHING_ZERO_BYTE_COLUMNS:
+                    filters.append(
+                        getattr(database.ManagedLaunchV2ReservationModel, column).is_(None)
+                    )
+            elif claimed_state == "preflight_blocked":
                 filters.append(database.ManagedLaunchV2ReservationModel.binding_json.is_(None))
             else:
                 filters.append(database.ManagedLaunchV2ReservationModel.binding_json.isnot(None))
@@ -1637,6 +1723,10 @@ def _build_bind_intent(
     bound_mode: str,
 ) -> dict[str, Any]:
     """Compute the exact bind intent (payload bytes + token) for one attempt."""
+    # The reservation's own durable request. Named apart from ``request``,
+    # which is the *bind* request: the assigned/requested route facts are
+    # statements about what was reserved, not about this attempt.
+    reserved_request = _parse_json(row.request_json, {})
     terminal = (
         db.query(database.TerminalModel)
         .filter(database.TerminalModel.id == row.terminal_id)
@@ -1653,11 +1743,19 @@ def _build_bind_intent(
         if terminal is not None
         else f"tmux:{row.session_name}:unknown:unknown"
     )
+    # This digest hashes the **assigned** route, stated here because it
+    # binds a failure domain and must be the same value on both sides of
+    # every later comparison. Assigned is the only choice that is always
+    # present: the observed effort is null for a provider-default route
+    # and for any pair whose effort cannot be read before a turn, so a
+    # digest over the observation would change meaning with the provider
+    # rather than with the route, and two peers comparing it would differ
+    # for reasons neither could see.
     route_digest = hashlib.sha256(
         _canonical_json(
             {
-                "model": receipt["model"],
-                "effort": receipt["effort"],
+                "model": reserved_request["expected_model"],
+                "effort": reserved_request["expected_effort"],
                 "agent_profile": row.agent_profile,
             }
         ).encode()
@@ -1722,13 +1820,27 @@ def _build_bind_intent(
         provider=_PINNED_PROVIDER[row.provider],
         native_id=receipt["provider_session_id"],
         authority_status="unobserved",
-        assigned_model=receipt["model"],
-        assigned_effort=receipt["effort"],
+        # Assigned and requested are statements about what this route ASKED
+        # FOR, so they come from the reservation's own durable request. The
+        # observed fields below stay null because PF-2 is red and nothing
+        # here may claim a provider observation.
+        #
+        # They used to be read from the receipt, which was indistinguishable
+        # while a receipt merely echoed the request. Once the receipt became
+        # honest, a provider-default route reported a null *observed* effort
+        # and that null arrived here as the *assigned* one — which the
+        # receipt contract rightly refuses, because an assigned effort is
+        # never unknown. A live Kimi generation with complete readiness
+        # failed its bind with "assigned_effort must be a non-empty string"
+        # for exactly that reason. The two fields answer different
+        # questions and only the observed one may be absent.
+        assigned_model=reserved_request["expected_model"],
+        assigned_effort=reserved_request["expected_effort"],
         assigned_policy_sha256=receipt.get("profile_sha256") or ("0" * 64),
         assigned_profile_sha256=receipt.get("profile_sha256") or ("0" * 64),
         assigned_config_sha256=receipt.get("protected_config_sha256") or ("0" * 64),
-        requested_model=receipt["model"],
-        requested_effort=receipt["effort"],
+        requested_model=reserved_request["expected_model"],
+        requested_effort=reserved_request["expected_effort"],
         observed_model=None,
         observed_effort=None,
         protocol_version=None,
@@ -2722,6 +2834,10 @@ class _V2NativePane:
             # command line could be interrupted into something else.
             managed_native_command=argv,
             protocol_vintage="v2",
+            # The pane runs the provider's own full-screen TUI, so its
+            # status comes from the native observer and the FIFO monitor
+            # is never scheduled for it.
+            native_status_source=True,
         )
         return self._window
 
@@ -2758,7 +2874,11 @@ async def _launch_native_tui(
     """
     import asyncio
 
-    from cli_agent_orchestrator.services import claude_native_readiness, kimi_native_bootstrap
+    from cli_agent_orchestrator.services import (
+        claude_native_launch,
+        claude_native_readiness,
+        kimi_native_bootstrap,
+    )
     from cli_agent_orchestrator.services.managed_provider_bridge import (
         BRIDGE_VERSION,
         native_child_environment,

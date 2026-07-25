@@ -25,7 +25,9 @@ cause.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import subprocess
 import uuid
 
@@ -34,6 +36,7 @@ import pytest
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.managed_launch_v2 import (
     PROTOCOL_VERSION_V2,
+    ManagedLaunchV2BindRequest,
     ManagedLaunchV2ReserveRequest,
 )
 from cli_agent_orchestrator.services import kimi_native_bootstrap, kimi_route
@@ -544,3 +547,175 @@ class TestTheHelperIsTheOneComparison:
         assert provider_contracts.effort_receipt_matches(SENTINEL, None) is True
         assert provider_contracts.effort_receipt_matches(SENTINEL, "high") is False
         assert provider_contracts.effort_receipt_matches(SENTINEL, SENTINEL) is False
+
+
+class TestBindSurvivesAProviderDefaultRoute:
+    """The live cond-0112 Kimi failure, reproduced at the bind seam.
+
+    A Kimi native generation reached durable readiness -- input_ready
+    true, exact pane, native session present -- and its very first bind
+    returned HTTP 503, "native bind failed: assigned_effort must be a
+    non-empty string". Nothing was wrong with the readiness. The bind
+    intent fed the receipt's *observed* effort, which a truthful
+    provider-default receipt reports as null, into the *assigned* route
+    fact, which is a statement about what was asked for and is never
+    null.
+
+    Every earlier test of this route stopped at the receipt or at
+    readiness validation, so the one consumer that actually rejected the
+    null was never exercised with it.
+    """
+
+    def _ready_state(self, record):
+        session_id = "session_bf43ec1e-793f-4d5e-80dd-39a03e6d3d82"
+        return {
+            "state": "ready",
+            "readiness": {
+                "bridge_version": bridge.BRIDGE_VERSION,
+                "reservation_id": record["reservation_id"],
+                "terminal_id": record["terminal_id"],
+                "generation": record["generation"],
+                "provider": "kimi_cli",
+                "agent_profile": record["agent_profile"],
+                "model": K27,
+                # Honest: this route selected no effort, so none was read.
+                "effort": None,
+                "working_directory": record["working_directory"],
+                "receipt_id": session_id,
+                "provider_session_id": session_id,
+                "provider_version": "0.29.1",
+                "provider_receipt_kind": "kimi-native-tui-attached",
+                "model_input_ready": True,
+                "model_input_ready_observation": {
+                    "authority": "observe_kimi_turn_state",
+                    "observed_at": "2026-07-25T21:02:26Z",
+                    "pane_id": "%30",
+                    "provider_status": "idle",
+                    "input_ready": True,
+                    "detail": None,
+                },
+                "process_identity": {"pid": 14744, "start_marker": "Sat Jul 25 17:02:24 2026"},
+                "provider_session_start": None,
+            },
+        }
+
+    def test_a_provider_default_route_binds(
+        self, isolated_memory_db, _companion, worktree, tmp_path, monkeypatch
+    ):
+        import uuid as _uuid
+
+        from cli_agent_orchestrator.models.managed_launch_v2 import ManagedLaunchV2BindRequest
+
+        record = _reserve(worktree, tmp_path, model=K27, effort=SENTINEL)
+        v2.claim_launch(record["reservation_id"])
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+            lambda _rid: self._ready_state(record),
+            raising=False,
+        )
+        monkeypatch.setattr(v2, "_assert_session_not_foreign_held", lambda *a, **k: None)
+
+        bound = v2.bind_native(
+            record["reservation_id"],
+            ManagedLaunchV2BindRequest(
+                protocol_version=PROTOCOL_VERSION_V2,
+                terminal_id=record["terminal_id"],
+                generation=record["generation"],
+                attempt_id=str(_uuid.uuid4()),
+            ),
+        )
+
+        assert bound["state"] == "bound"
+        assert bound["binding"] is not None
+
+
+class TestTheRouteDigestIsOverTheAssignedRoute:
+    """The digest binds a failure domain, so both peers must compute it alike.
+
+    ``assigned_route_digest`` rides in the binding payload and is compared
+    against a value the conductor derives from the route it reserved. It
+    was hashed from the receipt -- the *observation* -- which is a
+    different fact and, for the two classes that cannot be observed,
+    literally a different value: a provider-default Kimi route observes
+    null effort, and a Claude route observes a resolved model rather than
+    the alias that was requested.
+
+    So the digest changed with the provider rather than with the route,
+    and two peers comparing it would disagree for a reason neither could
+    see from its own side. Nothing asserted this value anywhere, which is
+    how it stayed wrong through the receipt fix.
+    """
+
+    def _digest_for(self, record, receipt_model, receipt_effort):
+        request = ManagedLaunchV2BindRequest(
+            protocol_version=PROTOCOL_VERSION_V2,
+            reservation_id=record["reservation_id"],
+            terminal_id=record["terminal_id"],
+            generation=record["generation"],
+            caller_id="deadbeef",
+            attempt_id=str(uuid.uuid4()),
+        )
+        receipt = _native_receipt(record, model=receipt_model, effort=receipt_effort)
+        with database.SessionLocal() as db:
+            row = v2._query(db, record["reservation_id"])
+            intent = v2._build_bind_intent(
+                db, row, record["reservation_id"], request, receipt, "native_tui"
+            )
+        return intent
+
+    def _route_digest(self, intent):
+        # The exact canonical bytes the peer receives, decoded rather than
+        # read from a convenient in-memory field, so this asserts about
+        # what actually crosses the wire.
+        payload = base64.b64decode(intent["binding_payload_b64"])
+        return json.loads(payload.decode())["assigned_route_digest"]
+
+    def test_the_observation_does_not_move_the_digest(
+        self, isolated_memory_db, _companion, worktree, tmp_path
+    ):
+        """Two truthful receipts, one route: one domain key.
+
+        The observed effort is null for this route and the observed model
+        is whatever the session resolved. Neither is the route, so neither
+        may change the value the two peers compare.
+        """
+        record = _reserve(worktree, tmp_path, model=K27, effort=SENTINEL)
+
+        from_null = self._route_digest(self._digest_for(record, K27, None))
+        from_echo = self._route_digest(self._digest_for(record, K27, SENTINEL))
+
+        assert from_null == from_echo
+
+    def test_the_digest_is_the_hash_of_the_reserved_route(
+        self, isolated_memory_db, _companion, worktree, tmp_path
+    ):
+        """Recomputed independently from the reservation, not from the code.
+
+        A peer holding only the reservation must arrive at this exact
+        value, so the test derives it the way that peer would rather than
+        calling the same helper and comparing it to itself.
+        """
+        record = _reserve(worktree, tmp_path, model=K27, effort=SENTINEL)
+
+        expected = hashlib.sha256(
+            v2._canonical_json(
+                {
+                    "model": K27,
+                    "effort": SENTINEL,
+                    "agent_profile": record["agent_profile"],
+                }
+            ).encode()
+        ).hexdigest()
+
+        assert self._route_digest(self._digest_for(record, K27, None)) == expected
+
+    def test_a_different_route_is_a_different_domain(
+        self, isolated_memory_db, _companion, worktree, tmp_path
+    ):
+        """The digest still discriminates; it is pinned, not neutralized."""
+        k27 = _reserve(worktree, tmp_path, model=K27, effort=SENTINEL)
+        k3 = _reserve(worktree, tmp_path, model=K3, effort="max")
+
+        assert self._route_digest(self._digest_for(k27, K27, None)) != self._route_digest(
+            self._digest_for(k3, K3, "max")
+        )

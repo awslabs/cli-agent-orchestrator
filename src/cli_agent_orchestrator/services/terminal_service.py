@@ -33,6 +33,7 @@ from sqlalchemy.exc import OperationalError
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
+    REGISTRATION_OK,
     backfill_terminal_identity_if_missing,
     create_inbox_message,
 )
@@ -51,7 +52,8 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata_v2,
     record_terminal_lifecycle,
     refresh_terminal_window_names,
-    register_terminal_incarnation,
+    register_terminal_incarnation_outcome,
+    register_v2_terminal_incarnation_outcome,
     set_terminal_native_session_id,
     update_last_active,
     update_terminal_shell_command,
@@ -190,12 +192,32 @@ class VerifiedPaneTarget(NamedTuple):
     window_name: str
 
 
+class IncarnationRegistrationRefused(Exception):
+    """A launch could not register its live incarnation, and why.
+
+    Carries the exact typed cause so a caller can tell an absent row from
+    an unreadable pane from a handle something else already holds. Raised
+    only where registration is a launch precondition; see
+    :func:`_register_incarnation`.
+    """
+
+    def __init__(self, terminal_id: str, cause: str, identity: Dict[str, Any]) -> None:
+        self.terminal_id = terminal_id
+        self.cause = cause
+        self.identity = {field: identity.get(field) for field in IDENTITY_FIELDS}
+        super().__init__(
+            f"terminal {terminal_id} could not be registered as a live "
+            f"incarnation ({cause}); observed identity {self.identity}"
+        )
+
+
 def _register_incarnation(
     terminal_id: str,
     generation: Optional[str],
     identity: Dict[str, Any],
     *,
     native_session_id: Optional[str] = None,
+    protocol_vintage: str = "v1",
 ) -> bool:
     """Register the live incarnation this create just produced.
 
@@ -206,12 +228,43 @@ def _register_incarnation(
     and the refusal to re-point are exercised by ordinary use rather than
     being guarantees nothing ever tests.
 
-    Failure is logged, never raised. The row is already correct — this call
-    can only confirm it — so treating a bookkeeping hiccup as a launch
-    failure would tear down a working terminal over a redundant write.
+    Dispatches on vintage, because a v2 managed terminal lives only in the
+    v2 store. Sending it to the legacy writer asked ``terminals`` for a row
+    only ``managed_launch_v2_terminals`` holds, which reported an absent
+    row for *every* native launch — a false negative from a table the
+    launch never wrote.
+
+    The two vintages differ in what a failure means, and so in what this
+    does about it:
+
+    v1 logs and continues, unchanged. The row is already correct there, so
+    this call can only confirm it, and tearing down a working terminal over
+    a redundant write would be the worse error.
+
+    v2 raises. For a native launch the registration is a *precondition*,
+    not bookkeeping: the identity registered here is what every later
+    identity-addressed operation resolves against, so a launch that
+    proceeds without it produces exactly what was observed in production —
+    a live pane whose terminal nothing can find, status stuck unknown, and
+    a lookup failure repeating for as long as the pane lives.
+
+    Raising does not tear that pane down. A managed v2 launch runs under
+    ``preserve_on_init_failure``, so this refusal preserves the generation
+    and exposes it as a zero-byte failure -- one that can then be finalized
+    negative, because no binding, bind intent or admission was ever
+    published. So the choice is not between a live pane and a dead one: it
+    is between a preserved generation somebody can close and a live pane
+    that can be neither addressed nor cleaned up. This happens before any
+    task byte can be delivered, and is the only reason this function is
+    allowed to raise at all.
     """
+    register = (
+        register_v2_terminal_incarnation_outcome
+        if protocol_vintage == "v2"
+        else register_terminal_incarnation_outcome
+    )
     try:
-        registered = register_terminal_incarnation(
+        outcome = register(
             terminal_id,
             generation=generation,
             server_socket_path=identity.get("server_socket_path") or "",
@@ -221,21 +274,24 @@ def _register_incarnation(
             pane_pid=int(identity["pane_pid"]) if identity.get("pane_pid") else 0,
             native_session_id=native_session_id,
         )
-    except Exception as exc:  # pragma: no cover - see the docstring
+    except Exception as exc:
+        if protocol_vintage == "v2":
+            raise
         logger.warning("Could not register incarnation for %s: %s", terminal_id, exc)
         return False
-    if not registered:
-        # Reached when the observation was incomplete, or when the row
-        # already holds a different pane. Neither is fatal here, and both
-        # are worth a line: the first means this terminal will refuse
-        # identity-addressed use, the second that something tried to move
-        # an existing handle.
+    if outcome != REGISTRATION_OK:
+        if protocol_vintage == "v2":
+            raise IncarnationRegistrationRefused(terminal_id, outcome, identity)
+        # v1, unchanged: the cause is named rather than reduced to a flag,
+        # because these need different fixes and the log is where somebody
+        # finds out which one happened.
         logger.info(
-            "Terminal %s was not registered as a live incarnation (identity %s)",
+            "Terminal %s was not registered as a live incarnation (%s, identity %s)",
             terminal_id,
+            outcome,
             {field: identity.get(field) for field in IDENTITY_FIELDS},
         )
-    return registered
+    return outcome == REGISTRATION_OK
 
 
 def record_native_session(terminal_id: str, native_session_id: str) -> bool:
@@ -1133,6 +1189,13 @@ async def create_terminal(
     preserve_on_init_failure: bool = False,
     managed_native_command: Optional[list[str]] = None,
     protocol_vintage: str = "v1",
+    # Whether this terminal's status comes from the native provider
+    # observer instead of the FIFO status monitor. Stated by the caller
+    # rather than inferred: ``managed_native_command`` cannot decide it,
+    # because the v2 ACP bridge is also launched by argv and *does* need
+    # the FIFO -- it is a line-oriented subprocess. Only the launch verb
+    # knows whether the pane it is about to create is a full-screen TUI.
+    native_status_source: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -1403,7 +1466,7 @@ async def create_terminal(
                 session_id=identity.get("session_id"),
                 pane_pid=int(identity["pane_pid"]) if identity.get("pane_pid") else None,
             )
-            _register_incarnation(terminal_id, terminal_generation, identity)
+            _register_incarnation(terminal_id, terminal_generation, identity, protocol_vintage="v2")
             # The v2 DB row is durably committed: observed creation.
             _mark_v2_resource_created(
                 f"{terminal_id}.db-row",
@@ -1458,7 +1521,19 @@ async def create_terminal(
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
         # socket events and their pipe_pane is a no-op, so skip the FIFO there and
         # rely on the herdr inbox registration below.
-        if not get_backend().supports_event_inbox():
+        #
+        # A native TUI is skipped here too, where the monitor is *scheduled*.
+        # It owns its pane's argv and renders a full-screen interface; there
+        # is no line-oriented stream for a FIFO to carry and no legacy
+        # provider to parse one, so scheduling the monitor is a category
+        # error. Left scheduled it does not degrade quietly: every output
+        # chunk reaches a provider lookup that raises for a terminal the
+        # legacy table does not hold, which is the log storm observed in
+        # production. Deciding it here rather than catching that exception
+        # is the difference between not asking a question and asking it and
+        # ignoring the answer -- only the first leaves the status source
+        # free to be the observer that can actually see the pane.
+        if not get_backend().supports_event_inbox() and not native_status_source:
             fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
             # Reader must exist BEFORE pipe-pane starts so it captures from the

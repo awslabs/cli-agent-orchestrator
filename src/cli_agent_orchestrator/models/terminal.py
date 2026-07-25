@@ -19,6 +19,14 @@ class TerminalStatus(str, Enum):
     COMPLETED = "completed"
     WAITING_USER_ANSWER = "waiting_user_answer"
     ERROR = "error"
+    #: A live pane whose status no FIFO monitor observes. A native TUI owns
+    #: its pane's argv and renders a full-screen interface, so there is no
+    #: line-oriented stream to classify and no legacy provider to classify
+    #: it. Distinct from UNKNOWN, which means "live pane, state not yet
+    #: detected" and so promises a detection that for this terminal is never
+    #: coming -- reporting it here is what left the dashboard showing every
+    #: native worker as pending forever.
+    NOT_FIFO_MONITORED = "not_fifo_monitored"
 
 
 class Terminal(BaseModel):

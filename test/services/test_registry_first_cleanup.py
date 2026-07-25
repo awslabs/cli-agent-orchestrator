@@ -486,7 +486,18 @@ def test_v2_construction_is_journal_first_and_teardown_is_truthful(tmp_path, mon
             return window
 
         def window_identity(self, _session, _window):
-            return {"pane_id": "%901", "window_id": "@902"}
+            # The complete five-field tuple, because a v2 launch registers
+            # its live incarnation as a precondition and refuses a partial
+            # identity. This test is about journal-first ordering and
+            # truthful teardown, so the identity only has to be registrable
+            # enough to reach them.
+            return {
+                "pane_id": "%901",
+                "window_id": "@902",
+                "session_id": "$9",
+                "server_socket_path": "/private/tmp/tmux-501/default",
+                "pane_pid": 9012,
+            }
 
         def window_exists(self, _session, _window):
             return False
