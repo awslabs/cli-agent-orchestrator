@@ -10,7 +10,10 @@ from typing import Dict, List, Optional
 
 import libtmux
 
-from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
+from cli_agent_orchestrator.constants import (
+    BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
+    TMUX_HISTORY_LINES,
+)
 from cli_agent_orchestrator.utils.path_validation import (
     BLOCKED_SYSTEM_DIRECTORIES,
     resolve_and_validate_path,
@@ -273,6 +276,27 @@ class TmuxClient:
                 cls._paste_buffer_sanitizes = True
         return cls._paste_buffer_sanitizes
 
+    def _pane_is_bracketed_paste_incompatible(self, session_name: str, window_name: str) -> bool:
+        """Whether the pane's live foreground command is a known shell.
+
+        Used by ``send_keys(force_bracketed_paste=True)`` to avoid gluing
+        bracketed-paste escape sequences onto a bare shell prompt that
+        doesn't understand them (see BRACKETED_PASTE_INCOMPATIBLE_SHELLS'
+        own docstring for the failure mode). Reuses the same
+        ``#{pane_current_command}`` probe already trusted elsewhere in this
+        codebase for an equivalent "has the TUI exited back to a shell?"
+        check (``codex.py``/``kiro_cli.py``'s own ``shell_baseline``
+        comparison in ``get_status()``).
+
+        Fails closed to "compatible" (returns False) on any lookup failure
+        or an unrecognized command name -- an unknown foreground process is
+        assumed to be a real TUI expecting bracketed paste, preserving the
+        existing behavior for every case this function can't positively
+        rule out.
+        """
+        command = self.get_pane_current_command(session_name, window_name)
+        return command is not None and command in BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+
     def send_keys(
         self,
         session_name: str,
@@ -298,27 +322,42 @@ class TmuxClient:
                 Some TUIs enter multi-line mode after bracketed paste,
                 requiring 2 Enters to submit.
             force_bracketed_paste: If True, guarantee bracketed-paste framing
-                for message delivery to TUIs. On tmux < 3.7 this wraps the
-                buffer in hand-crafted \x1b[200~...\x1b[201~ markers and
-                pastes with -r (no LF->CR conversion) — required because
-                paste-buffer -p only emits markers when the pane enabled
-                DECSET 2004, and some TUIs (e.g. kiro-cli) never do, so under
-                -p their multi-line messages would submit per-line (#230). On
-                tmux >= 3.7 the wrap is impossible: pasted buffer content
-                passes through vis(3) sanitization (hardening against
-                bracket-end injection), turning each raw ESC into the literal
-                two characters "^[" — hand-crafted markers render as visible
-                "^[[200~" garbage in the receiving TUI (issue #413). There we
-                paste raw content with -p, which emits genuine 0x1b markers
-                conditionally on the pane's DECSET 2004 state; non-2004 panes
-                receive raw text and multi-line content submits per-line
-                (tmux-sanctioned paste semantics — nothing better exists on
-                >= 3.7 without -S, which is deliberately NOT used because it
-                bypasses the vis(3) hardening and would let worker-authored
-                message bytes smuggle control sequences into a receiving
-                TUI). Do NOT set for shell commands sent to bash during
-                initialization (bash 4.x would receive the literal escape
-                sequences on tmux < 3.7).
+                for message delivery to TUIs -- UNLESS the pane's live
+                foreground command (per #{pane_current_command}) is a known
+                shell (see BRACKETED_PASTE_INCOMPATIBLE_SHELLS), in which
+                case the wrap is skipped entirely and the content is
+                delivered as plain keystrokes instead. A bare shell doesn't
+                understand the escape sequences and glues them onto the
+                first token of the command, corrupting it -- the caller
+                asking for bracketed delivery does not always know the
+                target TUI has already exited (e.g. via its own `/exit`)
+                and left the pane at a shell prompt, so this is checked
+                fresh on every call rather than trusted from the caller's
+                own intent.
+
+                For a pane that IS running a real TUI, how the wrap is
+                applied depends on the tmux version: on tmux < 3.7 this
+                wraps the buffer in hand-crafted \x1b[200~...\x1b[201~
+                markers and pastes with -r (no LF->CR conversion) —
+                required because paste-buffer -p only emits markers when
+                the pane enabled DECSET 2004, and some TUIs (e.g. kiro-cli)
+                never do, so under -p their multi-line messages would
+                submit per-line (#230). On tmux >= 3.7 the hand-crafted wrap
+                is impossible: pasted buffer content passes through vis(3)
+                sanitization (hardening against bracket-end injection),
+                turning each raw ESC into the literal two characters "^["
+                — hand-crafted markers render as visible "^[[200~" garbage
+                in the receiving TUI (issue #413). There we paste raw
+                content with -p, which emits genuine 0x1b markers
+                conditionally on the pane's DECSET 2004 state; non-2004
+                panes receive raw text and multi-line content submits
+                per-line (tmux-sanctioned paste semantics — nothing better
+                exists on >= 3.7 without -S, which is deliberately NOT used
+                because it bypasses the vis(3) hardening and would let
+                worker-authored message bytes smuggle control sequences
+                into a receiving TUI). Do NOT set for shell commands sent
+                to bash during initialization (bash 4.x would receive the
+                literal escape sequences on tmux < 3.7).
         """
         # Defence-in-depth: re-validate at the sink even though callers
         # validate at the API/MCP boundary. Both halves flow into a
@@ -339,33 +378,54 @@ class TmuxClient:
             # available here at DEBUG for local delivery troubleshooting.
             logger.info(f"send_keys: {target} - keys length: {len(keys)}")
             logger.debug(f"send_keys: {target} - keys: {keys}")
-            if force_bracketed_paste and not self._tmux_sanitizes_paste_buffers():
-                # tmux < 3.7: buffer bytes pass through paste-buffer
-                # unmodified, so keep the legacy unconditional wrap + -r
-                # (no LF->CR conversion). paste-buffer -p only emits markers
-                # when the pane enabled DECSET 2004, and some TUIs (e.g.
-                # kiro-cli) never do — under -p their multi-line messages
-                # would submit per-line (#230). No pane-level bracketed-paste
-                # state format exists on these versions (verified empirically
-                # on 3.4), so the wrap stays unconditional here.
-                buf_content = b"\x1b[200~" + keys.encode() + b"\x1b[201~"
-                paste_flag = "-r"
-            else:
-                # tmux >= 3.7 vis(3)-sanitizes pasted buffer content: raw ESC
-                # bytes in the buffer would render as literal "^[[200~" in the
-                # receiving TUI (issue #413). Load ONLY the raw message bytes
-                # and let tmux emit genuine markers via -p, conditionally on
-                # the pane's DECSET 2004 state. -S is deliberately NOT used:
-                # it bypasses the vis(3) hardening.
+            if force_bracketed_paste and self._pane_is_bracketed_paste_incompatible(
+                validated_session, validated_window
+            ):
+                # The pane's live foreground command is a known shell (see
+                # BRACKETED_PASTE_INCOMPATIBLE_SHELLS) -- it won't reliably
+                # understand bracketed-paste escapes, so don't ask tmux to
+                # add them, on ANY tmux version. Deliberately omitting -p
+                # here too, not just the manual \x1b[200~ wrap used below
+                # for a real TUI on tmux < 3.7: -p's own bracket-emitting
+                # decision is driven by tmux's per-pane ?2004h tracking,
+                # which can itself be stale (the very TUI that used to run
+                # in this pane can leave it "on" without ever sending
+                # ?2004l on exit) -- so -p is not a safe fallback here
+                # either. Sending with no paste flag at all never adds
+                # escape sequences regardless of that tracked state; \n
+                # still becomes Enter (no -r), the correct behavior for a
+                # plain shell prompt.
                 buf_content = keys.encode()
-                paste_flag = "-p"
+                paste_args = []
+            elif force_bracketed_paste and not self._tmux_sanitizes_paste_buffers():
+                # A real TUI, tmux < 3.7: buffer bytes pass through
+                # paste-buffer unmodified, so keep the legacy unconditional
+                # wrap + -r (no LF->CR conversion). paste-buffer -p only
+                # emits markers when the pane enabled DECSET 2004, and some
+                # TUIs (e.g. kiro-cli) never do — under -p their multi-line
+                # messages would submit per-line (#230). No pane-level
+                # bracketed-paste state format exists on these versions
+                # (verified empirically on 3.4), so the wrap stays
+                # unconditional here.
+                buf_content = b"\x1b[200~" + keys.encode() + b"\x1b[201~"
+                paste_args = ["-r"]
+            else:
+                # Either force_bracketed_paste=False, or a real TUI on
+                # tmux >= 3.7 which vis(3)-sanitizes pasted buffer content:
+                # raw ESC bytes in the buffer would render as literal
+                # "^[[200~" in the receiving TUI (issue #413). Load ONLY the
+                # raw message bytes and let tmux emit genuine markers via
+                # -p, conditionally on the pane's DECSET 2004 state. -S is
+                # deliberately NOT used: it bypasses the vis(3) hardening.
+                buf_content = keys.encode()
+                paste_args = ["-p"]
             subprocess.run(
                 ["tmux", "load-buffer", "-b", buf_name, "-"],
                 input=buf_content,
                 check=True,
             )
             subprocess.run(
-                ["tmux", "paste-buffer", paste_flag, "-b", buf_name, "-t", target],
+                ["tmux", "paste-buffer", *paste_args, "-b", buf_name, "-t", target],
                 check=True,
             )
             # Delay to let the TUI process the bracketed paste end sequence before

@@ -124,6 +124,18 @@ class TestConfigSet:
         assert result.exception is None or isinstance(result.exception, SystemExit)
         assert "Unknown memory setting" in result.output
 
+    def test_set_memory_lint_enabled_false_persists_locally(self, runner, _isolated_settings):
+        result = runner.invoke(config, ["set", "memory.lint_enabled", "false"])
+        assert result.exit_code == 0
+        assert json.loads(result.output)["lint_enabled"] is False
+
+        on_disk = json.loads(_isolated_settings["settings"].read_text())
+        assert on_disk["memory"]["lint_enabled"] is False
+
+        get_result = runner.invoke(config, ["get", "memory.lint_enabled"])
+        assert get_result.exit_code == 0
+        assert json.loads(get_result.output) is False
+
     def test_set_network_key_succeeds_persists_and_warns(self, runner, _isolated_settings):
         """network.* is schema-only (no runtime effect yet) — set() still
         succeeds and persists, but must warn the operator on stderr."""

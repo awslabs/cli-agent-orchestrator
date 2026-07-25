@@ -3,7 +3,6 @@
 import asyncio
 import inspect
 import json
-import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -54,66 +53,60 @@ class TestHerdrInboxServiceRegistration:
 
 
 class TestHerdrInboxServiceRegisterReconnect:
-    """Registering a terminal on a live connection must force a reconnect, never
-    a second events.subscribe.
+    """Registering a terminal must NOT touch the socket.
 
-    herdr 0.6.8 resets the entire connection when it receives a second
-    events.subscribe on a connection that already has an active subscription.
-    Because herdr exposes no incremental "add subscription" API, the only safe
-    way to start streaming events for a newly registered pane is to drop the
-    socket and rebuild the single combined subscription on a fresh connection.
-
-    register_terminal may be called from a synchronous, non-event-loop thread,
-    so it must schedule the reconnect onto the captured loop via
-    run_coroutine_threadsafe rather than asyncio.create_task (which requires a
-    running loop in the calling thread and would raise RuntimeError).
+    The subscription is a single broadcast pane.updated (no pane_id) covering
+    every pane, so a newly registered pane's events already arrive on the live
+    connection. Registration therefore only updates the in-memory maps — it must
+    never close the socket or write a second events.subscribe (herdr 0.7.x resets
+    the connection on a second subscribe, which caused past reconnect storms).
     """
 
-    def test_register_while_connected_triggers_reconnect_not_second_subscribe(self):
-        """register from a non-loop thread, while connected, closes the socket to
-        force a reconnect and must NOT write a second events.subscribe."""
+    def test_register_while_connected_does_not_touch_socket(self):
+        """With broadcast subscription, a newly registered pane's events already
+        arrive — registration must NOT close the socket, write, or schedule a
+        reconnect coroutine."""
+        import asyncio
 
-        async def run():
-            service = HerdrInboxService(socket_path="/tmp/test.sock")
-            service._connected = True
-            service._loop = asyncio.get_running_loop()
-            # close() is synchronous; use a plain MagicMock so write/close are tracked.
-            writer = MagicMock()
-            service._writer = writer
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        writer = MagicMock()
+        service._writer = writer
+        # Simulate a live connection with a captured loop, the state under which
+        # the removed force-reconnect used to fire.
+        service._connected = True
+        service._loop = MagicMock()
 
-            # Call register from a separate thread that has no event loop of its own.
-            t = threading.Thread(target=service.register_terminal, args=("tid_cross", "pane-cross"))
-            t.start()
-            t.join()
+        # Behavioral assertion: registration must not schedule ANY coroutine onto
+        # the loop. This is the real contract (not a private-name check) and it is
+        # non-vacuous — writer.close/write alone pass even if a coroutine is merely
+        # scheduled on an un-run loop, so assert on the scheduling call itself.
+        with patch.object(asyncio, "run_coroutine_threadsafe") as mock_schedule:
+            service.register_terminal("tid1", "w1:p1", is_kiro=False)
+            mock_schedule.assert_not_called()
 
-            # Give the cross-thread-scheduled coroutine time to run on this loop.
-            await asyncio.sleep(0.05)
-
-            # Mapping recorded.
-            assert service._pane_to_terminal["pane-cross"] == "tid_cross"
-            # Reconnect forced by closing the writer...
-            writer.close.assert_called_once()
-            # ...and NO second events.subscribe was written on the live connection.
-            writer.write.assert_not_called()
-
-        _run_async(run())
+        assert service._pane_to_terminal["w1:p1"] == "tid1"
+        writer.close.assert_not_called()
+        writer.write.assert_not_called()
+        # Belt-and-braces: the force-reconnect method is gone entirely, so it
+        # cannot be reintroduced without also updating this guard.
+        assert not hasattr(service, "_force_reconnect")
 
     def test_register_before_start_does_not_reconnect(self):
-        """register_terminal before start (no loop, not connected) must not touch the socket."""
+        """register_terminal before start() has run must not touch the socket."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         writer = MagicMock()
         service._writer = writer
 
-        # Pre-start state: start() has not run, so no loop captured and not connected.
-        assert service._connected is False
-        assert service._loop is None
+        # Pre-start state: start() has not run. Registration only updates the
+        # in-memory maps; it must not schedule a coroutine or write to the socket.
+        assert not hasattr(service, "_force_reconnect")
 
         service.register_terminal("tid_early", "pane-early")
 
         # Mapping is still recorded...
         assert service._pane_to_terminal["pane-early"] == "tid_early"
         assert service._terminal_to_pane["tid_early"] == "pane-early"
-        # ...but the socket was left untouched (guarded by _connected and _loop).
+        # ...but the socket is left untouched — registration never writes to it.
         writer.close.assert_not_called()
         writer.write.assert_not_called()
 
@@ -147,62 +140,46 @@ class TestHerdrInboxServiceDelivery:
 class TestHerdrInboxServiceSubscription:
     """Test combined event subscription message format.
 
-    herdr 0.6.8 resets the connection on a second events.subscribe, so all
-    subscriptions (every managed pane's agent-status plus the two lifecycle
-    events) must be sent in a SINGLE events.subscribe call.
+    herdr 0.7.5 resets the connection on a second events.subscribe, so all
+    subscriptions must be sent in a SINGLE events.subscribe call. The
+    subscription is a broadcast pane.updated (no pane_id) that carries
+    agent_status for every pane, plus the two lifecycle events.
     """
 
-    def test_subscribe_all_events_sends_single_combined_message(self):
-        """_subscribe_all_events should send exactly one events.subscribe containing
-        every managed pane's agent-status subscription plus the lifecycle events."""
+    def test_subscribe_all_events_sends_single_broadcast_message(self):
+        """One events.subscribe with broadcast pane.updated + lifecycle, NO pane_id.
+
+        herdr 0.7.5 resets the connection on a second events.subscribe, so this
+        must stay a single call. pane.updated is a broadcast (no pane_id) that
+        carries agent_status for every pane, so per-pane subscriptions are gone.
+        """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._writer = AsyncMock()
-        service._pane_to_terminal = {"pane-1": "tid1", "pane-2": "tid2"}
-        service._terminal_to_pane = {"tid1": "pane-1", "tid2": "pane-2"}
-
-        _run_async(service._subscribe_all_events())
-
-        # Exactly ONE write — never a second subscribe call.
-        service._writer.write.assert_called_once()
-        written = service._writer.write.call_args[0][0]
-        msg = json.loads(written.decode().strip())
-
-        assert msg["method"] == "events.subscribe"
-        subs = msg["params"]["subscriptions"]
-
-        # Every managed pane has an agent-status subscription with its pane_id.
-        agent_subs = [s for s in subs if s["type"] == "pane.agent_status_changed"]
-        assert {s["pane_id"] for s in agent_subs} == {"pane-1", "pane-2"}
-
-        # Lifecycle events are included in the same single call.
-        types = {s["type"] for s in subs}
-        assert "pane.closed" in types
-        assert "workspace.closed" in types
-
-    def test_subscribe_all_events_with_no_panes_still_includes_lifecycle(self):
-        """With no managed panes, the single subscribe still covers lifecycle events."""
-        service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        # Empty map: the broadcast subscription shape must NOT depend on any
+        # registered panes — it is a single pane.updated with no per-pane entries.
+        service._pane_to_terminal = {}
 
         _run_async(service._subscribe_all_events())
 
         service._writer.write.assert_called_once()
         msg = json.loads(service._writer.write.call_args[0][0].decode().strip())
+        assert msg["method"] == "events.subscribe"
         types = {s["type"] for s in msg["params"]["subscriptions"]}
-        assert types == {"pane.closed", "workspace.closed"}
-        # No agent-status entry without a pane_id (herdr rejects that as invalid_request).
-        assert all(
-            "pane_id" in s
-            for s in msg["params"]["subscriptions"]
-            if s["type"] == "pane.agent_status_changed"
-        )
+        assert types == {"pane.updated", "pane.closed", "workspace.closed"}
+        # Broadcast subscriptions carry no pane_id.
+        assert all("pane_id" not in s for s in msg["params"]["subscriptions"])
 
 
 class TestHerdrInboxServiceEventParsing:
     """Test that _event_loop correctly unwraps the 'data' wrapper in socket events."""
 
     def test_event_loop_parses_data_wrapper_and_delivers(self):
-        """Events with 'data' wrapper are correctly parsed and delivery is triggered."""
+        """Events with the nested data.pane wrapper are parsed and delivery is triggered.
+
+        Reflects the real subscribed wire shape (broadcast pane.updated with the
+        pane object under data.pane), not the retired top-level
+        pane.agent_status_changed shape.
+        """
         callback = MagicMock()
         service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
 
@@ -213,8 +190,8 @@ class TestHerdrInboxServiceEventParsing:
         idle_event = (
             json.dumps(
                 {
-                    "event": "pane.agent_status_changed",
-                    "data": {"pane_id": "pane-x", "agent_status": "idle"},
+                    "event": "pane_updated",
+                    "data": {"pane": {"pane_id": "pane-x", "agent_status": "idle"}},
                 }
             ).encode()
             + b"\n"
@@ -222,8 +199,8 @@ class TestHerdrInboxServiceEventParsing:
         done_event = (
             json.dumps(
                 {
-                    "event": "pane.agent_status_changed",
-                    "data": {"pane_id": "pane-x", "agent_status": "done"},
+                    "event": "pane_updated",
+                    "data": {"pane": {"pane_id": "pane-x", "agent_status": "done"}},
                 }
             ).encode()
             + b"\n"
@@ -232,8 +209,8 @@ class TestHerdrInboxServiceEventParsing:
         working_event = (
             json.dumps(
                 {
-                    "event": "pane.agent_status_changed",
-                    "data": {"pane_id": "pane-x", "agent_status": "working"},
+                    "event": "pane_updated",
+                    "data": {"pane": {"pane_id": "pane-x", "agent_status": "working"}},
                 }
             ).encode()
             + b"\n"
@@ -242,8 +219,8 @@ class TestHerdrInboxServiceEventParsing:
         other_event = (
             json.dumps(
                 {
-                    "event": "pane.agent_status_changed",
-                    "data": {"pane_id": "pane-other", "agent_status": "idle"},
+                    "event": "pane_updated",
+                    "data": {"pane": {"pane_id": "pane-other", "agent_status": "idle"}},
                 }
             ).encode()
             + b"\n"
@@ -298,15 +275,82 @@ class TestHerdrInboxServiceEventParsing:
         # Flat format is not parsed — no delivery expected
         callback.assert_not_called()
 
+    def test_event_loop_reads_pane_updated_nested_pane(self):
+        """pane.updated wraps the pane object under data.pane; extraction must
+        read pane_id/agent_status from there and deliver for a managed pane."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        callback = MagicMock()
+        service._delivery_callback = callback
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+
+        frame = {
+            "event": "pane_updated",
+            "data": {"pane": {"pane_id": "w1:p1", "agent_status": "idle"}},
+        }
+        reader = AsyncMock()
+        reader.readline.side_effect = [
+            (json.dumps(frame) + "\n").encode(),
+            b"",  # EOF ends the loop
+        ]
+        service._reader = reader
+        try:
+            _run_async(service._event_loop())
+        except ConnectionError:
+            pass  # EOF raises ConnectionError("Socket closed") — expected
+
+        callback.assert_called_once_with("tid1")
+
+    def test_event_loop_ignores_pane_updated_for_unmanaged_pane(self):
+        """Broadcast now delivers events for ALL panes; the managed-pane filter
+        must drop events for panes CAO does not track."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        callback = MagicMock()
+        service._delivery_callback = callback
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+
+        frame = {
+            "event": "pane_updated",
+            "data": {"pane": {"pane_id": "w9:p9", "agent_status": "idle"}},
+        }
+        reader = AsyncMock()
+        reader.readline.side_effect = [(json.dumps(frame) + "\n").encode(), b""]
+        service._reader = reader
+        try:
+            _run_async(service._event_loop())
+        except ConnectionError:
+            pass
+
+        callback.assert_not_called()
+
+    def test_event_loop_survives_pane_null(self):
+        """A malformed pane.updated with data.pane=null must not raise (which
+        would escape _event_loop/_socket_loop and permanently kill delivery)."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        callback = MagicMock()
+        service._delivery_callback = callback
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+
+        frame = {"event": "pane_updated", "data": {"pane": None}}
+        reader = AsyncMock()
+        reader.readline.side_effect = [(json.dumps(frame) + "\n").encode(), b""]
+        service._reader = reader
+        try:
+            _run_async(service._event_loop())
+        except ConnectionError:
+            pass  # EOF — expected
+        # No AttributeError; malformed event is simply ignored (no delivery).
+        callback.assert_not_called()
+
 
 class TestHerdrInboxServiceReconnect:
     """Test reconnect re-subscribe behavior: a single combined subscribe per connection."""
 
     def test_reconnect_resubscribe_sends_single_call_for_all_panes(self):
-        """On reconnect, all managed panes are re-subscribed in ONE events.subscribe call.
+        """On reconnect, the broadcast subscription is re-sent in ONE events.subscribe call.
 
         herdr resets the connection on a second events.subscribe, so re-subscribing
-        N panes must be one combined call, not N separate calls.
+        must be one combined call. The subscription is a broadcast pane.updated
+        (no pane_id) covering every pane, plus the two lifecycle events.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._writer = AsyncMock()
@@ -318,15 +362,13 @@ class TestHerdrInboxServiceReconnect:
 
         _run_async(service._subscribe_all_events())
 
-        # Exactly ONE subscribe message for all panes (not one per pane).
+        # Exactly ONE broadcast subscribe message (not one per pane).
         service._writer.write.assert_called_once()
         msg = json.loads(service._writer.write.call_args[0][0].decode().strip())
-        agent_panes = {
-            s["pane_id"]
-            for s in msg["params"]["subscriptions"]
-            if s["type"] == "pane.agent_status_changed"
-        }
-        assert agent_panes == {"pane-1", "pane-2"}
+        types = {s["type"] for s in msg["params"]["subscriptions"]}
+        assert types == {"pane.updated", "pane.closed", "workspace.closed"}
+        # Broadcast subscriptions carry no pane_id.
+        assert all("pane_id" not in s for s in msg["params"]["subscriptions"])
         # Mapping should be unchanged
         assert service._terminal_to_pane["tid1"] == "pane-1"
         assert service._terminal_to_pane["tid2"] == "pane-2"
@@ -397,28 +439,20 @@ class TestHerdrInboxServiceReconcile:
         assert inspect.iscoroutinefunction(service._reconcile)
         assert inspect.iscoroutinefunction(service._subscribe_all_events)
 
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
-    def test_reconcile_prunes_stale_pane(self, mock_meta, mock_delete, mock_run):
-        """Stale pane_ids (not in live herdr list) are pruned from maps and DB."""
+    def test_reconcile_prunes_stale_pane(self, mock_meta, mock_delete, mock_snap):
+        """Stale pane_ids (not in live herdr snapshot) are pruned from maps and DB."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid1", "pane-live")
         service.register_terminal("tid2", "pane-stale")
 
-        pane_list_response = json.dumps({"result": {"panes": [{"pane_id": "pane-live"}]}})
-        ws_list_response = json.dumps({"result": {"workspaces": []}})
-
-        def subprocess_side_effect(cmd, **_):
-            m = MagicMock()
-            m.returncode = 0
-            if "pane" in cmd and "list" in cmd:
-                m.stdout = pane_list_response
-            else:
-                m.stdout = ws_list_response
-            return m
-
-        mock_run.side_effect = subprocess_side_effect
+        mock_snap.return_value = {
+            "panes": [{"pane_id": "pane-live"}],
+            "tabs": [],
+            "workspaces": [],
+        }
         mock_meta.return_value = None  # No session tracking needed
 
         _run_async(service._reconcile())
@@ -431,44 +465,31 @@ class TestHerdrInboxServiceReconcile:
         # DB record for stale terminal deleted
         mock_delete.assert_called_once_with("tid2")
 
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    def test_reconcile_no_op_when_all_panes_live(self, mock_run):
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_reconcile_no_op_when_all_panes_live(self, mock_snap):
         """No pruning when all registered panes are still live."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid1", "pane-a")
         service.register_terminal("tid2", "pane-b")
 
-        pane_list_response = json.dumps(
-            {"result": {"panes": [{"pane_id": "pane-a"}, {"pane_id": "pane-b"}]}}
-        )
-        ws_list_response = json.dumps({"result": {"workspaces": []}})
-
-        def subprocess_side_effect(cmd, **_):
-            m = MagicMock()
-            m.returncode = 0
-            if "pane" in cmd and "list" in cmd:
-                m.stdout = pane_list_response
-            else:
-                m.stdout = ws_list_response
-            return m
-
-        mock_run.side_effect = subprocess_side_effect
+        mock_snap.return_value = {
+            "panes": [{"pane_id": "pane-a"}, {"pane_id": "pane-b"}],
+            "tabs": [],
+            "workspaces": [],
+        }
 
         _run_async(service._reconcile())
 
         # Maps unchanged
         assert service._pane_to_terminal == {"pane-a": "tid1", "pane-b": "tid2"}
 
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    def test_reconcile_continues_on_pane_list_failure(self, mock_run):
-        """When herdr pane list fails, reconcile logs warning and returns without pruning."""
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_reconcile_continues_on_snapshot_failure(self, mock_snap):
+        """When the snapshot fetch fails (None), reconcile logs and returns without pruning."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid1", "pane-a")
 
-        m = MagicMock()
-        m.returncode = 1
-        m.stderr = "socket not found"
-        mock_run.return_value = m
+        mock_snap.return_value = None
 
         # Should not raise
         _run_async(service._reconcile())
@@ -476,40 +497,21 @@ class TestHerdrInboxServiceReconcile:
         # Map unchanged
         assert "pane-a" in service._pane_to_terminal
 
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
-    def test_reconcile_deletes_ghost_db_terminals(self, mock_list_terminals, mock_delete, mock_run):
+    def test_reconcile_deletes_ghost_db_terminals(
+        self, mock_list_terminals, mock_delete, mock_snap
+    ):
         """Ghost DB terminals (tab not in herdr) are deleted; live terminals are kept."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._workspace_to_session = {"ws-abc": "my-session"}
 
-        pane_list_response = json.dumps({"result": {"panes": []}})
-        ws_list_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
-        )
-        tab_list_response = json.dumps(
-            {
-                "result": {
-                    "tabs": [
-                        {"label": "live-window", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"}
-                    ]
-                }
-            }
-        )
-
-        def subprocess_side_effect(cmd, **_):
-            m = MagicMock()
-            m.returncode = 0
-            if "pane" in cmd and "list" in cmd:
-                m.stdout = pane_list_response
-            elif "tab" in cmd and "list" in cmd:
-                m.stdout = tab_list_response
-            else:
-                m.stdout = ws_list_response
-            return m
-
-        mock_run.side_effect = subprocess_side_effect
+        mock_snap.return_value = {
+            "panes": [],
+            "tabs": [{"label": "live-window", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"}],
+            "workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}],
+        }
 
         mock_list_terminals.return_value = [
             {"id": "tid-live", "tmux_window": "live-window"},
@@ -521,74 +523,43 @@ class TestHerdrInboxServiceReconcile:
         # Only the ghost terminal should be deleted
         mock_delete.assert_called_once_with("tid-ghost")
 
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
-    def test_reconcile_skips_db_check_when_tab_list_fails(self, mock_list_terminals, mock_run):
-        """When herdr tab list returns non-zero, list_terminals_by_session is never called."""
+    def test_reconcile_skips_db_check_when_snapshot_fails(self, mock_list_terminals, mock_snap):
+        """When the snapshot is unavailable (None), the ghost-DB cross-check never runs.
+
+        Tabs now come from the single snapshot, so "can't read live tab data" means
+        the whole snapshot failed. reconcile must return before the DB cross-check so
+        it never deletes terminals based on incomplete herdr state.
+        """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._workspace_to_session = {"ws-abc": "my-session"}
 
-        pane_list_response = json.dumps({"result": {"panes": []}})
-        ws_list_response = json.dumps({"result": {"workspaces": []}})
-
-        def subprocess_side_effect(cmd, **_):
-            m = MagicMock()
-            if "pane" in cmd and "list" in cmd:
-                m.returncode = 0
-                m.stdout = pane_list_response
-            elif "tab" in cmd and "list" in cmd:
-                m.returncode = 1
-                m.stdout = ""
-                m.stderr = "tab list failed"
-            else:
-                m.returncode = 0
-                m.stdout = ws_list_response
-            return m
-
-        mock_run.side_effect = subprocess_side_effect
+        mock_snap.return_value = None
 
         # Should not raise
         _run_async(service._reconcile())
 
         mock_list_terminals.assert_not_called()
 
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     def test_reconcile_no_ghost_when_all_tabs_match(
-        self, mock_list_terminals, mock_delete, mock_run
+        self, mock_list_terminals, mock_delete, mock_snap
     ):
         """When all DB terminals have matching live tabs, delete_terminal is never called."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._workspace_to_session = {"ws-abc": "my-session"}
 
-        pane_list_response = json.dumps({"result": {"panes": []}})
-        ws_list_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
-        )
-        tab_list_response = json.dumps(
-            {
-                "result": {
-                    "tabs": [
-                        {"label": "window-one", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
-                        {"label": "window-two", "tab_id": "ws-abc:2", "workspace_id": "ws-abc"},
-                    ]
-                }
-            }
-        )
-
-        def subprocess_side_effect(cmd, **_):
-            m = MagicMock()
-            m.returncode = 0
-            if "pane" in cmd and "list" in cmd:
-                m.stdout = pane_list_response
-            elif "tab" in cmd and "list" in cmd:
-                m.stdout = tab_list_response
-            else:
-                m.stdout = ws_list_response
-            return m
-
-        mock_run.side_effect = subprocess_side_effect
+        mock_snap.return_value = {
+            "panes": [],
+            "tabs": [
+                {"label": "window-one", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
+                {"label": "window-two", "tab_id": "ws-abc:2", "workspace_id": "ws-abc"},
+            ],
+            "workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}],
+        }
 
         mock_list_terminals.return_value = [
             {"id": "tid-1", "tmux_window": "window-one"},
@@ -599,42 +570,114 @@ class TestHerdrInboxServiceReconcile:
 
         mock_delete.assert_not_called()
 
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_reconcile_survives_malformed_snapshot_records(
+        self, mock_snap, mock_list, mock_delete, mock_meta
+    ):
+        """A pane missing pane_id or a workspace missing label must not raise
+        (which would escape _reconcile and kill the socket loop)."""
+        mock_list.return_value = []
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._pane_to_terminal = {"w1:p1": "tid1"}
+        service._terminal_to_pane = {"tid1": "w1:p1"}
+        mock_snap.return_value = {
+            "panes": [{"agent_status": "idle"}, {"pane_id": "w1:p1"}],  # first missing pane_id
+            "workspaces": [{"workspace_id": "w1"}],  # missing label
+            "tabs": [{"workspace_id": "w1"}],  # missing label
+        }
+        # Must not raise; w1:p1 is live so nothing pruned.
+        _run_async(service._reconcile())
+        assert service._pane_to_terminal == {"w1:p1": "tid1"}
+
+
+class TestHerdrInboxSnapshot:
+    """_fetch_snapshot returns the parsed snapshot dict from `api snapshot`."""
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_fetch_snapshot_parses_result(self, mock_run):
+        service = HerdrInboxService(socket_path="/tmp/test.sock", herdr_session="cao")
+        snap = {
+            "result": {
+                "snapshot": {
+                    "panes": [
+                        {
+                            "pane_id": "w1:p1",
+                            "terminal_id": "term_a",
+                            "agent_status": "idle",
+                            "tab_id": "w1:t1",
+                            "workspace_id": "w1",
+                        }
+                    ],
+                    "tabs": [{"tab_id": "w1:t1", "label": "conductor", "workspace_id": "w1"}],
+                    "workspaces": [{"workspace_id": "w1", "label": "sess-a"}],
+                }
+            }
+        }
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(snap), stderr="")
+
+        result = service._fetch_snapshot()
+
+        assert [p["pane_id"] for p in result["panes"]] == ["w1:p1"]
+        assert result["workspaces"][0]["label"] == "sess-a"
+        # Invoked `api snapshot` for the configured session.
+        args = mock_run.call_args[0][0]
+        assert args[:2] == ["herdr", "--session"]
+        assert args[-2:] == ["api", "snapshot"]
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_fetch_snapshot_returns_none_on_failure(self, mock_run):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="boom")
+        assert service._fetch_snapshot() is None
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_fetch_snapshot_returns_none_on_malformed_json(self, mock_run):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_run.return_value = MagicMock(returncode=0, stdout="not json", stderr="")
+        assert service._fetch_snapshot() is None
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_fetch_snapshot_returns_none_on_non_object_json(self, mock_run):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_run.return_value = MagicMock(returncode=0, stdout="null", stderr="")
+        assert service._fetch_snapshot() is None
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_fetch_snapshot_returns_none_on_timeout(self, mock_run):
+        import subprocess as _sp
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_run.side_effect = _sp.TimeoutExpired(cmd="herdr", timeout=10)
+        assert service._fetch_snapshot() is None
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_fetch_snapshot_returns_none_when_snapshot_not_dict(self, mock_run):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        payload = {"result": {"snapshot": [1, 2, 3]}}  # snapshot is a list, not a dict
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
+        assert service._fetch_snapshot() is None
+
 
 class TestHerdrInboxServiceStartupDbCleanup:
     """Test _startup_db_cleanup removes ghost terminals on server start."""
 
-    def _make_subprocess_side_effect(self, ws_response, tab_response):
-        def side_effect(cmd, **_):
-            m = MagicMock()
-            m.returncode = 0
-            if "workspace" in cmd and "list" in cmd:
-                m.stdout = ws_response
-            else:
-                m.stdout = tab_response
-            return m
-
-        return side_effect
-
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
-    def test_startup_cleanup_deletes_ghost_terminals(self, mock_list, mock_delete, mock_run):
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_startup_cleanup_deletes_ghost_from_snapshot(self, mock_snap, mock_list, mock_delete):
         """Ghost terminals (window not in live herdr tabs) are deleted at startup."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
-        ws_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
-        )
-        tab_response = json.dumps(
-            {
-                "result": {
-                    "tabs": [
-                        {"label": "live-window", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
-                    ]
-                }
-            }
-        )
-        mock_run.side_effect = self._make_subprocess_side_effect(ws_response, tab_response)
+        mock_snap.return_value = {
+            "panes": [],
+            "workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}],
+            "tabs": [
+                {"label": "live-window", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
+            ],
+        }
         mock_list.return_value = [
             {"id": "tid-live", "tmux_window": "live-window"},
             {"id": "tid-ghost", "tmux_window": "dead-window"},
@@ -644,37 +687,32 @@ class TestHerdrInboxServiceStartupDbCleanup:
 
         mock_delete.assert_called_once_with("tid-ghost")
 
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
-    def test_startup_cleanup_skips_when_workspace_list_fails(self, mock_list, mock_run):
-        """When herdr workspace list fails, no DB queries run."""
-        service = HerdrInboxService(socket_path="/tmp/test.sock")
-
-        fail = MagicMock(returncode=1, stdout="")
-        mock_run.return_value = fail
-        _run_async(service._startup_db_cleanup())
-        mock_list.assert_not_called()
-
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
-    def test_startup_cleanup_no_deletes_when_all_live(self, mock_list, mock_delete, mock_run):
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_startup_cleanup_skips_on_snapshot_none(self, mock_snap, mock_list, mock_delete):
+        """When the snapshot is unavailable (None), no DB queries or deletes run."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+
+        mock_snap.return_value = None
+        _run_async(service._startup_db_cleanup())
+        mock_list.assert_not_called()
+        mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_startup_cleanup_no_deletes_when_all_live(self, mock_snap, mock_list, mock_delete):
         """No deletions when all DB terminals have matching live tabs."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
-        ws_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
-        )
-        tab_response = json.dumps(
-            {
-                "result": {
-                    "tabs": [
-                        {"label": "conductor-10e0", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
-                    ]
-                }
-            }
-        )
-        mock_run.side_effect = self._make_subprocess_side_effect(ws_response, tab_response)
+        mock_snap.return_value = {
+            "panes": [],
+            "workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}],
+            "tabs": [
+                {"label": "conductor-10e0", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
+            ],
+        }
         mock_list.return_value = [{"id": "tid-1", "tmux_window": "conductor-10e0"}]
 
         _run_async(service._startup_db_cleanup())
@@ -1003,7 +1041,7 @@ class TestHerdrInboxServiceLifecycleEvents:
         mock_delete.assert_called_once_with("tid-x")
 
     def test_event_loop_agent_status_real_shape_delivers(self):
-        """A real-shape agent_status_changed (event key, dotted name) triggers delivery."""
+        """A real-shape broadcast pane_updated (event key, nested data.pane) triggers delivery."""
         callback = MagicMock()
         service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
         service.register_terminal("tid-a", "pane-a", is_kiro=False)
@@ -1011,12 +1049,14 @@ class TestHerdrInboxServiceLifecycleEvents:
         idle_event = (
             json.dumps(
                 {
-                    "event": "pane.agent_status_changed",
+                    "event": "pane_updated",
                     "data": {
-                        "agent": "claude",
-                        "agent_status": "idle",
-                        "pane_id": "pane-a",
-                        "workspace_id": "ws-a",
+                        "pane": {
+                            "agent": "claude",
+                            "agent_status": "idle",
+                            "pane_id": "pane-a",
+                            "workspace_id": "ws-a",
+                        }
                     },
                 }
             ).encode()
@@ -1051,37 +1091,30 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_reconcile_remaps_renumbered_but_live_pane(
-        self, mock_meta, mock_delete, mock_run, mock_get_backend
+        self, mock_meta, mock_delete, mock_snap, mock_run, mock_get_backend
     ):
         """Stored pane_id missing from live list but tab label live -> re-map, never delete."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("tid1", "pane-old")
         mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-1"}
 
-        # Live pane list no longer contains pane-old (renumbered to pane-new).
-        pane_list_response = json.dumps({"result": {"panes": [{"pane_id": "pane-new"}]}})
-        # Empty workspace list bypasses the DB cross-check; isolates stale-pane logic.
-        ws_list_response = json.dumps({"result": {"workspaces": []}})
-        # _label_still_live() sees win-1 as a live tab -> pane was renumbered, not closed.
+        # Snapshot: pane-old renumbered to pane-new; empty workspaces bypasses the
+        # DB cross-check to isolate the stale-pane re-mapping logic.
+        mock_snap.return_value = {
+            "panes": [{"pane_id": "pane-new"}],
+            "tabs": [{"label": "win-1", "workspace_id": "ws-1"}],
+            "workspaces": [],
+        }
+        # _label_still_live() (unchanged, still shells out to `tab list`) sees win-1
+        # as live -> pane was renumbered, not closed.
         tab_list_response = json.dumps(
             {"result": {"tabs": [{"label": "win-1", "workspace_id": "ws-1"}]}}
         )
-
-        def subprocess_side_effect(cmd, **_):
-            m = MagicMock()
-            m.returncode = 0
-            if "pane" in cmd and "list" in cmd:
-                m.stdout = pane_list_response
-            elif "tab" in cmd and "list" in cmd:
-                m.stdout = tab_list_response
-            else:
-                m.stdout = ws_list_response
-            return m
-
-        mock_run.side_effect = subprocess_side_effect
+        mock_run.return_value = MagicMock(returncode=0, stdout=tab_list_response, stderr="")
 
         mock_backend = MagicMock()
         mock_backend.get_pane_id.return_value = "pane-new"
@@ -1099,10 +1132,11 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_reconcile_deletes_when_tab_label_gone(
-        self, mock_meta, mock_delete, mock_run, mock_get_backend
+        self, mock_meta, mock_delete, mock_snap, mock_run, mock_get_backend
     ):
         """Stored pane_id missing AND tab label absent from herdr -> prune maps + delete."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
@@ -1110,25 +1144,18 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
         service._working_since["tid1"] = time.time()
         mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-gone"}
 
-        pane_list_response = json.dumps({"result": {"panes": [{"pane_id": "pane-other"}]}})
-        ws_list_response = json.dumps({"result": {"workspaces": []}})
-        # win-gone is NOT among live tab labels -> genuinely closed.
+        # Snapshot: pane-old is stale (only pane-other live); empty workspaces
+        # bypasses the DB cross-check.
+        mock_snap.return_value = {
+            "panes": [{"pane_id": "pane-other"}],
+            "tabs": [{"label": "some-other-window", "workspace_id": "ws-1"}],
+            "workspaces": [],
+        }
+        # _label_still_live() (unchanged) sees win-gone absent -> genuinely closed.
         tab_list_response = json.dumps(
             {"result": {"tabs": [{"label": "some-other-window", "workspace_id": "ws-1"}]}}
         )
-
-        def subprocess_side_effect(cmd, **_):
-            m = MagicMock()
-            m.returncode = 0
-            if "pane" in cmd and "list" in cmd:
-                m.stdout = pane_list_response
-            elif "tab" in cmd and "list" in cmd:
-                m.stdout = tab_list_response
-            else:
-                m.stdout = ws_list_response
-            return m
-
-        mock_run.side_effect = subprocess_side_effect
+        mock_run.return_value = MagicMock(returncode=0, stdout=tab_list_response, stderr="")
         mock_get_backend.return_value = MagicMock()
 
         _run_async(service._reconcile())
@@ -1141,11 +1168,12 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_reconcile_does_not_kill_live_workspace_on_pane_diff(
-        self, mock_meta, mock_list, mock_delete, mock_run, mock_get_backend
+        self, mock_meta, mock_list, mock_delete, mock_snap, mock_run, mock_get_backend
     ):
         """A live workspace (label present) must NOT be killed merely because its
         pane failed the pane_id set diff. The renumbered pane is re-mapped and the
@@ -1154,28 +1182,18 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
         service.register_terminal("tid1", "pane-old")
         mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-1"}
 
-        pane_list_response = json.dumps({"result": {"panes": [{"pane_id": "pane-new"}]}})
-        # Workspace "sess" is LIVE.
-        ws_list_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-1", "label": "sess"}]}}
-        )
-        # Tab label win-1 is LIVE.
+        # Snapshot: pane-old renumbered to pane-new; workspace "sess" and tab
+        # label "win-1" both LIVE.
+        mock_snap.return_value = {
+            "panes": [{"pane_id": "pane-new"}],
+            "tabs": [{"label": "win-1", "workspace_id": "ws-1"}],
+            "workspaces": [{"workspace_id": "ws-1", "label": "sess"}],
+        }
+        # _label_still_live() (unchanged) sees win-1 as live.
         tab_list_response = json.dumps(
             {"result": {"tabs": [{"label": "win-1", "workspace_id": "ws-1"}]}}
         )
-
-        def subprocess_side_effect(cmd, **_):
-            m = MagicMock()
-            m.returncode = 0
-            if "pane" in cmd and "list" in cmd:
-                m.stdout = pane_list_response
-            elif "tab" in cmd and "list" in cmd:
-                m.stdout = tab_list_response
-            else:
-                m.stdout = ws_list_response
-            return m
-
-        mock_run.side_effect = subprocess_side_effect
+        mock_run.return_value = MagicMock(returncode=0, stdout=tab_list_response, stderr="")
         # DB cross-check: terminal's window matches a live tab -> not a ghost.
         mock_list.return_value = [{"id": "tid1", "tmux_window": "win-1"}]
 

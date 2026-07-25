@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
@@ -53,6 +54,8 @@ from cli_agent_orchestrator.constants import (
     DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
+    MODEL_ID_MAX_LEN,
+    MODEL_ID_RE,
     OTEL_SERVICE_NAME,
     SERVER_HOST,
     SERVER_PORT,
@@ -65,7 +68,8 @@ from cli_agent_orchestrator.constants import (
     add_local_cors_origins,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
-from cli_agent_orchestrator.graph.providers import get_provider
+from cli_agent_orchestrator.graph.models import GraphView
+from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 
 # Import the sinks package for its import-time @register_sink side effects
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
@@ -130,6 +134,7 @@ logger = logging.getLogger(__name__)
 TMUX_KEY_PATTERN = re.compile(
     r"^(?:Up|Down|Left|Right|Enter|Tab|Escape|Space|[A-Za-z0-9]|[CMS]-[A-Za-z0-9])$"
 )
+GRAPH_PROJECTION_TIMEOUT_S = 90.0
 
 
 async def flow_daemon():
@@ -202,6 +207,27 @@ class CreateTerminalBody(BaseModel):
     initial_message_orchestration_type: Optional[str] = None
 
 
+def _validate_model_id(value: str) -> None:
+    """Validate a ``model`` override at the request boundary (PR #501 review).
+
+    Shared by ``RunStepRequest.model`` (field_validator below) and the
+    ``/sessions/{session_name}/terminals`` ``model`` query param, so both
+    entry points into ``terminal_service.create_terminal`` apply the same
+    rule. Raises ``ValueError``; callers translate that into the transport
+    -appropriate error (FastAPI 422 for a Pydantic field_validator, an
+    explicit 400 for the query-param call site — see that endpoint).
+
+    Raises:
+        ValueError: ``value`` exceeds MODEL_ID_MAX_LEN or contains a
+            character outside MODEL_ID_RE (whitespace, control characters,
+            and shell/quoting metacharacters are all rejected).
+    """
+    if len(value) > MODEL_ID_MAX_LEN:
+        raise ValueError(f"model exceeds the {MODEL_ID_MAX_LEN}-char cap")
+    if not re.fullmatch(MODEL_ID_RE, value):
+        raise ValueError(f"model {value!r} is invalid (must match {MODEL_ID_RE!r})")
+
+
 class RunStepRequest(BaseModel):
     """Request body for the combined step-execution endpoint (N0, #312)."""
 
@@ -237,6 +263,15 @@ class RunStepRequest(BaseModel):
             "Workflow identity env vars injected into a freshly created terminal. "
             "Keys are restricted to the WORKFLOW_ENV_ALLOWLIST (NFR-SEC-4); "
             "values are validated but never echoed in error bodies."
+        ),
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description=(
+            "Explicit per-call model override for a freshly created terminal "
+            "(ignored when reusing a terminal), applied ahead of the agent "
+            "profile's own static model field. Lets a caller pin a specific "
+            "model for one worker without a dedicated agent profile."
         ),
     )
 
@@ -282,6 +317,20 @@ class RunStepRequest(BaseModel):
                     f"value for '{key}' is invalid (must be a 1-64 char "
                     "[A-Za-z0-9_-] identifier)"
                 ) from None
+        return v
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, v: Optional[str]) -> Optional[str]:
+        """See ``_validate_model_id`` -- the boundary check the model
+        override needs (PR #501 review): the value reaches a provider's
+        launch-command builder, shlex-quoted before delivery (so classic
+        word-splitting is not reachable) but a control character or newline
+        surviving quoting into the command string is still a delivery
+        hazard this codebase already guards against elsewhere."""
+        if v is None:
+            return v
+        _validate_model_id(v)
         return v
 
     @model_validator(mode="after")
@@ -473,6 +522,19 @@ def _reconcile_memory_at_startup() -> None:
             )
 
 
+def _seed_default_skills_at_startup() -> None:
+    """Seed newly packaged skills without overwriting an existing installation."""
+    try:
+        seeded_count = seed_default_skills()
+        if seeded_count:
+            logger.info("Seeded %d new builtin skill(s).", seeded_count)
+    except Exception as exc:
+        logger.warning(
+            "automatic builtin skill seeding failed (%s); run `cao init` to retry",
+            type(exc).__name__,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -490,6 +552,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
     init_db()
+    _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
     await registry.load()
@@ -1766,6 +1829,7 @@ async def create_terminal_in_session(
     allowed_tools: Optional[str] = None,
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
+    model: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -1784,9 +1848,17 @@ async def create_terminal_in_session(
     ``initial_message_orchestration_type``) rather than query params so prompt
     content isn't exposed in HTTP access logs and isn't subject to URL-length
     limits.
+
+    ``model``: optional explicit override, applied ahead of the agent
+    profile's own static ``model`` field (where the resolved provider
+    supports it -- see ``terminal_service.create_terminal``'s own docstring).
+    Lets a caller pin a specific model for one worker without needing a
+    dedicated agent profile.
     """
     try:
         validate_tmux_name(session_name, "session_name")
+        if model is not None:
+            _validate_model_id(model)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
@@ -1847,6 +1919,7 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            model=model,
         )
         return result
     except HTTPException:
@@ -2156,6 +2229,7 @@ async def run_step(
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,
+            model=body.model,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -2592,6 +2666,28 @@ async def resume_workflow_run_endpoint(
 # which raise KeyError for an unregistered name (mapped to 404 here).
 
 
+async def _project_graph_with_timeout(
+    inst: GraphProvider,
+    filters: Dict[str, Any],
+    *,
+    provider: str,
+    timeout_s: float = GRAPH_PROJECTION_TIMEOUT_S,
+) -> GraphView:
+    try:
+        return await asyncio.wait_for(inst.project(**filters), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={
+                "message": f"graph projection timed out after {timeout_s:g} seconds",
+                "kind": "graph_projection_timeout",
+                "timeout_s": timeout_s,
+                "provider": provider,
+                "metadata": {"graph_projection_timeout": True},
+            },
+        )
+
+
 @app.get("/graph/{provider}")
 async def get_graph_endpoint(
     provider: str,
@@ -2642,7 +2738,7 @@ async def get_graph_endpoint(
             detail=f"unknown graph provider '{provider}'",
         )
     try:
-        view = await inst.project(**filters)
+        view = await _project_graph_with_timeout(inst, filters, provider=provider)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return view.to_dict()
@@ -2679,7 +2775,7 @@ async def export_graph_endpoint(
         )
 
     try:
-        view = await prov.project(**filters)
+        view = await _project_graph_with_timeout(prov, filters, provider=provider)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 

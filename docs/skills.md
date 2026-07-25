@@ -91,10 +91,11 @@ After removal, all providers pick up the change automatically — Copilot CLI ag
 
 Builtin skills are auto-seeded when `cao-server` starts — no manual step required. If a skill with the same name already exists, it is skipped — preserving any edits you've made. After a CAO upgrade, restarting the server will seed any new builtin skills without overwriting your changes. You can also run `cao init` to seed them manually.
 
-CAO ships with two builtin skills:
+CAO ships with built-in skills including:
 
 | Skill | Description |
 |-------|-------------|
+| `cao-agent-routing` | Finds the best installed profile for specialist work before delegation |
 | `cao-supervisor-protocols` | Multi-agent orchestration patterns for supervisors: `assign`, `handoff`, idle-based message delivery |
 | `cao-worker-protocols` | Worker-side callback and completion rules for assigned and handed-off tasks |
 
@@ -164,6 +165,9 @@ Skills are delivered to agents differently depending on the provider. The table 
 | Kimi CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Kiro CLI | Native `skill://` resources | Every terminal creation | Kiro progressive loading |
 | Copilot CLI | Baked into `.agent.md` at install | On `cao skills add/remove` | `load_skill` MCP tool |
+| OpenCode CLI | Native `skill` tool via `OPENCODE_CONFIG_DIR/skills` symlink | Every terminal creation | OpenCode progressive loading (also via `load_skill` MCP tool) |
+| Cursor CLI | Runtime prompt (currently disabled — see [Cursor CLI provider docs](cursor-cli.md#agent-profile-integration)) | Not injected in v2026 | `load_skill` MCP tool |
+| Hermes | Not injected — configure skills in the selected Hermes profile | N/A | N/A |
 
 ### Runtime Prompt Providers (Claude Code, Codex, Antigravity CLI, Kimi CLI)
 

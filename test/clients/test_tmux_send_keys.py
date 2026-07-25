@@ -270,6 +270,127 @@ class TestSendKeysLegacyWrapOnOldTmux:
         )
 
 
+class TestSendKeysForcedBracketedPasteShellDetection:
+    """force_bracketed_paste=True skips bracket-wrapping (and the -p flag)
+    when the pane's live foreground command is a known shell -- issue: a
+    resumed/woken terminal whose original TUI already exited via its own
+    quit command left the pane at a bare shell prompt that doesn't
+    understand \\x1b[200~/\\x1b[201~, corrupting the first token of
+    whatever's sent next."""
+
+    def test_wraps_when_pane_runs_a_real_tui(self, client, mock_subprocess, mock_uuid, legacy_tmux):
+        """Baseline: an actual TUI (e.g. Claude Code, running as `node`) on
+        tmux < 3.7 still gets the existing unconditional bracket-wrap + -r
+        delivery (the manual wrap is only valid pre-#413; see
+        TestSendKeysNoHandCraftedMarkersOnModernTmux for the >= 3.7 case,
+        which this class's shell-detection check takes priority over)."""
+        with patch.object(client, "get_pane_current_command", return_value="node"):
+            client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
+
+        paste_call = mock_subprocess.run.call_args_list[1]
+        assert paste_call == call(
+            ["tmux", "paste-buffer", "-r", "-b", "cao_abcd1234", "-t", "sess:win"],
+            check=True,
+        )
+        load_call = mock_subprocess.run.call_args_list[0]
+        assert load_call[1]["input"] == b"\x1b[200~claude --continue\x1b[201~"
+
+    @pytest.mark.parametrize("shell", ["sh", "dash", "bash", "zsh", "fish"])
+    def test_skips_bracket_wrap_when_pane_is_a_bare_shell(
+        self, client, mock_subprocess, mock_uuid, shell
+    ):
+        """A bare shell prompt gets the plain command, with NEITHER the
+        manual \\x1b[200~ wrap NOR the -p flag (the latter's own bracket
+        decision depends on tmux's per-pane ?2004h tracking, which can be
+        stale from a TUI that used to run in this exact pane -- so it's not
+        a safe fallback either)."""
+        with patch.object(client, "get_pane_current_command", return_value=shell):
+            client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
+
+        load_call = mock_subprocess.run.call_args_list[0]
+        assert load_call[1]["input"] == b"claude --continue"
+        paste_call = mock_subprocess.run.call_args_list[1]
+        assert paste_call == call(
+            ["tmux", "paste-buffer", "-b", "cao_abcd1234", "-t", "sess:win"],
+            check=True,
+        )
+
+    def test_fails_closed_to_wrapped_when_pane_command_lookup_fails(
+        self, client, mock_subprocess, mock_uuid, legacy_tmux
+    ):
+        """An unresolvable pane command (tmux error, race with window
+        teardown, ...) preserves the existing wrap-unconditionally behavior
+        rather than guessing -- an unknown foreground process might still be
+        a real TUI expecting bracketed paste. Pinned to tmux < 3.7: on
+        >= 3.7 the "wrapped" fallback is -p with no manual markers (#413),
+        covered by TestSendKeysNoHandCraftedMarkersOnModernTmux."""
+        with patch.object(client, "get_pane_current_command", return_value=None):
+            client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
+
+        load_call = mock_subprocess.run.call_args_list[0]
+        assert load_call[1]["input"] == b"\x1b[200~claude --continue\x1b[201~"
+
+    def test_non_forced_calls_are_unaffected_by_shell_detection(
+        self, client, mock_subprocess, mock_uuid
+    ):
+        """force_bracketed_paste=False (the default, used for shell-command
+        delivery during provider initialization) keeps its existing -p
+        behavior regardless of what the pane is running -- this fix is
+        scoped to the force_bracketed_paste=True path only."""
+        with patch.object(client, "get_pane_current_command", return_value="bash") as mock_get:
+            client.send_keys("sess", "win", "echo ready")
+
+        mock_get.assert_not_called()
+        paste_call = mock_subprocess.run.call_args_list[1]
+        assert paste_call == call(
+            ["tmux", "paste-buffer", "-p", "-b", "cao_abcd1234", "-t", "sess:win"],
+            check=True,
+        )
+
+
+class TestSendKeysShellDetectionCrossedWithTmuxVersion:
+    """The bare-shell check and the tmux-version check are two independent
+    axes of the same `if/elif/else` in send_keys -- both interactions need
+    direct coverage, not just each axis tested in isolation with the other
+    implicitly defaulted."""
+
+    def test_bare_shell_skips_wrap_on_modern_tmux_too(
+        self, client, mock_subprocess, mock_uuid, sanitizing_tmux
+    ):
+        """A bare shell must never get bracketed-paste markers or -p,
+        regardless of tmux version -- the shell-detection check takes
+        priority over the tmux-version branch, not the other way around."""
+        with patch.object(client, "get_pane_current_command", return_value="bash"):
+            client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
+
+        load_call = mock_subprocess.run.call_args_list[0]
+        assert load_call[1]["input"] == b"claude --continue"
+        paste_call = mock_subprocess.run.call_args_list[1]
+        assert paste_call == call(
+            ["tmux", "paste-buffer", "-b", "cao_abcd1234", "-t", "sess:win"],
+            check=True,
+        )
+
+    def test_real_tui_on_modern_tmux_gets_p_flag_not_manual_wrap(
+        self, client, mock_subprocess, mock_uuid, sanitizing_tmux
+    ):
+        """A real TUI on tmux >= 3.7 must still get the #413 fix (-p, no
+        hand-crafted markers) even when force_bracketed_paste=True -- the
+        shell-detection feature must not regress the vis(3)-sanitization
+        fix for the non-shell case."""
+        with patch.object(client, "get_pane_current_command", return_value="node"):
+            client.send_keys("sess", "win", "claude --continue", force_bracketed_paste=True)
+
+        load_call = mock_subprocess.run.call_args_list[0]
+        assert load_call[1]["input"] == b"claude --continue"
+        assert b"\x1b" not in load_call[1]["input"]
+        paste_call = mock_subprocess.run.call_args_list[1]
+        assert paste_call == call(
+            ["tmux", "paste-buffer", "-p", "-b", "cao_abcd1234", "-t", "sess:win"],
+            check=True,
+        )
+
+
 class TestTmuxSanitizationDetection:
     """Version probe behind the tmux >= 3.7 vis(3) gate."""
 

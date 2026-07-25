@@ -946,6 +946,32 @@ class TestKimiCliProviderModelFlag:
 
         assert "--model" not in command
 
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_explicit_model_override_wins_over_profile_model(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = "kimi-k2-turbo"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "sess", "win", "agent", model="fable-5")
+        command = provider._build_kimi_command()
+
+        assert "--model fable-5" in command
+        assert "--model kimi-k2-turbo" not in command
+
+    def test_explicit_model_override_applies_with_no_agent_profile(self):
+        """Regression: PR #501 review -- model resolution used to live
+        entirely inside `if self._agent_profile is not None:`, so an
+        override passed with agent_profile=None (unreachable through
+        handoff/assign today, but inconsistent with codex/hermes's own
+        no-profile-still-applies shape) was silently dropped."""
+        provider = KimiCliProvider("term-1", "sess", "win", None, model="fable-5")
+        command = provider._build_kimi_command()
+
+        assert "--model fable-5" in command
+        provider.cleanup()
+
 
 class TestKimiCliProviderMisc:
     """Tests for miscellaneous KimiCliProvider methods and lifecycle."""

@@ -145,6 +145,10 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
         setError(err.detail || 'This scope cannot be viewed as a graph.')
       } else if (err.status === 404) {
         setError(err.detail || 'Graph provider not found (is memory enabled?).')
+      } else if (err.status === 504 && err.kind === 'graph_projection_timeout') {
+        const timeout = err.detailMeta?.timeout_s
+        const timeoutText = typeof timeout === 'number' ? `${timeout}s` : 'the server limit'
+        setError(`Graph projection timed out on the server after ${timeoutText}. The CAO server stayed responsive; refresh to retry or disable memory lint enrichment.`)
       } else if (err.name === 'AbortError') {
         // The AbortController in api.ts fired after the 120s graph budget. The
         // wiki-lint projection is ~30s typical / up to ~148s under load, so a
@@ -312,6 +316,7 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
   }
 
   const hasGraph = !!view && view.nodes.length > 0
+  const lintDisabled = view?.meta?.lint_enabled === false || view?.meta?.lint_enrichment === 'disabled'
 
   // Friendly guard: don't fire a doomed request for '' / session / agent.
   if (!graphable) {
@@ -354,6 +359,11 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
           </button>
         </div>
       </div>
+      {lintDisabled ? (
+        <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          Memory lint enrichment is disabled; this graph shows related-key topology only.
+        </div>
+      ) : null}
 
       {/* Graph + side panel */}
       <div className="flex gap-4 h-[600px]">

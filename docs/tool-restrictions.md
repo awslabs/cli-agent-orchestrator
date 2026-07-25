@@ -241,9 +241,12 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 | **Claude Code** | Hard | `--disallowedTools` flags block specific tools |
 | **Kiro CLI** | Hard | `allowedTools` in agent JSON at install time |
 | **Copilot CLI** | Hard | `--deny-tool` flags override `--allow-all` |
+| **OpenCode CLI** | Hard | `permission:` YAML frontmatter enforced natively at install time |
 | **Kimi CLI** | Soft | Security system prompt only |
 | **Codex** | Soft | Security system prompt only |
+| **Antigravity CLI** | Soft | Security system prompt only |
 | **Hermes** | Profile-defined | CAO launches default `hermes` or the optional `hermesProfile` wrapper declared by the CAO profile; restrict tools in that Hermes profile |
+| **Cursor CLI** | Not enforced (v2026) | `allowedTools` is currently ignored — no native flag or system-prompt path is active; see [Cursor CLI Tool Restrictions](cursor-cli.md#tool-restrictions) |
 
 **Hard enforcement** = the agent physically cannot use denied tools, enforced by the provider runtime.
 

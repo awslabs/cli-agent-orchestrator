@@ -2,6 +2,17 @@
 name: reviewer
 description: Code Reviewer Agent in a multi-agent system
 role: reviewer  # @builtin, fs_read, fs_list, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
+tags:
+  - review
+  - code-review
+  - security
+  - correctness
+  - aws
+  - cdk
+  - infrastructure
+capabilities:
+  - review code for security, correctness, quality, and test coverage
+  - review AWS CDK infrastructure and infrastructure as code
 mcpServers:
   cao-mcp-server:
     type: stdio

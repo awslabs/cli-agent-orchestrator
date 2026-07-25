@@ -293,10 +293,22 @@ def lint_cmd(scope, out_format):
     """
     import json as _json
 
+    from cli_agent_orchestrator.services import settings_service
     from cli_agent_orchestrator.services.wiki_lint import (
         compute_exit_code,
         run_lint,
     )
+
+    is_json = out_format.lower() == "json"
+    if not settings_service.is_memory_lint_enabled():
+        message = (
+            "Memory lint is disabled by configuration "
+            "(memory.lint_enabled=false or CAO_MEMORY_LINT_ENABLED=false)."
+        )
+        click.echo(message, err=is_json)
+        if is_json:
+            click.echo("[]")
+        raise click.exceptions.Exit(0)
 
     svc = _get_memory_service()
     ctx = _cwd_context()
@@ -310,8 +322,6 @@ def lint_cmd(scope, out_format):
         issues = _run_async(run_lint(project_hash, scope=scope))
     except Exception as e:
         raise click.ClickException(f"lint run failed: {e}")
-
-    is_json = out_format.lower() == "json"
 
     # Emit a top-line completion summary for visibility even when the result
     # list is empty. Routed to stderr under --format json so stdout stays a
@@ -460,8 +470,21 @@ def heal_cmd(scope, do_apply, aggressive, issue_type, out_format):
     """
     import json as _json
 
-    from cli_agent_orchestrator.services import wiki_healer
+    from cli_agent_orchestrator.services import settings_service, wiki_healer
     from cli_agent_orchestrator.services.wiki_lint import run_lint
+
+    is_json = out_format.lower() == "json"
+    if not settings_service.is_memory_lint_enabled():
+        message = (
+            "Memory lint is disabled by configuration "
+            "(memory.lint_enabled=false or CAO_MEMORY_LINT_ENABLED=false)."
+        )
+        if is_json:
+            click.echo(message, err=True)
+            click.echo(_json.dumps({"disabled": True, "message": message}, indent=2))
+        else:
+            click.echo(message)
+        return
 
     svc = _get_memory_service()
     ctx = _cwd_context()
@@ -497,7 +520,6 @@ def heal_cmd(scope, do_apply, aggressive, issue_type, out_format):
     except Exception as e:
         raise click.ClickException(f"heal failed: {e}")
 
-    is_json = out_format.lower() == "json"
     if is_json:
         payload = {
             "scope": report.scope,
