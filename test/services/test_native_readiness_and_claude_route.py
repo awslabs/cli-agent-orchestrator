@@ -168,6 +168,21 @@ class _Row:
         self.request_json = '{"expected_model": "%s", "expected_effort": "%s"}' % (model, effort)
 
 
+def _parse_mismatches(exc: Exception) -> dict:
+    """The structured diagnostic out of a bind refusal.
+
+    The refusal appends canonical JSON to a prose prefix, so the object is
+    recovered from the first brace rather than by splitting on the prose —
+    which would break the moment anyone reworded the sentence.
+    """
+    import json
+
+    message = str(exc)
+    start = message.find("{")
+    assert start != -1, f"refusal carried no structured diagnostic: {message}"
+    return json.loads(message[start:])
+
+
 def _receipt(row, *, model, effort=None):
     return {
         "reservation_id": row.reservation_id,
@@ -198,13 +213,27 @@ class TestBindRefusesAWrongFamilyBeforeAdmission:
     """
 
     def test_a_wrong_family_is_refused_and_names_both_values(self):
+        """The diagnostic is parsed, not scanned for substrings.
+
+        Both values appearing *somewhere* in a serialized dict is
+        satisfied just as well by a refusal that has them the wrong way
+        round — and expected-vs-observed reversed is not a cosmetic
+        defect: an operator reading it concludes the provider was asked
+        for the model it actually ran, and goes looking for the fault
+        somewhere it is not. So the structure is asserted, keyed, and
+        each value pinned to its own side.
+        """
         row = _Row(model=SONNET)
         with pytest.raises(Exception) as raised:
             v2._validate_readiness_for_bind(row, _receipt(row, model=OBSERVED_OPUS_1M))
-        message = str(raised.value)
-        assert "model" in message
-        assert SONNET in message
-        assert "opus" in message
+
+        mismatches = _parse_mismatches(raised.value)
+        assert "model" in mismatches, mismatches
+        assert mismatches["model"] == {"expected": SONNET, "observed": OBSERVED_OPUS_1M}
+        # And nothing else drifted: a refusal that also flagged unrelated
+        # fields would pass the check above while pointing an operator at
+        # the wrong cause.
+        assert set(mismatches) == {"model"}
 
     def test_the_requested_family_binds(self):
         row = _Row(model=SONNET)
