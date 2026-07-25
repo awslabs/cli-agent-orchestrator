@@ -2758,7 +2758,11 @@ async def _launch_native_tui(
     """
     import asyncio
 
-    from cli_agent_orchestrator.services import claude_native_readiness, kimi_native_bootstrap
+    from cli_agent_orchestrator.services import (
+        claude_native_launch,
+        claude_native_readiness,
+        kimi_native_bootstrap,
+    )
     from cli_agent_orchestrator.services.managed_provider_bridge import (
         BRIDGE_VERSION,
         native_child_environment,
