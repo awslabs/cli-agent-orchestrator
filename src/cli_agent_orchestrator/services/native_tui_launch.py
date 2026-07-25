@@ -88,6 +88,7 @@ AMBIGUOUS_PANE_UNREADABLE = "pane_observation_unreadable"
 AMBIGUOUS_PANE_ABSENT_AFTER_CREATE = "pane_absent_after_create"
 AMBIGUOUS_START_CROSSED_NO_PANE = "start_crossed_with_no_observable_pane"
 AMBIGUOUS_ARGV_MISMATCH = "pane_argv_does_not_resume_bound_session"
+AMBIGUOUS_PANE_WORKDIR_MISMATCH = "pane_cwd_is_not_the_bound_working_directory"
 AMBIGUOUS_PUBLISH_FAILED = "attachment_publication_failed"
 
 
@@ -158,7 +159,9 @@ class NativePaneTransport(Protocol):
         collapsing the two is how a launcher talks itself into a retry.
 
         A returned mapping must carry ``pane_id``, an integer ``pid``, a
-        ``start_marker``, and the primary process's observed ``argv``.
+        ``start_marker``, the primary process's observed ``argv``, and
+        its observed ``cwd``.  A transport that cannot report the cwd
+        must raise: an observation missing it is unreadable, not exempt.
         """
         ...
 
@@ -205,6 +208,35 @@ def _validate_binary(binary: str, binary_sha256: str) -> str:
     return binary
 
 
+def _validate_working_directory(working_directory: str) -> str:
+    """Accept only the canonical directory the bound session was minted in.
+
+    Checked here, immediately before the launch, even though the caller
+    checked it when the reservation was taken and the bootstrap checked
+    it again when the session was minted.  The three checks bracket the
+    two windows in which the recorded path and the resumed path could
+    drift: between reserving and minting, and between minting and
+    starting the pane.  A drift caught in either window costs a typed
+    refusal; the same drift caught by the provider costs a pane that
+    exits about a second after a launch that reported success.
+
+    Refused, never rewritten.  This value is the one the reservation
+    echoes and the one the session was filed under; substituting a
+    different string here would make the pane disagree with both.
+    """
+    path = _require_text(working_directory, field="working_directory")
+    if not os.path.isabs(path) or os.path.realpath(path) != path:
+        raise NativeLaunchInvalid(
+            f"working_directory must be a canonical absolute path; got {path!r} "
+            f"(realpath {os.path.realpath(path)!r}) — the bound session is filed under the "
+            "path string it was minted with, and the TUI resuming it reports only the "
+            "realpath, so a non-canonical launch cannot find its own session"
+        )
+    if not os.path.isdir(path):
+        raise NativeLaunchInvalid(f"working_directory is not an existing directory: {path}")
+    return path
+
+
 def _freeze(
     *,
     provider: str,
@@ -237,6 +269,7 @@ def _validated_observation(raw: Mapping[str, Any]) -> dict[str, Any]:
     pid = raw.get("pid")
     start_marker = raw.get("start_marker")
     argv = raw.get("argv")
+    cwd = raw.get("cwd")
     if not isinstance(pane_id, str) or not pane_id:
         raise NativeLaunchInvalid("pane observation requires a non-empty pane_id")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
@@ -250,12 +283,19 @@ def _validated_observation(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise NativeLaunchInvalid(
             "pane observation requires the observed argv as a list of strings"
         )
+    if not isinstance(cwd, str) or not cwd:
+        raise NativeLaunchInvalid(
+            "pane observation requires the primary process's observed cwd; without it the "
+            "session's recorded directory cannot be checked against the one the process is "
+            "actually in, which is the check that catches a resume filed under another path"
+        )
     return {
         "schema": OBSERVATION_SCHEMA,
         "pane_id": pane_id,
         "pid": pid,
         "start_marker": start_marker,
         "argv": list(argv),
+        "cwd": cwd,
     }
 
 
@@ -306,9 +346,19 @@ def _publish(
     native_session_id: str,
     terminal_id: str,
     generation: str,
+    working_directory: str,
     observation: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Verify the pane runs the bound session, then publish the attachment."""
+    """Verify the pane runs the bound session, then publish the attachment.
+
+    Two independent proofs, both taken before the attachment is
+    published, because publication is what makes the generation
+    bindable.  The argv proves *which session* the process resumed; the
+    cwd proves *which directory* it resumed it in.  Neither implies the
+    other: a correct argv started in the wrong directory names a session
+    the provider will refuse to open, and it fails after the launch has
+    already reported success.
+    """
     if not kimi_native_launch.resumes_exactly(observation["argv"], native_session_id):
         _freeze(
             provider=provider,
@@ -318,6 +368,26 @@ def _publish(
                 f"the pane's primary process does not resume exactly {native_session_id!r}; "
                 "a resume that lost its id opens an interactive picker rather than failing, "
                 "so the running session may be a different one"
+            ),
+        )
+    observed_cwd = os.path.realpath(observation["cwd"])
+    if observed_cwd != working_directory:
+        # Frozen rather than refused, because a process is running: it
+        # holds the bound session in a directory the session was not
+        # filed under, so it will fail to open it and exit shortly.
+        # Freezing before publication means the generation never becomes
+        # bindable, no task byte is ever typed at it, and the session
+        # stays permanently blocked instead of appearing free to the next
+        # claimant while a doomed process is still winding down.
+        _freeze(
+            provider=provider,
+            native_session_id=native_session_id,
+            reason=AMBIGUOUS_PANE_WORKDIR_MISMATCH,
+            detail=(
+                f"the pane's primary process is in {observed_cwd!r}, but session "
+                f"{native_session_id!r} is bound to {working_directory!r}; the provider "
+                "resolves a resume against the directory the session was minted in, so this "
+                "pane cannot open the session it was started for"
             ),
         )
     try:
@@ -393,6 +463,7 @@ def start(
     intent: Mapping[str, Any],
     binary: str,
     binary_sha256: str,
+    working_directory: str,
     transport: NativePaneTransport,
     extra_args: Optional[Sequence[str]] = None,
 ) -> dict[str, Any]:
@@ -403,6 +474,12 @@ def start(
     branch.  The two modes are separate launch branches; a caller that
     reaches the wrong one has a bug that must surface as a rejection, not
     as a working launch in the mode it did not ask for.
+
+    ``working_directory`` is required rather than inferred from the
+    transport for the same reason: it is the directory the bound session
+    was minted in, and it is checked twice here — once before anything is
+    claimed, and once against the running process before the attachment
+    is published.
     """
     provider = _require_text(provider, field="provider")
     native_session_id = _require_text(native_session_id, field="native_session_id")
@@ -420,6 +497,10 @@ def start(
         )
 
     binary = _validate_binary(binary, binary_sha256)
+    # Before ``declare``, so a non-canonical directory costs a refusal
+    # with nothing claimed and no pane started, rather than a frozen
+    # attachment.
+    working_directory = _validate_working_directory(working_directory)
 
     try:
         argv = kimi_native_launch.build_resume_argv(
@@ -490,6 +571,7 @@ def start(
             native_session_id=native_session_id,
             terminal_id=terminal_id,
             generation=generation,
+            working_directory=working_directory,
             observation=observation,
         )
         return _result(
@@ -544,6 +626,7 @@ def start(
         native_session_id=native_session_id,
         terminal_id=terminal_id,
         generation=generation,
+        working_directory=working_directory,
         observation=observation,
     )
     return _result(
@@ -623,6 +706,16 @@ class TmuxNativePane:
             raise NativeLaunchUnavailable(
                 f"the process table did not report the identity of pid {pid}"
             )
+        cwd = _process_cwd(pid)
+        if cwd is None:
+            # Raised, not omitted.  A caller that could not read the cwd
+            # has not proven the pane is in the right directory, and the
+            # only safe reading of an unproven check is that the
+            # observation failed.
+            raise NativeLaunchUnavailable(
+                f"the working directory of pid {pid} could not be read, so the pane cannot "
+                "be shown to be running in the directory its session was minted in"
+            )
         return {
             "pane_id": str(identity["pane_id"]),
             "pid": pid,
@@ -634,6 +727,7 @@ class TmuxNativePane:
             # splits — and any split that does not yield exactly one
             # resume option fails the check rather than passing it.
             "argv": command.split(),
+            "cwd": cwd,
         }
 
     def _pane_pid(self) -> Optional[int]:
@@ -689,3 +783,46 @@ def _process_field(pid: int, field: str) -> Optional[str]:
         return None
     value = proc.stdout.strip()
     return value or None
+
+
+def _process_cwd(pid: int) -> Optional[str]:
+    """The live working directory of one pid, or ``None`` if unreadable.
+
+    Read from the kernel rather than from anything the launcher recorded,
+    because the point of the check it feeds is to catch a pane that is
+    *not* where the record says it is.  Asking the same record twice
+    would prove nothing.
+
+    ``ps`` cannot report a working directory on either platform, so this
+    goes to ``/proc`` where that exists and to ``lsof`` otherwise.  Both
+    report the resolved path, which is what makes the comparison
+    meaningful: a process started in a symlinked directory reports the
+    real one, exactly as the provider's own runtime does.
+    """
+    proc_link = f"/proc/{pid}/cwd"
+    if os.path.isdir(f"/proc/{pid}"):
+        try:
+            return os.readlink(proc_link) or None
+        except OSError:
+            return None
+    lsof = shutil.which("lsof")
+    if not lsof:
+        return None
+    try:
+        proc = subprocess.run(
+            [os.path.realpath(lsof), "-a", "-d", "cwd", "-p", str(pid), "-Fn"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    # Field-per-line output: ``p<pid>``, ``fcwd``, ``n<path>``.  Only the
+    # ``n`` line carries the path, and a dead pid yields no lines at all.
+    for line in proc.stdout.splitlines():
+        if line.startswith("n") and len(line) > 1:
+            return line[1:]
+    return None

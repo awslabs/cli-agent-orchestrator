@@ -181,12 +181,50 @@ def native_binding_digest(record: dict[str, Any]) -> Optional[str]:
     return hashlib.sha256(_canonical_json(binding).encode()).hexdigest()
 
 
-def _validate_reserve_identity(request: ManagedLaunchV2ReserveRequest) -> dict[str, Any]:
-    worktree = os.path.realpath(request.working_directory)
-    if worktree != request.working_directory or not os.path.isdir(worktree):
+def _reject_non_canonical_workdir(working_directory: str) -> None:
+    """Refuse a working directory that is not already its own realpath.
+
+    The provider files a session under the working-directory *string* it
+    was handed and resolves a later resume against that same string,
+    while the terminal UI that resume starts is a process whose reported
+    cwd is always the realpath.  So a reservation naming ``/tmp/w`` on a
+    platform where that is a symlink mints a session that a UI started in
+    the very same physical directory can never find: the launch reports
+    success, readiness publishes, bind succeeds against a session id that
+    genuinely exists on disk, and the pane is dead about a second later
+    with nothing on the reservation naming the cause.
+
+    Refused, not rewritten, for two reasons.  Normalising here would
+    change what the reservation echoes back, so a caller that compares a
+    replayed reserve against the stored one would read its own ordinary
+    retry as a conflict.  And the same string is handed on to the session
+    mint and to the pane; a value corrected in one place and not the
+    others reintroduces exactly the divergence this prevents.  Refusing
+    puts the correction at the one boundary that can make it consistently
+    — the caller — and names the form to send.
+
+    This runs before any row, provider process, bootstrap, or session
+    exists, so a refusal leaves nothing behind to reconcile.
+    """
+    if not os.path.isabs(working_directory):
         raise ManagedLaunchConflict(
-            "working_directory must be an existing canonical absolute directory"
+            f"working_directory must be an absolute path; got {working_directory!r}"
         )
+    canonical = os.path.realpath(working_directory)
+    if canonical != working_directory:
+        raise ManagedLaunchConflict(
+            f"working_directory must be canonical; got {working_directory!r}, whose canonical "
+            f"form is {canonical!r} — reserve with that instead. A session minted under a "
+            "non-canonical path is filed where the terminal UI will never look for it."
+        )
+    if not os.path.isdir(canonical):
+        raise ManagedLaunchConflict(
+            f"working_directory must be an existing directory; {canonical!r} is not one"
+        )
+
+
+def _validate_reserve_identity(request: ManagedLaunchV2ReserveRequest) -> dict[str, Any]:
+    _reject_non_canonical_workdir(request.working_directory)
     if request.provider == "codex":
         if request.trusted_project_root is None:
             raise ManagedLaunchConflict("Codex managed launches require trusted_project_root")
@@ -1615,6 +1653,7 @@ async def _launch_native_tui(
             intent=intent,
             binary=executable,
             binary_sha256=digest,
+            working_directory=record["working_directory"],
             transport=transport,
         )
     except Exception as exc:  # noqa: BLE001 - the attachment store holds the detail

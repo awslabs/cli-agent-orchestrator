@@ -145,6 +145,7 @@ def harness(monkeypatch):
             "pid": 4321,
             "start_marker": "Thu Jul 24 10:00:00 2026",
             "argv": state.launched_argv,
+            "cwd": self._record["working_directory"],
         }
 
     monkeypatch.setattr(boot, "StdioAcpBootstrap", lambda **kwargs: _FakeAcp())

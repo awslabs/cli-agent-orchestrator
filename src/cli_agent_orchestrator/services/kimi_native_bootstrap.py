@@ -173,6 +173,38 @@ def _validate_binary(binary: str, binary_sha256: str, version_output: str) -> st
     return observed
 
 
+def _validate_working_directory(working_directory: Any) -> str:
+    """Accept only a canonical working directory to mint a session in.
+
+    Kimi buckets a session by the ``cwd`` *string* this call passes it,
+    and resolves ``--session`` against the recorded string.  The TUI that
+    later resumes it is a node process, whose reported working directory
+    is always the realpath.  Mint under ``/tmp/w`` and the resume of that
+    exact directory is refused with "created under a different
+    directory", because the two names index different buckets.
+
+    Refused rather than canonicalised here, for the same reason the
+    binary above is: this module is handed a path that a reservation
+    already recorded and that the pane will be started in, and quietly
+    minting under a different string than the one on record is precisely
+    the divergence being guarded against.  The caller's own boundary
+    rejects this first; the repetition is deliberate, and brackets the
+    window in which the recorded path and the minted path could drift
+    apart.
+    """
+    path = _require_text(working_directory, field="working_directory")
+    if not os.path.isabs(path) or os.path.realpath(path) != path:
+        raise KimiBootstrapInvalid(
+            f"working_directory must be a canonical absolute path; got {path!r} "
+            f"(realpath {os.path.realpath(path)!r}) — Kimi files the session under the "
+            "string given here and the resuming TUI reports only the realpath, so the "
+            "two would never match"
+        )
+    if not os.path.isdir(path):
+        raise KimiBootstrapInvalid(f"working_directory {path!r} is not an existing directory")
+    return path
+
+
 def _validated_exit_proof(raw: Any) -> dict[str, Any]:
     """Accept only evidence that the minting process was actually reaped."""
     if not isinstance(raw, Mapping):
@@ -248,7 +280,7 @@ def mint_session(
     model under a receipt that says otherwise.
     """
     digest = _validate_binary(kimi_binary, binary_sha256, version_output)
-    cwd = _require_text(working_directory, field="working_directory")
+    cwd = _validate_working_directory(working_directory)
     wanted_model = _require_text(model, field="model")
     wanted_effort = _require_text(effort, field="effort")
     servers = [dict(server) for server in mcp_servers]

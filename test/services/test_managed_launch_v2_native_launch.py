@@ -18,7 +18,9 @@ one confused run.
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
+import tempfile
 import uuid
 from typing import Any, Mapping, Optional
 
@@ -32,7 +34,7 @@ from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import kimi_native_bootstrap as boot
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
-from cli_agent_orchestrator.services import native_tui_launch
+from cli_agent_orchestrator.services import native_attachment, native_tui_launch
 
 PINNED_VERSION_BANNER = "kimi 0.29.0"
 SESSION_ID = "session_9f2c41ab"
@@ -147,6 +149,9 @@ class _Harness:
         self.bootstrap_kwargs: dict[str, Any] = {}
         self.terminals: list[dict[str, Any]] = []
         self.observed_pid = 4321
+        # None means "the pane is where the reservation says"; a test
+        # sets this to stage a pane that drifted.
+        self.observed_cwd: Optional[str] = None
 
     @property
     def launched_argv(self) -> list[str]:
@@ -179,6 +184,9 @@ def harness(monkeypatch):
             "pid": state.observed_pid,
             "start_marker": "Thu Jul 24 10:00:00 2026",
             "argv": state.launched_argv,
+            # What a healthy pane reports: the reserved directory, which
+            # is also the one the session was minted under.
+            "cwd": state.observed_cwd or self._record["working_directory"],
         }
 
     monkeypatch.setattr(boot, "StdioAcpBootstrap", _transport)
@@ -451,6 +459,7 @@ async def test_a_pane_that_resumes_the_wrong_session_is_never_certified(
             "pid": 4321,
             "start_marker": "Thu Jul 24 10:00:00 2026",
             "argv": [harness.launched_argv[0], "-S", "session_somebody_else"],
+            "cwd": self._record["working_directory"],
         }
 
     monkeypatch.setattr(v2._V2NativePane, "observe", _wrong_session)
@@ -460,3 +469,205 @@ async def test_a_pane_that_resumes_the_wrong_session_is_never_certified(
     assert result["state"] == "preflight_blocked"
     with pytest.raises(Exception):
         _published_receipt(record["reservation_id"])
+
+
+# --------------------------------------------------------------------
+# The working directory the session is filed under
+# --------------------------------------------------------------------
+#
+# The provider files a session under the working-directory *string* it
+# is given and resolves a later resume against that same string, while
+# the TUI that resume starts reports only the realpath.  So two names
+# for one physical directory are two different sessions to the provider,
+# and a launch that mixes them succeeds at every checkpoint and then
+# produces a pane that exits about a second later.  The cases below
+# cover each boundary that now refuses the mix, and prove that refusing
+# is all any of them does — no path is silently corrected, because a
+# correction applied at one boundary and not the others *is* the mix.
+
+
+def test_a_symlinked_temporary_root_is_refused_by_name(isolated_memory_db, worktree, tmp_path):
+    """The exact shape a live rig produced: ``/tmp`` reached as itself.
+
+    On macOS ``/tmp`` is a symlink to ``/private/tmp``, so this is one
+    directory under two names.  The refusal must name the other one,
+    because a caller told only "not canonical" has to go and work out
+    what to send instead.
+    """
+    alias = "/tmp/cao-canonicality-probe"
+    canonical = os.path.realpath(alias)
+    if alias == canonical:
+        pytest.skip("this platform's /tmp is already canonical")
+    os.makedirs(canonical, exist_ok=True)
+
+    with pytest.raises(v2.ManagedLaunchConflict) as refusal:
+        v2.reserve(_reserve_request(worktree, tmp_path, working_directory=alias))
+
+    assert canonical in str(refusal.value)
+    assert alias in str(refusal.value)
+
+
+def test_a_reservation_refused_for_its_directory_leaves_no_row(
+    isolated_memory_db, worktree, tmp_path
+):
+    """Refused before anything durable exists, not rolled back after.
+
+    The distinction matters to a caller retrying with the corrected
+    path: a half-created reservation would make the corrected retry
+    collide with the refused attempt's own id.
+    """
+    request = _reserve_request(worktree, tmp_path, working_directory=tempfile.mkdtemp())
+    reservation_id = request.reservation_id
+
+    with pytest.raises(v2.ManagedLaunchConflict):
+        v2.reserve(request)
+
+    # No row, so the id is still free -- and the proof is that reserving
+    # it again with a good directory succeeds rather than conflicting.
+    with pytest.raises(v2.ManagedLaunchNotFound):
+        v2.get(reservation_id)
+    record, created = v2.reserve(
+        _reserve_request(worktree, tmp_path, reservation_id=reservation_id)
+    )
+    assert created is True
+    assert record["reservation_id"] == reservation_id
+
+
+def test_a_mkdtemp_directory_is_refused_because_it_is_never_canonical(
+    isolated_memory_db, worktree, tmp_path
+):
+    """The reachable production case, not a contrived one.
+
+    ``tempfile.mkdtemp`` returns a path under a symlinked root on macOS
+    every single time, and this codebase already builds provider
+    working directories that way.  Skipped rather than faked where the
+    platform makes it canonical, so the test never passes by accident.
+    """
+    created_directory = tempfile.mkdtemp()
+    if created_directory == os.path.realpath(created_directory):
+        pytest.skip("this platform's temporary root is already canonical")
+
+    with pytest.raises(v2.ManagedLaunchConflict) as refusal:
+        v2.reserve(_reserve_request(worktree, tmp_path, working_directory=created_directory))
+
+    assert os.path.realpath(created_directory) in str(refusal.value)
+
+
+def test_a_symlinked_interior_component_is_refused(isolated_memory_db, worktree, tmp_path):
+    """A path can be absolute, existing, and still not canonical.
+
+    The link is in the middle rather than at the root, which is the case
+    a check written as "does it start with /private" would wave through.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "inner").mkdir()
+    (tmp_path / "link").symlink_to(real)
+    through_link = str(tmp_path / "link" / "inner")
+
+    with pytest.raises(v2.ManagedLaunchConflict) as refusal:
+        v2.reserve(_reserve_request(worktree, tmp_path, working_directory=through_link))
+
+    assert str(real / "inner") in str(refusal.value)
+
+
+def test_a_nonexistent_directory_is_refused_as_missing_rather_than_as_uncanonical(
+    isolated_memory_db, worktree, tmp_path
+):
+    """Two different faults must not share one message.
+
+    ``realpath`` happily resolves a path that does not exist, so a
+    caller who mistyped a directory and a caller who sent a symlinked
+    one would otherwise both be told to send the canonical form -- and
+    only one of them has one to send.
+    """
+    missing = str(tmp_path / "not-there")
+
+    with pytest.raises(v2.ManagedLaunchConflict) as refusal:
+        v2.reserve(_reserve_request(worktree, tmp_path, working_directory=missing))
+
+    assert "existing directory" in str(refusal.value)
+
+
+def test_a_replayed_reservation_echoes_the_request_byte_for_byte(
+    isolated_memory_db, worktree, tmp_path
+):
+    """Nothing on this path rewrites the stored request or the echo.
+
+    A caller that replays a reserve compares what comes back against
+    what it sent.  Had the directory been normalised on ingest instead
+    of refused, a caller sending one valid spelling would read back
+    another and see its own ordinary retry as a conflict -- which is
+    exactly why every check here refuses rather than corrects.
+    """
+    request = _reserve_request(worktree, tmp_path)
+
+    first, created = v2.reserve(request)
+    second, created_again = v2.reserve(request)
+
+    assert created is True and created_again is False
+    assert first == second
+    assert first["working_directory"] == request.working_directory
+    assert first["request"]["working_directory"] == request.working_directory
+    # The stored request bytes, not a re-render of them: identical
+    # across the replay and still carrying the caller's own spelling.
+    stored = v2._canonical_json(first["request"])
+    assert v2._canonical_json(second["request"]) == stored
+    assert request.working_directory in stored
+
+
+@pytest.mark.asyncio
+async def test_a_canonical_directory_launches_and_consumes_no_turn(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """The accepting case, proven to still cost nothing at the provider.
+
+    A check that refuses everything would pass all the cases above.
+    This one runs the whole reserve-mint-launch chain on a canonical
+    directory and asserts the directory reached all three boundaries as
+    the same string, with no turn submitted anywhere.
+    """
+    record, result = await _launch(worktree, tmp_path)
+
+    assert result["state"] != "preflight_blocked"
+    assert record["working_directory"] == os.path.realpath(record["working_directory"])
+    # One string at the reservation, the mint, and the pane.
+    assert harness.bootstrap_kwargs["working_directory"] == record["working_directory"]
+    assert harness.terminals[-1]["working_directory"] == record["working_directory"]
+    assert "session/prompt" not in harness.transport.calls
+    assert _published_receipt(record["reservation_id"])["working_directory"] == (
+        record["working_directory"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_pane_running_in_another_directory_is_never_certified(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """The late check: the pane exists, but not where the session does.
+
+    Everything before this point succeeded -- the directory was
+    canonical at the reservation, at the mint, and at the launch -- and
+    the pane still came up somewhere else.  It resumes the right session
+    id in a directory that session was not filed under, so the provider
+    will refuse to open it.  Caught before the attachment is published,
+    which is what keeps the generation from ever becoming bindable.
+    """
+    harness.observed_cwd = os.path.realpath(tempfile.gettempdir())
+    assert harness.observed_cwd != str(worktree)
+
+    record, result = await _launch(worktree, tmp_path)
+
+    assert result["state"] == "preflight_blocked"
+    # Frozen with the reason that names this boundary, so a later
+    # reconciler is sent to the pane's directory rather than to its argv.
+    frozen = native_attachment.get("kimi_cli", SESSION_ID)
+    assert frozen["state"] == native_attachment.AMBIGUOUS
+    assert frozen["ambiguity_reason"] == native_tui_launch.AMBIGUOUS_PANE_WORKDIR_MISMATCH
+    # No readiness receipt, so bind has nothing to read and the
+    # generation cannot be admitted into.
+    with pytest.raises(Exception):
+        _published_receipt(record["reservation_id"])
+    # And the pane was never typed at: a native launch types nothing by
+    # construction, and a blocked one must not have found an exception.
+    assert harness.terminals[-1]["initial_message"] is None

@@ -216,6 +216,7 @@ def harness(monkeypatch):
             "pid": PANE_PID,
             "start_marker": START_MARKER,
             "argv": state.launched_argv,
+            "cwd": self._record["working_directory"],
         }
 
     def _request_bridge(reservation_id, command, timeout=None):

@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import tempfile
 from typing import Any, Mapping
 
 import pytest
@@ -109,10 +110,21 @@ class FakeAcp:
         return self._exit_proof
 
 
+def _canonical_workdir():
+    """A real, existing, canonical directory a mint will accept.
+
+    Real rather than invented because the mint stats it, and taken
+    through ``realpath`` because on macOS the temporary root is reached
+    through a symlink -- the exact shape that files a session where the
+    resuming TUI will never look for it.
+    """
+    return os.path.realpath(tempfile.gettempdir())
+
+
 def _mint(pinned, transport, **overrides):
     kwargs = {
         **pinned,
-        "working_directory": "/tmp/work",
+        "working_directory": _canonical_workdir(),
         "model": MODEL,
         "effort": EFFORT,
         "transport": transport,
@@ -169,19 +181,24 @@ def test_the_bootstrap_client_claims_no_filesystem_or_terminal_capability(pinned
     }
 
 
-def test_the_working_directory_and_servers_reach_session_new(pinned_binary):
+def test_the_working_directory_and_servers_reach_session_new(pinned_binary, tmp_path):
     transport = FakeAcp()
+    workdir = os.path.realpath(str(tmp_path))
 
     _mint(
         pinned_binary,
         transport,
-        working_directory="/srv/project",
+        working_directory=workdir,
         mcp_servers=[{"name": "cao"}],
     )
 
     method, params = transport.calls[1]
     assert method == "session/new"
-    assert params == {"cwd": "/srv/project", "mcpServers": [{"name": "cao"}]}
+    # Passed through byte-for-byte. The mint validates this string and
+    # refuses a bad one; it never substitutes a corrected one, because
+    # the reservation and the pane are carrying the same string and a
+    # silent correction in one of the three is the divergence itself.
+    assert params == {"cwd": workdir, "mcpServers": [{"name": "cao"}]}
 
 
 def test_two_mints_of_different_conversations_digest_differently(pinned_binary):
@@ -477,3 +494,62 @@ def test_a_receipt_that_denies_its_own_assertions_cannot_license_an_attachment(p
 
     with pytest.raises(boot.KimiBootstrapInvalid, match="turn-free, detached"):
         boot.bootstrap_intent(receipt)
+
+
+# --------------------------------------------------------------------------
+# The directory the session is filed under
+# --------------------------------------------------------------------------
+
+
+def test_a_non_canonical_working_directory_is_refused_before_any_provider_io(
+    pinned_binary, tmp_path
+):
+    """Kimi buckets a session by the directory *string* it is handed.
+
+    Mint under one name for a directory and resume in another and the
+    resume is refused with "created under a different directory" -- the
+    two names index different buckets even though they are one place on
+    disk.  The refusal must come before the transport is touched, so a
+    bad path costs no provider process and mints no orphan session.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    transport = FakeAcp()
+
+    with pytest.raises(boot.KimiBootstrapInvalid) as refusal:
+        _mint(pinned_binary, transport, working_directory=str(tmp_path / "link"))
+
+    assert str(real) in str(refusal.value)
+    assert transport.calls == []
+    assert transport.terminated == 0
+
+
+def test_the_mint_refuses_a_bad_directory_rather_than_correcting_it(pinned_binary, tmp_path):
+    """Refusing is the contract, not an implementation detail.
+
+    The reservation, the mint, and the pane all carry the same directory
+    string.  A mint that silently substituted the canonical form would
+    file the session somewhere the reservation does not name, which is
+    the divergence these checks exist to prevent rather than a fix for
+    it.  So there is no accepted spelling other than the canonical one.
+    """
+    alias = "/tmp/cao-mint-canonicality-probe"
+    canonical = os.path.realpath(alias)
+    if alias == canonical:
+        pytest.skip("this platform's /tmp is already canonical")
+    os.makedirs(canonical, exist_ok=True)
+    transport = FakeAcp()
+
+    with pytest.raises(boot.KimiBootstrapInvalid):
+        _mint(pinned_binary, transport, working_directory=alias)
+
+    # Not minted-then-rejected: nothing was asked of the provider at all.
+    assert transport.calls == []
+
+
+def test_a_working_directory_that_does_not_exist_is_refused(pinned_binary, tmp_path):
+    transport = FakeAcp()
+    with pytest.raises(boot.KimiBootstrapInvalid, match="existing directory"):
+        _mint(pinned_binary, transport, working_directory=str(tmp_path / "absent"))
+    assert transport.calls == []

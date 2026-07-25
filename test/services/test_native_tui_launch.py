@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
 from typing import Any, Mapping, Optional, Sequence
 
 import pytest
@@ -85,12 +86,26 @@ class FakePane:
         return self.observation
 
 
-def _observation(argv: Sequence[str], *, pid: int = 4321) -> dict[str, Any]:
+def _canonical_workdir() -> str:
+    """A real, existing, canonical directory the launcher will accept.
+
+    Real rather than invented because the launcher stats it, and taken
+    through ``realpath`` because on macOS the temporary root is reached
+    through a symlink — which is the very shape these tests are here to
+    reject when it reaches the launcher unresolved.
+    """
+    return os.path.realpath(tempfile.gettempdir())
+
+
+def _observation(
+    argv: Sequence[str], *, pid: int = 4321, cwd: Optional[str] = None
+) -> dict[str, Any]:
     return {
         "pane_id": "%7",
         "pid": pid,
         "start_marker": "Thu Jul 24 10:00:00 2026",
         "argv": list(argv),
+        "cwd": _canonical_workdir() if cwd is None else cwd,
     }
 
 
@@ -109,6 +124,7 @@ def _start(pinned: tuple[str, str], transport: Any, **overrides: Any) -> dict[st
         "intent": _intent(),
         "binary": path,
         "binary_sha256": digest,
+        "working_directory": _canonical_workdir(),
         "transport": transport,
     }
     kwargs.update(overrides)
@@ -315,6 +331,7 @@ def test_an_unreadable_pane_and_an_absent_pane_freeze_with_different_reasons(
             intent=_intent(),
             binary=pinned_binary[0],
             binary_sha256=pinned_binary[1],
+            working_directory=_canonical_workdir(),
             transport=FakePane(observation=None),
         )
     absent = native_attachment.get(PROVIDER, "sess-native-0002")
@@ -340,13 +357,19 @@ def test_a_transport_raising_the_module_error_still_freezes(
 @pytest.mark.parametrize(
     "observation",
     [
-        {"pid": 1, "start_marker": "m", "argv": ["/x/kimi"]},
-        {"pane_id": "%1", "start_marker": "m", "argv": ["/x/kimi"]},
-        {"pane_id": "%1", "pid": 1, "argv": ["/x/kimi"]},
-        {"pane_id": "%1", "pid": 1, "start_marker": "m"},
-        {"pane_id": "%1", "pid": 0, "start_marker": "m", "argv": []},
-        {"pane_id": "%1", "pid": True, "start_marker": "m", "argv": []},
-        {"pane_id": "%1", "pid": 1, "start_marker": "m", "argv": "not-a-list"},
+        {"pid": 1, "start_marker": "m", "argv": ["/x/kimi"], "cwd": "/"},
+        {"pane_id": "%1", "start_marker": "m", "argv": ["/x/kimi"], "cwd": "/"},
+        {"pane_id": "%1", "pid": 1, "argv": ["/x/kimi"], "cwd": "/"},
+        {"pane_id": "%1", "pid": 1, "start_marker": "m", "cwd": "/"},
+        {"pane_id": "%1", "pid": 0, "start_marker": "m", "argv": [], "cwd": "/"},
+        {"pane_id": "%1", "pid": True, "start_marker": "m", "argv": [], "cwd": "/"},
+        {"pane_id": "%1", "pid": 1, "start_marker": "m", "argv": "not-a-list", "cwd": "/"},
+        # A pane that cannot say where it is has not been shown to be in
+        # the directory its session was minted in, so the observation is
+        # incomplete rather than merely unverified.
+        {"pane_id": "%1", "pid": 1, "start_marker": "m", "argv": ["/x/kimi"]},
+        {"pane_id": "%1", "pid": 1, "start_marker": "m", "argv": ["/x/kimi"], "cwd": ""},
+        {"pane_id": "%1", "pid": 1, "start_marker": "m", "argv": ["/x/kimi"], "cwd": 7},
     ],
 )
 def test_an_incomplete_observation_freezes_rather_than_being_filled_in(
@@ -614,10 +637,200 @@ def test_tmux_transport_splits_the_observed_command_line(
             "Thu Jul 24 10:00:00 2026" if field == "lstart=" else f"/bin/kimi --session {SESSION}"
         ),
     )
+    monkeypatch.setattr(native_tui_launch, "_process_cwd", lambda pid: "/private/tmp/w")
     observed = pane.observe()
     assert observed == {
         "pane_id": "%3",
         "pid": 777,
         "start_marker": "Thu Jul 24 10:00:00 2026",
         "argv": ["/bin/kimi", "--session", SESSION],
+        "cwd": "/private/tmp/w",
     }
+
+
+def test_tmux_transport_raises_when_the_pane_cwd_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable cwd is an unreadable pane, not a pane that passes.
+
+    Returning the observation without a cwd would let the launch publish
+    an attachment having never checked the one thing that distinguishes
+    a resumable pane from one that is about to die on the directory the
+    session was filed under.
+    """
+    pane = _pane(FakeBackend(identity={"pane_id": "%3"}, exists=True))
+    monkeypatch.setattr(pane, "_pane_pid", lambda: 777)
+    monkeypatch.setattr(
+        native_tui_launch,
+        "_process_field",
+        lambda pid, field: (
+            "Thu Jul 24 10:00:00 2026" if field == "lstart=" else f"/bin/kimi --session {SESSION}"
+        ),
+    )
+    monkeypatch.setattr(native_tui_launch, "_process_cwd", lambda pid: None)
+    with pytest.raises(native_tui_launch.NativeLaunchUnavailable):
+        pane.observe()
+
+
+def test_process_cwd_reads_the_real_directory_of_a_live_process() -> None:
+    """The cwd probe must report a live process's resolved directory.
+
+    Run against a real process because the whole check rests on the
+    kernel disagreeing with the launcher's own record when they diverge;
+    a stubbed probe could only ever agree with whatever it was told.
+    """
+    import subprocess
+    import time
+
+    alias = os.path.join(tempfile.gettempdir(), "cao-cwd-probe")
+    os.makedirs(alias, exist_ok=True)
+    canonical = os.path.realpath(alias)
+    process = subprocess.Popen(["/bin/sh", "-c", "sleep 30"], cwd=alias)
+    try:
+        for _ in range(50):
+            observed = native_tui_launch._process_cwd(process.pid)
+            if observed is not None:
+                break
+            time.sleep(0.05)
+        # Started through whatever name the caller used; reported as the
+        # resolved one -- exactly the asymmetry the launch check exists
+        # to catch, and the reason comparing raw strings would not do.
+        assert observed == canonical
+    finally:
+        process.kill()
+        process.wait()
+    assert native_tui_launch._process_cwd(process.pid) is None
+
+
+# --------------------------------------------------------------------------
+# The directory the bound session was minted in
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("suffix", ["", "/nested"])
+def test_a_non_canonical_working_directory_claims_nothing_and_starts_nothing(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], tmp_path: Any, suffix: str
+) -> None:
+    """Refused before ``declare``, so the session is left free.
+
+    Ordering is the whole assertion.  Every other refusal in this module
+    that happens after a claim leaves the session frozen and needing an
+    explicit human release; this one happens before, so a caller can fix
+    the path and simply try again.  Both a symlinked leaf and a symlinked
+    interior component are covered, because a check that only compared
+    the last component would pass the second.
+    """
+    real = tmp_path / "real"
+    (real / "nested").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(real)
+    through_link = f"{tmp_path / 'link'}{suffix}"
+
+    pane = FakePane(observation=_observation([]))
+    with pytest.raises(native_tui_launch.NativeLaunchInvalid) as refusal:
+        _start(pinned_binary, pane, working_directory=through_link)
+
+    assert os.path.realpath(through_link) in str(refusal.value)
+    assert pane.created == []
+    # Nothing claimed: not attached, not starting, not frozen.
+    assert native_attachment.get(PROVIDER, SESSION) is None
+
+
+def test_a_working_directory_that_does_not_exist_is_refused(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], tmp_path: Any
+) -> None:
+    """``realpath`` resolves a path that is not there, so existence is checked.
+
+    A canonical-looking path to nothing would otherwise pass every
+    string test and fail only when the pane tried to start in it.
+    """
+    pane = FakePane(observation=_observation([]))
+    with pytest.raises(native_tui_launch.NativeLaunchInvalid):
+        _start(pinned_binary, pane, working_directory=str(tmp_path / "absent"))
+    assert pane.created == []
+    assert native_attachment.get(PROVIDER, SESSION) is None
+
+
+def test_a_pane_running_in_the_wrong_directory_freezes_before_attaching(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], tmp_path: Any
+) -> None:
+    """A correct argv in the wrong directory is still the wrong pane.
+
+    The process resumes exactly the bound session id, so the argv check
+    passes.  It is in a directory that session was never filed under, so
+    the provider will refuse to open it and the pane will exit.  Frozen
+    rather than published, because publishing would make the generation
+    bindable and a task would then be typed at a dying process.
+    """
+    elsewhere = os.path.realpath(str(tmp_path))
+    workdir = os.path.realpath(tempfile.gettempdir())
+    assert elsewhere != workdir
+
+    path, _digest = pinned_binary
+    pane = FakePane(observation=_observation(_expected_argv(path), cwd=elsewhere))
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as frozen:
+        _start(pinned_binary, pane, working_directory=workdir)
+
+    assert frozen.value.reason == native_tui_launch.AMBIGUOUS_PANE_WORKDIR_MISMATCH
+    # Both directories named, so a reconciler is not left guessing which
+    # of the two moved.
+    assert elsewhere in str(frozen.value) and workdir in str(frozen.value)
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_WORKDIR_MISMATCH)
+
+
+def test_a_pane_reporting_the_bound_directory_by_another_name_still_attaches(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str]
+) -> None:
+    """One physical directory under two names is not a mismatch.
+
+    The comparison resolves what the process reports before comparing.
+    Refusing here would freeze healthy sessions on any platform whose
+    process table happens to answer with an unresolved path.
+    """
+    workdir = os.path.realpath(tempfile.gettempdir())
+    alias = os.path.join(workdir, "..", os.path.basename(workdir))
+
+    path, _digest = pinned_binary
+    pane = FakePane(observation=_observation(_expected_argv(path), cwd=alias))
+    result = _start(pinned_binary, pane, working_directory=workdir)
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert native_attachment.get(PROVIDER, SESSION)["state"] == native_attachment.ATTACHED
+
+
+def test_reentry_over_a_pane_in_the_wrong_directory_freezes_too(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], tmp_path: Any
+) -> None:
+    """The reconcile path checks the directory as well.
+
+    Re-entry publishes an attachment for a pane it did not start, which
+    makes it the path *most* in need of the check: the directory the pane
+    is in was never observed by whoever created it.
+    """
+    path, _digest = pinned_binary
+    workdir = os.path.realpath(tempfile.gettempdir())
+    native_attachment.declare(
+        provider=PROVIDER,
+        native_session_id=SESSION,
+        terminal_id=TERMINAL,
+        generation=GENERATION,
+        execution_mode=em.NATIVE_TUI,
+        intent=_intent(),
+    )
+    native_attachment.mark_starting(
+        provider=PROVIDER,
+        native_session_id=SESSION,
+        terminal_id=TERMINAL,
+        generation=GENERATION,
+        execution_mode=em.NATIVE_TUI,
+    )
+
+    pane = FakePane(
+        observation=_observation(_expected_argv(path), cwd=os.path.realpath(str(tmp_path)))
+    )
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous):
+        _start(pinned_binary, pane, working_directory=workdir)
+
+    # Observed, never relaunched: the freeze must not be reached by way
+    # of starting a second process.
+    assert pane.created == []
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_WORKDIR_MISMATCH)
