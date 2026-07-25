@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.settings_service import (
     _DEFAULTS,
     _load,
@@ -21,8 +22,21 @@ from cli_agent_orchestrator.services.settings_service import (
 
 @pytest.fixture
 def settings_file(tmp_path):
-    """Patch SETTINGS_FILE and CAO_HOME_DIR to use a temp directory."""
+    """Patch SETTINGS_FILE and CAO_HOME_DIR to use a temp directory.
+
+    Also resets get_server_settings()'s module-global cache
+    (_server_settings_cache/_server_settings_mtime_ns), which is keyed only
+    on SETTINGS_FILE's st_mtime_ns. Without this reset, back-to-back tests
+    that each write their own tmp_path/settings.json can collide on a
+    coarse-clock filesystem (two writes to DIFFERENT files landing on the
+    same st_mtime_ns tick) and a test would silently read the PRIOR test's
+    cached settings instead of its own -- flaky (~3-4 failures per run on
+    WSL2), not reproducible on every host, and each failing test passes in
+    isolation, which is exactly what a stale-cache bug looks like.
+    """
     fake_settings = tmp_path / "settings.json"
+    settings_service._server_settings_cache = None
+    settings_service._server_settings_mtime_ns = -1
     with (
         patch(
             "cli_agent_orchestrator.services.settings_service.SETTINGS_FILE",
@@ -34,6 +48,8 @@ def settings_file(tmp_path):
         ),
     ):
         yield fake_settings
+    settings_service._server_settings_cache = None
+    settings_service._server_settings_mtime_ns = -1
 
 
 class TestLoad:
@@ -361,6 +377,18 @@ class TestGetServerSettings:
         from cli_agent_orchestrator.services.settings_service import get_server_settings
 
         _save({"server": {"state_buffer_max": -1}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+    def test_state_buffer_max_fractional_below_one_falls_back_to_default(self, settings_file):
+        """0.5 passes the naive ``val <= 0`` check (0.5 > 0) but truncates to
+        0 once coerced to int for the slice bound -- ``buffer[-0:]`` is the
+        same unbounded-buffer failure mode as the zero case above, just
+        reached through the float door instead. The guard must check
+        ``int(val) <= 0``, not ``val <= 0``."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 0.5}})
         result = get_server_settings()
         assert result["state_buffer_max"] == 32768
 

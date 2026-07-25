@@ -264,7 +264,14 @@ def get_server_settings() -> Dict[str, Any]:
     # Validate types and ranges; coerce to int for queue size
     for key, default in _SERVER_DEFAULTS.items():
         val = result[key]
-        if isinstance(val, bool) or not isinstance(val, (int, float)) or val <= 0:
+        # int(val), not val <= 0: a float in (0, 1) (e.g. a settings.json
+        # value of 0.5) passes val <= 0 but truncates to 0 once coerced to
+        # int below (state_buffer_max) or by Queue(maxsize=...)
+        # (event_bus_max_queue_size), reintroducing the same
+        # unbounded-buffer/unbounded-queue failure mode this validation
+        # exists to prevent. isinstance(val, (int, float)) above guarantees
+        # int(val) cannot itself raise here.
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or int(val) <= 0:
             logger.warning(f"Invalid server setting {key}={val!r}, using default {default}")
             result[key] = default
     result["event_bus_max_queue_size"] = int(result["event_bus_max_queue_size"])
