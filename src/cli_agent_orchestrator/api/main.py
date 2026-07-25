@@ -1606,6 +1606,26 @@ async def managed_launch_capabilities(
         # read from the surface's own tuple for the same
         # no-second-source-of-truth reason as above.
         "v2_launchable_execution_modes": list(managed_launch_v2.LAUNCHABLE_EXECUTION_MODES),
+        # Native-TUI support, per provider. Additive: the mode gate above
+        # is unchanged and still decides whether native TUI can be
+        # launched at all. This block answers the narrower question of
+        # *which providers* have a real native adapter, which the flat
+        # mode list cannot express — and a flat relaxation of that list
+        # would have advertised native launch for providers with no
+        # branch to run it.
+        #
+        # Both gates are required, and both come from this one response
+        # so they cannot be read at two different moments: a caller may
+        # route native TUI to a provider only when `native_tui` appears
+        # in `v2_launchable_execution_modes` AND
+        # `native_tui.providers[<provider>].supported` is true. An older
+        # peer returns no `native_tui` key at all, which is the same
+        # answer as unsupported and must be treated as a typed refusal
+        # before any reservation is created.
+        #
+        # Keyed by canonical provider. `claude` is the executable name
+        # and appears only as the `executable` field.
+        "native_tui": managed_launch_v2.native_tui_capabilities(),
     }
 
 

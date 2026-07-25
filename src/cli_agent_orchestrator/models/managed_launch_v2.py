@@ -34,7 +34,11 @@ class ManagedLaunchV2ReserveRequest(BaseModel):
     protocol_version: ProtocolVersionV2
     reservation_id: str
     session_name: str
-    provider: Literal["codex", "kimi_cli"]
+    # Canonical provider keys. ``claude_code`` is the provider; ``claude``
+    # is only the executable name and never appears here — the two are
+    # kept apart deliberately, because a surface that accepted both would
+    # make "which provider is this?" answerable two ways.
+    provider: Literal["codex", "kimi_cli", "claude_code"]
     agent_profile: str
     caller_id: str
     working_directory: str

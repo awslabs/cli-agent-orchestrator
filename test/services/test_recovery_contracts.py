@@ -21,7 +21,7 @@ from cli_agent_orchestrator.services.recovery_capabilities import build_capabili
 
 def test_pinned_versions():
     # The current pin is the stage-verified installed build.
-    assert pc.PINNED_VERSIONS == {"codex": "0.145.0", "kimi": "0.29.1", "claude": "2.1.218"}
+    assert pc.PINNED_VERSIONS == {"codex": "0.145.0", "kimi": "0.29.1", "claude": "2.1.220"}
     pc.check_pinned_version("codex", "0.145.0")
     pc.check_pinned_version("codex", "codex-cli 0.145.0")
     with pytest.raises(pc.ProviderVersionDrift):
@@ -46,7 +46,7 @@ def test_kimi_accepts_both_pinned_and_retained_versions_but_never_a_range():
 
 def test_normalized_version_extracts_the_semver_token():
     assert pc.normalized_version("kimi 0.29.1") == "0.29.1"
-    assert pc.normalized_version("2.1.218 (Claude Code)") == "2.1.218"
+    assert pc.normalized_version("2.1.220 (Claude Code)") == "2.1.220"
     assert pc.normalized_version("no version here") == ""
 
 
@@ -115,7 +115,7 @@ def test_resume_status_version_checked_and_receipt_bound():
     assert codex.identity_available and not codex.authority_supported
     drifted = pc.resume_status("codex", installed_version="codex 0.145.1")
     assert not drifted.identity_available
-    claude = pc.resume_status("claude", installed_version="2.1.218 (Claude Code)")
+    claude = pc.resume_status("claude", installed_version="2.1.220 (Claude Code)")
     assert claude.identity_available and not claude.authority_supported
     drifted_claude = pc.resume_status("claude", installed_version="2.1.216 (Claude Code)")
     assert not drifted_claude.identity_available

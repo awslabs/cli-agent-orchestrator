@@ -42,7 +42,7 @@ PROVIDERS = (PROVIDER_CODEX, PROVIDER_KIMI, PROVIDER_CLAUDE)
 PINNED_VERSIONS = {
     PROVIDER_CODEX: "0.145.0",
     PROVIDER_KIMI: "0.29.1",
-    PROVIDER_CLAUDE: "2.1.218",
+    PROVIDER_CLAUDE: "2.1.220",
 }
 
 #: Every exact version accepted for a provider, current first.  A tuple of
@@ -52,10 +52,18 @@ PINNED_VERSIONS = {
 #: under it still validates after the binary is stage-verified up to
 #: ``0.29.1`` (installed bundle ``main.mjs`` sha256
 #: cba31835395ff75fa6b5bc9b81a7907c7d933e7e6a7d8ba53afac23dd0f5ab04).
+#:
+#: Claude accepts only ``2.1.220``, the stage-verified installed build
+#: (``versions/2.1.220`` sha256
+#: 8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081).
+#: ``2.1.218`` is *not* retained: unlike Kimi, no managed Claude session
+#: has ever been minted, so there is no existing receipt that retaining it
+#: would keep valid — it would only assert that a build nobody has read
+#: the composer behaviour of is acceptable.
 SUPPORTED_VERSIONS: dict[str, tuple[str, ...]] = {
     PROVIDER_CODEX: ("0.145.0",),
     PROVIDER_KIMI: ("0.29.1", "0.29.0"),
-    PROVIDER_CLAUDE: ("2.1.218",),
+    PROVIDER_CLAUDE: ("2.1.220",),
 }
 # The current pin must always be an accepted version — asserted here so the
 # two maps cannot silently drift apart.
@@ -95,7 +103,7 @@ class ResumeFormRefused(ProviderContractError):
 def normalized_version(installed_version: str) -> str:
     """The first semver-shaped token in a ``<name> <version> ...`` banner.
 
-    ``"codex 0.145.0"``, ``"2.1.218 (Claude Code)"``, ``"kimi 0.29.1"`` all
+    ``"codex 0.145.0"``, ``"2.1.220 (Claude Code)"``, ``"kimi 0.29.1"`` all
     yield the bare version; an absent one yields ``""``.  Exposed so a
     caller can record the *actual* validated version rather than a pin
     constant that may name the wrong one of several accepted builds.

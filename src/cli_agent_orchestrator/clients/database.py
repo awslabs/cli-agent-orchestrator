@@ -454,6 +454,58 @@ class KimiNativeControlOperationModel(Base):
     updated_at = Column(Text, nullable=False)
 
 
+class ClaudeNativeControlOperationModel(Base):
+    """One control operation against a native Claude TUI.
+
+    Structurally the twin of the Kimi control store and deliberately a
+    *separate table*, not a shared one with a provider column. The
+    separation is what makes a Kimi operation unable to satisfy a Claude
+    check, and vice versa: the two providers' composer facts, refusal
+    reasons and acceptance evidence are different, and one table would
+    make cross-provider confusion a query away rather than impossible.
+
+    Every other property is the same, and for the same reasons. Keyed by
+    the caller-minted ``operation_id`` so a lost response is resolvable by
+    exact id rather than by re-sending. The intent is written before
+    anything is typed, so a crash between intent and keystroke leaves a
+    durable record recovery can adjudicate instead of a silent maybe-sent.
+    ``posted_at`` records that bytes reached the transport and nothing
+    more; provider acceptance is a separate observation in a separate
+    column, because a successful pane write is not acceptance and the two
+    must never be readable as one fact.
+    """
+
+    __tablename__ = "claude_native_control_operations"
+
+    operation_id = Column(Text, primary_key=True)
+    kind = Column(Text, nullable=False)
+    state = Column(Text, nullable=False)
+    # The full binding this operation is valid for. A mismatch on any
+    # component is refused before the pane is touched, so an operation
+    # minted for one generation can never land in its successor.
+    provider = Column(Text, nullable=False)
+    native_session_id = Column(Text, nullable=False)
+    terminal_id = Column(Text, nullable=False)
+    generation = Column(Text, nullable=False)
+    execution_mode = Column(Text, nullable=False)
+    # Present only for a steer, which binds to the exact active turn it
+    # intends to interrupt. A queue operation has no turn by definition.
+    turn_id = Column(Text, nullable=True)
+    # The digest of the exact literal payload rather than the payload
+    # itself: enough to prove the same operation was not re-sent with
+    # different bytes, without durably storing message content here.
+    payload_sha256 = Column(Text, nullable=False)
+    intent_json = Column(Text, nullable=False)
+    transport_json = Column(Text, nullable=True)
+    observation_json = Column(Text, nullable=True)
+    posted_at = Column(Text, nullable=True)
+    refusal_reason = Column(Text, nullable=True)
+    ambiguity_reason = Column(Text, nullable=True)
+    epoch = Column(Integer, nullable=False, default=0)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+
 class FlowModel(Base):
     """SQLAlchemy model for flow metadata."""
 
@@ -531,6 +583,7 @@ def init_db() -> None:
     _migrate_session_env()
     _migrate_native_session_attachments()
     _migrate_kimi_native_control_operations()
+    _migrate_claude_native_control_operations()
     _migrate_managed_launch_reservations()
     _migrate_managed_launch_v2()
 
@@ -962,6 +1015,48 @@ def _migrate_kimi_native_control_operations() -> None:
             )
     except Exception as e:  # noqa: BLE001 - the operation path fails closed
         logger.warning(f"kimi native control migration failed: {e}")
+
+
+def _migrate_claude_native_control_operations() -> None:
+    """Create the Claude control-operation store on older databases.
+
+    The same idempotent, byte-compatible pattern as the Kimi store above,
+    against its own table. A failure is logged rather than raised for the
+    same reason: startup must not be blocked by a table only one optional
+    surface needs, and nothing unsafe follows, because a control operation
+    that cannot journal its intent types nothing into a provider pane.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS claude_native_control_operations ("
+                "operation_id TEXT PRIMARY KEY, "
+                "kind TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "provider TEXT NOT NULL, "
+                "native_session_id TEXT NOT NULL, "
+                "terminal_id TEXT NOT NULL, "
+                "generation TEXT NOT NULL, "
+                "execution_mode TEXT NOT NULL, "
+                "turn_id TEXT, "
+                "payload_sha256 TEXT NOT NULL, "
+                "intent_json TEXT NOT NULL, "
+                "transport_json TEXT, "
+                "observation_json TEXT, "
+                "posted_at TEXT, "
+                "refusal_reason TEXT, "
+                "ambiguity_reason TEXT, "
+                "epoch INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 - the operation path fails closed
+        logger.warning(f"claude native control migration failed: {e}")
 
 
 def _migrate_managed_launch_reservations() -> None:

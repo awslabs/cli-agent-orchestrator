@@ -31,7 +31,7 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
 )
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
-from cli_agent_orchestrator.services import native_attachment, run_manifest
+from cli_agent_orchestrator.services import native_attachment, native_tui_launch, run_manifest
 from cli_agent_orchestrator.services import vintage_migration as vm
 from cli_agent_orchestrator.services.destructive_endpoint import binding_record_path
 from cli_agent_orchestrator.services.managed_launch import (
@@ -1096,8 +1096,17 @@ def test_only_providers_with_a_native_branch_may_launch_native():
     not fall back: the mode gate above would pass it, so the provider
     gate is the one that catches it.
     """
-    assert v2.NATIVE_TUI_PROVIDERS == frozenset({"kimi_cli"})
+    assert v2.NATIVE_TUI_PROVIDERS == frozenset({"kimi_cli", "claude_code"})
+    # The set is *derived* from the adapters that exist, not written out
+    # by hand, so a provider cannot be advertised as native-launchable
+    # while one of the three surfaces it needs is missing. Asserted as an
+    # equality against each table rather than a subset: a provider that
+    # appeared in only two of them would advertise a launch that fails
+    # part-way through.
     assert set(v2._NATIVE_TUI_READINESS_RECEIPT_KINDS) == v2.NATIVE_TUI_PROVIDERS
+    assert v2.NATIVE_TUI_PROVIDERS <= set(v2._ISSUANCE_SOURCES)
+    assert v2.NATIVE_TUI_PROVIDERS <= set(v2._PINNED_PROVIDER)
+    assert v2.NATIVE_TUI_PROVIDERS <= native_tui_launch.SUPPORTED_NATIVE_PROVIDERS
     # Disjoint from the ACP kinds, so neither table can accept the other's
     # evidence by accident.
     assert not set(v2._NATIVE_TUI_READINESS_RECEIPT_KINDS.values()) & set(

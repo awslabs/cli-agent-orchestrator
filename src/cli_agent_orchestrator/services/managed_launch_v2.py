@@ -34,6 +34,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any, Optional
 
 from sqlalchemy.exc import IntegrityError
@@ -53,6 +54,7 @@ from cli_agent_orchestrator.services import (
     generation_fence,
     heartbeat_store,
     native_attachment,
+    native_tui_launch,
     recovery_receipts,
     secret_gate,
 )
@@ -66,6 +68,7 @@ from cli_agent_orchestrator.services.managed_launch import (
 from cli_agent_orchestrator.services.provider_contracts import (
     ProviderContractError,
     check_pinned_version,
+    normalized_version,
 )
 from cli_agent_orchestrator.utils.terminal import generate_terminal_id, managed_window_name
 
@@ -86,14 +89,28 @@ _READINESS_RECEIPT_KINDS = {
 #: thing entirely.
 _NATIVE_TUI_READINESS_RECEIPT_KINDS = {
     "kimi_cli": "kimi-native-tui-attached",
+    # Distinct from Kimi's for the same structural reason the native and
+    # ACP kinds are distinct: the two providers prove readiness by
+    # different evidence.  Kimi's pane is proven attached; Claude's
+    # readiness is its own SessionStart hook naming the exact session id,
+    # which is a claim about the provider rather than about the pane.
+    "claude_code": "claude-native-session-start",
 }
 _ISSUANCE_SOURCES = {
     "codex": "app_server_thread_start",
     "kimi_cli": "acp_session_new",
+    # Claude's identity is chosen, not discovered: a canonical uuid minted
+    # before any provider I/O and handed to the launch as --session-id.
+    "claude_code": "cli_session_id",
 }
+#: Canonical provider key to the *executable* name the version-pin tables
+#: are keyed by.  The mapping exists because these are two different
+#: namespaces and conflating them is how "claude" ends up published as a
+#: provider on a shared surface.
 _PINNED_PROVIDER = {
     "codex": "codex",
     "kimi_cli": "kimi",
+    "claude_code": "claude",
 }
 
 #: How long a native launch watches for its pane to become input-ready,
@@ -361,7 +378,126 @@ LAUNCHABLE_EXECUTION_MODES: tuple[str, ...] = (em.ACP, em.NATIVE_TUI)
 #: than "providers this surface can launch".  Native TUI needs a pre-turn
 #: session id the provider will resume by id; a provider without both is
 #: refused rather than launched into an unresumable pane.
-NATIVE_TUI_PROVIDERS: frozenset[str] = frozenset({"kimi_cli"})
+#: Derived from the adapters that actually exist rather than written out
+#: by hand.  A provider is native-launchable only if every one of the
+#: three surfaces it needs is implemented for it: an argv binder that can
+#: bind a session exactly, a readiness receipt kind, and an issuance
+#: source.  Listing a provider here that lacked one of those would
+#: advertise a capability whose first use fails part-way through a launch.
+NATIVE_TUI_PROVIDERS: frozenset[str] = frozenset(
+    provider
+    for provider in native_tui_launch.SUPPORTED_NATIVE_PROVIDERS
+    if provider in _NATIVE_TUI_READINESS_RECEIPT_KINDS
+    and provider in _ISSUANCE_SOURCES
+    and provider in _PINNED_PROVIDER
+)
+
+
+#: Version of the published native-TUI capability block. Bumped only for
+#: a breaking change to its shape, so a consumer can tell "this peer does
+#: not advertise native TUI" from "this peer advertises it differently".
+NATIVE_TUI_CAPABILITY_SCHEMA_VERSION = 1
+
+
+def native_tui_capabilities() -> dict[str, Any]:
+    """Per-provider native-TUI support, derived from implemented adapters.
+
+    Published *additively* alongside the flat launchable-mode list, which
+    is unchanged. The mode list still decides whether native TUI can be
+    launched at all; this answers the narrower question of which
+    providers have a real adapter behind it — something a flat list
+    cannot express, and which a flat relaxation of that list would have
+    got wrong by advertising native launch for providers with no branch
+    to run it.
+
+    A consumer must satisfy *both* gates, from one read of the
+    capabilities response so the two facts cannot come from different
+    moments: ``native_tui`` present in the launchable modes, *and*
+    ``providers[<provider>].supported``. A peer too old to know about
+    this block returns no ``native_tui`` key at all, which is the same
+    answer as unsupported and must be a typed refusal taken before any
+    reservation exists.
+
+    Keyed by canonical provider. ``claude`` is an executable name and
+    appears only under ``executable``.
+    """
+    from cli_agent_orchestrator.services import provider_contracts as contracts
+
+    providers = {}
+    for provider in sorted(NATIVE_TUI_PROVIDERS):
+        executable = _PINNED_PROVIDER[provider]
+        providers[provider] = {
+            "supported": True,
+            "id_source": _ISSUANCE_SOURCES[provider],
+            "readiness_receipt_kind": _NATIVE_TUI_READINESS_RECEIPT_KINDS[provider],
+            "executable": executable,
+            "pinned_version": contracts.PINNED_VERSIONS[executable],
+            # The exact accepted set, not a range: acceptance is exact-set
+            # membership, and publishing a range would invite a consumer
+            # to interpolate builds nobody has verified.
+            "supported_versions": list(contracts.SUPPORTED_VERSIONS[executable]),
+        }
+    return {"schema_version": NATIVE_TUI_CAPABILITY_SCHEMA_VERSION, "providers": providers}
+
+
+def _control_adapter(provider: str) -> Any:
+    """The native control adapter for one provider, or a refusal.
+
+    Resolved by canonical provider rather than passed in, and never
+    defaulted. The two adapters use disjoint record schemas and disjoint
+    stores precisely so one provider's operation cannot answer for
+    another's; picking the adapter from anything other than the binding's
+    own provider would give that separation away at the last step.
+    """
+    from cli_agent_orchestrator.services import claude_native_control, kimi_native_control
+
+    adapters = {
+        "kimi_cli": kimi_native_control,
+        "claude_code": claude_native_control,
+    }
+    adapter = adapters.get(provider)
+    if adapter is None:
+        raise ManagedLaunchConflict(
+            f"provider {provider!r} has no native control adapter; "
+            f"native providers are {sorted(adapters)}"
+        )
+    return adapter
+
+
+def _observe_turn_state(provider: str, **kwargs: Any) -> Any:
+    """Read one pane's turn state through that provider's own detector.
+
+    Dispatched by provider for the same reason the control adapter is:
+    each detector describes one provider's rendering, and a shared one
+    would eventually read a Claude screen with Kimi's rules and call a
+    busy pane idle.
+    """
+    from cli_agent_orchestrator.services.native_pane_input import (
+        observe_claude_turn_state,
+        observe_kimi_turn_state,
+    )
+
+    observers = {
+        "kimi_cli": observe_kimi_turn_state,
+        "claude_code": observe_claude_turn_state,
+    }
+    observer = observers.get(provider)
+    if observer is None:
+        raise ManagedLaunchConflict(
+            f"provider {provider!r} has no native turn-state observer; "
+            f"native providers are {sorted(observers)}"
+        )
+    return observer(**kwargs)
+
+
+#: The detector name recorded on a readiness observation, per provider.
+#: Stored so a reader of a durable receipt knows which detector produced
+#: it — two providers' status strings look alike and would otherwise be
+#: indistinguishable after the fact.
+TURN_OBSERVER_AUTHORITY = {
+    "kimi_cli": "observe_kimi_turn_state",
+    "claude_code": "observe_claude_turn_state",
+}
 
 
 def _resolve_reserve_mode(request: ManagedLaunchV2ReserveRequest) -> em.ExecutionModeResolution:
@@ -1363,6 +1499,7 @@ def _readiness_observation(
     provider_status: Optional[str],
     input_ready: bool,
     detail: Optional[str],
+    authority: str = "observe_native_turn_state",
 ) -> dict[str, Any]:
     """One record of whether a pane could actually be typed into, and when.
 
@@ -1376,7 +1513,10 @@ def _readiness_observation(
     return {
         # Named so a reader of the stored record knows which detector
         # produced it without having to guess from the status string.
-        "authority": "observe_kimi_turn_state",
+        # Per-provider, because the two detectors read different
+        # renderings and a shared label would make a Claude observation
+        # indistinguishable from a Kimi one in the stored receipt.
+        "authority": authority,
         "observed_at": _now(),
         "pane_id": pane_id,
         "provider_status": provider_status,
@@ -1581,13 +1721,16 @@ def complete_native_admission(
     read a successful write as an accepted turn would report work
     started that may still be sitting in a composer.
     """
-    from cli_agent_orchestrator.services import kimi_native_control
-
     try:
         with database.SessionLocal() as db:
             row = _query(db, reservation_id)
             if row is None:
                 raise ManagedLaunchNotFound(f"v2 reservation not found: {reservation_id}")
+            # Resolved from the row rather than from the operation record:
+            # the operation is the thing being checked, so letting it
+            # choose its own validator would let a foreign record nominate
+            # the schema it happens to satisfy.
+            native_control = _control_adapter(row.provider)
             admission = _parse_json(row.admission_json, None)
             if not admission or admission.get("delivery_id") != delivery_id:
                 raise ManagedLaunchConflict("delivery_id does not match the admission claim")
@@ -1605,18 +1748,18 @@ def complete_native_admission(
                     f"native admission completion requires an immutable {em.NATIVE_TUI!r} "
                     f"row; this reservation is {mode!r} and completes over its bridge path"
                 )
-            if operation.get("schema") != kimi_native_control.RECORD_SCHEMA:
+            if operation.get("schema") != native_control.RECORD_SCHEMA:
                 raise ManagedLaunchConflict(
-                    f"native admission requires a {kimi_native_control.RECORD_SCHEMA!r} "
+                    f"native admission requires a {native_control.RECORD_SCHEMA!r} "
                     f"operation record; got {operation.get('schema')!r}"
                 )
-            if operation.get("kind") != kimi_native_control.KIND_QUEUE:
+            if operation.get("kind") != native_control.KIND_QUEUE:
                 # Admission is ordinary first delivery. A steer targets a
                 # running turn and a control op is a slash command; either
                 # completing an admission would mean the task bytes went
                 # somewhere other than the idle-gated queue path.
                 raise ManagedLaunchConflict(
-                    f"native admission requires a {kimi_native_control.KIND_QUEUE!r} "
+                    f"native admission requires a {native_control.KIND_QUEUE!r} "
                     f"operation; got {operation.get('kind')!r}"
                 )
             if not operation.get("posted"):
@@ -2198,7 +2341,7 @@ async def _launch_native_tui(
     """
     import asyncio
 
-    from cli_agent_orchestrator.services import kimi_native_bootstrap, native_tui_launch
+    from cli_agent_orchestrator.services import claude_native_readiness, kimi_native_bootstrap
     from cli_agent_orchestrator.services.managed_provider_bridge import (
         BRIDGE_VERSION,
         native_child_environment,
@@ -2232,17 +2375,43 @@ async def _launch_native_tui(
             reason=PREFLIGHT_REASON_NATIVE_PREFLIGHT,
         )
 
+    # How a session acquires its identity is the one place the two native
+    # providers genuinely differ, and the difference decides the launch
+    # form. Kimi's id is *discovered*: a separate ACP conversation mints
+    # it, sends no turn, and is proven dead before anything else happens,
+    # after which the TUI resumes that id. Claude's id is *chosen*: a
+    # canonical uuid minted here, before any provider I/O at all, and
+    # handed to the TUI as --session-id. The consequence is that a Claude
+    # launch which dies before its first turn still has a recorded
+    # identity, because the identity preceded the launch.
+    readiness_hook: Optional[dict[str, Any]] = None
+    launch_extra_args: Optional[list[str]] = None
     try:
-        bootstrap = await asyncio.to_thread(
-            _mint_native_session,
-            kimi_native_bootstrap,
-            executable=executable,
-            digest=digest,
-            version_output=version_output,
-            environment=environment,
-            record=record,
-            request=request,
-        )
+        if provider == "claude_code":
+            bootstrap, readiness_hook = await asyncio.to_thread(
+                _mint_claude_native_session,
+                record=record,
+                request=request,
+                version_output=version_output,
+                digest=digest,
+            )
+            launch_kind = native_tui_launch.LAUNCH_KIND_NEW
+            launch_extra_args = [
+                "--settings",
+                claude_native_readiness.settings_argument(readiness_hook["settings"]),
+            ]
+        else:
+            bootstrap = await asyncio.to_thread(
+                _mint_native_session,
+                kimi_native_bootstrap,
+                executable=executable,
+                digest=digest,
+                version_output=version_output,
+                environment=environment,
+                record=record,
+                request=request,
+            )
+            launch_kind = native_tui_launch.LAUNCH_KIND_RESUME
     except Exception as exc:  # noqa: BLE001 - no turn was ever submitted
         return _mark_preflight_blocked(
             reservation_id,
@@ -2251,8 +2420,12 @@ async def _launch_native_tui(
         )
 
     try:
-        intent = kimi_native_bootstrap.bootstrap_intent(
-            bootstrap, note=f"v2 native launch of reservation {reservation_id}"
+        intent = (
+            _claude_bootstrap_intent(bootstrap, reservation_id=reservation_id)
+            if provider == "claude_code"
+            else kimi_native_bootstrap.bootstrap_intent(
+                bootstrap, note=f"v2 native launch of reservation {reservation_id}"
+            )
         )
         transport = _V2NativePane(
             record=record,
@@ -2272,6 +2445,8 @@ async def _launch_native_tui(
             binary_sha256=digest,
             working_directory=record["working_directory"],
             transport=transport,
+            extra_args=launch_extra_args,
+            launch_kind=launch_kind,
         )
     except Exception as exc:  # noqa: BLE001 - the attachment store holds the detail
         return _mark_preflight_blocked(
@@ -2295,6 +2470,31 @@ async def _launch_native_tui(
     # ownership store recorded — and is the same field admission later
     # validates and delivers into. Watching anything else would let the
     # receipt certify a pane that is not the one a task goes to.
+    # For Claude, the provider's own SessionStart hook is the
+    # authoritative readiness and it is awaited *first*. Nothing weaker
+    # may stand in for it: a live pane proves a process was spawned, an
+    # elapsed interval proves nothing at all, and a rendered composer
+    # belongs to whatever session Claude actually opened — including the
+    # wrong one, which is exactly what a resume falling back to its
+    # interactive picker looks like from outside. Only the hook names the
+    # session id.
+    session_start: Optional[dict[str, Any]] = None
+    if provider == "claude_code" and readiness_hook is not None:
+        try:
+            session_start = await asyncio.to_thread(
+                claude_native_readiness.await_session_start,
+                readiness_hook["readiness_path"],
+                bootstrap["native_session_id"],
+            )
+        except claude_native_readiness.ClaudeNativeReadinessError as exc:
+            # Zero task bytes were submitted: the launch never got as far
+            # as being bindable, and admission requires a bind.
+            return _mark_preflight_blocked(
+                reservation_id,
+                f"claude native readiness was never proven: {exc}",
+                reason=PREFLIGHT_REASON_READINESS,
+            )
+
     readiness = await asyncio.to_thread(
         _await_native_pane_input_ready,
         record,
@@ -2312,6 +2512,7 @@ async def _launch_native_tui(
                 version_output=version_output,
                 bridge_version=BRIDGE_VERSION,
                 readiness=readiness,
+                session_start=session_start,
             ),
         )
     except Exception as exc:  # noqa: BLE001 - a pane exists but bind cannot read it
@@ -2321,6 +2522,74 @@ async def _launch_native_tui(
             reason=PREFLIGHT_REASON_READINESS,
         )
     return get(reservation_id)
+
+
+CLAUDE_BOOTSTRAP_SCHEMA = "cao-claude-native-bootstrap-v1"
+CLAUDE_BOOTSTRAP_INTENT_SCHEMA = "cao-claude-native-bootstrap-intent-v1"
+
+
+def _mint_claude_native_session(
+    *,
+    record: dict[str, Any],
+    request: dict[str, Any],
+    version_output: str,
+    digest: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Choose a Claude session identity, and arrange for it to prove itself.
+
+    Spends no provider I/O whatsoever. The identity is a canonical uuid
+    minted here, and the second half of the work is preparing the
+    generation-private file the provider's SessionStart hook will write
+    to — both done *before* the launch, so the hook has somewhere to
+    write the instant Claude starts and so the identity is recorded even
+    if the launch never succeeds.
+
+    The version is checked before the id is minted rather than after. A
+    drifted build is a refusal, and refusing after minting would leave a
+    recorded identity for a session that was never going to be started.
+    """
+    from cli_agent_orchestrator.services import claude_native_launch, claude_native_readiness
+
+    check_pinned_version(_PINNED_PROVIDER["claude_code"], version_output)
+
+    native_session_id = claude_native_launch.mint_session_id()
+    hook = claude_native_readiness.prepare(
+        COMPANION_DIR, record["terminal_id"], record["generation"]
+    )
+    bootstrap = {
+        "schema": CLAUDE_BOOTSTRAP_SCHEMA,
+        "provider": "claude_code",
+        "native_session_id": native_session_id,
+        # Named so a receipt reader knows the identity was *assigned*,
+        # not read back from the provider. The distinction matters when
+        # reconciling: a chosen id exists whether or not the provider
+        # ever ran, and an absent SessionStart is then a fact about the
+        # provider rather than about the id.
+        "id_source": _ISSUANCE_SOURCES["claude_code"],
+        "provider_version": normalized_version(version_output),
+        "binary_sha256": digest,
+        "working_directory": record["working_directory"],
+        "model": request["expected_model"],
+        "effort": request["expected_effort"],
+        "readiness_path": str(hook["readiness_path"]),
+        "task_bytes_submitted": False,
+        "minted_at": _now(),
+    }
+    return bootstrap, hook
+
+
+def _claude_bootstrap_intent(bootstrap: dict[str, Any], *, reservation_id: str) -> dict[str, Any]:
+    """The launch intent recorded against a chosen Claude identity."""
+    return {
+        "schema": CLAUDE_BOOTSTRAP_INTENT_SCHEMA,
+        "provider": "claude_code",
+        "native_session_id": bootstrap["native_session_id"],
+        "id_source": bootstrap["id_source"],
+        "provider_version": bootstrap["provider_version"],
+        "working_directory": bootstrap["working_directory"],
+        "note": f"v2 native launch of reservation {reservation_id}",
+        "task_bytes_submitted": False,
+    }
 
 
 def _mint_native_session(
@@ -2376,7 +2645,6 @@ def _await_native_pane_input_ready(
     the receipt must carry, so the bind gate can refuse on it.
     """
     from cli_agent_orchestrator.models.terminal import TerminalStatus
-    from cli_agent_orchestrator.services.native_pane_input import observe_kimi_turn_state
 
     if not pane_handle:
         return _readiness_observation(
@@ -2386,11 +2654,13 @@ def _await_native_pane_input_ready(
             detail="the launch outcome names no pane, so readiness could not be observed",
         )
     window_name = managed_window_name(record["terminal_id"], record["generation"])
+    authority = TURN_OBSERVER_AUTHORITY.get(record["provider"], "observe_native_turn_state")
     deadline = time.monotonic() + NATIVE_PANE_READY_TIMEOUT_SECONDS
     while True:
         try:
-            status = observe_kimi_turn_state(
-                pane_handle,
+            status = _observe_turn_state(
+                record["provider"],
+                pane_id=pane_handle,
                 terminal_id=record["terminal_id"],
                 session_name=record["session_name"],
                 window_name=window_name,
@@ -2401,6 +2671,7 @@ def _await_native_pane_input_ready(
                 provider_status=None,
                 input_ready=False,
                 detail=f"the pane could not be read: {exc}",
+                authority=authority,
             )
         else:
             observation = _readiness_observation(
@@ -2408,6 +2679,7 @@ def _await_native_pane_input_ready(
                 provider_status=status.value,
                 input_ready=status is TerminalStatus.IDLE,
                 detail=None,
+                authority=authority,
             )
             if observation["input_ready"]:
                 return observation
@@ -2425,6 +2697,7 @@ def _native_readiness_receipt(
     version_output: str,
     bridge_version: str,
     readiness: dict[str, Any],
+    session_start: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """The readiness receipt a native generation offers to ``bind_native``.
 
@@ -2461,6 +2734,17 @@ def _native_readiness_receipt(
         # trust it, and a refusal at admission can cite the same evidence.
         "model_input_ready": bool(readiness.get("input_ready")),
         "model_input_ready_observation": readiness,
+        # The provider's own statement that this exact session started,
+        # for providers whose readiness has one. Present for Claude, where
+        # the SessionStart hook names the session id; ``None`` for Kimi,
+        # whose readiness is the attached pane running the resumed session
+        # and which has no such hook. Kept as its own field rather than
+        # folded into the pane observation, because they answer different
+        # questions: the pane observation says the composer can be typed
+        # into, and this says the provider adopted the identity it was
+        # given rather than some other one.
+        "provider_session_start": session_start,
+        "provider_session_start_proven": session_start is not None,
         "execution_mode": em.NATIVE_TUI,
         "native_launch_outcome": outcome["outcome"],
         "launch_argv_sha256": outcome["launch_argv_sha256"],
@@ -2503,11 +2787,7 @@ def _validate_native_admission_identity(record: dict[str, Any]) -> dict[str, Any
     is not identity, since pids recycle in both directions — a stale one
     can match an unrelated live process and forge a survivor.
     """
-    from cli_agent_orchestrator.services import (
-        kimi_native_control,
-        native_tui_launch,
-        terminal_service,
-    )
+    from cli_agent_orchestrator.services import native_tui_launch, terminal_service
 
     provider = record["provider"]
     if provider not in NATIVE_TUI_PROVIDERS:
@@ -2530,7 +2810,7 @@ def _validate_native_admission_identity(record: dict[str, Any]) -> dict[str, Any
     if not isinstance(native_session_id, str) or not native_session_id:
         raise ManagedLaunchConflict("the journaled binding carries no native session id")
 
-    blocking = kimi_native_control.unresolved_ambiguity(native_session_id)
+    blocking = _control_adapter(provider).unresolved_ambiguity(native_session_id)
     if blocking is not None:
         # Checked here rather than left to the adapter so the refusal
         # happens before the admission is claimed. An earlier operation
@@ -2629,6 +2909,8 @@ def _settle_native_admission(
     delivery_id: str,
     operation: dict[str, Any],
     expected_payload_sha256: str,
+    *,
+    provider: str,
 ) -> dict[str, Any]:
     """Map one control-operation outcome onto the admission record.
 
@@ -2638,14 +2920,14 @@ def _settle_native_admission(
     posted and not a typed refusal is treated as ambiguous, so an
     unrecognised state can never be read as a delivery.
     """
-    from cli_agent_orchestrator.services import kimi_native_control
+    native_control = _control_adapter(provider)
 
     if operation.get("posted"):
         return complete_native_admission(
             reservation_id, delivery_id, operation, expected_payload_sha256
         )
     state = operation.get("state")
-    if state == kimi_native_control.REFUSED:
+    if state == native_control.REFUSED:
         return mark_admission_refused(
             reservation_id,
             delivery_id,
@@ -2687,7 +2969,7 @@ def _reconcile_native_admission(
     missing record only means "not opened yet" — reading it as proof would
     publish a zero-byte verdict about bytes that are still being written.
     """
-    from cli_agent_orchestrator.services import kimi_native_control
+    native_control = _control_adapter(record["provider"])
 
     admission = record.get("admission") or {}
     if admission.get("status") == "admitted":
@@ -2700,7 +2982,7 @@ def _reconcile_native_admission(
         # wrong" into "no operation was opened", which is true but tells a
         # reader nothing about what to fix.
         return record
-    operation = kimi_native_control.get(request.delivery_id)
+    operation = native_control.get(request.delivery_id)
     if operation is None:
         if not may_refuse_absent_operation:
             # A live sibling owns this delivery. Its record is returned as
@@ -2719,7 +3001,11 @@ def _reconcile_native_admission(
             "task was never written to the pane",
         )
     return _settle_native_admission(
-        reservation_id, request.delivery_id, operation, expected_payload_sha256
+        reservation_id,
+        request.delivery_id,
+        operation,
+        expected_payload_sha256,
+        provider=record["provider"],
     )
 
 
@@ -2740,12 +3026,10 @@ async def _admit_native_tui(
     import asyncio
 
     from cli_agent_orchestrator.models.terminal import TerminalStatus
-    from cli_agent_orchestrator.services import kimi_native_control
     from cli_agent_orchestrator.services.canonical_json import canonical_sha256
-    from cli_agent_orchestrator.services.native_pane_input import (
-        TmuxPaneInput,
-        observe_kimi_turn_state,
-    )
+    from cli_agent_orchestrator.services.native_pane_input import TmuxPaneInput
+
+    native_control = _control_adapter(record["provider"])
 
     # The control adapter digests the payload with its own canonical
     # encoding, which is not the admission's raw-bytes ``message_sha256``.
@@ -2829,11 +3113,14 @@ async def _admit_native_tui(
     observed_at = _now()
     try:
         status = await asyncio.to_thread(
-            observe_kimi_turn_state,
-            identity["pane_id"],
-            terminal_id=record["terminal_id"],
-            session_name=identity["session_name"],
-            window_name=identity["window_name"],
+            partial(
+                _observe_turn_state,
+                record["provider"],
+                pane_id=identity["pane_id"],
+                terminal_id=record["terminal_id"],
+                session_name=identity["session_name"],
+                window_name=identity["window_name"],
+            )
         )
     except Exception as exc:  # noqa: BLE001 - an unread pane, not a busy one
         refused = _persist_pre_io_refusal(
@@ -2902,14 +3189,14 @@ async def _admit_native_tui(
     # The delivery id is the operation id: it is caller-minted, immutable
     # on the reservation, and already the identity a replay carries, so a
     # lost response addresses the exact operation with nothing derived.
-    observation = kimi_native_control.turn_observation(
+    observation = native_control.turn_observation(
         active_turn_id=None,
         observed_at=observed_at,
         observer="managed_launch_v2.admit_reserved",
     )
     try:
         operation = await asyncio.to_thread(
-            kimi_native_control.queue,
+            native_control.queue,
             operation_id=request.delivery_id,
             native_session_id=identity["native_session_id"],
             terminal_id=record["terminal_id"],
@@ -2936,7 +3223,11 @@ async def _admit_native_tui(
             f"native control raised while delivering the task: {exc}",
         )
     return _settle_native_admission(
-        reservation_id, request.delivery_id, operation, expected_payload_sha256
+        reservation_id,
+        request.delivery_id,
+        operation,
+        expected_payload_sha256,
+        provider=record["provider"],
     )
 
 

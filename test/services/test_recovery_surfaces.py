@@ -37,7 +37,7 @@ def claude_setup(tmp_path):
         generation="gen-000042",
         attempt_id="7c9e6679-7425-40de-944b-e07fc1f90ae7",
         provider="claude",
-        provider_version="2.1.218",
+        provider_version="2.1.220",
         native_session_id="uuid-session-1",
         assigned_policy_sha256="7" * 64,
         segment_hash="9" * 64,
