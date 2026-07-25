@@ -128,6 +128,30 @@ class TestCreateAndRemoveWorktree:
         with pytest.raises(WorktreeError):
             create_worktree(str(non_repo), "term_xyz")
 
+    def test_create_worktree_gitignores_the_worktrees_subdir(self, repo: Path) -> None:
+        # Without this, every `git status` in the main checkout shows the
+        # provisioned worktree as an untracked/embedded-repo gitlink, and
+        # `git add -A` there (agents do this constantly) stages it.
+        create_worktree(str(repo), "term_first")
+
+        gitignore = repo / ".cao" / "worktrees" / ".gitignore"
+        assert gitignore.is_file()
+        assert gitignore.read_text() == "*\n"
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True, check=True
+        )
+        assert ".cao" not in status.stdout
+
+    def test_create_worktree_does_not_clobber_an_existing_gitignore(self, repo: Path) -> None:
+        create_worktree(str(repo), "term_first")
+        gitignore = repo / ".cao" / "worktrees" / ".gitignore"
+        gitignore.write_text("custom\n")
+
+        create_worktree(str(repo), "term_second")
+
+        assert gitignore.read_text() == "custom\n"
+
     def test_remove_worktree_deletes_the_directory_and_the_branch(self, repo: Path) -> None:
         terminal_id = "term_clean01"
         path = create_worktree(str(repo), terminal_id)
@@ -143,6 +167,36 @@ class TestCreateAndRemoveWorktree:
             check=True,
         )
         assert branch_result.stdout.strip() == ""
+
+    def test_remove_worktree_retains_a_branch_with_unmerged_commits(self, repo: Path) -> None:
+        """A worker that committed real work to its branch before completing
+        must not have that history destroyed just because Phase 1 has no
+        merge-back story -- the worktree's working-tree contents are force
+        -discarded, but the branch itself is only safe-deleted (``git branch
+        -d``), which refuses when there are commits that would be lost."""
+        terminal_id = "term_committed01"
+        path = create_worktree(str(repo), terminal_id)
+        (Path(path) / "result.txt").write_text("important output\n")
+        subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "worker output"],
+            cwd=path,
+            check=True,
+            capture_output=True,
+        )
+
+        remove_worktree(str(repo), terminal_id)  # must not raise
+
+        assert not Path(path).exists()  # worktree checkout itself is gone
+        branch_result = subprocess.run(
+            ["git", "branch", "--list", branch_for(terminal_id)],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        # Branch survives -- a leak for Phase 3 to sweep, not data loss.
+        assert branch_for(terminal_id) in branch_result.stdout
 
     def test_remove_worktree_force_removes_uncommitted_and_untracked_content(
         self, repo: Path
@@ -215,8 +269,33 @@ class TestParseWorktreePath:
     def test_returns_none_for_none(self) -> None:
         assert parse_worktree_path(None) is None
 
-    def test_returns_none_for_a_worktree_subdir_path_with_no_terminal_segment(self) -> None:
-        # `.cao/worktrees` itself, or a nested extra path segment past the
-        # terminal_id -- neither is a valid single terminal_id leaf.
+    def test_returns_none_for_the_worktrees_dir_itself_with_no_terminal_segment(self) -> None:
         assert parse_worktree_path("/home/user/myrepo/.cao/worktrees/") is None
-        assert parse_worktree_path("/home/user/myrepo/.cao/worktrees/term_x/extra") is None
+
+    def test_accepts_a_subdirectory_of_the_worktree(self) -> None:
+        # tmux reports the pane's CURRENT directory (pane_current_path); a
+        # worker that `cd`s into a subdirectory of its own worktree (very
+        # likely) must still be recognized as worktree-backed at teardown,
+        # or the worktree/branch leaks silently.
+        assert parse_worktree_path("/home/user/myrepo/.cao/worktrees/term_x/extra") == (
+            "/home/user/myrepo",
+            "term_x",
+        )
+        assert parse_worktree_path("/home/user/myrepo/.cao/worktrees/term_x/deeply/nested/dir") == (
+            "/home/user/myrepo",
+            "term_x",
+        )
+
+    def test_resolves_the_innermost_worktree_under_nesting(self) -> None:
+        # A worktree-backed supervisor (terminal A) spawning a worktree-backed
+        # worker (terminal B) nests B's worktree under A's:
+        # <repo_root>/.cao/worktrees/A/.cao/worktrees/B. `rfind` (last
+        # marker occurrence) must resolve to B's own (repo_root, terminal_id)
+        # -- repo_root being A's worktree root -- not fail to parse (`find`,
+        # first occurrence, would yield terminal_id "A/.cao/worktrees/B",
+        # rejected for containing a path separator, leaking B).
+        nested = "/home/user/myrepo/.cao/worktrees/term_a/.cao/worktrees/term_b"
+        assert parse_worktree_path(nested) == (
+            "/home/user/myrepo/.cao/worktrees/term_a",
+            "term_b",
+        )

@@ -376,7 +376,7 @@ class TestCreateTerminalUseWorktree:
         mock_requests.get.return_value = metadata_response
         mock_requests.post.return_value = post_response
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-1"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             _create_terminal("reviewer", "/repo", use_worktree=True)
 
         _, kwargs = mock_requests.post.call_args
@@ -407,7 +407,7 @@ class TestCreateTerminalUseWorktree:
         mock_requests.get.return_value = metadata_response
         mock_requests.post.return_value = post_response
 
-        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-1"}):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             _create_terminal("reviewer", "/repo")
 
         _, kwargs = mock_requests.post.call_args

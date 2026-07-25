@@ -312,8 +312,20 @@ async def create_terminal(
         # its own isolated checkout rather than the shared one it would
         # otherwise have used.
         if use_worktree:
-            worktree_repo_root = worktree_service.find_repo_root(working_directory or os.getcwd())
-            working_directory = worktree_service.create_worktree(worktree_repo_root, terminal_id)
+            # `find_repo_root`/`create_worktree` are synchronous `subprocess.run`
+            # calls (a full worktree checkout can take seconds to tens of
+            # seconds on a large repo); `create_terminal` is awaited directly on
+            # the shared event loop, so running them in-line here would freeze
+            # every other cao-server request (status monitor ticks, inbox
+            # delivery, unrelated terminal calls) for the duration. Offload to a
+            # thread, same posture as `delete_terminal`'s own blocking subprocess
+            # work (see its `run_in_executor` call site in api/main.py).
+            worktree_repo_root = await asyncio.to_thread(
+                worktree_service.find_repo_root, working_directory or os.getcwd()
+            )
+            working_directory = await asyncio.to_thread(
+                worktree_service.create_worktree, worktree_repo_root, terminal_id
+            )
 
         # Step 2: Create tmux session or window
         if new_session:
@@ -584,7 +596,12 @@ async def create_terminal(
             # else in this block. Without this, a provider-init timeout (or any
             # later failure) on a worktree-backed terminal would leave an orphan
             # worktree + branch behind with no CAO-side record pointing at it.
-            worktree_service.remove_worktree(worktree_repo_root, terminal_id)
+            # Offloaded to a thread for the same reason Step 1b's create is:
+            # `git worktree remove` is a blocking subprocess call and this
+            # `except` block still runs on the shared event loop.
+            await asyncio.to_thread(
+                worktree_service.remove_worktree, worktree_repo_root, terminal_id
+            )
         raise
 
 
@@ -1369,6 +1386,22 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         metadata = get_terminal_metadata(terminal_id)
 
         if metadata:
+            # Read the pane's live working directory BEFORE kill_window below
+            # destroys the pane. Single read, reused for two purposes: the
+            # scrollback snapshot below, and issue #100 Phase 1's worktree
+            # cleanup (recognizing a worktree-backed terminal from its live
+            # cwd alone -- there is no separate CAO-side record of which
+            # terminals are worktree-backed). Best-effort: a read failure
+            # means the snapshot's working_directory field is None and no
+            # worktree cleanup runs below.
+            live_working_directory = None
+            try:
+                live_working_directory = get_backend().get_pane_working_directory(
+                    metadata["tmux_session"], metadata["tmux_window"]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to read working directory for {terminal_id}: {e}")
+
             # Snapshot scrollback + metadata before killing (for debugging/restore)
             try:
                 # Capture plain text full scrollback (no -e, no line cap)
@@ -1389,9 +1422,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                     "window_name": metadata["tmux_window"],
                     "agent_profile": metadata.get("agent_profile"),
                     "provider": metadata["provider"],
-                    "working_directory": get_backend().get_pane_working_directory(
-                        metadata["tmux_session"], metadata["tmux_window"]
-                    ),
+                    "working_directory": live_working_directory,
                     "allowed_tools": metadata.get("allowed_tools"),
                     "caller_id": metadata.get("caller_id"),
                 }
@@ -1420,22 +1451,6 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
             except Exception as e:
                 logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
 
-            # Read the pane's live working directory BEFORE kill_window below
-            # destroys the pane -- issue #100 Phase 1's worktree cleanup (just
-            # after kill_window) needs this to recognize a worktree-backed
-            # terminal; there is no separate CAO-side record of which
-            # terminals are worktree-backed, so this live read is the only
-            # source. Best-effort: a read failure just means no worktree
-            # cleanup runs below (same fail-open posture as the snapshot
-            # above, which reads this same value for a different purpose).
-            live_working_directory = None
-            try:
-                live_working_directory = get_backend().get_pane_working_directory(
-                    metadata["tmux_session"], metadata["tmux_window"]
-                )
-            except Exception as e:
-                logger.warning(f"Failed to read working directory for {terminal_id}: {e}")
-
             # Kill the tmux window (this terminates the agent process)
             try:
                 get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
@@ -1447,10 +1462,24 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
             # worktree + branch now that the process using it is gone.
             # `remove_worktree` is itself best-effort/never-raises, matching
             # every other step in this teardown.
+            #
+            # The parsed terminal_id MUST match the terminal actually being
+            # deleted here, not just "some" CAO worktree path. Without this
+            # guard: a worktree-backed terminal A (cwd
+            # .../.cao/worktrees/A) can spawn a non-worktree terminal B with
+            # working_directory explicitly set to A's cwd (handoff/assign
+            # both accept an explicit working_directory, and "here" -- the
+            # caller's own directory -- is a common choice). Deleting B --
+            # including handoff's automatic success teardown -- would then
+            # read B's pane cwd (== A's worktree path), parse terminal_id
+            # "A" out of it, and force-remove A's still-running worktree.
+            # Mismatched parses now fall through as a no-op leak (Phase 3
+            # territory) instead of destroying another terminal's checkout.
             parsed = worktree_service.parse_worktree_path(live_working_directory)
             if parsed is not None:
                 worktree_repo_root, worktree_terminal_id = parsed
-                worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
+                if worktree_terminal_id == terminal_id:
+                    worktree_service.remove_worktree(worktree_repo_root, worktree_terminal_id)
 
         # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)

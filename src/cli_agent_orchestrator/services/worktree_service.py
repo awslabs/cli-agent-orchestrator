@@ -82,7 +82,7 @@ def find_repo_root(start_path: str) -> str:
     result = _run_git(["rev-parse", "--show-toplevel"], cwd=start_path)
     if result.returncode != 0:
         raise WorktreeError(
-            f"'{start_path}' is not inside a git repository -- use_worktree requires "
+            f"{start_path!r} is not inside a git repository -- use_worktree requires "
             f"a real git repo ('git rev-parse --show-toplevel' failed: {result.stderr.strip()})"
         )
     stdout: str = result.stdout
@@ -119,13 +119,48 @@ def create_worktree(repo_root: str, terminal_id: str) -> str:
         raise WorktreeError(
             f"'git worktree add' failed for terminal {terminal_id}: {result.stderr.strip()}"
         )
+    _ensure_worktree_subdir_gitignored(repo_root)
     return path
+
+
+def _ensure_worktree_subdir_gitignored(repo_root: str) -> None:
+    """Best-effort: write ``<repo_root>/.cao/worktrees/.gitignore`` (``*``) the
+    first time a worktree is created there, so the main checkout's own
+    ``git status``/``git add -A`` never sees -- and never stages as an
+    embedded-repo gitlink -- the worktrees CAO provisions inside it. The
+    target repo is arbitrary user code; we cannot assume its own
+    ``.gitignore`` already excludes ``.cao/worktrees`` (this repo's own
+    ``.gitignore`` only excludes its unrelated ``.worktrees``), so CAO must
+    write its own ignore file rather than rely on one being present.
+
+    Never raises: a failure here (e.g. read-only filesystem) must not fail
+    the worktree creation that already succeeded.
+    """
+    gitignore_path = os.path.join(repo_root, WORKTREE_SUBDIR, ".gitignore")
+    try:
+        if not os.path.exists(gitignore_path):
+            with open(gitignore_path, "w", encoding="utf-8") as f:
+                f.write("*\n")
+    except OSError as e:
+        logger.warning("worktree setup: failed to write %s: %s", gitignore_path, e)
 
 
 def remove_worktree(repo_root: str, terminal_id: str) -> None:
     """Best-effort teardown: ``git worktree remove --force`` (agents commonly
     leave modified/untracked files behind, so a plain ``remove`` would
-    refuse) followed by deleting the branch.
+    refuse) followed by a SAFE branch delete (``git branch -d``, not
+    ``-D``).
+
+    Deliberately never force-deletes the branch: a worker that committed
+    its results to ``cao/<terminal_id>`` before completing (exactly what
+    agents are usually instructed to do) must not have that history
+    destroyed just because Phase 1 has no merge-back story yet. ``-d``
+    only succeeds when the branch has no commits that would be lost (i.e.
+    it is unchanged, or already merged); a worker that committed real work
+    fails the safe delete and the branch is left behind -- a leak for
+    Phase 3's ``cao worktrees clean`` to sweep up later, not silent data
+    loss. Only the (uncommitted/untracked) working-tree contents of the
+    worktree itself are ever force-discarded.
 
     Never raises -- called from terminal-teardown paths (``delete_terminal``,
     and the failure-cleanup path in ``create_terminal``) that must not fail
@@ -141,10 +176,13 @@ def remove_worktree(repo_root: str, terminal_id: str) -> None:
             path,
             result.stderr.strip(),
         )
-    result = _run_git(["branch", "-D", branch], cwd=repo_root)
+    result = _run_git(["branch", "-d", branch], cwd=repo_root)
     if result.returncode != 0:
         logger.warning(
-            "worktree cleanup: 'git branch -D %s' failed: %s", branch, result.stderr.strip()
+            "worktree cleanup: 'git branch -d %s' failed (left in place -- likely has "
+            "unmerged commits; merge/push the work, then delete it manually): %s",
+            branch,
+            result.stderr.strip(),
         )
 
 
@@ -177,14 +215,27 @@ def list_worktrees(repo_root: str) -> list[dict[str, str | bool]]:
 
 
 def parse_worktree_path(path: object) -> tuple[str, str] | None:
-    """If ``path`` looks like a CAO-managed worktree
-    (``<repo_root>/.cao/worktrees/<terminal_id>``), return
+    """If ``path`` looks like a CAO-managed worktree, or a subdirectory of
+    one (``<repo_root>/.cao/worktrees/<terminal_id>[/...]``), return
     ``(repo_root, terminal_id)``; otherwise ``None``.
 
     Used at teardown time to recognize a worktree-provisioned terminal from
     its own live pane working directory alone -- no separate CAO-side
     tracking of "which terminals are worktree-backed" is needed, since the
     path shape itself is the marker.
+
+    Two deliberate choices beyond a naive split:
+
+    - Subdirectories of the worktree are accepted, not just the worktree
+      root exactly. tmux reports the pane's CURRENT directory
+      (``pane_current_path``): a worker that ``cd``s into a subdirectory
+      (very likely) would otherwise no longer be recognized as
+      worktree-backed at teardown, leaking the worktree/branch.
+    - ``rfind`` (last occurrence), not ``find`` (first), so a
+      worktree-backed supervisor spawning a worktree-backed worker --
+      nesting ``<repo_root>/.cao/worktrees/A/.cao/worktrees/B`` -- resolves
+      to B's own ``(repo_root, terminal_id)`` (repo_root = A's worktree
+      root, terminal_id = B) instead of failing to parse and leaking B.
 
     Accepts ``object`` (not just ``str | None``) and returns ``None`` for
     anything that isn't a real string, deliberately: the caller
@@ -196,11 +247,12 @@ def parse_worktree_path(path: object) -> tuple[str, str] | None:
     """
     if not isinstance(path, str) or not path:
         return None
-    idx = path.find(_WORKTREE_PATH_MARKER)
+    idx = path.rfind(_WORKTREE_PATH_MARKER)
     if idx == -1:
         return None
     repo_root = path[:idx]
-    terminal_id = path[idx + len(_WORKTREE_PATH_MARKER) :]
-    if not repo_root or not terminal_id or os.sep in terminal_id:
+    remainder = path[idx + len(_WORKTREE_PATH_MARKER) :]
+    terminal_id = remainder.split(os.sep, 1)[0]
+    if not repo_root or not terminal_id:
         return None
     return repo_root, terminal_id

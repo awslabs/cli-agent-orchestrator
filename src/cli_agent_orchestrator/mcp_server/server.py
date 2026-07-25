@@ -905,9 +905,12 @@ if ENABLE_WORKING_DIRECTORY:
             description=(
                 "If true, provision an isolated git worktree for this handoff instead of "
                 "sharing the supervisor's working directory -- the worktree checkout is "
-                "created on its own branch from the target repo's current HEAD and removed "
-                "automatically when the handoff completes. Requires the resolved working "
-                "directory (explicit or inherited) to be inside a git repository."
+                "created on its own branch from the target repo's current HEAD. At "
+                "teardown, the checkout's working-tree contents are always discarded, but "
+                "the branch is only deleted if it has no unmerged commits -- commit AND "
+                "merge/push results before finishing if you need them kept. Requires the "
+                "resolved working directory (explicit or inherited) to be inside a git "
+                "repository."
             ),
         ),
     ) -> HandoffResult:
@@ -945,8 +948,11 @@ if ENABLE_WORKING_DIRECTORY:
           sharing the supervisor's (or working_directory's) checkout -- closes the
           "parallel agents editing the same branch/files" race.
         - The worktree is created from the resolved directory's repo, on its own
-          branch, and is automatically removed when the handoff's terminal is torn
-          down (success or failure).
+          branch, and torn down when the handoff's terminal is torn down (success or
+          failure): the checkout's working-tree contents are always discarded, but the
+          branch is only deleted if it has no unmerged commits. Commit AND merge/push
+          any results you need kept before the handoff completes -- an uncommitted or
+          unmerged result is not preserved.
         - Requires the resolved working directory to actually be inside a git
           repository; otherwise the handoff fails with a clear error.
 
@@ -1000,9 +1006,11 @@ else:
             description=(
                 "If true, provision an isolated git worktree for this handoff instead of "
                 "sharing the supervisor's working directory -- the worktree checkout is "
-                "created on its own branch from the target repo's current HEAD and removed "
-                "automatically when the handoff completes. Requires the supervisor's "
-                "current directory to be inside a git repository."
+                "created on its own branch from the target repo's current HEAD. At "
+                "teardown, the checkout's working-tree contents are always discarded, but "
+                "the branch is only deleted if it has no unmerged commits -- commit AND "
+                "merge/push results before finishing if you need them kept. Requires the "
+                "supervisor's current directory to be inside a git repository."
             ),
         ),
     ) -> HandoffResult:
@@ -1032,7 +1040,10 @@ else:
         - Set use_worktree=true to give this handoff its own git worktree instead of
           sharing the supervisor's checkout -- closes the "parallel agents editing the
           same branch/files" race.
-        - Automatically removed when the handoff's terminal is torn down.
+        - Torn down when the handoff's terminal is torn down: the checkout's
+          working-tree contents are always discarded, but the branch is only deleted if
+          it has no unmerged commits. Commit AND merge/push any results you need kept
+          before the handoff completes.
         - Requires the supervisor's current directory to be inside a git repository.
 
         ## Requirements
@@ -1196,8 +1207,10 @@ Example message: "Analyze the logs. When done, send results back to terminal ee3
 - Set use_worktree=true to give this worker its own git worktree instead of sharing
   the supervisor's checkout -- closes the "parallel agents editing the same
   branch/files" race.
-- The worktree is created on its own branch and removed automatically when you
-  call delete_terminal on the worker.
+- The worktree is created on its own branch. When you call delete_terminal on the
+  worker, the checkout's working-tree contents are always discarded, but the branch
+  is only deleted if it has no unmerged commits -- commit AND merge/push results
+  before deleting the worker if you need them kept.
 - Requires the resolved working directory to be inside a git repository.
 
 ## Cleanup
@@ -1251,8 +1264,11 @@ if ENABLE_WORKING_DIRECTORY:
             default=False,
             description=(
                 "If true, provision an isolated git worktree for this worker instead of "
-                "sharing the supervisor's working directory. Requires the resolved working "
-                "directory to be inside a git repository."
+                "sharing the supervisor's working directory. At teardown (delete_terminal), "
+                "the checkout's working-tree contents are always discarded, but the branch "
+                "is only deleted if it has no unmerged commits -- commit AND merge/push "
+                "results before deleting the worker if you need them kept. Requires the "
+                "resolved working directory to be inside a git repository."
             ),
         ),
     ) -> Dict[str, Any]:
@@ -1281,8 +1297,11 @@ else:
             default=False,
             description=(
                 "If true, provision an isolated git worktree for this worker instead of "
-                "sharing the supervisor's working directory. Requires the supervisor's "
-                "current directory to be inside a git repository."
+                "sharing the supervisor's working directory. At teardown (delete_terminal), "
+                "the checkout's working-tree contents are always discarded, but the branch "
+                "is only deleted if it has no unmerged commits -- commit AND merge/push "
+                "results before deleting the worker if you need them kept. Requires the "
+                "supervisor's current directory to be inside a git repository."
             ),
         ),
     ) -> Dict[str, Any]:

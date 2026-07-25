@@ -1894,6 +1894,49 @@ class TestDeleteTerminalWorktree:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_does_not_remove_another_terminals_worktree(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_delete,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_worktree_service,
+    ):
+        """Regression: worktree-backed terminal A (cwd
+        .../.cao/worktrees/A) spawns non-worktree terminal B with
+        working_directory explicitly set to A's cwd -- a common choice
+        (handoff/assign both accept an explicit working_directory, and "here"
+        is A's own directory). Deleting B must NOT force-remove A's
+        still-running worktree just because B's pane cwd happens to
+        path-match it; the parsed terminal_id must match the terminal
+        actually being deleted (B), not A."""
+        from cli_agent_orchestrator.services.worktree_service import (
+            parse_worktree_path as real_parse_worktree_path,
+        )
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-bbbb",
+        }
+        # B's pane cwd is A's worktree root -- NOT B's own terminal_id.
+        mock_tmux.get_pane_working_directory.return_value = "/repo/.cao/worktrees/terminalA"
+        mock_worktree_service.parse_worktree_path.side_effect = real_parse_worktree_path
+        mock_db_delete.return_value = True
+
+        result = delete_terminal("terminalB")
+
+        assert result is True
+        mock_worktree_service.remove_worktree.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_does_not_touch_worktree_service_for_an_ordinary_shared_directory(
         self,
         mock_get_metadata,
