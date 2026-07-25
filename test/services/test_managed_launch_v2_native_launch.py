@@ -76,7 +76,7 @@ def _reserve_request(worktree, tmp_path, **changes):
         "reservation_id": str(uuid.uuid4()),
         "session_name": "cao-test",
         "provider": "kimi_cli",
-        "agent_profile": "reviewer-sol-max",
+        "agent_profile": "reviewer",
         "caller_id": "deadbeef",
         "working_directory": str(worktree),
         # A codex-only field; a kimi reservation must leave it unset.
