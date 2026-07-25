@@ -49,6 +49,26 @@ class ManagedLaunchV2ReserveRequest(BaseModel):
     project: Optional[str] = None
     delivery_id: str
     launch_nonce: str
+    #: The explicit launch-level execution mode, or ``None`` when the
+    #: caller states none.  ``None`` is *unspecified*, never "either":
+    #: it defers to the worker-class default, which keeps a caller that
+    #: names neither on the historical ACP branch.  A value outside the
+    #: closed enum is rejected here rather than coerced, so a malformed
+    #: mode can never reach a store or a receipt.
+    execution_mode: Optional[Literal["native_tui", "acp"]] = None
+    #: The worker class that supplies the default when no explicit mode
+    #: is given.  Native is the default only for the long-lived,
+    #: human-observable classes; absent a class the default stays ACP.
+    worker_class: Optional[
+        Literal[
+            "persistent",
+            "long_running",
+            "human_monitored",
+            "one_shot",
+            "hands_off",
+            "unspecified",
+        ]
+    ] = None
 
     @field_validator("project")
     @classmethod
@@ -113,6 +133,14 @@ class ManagedLaunchV2BindRequest(BaseModel):
     terminal_id: str
     generation: str
     attempt_id: str
+    #: The mode the caller believes this generation is bound to, when it
+    #: chooses to restate it.  ``None`` means "not restated" and is
+    #: accepted — silence is not a change — but a *present* value that
+    #: disagrees with the reserved mode is refused.  This is the seam
+    #: that stops a caller which thinks it is binding ACP from binding a
+    #: native generation (or the reverse); the mode of a live generation
+    #: is immutable, and changing it means a new generation.
+    execution_mode: Optional[Literal["native_tui", "acp"]] = None
 
     @field_validator("terminal_id")
     @classmethod

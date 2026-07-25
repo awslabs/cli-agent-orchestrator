@@ -56,9 +56,22 @@ _V2_RESERVATIONS_DDL = (
     "binding_json TEXT, "
     "bind_intent_json TEXT, "
     "admission_json TEXT, "
+    "execution_mode TEXT, "
+    "execution_mode_source TEXT, "
     "created_at TEXT NOT NULL, "
     "updated_at TEXT NOT NULL"
     ")"
+)
+
+#: Columns added to the v2 reservation table after its first release.
+#: Each is nullable and additive, so an existing row keeps its bytes and
+#: reads back as the legacy default rather than being rewritten.  They
+#: are applied with the same PRAGMA-guarded ALTER used for
+#: ``bind_intent_json`` and inside the same transaction as the DDL.
+_V2_RESERVATIONS_ADDITIVE_COLUMNS = (
+    ("bind_intent_json", "TEXT"),
+    ("execution_mode", "TEXT"),
+    ("execution_mode_source", "TEXT"),
 )
 
 _V2_TERMINALS_DDL = (
@@ -197,10 +210,15 @@ def migrate_v2(
         conn.execute(_V2_RESERVATIONS_DDL)
         conn.execute(_V2_TERMINALS_DDL)
         cursor = conn.execute("PRAGMA table_info(managed_launch_v2_reservations)")
-        if "bind_intent_json" not in {row[1] for row in cursor.fetchall()}:
-            conn.execute(
-                "ALTER TABLE managed_launch_v2_reservations ADD COLUMN bind_intent_json TEXT"
-            )
+        present = {row[1] for row in cursor.fetchall()}
+        added_columns = []
+        for column, column_type in _V2_RESERVATIONS_ADDITIVE_COLUMNS:
+            if column not in present:
+                conn.execute(
+                    "ALTER TABLE managed_launch_v2_reservations "
+                    f"ADD COLUMN {column} {column_type}"
+                )
+                added_columns.append(column)
         conn.execute(_JOURNAL_DDL)
         event_id = str(uuid.uuid4())
         conn.execute(
@@ -212,7 +230,16 @@ def migrate_v2(
                 "migrate",
                 _now(),
                 json.dumps(
-                    {"already_present": already, "old_binary_gate": gate_report},
+                    {
+                        "already_present": already,
+                        # Journaled separately because ``already_present``
+                        # answers "did the tables exist", not "was the
+                        # schema changed". An additive column lands on an
+                        # existing table, so without this the receipt for
+                        # a real schema change would read as a no-op.
+                        "added_columns": added_columns,
+                        "old_binary_gate": gate_report,
+                    },
                     sort_keys=True,
                 ),
             ),
@@ -222,6 +249,7 @@ def migrate_v2(
             "migration_id": MIGRATION_ID,
             "action": "migrate",
             "already_present": already,
+            "added_columns": added_columns,
             "tables": list(V2_TABLES),
             "event_id": event_id,
             "at": _now(),

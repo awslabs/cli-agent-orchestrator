@@ -164,6 +164,7 @@ def write_binding_record(
     assigned_policy_sha256: Optional[str] = None,
     route_payload_sha256: Optional[str] = None,
     bound_at: Optional[str] = None,
+    execution_mode: Optional[str] = None,
 ) -> Path:
     """Publish the fork-owned immutable binding record for a generation.
 
@@ -171,6 +172,15 @@ def write_binding_record(
     resume writes a new generation's record, never rewrites this one).
     ``bound_at`` is supplied by the journaled bind intent so a reconciled
     retry reproduces byte-identical record content.
+
+    ``execution_mode`` tags the record with the branch the generation was
+    bound on, so this published evidence cannot be read as satisfying the
+    other mode's admission.  It is *omitted* rather than written as null
+    when absent: a record published before the execution-mode contract
+    existed has no such key, and a reconciling retry must reproduce those
+    exact bytes.  A reader therefore applies the same rule as for a
+    pre-contract database row — key absent means legacy ACP, and it must
+    never be read as native.
     """
     path = binding_record_path(companion_dir, terminal_id, generation)
     if path.exists():
@@ -189,6 +199,8 @@ def write_binding_record(
         "route_payload_sha256": route_payload_sha256,
         "bound_at": bound_at or _rfc3339_now(),
     }
+    if execution_mode is not None:
+        record["execution_mode"] = execution_mode
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         publish_mutable(

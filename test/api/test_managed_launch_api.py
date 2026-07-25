@@ -4,6 +4,7 @@ import hashlib
 import uuid
 
 from cli_agent_orchestrator.models.managed_launch import PROTOCOL_VERSION
+from cli_agent_orchestrator.services import managed_launch
 
 
 def _reservation(tmp_path):
@@ -70,7 +71,61 @@ def test_capability_handshake_is_exact_and_versioned(client):
         "launch_failure_evidence_schema": "cao-managed-bridge-launch-failure-v1",
         "trusted_project_root_providers": ["codex"],
         "readiness_providers": ["codex", "kimi_cli"],
+        "execution_mode_selection": True,
+        # Only the modes this surface can actually run. Native TUI is
+        # absent until a native launch branch exists, so a consumer that
+        # gates a native claim on this list is fail-closed by default.
+        "execution_modes": ["acp"],
+        # The v2 surface reserves any resolvable mode but launches
+        # only what it has a branch for, so the two permissions are
+        # advertised separately.
+        "v2_launchable_execution_modes": ["acp", "native_tui"],
     }
+
+
+def test_advertised_execution_modes_are_the_surface_support_set(client):
+    """The advertisement is read from the support set, not restated.
+
+    A hand-maintained second copy of this list is the failure mode worth
+    preventing: it would keep advertising a mode after the branch behind
+    it was removed, or fail to advertise one that had landed, and a
+    consumer trusting the handshake has no way to detect either.
+    """
+    advertised = client.get("/managed-launch/capabilities").json()["execution_modes"]
+
+    assert advertised == list(managed_launch.SUPPORTED_EXECUTION_MODES)
+
+
+def test_advertisement_follows_the_support_set_when_it_widens(client, monkeypatch):
+    """Adding a launch branch changes the handshake with no edit here."""
+    monkeypatch.setattr(managed_launch, "SUPPORTED_EXECUTION_MODES", ("acp", "native_tui"))
+
+    advertised = client.get("/managed-launch/capabilities").json()["execution_modes"]
+
+    assert advertised == ["acp", "native_tui"]
+
+
+def test_v2_launchable_modes_are_read_from_the_v2_surface(client, monkeypatch):
+    """v2 publishes what it can launch, independently of what v1 supports.
+
+    Kept distinct because the two surfaces gain their native branches at
+    different times; a consumer reading one for the other would be
+    fail-open for whichever lands second.
+    """
+    from cli_agent_orchestrator.services import managed_launch_v2
+
+    body = client.get("/managed-launch/capabilities").json()
+    assert body["v2_launchable_execution_modes"] == list(
+        managed_launch_v2.LAUNCHABLE_EXECUTION_MODES
+    )
+
+    monkeypatch.setattr(managed_launch_v2, "LAUNCHABLE_EXECUTION_MODES", ("acp",))
+    narrowed = client.get("/managed-launch/capabilities").json()
+    assert narrowed["v2_launchable_execution_modes"] == ["acp"]
+    # The two surfaces advertise independently: v2 carries a native
+    # launch branch and v1 does not, so the handshake must be able to
+    # show one without the other.
+    assert narrowed["execution_modes"] == ["acp"]
 
 
 def test_reserve_query_reconcile_and_cancel_round_trip(client, isolated_memory_db, tmp_path):

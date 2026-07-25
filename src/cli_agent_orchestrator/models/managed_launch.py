@@ -50,6 +50,29 @@ class ManagedLaunchReserveRequest(BaseModel):
     # PATH-resolves a provider on the managed campaign path.
     provider_executable: Optional[str] = None
     provider_executable_sha256: Optional[str] = None
+    #: The execution mode the caller asks this reservation to run in, or
+    #: ``None`` when it names none.  ``None`` is *unspecified*, never
+    #: "either": it defers to the worker-class default, which keeps a
+    #: caller that names neither on the historical ACP branch.  An older
+    #: client that has never heard of this field therefore behaves
+    #: exactly as it did before.  A value outside the closed enum is
+    #: rejected here rather than coerced, so a malformed mode can never
+    #: reach a store, a launch, or a receipt.
+    execution_mode: Optional[Literal["native_tui", "acp"]] = None
+    #: The worker class that supplies the default when no explicit mode
+    #: is given.  Absent a class the default stays ACP; a class is never
+    #: a way to *override* an explicit mode, only to fill in a missing
+    #: one.
+    worker_class: Optional[
+        Literal[
+            "persistent",
+            "long_running",
+            "human_monitored",
+            "one_shot",
+            "hands_off",
+            "unspecified",
+        ]
+    ] = None
 
     @field_validator("reservation_id")
     @classmethod

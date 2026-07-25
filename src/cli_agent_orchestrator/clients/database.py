@@ -230,6 +230,14 @@ class ManagedLaunchV2ReservationModel(Base):
     # boundary reconciles against the same bytes.
     bind_intent_json = Column(Text, nullable=True)
     admission_json = Column(Text, nullable=True)
+    # The resolved execution mode ('native_tui' | 'acp') and the
+    # precedence level that supplied it.  Nullable on purpose: a row
+    # written before the execution-mode contract existed carries NULL,
+    # and NULL reads back as legacy ACP.  It must never read as native —
+    # a native guard that accepted "mode absent" would treat every
+    # historical ACP generation as an attachable native session.
+    execution_mode = Column(Text, nullable=True)
+    execution_mode_source = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
     updated_at = Column(Text, nullable=False)
 
@@ -258,6 +266,117 @@ class ManagedLaunchV2TerminalModel(Base):
     pane_id = Column(Text, nullable=True)
     window_id = Column(Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
+
+
+class NativeSessionAttachmentModel(Base):
+    """Exclusive, crash-safe ownership of one provider-native session.
+
+    Keyed by ``(provider, native_session_id)`` — the provider's own
+    session identity, not any CAO-side name — so exactly one owner can
+    be attached to a given provider session at a time regardless of how
+    many terminals, generations, or execution modes reference it.
+
+    The owner tuple is ``(terminal_id, generation, execution_mode,
+    pane_id, process_identity)``.  ``execution_mode`` is part of the
+    owner precisely so an ACP bridge and a native TUI can never both
+    hold the same provider session: a second attach in the other mode
+    sees a live owner and is refused rather than silently multiplexed.
+
+    Rows are written with the intent BEFORE the provider is launched, so
+    a crash at any point leaves a durable claim that recovery must
+    adjudicate.  ``ambiguous`` is a frozen terminal-for-automation
+    state: it preserves the owner and is never auto-released.
+    """
+
+    __tablename__ = "native_session_attachments"
+
+    provider = Column(Text, primary_key=True)
+    native_session_id = Column(Text, primary_key=True)
+    state = Column(Text, nullable=False)
+    owner_terminal_id = Column(Text, nullable=False)
+    owner_generation = Column(Text, nullable=False)
+    owner_execution_mode = Column(Text, nullable=False)
+    owner_pane_id = Column(Text, nullable=True)
+    # Canonical JSON of the owning OS process identity (pid + an
+    # start-time/lineage marker).  A bare pid is not identity: pids are
+    # recycled, and a recycled pid would forge a survivor.
+    owner_process_identity_json = Column(Text, nullable=True)
+    # Canonical JSON of the journaled acquire intent, written before any
+    # provider I/O so a crash between intent and launch is adjudicable.
+    intent_json = Column(Text, nullable=False)
+    # Canonical JSON of the accepted no-survivor proof that permitted the
+    # last release.  Retained as evidence; never cleared by a later claim.
+    release_proof_json = Column(Text, nullable=True)
+    ambiguity_reason = Column(Text, nullable=True)
+    # Monotonic per-row counter; every CAS transition bumps it so a
+    # lost-update race is detectable rather than silently last-write-wins.
+    epoch = Column(Integer, nullable=False, default=0)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+
+class KimiNativeControlOperationModel(Base):
+    """One human/orchestrator control operation against a native Kimi TUI.
+
+    Deliberately a separate store from the delivery journal and from every
+    ACP receipt kind.  The delivery journal records the truth of ordinary
+    task submission; a native control operation is a different act against
+    a different surface, and writing one into the other would let a pane
+    keystroke rewrite delivery truth.
+
+    Keyed by the caller-minted ``operation_id`` so a lost response is
+    resolvable by exact id rather than by re-sending.  The row is written
+    with its intent BEFORE anything is typed into the pane, so a crash
+    between intent and keystroke leaves a durable record that recovery
+    adjudicates instead of a silent maybe-sent.
+
+    ``posted_at`` records that bytes reached the transport and nothing
+    more.  It is stored separately from the provider observation on
+    purpose: a successful pane write is not provider acceptance, and the
+    two must never be readable as the same fact.
+    """
+
+    __tablename__ = "kimi_native_control_operations"
+
+    operation_id = Column(Text, primary_key=True)
+    kind = Column(Text, nullable=False)
+    state = Column(Text, nullable=False)
+    # The full binding this operation is valid for. A mismatch on any
+    # component is refused before the pane is touched, so an operation
+    # minted for one generation can never land in its successor.
+    provider = Column(Text, nullable=False)
+    native_session_id = Column(Text, nullable=False)
+    terminal_id = Column(Text, nullable=False)
+    generation = Column(Text, nullable=False)
+    execution_mode = Column(Text, nullable=False)
+    # Present only for a steer, which binds to the exact active turn it
+    # intends to interrupt. A queue operation has no turn by definition.
+    turn_id = Column(Text, nullable=True)
+    # The digest of the exact literal payload rather than the payload
+    # itself: enough to prove the same operation was not re-sent with
+    # different bytes, without durably storing message content here.
+    payload_sha256 = Column(Text, nullable=False)
+    # Canonical JSON of the intent journaled before any side effect.
+    intent_json = Column(Text, nullable=False)
+    # Canonical JSON of the transport-level observation: the digest of
+    # what was written, and that Enter went as its own explicit key after
+    # the literal text. Facts about what this process did -- never a claim
+    # about what the provider received.
+    transport_json = Column(Text, nullable=True)
+    # Canonical JSON of the provider-side observation that justified
+    # acceptance, completion, or refusal. Absent means no provider fact
+    # was ever observed -- which is exactly why such a row cannot read as
+    # accepted.
+    observation_json = Column(Text, nullable=True)
+    posted_at = Column(Text, nullable=True)
+    refusal_reason = Column(Text, nullable=True)
+    ambiguity_reason = Column(Text, nullable=True)
+    # Monotonic per-row counter; every CAS transition bumps it so two
+    # concurrent operators racing the same operation are detected rather
+    # than silently last-write-wins.
+    epoch = Column(Integer, nullable=False, default=0)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
 
 
 class FlowModel(Base):
@@ -335,6 +454,8 @@ def init_db() -> None:
     _migrate_workflow_run()
     _migrate_workflow_run_step()
     _migrate_session_env()
+    _migrate_native_session_attachments()
+    _migrate_kimi_native_control_operations()
     _migrate_managed_launch_reservations()
     _migrate_managed_launch_v2()
 
@@ -676,6 +797,96 @@ def _migrate_session_env() -> None:
             )
     except Exception as e:  # noqa: BLE001 — read path fails closed instead
         logger.debug(f"session_env migration skipped: {e}")
+
+
+def _migrate_native_session_attachments() -> None:
+    """Create the native-session attachment store on older databases.
+
+    ``Base.metadata.create_all`` covers fresh databases via
+    ``NativeSessionAttachmentModel``; this idempotent migration covers
+    databases created before native execution mode existed. The DDL is
+    byte-compatible with the ORM model so both paths yield one schema.
+
+    Failure is surfaced rather than swallowed: every native attachment
+    operation fails closed when this table cannot be read, and a native
+    launch that cannot record exclusive ownership must never proceed to
+    attach a provider session.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS native_session_attachments ("
+                "provider TEXT NOT NULL, "
+                "native_session_id TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "owner_terminal_id TEXT NOT NULL, "
+                "owner_generation TEXT NOT NULL, "
+                "owner_execution_mode TEXT NOT NULL, "
+                "owner_pane_id TEXT, "
+                "owner_process_identity_json TEXT, "
+                "intent_json TEXT NOT NULL, "
+                "release_proof_json TEXT, "
+                "ambiguity_reason TEXT, "
+                "epoch INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL, "
+                "PRIMARY KEY (provider, native_session_id)"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 - the operation path fails closed
+        logger.warning(f"native-session attachment migration failed: {e}")
+
+
+def _migrate_kimi_native_control_operations() -> None:
+    """Create the native control-operation store on older databases.
+
+    ``Base.metadata.create_all`` covers fresh databases via
+    ``KimiNativeControlOperationModel``; this idempotent migration covers
+    databases created before native control existed. The DDL is
+    byte-compatible with the ORM model so both paths yield one schema.
+
+    A failure here is logged rather than raised, matching the other
+    migrations, because startup must not be blocked by a table that only
+    one optional surface needs. Nothing unsafe follows from that: every
+    native control operation fails closed when this table cannot be
+    written, so an operation that cannot journal its intent types nothing
+    into a provider pane.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS kimi_native_control_operations ("
+                "operation_id TEXT PRIMARY KEY, "
+                "kind TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "provider TEXT NOT NULL, "
+                "native_session_id TEXT NOT NULL, "
+                "terminal_id TEXT NOT NULL, "
+                "generation TEXT NOT NULL, "
+                "execution_mode TEXT NOT NULL, "
+                "turn_id TEXT, "
+                "payload_sha256 TEXT NOT NULL, "
+                "intent_json TEXT NOT NULL, "
+                "transport_json TEXT, "
+                "observation_json TEXT, "
+                "posted_at TEXT, "
+                "refusal_reason TEXT, "
+                "ambiguity_reason TEXT, "
+                "epoch INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 - the operation path fails closed
+        logger.warning(f"kimi native control migration failed: {e}")
 
 
 def _migrate_managed_launch_reservations() -> None:
