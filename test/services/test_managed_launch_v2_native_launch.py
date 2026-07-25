@@ -545,8 +545,19 @@ def test_a_reservation_refused_for_its_directory_leaves_no_row(
     The distinction matters to a caller retrying with the corrected
     path: a half-created reservation would make the corrected retry
     collide with the refused attempt's own id.
+
+    The non-canonical directory is built explicitly rather than taken
+    from ``tempfile.mkdtemp``, whose root is symlinked on macOS but not
+    on Linux.  What is under test here is that a refusal leaves no row,
+    which is true on every platform, so the test should run on every
+    platform instead of skipping where the shortcut stops working.
     """
-    request = _reserve_request(worktree, tmp_path, working_directory=tempfile.mkdtemp())
+    real = tmp_path / "refused-real"
+    real.mkdir()
+    (tmp_path / "refused-alias").symlink_to(real)
+    request = _reserve_request(
+        worktree, tmp_path, working_directory=str(tmp_path / "refused-alias")
+    )
     reservation_id = request.reservation_id
 
     with pytest.raises(v2.ManagedLaunchConflict):
