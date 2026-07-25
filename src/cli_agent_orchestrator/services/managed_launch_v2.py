@@ -236,7 +236,71 @@ def _row_dict(row: Any) -> dict[str, Any]:
         "preflight_failure": _parse_json(getattr(row, "preflight_failure_json", None), None),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
+        **_published_terminal_facts(row.terminal_id),
     }
+
+
+#: The canonical identity a caller may address a managed terminal by. Six
+#: fields, not the five the writer boundary checks: a conductor deciding
+#: whether to adopt a pane also has to know *which provider session* is
+#: running in it, and a pane running a different session than the one
+#: registered is a supersession that the other five fields cannot see.
+PUBLISHED_IDENTITY_FIELDS = (
+    "server_socket_path",
+    "session_id",
+    "window_id",
+    "pane_id",
+    "pane_pid",
+    "native_session_id",
+)
+
+#: Every key this surface adds, so a peer can tell "the field is absent
+#: because the row has no value" from "this build does not publish it".
+PUBLISHED_TERMINAL_FIELDS = (
+    "lifecycle_state",
+    "lifecycle_reason",
+    "superseded_by_terminal_id",
+    "superseded_by_generation",
+    *PUBLISHED_IDENTITY_FIELDS,
+)
+
+
+def _published_terminal_facts(terminal_id: Optional[str]) -> dict[str, Any]:
+    """The terminal's lifecycle and canonical identity, for the reservation.
+
+    Published here because this is the surface the conductor actually
+    reads. Its non-adoptable gate consults ``lifecycle_state`` on the
+    reservation response, and until this existed that key was simply
+    absent — so the gate compared ``None`` against the non-adoptable set,
+    never matched, and fell through to the adoption branches. A guard that
+    fails open is worse than no guard, because the code reads as though the
+    case is handled.
+
+    Every key is always present, ``None`` when unknown. An absent key and a
+    null one would otherwise be indistinguishable to a reader, and they
+    mean opposite things: "this peer cannot answer" versus "this peer
+    answered, and the row holds nothing". The first must fail closed; the
+    second is ordinary.
+
+    Read through the projection so this surface and the human views cannot
+    drift: one authority for what a terminal's lifecycle is, rather than a
+    second implementation that agrees today.
+    """
+    published: dict[str, Any] = {field: None for field in PUBLISHED_TERMINAL_FIELDS}
+    if not terminal_id:
+        return published
+    try:
+        from cli_agent_orchestrator.services import terminal_projection
+
+        projected = terminal_projection.project_terminal(terminal_id)
+    except Exception as exc:  # noqa: BLE001 - an unreadable row publishes nulls
+        logger.debug("Could not project terminal %s for a v2 response: %s", terminal_id, exc)
+        return published
+    if not projected:
+        return published
+    for field in PUBLISHED_TERMINAL_FIELDS:
+        published[field] = projected.get(field)
+    return published
 
 
 def _query(db: Any, reservation_id: str) -> Any:
@@ -2496,6 +2560,43 @@ async def _launch_native_tui(
                 f"claude native readiness was never proven: {exc}",
                 reason=PREFLIGHT_REASON_READINESS,
             )
+
+    # The post-proof boundary, and the only correct one. Before this point
+    # the session id is what the launcher *intended* to run — a chosen uuid
+    # for Claude, a minted one for Kimi — and persisting it there would
+    # record an assertion. By here it is proven: Claude's own SessionStart
+    # hook has named this exact uuid, and Kimi's bootstrap minted it and
+    # proved the minting process dead before the TUI could attach.
+    #
+    # Fail closed. A pane whose row does not say which provider session it
+    # is running defeats the native-session half of the supersession test:
+    # a pane that later holds a *different* session looks identical to the
+    # right one, because the comparison has nothing to compare. Zero task
+    # bytes have been submitted at this point, so refusing costs a
+    # finalizable reservation rather than a lost turn.
+    try:
+        persisted = await asyncio.to_thread(
+            database.set_terminal_v2_native_session_id,
+            record["terminal_id"],
+            bootstrap["native_session_id"],
+        )
+    except Exception as exc:  # noqa: BLE001 - treated as a failure to persist
+        persisted = False
+        logger.warning(
+            "Could not persist the proven native session for %s: %s",
+            record["terminal_id"],
+            exc,
+        )
+    if not persisted:
+        return _mark_preflight_blocked(
+            reservation_id,
+            (
+                "the proven native session id could not be durably recorded against "
+                f"terminal {record['terminal_id']}; refusing rather than publishing a "
+                "readiness receipt for a pane whose row cannot say which session it runs"
+            ),
+            reason=PREFLIGHT_REASON_READINESS,
+        )
 
     readiness = await asyncio.to_thread(
         _await_native_pane_input_ready,

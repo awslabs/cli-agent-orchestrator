@@ -1565,6 +1565,176 @@ def refresh_terminal_window_names(
         return updated == 1
 
 
+def upgrade_terminal_identity_from_observation(
+    terminal_id: str,
+    *,
+    pane_id: str,
+    server_socket_path: str,
+    session_id: str,
+    pane_pid: int,
+    native_session_id: Optional[str] = None,
+) -> bool:
+    """Complete a row that predates the two newest identity fields.
+
+    The build deployed before this one wrote ``pane_id``, ``window_id`` and
+    ``server_socket_path`` and nothing else, so every row it created grades
+    partial once ``session_id`` and ``pane_pid`` join the canonical tuple —
+    and partial fails closed. Without this, installing over an existing
+    database would leave the whole running fleet unable to take control
+    input, unreadable, and unattachable.
+
+    What makes this safe is the same thing that makes the migration right
+    to refuse a blind backfill: the values written here come from
+    *observing the row's own recorded pane on the row's own recorded
+    socket*. The migration cannot do that — it runs against whichever
+    server the upgrading process happens to reach, and recording that as
+    the terminal's binding would make the later identity check confirm the
+    migration's guess. An observation of the named pane on the named socket
+    confirms nothing; it reports.
+
+    Guarded so it can only ever complete, never re-point:
+
+    * the update matches on the row's existing ``pane_id`` **and**
+      ``server_socket_path``, so a row whose pane moved is not touched;
+    * it matches on ``session_id IS NULL AND pane_pid IS NULL``, so a
+      complete row is never rewritten and two concurrent upgrades cannot
+      both win;
+    * a row with no ``pane_id`` or no ``server_socket_path`` is out of
+      scope entirely — there is nothing to observe it against, and that is
+      exactly the case where guessing would be wrong.
+
+    Returns True only when this call completed the row.
+    """
+    if not (pane_id and server_socket_path and session_id) or pane_pid <= 0:
+        return False
+    with SessionLocal() as db:
+        values: Dict[str, Any] = {
+            "session_id": session_id,
+            "pane_pid": pane_pid,
+        }
+        if native_session_id is not None:
+            values["native_session_id"] = native_session_id
+        updated = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.pane_id == pane_id,
+                TerminalModel.server_socket_path == server_socket_path,
+                TerminalModel.session_id.is_(None),
+                TerminalModel.pane_pid.is_(None),
+            )
+            .update(values, synchronize_session=False)
+        )
+        db.commit()
+        return updated == 1
+
+
+def set_terminal_native_session_id(terminal_id: str, native_session_id: str) -> bool:
+    """Record the provider-native session this terminal's pane is running.
+
+    Separate from :func:`register_terminal_incarnation` because the two
+    facts are learned at different moments: the pane identity exists as
+    soon as the window does, while the native session id is only proven
+    once the provider has answered — by its SessionStart hook for Claude,
+    or by the ACP bootstrap for Kimi. Writing it early, from the value the
+    launcher *intended* to use, would record an assertion rather than an
+    observation.
+
+    Refuses to re-point: a row already carrying a different native session
+    is left alone, because a pane that is running someone else's session is
+    a supersession, not an update.
+    """
+    if not native_session_id:
+        return False
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal is None:
+            return False
+        if terminal.native_session_id not in (None, native_session_id):
+            logger.warning(
+                "Refusing to re-point terminal %s from native session %s to %s",
+                terminal_id,
+                terminal.native_session_id,
+                native_session_id,
+            )
+            return False
+        terminal.native_session_id = native_session_id
+        db.commit()
+        return True
+
+
+def set_terminal_v2_native_session_id(terminal_id: str, native_session_id: str) -> bool:
+    """The v2 twin of :func:`set_terminal_native_session_id`.
+
+    Separate rather than a vintage argument on one function, because the
+    two stores are isolated by design and a single writer that chose its
+    table at runtime would be one bug away from a v1 path touching a v2
+    row. Same rule: idempotent for the same session, refused for a
+    different one, since a pane running someone else's session is a
+    supersession rather than an update.
+    """
+    if not native_session_id:
+        return False
+    with SessionLocal() as db:
+        terminal = (
+            db.query(ManagedLaunchV2TerminalModel)
+            .filter(ManagedLaunchV2TerminalModel.id == terminal_id)
+            .first()
+        )
+        if terminal is None:
+            return False
+        if terminal.v2_native_session_id not in (None, native_session_id):
+            logger.warning(
+                "Refusing to re-point v2 terminal %s from native session %s to %s",
+                terminal_id,
+                terminal.v2_native_session_id,
+                native_session_id,
+            )
+            return False
+        terminal.v2_native_session_id = native_session_id
+        db.commit()
+        return True
+
+
+def find_terminal_by_pane_identity(
+    *,
+    server_socket_path: str,
+    pane_id: str,
+    session_id: Optional[str] = None,
+    pane_pid: Optional[int] = None,
+    exclude_terminal_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """The terminal registered to this exact pane, if any row claims it.
+
+    Used to name a successor when an older row is demoted: the demotion
+    already knows *which pane* it observed and that the pane is no longer
+    the incarnation that registered it, and this answers "so whose is it
+    now?". Without it a superseded row can only say that it lost its pane,
+    which leaves an operator and the conductor with nothing to act on.
+
+    Matched on the full observed identity rather than the pane id alone,
+    because a pane id is unique only within one server and this lookup runs
+    precisely when ids are known to have been reissued.
+    """
+    if not (server_socket_path and pane_id):
+        return None
+    with SessionLocal() as db:
+        query = db.query(TerminalModel).filter(
+            TerminalModel.server_socket_path == server_socket_path,
+            TerminalModel.pane_id == pane_id,
+        )
+        if session_id is not None:
+            query = query.filter(TerminalModel.session_id == session_id)
+        if pane_pid is not None:
+            query = query.filter(TerminalModel.pane_pid == pane_pid)
+        if exclude_terminal_id is not None:
+            query = query.filter(TerminalModel.id != exclude_terminal_id)
+        row = query.first()
+        if row is None:
+            return None
+        return {"terminal_id": row.id, "generation": row.generation}
+
+
 def record_terminal_lifecycle(
     terminal_id: str,
     *,

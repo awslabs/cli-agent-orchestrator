@@ -129,6 +129,17 @@ def observed_lifecycle(
         # there being no evidence against it.
         return LIFECYCLE_UNKNOWN_LIVENESS, "no recorded identity"
     if completeness == terminal_service.IDENTITY_PARTIAL:
+        # Every row the previously deployed build created lands here on the
+        # first read after an upgrade, because it wrote three of the five
+        # fields. Completing it from an observation of its own pane is what
+        # keeps installing this build from grading the whole existing fleet
+        # unknown — and the caller mutates ``row`` in place so the rest of
+        # this projection sees the completed identity.
+        upgraded = terminal_service.upgrade_observed_identity(row["id"], row)
+        if upgraded is not None:
+            row.update(upgraded)
+            completeness = terminal_service.identity_completeness(row)
+    if completeness == terminal_service.IDENTITY_PARTIAL:
         # The same rule the write and attach paths apply: a partial
         # identity is not checked on the fields it happens to have. A view
         # that rendered such a row as live would be the one place the

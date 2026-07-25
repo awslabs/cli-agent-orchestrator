@@ -462,8 +462,26 @@ class HerdrBackend(TerminalBackend):
         for _ in range(enter_count):
             self._run_herdr(["pane", "send-keys", pane_id, "Enter"])
 
-    def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
-        """Send a special key to a pane."""
+    def send_special_key(
+        self,
+        session_name: str,
+        window_name: str,
+        key: str,
+        pane_id: Optional[str] = None,
+    ) -> None:
+        """Send a special key to a pane.
+
+        A supplied ``pane_id`` names a tmux pane, which this backend does
+        not address, and is refused for the same reason ``send_keys``
+        refuses one: a caller passing a verified id has specifically
+        declined name resolution, so silently delivering by name would give
+        it the opposite of what it asked for.
+        """
+        if pane_id is not None:
+            raise TerminalBackendError(
+                "herdr backend cannot target a tmux pane id; "
+                "refusing to fall back to name resolution"
+            )
         pane_id = self._resolve_pane_id_from_window(session_name, window_name)
 
         # Map key names

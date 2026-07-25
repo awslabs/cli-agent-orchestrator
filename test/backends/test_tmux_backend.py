@@ -186,7 +186,21 @@ class TestTmuxBackendDelegation:
 
     def test_send_special_key_delegates(self, backend, mock_client):
         backend.send_special_key("cao-test", "window-0", "C-c")
-        mock_client.send_special_key.assert_called_once_with("cao-test", "window-0", "C-c")
+        mock_client.send_special_key.assert_called_once_with(
+            "cao-test", "window-0", "C-c", pane_id=None
+        )
+
+    def test_send_special_key_passes_a_verified_pane_through(self, backend, mock_client):
+        """A control key is delivered to the proven pane, not to a name.
+
+        ``Enter`` submits whatever a composer is holding and ``C-c``
+        interrupts whatever is running, so a name-resolved target that has
+        since been reused acts on a stranger's session immediately.
+        """
+        backend.send_special_key("cao-test", "window-0", "C-c", pane_id="%9")
+        mock_client.send_special_key.assert_called_once_with(
+            "cao-test", "window-0", "C-c", pane_id="%9"
+        )
 
     def test_get_history_delegates(self, backend, mock_client):
         mock_client.get_history.return_value = "output text"

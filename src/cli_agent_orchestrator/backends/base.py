@@ -257,7 +257,13 @@ class TerminalBackend(ABC):
         ...
 
     @abstractmethod
-    def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
+    def send_special_key(
+        self,
+        session_name: str,
+        window_name: str,
+        key: str,
+        pane_id: Optional[str] = None,
+    ) -> None:
         """Send a special key (e.g., C-c, C-d, Enter) to a window.
 
         Unlike send_keys(), this sends the key as a control/special key name
@@ -267,6 +273,10 @@ class TerminalBackend(ABC):
             session_name: Target session
             window_name: Target window
             key: Key name (e.g., "C-d", "C-c", "Escape", "Enter", "")
+            pane_id: Verified immutable pane id. When supplied it is the
+                target and the names are context. A backend whose own ids
+                are not tmux pane ids must refuse it rather than fall back
+                to the names — see ``send_input`` for the same rule.
         """
         ...
 

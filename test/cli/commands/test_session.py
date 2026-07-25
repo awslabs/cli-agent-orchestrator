@@ -21,7 +21,7 @@ class TestListSessions:
         sessions_resp = MagicMock(status_code=200)
         sessions_resp.json.return_value = [{"name": "cao-test"}]
         terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [{"id": "abc12345"}]
+        terminals_resp.json.return_value = [{"id": "abc12345", "lifecycle_state": "live"}]
         terminal_resp = MagicMock(status_code=200)
         terminal_resp.json.return_value = {
             "id": "abc12345",
@@ -60,7 +60,7 @@ class TestListSessions:
         sessions_resp = MagicMock(status_code=200)
         sessions_resp.json.return_value = [{"name": "cao-test"}]
         terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [{"id": "abc12345"}]
+        terminals_resp.json.return_value = [{"id": "abc12345", "lifecycle_state": "live"}]
         terminal_resp = MagicMock(status_code=200)
         terminal_resp.json.return_value = {
             "id": "abc12345",
@@ -112,7 +112,7 @@ class TestStatus:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_status_success(self, mock_get, runner):
         terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [{"id": "abc12345"}]
+        terminals_resp.json.return_value = [{"id": "abc12345", "lifecycle_state": "live"}]
         terminal_resp = MagicMock(status_code=200)
         terminal_resp.json.return_value = {
             "id": "abc12345",
@@ -134,7 +134,7 @@ class TestStatus:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_status_json(self, mock_get, runner):
         terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [{"id": "abc12345"}]
+        terminals_resp.json.return_value = [{"id": "abc12345", "lifecycle_state": "live"}]
         terminal_resp = MagicMock(status_code=200)
         terminal_resp.json.return_value = {
             "id": "abc12345",
@@ -196,12 +196,14 @@ class TestStatus:
         terminals_resp.json.return_value = [
             {
                 "id": "cond1234",
+                "lifecycle_state": "live",
                 "agent_profile": "conductor",
                 "provider": "kiro_cli",
                 "status": "idle",
             },
             {
                 "id": "work5678",
+                "lifecycle_state": "live",
                 "agent_profile": "dev",
                 "provider": "kiro_cli",
                 "status": "processing",
@@ -230,12 +232,14 @@ class TestStatus:
         terminals_resp.json.return_value = [
             {
                 "id": "cond1234",
+                "lifecycle_state": "live",
                 "agent_profile": "conductor",
                 "provider": "kiro_cli",
                 "status": "idle",
             },
             {
                 "id": "work5678",
+                "lifecycle_state": "live",
                 "agent_profile": "dev",
                 "provider": "kiro_cli",
                 "status": "processing",
@@ -265,6 +269,7 @@ class TestStatus:
         terminals_resp.json.return_value = [
             {
                 "id": "cond1234",
+                "lifecycle_state": "live",
                 "agent_profile": "conductor",
                 "provider": "kiro_cli",
                 "status": "idle",
@@ -289,7 +294,7 @@ class TestStatus:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_status_output_fetch_error(self, mock_get, runner):
         terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [{"id": "abc12345"}]
+        terminals_resp.json.return_value = [{"id": "abc12345", "lifecycle_state": "live"}]
         terminal_resp = MagicMock(status_code=200)
         terminal_resp.json.return_value = {
             "id": "abc12345",
@@ -311,7 +316,7 @@ class TestStatus:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_status_output_truncated(self, mock_get, runner):
         terminals_resp = MagicMock(status_code=200)
-        terminals_resp.json.return_value = [{"id": "abc12345"}]
+        terminals_resp.json.return_value = [{"id": "abc12345", "lifecycle_state": "live"}]
         terminal_resp = MagicMock(status_code=200)
         terminal_resp.json.return_value = {
             "id": "abc12345",
@@ -334,7 +339,9 @@ class TestSend:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_send_async(self, mock_get, mock_post, runner):
-        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        resolve_resp = MagicMock(
+            status_code=200, json=lambda: [{"id": "abc12345", "lifecycle_state": "live"}]
+        )
         status_resp = MagicMock(status_code=200)
         status_resp.json.return_value = {"status": "idle"}
         mock_get.side_effect = [resolve_resp, status_resp]
@@ -363,7 +370,9 @@ class TestSend:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_send_server_down(self, mock_get, mock_post, runner):
-        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        resolve_resp = MagicMock(
+            status_code=200, json=lambda: [{"id": "abc12345", "lifecycle_state": "live"}]
+        )
         status_resp = MagicMock(status_code=200)
         status_resp.json.return_value = {"status": "idle"}
         mock_get.side_effect = [resolve_resp, status_resp]
@@ -376,7 +385,9 @@ class TestSend:
 
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_send_terminal_not_idle(self, mock_get, runner):
-        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        resolve_resp = MagicMock(
+            status_code=200, json=lambda: [{"id": "abc12345", "lifecycle_state": "live"}]
+        )
         status_resp = MagicMock(status_code=200)
         status_resp.json.return_value = {"status": "processing"}
         mock_get.side_effect = [resolve_resp, status_resp]
@@ -446,7 +457,9 @@ class TestSendSync:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_send_sync_completed(self, mock_get, mock_post, mock_time, runner):
         """Default (sync) mode polls until completed, then prints output."""
-        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        resolve_resp = MagicMock(
+            status_code=200, json=lambda: [{"id": "abc12345", "lifecycle_state": "live"}]
+        )
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
         poll_resp = MagicMock(status_code=200)
@@ -469,7 +482,9 @@ class TestSendSync:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_send_sync_error_status(self, mock_get, mock_post, mock_time, runner):
         """Default (sync) mode detects error status and raises."""
-        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        resolve_resp = MagicMock(
+            status_code=200, json=lambda: [{"id": "abc12345", "lifecycle_state": "live"}]
+        )
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
         poll_resp = MagicMock(status_code=200)
@@ -492,7 +507,9 @@ class TestSendSync:
         self, mock_get, mock_post, mock_session_time, mock_terminal_time, runner
     ):
         """--timeout raises on expiry."""
-        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        resolve_resp = MagicMock(
+            status_code=200, json=lambda: [{"id": "abc12345", "lifecycle_state": "live"}]
+        )
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
         poll_resp = MagicMock(status_code=200)
@@ -516,7 +533,9 @@ class TestSendSync:
         self, mock_get, mock_post, mock_time, runner
     ):
         """--timeout does not interfere when terminal completes in time."""
-        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        resolve_resp = MagicMock(
+            status_code=200, json=lambda: [{"id": "abc12345", "lifecycle_state": "live"}]
+        )
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
         poll_resp = MagicMock(status_code=200)
@@ -538,7 +557,9 @@ class TestSendSync:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_send_sync_poll_request_exception(self, mock_get, mock_post, mock_time, runner):
         """Poll failure raises ClickException."""
-        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        resolve_resp = MagicMock(
+            status_code=200, json=lambda: [{"id": "abc12345", "lifecycle_state": "live"}]
+        )
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
         mock_get.side_effect = [
@@ -560,7 +581,9 @@ class TestSendSync:
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_send_sync_output_fetch_error(self, mock_get, mock_post, mock_time, runner):
         """Output fetch failure after completion is silently ignored."""
-        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        resolve_resp = MagicMock(
+            status_code=200, json=lambda: [{"id": "abc12345", "lifecycle_state": "live"}]
+        )
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
         poll_resp = MagicMock(status_code=200)
@@ -588,7 +611,9 @@ class TestSendSync:
         self, mock_get, mock_post, mock_session_time, mock_terminal_time, mock_exit, runner
     ):
         """KeyboardInterrupt during poll calls sys.exit(130)."""
-        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        resolve_resp = MagicMock(
+            status_code=200, json=lambda: [{"id": "abc12345", "lifecycle_state": "live"}]
+        )
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
         poll_resp = MagicMock(status_code=200)
@@ -606,3 +631,43 @@ class TestSendSync:
         runner.invoke(session, ["send", "cao-test", "question"])
 
         mock_exit.assert_any_call(130)
+
+
+class TestAbsentLifecycleFailsClosed:
+    """A server that publishes no lifecycle cannot be shown to have a live one.
+
+    This used to default an absent ``lifecycle_state`` to ``live``, which
+    reads "we do not know" as "it is fine" — and a peer that answers with no
+    lifecycle at all is exactly the too-old server the check exists for.
+    """
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_a_listing_with_no_lifecycle_named_no_conductor(self, mock_get, runner):
+        terminals_resp = MagicMock(status_code=200)
+        terminals_resp.json.return_value = [{"id": "abc12345", "agent_profile": "conductor"}]
+        mock_get.side_effect = [terminals_resp]
+
+        result = runner.invoke(session, ["status", "cao-test"])
+
+        assert result.exit_code != 0
+        assert "published no lifecycle" in result.output
+        # Named as a peer limitation rather than as a dead worker: the rows
+        # may be perfectly healthy, and saying they are dead would be a
+        # different lie from the one this replaces.
+        assert "guessing would name a dead row" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_a_demoted_listing_still_reports_what_it_found(self, mock_get, runner):
+        terminals_resp = MagicMock(status_code=200)
+        terminals_resp.json.return_value = [
+            {"id": "abc12345", "lifecycle_state": "dead"},
+            {"id": "def67890", "lifecycle_state": "superseded"},
+        ]
+        mock_get.side_effect = [terminals_resp]
+
+        result = runner.invoke(session, ["status", "cao-test"])
+
+        assert result.exit_code != 0
+        assert "No live conductor" in result.output
+        assert "abc12345=dead" in result.output
+        assert "def67890=superseded" in result.output

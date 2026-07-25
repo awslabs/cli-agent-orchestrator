@@ -184,8 +184,14 @@ class TmuxBackend(TerminalBackend):
             pane_id=pane_id,
         )
 
-    def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
-        self._client.send_special_key(session_name, window_name, key)
+    def send_special_key(
+        self,
+        session_name: str,
+        window_name: str,
+        key: str,
+        pane_id: Optional[str] = None,
+    ) -> None:
+        self._client.send_special_key(session_name, window_name, key, pane_id=pane_id)
 
     # --- Output ---
 

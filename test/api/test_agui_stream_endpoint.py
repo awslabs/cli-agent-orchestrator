@@ -184,7 +184,12 @@ def test_stream_fleet_snapshot_with_terminals_emits_delta(monkeypatch):
             )
         return terms
 
-    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_terminals_by_session", _terms)
+    # The fleet snapshot reads the projection, like every other dashboard
+    # surface: raw rows here would make this stream the one view that still
+    # shows a dead terminal as live and cannot see a managed v2 worker.
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_projection.project_session", _terms
+    )
 
     live_event = {
         "id": "ev-1",

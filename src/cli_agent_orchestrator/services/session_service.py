@@ -102,18 +102,30 @@ def get_session(session_name: str) -> Dict:
         if not session_data:
             raise ValueError(f"Session '{session_name}' not found")
 
-        terminals = list_terminals_by_session(session_name)
-        # Enrich each terminal with its live status. list_terminals_by_session
-        # reads only the DB row (no status column), but callers monitoring an
-        # orchestration — the web UI, and the cao-ops-mcp get_session_info tool
-        # an external supervisor polls — need to distinguish
-        # IDLE/PROCESSING/COMPLETED/ERROR per terminal. status_monitor is the
-        # single source of truth and is backend-aware (tmux push vs herdr
-        # native), so derive it here rather than persisting a stale column.
-        from cli_agent_orchestrator.services.status_monitor import status_monitor
+        # Read through the projection, which is the one authority on what a
+        # terminal is: it observes liveness rather than trusting the stored
+        # row, reports a lifecycle instead of a provider status for a pane
+        # that no longer resolves, and covers both protocol vintages.
+        #
+        # This route is what the dashboard and ``conduct status`` read. While
+        # it returned raw rows, a terminal whose window had been deleted
+        # rendered as provider ``Unknown`` forever — indistinguishable from a
+        # healthy worker awaiting detection — and a managed v2 worker
+        # appeared in neither view, because its row lives in a separate
+        # table. Meanwhile ``cao session status`` *was* projected, so the two
+        # human views disagreed by construction.
+        #
+        # The projection derives the provider status itself, for a live pane
+        # only, so nothing is enriched here.
+        #
+        # Deliberately not applied to ``delete_session``, the watchdog or
+        # cleanup: those are the machine paths the v2 store's write/consume
+        # isolation is about, and they must keep seeing v1 rows only. The
+        # boundary this crosses is *human visibility*, which was never the
+        # thing being isolated.
+        from cli_agent_orchestrator.services import terminal_projection
 
-        for terminal in terminals:
-            terminal["status"] = status_monitor.get_status(terminal["id"]).value
+        terminals = terminal_projection.project_session(session_name)
         return {"session": session_data, "terminals": terminals}
 
     except Exception as e:

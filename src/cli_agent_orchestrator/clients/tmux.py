@@ -659,7 +659,13 @@ class TmuxClient:
             logger.error(f"Failed to send text via paste to {session_name}:{window_name}: {e}")
             raise
 
-    def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
+    def send_special_key(
+        self,
+        session_name: str,
+        window_name: str,
+        key: str,
+        pane_id: Optional[str] = None,
+    ) -> None:
         """Send a tmux special key sequence (e.g., C-d, C-c) to a window.
 
         Unlike send_keys(), this sends the key as a tmux key name (not literal text)
@@ -669,9 +675,25 @@ class TmuxClient:
             session_name: Name of tmux session
             window_name: Name of window in session
             key: Tmux key name (e.g., "C-d", "C-c", "Escape")
+            pane_id: Immutable tmux pane id (``%N``). When supplied it *is*
+                the target and the names are used only for logging. A
+                control key is delivered the instant it arrives, so a
+                name-resolved target that has been reused acts on a
+                stranger's pane with no opportunity to notice first.
         """
         try:
             logger.info(f"send_special_key: {session_name}:{window_name} - key: {key}")
+
+            if pane_id is not None:
+                # Refused rather than downgraded to the name target, for
+                # the same reason ``send_keys`` refuses: the caller asked
+                # for an exact pane, and writing somewhere else instead is
+                # the failure this parameter exists to prevent.
+                if not is_valid_pane_id(pane_id):
+                    raise ValueError(f"Invalid pane_id: {pane_id!r}")
+                subprocess.run(["tmux", "send-keys", "-t", pane_id, key], check=True)
+                logger.debug(f"Sent special key to pane {pane_id}")
+                return
 
             session = self.server.sessions.get(session_name=session_name)
             if not session:

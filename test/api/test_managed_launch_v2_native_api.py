@@ -25,6 +25,7 @@ from typing import Any, Mapping, Optional
 
 import pytest
 
+from cli_agent_orchestrator.clients import database as _db
 from cli_agent_orchestrator.models.managed_launch_v2 import PROTOCOL_VERSION_V2
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import execution_mode as em
@@ -140,7 +141,23 @@ def harness(monkeypatch):
 
     async def _create_terminal(**kwargs):
         state.terminals.append(kwargs)
-        return {"terminal_id": kwargs["reserved_terminal_id"]}
+        terminal_id = kwargs["reserved_terminal_id"]
+        # A real row in the v2 store. The launch path writes one and later
+        # steps read it back, so a fake that returned an id without a row
+        # would test those steps against a terminal that does not exist.
+        _db.create_terminal_v2(
+            terminal_id,
+            kwargs.get("session_name") or "cao-test",
+            kwargs.get("window_name") or f"w-{terminal_id}",
+            kwargs.get("provider") or "kimi_cli",
+            generation=kwargs.get("terminal_generation"),
+            pane_id="%7",
+            window_id="@7",
+            server_socket_path="/private/tmp/cao-native.sock",
+            session_id="$1",
+            pane_pid=4242,
+        )
+        return {"terminal_id": terminal_id}
 
     def _observe(self):
         return {

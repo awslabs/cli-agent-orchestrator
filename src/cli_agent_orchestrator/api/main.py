@@ -122,6 +122,7 @@ from cli_agent_orchestrator.services import (
     managed_launch_v2,
     secret_gate,
     session_service,
+    terminal_projection,
     terminal_service,
 )
 from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
@@ -1041,7 +1042,11 @@ async def agui_stream(
         terminals: List[Dict] = []
         for sess in sessions:
             try:
-                terminals.extend(list_terminals_by_session(sess["id"]))
+                # Through the projection, like every other dashboard
+                # surface. Reading raw rows here would make this stream the
+                # one view that still shows a dead terminal as live and
+                # cannot see a managed v2 worker at all.
+                terminals.extend(terminal_projection.project_session(sess["id"]))
             except Exception:
                 logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
         return build_dashboard_snapshot(sessions, terminals, list(scopes))
@@ -2347,6 +2352,60 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
         )
 
 
+def _identity_for_verification(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """One identity shape, whichever store the row came from.
+
+    The v2 terminal store prefixes its newer identity columns ``v2_``
+    because the vintage receipt requires unique bare column names across
+    the two tables. Every checker below this point speaks the canonical
+    names, so the prefix is stripped here rather than teaching each of them
+    about the storage detail — a checker that silently found no
+    ``session_id`` on a v2 row would grade a complete identity as partial
+    and refuse a healthy worker.
+    """
+    normalized = dict(metadata)
+    for field in ("session_id", "pane_pid", "native_session_id"):
+        prefixed = f"v2_{field}"
+        if normalized.get(field) is None and prefixed in normalized:
+            normalized[field] = normalized[prefixed]
+    return normalized
+
+
+def _projected_terminal(terminal_id: str) -> Dict[str, Any]:
+    """One terminal, from the same projection both human views read.
+
+    Sourced here rather than from ``terminal_service.get_terminal`` because
+    this route is the per-terminal answer for almost everything — the
+    conductor's report, steer and control-input commands, supervisor
+    resolution, and the card ``cao session status`` prints after selecting
+    the conductor through the projection. While it returned the raw row,
+    a dead terminal read ``dead`` in the listing and ``unknown`` on its own
+    card: the phantom-unknown card, one endpoint over.
+
+    ``status`` keeps its provider meaning for a live pane, because machine
+    orchestration polls this route waiting on provider status and would
+    otherwise never see the value it waits for. Only a row whose identity
+    does not resolve reports its lifecycle there, which is exactly the case
+    where there is no provider state to report.
+
+    Falls back to the unprojected row when the projection has no answer, so
+    a terminal that exists but cannot be observed is still readable rather
+    than becoming a 404.
+    """
+    projected = terminal_projection.project_terminal(terminal_id)
+    if projected is None:
+        return terminal_service.get_terminal(terminal_id)
+    # ``id``/``name``/``session_name`` are the shape this response model has
+    # always used; the projection carries the canonical spellings alongside
+    # its back-compat keys, so map rather than rename either side.
+    return {
+        **projected,
+        "id": projected.get("terminal_id") or terminal_id,
+        "name": projected.get("tmux_window"),
+        "session_name": projected.get("tmux_session"),
+    }
+
+
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
 async def get_terminal(terminal_id: TerminalId) -> Terminal:
     try:
@@ -2355,7 +2414,7 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
         # tmux (blocking subprocess). This endpoint is polled heavily by
         # wait_until_terminal_status, so run it off the loop to keep the
         # server responsive under concurrent orchestration.
-        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+        terminal = await asyncio.to_thread(_projected_terminal, terminal_id)
         return Terminal(**terminal)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -3679,31 +3738,37 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # terminal", and never by falling back to resolving the name.
     from cli_agent_orchestrator.services import terminal_projection
 
+    # Managed terminals are verified too, and they are the ones this
+    # matters most for. Skipping them left every v2 native worker attaching
+    # by mutable name on the *default* tmux server — discarding the pane,
+    # window and socket its own row records — so opening the card of a
+    # worker whose window had been deleted and its name reused gave an
+    # operator an interactive PTY into a stranger's live pane, which is
+    # worse than a one-shot key because they then type into it.
     verified_pane: str | None = None
-    if not managed_terminal:
-        try:
-            verified = await asyncio.to_thread(
-                terminal_service.verified_pane_target,
-                terminal_id,
-                metadata,
-                operation="web-attach",
-            )
-        except terminal_service.TerminalIdentityMismatchError as exc:
-            projected = await asyncio.to_thread(terminal_projection.project_terminal, terminal_id)
-            state = (projected or {}).get("lifecycle_state") or "identity-mismatch"
-            successor = (projected or {}).get("superseded_by_terminal_id")
-            reason = f"terminal-{state}"
-            if successor:
-                reason = f"{reason}; replaced by {successor}"
-            logger.info("Refused web attach for terminal %s: %s", terminal_id, exc)
-            await websocket.close(code=4004, reason=reason[:120])
-            return
-        if verified is not None:
-            verified_pane = verified.pane_id
-            # The pane may have been relabelled since the row was written;
-            # the verification returns the names it answers to now.
-            session_name = verified.session_name
-            window_name = verified.window_name
+    try:
+        verified = await asyncio.to_thread(
+            terminal_service.verified_pane_target,
+            terminal_id,
+            _identity_for_verification(metadata),
+            operation="web-attach",
+        )
+    except terminal_service.TerminalIdentityMismatchError as exc:
+        projected = await asyncio.to_thread(terminal_projection.project_terminal, terminal_id)
+        state = (projected or {}).get("lifecycle_state") or "identity-mismatch"
+        successor = (projected or {}).get("superseded_by_terminal_id")
+        reason = f"terminal-{state}"
+        if successor:
+            reason = f"{reason}; replaced by {successor}"
+        logger.info("Refused web attach for terminal %s: %s", terminal_id, exc)
+        await websocket.close(code=4004, reason=reason[:120])
+        return
+    if verified is not None:
+        verified_pane = verified.pane_id
+        # The pane may have been relabelled since the row was written;
+        # the verification returns the names it answers to now.
+        session_name = verified.session_name
+        window_name = verified.window_name
 
     try:
         attach_command = await asyncio.to_thread(
