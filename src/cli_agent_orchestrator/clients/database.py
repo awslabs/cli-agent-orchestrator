@@ -324,6 +324,22 @@ class ManagedLaunchV2TerminalModel(Base):
     window_id = Column(Text, nullable=True)
     # The tmux server owning ``pane_id`` (§24.7); see TerminalModel.
     server_socket_path = Column(Text, nullable=True)
+    # The same canonical identity and lifecycle the shared table carries,
+    # duplicated here rather than shared. The separation is the whole
+    # point of this store — old-binary machine paths must keep zero v2
+    # visibility — but a managed terminal still has to answer the identity
+    # questions a human view asks of every other terminal, or it can only
+    # be made visible by guessing. Column names are prefixed because the
+    # vintage receipt records bare names and requires them unique across
+    # the v2 surface. See TerminalModel for what each one means.
+    v2_session_id = Column(Text, nullable=True)
+    v2_pane_pid = Column(Integer, nullable=True)
+    v2_native_session_id = Column(Text, nullable=True)
+    v2_lifecycle_state = Column(Text, nullable=True)
+    v2_lifecycle_reason = Column(Text, nullable=True)
+    v2_liveness_checked_at = Column(Text, nullable=True)
+    v2_superseded_by_terminal_id = Column(Text, nullable=True)
+    v2_superseded_by_generation = Column(Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -1176,6 +1192,9 @@ def create_terminal_v2(
     pane_id: Optional[str] = None,
     window_id: Optional[str] = None,
     server_socket_path: Optional[str] = None,
+    session_id: Optional[str] = None,
+    pane_pid: Optional[int] = None,
+    native_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a v2 managed terminal metadata record (isolated vintage surface).
 
@@ -1201,6 +1220,9 @@ def create_terminal_v2(
             pane_id=pane_id,
             window_id=window_id,
             server_socket_path=server_socket_path,
+            v2_session_id=session_id,
+            v2_pane_pid=pane_pid,
+            v2_native_session_id=native_session_id,
         )
         db.add(terminal)
         db.commit()
@@ -1217,6 +1239,9 @@ def create_terminal_v2(
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
             "server_socket_path": terminal.server_socket_path,
+            "v2_session_id": terminal.v2_session_id,
+            "v2_pane_pid": terminal.v2_pane_pid,
+            "v2_native_session_id": terminal.v2_native_session_id,
         }
 
 
@@ -1247,6 +1272,14 @@ def get_terminal_metadata_v2(terminal_id: str) -> Optional[Dict[str, Any]]:
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
             "server_socket_path": terminal.server_socket_path,
+            "v2_session_id": terminal.v2_session_id,
+            "v2_pane_pid": terminal.v2_pane_pid,
+            "v2_native_session_id": terminal.v2_native_session_id,
+            "v2_lifecycle_state": terminal.v2_lifecycle_state,
+            "v2_lifecycle_reason": terminal.v2_lifecycle_reason,
+            "v2_liveness_checked_at": terminal.v2_liveness_checked_at,
+            "v2_superseded_by_terminal_id": terminal.v2_superseded_by_terminal_id,
+            "v2_superseded_by_generation": terminal.v2_superseded_by_generation,
             "last_active": terminal.last_active,
         }
 

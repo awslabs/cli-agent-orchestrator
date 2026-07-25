@@ -43,10 +43,31 @@ def _get_terminal_output(terminal_id):
 
 
 def _resolve_conductor(session_name):
+    """The session's conductor, resolved over live terminals only.
+
+    This used to return ``terminals[0]`` of the raw listing. With several
+    stale rows in a session that reliably named a dead one and reported
+    its status, which is a guaranteed disagreement with the dashboard
+    rather than a race. A demoted row is now excluded outright rather than
+    ranked last: ranking still picks a dead row when that is all there is,
+    which is exactly the case that went wrong.
+    """
     terminals = _get_terminals(session_name)
     if not terminals:
         raise click.ClickException(f"No terminals found for session '{session_name}'")
-    return terminals[0], terminals
+    live = [t for t in terminals if t.get("lifecycle_state", "live") == "live"]
+    if not live:
+        # Says what was found instead of silently substituting one of them:
+        # the operator needs to know these rows exist and are finalizable,
+        # not be handed one as though it were serving.
+        demoted = ", ".join(
+            f"{t.get('terminal_id', t.get('id'))}={t.get('lifecycle_state')}" for t in terminals
+        )
+        raise click.ClickException(
+            f"No live conductor for session '{session_name}'; "
+            f"{len(terminals)} superseded/dead rows ({demoted})"
+        )
+    return live[0], live
 
 
 @click.group()

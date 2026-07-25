@@ -91,13 +91,39 @@ _V2_TERMINALS_DDL = (
     "pane_id TEXT, "
     "window_id TEXT, "
     "server_socket_path TEXT, "
+    "v2_session_id TEXT, "
+    "v2_pane_pid INTEGER, "
+    "v2_native_session_id TEXT, "
+    "v2_lifecycle_state TEXT, "
+    "v2_lifecycle_reason TEXT, "
+    "v2_liveness_checked_at TEXT, "
+    "v2_superseded_by_terminal_id TEXT, "
+    "v2_superseded_by_generation TEXT, "
     "last_active TEXT"
     ")"
 )
 
 #: Columns added to the v2 terminal table after its first release, on the
 #: same PRAGMA-guarded terms as the reservation ones above.
-_V2_TERMINALS_ADDITIVE_COLUMNS = (("server_socket_path", "TEXT"),)
+#:
+#: The identity and lifecycle columns mirror the ones on the shared
+#: ``terminals`` table, deliberately duplicated rather than shared: the
+#: two stores stay separate so that old-binary machine paths keep zero v2
+#: visibility, and a managed row still has to be able to answer the same
+#: identity questions a human view asks of any other terminal.  Names are
+#: prefixed because the receipt records bare column names and asserts they
+#: are unique across the whole v2 surface.
+_V2_TERMINALS_ADDITIVE_COLUMNS = (
+    ("server_socket_path", "TEXT"),
+    ("v2_session_id", "TEXT"),
+    ("v2_pane_pid", "INTEGER"),
+    ("v2_native_session_id", "TEXT"),
+    ("v2_lifecycle_state", "TEXT"),
+    ("v2_lifecycle_reason", "TEXT"),
+    ("v2_liveness_checked_at", "TEXT"),
+    ("v2_superseded_by_terminal_id", "TEXT"),
+    ("v2_superseded_by_generation", "TEXT"),
+)
 
 #: Every additive column, by the table it belongs to.  The receipt records
 #: bare column names, which stays unambiguous only while the names are

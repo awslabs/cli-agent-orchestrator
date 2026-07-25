@@ -396,6 +396,49 @@ class TestSend:
         assert result.exit_code != 0
         assert "No terminals found" in result.output
 
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_send_refuses_when_every_row_is_demoted(self, mock_get, runner):
+        """A dead row is never silently substituted for a conductor.
+
+        The resolver used to take ``terminals[0]`` of the raw listing, so a
+        session left holding stale rows reliably named one and reported its
+        status — a guaranteed disagreement with the dashboard rather than a
+        race. The operator is told these rows exist instead.
+        """
+        listing = [
+            {"terminal_id": "aaaa1111", "id": "aaaa1111", "lifecycle_state": "dead"},
+            {"terminal_id": "bbbb2222", "id": "bbbb2222", "lifecycle_state": "superseded"},
+        ]
+        mock_get.return_value = MagicMock(status_code=200, json=lambda: listing)
+
+        result = runner.invoke(session, ["send", "cao-test", "hello"])
+
+        assert result.exit_code != 0
+        assert "No live conductor" in result.output
+        assert "aaaa1111=dead" in result.output
+        assert "bbbb2222=superseded" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
+    def test_send_skips_demoted_rows_and_picks_the_live_one(self, mock_get, runner):
+        """Exclusion, not ranking: the dead row must not be reachable."""
+        listing = [
+            {"terminal_id": "aaaa1111", "id": "aaaa1111", "lifecycle_state": "dead"},
+            {"terminal_id": "cccc3333", "id": "cccc3333", "lifecycle_state": "live"},
+        ]
+        status_resp = MagicMock(status_code=200)
+        status_resp.json.return_value = {"status": "processing"}
+        mock_get.side_effect = [
+            MagicMock(status_code=200, json=lambda: listing),
+            status_resp,
+        ]
+
+        result = runner.invoke(session, ["send", "cao-test", "hello"])
+
+        # It stops on the live row's busy status, which proves the live row
+        # is the one that was resolved.
+        assert "processing" in result.output
+        assert "aaaa1111" not in result.output
+
 
 class TestSendSync:
     @patch("cli_agent_orchestrator.cli.commands.session.time")

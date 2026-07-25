@@ -2301,15 +2301,25 @@ async def create_terminal_in_session(
 
 @app.get("/sessions/{session_name}/terminals")
 async def list_terminals_in_session(session_name: str) -> List[Dict]:
-    """List all terminals in a session."""
+    """List all terminals in a session, as the one shared projection.
+
+    The CLI and the dashboard read this same shape, which is the point:
+    they used to answer the question from different queries and disagree
+    about which terminals existed and what state they were in. Each row
+    carries its ``protocol_vintage`` and an observed ``lifecycle_state``,
+    so a card can say "superseded" instead of showing a deleted window as
+    a worker in an unknown state.
+    """
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.services import terminal_projection
 
-        return list_terminals_by_session(session_name)
+        # Off-loop: the projection enumerates tmux once, which is a
+        # blocking subprocess, and this endpoint is polled by both views.
+        return await asyncio.to_thread(terminal_projection.project_session, session_name)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3642,13 +3652,62 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4003, reason="Invalid tmux target name")
         return
 
+    # Before a single byte is streamed, prove the registered pane is still
+    # the pane that was registered. A row whose window was deleted, or
+    # whose name a later window has taken, must fail closed with a reason
+    # that names what happened — not the generic "Failed to attach
+    # terminal", and never by falling back to resolving the name.
+    from cli_agent_orchestrator.services import terminal_projection
+
+    verified_pane: str | None = None
+    if not managed_terminal:
+        try:
+            verified = await asyncio.to_thread(
+                terminal_service.verified_pane_target,
+                terminal_id,
+                metadata,
+                operation="web-attach",
+            )
+        except terminal_service.TerminalIdentityMismatchError as exc:
+            projected = await asyncio.to_thread(terminal_projection.project_terminal, terminal_id)
+            state = (projected or {}).get("lifecycle_state") or "identity-mismatch"
+            successor = (projected or {}).get("superseded_by_terminal_id")
+            reason = f"terminal-{state}"
+            if successor:
+                reason = f"{reason}; replaced by {successor}"
+            logger.info("Refused web attach for terminal %s: %s", terminal_id, exc)
+            await websocket.close(code=4004, reason=reason[:120])
+            return
+        if verified is not None:
+            verified_pane = verified.pane_id
+            # The pane may have been relabelled since the row was written;
+            # the verification returns the names it answers to now.
+            session_name = verified.session_name
+            window_name = verified.window_name
+
     try:
+        attach_command = await asyncio.to_thread(
+            partial(
+                get_backend().prepare_web_attach,
+                session_name,
+                window_name,
+                pane_id=verified_pane,
+                server_socket_path=metadata.get("server_socket_path"),
+            )
+        )
+    except TypeError:
+        # A backend that predates identity-addressed attach. It is handed
+        # the names only, which is exactly what it did before.
         attach_command = await asyncio.to_thread(
             get_backend().prepare_web_attach, session_name, window_name
         )
     except TerminalBackendError as e:
+        # Includes the backend's own refusal of an identity it cannot
+        # address safely. Reported as unbound rather than as a generic
+        # failure: nothing is wrong with the pane, the row does not say
+        # enough about it to be attached to.
         logger.error(f"Web attach failed for terminal {terminal_id}: {e}")
-        await websocket.close(code=4004, reason="Failed to attach terminal")
+        await websocket.close(code=4004, reason="terminal-unbound-identity")
         return
 
     # Create PTY pair for backend attach

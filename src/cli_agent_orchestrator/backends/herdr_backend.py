@@ -563,8 +563,23 @@ class HerdrBackend(TerminalBackend):
         # Equivalent to `tmux attach-session -t <session>`.
         os.execvp("herdr", ["herdr", "--session", self._herdr_session])
 
-    def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
-        """Focus the requested Herdr tab and return the browser PTY attach command."""
+    def prepare_web_attach(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        pane_id: Optional[str] = None,
+        server_socket_path: Optional[str] = None,
+    ) -> List[str]:
+        """Focus the requested Herdr tab and return the browser PTY attach command.
+
+        The tmux identity arguments are accepted for interface parity and
+        are not usable here: herdr owns its own panes and addresses them by
+        its own tab ids, which is already identity-based rather than
+        name-based. They are ignored rather than partially honoured — a
+        tmux pane id has no meaning on this backend, and pretending it did
+        would be worse than admitting it does not.
+        """
         workspace_id = self._resolve_workspace_id(session_name)
         tab_id = self._resolve_tab_id(session_name, workspace_id, window_name)
         self._run_herdr(["tab", "focus", tab_id])

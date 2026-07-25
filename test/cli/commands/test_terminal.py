@@ -17,13 +17,29 @@ from cli_agent_orchestrator.cli.commands.terminal import terminal
 
 
 class TestSnapshotOnDelete:
+    """Deletion writes its snapshots before the window is killed.
+
+    These use ``isolated_memory_db`` even though they mock the metadata
+    read: ``delete_terminal`` also consults the isolated v2 terminal store
+    to decide whether the row is a managed vintage, and without the
+    fixture that query lands on the operator's real database — whose
+    schema is whatever their last migration left behind.
+    """
+
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     def test_snapshot_written_on_delete(
-        self, mock_log_dir, mock_db_delete, mock_pm, mock_meta, mock_tmux, tmp_path
+        self,
+        mock_log_dir,
+        mock_db_delete,
+        mock_pm,
+        mock_meta,
+        mock_tmux,
+        tmp_path,
+        isolated_memory_db,
     ):
         """Snapshot files are written before the window is killed."""
         from cli_agent_orchestrator.services.terminal_service import delete_terminal
@@ -61,7 +77,14 @@ class TestSnapshotOnDelete:
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     def test_snapshot_failure_is_nonfatal(
-        self, mock_log_dir, mock_db_delete, mock_pm, mock_meta, mock_tmux, tmp_path
+        self,
+        mock_log_dir,
+        mock_db_delete,
+        mock_pm,
+        mock_meta,
+        mock_tmux,
+        tmp_path,
+        isolated_memory_db,
     ):
         """Snapshot failure does not prevent terminal deletion."""
         from cli_agent_orchestrator.services.terminal_service import delete_terminal

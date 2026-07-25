@@ -124,6 +124,49 @@ LIFECYCLE_SUPERSEDED = "superseded"
 LIFECYCLE_DEAD = "dead"
 LIFECYCLE_UNKNOWN_LIVENESS = "unknown-liveness"
 
+#: The canonical identity of one live incarnation. All five or none —
+#: there is no useful subset.
+#:
+#: Each field closes a way the others can be wrong. ``server_socket_path``
+#: is not optional context: a pane id is unique only *within* one tmux
+#: server, several run on one host, and an id with no server named is an
+#: id on whichever server the reading process happens to reach.
+#: ``pane_pid`` closes the remaining gap, which is not hypothetical — a
+#: tmux server restart hands out ``%0``/``%1`` again, so the old ids
+#: resolve to different live panes on a socket with the same path.
+IDENTITY_FIELDS = ("server_socket_path", "session_id", "window_id", "pane_id", "pane_pid")
+
+IDENTITY_ABSENT = "absent"
+IDENTITY_PARTIAL = "partial"
+IDENTITY_COMPLETE = "complete"
+
+
+def identity_completeness(metadata: Dict[str, Any]) -> str:
+    """Whether a row carries a whole canonical identity, some of one, or none.
+
+    The three answers get three different treatments, and the middle one
+    is the point:
+
+    ``complete``  every field present — the row may be verified and
+                  addressed by id.
+    ``partial``   some fields present — **fail closed**. The missing
+                  fields cannot be inferred, and inferring them is the
+                  specific mistake: a pane id without its server silently
+                  means "this pane on the default server", which after a
+                  tmux restart is a different live pane wearing the same
+                  id. Refusing costs an operator a re-registration;
+                  guessing costs somebody else's session.
+    ``absent``    no fields at all — a row predating identity
+                  persistence. Unmanaged, and left on the name-resolved
+                  path it has always used.
+    """
+    present = [field for field in IDENTITY_FIELDS if metadata.get(field)]
+    if not present:
+        return IDENTITY_ABSENT
+    if len(present) == len(IDENTITY_FIELDS):
+        return IDENTITY_COMPLETE
+    return IDENTITY_PARTIAL
+
 
 class VerifiedPaneTarget(NamedTuple):
     """One pane, proven at a single instant to still be the registered one.
@@ -155,27 +198,31 @@ def verified_pane_target(
     :class:`TerminalIdentityMismatchError` when the row *is* inside the
     boundary and the proof fails — before anything is written or read.
 
-    A row is inside the boundary when it records a pane id together with at
-    least one discriminator that a coincidence cannot supply: the owning
-    tmux server, or the pane's primary process id. Pane and window ids are
-    small integers that different tmux servers hand out independently, so
-    those two alone would let a pane on some other server answer for this
-    one. Rows predating identity persistence record neither discriminator;
-    they keep resolving by name exactly as before, which is the documented
-    boundary of this change rather than an oversight.
+    A row is inside the boundary only when it records the *whole*
+    canonical identity (see :func:`identity_completeness`). A partial
+    identity is refused rather than partially trusted, and a row with no
+    identity at all keeps resolving by name exactly as before — the
+    documented boundary of this change rather than an oversight.
 
     The check is read-only. It spends no provider turn, delivers no byte,
     and its whole cost is one enumeration of the panes tmux already knows
     about — so a refused operation costs nothing and a demotion is never
     something the system did to a worker, only something it noticed.
     """
-    recorded_pane = metadata.get("pane_id")
-    if not isinstance(recorded_pane, str) or not recorded_pane:
+    completeness = identity_completeness(metadata)
+    if completeness == IDENTITY_ABSENT:
         return None
-    recorded_socket = metadata.get("server_socket_path")
-    recorded_pid = metadata.get("pane_pid")
-    if not recorded_socket and not recorded_pid:
-        return None
+    if completeness == IDENTITY_PARTIAL:
+        recorded = {field: metadata.get(field) for field in IDENTITY_FIELDS}
+        missing = ", ".join(field for field in IDENTITY_FIELDS if not metadata.get(field))
+        _demote(terminal_id, LIFECYCLE_UNKNOWN_LIVENESS, f"identity incomplete: missing {missing}")
+        raise TerminalIdentityMismatchError(
+            f"Terminal {terminal_id} cannot be used for {operation}: its recorded identity "
+            f"is incomplete (missing {missing}; have {recorded}). The missing fields are not "
+            "inferred — a pane id resolved against an unnamed server can be a different live "
+            "pane. Nothing was delivered."
+        )
+    recorded_pane = metadata["pane_id"]
 
     backend = get_backend()
     # ``is True`` rather than a truthiness test: a backend double answers
@@ -220,19 +267,21 @@ def verified_pane_target(
             f"{recorded_pane} is dead. Nothing was delivered."
         )
 
+    # Every field is compared, because the identity was required to be
+    # complete to get here. A conditional comparison would quietly skip
+    # whichever field happened to be missing, which is the partial-trust
+    # this boundary refuses.
     mismatches = []
-    if recorded_socket and observed.get("server_socket_path") != recorded_socket:
-        mismatches.append(
-            f"tmux server {observed.get('server_socket_path')!r} != {recorded_socket!r}"
-        )
-    recorded_window = metadata.get("window_id")
-    if recorded_window and observed.get("window_id") != recorded_window:
-        mismatches.append(f"window {observed.get('window_id')!r} != {recorded_window!r}")
-    recorded_session_id = metadata.get("session_id")
-    if recorded_session_id and observed.get("session_id") != recorded_session_id:
-        mismatches.append(f"session {observed.get('session_id')!r} != {recorded_session_id!r}")
-    if recorded_pid and str(observed.get("pane_pid")) != str(recorded_pid):
-        mismatches.append(f"pane process {observed.get('pane_pid')!r} != {recorded_pid!r}")
+    for field, label in (
+        ("server_socket_path", "tmux server"),
+        ("window_id", "window"),
+        ("session_id", "session"),
+        ("pane_pid", "pane process"),
+    ):
+        recorded = metadata[field]
+        seen = observed.get(field)
+        if str(seen) != str(recorded):
+            mismatches.append(f"{label} {seen!r} != {recorded!r}")
 
     if mismatches:
         detail = "; ".join(mismatches)
@@ -1120,6 +1169,13 @@ async def create_terminal(
                 pane_id=identity.get("pane_id"),
                 window_id=identity.get("window_id"),
                 server_socket_path=identity.get("server_socket_path"),
+                # The rest of the canonical tuple, from the same single
+                # observation. Recorded now rather than repaired later:
+                # every consumer of this row treats a partial identity as
+                # unusable, so a row born incomplete is a row that has to
+                # be replaced rather than one that merely reads oddly.
+                session_id=identity.get("session_id"),
+                pane_pid=int(identity["pane_pid"]) if identity.get("pane_pid") else None,
             )
             # The v2 DB row is durably committed: observed creation.
             _mark_v2_resource_created(
@@ -1161,6 +1217,13 @@ async def create_terminal(
                 pane_id=identity.get("pane_id"),
                 window_id=identity.get("window_id"),
                 server_socket_path=identity.get("server_socket_path"),
+                # The rest of the canonical tuple, from the same single
+                # observation. Recorded now rather than repaired later:
+                # every consumer of this row treats a partial identity as
+                # unusable, so a row born incomplete is a row that has to
+                # be replaced rather than one that merely reads oddly.
+                session_id=identity.get("session_id"),
+                pane_pid=int(identity["pane_pid"]) if identity.get("pane_pid") else None,
             )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane

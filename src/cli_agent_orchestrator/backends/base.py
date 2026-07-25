@@ -167,6 +167,20 @@ class TerminalBackend(ABC):
         """
         return False
 
+    def observe_pane_identities(self) -> Optional[Dict[str, Dict[str, str]]]:
+        """Every observable pane's identity, keyed by pane id, in one read.
+
+        ``None`` means the server could not be read — distinct from an
+        empty mapping, which means it was read and holds no panes.
+
+        Exists so that a view rendering many terminals asks once rather
+        than once per row. Per-row probing is not merely slower: the rows
+        would be answered at different instants, so a listing could show
+        one terminal as live and another as dead on the strength of two
+        different moments.
+        """
+        return None
+
     def observe_pane_identity(self, pane_id: str) -> Optional[Dict[str, str]]:
         """The live facts of exactly ``pane_id``.
 
@@ -319,7 +333,14 @@ class TerminalBackend(ABC):
         ...
 
     @abstractmethod
-    def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
+    def prepare_web_attach(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        pane_id: Optional[str] = None,
+        server_socket_path: Optional[str] = None,
+    ) -> List[str]:
         """Prepare a browser PTY attachment and return its subprocess argv.
 
         Backends may perform routing work before returning, such as focusing a
@@ -328,6 +349,14 @@ class TerminalBackend(ABC):
         Args:
             session_name: Target session
             window_name: Target window
+            pane_id: A caller-verified immutable pane identity. When
+                present it is the target and the names are diagnostic
+                only. A backend that cannot address one may ignore it if
+                its own addressing is already identity-based (herdr
+                resolves its tabs by id), but must never use it as a hint
+                and then resolve by name anyway.
+            server_socket_path: The server that owns ``pane_id``, so the
+                attach cannot land on a different one.
 
         Returns:
             Subprocess argv for the interactive backend client

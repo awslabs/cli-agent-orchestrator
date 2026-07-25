@@ -94,38 +94,49 @@ class TmuxBackend(TerminalBackend):
     def supports_pane_identity(self) -> bool:
         return True
 
+    def observe_pane_identities(self) -> Optional[Dict[str, Dict[str, str]]]:
+        records = self._client.list_pane_control_identities()
+        if records is None:
+            return None
+        identities: Dict[str, Dict[str, str]] = {}
+        ambiguous = set()
+        for record in records:
+            if record.pane_id in identities:
+                # One id answering for two panes is not an observation of
+                # either. tmux does not do this within a server, but a
+                # reading that assumed so and was wrong would silently pick
+                # a pane rather than decline to.
+                ambiguous.add(record.pane_id)
+            identity = {
+                "outcome": "observed",
+                "pane_id": record.pane_id,
+                "window_id": record.window_id,
+                "session_id": record.session_id,
+                "pane_pid": str(record.pane_pid),
+                "session_name": record.session_name,
+                "window_name": record.window_name,
+                "dead": "1" if record.dead else "0",
+            }
+            # Absent rather than null when the owning server could not be
+            # proven, so a comparison against a recorded socket has nothing
+            # to pass against instead of comparing None to None and
+            # agreeing.
+            if record.server_socket_path is not None:
+                identity["server_socket_path"] = record.server_socket_path
+            identities[record.pane_id] = identity
+        for pane_id in ambiguous:
+            identities.pop(pane_id, None)
+        return identities
+
     def observe_pane_identity(self, pane_id: str) -> Optional[Dict[str, str]]:
         # Enumerated, then matched here, so that "the server answered and
         # this pane is not on it" stays distinguishable from "the server
         # did not answer". A single ``-t`` lookup collapses the two, and
         # collapsing them would let an unreadable server reap live rows.
-        records = self._client.list_pane_control_identities()
-        if records is None:
+        identities = self.observe_pane_identities()
+        if identities is None:
             return {"outcome": "unreadable"}
-        matches = [record for record in records if record.pane_id == pane_id]
-        if len(matches) > 1:
-            # One id matching several panes is not an observation of
-            # either of them.
-            return {"outcome": "unreadable"}
-        if not matches:
-            return {"outcome": "absent"}
-        observed = matches[0]
-        identity = {
-            "outcome": "observed",
-            "pane_id": observed.pane_id,
-            "window_id": observed.window_id,
-            "session_id": observed.session_id,
-            "pane_pid": str(observed.pane_pid),
-            "session_name": observed.session_name,
-            "window_name": observed.window_name,
-            "dead": "1" if observed.dead else "0",
-        }
-        # Absent rather than null when the owning server could not be
-        # proven, so a comparison against a recorded socket has nothing to
-        # pass against instead of comparing None to None and agreeing.
-        if observed.server_socket_path is not None:
-            identity["server_socket_path"] = observed.server_socket_path
-        return identity
+        return identities.get(pane_id) or {"outcome": "absent"}
 
     def create_window_with_argv(
         self,
@@ -208,8 +219,51 @@ class TmuxBackend(TerminalBackend):
 
         subprocess.run(["tmux", "attach-session", "-t", session_name], check=True)
 
-    def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
-        """Return the tmux command used by the browser PTY WebSocket."""
+    def prepare_web_attach(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        pane_id: Optional[str] = None,
+        server_socket_path: Optional[str] = None,
+    ) -> List[str]:
+        """Return the tmux command used by the browser PTY WebSocket.
+
+        Given a registered ``pane_id``, the target is that pane and the two
+        names are not used at all. This is the difference between opening
+        "the worker's terminal" and opening "whatever currently answers to
+        that window name" — the latter is what produced ``can't find
+        window:`` for deleted windows and, worse, a live attach to an
+        unrelated window that had reused the name.
+
+        Verified against the installed tmux (3.7b): ``attach-session -t``
+        with a pane id selects that pane's window, as does a window id. A
+        bare *session* id does not — it lands on whichever window the
+        session last had current — so the pane id is the target that
+        actually means what the caller intends.
+
+        ``server_socket_path`` is required alongside ``pane_id`` and is
+        not a refinement of it. A pane id is unique only within one tmux
+        server, several routinely run on one host, and a restarted server
+        hands out ``%0``/``%1`` again — so an unpinned id resolves against
+        whichever server this process happens to reach and can name a
+        different live pane. A pane id with no server is therefore refused
+        outright: not downgraded to the name form, and not attached to the
+        default server. Zero bytes either way.
+        """
+        if pane_id is not None:
+            if not server_socket_path:
+                raise TerminalBackendError(
+                    f"refusing to attach pane {pane_id} with no recorded tmux server: "
+                    "a pane id is unique only within one server, so an unpinned id "
+                    "can name a different live pane"
+                )
+            return ["tmux", "-S", server_socket_path, "-u", "attach-session", "-t", pane_id]
+        # No recorded identity at all: a row predating identity
+        # persistence. It keeps the name-resolved form, which is the
+        # documented edge of this change — such rows are not managed and
+        # are not registered. A row holding *some* identity never reaches
+        # here; the caller refuses it as unbound.
         return ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"]
 
     # --- Pipe-pane ---

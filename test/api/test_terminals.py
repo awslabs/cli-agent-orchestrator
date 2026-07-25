@@ -681,7 +681,12 @@ class TestWebSocketSubprocessTerm:
             with pytest.raises(_StopHere):
                 await main_module.terminal_ws(ws, "abcd1234")
 
-        backend.prepare_web_attach.assert_called_once_with("cao-s", "w")
+        # The row carries no recorded pane, so there is no identity to
+        # verify and none to pass down: the backend is asked for a
+        # name-resolved attach, which is what a pre-identity row gets.
+        backend.prepare_web_attach.assert_called_once_with(
+            "cao-s", "w", pane_id=None, server_socket_path=None
+        )
         assert captured["args"][0] == ["herdr", "--session", "cao"]
 
     @pytest.mark.asyncio
@@ -709,7 +714,11 @@ class TestWebSocketSubprocessTerm:
         ):
             await main_module.terminal_ws(ws, "abcd1234")
 
-        ws.close.assert_awaited_once_with(code=4004, reason="Failed to attach terminal")
+        # The close reason names the class of failure without echoing the
+        # backend's message, which may carry paths or other detail that
+        # does not belong in a browser-visible close frame.
+        ws.close.assert_awaited_once_with(code=4004, reason="terminal-unbound-identity")
+        assert "sensitive backend detail" not in ws.close.await_args.kwargs["reason"]
         mock_openpty.assert_not_called()
 
 

@@ -240,6 +240,61 @@ class TestReusedWindowNameIsNotAHandle:
         assert after["pane_id"] != live["pane_id"]
         assert impostor.received() == b""
 
+    @pytest.mark.parametrize(
+        "dropped",
+        ["server_socket_path", "session_id", "window_id", "pane_pid"],
+    )
+    def test_a_partial_identity_fails_closed_rather_than_being_trusted(
+        self,
+        isolated_memory_db,
+        tmux_server: TmuxServer,
+        tmux_backend: TmuxBackend,
+        tmp_path: Path,
+        dropped: str,
+    ):
+        """Every field is load-bearing; none of them is inferred.
+
+        A row missing any component is refused outright rather than
+        checked on the fields it does have. The dangerous case is concrete:
+        a restarted tmux server issues ``%0``/``%1`` again, so a row that
+        recorded a pane id without its server resolves, after the restart,
+        to a different live pane at the same id — and a boundary that
+        checked "the fields we have" would pass it.
+        """
+        client = TmuxClient()
+        name = f"cao-stale-{uuid.uuid4().hex[:6]}"
+        window = "worker-partial"
+        terminal_id = uuid.uuid4().hex[:8]
+
+        pane = _spawn_recorder(tmux_server, tmp_path, name, window)
+        identity = client.window_identity(pane.session, pane.window)
+        assert identity is not None
+        fields = {
+            "pane_id": identity["pane_id"],
+            "window_id": identity["window_id"],
+            "session_id": identity["session_id"],
+            "pane_pid": int(identity["pane_pid"]),
+            "server_socket_path": identity["server_socket_path"],
+        }
+        fields[dropped] = None
+        database.create_terminal(
+            terminal_id=terminal_id,
+            tmux_session=pane.session,
+            tmux_window=pane.window,
+            provider="claude_code",
+            **fields,
+        )
+
+        with pytest.raises(terminal_service.TerminalIdentityMismatchError, match="incomplete"):
+            terminal_service.send_input(terminal_id, PAYLOAD)
+
+        time.sleep(0.3)
+        # The pane is perfectly healthy — the refusal is about the row, so
+        # the live worker must be untouched rather than written to.
+        assert PAYLOAD.encode() not in pane.received()
+        after = database.get_terminal_metadata(terminal_id)
+        assert after["lifecycle_state"] == terminal_service.LIFECYCLE_UNKNOWN_LIVENESS
+
     def test_a_renamed_window_is_still_the_same_terminal(
         self,
         isolated_memory_db,
