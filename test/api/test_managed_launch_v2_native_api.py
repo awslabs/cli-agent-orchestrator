@@ -427,3 +427,61 @@ def test_every_advertised_v2_mode_has_a_launch_branch(client):
     advertised = client.get("/managed-launch/capabilities").json()["v2_launchable_execution_modes"]
 
     assert advertised == list(v2.LAUNCHABLE_EXECUTION_MODES)
+
+
+def test_a_not_yet_ready_bind_is_425_with_the_exact_serialized_envelope(
+    client, isolated_memory_db, worktree, tmp_path, monkeypatch
+):
+    """The transient bind refusal, as it actually appears on the wire.
+
+    Both sides had been modelling this envelope independently — the
+    consumer's client and its own fake shared one assumption about where
+    ``reason`` sits, and would have passed together while failing against
+    this server. So the shape is asserted here, through the real ASGI
+    app, where FastAPI does the serializing: a test that built the body
+    itself would be asserting its own model of the framework.
+
+    ``reason`` is nested under ``detail`` because that is what an
+    ``HTTPException(detail={...})`` produces. It is the one refusal a
+    consumer may retry, which is why it needs its own status *and* a
+    closed-vocabulary token — everything else on this surface stays 409
+    and permanent.
+    """
+    payload = _reserve_payload(worktree, tmp_path)
+    assert client.post(V2_ROOT, json=payload).status_code == 201
+    reservation_id = payload["reservation_id"]
+    v2.claim_launch(reservation_id)
+    # The bridge has started but published no durable readiness yet: the
+    # ordinary early state, not a fault.
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+        lambda _rid: {"state": "starting"},
+        raising=False,
+    )
+
+    response = client.post(
+        f"{V2_ROOT}/{reservation_id}/bind",
+        json=_bind_payload(
+            {
+                "terminal_id": _terminal_of(reservation_id),
+                "generation": _generation_of(reservation_id),
+            }
+        ),
+    )
+
+    assert response.status_code == 425, response.text
+    body = response.json()
+    assert set(body) == {"detail"}
+    assert body["detail"]["reason"] == "bind-bridge-not-durably-ready"
+    assert isinstance(body["detail"]["message"], str) and body["detail"]["message"]
+    # Not root-level: a consumer that reads body["reason"] finds nothing,
+    # which is exactly the divergence this pins.
+    assert "reason" not in body
+
+
+def _terminal_of(reservation_id: str) -> str:
+    return v2.get(reservation_id)["terminal_id"]
+
+
+def _generation_of(reservation_id: str) -> str:
+    return v2.get(reservation_id)["generation"]
