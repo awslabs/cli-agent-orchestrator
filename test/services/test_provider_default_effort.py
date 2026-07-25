@@ -544,3 +544,83 @@ class TestTheHelperIsTheOneComparison:
         assert provider_contracts.effort_receipt_matches(SENTINEL, None) is True
         assert provider_contracts.effort_receipt_matches(SENTINEL, "high") is False
         assert provider_contracts.effort_receipt_matches(SENTINEL, SENTINEL) is False
+
+
+class TestBindSurvivesAProviderDefaultRoute:
+    """The live cond-0112 Kimi failure, reproduced at the bind seam.
+
+    A Kimi native generation reached durable readiness -- input_ready
+    true, exact pane, native session present -- and its very first bind
+    returned HTTP 503, "native bind failed: assigned_effort must be a
+    non-empty string". Nothing was wrong with the readiness. The bind
+    intent fed the receipt's *observed* effort, which a truthful
+    provider-default receipt reports as null, into the *assigned* route
+    fact, which is a statement about what was asked for and is never
+    null.
+
+    Every earlier test of this route stopped at the receipt or at
+    readiness validation, so the one consumer that actually rejected the
+    null was never exercised with it.
+    """
+
+    def _ready_state(self, record):
+        session_id = "session_bf43ec1e-793f-4d5e-80dd-39a03e6d3d82"
+        return {
+            "state": "ready",
+            "readiness": {
+                "bridge_version": bridge.BRIDGE_VERSION,
+                "reservation_id": record["reservation_id"],
+                "terminal_id": record["terminal_id"],
+                "generation": record["generation"],
+                "provider": "kimi_cli",
+                "agent_profile": record["agent_profile"],
+                "model": K27,
+                # Honest: this route selected no effort, so none was read.
+                "effort": None,
+                "working_directory": record["working_directory"],
+                "receipt_id": session_id,
+                "provider_session_id": session_id,
+                "provider_version": "0.29.1",
+                "provider_receipt_kind": "kimi-native-tui-attached",
+                "model_input_ready": True,
+                "model_input_ready_observation": {
+                    "authority": "observe_kimi_turn_state",
+                    "observed_at": "2026-07-25T21:02:26Z",
+                    "pane_id": "%30",
+                    "provider_status": "idle",
+                    "input_ready": True,
+                    "detail": None,
+                },
+                "process_identity": {"pid": 14744, "start_marker": "Sat Jul 25 17:02:24 2026"},
+                "provider_session_start": None,
+            },
+        }
+
+    def test_a_provider_default_route_binds(
+        self, isolated_memory_db, _companion, worktree, tmp_path, monkeypatch
+    ):
+        import uuid as _uuid
+
+        from cli_agent_orchestrator.models.managed_launch_v2 import ManagedLaunchV2BindRequest
+
+        record = _reserve(worktree, tmp_path, model=K27, effort=SENTINEL)
+        v2.claim_launch(record["reservation_id"])
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+            lambda _rid: self._ready_state(record),
+            raising=False,
+        )
+        monkeypatch.setattr(v2, "_assert_session_not_foreign_held", lambda *a, **k: None)
+
+        bound = v2.bind_native(
+            record["reservation_id"],
+            ManagedLaunchV2BindRequest(
+                protocol_version=PROTOCOL_VERSION_V2,
+                terminal_id=record["terminal_id"],
+                generation=record["generation"],
+                attempt_id=str(_uuid.uuid4()),
+            ),
+        )
+
+        assert bound["state"] == "bound"
+        assert bound["binding"] is not None

@@ -574,3 +574,81 @@ class TestModelPinnabilityIsCheckedBeforeAnythingPersists:
         """
         with pytest.raises(cl.ClaudeNativeModelError):
             cl.validate_requested_model("gpt-5")
+
+
+class TestBindCarriesTheAssignedRouteNotTheObservation:
+    """A provider-default route must still name an assigned effort.
+
+    Reproduced live: a Kimi native generation reached durable readiness --
+    input_ready true, exact pane, native session present -- and the exact
+    idempotent bind replay returned HTTP 503, "native bind failed:
+    assigned_effort must be a non-empty string".
+
+    The cause is the requested/observed split not being carried into this
+    consumer. Making the receipt honest gave a provider-default route a
+    null *observed* effort, and the bind intent then fed that same null in
+    as the *assigned* route fact -- but assigned is a statement about what
+    was asked for, which is `provider-default`, and it is never null. The
+    two fields answer different questions and only one of them may be
+    unknown here.
+    """
+
+    ROUTE = {"expected_model": "kimi-code/kimi-for-coding", "expected_effort": "provider-default"}
+
+    def test_the_assigned_effort_is_the_requested_one_not_the_observation(self):
+        from cli_agent_orchestrator.services import recovery_receipts
+
+        payload = recovery_receipts.route_payload(
+            provider="kimi",
+            native_id="session_bf43ec1e",
+            authority_status="unobserved",
+            assigned_model=self.ROUTE["expected_model"],
+            assigned_effort=self.ROUTE["expected_effort"],
+            assigned_policy_sha256="0" * 64,
+            assigned_profile_sha256="0" * 64,
+            assigned_config_sha256="0" * 64,
+            requested_model=self.ROUTE["expected_model"],
+            requested_effort=self.ROUTE["expected_effort"],
+            observed_model=None,
+            observed_effort=None,
+            protocol_version=None,
+            event_sequence=None,
+            native_turn_id=None,
+            attested_at="2026-07-25T21:02:26Z",
+        )
+
+        # Canonical bytes, not a mapping: parsed rather than indexed, so
+        # the assertion is about what the receipt actually carries.
+        import json
+
+        fields = json.loads(payload.decode() if isinstance(payload, bytes) else payload)
+        assert fields["assigned_effort"] == "provider-default"
+        assert fields["observed_effort"] is None
+
+    def test_a_null_assigned_effort_is_refused_by_the_receipt_contract(self):
+        """The guard is right; feeding it the observation was wrong.
+
+        Pinned so the repair is understood as routing the correct fact to
+        this field, never as relaxing the field.
+        """
+        from cli_agent_orchestrator.services import recovery_receipts
+
+        with pytest.raises(Exception):
+            recovery_receipts.route_payload(
+                provider="kimi",
+                native_id="session_bf43ec1e",
+                authority_status="unobserved",
+                assigned_model=self.ROUTE["expected_model"],
+                assigned_effort=None,
+                assigned_policy_sha256="0" * 64,
+                assigned_profile_sha256="0" * 64,
+                assigned_config_sha256="0" * 64,
+                requested_model=self.ROUTE["expected_model"],
+                requested_effort=None,
+                observed_model=None,
+                observed_effort=None,
+                protocol_version=None,
+                event_sequence=None,
+                native_turn_id=None,
+                attested_at="2026-07-25T21:02:26Z",
+            )

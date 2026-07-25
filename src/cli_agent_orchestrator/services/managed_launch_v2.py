@@ -1637,6 +1637,10 @@ def _build_bind_intent(
     bound_mode: str,
 ) -> dict[str, Any]:
     """Compute the exact bind intent (payload bytes + token) for one attempt."""
+    # The reservation's own durable request. Named apart from ``request``,
+    # which is the *bind* request: the assigned/requested route facts are
+    # statements about what was reserved, not about this attempt.
+    reserved_request = _parse_json(row.request_json, {})
     terminal = (
         db.query(database.TerminalModel)
         .filter(database.TerminalModel.id == row.terminal_id)
@@ -1722,13 +1726,27 @@ def _build_bind_intent(
         provider=_PINNED_PROVIDER[row.provider],
         native_id=receipt["provider_session_id"],
         authority_status="unobserved",
-        assigned_model=receipt["model"],
-        assigned_effort=receipt["effort"],
+        # Assigned and requested are statements about what this route ASKED
+        # FOR, so they come from the reservation's own durable request. The
+        # observed fields below stay null because PF-2 is red and nothing
+        # here may claim a provider observation.
+        #
+        # They used to be read from the receipt, which was indistinguishable
+        # while a receipt merely echoed the request. Once the receipt became
+        # honest, a provider-default route reported a null *observed* effort
+        # and that null arrived here as the *assigned* one — which the
+        # receipt contract rightly refuses, because an assigned effort is
+        # never unknown. A live Kimi generation with complete readiness
+        # failed its bind with "assigned_effort must be a non-empty string"
+        # for exactly that reason. The two fields answer different
+        # questions and only the observed one may be absent.
+        assigned_model=reserved_request["expected_model"],
+        assigned_effort=reserved_request["expected_effort"],
         assigned_policy_sha256=receipt.get("profile_sha256") or ("0" * 64),
         assigned_profile_sha256=receipt.get("profile_sha256") or ("0" * 64),
         assigned_config_sha256=receipt.get("protected_config_sha256") or ("0" * 64),
-        requested_model=receipt["model"],
-        requested_effort=receipt["effort"],
+        requested_model=reserved_request["expected_model"],
+        requested_effort=reserved_request["expected_effort"],
         observed_model=None,
         observed_effort=None,
         protocol_version=None,
