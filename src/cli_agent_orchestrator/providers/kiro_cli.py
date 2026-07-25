@@ -160,6 +160,7 @@ class KiroCliProvider(BaseProvider):
         window_name: str,
         agent_profile: str,
         allowed_tools: Optional[list] = None,
+        model: Optional[str] = None,
     ):
         """Initialize Kiro CLI provider with terminal context.
 
@@ -169,11 +170,15 @@ class KiroCliProvider(BaseProvider):
             window_name: Name of the tmux window
             agent_profile: Name of the Kiro agent profile to use (e.g., "developer")
             allowed_tools: Optional list of CAO tool names the agent is allowed to use
+            model: Explicit per-call override for profile.model (see
+                _get_profile_model), e.g. a handoff/assign caller pinning a
+                specific model for one worker without a dedicated profile.
         """
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._input_received = False
         self._agent_profile = agent_profile
+        self._model = model
 
         # Build dynamic prompt pattern based on agent profile
         # This pattern matches various Kiro prompt formats after ANSI stripping:
@@ -224,12 +229,15 @@ class KiroCliProvider(BaseProvider):
         return 2000
 
     def _get_profile_model(self) -> Optional[str]:
-        """Return profile.model if the agent profile can be loaded, else None.
+        """Return the explicit per-call model override if given, else
+        profile.model if the agent profile can be loaded, else None.
 
         Best-effort: historically the Kiro CLI provider has not required the
         CAO agent profile to be loadable at runtime (kiro-cli has its own
         agent store). A missing or unparseable profile must not block launch.
         """
+        if self._model:
+            return self._model
         try:
             profile = load_agent_profile(self._agent_profile)
         except (FileNotFoundError, RuntimeError) as exc:

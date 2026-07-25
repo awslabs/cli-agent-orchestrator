@@ -1,5 +1,6 @@
 """Flow service for scheduled agent sessions."""
 
+import asyncio
 import json
 import logging
 import re
@@ -266,8 +267,14 @@ async def execute_flow(name: str) -> bool:
             new_session=True,
         )
 
-        # Send rendered prompt to terminal
-        send_input(terminal.id, rendered_prompt)
+        # Send rendered prompt to terminal. send_input is blocking tmux I/O
+        # (now additionally a pane-foreground-command probe on top of the
+        # existing bracketed-paste delivery, see clients/tmux.py's
+        # _pane_is_bracketed_paste_incompatible) -- run it off the event loop
+        # so a slow tmux call can't freeze every other request (same hazard
+        # class as issue #382, already fixed for POST /terminals/{id}/input
+        # in api/main.py's send_terminal_input; this call site was missed).
+        await asyncio.to_thread(send_input, terminal.id, rendered_prompt)
 
         logger.info(f"Flow {name}: launched session {session_name}")
         return True

@@ -1162,6 +1162,7 @@ class TestLifespan:
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
+            patch("cli_agent_orchestrator.api.main._seed_default_skills_at_startup") as mock_seed,
             patch(
                 "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
                 return_value=None,
@@ -1186,6 +1187,7 @@ class TestLifespan:
         ):
             async with lifespan(app):
                 # Inside the lifespan — startup completed.
+                mock_seed.assert_called_once_with()
                 # The registry was loaded and stored on app state.
                 mock_load.assert_awaited_once()
                 assert app.state.plugin_registry is not None

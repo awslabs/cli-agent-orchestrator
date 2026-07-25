@@ -183,6 +183,51 @@ describe('API wrapper', () => {
     await expect(api.listSessions()).rejects.toThrow('500 Internal Server Error')
   })
 
+  it('preserves string error detail on non-OK response', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      json: () => Promise.resolve({ detail: 'bad graph scope' }),
+    })
+
+    try {
+      await api.getGraph('memory', 'session')
+      throw new Error('expected rejection')
+    } catch (err: any) {
+      expect(err.status).toBe(400)
+      expect(err.detail).toBe('bad graph scope')
+      expect(err.kind).toBeUndefined()
+    }
+  })
+
+  it('preserves object error detail metadata on non-OK response', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 504,
+      statusText: 'Gateway Timeout',
+      json: () => Promise.resolve({
+        detail: {
+          message: 'graph projection timed out after 90 seconds',
+          kind: 'graph_projection_timeout',
+          timeout_s: 90,
+          metadata: { graph_projection_timeout: true },
+        },
+      }),
+    })
+
+    try {
+      await api.getGraph('memory', 'global')
+      throw new Error('expected rejection')
+    } catch (err: any) {
+      expect(err.status).toBe(504)
+      expect(err.detail).toBe('graph projection timed out after 90 seconds')
+      expect(err.kind).toBe('graph_projection_timeout')
+      expect(err.detailMeta.timeout_s).toBe(90)
+      expect(err.detailMeta.metadata.graph_projection_timeout).toBe(true)
+    }
+  })
+
   it('exitTerminal sends POST', async () => {
     mockResponse({ success: true })
     await api.exitTerminal('t1')

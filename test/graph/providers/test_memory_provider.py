@@ -9,6 +9,7 @@ engine (no mocking of the memory internals); the lint LLM is stubbed.
 import asyncio
 import json
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import create_engine
@@ -311,3 +312,34 @@ class TestMemoryProviderEdgeCases:
 
         with pytest.raises(asyncio.CancelledError):
             await provider.project(scope="global")
+
+    @pytest.mark.asyncio
+    async def test_lint_disabled_skips_run_lint_and_keeps_related_topology(
+        self, populated_scope, monkeypatch
+    ):
+        run_lint = AsyncMock(return_value=[])
+        monkeypatch.setattr(wiki_lint, "run_lint", run_lint)
+        provider = MemoryGraphProvider(
+            memory_service=populated_scope,
+            lint_enabled=lambda: False,
+        )
+
+        view = await provider.project(scope="global")
+
+        run_lint.assert_not_called()
+        assert {n.id for n in view.nodes} >= {"a", "b", "c"}
+        assert [(e.source, e.target, e.type) for e in view.edges] == [
+            ("a", "b", EdgeType.RELATES_TO)
+        ]
+        assert view.meta["lint_enabled"] is False
+        assert view.meta["lint_enrichment"] == "disabled"
+        assert set(view.meta["disabled_enrichments"]) == {
+            "orphan_page",
+            "contradiction",
+            "stale_claim",
+            "poison_frequency",
+            "graph_density",
+        }
+        by_id = {n.id: n for n in view.nodes}
+        assert "is_hub" not in by_id["a"].attrs
+        assert all(e.type != EdgeType.CONTRADICTION for e in view.edges)
