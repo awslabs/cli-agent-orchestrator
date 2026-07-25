@@ -1069,6 +1069,22 @@ def complete_admission(
                 return _row_dict(row)
             if row.state != "admitting":
                 raise ManagedLaunchConflict(f"admission cannot complete from state {row.state!r}")
+            mode = em.mode_of_record(_mode_record(row))
+            if mode == em.NATIVE_TUI:
+                # The mirror of the guard in complete_native_admission, so
+                # the two completions exclude each other by construction
+                # rather than by whoever calls them being careful. Provider
+                # and receipt kind alone cannot tell them apart: a native
+                # kimi row and an ACP kimi row agree on both, and a
+                # well-formed ACP receipt naming the bound session would
+                # otherwise mark a native generation admitted on a turn
+                # that happened over a socket it never opened.
+                raise ManagedLaunchConflict(
+                    f"an immutable {em.NATIVE_TUI!r} row completes on its own control "
+                    f"operation record, never on a provider submission receipt; a receipt "
+                    f"is evidence about a different transport, not weaker evidence about "
+                    f"this one"
+                )
             expected_kind = {
                 "codex": "codex-turn-start",
                 "kimi_cli": "kimi-session-update",
@@ -1099,6 +1115,172 @@ def complete_admission(
         raise
     except Exception as exc:  # noqa: BLE001
         raise ManagedLaunchUnavailable(f"task admission completion failed: {exc}") from exc
+
+
+def complete_native_admission(
+    reservation_id: str,
+    delivery_id: str,
+    operation: dict[str, Any],
+    expected_payload_sha256: str,
+) -> dict[str, Any]:
+    """Complete a native admission from the control operation's own record.
+
+    A native TUI emits no submission receipt.  There is no provider
+    transcript, no turn id, and no socket that could carry one — the
+    human's screen is the transcript.  So admission completes on the
+    durable, identity-bound operation record the control adapter wrote,
+    and on nothing else.  Reusing the ACP path here would mean either
+    inventing a receipt kind or accepting an ACP receipt for a native
+    generation, and both are refused: an ACP receipt is not weaker
+    evidence about a native run, it is evidence about a different thing.
+
+    What completes is the *admission* — this exact task was delivered
+    into this exact bound session, exactly once.  That is a different
+    claim from "the provider took the turn", which stays open in the
+    operation's own ``provider_accepted`` field until something observes
+    the pane.  Collapsing the two is the tempting error: a caller that
+    read a successful write as an accepted turn would report work
+    started that may still be sitting in a composer.
+    """
+    from cli_agent_orchestrator.services import kimi_native_control
+
+    try:
+        with database.SessionLocal() as db:
+            row = _query(db, reservation_id)
+            if row is None:
+                raise ManagedLaunchNotFound(f"v2 reservation not found: {reservation_id}")
+            admission = _parse_json(row.admission_json, None)
+            if not admission or admission.get("delivery_id") != delivery_id:
+                raise ManagedLaunchConflict("delivery_id does not match the admission claim")
+            if admission.get("status") == "admitted":
+                if admission.get("native_submission") != operation:
+                    raise ManagedLaunchConflict("native submission record changed after admission")
+                return _row_dict(row)
+            if row.state != "admitting":
+                raise ManagedLaunchConflict(f"admission cannot complete from state {row.state!r}")
+            mode = em.mode_of_record(_mode_record(row))
+            if mode != em.NATIVE_TUI:
+                # The mode is immutable, so this can only be reached by a
+                # caller that routed an ACP row into the native branch.
+                raise ManagedLaunchConflict(
+                    f"native admission completion requires an immutable {em.NATIVE_TUI!r} "
+                    f"row; this reservation is {mode!r} and completes over its bridge path"
+                )
+            if operation.get("schema") != kimi_native_control.RECORD_SCHEMA:
+                raise ManagedLaunchConflict(
+                    f"native admission requires a {kimi_native_control.RECORD_SCHEMA!r} "
+                    f"operation record; got {operation.get('schema')!r}"
+                )
+            if operation.get("kind") != kimi_native_control.KIND_QUEUE:
+                # Admission is ordinary first delivery. A steer targets a
+                # running turn and a control op is a slash command; either
+                # completing an admission would mean the task bytes went
+                # somewhere other than the idle-gated queue path.
+                raise ManagedLaunchConflict(
+                    f"native admission requires a {kimi_native_control.KIND_QUEUE!r} "
+                    f"operation; got {operation.get('kind')!r}"
+                )
+            if not operation.get("posted"):
+                raise ManagedLaunchConflict(
+                    "native admission requires an operation whose payload was posted; "
+                    f"operation {operation.get('operation_id')!r} is "
+                    f"{operation.get('state')!r}"
+                )
+            binding = _parse_json(row.binding_json, {}) or {}
+            expected_identity = (
+                binding.get("native_session_id"),
+                row.terminal_id,
+                row.generation,
+                em.NATIVE_TUI,
+            )
+            actual_identity = (
+                operation.get("native_session_id"),
+                operation.get("terminal_id"),
+                operation.get("generation"),
+                operation.get("execution_mode"),
+            )
+            if actual_identity != expected_identity:
+                raise ManagedLaunchConflict(
+                    f"native submission identity {actual_identity} does not match the bound "
+                    f"generation {expected_identity}; admission is refused rather than "
+                    f"credited to another session"
+                )
+            if operation.get("payload_sha256") != expected_payload_sha256:
+                # Binds the exact bytes. Without this the record could
+                # certify that *something* was typed into the right pane
+                # while the admitted task was a different message.
+                #
+                # Compared against a digest the caller computes with the
+                # control adapter's own convention rather than against the
+                # admission's ``message_sha256``: the adapter hashes the
+                # canonical JSON encoding of the payload, and the admission
+                # hashes the raw message bytes, so the two disagree on every
+                # message. Restating the digest here would only re-encode
+                # the mismatch; the caller states which bytes it admitted.
+                raise ManagedLaunchConflict(
+                    "native submission payload digest does not match the admitted message"
+                )
+            admission["native_submission"] = operation
+            # Named on the admission itself so a reader never has to infer
+            # it from the nested record. Admission is delivery; the turn is
+            # a separate fact that may still be unobserved.
+            admission["provider_accepted"] = bool(operation.get("provider_accepted"))
+            admission["status"] = "admitted"
+            admission["admitted_at"] = _now()
+            row.admission_json = _canonical_json(admission)
+            row.state = "admitted"
+            row.updated_at = _now()
+            db.commit()
+            db.refresh(row)
+            return _row_dict(row)
+    except ManagedLaunchError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ManagedLaunchUnavailable(f"native admission completion failed: {exc}") from exc
+
+
+def mark_admission_refused(
+    reservation_id: str,
+    delivery_id: str,
+    reason: str,
+    detail: str,
+) -> dict[str, Any]:
+    """The state for "provably nothing was sent", which is not ambiguity.
+
+    Kept distinct from :func:`mark_admission_ambiguous` because the two
+    license opposite handling.  Ambiguity means the bytes may have landed,
+    so nothing may be resent.  A refusal carries the control adapter's own
+    proof that the payload was never posted, so the delivery is closed
+    with a reason a caller can act on instead of a silence it must treat
+    as maybe-delivered forever.
+    """
+    try:
+        with database.SessionLocal() as db:
+            row = _query(db, reservation_id)
+            if row is None:
+                raise ManagedLaunchNotFound(f"v2 reservation not found: {reservation_id}")
+            admission = _parse_json(row.admission_json, None)
+            if not admission or admission.get("delivery_id") != delivery_id:
+                raise ManagedLaunchConflict("delivery_id does not match the admission claim")
+            if admission.get("status") == "admitted":
+                return _row_dict(row)
+            admission["status"] = "refused"
+            admission["refusal_reason"] = reason
+            admission["detail"] = detail
+            admission["updated_at"] = _now()
+            row.admission_json = _canonical_json(admission)
+            # The row is preserved rather than advanced: nothing was
+            # delivered, so nothing downstream may treat this generation
+            # as carrying a task.
+            row.state = "admitting"
+            row.updated_at = _now()
+            db.commit()
+            db.refresh(row)
+            return _row_dict(row)
+    except ManagedLaunchError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ManagedLaunchUnavailable(f"refused admission persistence failed: {exc}") from exc
 
 
 def mark_admission_ambiguous(reservation_id: str, delivery_id: str, detail: str) -> dict[str, Any]:
@@ -1545,6 +1727,344 @@ def _native_readiness_receipt(
     }
 
 
+def _validate_native_admission_identity(record: dict[str, Any]) -> dict[str, Any]:
+    """Prove the bound native identity is still exactly what was bound.
+
+    Runs before the admission is claimed and before a single byte is
+    written, so every refusal below leaves zero task admission and zero
+    provider I/O with the reservation row untouched.  That ordering is
+    the contract: a caller that receives a refusal here knows the task
+    was not delivered, rather than having to treat it as maybe-delivered.
+
+    The authority is the exclusive-attachment store, not the reservation
+    row.  The row records what was bound; the store records who holds the
+    session *now*.  Trusting the row would let an admission minted for a
+    generation that has since been replaced type into the pane that
+    replaced it — the exact crossing the ownership record exists to stop.
+
+    The live pane is then compared against what the store recorded at
+    attach: pane id, pid, and process start marker together.  A bare pid
+    is not identity, since pids recycle in both directions — a stale one
+    can match an unrelated live process and forge a survivor.
+    """
+    from cli_agent_orchestrator.services import (
+        kimi_native_control,
+        native_tui_launch,
+        terminal_service,
+    )
+
+    provider = record["provider"]
+    if provider not in NATIVE_TUI_PROVIDERS:
+        raise ManagedLaunchConflict(
+            f"native admission is not supported for provider {provider!r}; "
+            f"native providers are {sorted(NATIVE_TUI_PROVIDERS)}"
+        )
+    binding = record.get("binding")
+    if not isinstance(binding, dict) or not binding:
+        raise ManagedLaunchConflict(
+            "native admission requires the journaled native binding; without it there is "
+            "no proven session to deliver into and zero task bytes are sent"
+        )
+    if binding.get("execution_mode") != em.NATIVE_TUI:
+        raise ManagedLaunchConflict(
+            f"the journaled binding carries execution_mode "
+            f"{binding.get('execution_mode')!r}, not {em.NATIVE_TUI!r}"
+        )
+    native_session_id = binding.get("native_session_id")
+    if not isinstance(native_session_id, str) or not native_session_id:
+        raise ManagedLaunchConflict("the journaled binding carries no native session id")
+
+    blocking = kimi_native_control.unresolved_ambiguity(native_session_id)
+    if blocking is not None:
+        # Checked here rather than left to the adapter so the refusal
+        # happens before the admission is claimed. An earlier operation
+        # that may or may not have landed makes the transcript order
+        # unreconstructable if anything further is sent.
+        raise ManagedLaunchConflict(
+            f"control operation {blocking['operation_id']!r} on session "
+            f"{native_session_id} is ambiguous and must be reconciled by exact id "
+            f"before any further input; zero task bytes were sent"
+        )
+
+    attachment = native_attachment.get(provider, native_session_id)
+    if attachment is None:
+        raise ManagedLaunchConflict(
+            f"no attachment record for {provider} session {native_session_id}; "
+            f"native admission requires a live owned attachment"
+        )
+    if attachment["state"] != native_attachment.ATTACHED:
+        raise ManagedLaunchConflict(
+            f"{provider} session {native_session_id} is {attachment['state']!r}, not "
+            f"{native_attachment.ATTACHED!r}; only an attached session accepts a task"
+        )
+    owner = attachment["owner"]
+    expected_owner = (record["terminal_id"], record["generation"], em.NATIVE_TUI)
+    actual_owner = (owner["terminal_id"], owner["generation"], owner["execution_mode"])
+    if actual_owner != expected_owner:
+        raise ManagedLaunchConflict(
+            f"{provider} session {native_session_id} is held by {actual_owner}, not "
+            f"{expected_owner}; the task is refused rather than delivered to another "
+            f"owner's pane"
+        )
+
+    pane_id = owner.get("pane_id")
+    if not isinstance(pane_id, str) or not pane_id:
+        raise ManagedLaunchConflict(
+            f"the attachment for session {native_session_id} records no pane id, so the "
+            f"exact pane to deliver into cannot be named"
+        )
+    recorded_process = owner.get("process_identity") or {}
+    recorded_pid = recorded_process.get("pid")
+    recorded_marker = recorded_process.get("start_marker")
+    if not isinstance(recorded_pid, int) or not isinstance(recorded_marker, str):
+        raise ManagedLaunchConflict(
+            f"the attachment for session {native_session_id} records no usable process "
+            f"identity; a task must never be typed at an unidentified process"
+        )
+
+    session_name = record["session_name"]
+    window_name = managed_window_name(record["terminal_id"], record["generation"])
+    pane = native_tui_launch.TmuxNativePane(
+        terminal_service.get_backend(),
+        session_name=session_name,
+        window_name=window_name,
+        terminal_id=record["terminal_id"],
+    )
+    # An observation that could not be made raises out of here as
+    # unavailable (503) rather than becoming a refusal (409). "The pane
+    # is gone" and "we could not look" license opposite handling, and
+    # reporting the second as the first would close a delivery that is
+    # still open.
+    try:
+        observed = pane.observe()
+    except native_tui_launch.NativeLaunchError as exc:
+        raise ManagedLaunchUnavailable(
+            f"the bound native pane could not be observed, so the task was not sent: {exc}"
+        ) from exc
+    if observed is None:
+        raise ManagedLaunchConflict(
+            f"the bound native pane for session {native_session_id} no longer exists; "
+            f"the task is refused rather than typed into whatever replaced it"
+        )
+    observed_identity = (
+        str(observed["pane_id"]),
+        observed["pid"],
+        observed["start_marker"],
+    )
+    recorded_identity = (pane_id, recorded_pid, recorded_marker)
+    if observed_identity != recorded_identity:
+        raise ManagedLaunchConflict(
+            f"the live pane identity {observed_identity} does not match the attached "
+            f"identity {recorded_identity}; the process holding this session was "
+            f"replaced and the task is refused with zero bytes sent"
+        )
+
+    return {
+        "provider": provider,
+        "native_session_id": native_session_id,
+        "pane_id": pane_id,
+        "session_name": session_name,
+        "window_name": window_name,
+    }
+
+
+def _settle_native_admission(
+    reservation_id: str,
+    delivery_id: str,
+    operation: dict[str, Any],
+    expected_payload_sha256: str,
+) -> dict[str, Any]:
+    """Map one control-operation outcome onto the admission record.
+
+    Reads the adapter's own transport-vs-provider split rather than
+    re-deciding it: ``posted`` is the only field that says bytes were
+    written, and it is what admission turns on.  Anything that is not
+    posted and not a typed refusal is treated as ambiguous, so an
+    unrecognised state can never be read as a delivery.
+    """
+    from cli_agent_orchestrator.services import kimi_native_control
+
+    if operation.get("posted"):
+        return complete_native_admission(
+            reservation_id, delivery_id, operation, expected_payload_sha256
+        )
+    state = operation.get("state")
+    if state == kimi_native_control.REFUSED:
+        return mark_admission_refused(
+            reservation_id,
+            delivery_id,
+            operation.get("refusal_reason") or "unspecified control refusal",
+            f"control operation {operation.get('operation_id')!r} was refused before any "
+            f"input was written; no task bytes reached the session",
+        )
+    return mark_admission_ambiguous(
+        reservation_id,
+        delivery_id,
+        operation.get("ambiguity_reason")
+        or (
+            f"control operation {operation.get('operation_id')!r} is {state!r}; whether "
+            f"the task bytes landed is unknown and must be reconciled by exact id"
+        ),
+    )
+
+
+def _reconcile_native_admission(
+    reservation_id: str,
+    record: dict[str, Any],
+    request: ManagedLaunchV2AdmitRequest,
+    expected_payload_sha256: str,
+) -> dict[str, Any]:
+    """Answer a replayed native admission from stored state, sending nothing.
+
+    v2 has no reconcile endpoint; a lost admission response is recovered
+    by replaying the same delivery id, which lands here.  The delivery id
+    is also the control operation id, so the exact operation is
+    addressable — no scan, no recency guess, no "the last thing we typed".
+    """
+    from cli_agent_orchestrator.services import kimi_native_control
+
+    admission = record.get("admission") or {}
+    if admission.get("status") == "admitted":
+        return record
+    operation = kimi_native_control.get(request.delivery_id)
+    if operation is None:
+        # The adapter journals its intent before any I/O, so an absent
+        # operation record means the crash landed between claiming the
+        # admission and opening the operation — provably before anything
+        # was typed.
+        return mark_admission_refused(
+            reservation_id,
+            request.delivery_id,
+            "no_control_operation",
+            "the admission was claimed but no control operation was ever opened, so the "
+            "task was never written to the pane",
+        )
+    return _settle_native_admission(
+        reservation_id, request.delivery_id, operation, expected_payload_sha256
+    )
+
+
+async def _admit_native_tui(
+    reservation_id: str,
+    record: dict[str, Any],
+    request: ManagedLaunchV2AdmitRequest,
+) -> dict[str, Any]:
+    """Deliver one admitted task into a native TUI, with no ACP bridge.
+
+    A native generation starts no bridge process and owns no control
+    socket, so the bridge is not merely unnecessary here — it does not
+    exist, and waiting on it is how a native admission used to end in a
+    two-minute timeout and a fabricated ambiguity.  Delivery instead goes
+    through the control adapter's idle-gated queue operation into the
+    exact bound session.
+    """
+    import asyncio
+
+    from cli_agent_orchestrator.models.terminal import TerminalStatus
+    from cli_agent_orchestrator.services import kimi_native_control
+    from cli_agent_orchestrator.services.canonical_json import canonical_sha256
+    from cli_agent_orchestrator.services.native_pane_input import (
+        TmuxPaneInput,
+        observe_kimi_turn_state,
+    )
+
+    # The control adapter digests the payload with its own canonical
+    # encoding, which is not the admission's raw-bytes ``message_sha256``.
+    # Computed once here from the same string the delivery will carry, so
+    # completion can bind the exact bytes without either side guessing at
+    # the other's convention.
+    expected_payload_sha256 = canonical_sha256(request.message)
+
+    if record.get("admission") is not None:
+        # A replay is answered from stored state before anything looks at
+        # the pane. Running the first-delivery checks here would ask the
+        # wrong question: the control adapter blocks a session holding an
+        # unresolved ambiguity, and on a replay that ambiguity is this very
+        # operation — so the gate would refuse to reconcile the one thing
+        # that needs reconciling, permanently. Nothing is sent on this path
+        # under any outcome, so there is nothing for a live check to protect.
+        record, _ = claim_admission(reservation_id, request)
+        # ``claim_admission`` cannot mint a fresh claim over an existing
+        # admission (its update is filtered on a null admission), so the
+        # call is purely the replay-identity check: a same-delivery-id
+        # request with a different message, sender, context, or binding is
+        # refused rather than answered from the earlier admission's state.
+        return await asyncio.to_thread(
+            _reconcile_native_admission,
+            reservation_id,
+            record,
+            request,
+            expected_payload_sha256,
+        )
+
+    identity = await asyncio.to_thread(_validate_native_admission_identity, record)
+
+    observed_at = _now()
+    status = await asyncio.to_thread(
+        observe_kimi_turn_state,
+        identity["pane_id"],
+        terminal_id=record["terminal_id"],
+        session_name=identity["session_name"],
+        window_name=identity["window_name"],
+    )
+    if status is not TerminalStatus.IDLE:
+        # Idle-gated by the provider's own reading of its own screen.
+        # The boot window is the case that matters: Kimi paints its
+        # status bar before it can accept input, and a task delivered
+        # into that window is absorbed with no error anywhere.
+        raise ManagedLaunchConflict(
+            f"the bound native pane reads {status.value!r}, not idle; the task is refused "
+            f"rather than typed into a session that is mid-turn or still booting. Zero "
+            f"task bytes were sent and the reservation is unchanged"
+        )
+
+    record, should_send = claim_admission(reservation_id, request)
+    if not should_send:
+        # Lost the claim to a concurrent request for the same delivery id.
+        return await asyncio.to_thread(
+            _reconcile_native_admission,
+            reservation_id,
+            record,
+            request,
+            expected_payload_sha256,
+        )
+
+    # The delivery id is the operation id: it is caller-minted, immutable
+    # on the reservation, and already the identity a replay carries, so a
+    # lost response addresses the exact operation with nothing derived.
+    observation = kimi_native_control.turn_observation(
+        active_turn_id=None,
+        observed_at=observed_at,
+        observer="managed_launch_v2.admit_reserved",
+    )
+    try:
+        operation = await asyncio.to_thread(
+            kimi_native_control.queue,
+            operation_id=request.delivery_id,
+            native_session_id=identity["native_session_id"],
+            terminal_id=record["terminal_id"],
+            generation=record["generation"],
+            execution_mode=em.NATIVE_TUI,
+            text=request.message,
+            observation=observation,
+            transport=TmuxPaneInput(identity["pane_id"]),
+        )
+    except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
+        # Deliberately conservative. The adapter turns transport failures
+        # into ambiguous records itself, so an exception escaping it is a
+        # store or programming failure whose position relative to the
+        # keystrokes is unknown — and treating unknown as "not sent" is
+        # what would license a duplicate task.
+        return mark_admission_ambiguous(
+            reservation_id,
+            request.delivery_id,
+            f"native control raised while delivering the task: {exc}",
+        )
+    return _settle_native_admission(
+        reservation_id, request.delivery_id, operation, expected_payload_sha256
+    )
+
+
 async def admit_reserved(
     reservation_id: str,
     request: ManagedLaunchV2AdmitRequest,
@@ -1565,6 +2085,16 @@ async def admit_reserved(
     generation_fence.assert_admission_open(
         COMPANION_DIR, record["terminal_id"], record["generation"]
     )
+    # Admission branches on the immutable mode exactly as launch does,
+    # and the two branches share no code below this point. The ACP bridge
+    # is a lawful admission transport for ACP rows only: a native
+    # generation never starts one, so requiring it there would mean
+    # waiting on a socket that will never exist. Neither branch can
+    # partially become the other, and neither is ever a fallback for the
+    # other's failure.
+    if record["execution_mode"] == em.NATIVE_TUI:
+        return await _admit_native_tui(reservation_id, record, request)
+
     record, should_send = claim_admission(reservation_id, request)
     if not should_send:
         if record["state"] == "admitting":
