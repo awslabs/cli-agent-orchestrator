@@ -2748,6 +2748,10 @@ class _V2NativePane:
             # command line could be interrupted into something else.
             managed_native_command=argv,
             protocol_vintage="v2",
+            # The pane runs the provider's own full-screen TUI, so its
+            # status comes from the native observer and the FIFO monitor
+            # is never scheduled for it.
+            native_status_source=True,
         )
         return self._window
 

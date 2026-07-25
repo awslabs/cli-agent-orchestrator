@@ -1444,6 +1444,31 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         }
 
 
+#: Why a live-incarnation registration did not happen. A closed vocabulary
+#: rather than a boolean because the three failures need different fixes
+#: and one flag makes them indistinguishable exactly when somebody has to
+#: know which occurred: an absent row means the launch wrote no terminal, a
+#: partial identity means the pane could not be fully observed, and a held
+#: pane means something tried to move an existing handle. The last is a
+#: safety refusal and the other two are launch faults, so a caller that
+#: cannot tell them apart cannot fail closed correctly either.
+REGISTRATION_OK = "registered"
+REGISTRATION_ABSENT_ROW = "absent-row"
+REGISTRATION_PARTIAL_IDENTITY = "partial-identity"
+REGISTRATION_PANE_ALREADY_HELD = "pane-already-held"
+REGISTRATION_GENERATION_MISMATCH = "generation-mismatch"
+
+REGISTRATION_OUTCOMES = frozenset(
+    {
+        REGISTRATION_OK,
+        REGISTRATION_ABSENT_ROW,
+        REGISTRATION_PARTIAL_IDENTITY,
+        REGISTRATION_PANE_ALREADY_HELD,
+        REGISTRATION_GENERATION_MISMATCH,
+    }
+)
+
+
 def register_terminal_incarnation(
     terminal_id: str,
     *,
@@ -1455,13 +1480,44 @@ def register_terminal_incarnation(
     pane_pid: int,
     native_session_id: Optional[str] = None,
 ) -> bool:
+    """Bool form of :func:`register_terminal_incarnation_outcome`.
+
+    Kept because ``True``/``False`` is what the v1 launch path has always
+    asked for. It is a projection of the typed outcome, never a second
+    implementation of the rules.
+    """
+    return (
+        register_terminal_incarnation_outcome(
+            terminal_id,
+            generation=generation,
+            server_socket_path=server_socket_path,
+            session_id=session_id,
+            window_id=window_id,
+            pane_id=pane_id,
+            pane_pid=pane_pid,
+            native_session_id=native_session_id,
+        )
+        == REGISTRATION_OK
+    )
+
+
+def register_terminal_incarnation_outcome(
+    terminal_id: str,
+    *,
+    generation: Optional[str],
+    server_socket_path: str,
+    session_id: str,
+    window_id: str,
+    pane_id: str,
+    pane_pid: int,
+    native_session_id: Optional[str] = None,
+) -> str:
     """Write one live incarnation's complete canonical identity in a single
     transaction, and mark it live.
 
-    Returns True when the row now carries exactly this tuple — whether this
-    call wrote it or an identical earlier call already had. Returns False
-    when the row is absent, or when it already carries a *different*
-    identity for the same generation.
+    Returns ``REGISTRATION_OK`` when the row now carries exactly this
+    tuple — whether this call wrote it or an identical earlier call
+    already had — and otherwise the exact reason it does not.
 
     Two properties the callers depend on:
 
@@ -1480,11 +1536,11 @@ def register_terminal_incarnation(
         # Partial identity is refused outright rather than stored with the
         # unreadable parts left NULL: a row published with three of five
         # fields is a row some later check will pass against.
-        return False
+        return REGISTRATION_PARTIAL_IDENTITY
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal is None:
-            return False
+            return REGISTRATION_ABSENT_ROW
         already = (
             terminal.pane_id is not None
             or terminal.window_id is not None
@@ -1504,7 +1560,7 @@ def register_terminal_incarnation(
                 terminal.pane_id,
                 pane_id,
             )
-            return False
+            return REGISTRATION_PANE_ALREADY_HELD
         if generation is not None and terminal.generation not in (None, generation):
             logger.warning(
                 "Refusing to register terminal %s under generation %s; row holds %s",
@@ -1512,7 +1568,7 @@ def register_terminal_incarnation(
                 generation,
                 terminal.generation,
             )
-            return False
+            return REGISTRATION_GENERATION_MISMATCH
         terminal.server_socket_path = server_socket_path
         terminal.session_id = session_id
         terminal.window_id = window_id
@@ -1528,7 +1584,90 @@ def register_terminal_incarnation(
         terminal.superseded_by_terminal_id = None
         terminal.superseded_by_generation = None
         db.commit()
-        return True
+        return REGISTRATION_OK
+
+
+def register_v2_terminal_incarnation_outcome(
+    terminal_id: str,
+    *,
+    generation: Optional[str],
+    server_socket_path: str,
+    session_id: str,
+    window_id: str,
+    pane_id: str,
+    pane_pid: int,
+    native_session_id: Optional[str] = None,
+) -> str:
+    """The v2 twin of :func:`register_terminal_incarnation_outcome`.
+
+    Same rules, same vocabulary, different store. A v2 managed terminal
+    lives only in ``managed_launch_v2_terminals``, so the legacy writer
+    asking ``terminals`` for it found nothing and reported an absent row
+    for every native launch — a false negative that read as a bookkeeping
+    hiccup and was logged and passed over, leaving a live pane with no
+    registered incarnation.
+
+    Duplicated rather than shared because the two stores use different
+    column names for the same facts (the v2 identity columns are
+    ``v2_``-prefixed so the vintage receipt's bare names stay unique), and
+    a single writer switching column names by vintage would be one edit
+    away from writing v2 identity into the legacy row. The v2 row is never
+    copied into ``terminals``: vintage isolation is what gives an old
+    binary zero visibility into v2 state, and a status lookup is not worth
+    spending it.
+    """
+    if not (server_socket_path and session_id and window_id and pane_id) or pane_pid <= 0:
+        return REGISTRATION_PARTIAL_IDENTITY
+    with SessionLocal() as db:
+        terminal = (
+            db.query(ManagedLaunchV2TerminalModel)
+            .filter(ManagedLaunchV2TerminalModel.id == terminal_id)
+            .first()
+        )
+        if terminal is None:
+            return REGISTRATION_ABSENT_ROW
+        already = (
+            terminal.pane_id is not None
+            or terminal.window_id is not None
+            or terminal.v2_session_id is not None
+        )
+        matches = (
+            terminal.pane_id == pane_id
+            and terminal.window_id == window_id
+            and terminal.v2_session_id == session_id
+            and terminal.v2_pane_pid == pane_pid
+            and terminal.server_socket_path == server_socket_path
+        )
+        if already and not matches:
+            logger.warning(
+                "Refusing to re-point v2 terminal %s from pane %s to %s",
+                terminal_id,
+                terminal.pane_id,
+                pane_id,
+            )
+            return REGISTRATION_PANE_ALREADY_HELD
+        if generation is not None and terminal.generation not in (None, generation):
+            logger.warning(
+                "Refusing to register v2 terminal %s under generation %s; row holds %s",
+                terminal_id,
+                generation,
+                terminal.generation,
+            )
+            return REGISTRATION_GENERATION_MISMATCH
+        terminal.server_socket_path = server_socket_path
+        terminal.v2_session_id = session_id
+        terminal.window_id = window_id
+        terminal.pane_id = pane_id
+        terminal.v2_pane_pid = pane_pid
+        if native_session_id is not None:
+            terminal.v2_native_session_id = native_session_id
+        terminal.v2_lifecycle_state = "live"
+        terminal.v2_lifecycle_reason = None
+        terminal.v2_liveness_checked_at = datetime.now().isoformat()
+        terminal.v2_superseded_by_terminal_id = None
+        terminal.v2_superseded_by_generation = None
+        db.commit()
+        return REGISTRATION_OK
 
 
 def refresh_terminal_window_names(
