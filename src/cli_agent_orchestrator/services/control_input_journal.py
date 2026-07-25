@@ -89,7 +89,11 @@ from cli_agent_orchestrator.services.control_input_contract import (
     outcome_for_reason,
 )
 
-CONTROL_INPUT_JOURNAL_SCHEMA_VERSION = 1
+#: 2 adds ``control_input_request.server_socket_path`` (§24.7). Bumped
+#: rather than left at 1 because the recorded version is re-stamped by the
+#: additive migration below, so it describes the shape a journal actually
+#: has now — not the shape it was born with.
+CONTROL_INPUT_JOURNAL_SCHEMA_VERSION = 2
 
 # --- Record states --------------------------------------------------------
 
@@ -134,6 +138,7 @@ CREATE TABLE IF NOT EXISTS control_input_request (
   pane_id TEXT NOT NULL,
   window_id TEXT NOT NULL,
   pane_pid INTEGER NOT NULL,
+  server_socket_path TEXT,
   generation TEXT,
   request_sha256 TEXT NOT NULL,
   state TEXT NOT NULL,
@@ -159,6 +164,16 @@ CREATE TRIGGER IF NOT EXISTS cie_no_update BEFORE UPDATE ON control_input_event
 CREATE TRIGGER IF NOT EXISTS cie_no_delete BEFORE DELETE ON control_input_event
   BEGIN SELECT RAISE(ABORT,'control_input_event is append-only'); END;
 """
+
+#: Columns added to ``control_input_request`` after its first release.
+#: ``_DDL`` alone cannot introduce them: it is ``CREATE TABLE IF NOT
+#: EXISTS`` and the journal has no schema-version gate on open, so an
+#: existing journal would silently keep the old shape and every write
+#: naming the new column would fail at runtime rather than at migration.
+#: Each is nullable — an existing row records a request that was bound
+#: before this identity existed, and inventing a value for it would
+#: manufacture a binding nobody ever observed.
+_ADDITIVE_REQUEST_COLUMNS: Tuple[Tuple[str, str], ...] = (("server_socket_path", "TEXT"),)
 
 
 class ControlInputJournalError(RuntimeError):
@@ -212,6 +227,19 @@ def outcome_for_state(state: str) -> Optional[str]:
     return _STATE_OUTCOMES.get(state)
 
 
+def _add_missing_request_columns(conn: sqlite3.Connection) -> None:
+    """Bring an existing ``control_input_request`` up to the current shape.
+
+    Idempotent and additive only. Runs inside the caller's creation
+    transaction so a journal is never observed half-migrated.
+    """
+    cursor = conn.execute("PRAGMA table_info(control_input_request)")
+    present = {row[1] for row in cursor.fetchall()}
+    for column, column_type in _ADDITIVE_REQUEST_COLUMNS:
+        if column not in present:
+            conn.execute(f"ALTER TABLE control_input_request ADD COLUMN {column} {column_type}")
+
+
 @dataclass(frozen=True)
 class ControlInputBinding:
     """Everything one request id is permanently bound to.
@@ -228,6 +256,12 @@ class ControlInputBinding:
     pane_pid: int
     request_sha256: str
     generation: Optional[str] = None
+    # The tmux server the pane id belongs to (§24.7). Optional because a
+    # terminal recorded before this identity existed has none, and such a
+    # request is refused at the writer boundary rather than here — the
+    # journal's job is to record what a request was bound to, including
+    # that it was bound to no server, so the refusal is evidenced.
+    server_socket_path: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -251,6 +285,7 @@ class ControlInputRecord:
     pane_id: str
     window_id: str
     pane_pid: int
+    server_socket_path: Optional[str]
     generation: Optional[str]
     request_sha256: str
     state: str
@@ -279,6 +314,7 @@ class ControlInputRecord:
             "pane_id": self.pane_id,
             "window_id": self.window_id,
             "pane_pid": self.pane_pid,
+            "server_socket_path": self.server_socket_path,
             "generation": self.generation,
             "request_sha256": self.request_sha256,
             "state": self.state,
@@ -332,14 +368,25 @@ class ControlInputJournal:
                 conn = self._connect()
                 try:
                     conn.executescript(_DDL)
+                    _add_missing_request_columns(conn)
+                    # Birth facts: written once and never revised. A
+                    # journal that reported a new db_uuid or creation time
+                    # after a migration would be claiming to be a
+                    # different journal than the one holding the records.
                     conn.execute(
                         "INSERT OR IGNORE INTO journal_meta(k,v) VALUES "
-                        "('journal_schema_version', ?), ('db_uuid', ?), ('created_at', ?)",
-                        (
-                            str(CONTROL_INPUT_JOURNAL_SCHEMA_VERSION),
-                            str(uuid.uuid4()),
-                            _now(),
-                        ),
+                        "('db_uuid', ?), ('created_at', ?)",
+                        (str(uuid.uuid4()), _now()),
+                    )
+                    # Current shape, so it stays true across a migration
+                    # instead of describing the shape this journal was
+                    # born with. Stamped in the same transaction as the
+                    # ALTERs above: the version and the columns it names
+                    # commit together or not at all.
+                    conn.execute(
+                        "INSERT INTO journal_meta(k,v) VALUES ('journal_schema_version', ?) "
+                        "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                        (str(CONTROL_INPUT_JOURNAL_SCHEMA_VERSION),),
                     )
                     conn.commit()
                 finally:
@@ -390,8 +437,9 @@ class ControlInputJournal:
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT terminal_id, pane_id, window_id, pane_pid, generation, "
-                "request_sha256, state FROM control_input_request WHERE request_id=?",
+                "SELECT terminal_id, pane_id, window_id, pane_pid, server_socket_path, "
+                "generation, request_sha256, state FROM control_input_request "
+                "WHERE request_id=?",
                 (binding.request_id,),
             ).fetchone()
             if row is not None:
@@ -402,12 +450,19 @@ class ControlInputJournal:
                     int(row[3]),
                     row[4],
                     row[5],
+                    row[6],
                 )
                 incoming = (
                     binding.terminal_id,
                     binding.pane_id,
                     binding.window_id,
                     binding.pane_pid,
+                    # In the comparison, so a re-arrival naming the same
+                    # pane id on a *different* tmux server is a rebound
+                    # rather than a retry. Without it the one identity that
+                    # distinguishes two panes that share an id would be the
+                    # one identity a re-used request id could change.
+                    binding.server_socket_path,
                     binding.generation,
                     binding.request_sha256,
                 )
@@ -416,7 +471,7 @@ class ControlInputJournal:
                         f"request id {binding.request_id!r} is already bound to a "
                         "different control target or different request bytes"
                     )
-                if str(row[6]) == STATE_REFUSED:
+                if str(row[7]) == STATE_REFUSED:
                     moment = _now()
                     # The old refusal's evidence is cleared from the live
                     # row rather than carried forward: it describes an
@@ -444,15 +499,17 @@ class ControlInputJournal:
             moment = _now()
             conn.execute(
                 "INSERT INTO control_input_request(request_id, terminal_id, pane_id, "
-                "window_id, pane_pid, generation, request_sha256, state, reason_code, "
-                "chunks_sent, enter_attempted, owner_pid, owner_token, opened_at, "
-                "updated_at) VALUES (?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?)",
+                "window_id, pane_pid, server_socket_path, generation, request_sha256, "
+                "state, reason_code, chunks_sent, enter_attempted, owner_pid, "
+                "owner_token, opened_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?)",
                 (
                     binding.request_id,
                     binding.terminal_id,
                     binding.pane_id,
                     binding.window_id,
                     binding.pane_pid,
+                    binding.server_socket_path,
                     binding.generation,
                     binding.request_sha256,
                     INTENT,
@@ -692,10 +749,10 @@ class ControlInputJournal:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT request_id, terminal_id, pane_id, window_id, pane_pid, generation, "
-                "request_sha256, state, reason_code, chunks_sent, enter_attempted, "
-                "owner_pid, owner_token, opened_at, updated_at "
-                "FROM control_input_request WHERE request_id=?",
+                "SELECT request_id, terminal_id, pane_id, window_id, pane_pid, "
+                "server_socket_path, generation, request_sha256, state, reason_code, "
+                "chunks_sent, enter_attempted, owner_pid, owner_token, opened_at, "
+                "updated_at FROM control_input_request WHERE request_id=?",
                 (request_id,),
             ).fetchone()
             if row is None:
@@ -721,16 +778,17 @@ class ControlInputJournal:
             pane_id=row[2],
             window_id=row[3],
             pane_pid=int(row[4]),
-            generation=row[5],
-            request_sha256=row[6],
-            state=row[7],
-            reason_code=row[8],
-            chunks_sent=row[9],
-            enter_attempted=None if row[10] is None else bool(row[10]),
-            owner_pid=int(row[11]),
-            owner_token=row[12],
-            opened_at=row[13],
-            updated_at=row[14],
+            server_socket_path=row[5],
+            generation=row[6],
+            request_sha256=row[7],
+            state=row[8],
+            reason_code=row[9],
+            chunks_sent=row[10],
+            enter_attempted=None if row[11] is None else bool(row[11]),
+            owner_pid=int(row[12]),
+            owner_token=row[13],
+            opened_at=row[14],
+            updated_at=row[15],
             events=events,
         )
 

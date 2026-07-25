@@ -48,20 +48,32 @@ on exactly the request whose identity mattered most.  The definition is
 therefore adopted from the side that committed it first rather than
 re-derived here.
 
-The physical write target — tmux pane id, window id, and pane pid — is
-deliberately *not* in the preimage.  The client has never been told those
-values, so a preimage containing them is one only the server can compute:
-it would look like agreement and fail only under conflict, which is worse
-than no digest at all.  They are instead mandatory server-side identity,
-resolved from the terminal and re-verified under the pane lease before the
-first byte, and recorded as their own binding columns in the journal.  A
-pane that moved is therefore still a refusal and still a rebind; it is
-just decided by re-verification against tmux rather than by a hash of
-facts the caller could only have guessed.
+The physical write target — the canonical tmux server socket identity,
+pane id, window id, and pane pid — is deliberately *not* in the preimage.
+The client has never been told those values, so a preimage containing
+them is one only the server can compute: it would look like agreement and
+fail only under conflict, which is worse than no digest at all.  They are
+instead mandatory server-side identity, resolved from the terminal and
+re-verified under the pane lease before the first byte, and recorded as
+their own binding columns in the journal.  A pane that moved is therefore
+still a refusal and still a rebind; it is just decided by re-verification
+against tmux rather than by a hash of facts the caller could only have
+guessed.
+
+Why the *server* socket is part of that target (§24.7): a tmux pane id is
+scoped to one server, and several servers routinely run on one host.  A
+pane id alone therefore names a pane on whichever server the writer's
+process happens to resolve — and ``%3`` on a private fixture server is a
+different pane from ``%3`` on the operator's default server, with no
+error and no observable difference at the pane-id level.  Binding the
+server's ``#{socket_path}`` realpath alongside the pane id is what makes
+the target complete, and checking it at the writer boundary is what makes
+the completeness enforced rather than assumed.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Dict, Mapping, Optional, Union
 
@@ -110,6 +122,17 @@ REASON_WRITE_INCOMPLETE = "write-incomplete"
 # remove.
 REASON_OWNER_LOST_BEFORE_WRITE = "owner-lost-before-write"
 REASON_OWNER_LOST_MID_WRITE = "owner-lost-mid-write"
+# Canonical tmux server socket identity (§24.7).  Three reasons rather
+# than one because a caller acts differently on each: unbound is a
+# terminal that predates the binding and can never pass until it is
+# re-created, unreadable is an observation that may succeed on the next
+# attempt, and mismatch means the pane in front of the writer belongs to
+# a different tmux server than the one this control was bound to — the
+# case where a single reason would hide a cross-server delivery behind
+# the same words as a transient read failure.
+REASON_SERVER_IDENTITY_UNBOUND = "server-identity-unbound"
+REASON_SERVER_IDENTITY_UNREADABLE = "server-identity-unreadable"
+REASON_SERVER_IDENTITY_MISMATCH = "server-identity-mismatch"
 
 # Every reason is bound to the one outcome it can honestly carry.
 #
@@ -134,6 +157,13 @@ REASON_OUTCOMES: "dict[str, str]" = {
     REASON_MANAGED_ACP_PANE: REFUSED,
     REASON_REQUEST_REBOUND: REFUSED,
     REASON_OWNER_LOST_BEFORE_WRITE: REFUSED,
+    # All three are decided before the first byte, so all three carry the
+    # zero-bytes proof that makes `refused` re-attemptable.  A server
+    # identity that cannot be read is refused rather than made ambiguous
+    # for exactly that reason: the write never started.
+    REASON_SERVER_IDENTITY_UNBOUND: REFUSED,
+    REASON_SERVER_IDENTITY_UNREADABLE: REFUSED,
+    REASON_SERVER_IDENTITY_MISMATCH: REFUSED,
     REASON_CONTROL_ROUTE_ABSENT: UNSUPPORTED,
     REASON_PROTOCOL_MISMATCH: UNSUPPORTED,
     REASON_RESPONSE_LOST: AMBIGUOUS,
@@ -183,6 +213,82 @@ PANE_ID_PATTERN = re.compile(r"^%[0-9]{1,10}$")
 def is_valid_pane_id(pane_id: object) -> bool:
     """Whether ``pane_id`` is a syntactically legal tmux pane id."""
     return isinstance(pane_id, str) and PANE_ID_PATTERN.fullmatch(pane_id) is not None
+
+
+# --- Canonical tmux server socket identity (§24.7) ------------------------
+
+
+def normalize_server_identity(value: object) -> Optional[str]:
+    """The comparable canonical form of one tmux server's socket identity.
+
+    A tmux server's only durable identity is the socket it answers on, so
+    the socket path is the identity — but the *same* server reports paths
+    that differ as text: ``/tmp/x/server.sock`` and
+    ``/private/tmp/x/server.sock`` are one socket on macOS, and comparing
+    them as raw strings would refuse a write to the very server it was
+    bound to.  Every value therefore passes through ``realpath`` on the
+    way in and on the way out, so both sides of every comparison are the
+    same spelling of the same thing.
+
+    ``realpath`` is used rather than ``resolve(strict=True)`` on purpose:
+    it is purely textual for the leaf, so a socket file that has since
+    been unlinked still normalises to the identity it had.  A binding that
+    silently stopped being comparable the moment its server exited would
+    fail open exactly when the pane id it guards became reusable.
+
+    Returns None for anything that cannot name a server — absent, empty,
+    not a string, or relative.  None means "no identity", never "any
+    identity": :func:`server_identity_refusal` treats it as a refusal.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or not os.path.isabs(text):
+        return None
+    return os.path.realpath(text)
+
+
+def server_identity_refusal(*, bound: object, observed: object) -> Optional["tuple[str, str]"]:
+    """Reason and detail for refusing this target, or None to proceed.
+
+    The one place the server-identity decision is made.  The writer
+    primitive and the control-input service both call it, so the byte-level
+    refusal and the typed wire outcome can never disagree about whether a
+    given pair was acceptable — a disagreement there would be a write the
+    service believed it had refused.
+
+    Order is deliberate: an unbound target is reported as unbound even when
+    the live observation also failed, because "this terminal never recorded
+    which server it lives on" is a durable fact the caller must act on,
+    while an unreadable observation invites a re-attempt that would never
+    succeed for it.
+    """
+    bound_identity = normalize_server_identity(bound)
+    observed_identity = normalize_server_identity(observed)
+    if bound_identity is None:
+        return (
+            REASON_SERVER_IDENTITY_UNBOUND,
+            "this terminal has no canonical tmux server identity bound to it, so a "
+            "write could only be aimed at whichever server this process happens to "
+            "resolve; a pane id is scoped to one server and names a different pane "
+            "on every other one",
+        )
+    if observed_identity is None:
+        return (
+            REASON_SERVER_IDENTITY_UNREADABLE,
+            f"the tmux server owning this pane did not report a usable socket "
+            f"identity, so it cannot be shown to be the bound "
+            f"{bound_identity!r}; nothing is written on an unproven target",
+        )
+    if observed_identity != bound_identity:
+        return (
+            REASON_SERVER_IDENTITY_MISMATCH,
+            f"this pane belongs to the tmux server at {observed_identity!r}, not the "
+            f"bound {bound_identity!r}; the same pane id exists on both servers and "
+            "names a different pane on each, so the write would land in a stranger's "
+            "composer",
+        )
+    return None
 
 
 # --- The request digest ---------------------------------------------------

@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
-from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError
+from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
     AMBIGUOUS,
@@ -81,7 +81,9 @@ from cli_agent_orchestrator.services.control_input_contract import (
     control_input_request_digest,
     is_reattemptable,
     normalize_expected_identity,
+    normalize_server_identity,
     outcome_for_reason,
+    server_identity_refusal,
 )
 from cli_agent_orchestrator.services.control_input_journal import (
     STATE_AMBIGUOUS,
@@ -176,6 +178,15 @@ class ResolvedControlIdentity:
     # recorded is gone".  They are different refusals and a caller acts
     # differently on each.
     recorded_pane_id: Optional[str] = None
+    # The tmux server the terminal record binds this pane to, and the one
+    # this process actually reached when it read the pane (§24.7). Kept
+    # apart for the same reason as the pane ids above: "this terminal
+    # never recorded a server" and "it recorded a different server than
+    # the one answering" are different refusals. A pane id is unique only
+    # within one server, so with several servers on a host these two can
+    # disagree while every other field agrees perfectly.
+    bound_server_socket_path: Optional[str] = None
+    observed_server_socket_path: Optional[str] = None
 
     def expected_identity_view(self) -> Dict[str, Any]:
         """The nine declarable fields, in the digest's fixed order.
@@ -207,6 +218,12 @@ class ResolvedControlIdentity:
             "window_id": self.window_id,
             "pane_pid": self.pane_pid,
             "dead": self.pane_dead,
+            # Both, never one reconciled value: a receipt that showed a
+            # single server could not distinguish "bound and confirmed"
+            # from "bound to A, answered by B", which is the whole fact
+            # a §24.7 refusal turns on.
+            "bound_server_socket_path": self.bound_server_socket_path,
+            "observed_server_socket_path": self.observed_server_socket_path,
         }
         return payload
 
@@ -273,10 +290,15 @@ def resolve_control_identity(terminal_id: str) -> Optional[ResolvedControlIdenti
 
     recorded = metadata.get("pane_id")
     recorded_pane_id = recorded if isinstance(recorded, str) and recorded else None
+    # Normalised on the way in: the recorded value and the live reading
+    # must be compared as canonical paths, or /tmp and /private/tmp would
+    # refuse a write to the very server it was bound to.
+    bound_server = normalize_server_identity(metadata.get("server_socket_path"))
     pane_id: Optional[str] = None
     window_id: Optional[str] = None
     pane_pid: Optional[int] = None
     pane_dead = False
+    observed_server: Optional[str] = None
     client = _tmux_client()
     if client is not None and recorded_pane_id is not None:
         live = client.pane_control_identity(pane_id=recorded_pane_id)
@@ -288,6 +310,7 @@ def resolve_control_identity(terminal_id: str) -> Optional[ResolvedControlIdenti
             window_id = live.window_id
             pane_pid = live.pane_pid
             pane_dead = live.dead
+            observed_server = live.server_socket_path
 
     return ResolvedControlIdentity(
         terminal_id=terminal_id,
@@ -313,6 +336,8 @@ def resolve_control_identity(terminal_id: str) -> Optional[ResolvedControlIdenti
         pane_dead=pane_dead,
         managed=managed is not None,
         recorded_pane_id=recorded_pane_id,
+        bound_server_socket_path=bound_server,
+        observed_server_socket_path=observed_server,
     )
 
 
@@ -819,6 +844,24 @@ def deliver_control_input(
             digest=digest,
         )
 
+    # Before the binding is formed, because a binding that named a pane
+    # without a proven server would be a binding to "%N on whichever
+    # server answers next" — and the journal would then record that
+    # non-target as though it were one.
+    server_refusal = server_identity_refusal(
+        bound=resolved.bound_server_socket_path,
+        observed=resolved.observed_server_socket_path,
+    )
+    if server_refusal is not None:
+        return _refusal(
+            control_id,
+            server_refusal[0],
+            server_refusal[1],
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+        )
+
     book = get_control_input_journal() if journal is None else journal
     binding = ControlInputBinding(
         request_id=control_id,
@@ -828,6 +871,7 @@ def deliver_control_input(
         pane_pid=resolved.pane_pid,
         request_sha256=digest,
         generation=resolved.terminal_generation,
+        server_socket_path=resolved.bound_server_socket_path,
     )
     try:
         record = book.open_intent(binding)
@@ -924,6 +968,25 @@ def _deliver_under_lease(
             resolved=resolved,
             digest=digest,
         )
+    # Re-verified here for the same reason window and pid are, and
+    # necessarily *before* the claim below: the journal has no
+    # (writing, refused) edge, so this is the last point at which a
+    # zero-byte refusal can still be recorded as one. After the claim the
+    # only honest encoding left is ambiguous, which would withhold the
+    # re-attempt this refusal is entitled to grant.
+    server_refusal = server_identity_refusal(
+        bound=binding.server_socket_path, observed=live.server_socket_path
+    )
+    if server_refusal is not None:
+        return _record_refusal(
+            journal,
+            control_id,
+            server_refusal[0],
+            server_refusal[1],
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+        )
 
     claim = journal.claim_write(control_id)
     if not claim.granted:
@@ -933,7 +996,54 @@ def _deliver_under_lease(
         return _from_record(claim.record, resolved=resolved)
 
     try:
-        chunks = client.send_literal_line(binding.pane_id, text, submit=enter)
+        chunks = client.send_literal_line(
+            binding.pane_id,
+            text,
+            submit=enter,
+            expected_server_identity=binding.server_socket_path,
+        )
+    except TmuxServerIdentityError as exc:
+        # Unreachable by construction: the same comparison ran above,
+        # under this lease, moments ago. Reaching it means the pane's
+        # server changed underneath a held lease, so it is logged as the
+        # anomaly it is.
+        #
+        # Recorded as ambiguous despite this error proving zero bytes.
+        # That is deliberate pessimism: the journal's rule that nothing
+        # after a write claim may be called a refusal is a stronger
+        # invariant than this one error type's guarantee, and carving an
+        # exception for it would leave a (writing, refused) edge that a
+        # future error without the same proof could travel.
+        logger.error(
+            "control-input server identity changed under the write lease for %s: "
+            "bound=%r observed=%r",
+            control_id,
+            exc.bound,
+            exc.observed,
+        )
+        journal.mark_ambiguous(
+            control_id,
+            reason_code=exc.reason_code,
+            chunks_sent=0,
+            enter_attempted=False,
+            evidence_digest=digest,
+        )
+        return ControlInputResult(
+            control_id=control_id,
+            outcome=AMBIGUOUS,
+            reason_code=exc.reason_code,
+            detail=(
+                f"the pane's tmux server changed while the write lease was held: {exc}. "
+                "Nothing was written, but the write had already been claimed, and a "
+                "claimed write is never reported as a refusal"
+            ),
+            state=STATE_AMBIGUOUS,
+            terminal_id=terminal_id,
+            request_digest=digest,
+            resolved_identity=resolved.as_dict(),
+            chunks_sent=0,
+            enter_attempted=False,
+        )
     except TmuxLiteralSendError as exc:
         journal.mark_ambiguous(
             control_id,
@@ -1081,5 +1191,12 @@ def control_input_capabilities() -> Dict[str, Any]:
         "literal_write": True,
         "bracketed_paste": False,
         "enter_required": True,
+        # A control is bound to a pane id *on a named tmux server* and the
+        # binding is re-proven immediately before the first byte (§24.7).
+        # Stated here because a caller cannot discover it by probing: on a
+        # server without it, a control aimed at a colliding pane id on
+        # another tmux server is delivered rather than refused, and the
+        # only difference the caller sees is that it worked.
+        "server_identity_bound": True,
         "execution_modes": [EXECUTION_MODE_NATIVE_TUI],
     }

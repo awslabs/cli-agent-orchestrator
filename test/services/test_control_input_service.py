@@ -65,13 +65,26 @@ PANE = "%17"
 WINDOW = "@3"
 PANE_PID = 4242
 GENERATION = "gen-7"
+# Absolute and already canonical, so normalize_server_identity is an
+# identity function on it and a test that fails is reporting a real
+# disagreement rather than a realpath difference.
+SOCKET = "/private/tmp/tmux-501/cao-test"
+OTHER_SOCKET = "/private/tmp/tmux-501/somebody-elses-server"
 TEXT = "/compact"
 
 
 class FakePaneIdentity:
     """Stands in for tmux's observed pane facts."""
 
-    def __init__(self, *, pane_id=PANE, window_id=WINDOW, pane_pid=PANE_PID, dead=False):
+    def __init__(
+        self,
+        *,
+        pane_id=PANE,
+        window_id=WINDOW,
+        pane_pid=PANE_PID,
+        dead=False,
+        server_socket_path=SOCKET,
+    ):
         self.pane_id = pane_id
         self.window_id = window_id
         self.pane_pid = pane_pid
@@ -79,6 +92,7 @@ class FakePaneIdentity:
         self.window_name = "worker-1"
         self.bracketed_paste_proven = False
         self.dead = dead
+        self.server_socket_path = server_socket_path
 
 
 class FakeTmux:
@@ -104,12 +118,22 @@ class FakeTmux:
             return self._identities.pop(0)
         return self._identities[0]
 
-    def send_literal_line(self, pane_id, text, submit=True):
+    # Keyword-only and undefaulted, exactly like the real primitive: a
+    # fake that tolerated the argument being omitted would let the one
+    # mistake §24.7 is about pass every test in this file.
+    def send_literal_line(self, pane_id, text, submit=True, *, expected_server_identity):
         if self._on_write is not None:
             self._on_write()
         if self._write_error is not None:
             raise self._write_error
-        self.writes.append({"pane_id": pane_id, "text": text, "submit": submit})
+        self.writes.append(
+            {
+                "pane_id": pane_id,
+                "text": text,
+                "submit": submit,
+                "expected_server_identity": expected_server_identity,
+            }
+        )
         return 1
 
 
@@ -119,6 +143,7 @@ def _metadata(**overrides):
         "generation": GENERATION,
         "provider": "claude-code",
         "tmux_session": "cao",
+        "server_socket_path": SOCKET,
     }
     fields.update(overrides)
     return fields
@@ -449,7 +474,17 @@ class TestDelivery:
         result = _deliver(journal)
         assert result.outcome == ACCEPTED
         assert result.text_sent and result.enter_sent
-        assert tmux.writes == [{"pane_id": PANE, "text": TEXT, "submit": True}]
+        assert tmux.writes == [
+            {
+                "pane_id": PANE,
+                "text": TEXT,
+                "submit": True,
+                # The write primitive is handed the *bound* server, never
+                # the one just observed: handing it the observation would
+                # ask it to compare a reading with itself.
+                "expected_server_identity": SOCKET,
+            }
+        ]
 
     def test_nothing_written_carries_paste_framing(self, tmux, journal):
         """The leakage this lane exists to remove is structurally absent
@@ -486,6 +521,8 @@ class TestDelivery:
             "window_id": WINDOW,
             "pane_pid": PANE_PID,
             "dead": False,
+            "bound_server_socket_path": SOCKET,
+            "observed_server_socket_path": SOCKET,
         }
 
     def test_accepted_is_not_reattemptable(self, tmux, journal):
@@ -549,6 +586,9 @@ class TestAtMostOnce:
                 window_id=WINDOW,
                 pane_pid=PANE_PID,
                 generation=GENERATION,
+                # Must match what the service will bind, or this is a
+                # rebinding rather than the claim contention under test.
+                server_socket_path=SOCKET,
                 request_sha256=control_input_request_digest(
                     control_id=CONTROL, text=TEXT, enter=True, expected_identity=None
                 ),
@@ -644,6 +684,7 @@ class TestCrashWindow:
                 window_id=WINDOW,
                 pane_pid=PANE_PID,
                 generation=GENERATION,
+                server_socket_path=SOCKET,
                 request_sha256="a" * 64,
             )
         )
@@ -664,6 +705,7 @@ class TestCrashWindow:
                 window_id=WINDOW,
                 pane_pid=PANE_PID,
                 generation=GENERATION,
+                server_socket_path=SOCKET,
                 request_sha256="b" * 64,
             )
         )

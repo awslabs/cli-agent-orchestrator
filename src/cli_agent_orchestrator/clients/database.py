@@ -52,6 +52,13 @@ class TerminalModel(Base):
     # the only tmux-side facts an attestation may bind a supervisor to.
     pane_id = Column(Text, nullable=True)
     window_id = Column(Text, nullable=True)
+    # The tmux server that owns that pane id (cond-0078 §24.7). A pane id
+    # is unique only within one tmux server and several servers routinely
+    # run on one host, so pane_id alone names a pane on *whichever* server
+    # a later process happens to reach. NULL on every legacy row, and a
+    # NULL never satisfies the writer-boundary check: an unbound terminal
+    # refuses control input rather than being written somewhere plausible.
+    server_socket_path = Column(Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -265,6 +272,8 @@ class ManagedLaunchV2TerminalModel(Base):
     protocol_vintage = Column(Text, nullable=False, default="v2")
     pane_id = Column(Text, nullable=True)
     window_id = Column(Text, nullable=True)
+    # The tmux server owning ``pane_id`` (§24.7); see TerminalModel.
+    server_socket_path = Column(Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -1000,6 +1009,16 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN window_id TEXT")
             conn.commit()
             logger.info("Migration: added window_id column to terminals table")
+        if "server_socket_path" not in columns:
+            # Added NULL for every existing row, and deliberately not
+            # backfilled (§24.7). Backfilling from the server this process
+            # happens to be talking to would bind each legacy terminal to
+            # whichever tmux server ran the migration — which is exactly
+            # the mistake the column exists to catch. A legacy row stays
+            # unbound and refuses until something re-observes it.
+            conn.execute("ALTER TABLE terminals ADD COLUMN server_socket_path TEXT")
+            conn.commit()
+            logger.info("Migration: added server_socket_path column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -1017,6 +1036,7 @@ def create_terminal(
     generation: Optional[str] = None,
     pane_id: Optional[str] = None,
     window_id: Optional[str] = None,
+    server_socket_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -1034,6 +1054,7 @@ def create_terminal(
             generation=generation,
             pane_id=pane_id,
             window_id=window_id,
+            server_socket_path=server_socket_path,
         )
         db.add(terminal)
         db.commit()
@@ -1049,6 +1070,7 @@ def create_terminal(
             "generation": terminal.generation,
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
+            "server_socket_path": terminal.server_socket_path,
         }
 
 
@@ -1063,6 +1085,7 @@ def create_terminal_v2(
     generation: Optional[str] = None,
     pane_id: Optional[str] = None,
     window_id: Optional[str] = None,
+    server_socket_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a v2 managed terminal metadata record (isolated vintage surface).
 
@@ -1087,6 +1110,7 @@ def create_terminal_v2(
             protocol_vintage="v2",
             pane_id=pane_id,
             window_id=window_id,
+            server_socket_path=server_socket_path,
         )
         db.add(terminal)
         db.commit()
@@ -1102,6 +1126,7 @@ def create_terminal_v2(
             "protocol_vintage": "v2",
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
+            "server_socket_path": terminal.server_socket_path,
         }
 
 
@@ -1131,6 +1156,7 @@ def get_terminal_metadata_v2(terminal_id: str) -> Optional[Dict[str, Any]]:
             "protocol_vintage": "v2",
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
+            "server_socket_path": terminal.server_socket_path,
             "last_active": terminal.last_active,
         }
 
@@ -1187,12 +1213,22 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "generation": terminal.generation,
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
+            "server_socket_path": terminal.server_socket_path,
             "last_active": terminal.last_active,
         }
 
 
 def backfill_terminal_identity_if_missing(terminal_id: str, pane_id: str, window_id: str) -> bool:
-    """Write both legacy identity fields once, only while both remain null."""
+    """Write both legacy identity fields once, only while both remain null.
+
+    ``server_socket_path`` is deliberately NOT backfilled here (§24.7).
+    This runs against whichever tmux server the calling process reaches,
+    and recording that server as the terminal's binding would make the
+    writer-boundary check agree with whatever the backfill happened to
+    see — the check would confirm its own guess. A row backfilled by this
+    path therefore carries a pane id and no server, and refuses control
+    input until something that actually knows the server records one.
+    """
     if not pane_id or not window_id:
         return False
     with SessionLocal() as db:

@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import uuid
 from pathlib import Path
 from test.fixtures import tmux_server as iso
 from test.fixtures.cao_server import _subprocess_env
@@ -43,11 +42,13 @@ from test.fixtures.tmux_server import (
     AMBIENT_SERVER_VARS,
     TmuxSelectorLost,
     TmuxServer,
+    assert_shared_server_untouched,
     default_socket_path,
     isolated_tmux_server,
     real_tmux_binary,
     sanitized_env,
     shared_server,
+    shared_server_sentinel,
 )
 from typing import Iterator
 
@@ -194,28 +195,11 @@ class TestDestructionProvesItsTarget:
 
 @pytest.fixture(scope="module")
 def sentinel() -> Iterator[tuple[TmuxServer, iso.SessionIdentity, iso.ServerIdentity]]:
-    """A canary session on the real shared server, removed exactly.
-
-    The command is a bounded sleep so that a hard crash of this suite
-    cannot leave a session on the operator's server indefinitely.
-    """
-    shared = shared_server()
-    name = f"cao-shared-sentinel-{uuid.uuid4().hex[:8]}"
-    shared.new_session(name, "--", "sh", "-c", "sleep 900")
-    try:
-        yield shared, shared.session(name), shared.identity()
-    finally:
-        shared.kill_session(name)
+    with shared_server_sentinel() as canary:
+        yield canary
 
 
-def _assert_untouched(
-    shared: TmuxServer,
-    session: iso.SessionIdentity,
-    server: iso.ServerIdentity,
-) -> None:
-    assert shared.alive(), "the shared server did not survive the fixture"
-    assert shared.identity() == server, "the shared server was restarted under us"
-    assert shared.session(session.name) == session, "the sentinel session is not the same session"
+_assert_untouched = assert_shared_server_untouched
 
 
 class TestTheSharedServerSurvives:

@@ -44,6 +44,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Mapping, Optional
@@ -355,6 +356,49 @@ def shared_server(env: Optional[Mapping[str, str]] = None) -> TmuxServer:
     closed by construction rather than by a caller remembering not to.
     """
     return TmuxServer(socket_path=default_socket_path(env))
+
+
+@contextlib.contextmanager
+def shared_server_sentinel(
+    prefix: str = "cao-shared-sentinel",
+) -> Iterator[tuple[TmuxServer, SessionIdentity, ServerIdentity]]:
+    """A canary session on the real shared server, removed exactly.
+
+    The sentinel is deliberately on the shared server rather than on a
+    stand-in.  A stand-in would prove a fixture is careful with a server
+    it was told about; only the real one proves it is careful with the
+    server nobody told it about.
+
+    Nothing reached through this handle can destroy that server: it is
+    built without ownership, so every destructive method on it raises
+    before acting, and the only session removed is the one created here,
+    addressed by exact-match name.  The command is a bounded sleep so
+    that a hard crash of the suite cannot leave a session on the
+    operator's server indefinitely.
+    """
+    shared = shared_server()
+    name = f"{prefix}-{uuid.uuid4().hex[:8]}"
+    shared.new_session(name, "--", "sh", "-c", "sleep 900")
+    try:
+        yield shared, shared.session(name), shared.identity()
+    finally:
+        shared.kill_session(name)
+
+
+def assert_shared_server_untouched(
+    shared: TmuxServer,
+    session: SessionIdentity,
+    server: ServerIdentity,
+) -> None:
+    """The shared server is still the same server, holding the same session.
+
+    All three claims are needed.  A server answering on the socket is not
+    the same server if it was restarted, and a session with the right
+    name on a restarted server is not the session that was there before.
+    """
+    assert shared.alive(), "the shared server did not survive the fixture"
+    assert shared.identity() == server, "the shared server was restarted under us"
+    assert shared.session(session.name) == session, "the sentinel session is not the same session"
 
 
 @contextlib.contextmanager

@@ -939,6 +939,7 @@ async def create_terminal(
                 generation=terminal_generation,
                 pane_id=identity.get("pane_id"),
                 window_id=identity.get("window_id"),
+                server_socket_path=identity.get("server_socket_path"),
             )
             # The v2 DB row is durably committed: observed creation.
             _mark_v2_resource_created(
@@ -979,6 +980,7 @@ async def create_terminal(
                 generation=terminal_generation,
                 pane_id=identity.get("pane_id"),
                 window_id=identity.get("window_id"),
+                server_socket_path=identity.get("server_socket_path"),
             )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane

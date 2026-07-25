@@ -75,13 +75,23 @@ PANE = "%17"
 WINDOW = "@3"
 PANE_PID = 4242
 GENERATION = "gen-7"
+# Canonical already, so a mismatch in a failing test is a real one.
+SOCKET = "/private/tmp/tmux-501/cao-test"
 TEXT = "/compact"
 
 
 class FakePaneIdentity:
     """Stands in for tmux's observed pane facts."""
 
-    def __init__(self, *, pane_id=PANE, window_id=WINDOW, pane_pid=PANE_PID, dead=False):
+    def __init__(
+        self,
+        *,
+        pane_id=PANE,
+        window_id=WINDOW,
+        pane_pid=PANE_PID,
+        dead=False,
+        server_socket_path=SOCKET,
+    ):
         self.pane_id = pane_id
         self.window_id = window_id
         self.pane_pid = pane_pid
@@ -89,6 +99,7 @@ class FakePaneIdentity:
         self.window_name = "worker-1"
         self.bracketed_paste_proven = False
         self.dead = dead
+        self.server_socket_path = server_socket_path
 
 
 class FakeTmux:
@@ -105,11 +116,19 @@ class FakeTmux:
             return self._identities.pop(0)
         return self._identities[0]
 
-    def send_literal_line(self, pane_id, text, submit=True):
+    # Keyword-only and undefaulted, mirroring the real primitive.
+    def send_literal_line(self, pane_id, text, submit=True, *, expected_server_identity):
         if self.on_write is not None:
             self.on_write()
         with self._guard:
-            self.writes.append({"pane_id": pane_id, "text": text, "submit": submit})
+            self.writes.append(
+                {
+                    "pane_id": pane_id,
+                    "text": text,
+                    "submit": submit,
+                    "expected_server_identity": expected_server_identity,
+                }
+            )
         return 1
 
 
@@ -119,6 +138,7 @@ def _metadata(**overrides):
         "generation": GENERATION,
         "provider": "claude-code",
         "tmux_session": "cao",
+        "server_socket_path": SOCKET,
     }
     fields.update(overrides)
     return fields
@@ -270,7 +290,17 @@ class TestSendingAControl:
         assert body["enter_sent"] is True
         assert body["chunks_sent"] == 1
         assert body["enter_attempted"] is True
-        assert tmux.writes == [{"pane_id": PANE, "text": TEXT, "submit": True}]
+        assert tmux.writes == [
+            {
+                "pane_id": PANE,
+                "text": TEXT,
+                "submit": True,
+                # The bound server reaches the write primitive across the
+                # HTTP boundary too, so a request that crossed the wire is
+                # no less pinned to one server than a direct call.
+                "expected_server_identity": SOCKET,
+            }
+        ]
 
     def test_no_paste_framing_reaches_the_pane(self, client, tmux):
         _post(client)
@@ -434,6 +464,8 @@ class TestControlIdentity:
             "window_id": WINDOW,
             "pane_pid": PANE_PID,
             "dead": False,
+            "bound_server_socket_path": SOCKET,
+            "observed_server_socket_path": SOCKET,
         }
 
     def test_its_view_can_be_declared_back_and_accepted(self, client, tmux):
@@ -640,6 +672,10 @@ class TestCrashWindowOverTheWire:
                 window_id=WINDOW,
                 pane_pid=PANE_PID,
                 generation=GENERATION,
+                # Must match what the endpoint's own request would bind,
+                # or the re-arrival is a rebinding instead of the replay
+                # these crash-window tests are about.
+                server_socket_path=SOCKET,
                 request_sha256=request_sha256
                 or control_input_request_digest(
                     control_id=CONTROL, text=TEXT, enter=True, expected_identity=None

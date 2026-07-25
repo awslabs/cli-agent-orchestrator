@@ -31,6 +31,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     control_input_request_digest,
 )
 from cli_agent_orchestrator.services.control_input_journal import (
+    CONTROL_INPUT_JOURNAL_SCHEMA_VERSION,
     DELIVERED,
     INTENT,
     LEGAL_TRANSITIONS,
@@ -149,7 +150,7 @@ class TestStorage:
             rows = dict(conn.execute("SELECT k, v FROM journal_meta"))
         finally:
             conn.close()
-        assert rows["journal_schema_version"] == "1"
+        assert rows["journal_schema_version"] == str(CONTROL_INPUT_JOURNAL_SCHEMA_VERSION)
         assert rows["db_uuid"]
 
     def test_event_history_is_append_only(self, journal, db_path):
