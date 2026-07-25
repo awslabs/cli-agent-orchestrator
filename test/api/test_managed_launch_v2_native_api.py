@@ -26,11 +26,13 @@ from typing import Any, Mapping, Optional
 import pytest
 
 from cli_agent_orchestrator.models.managed_launch_v2 import PROTOCOL_VERSION_V2
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import kimi_native_bootstrap as boot
 from cli_agent_orchestrator.services import managed_launch
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
+from cli_agent_orchestrator.services import native_pane_input as npi
 
 PINNED_VERSION_BANNER = "kimi 0.29.0"
 SESSION_ID = "session_9f2c41ab"
@@ -123,6 +125,7 @@ class _Harness:
     def __init__(self) -> None:
         self.terminals: list[dict[str, Any]] = []
         self.bridge_requests: list[dict[str, Any]] = []
+        self.turn_state = TerminalStatus.IDLE
 
     @property
     def launched_argv(self) -> list[str]:
@@ -154,6 +157,11 @@ def harness(monkeypatch):
         "cli_agent_orchestrator.services.terminal_service.create_terminal", _create_terminal
     )
     monkeypatch.setattr(v2._V2NativePane, "observe", _observe)
+    # The pane's own reading of its own screen. Stubbed because the launch
+    # now waits for a composer that accepts input before it certifies
+    # readiness, and there is no real TUI behind this fake pane to paint
+    # one -- an unstubbed read would report every launch as still booting.
+    monkeypatch.setattr(npi, "observe_kimi_turn_state", lambda *a, **k: state.turn_state)
     return state
 
 

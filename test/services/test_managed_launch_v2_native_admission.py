@@ -40,7 +40,10 @@ from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services import native_pane_input as npi
 from cli_agent_orchestrator.services import native_tui_launch
 from cli_agent_orchestrator.services.canonical_json import canonical_sha256
-from cli_agent_orchestrator.services.managed_launch import ManagedLaunchConflict
+from cli_agent_orchestrator.services.managed_launch import (
+    ManagedLaunchConflict,
+    ManagedLaunchUnavailable,
+)
 
 PINNED_VERSION_BANNER = "kimi 0.29.0"
 SESSION_ID = "session_9f2c41ab"
@@ -190,6 +193,10 @@ class _Harness:
         self.terminals: list[dict[str, Any]] = []
         self.keystrokes = _Keystrokes()
         self.turn_state = TerminalStatus.IDLE
+        # Set by a test that needs something to happen *during* the
+        # readiness read -- the window a concurrent handler for the same
+        # delivery id actually occupies.
+        self.observe_turn_state: Optional[Any] = None
         self.pane_gone = False
         self.observed_pane_id = PANE_ID
         self.observed_pid = PANE_PID
@@ -243,7 +250,13 @@ def harness(monkeypatch):
     # The admission-time seams: the live pane read, the provider's own
     # idle reading of its own screen, and the keystroke transport.
     monkeypatch.setattr(native_tui_launch, "TmuxNativePane", lambda *a, **k: _Pane(state))
-    monkeypatch.setattr(npi, "observe_kimi_turn_state", lambda *a, **k: state.turn_state)
+
+    def _turn_state(*args, **kwargs):
+        if state.observe_turn_state is not None:
+            return state.observe_turn_state(*args, **kwargs)
+        return state.turn_state
+
+    monkeypatch.setattr(npi, "observe_kimi_turn_state", _turn_state)
     monkeypatch.setattr(npi, "TmuxPaneInput", state.keystrokes.transport_for)
     return state
 
@@ -412,10 +425,18 @@ async def test_a_replaced_pane_process_refuses_with_zero_task_bytes(
         await v2.admit_reserved(reservation_id, _admit_request(v2.native_binding_digest(bound)))
 
     assert harness.keystrokes.events == []
-    # Zero task admission: the row is untouched and still awaits one.
+    # Zero task bytes, and the reason is durable rather than living only
+    # in an HTTP response that a lost connection would destroy. A caller
+    # that never received the answer re-reads the reservation and finds
+    # the refusal, instead of a bare ``bound`` row it must treat as
+    # maybe-delivered forever.
     after = v2.get(reservation_id)
-    assert after["state"] == "bound"
-    assert after["admission"] is None
+    assert after["admission"]["status"] == "refused"
+    assert after["admission"]["refusal_reason"] == v2.REFUSED_NATIVE_IDENTITY
+    # A replaced process is not going to become the bound one by asking
+    # again, so this refusal is closed rather than held open.
+    assert after["admission"]["retryable"] is False
+    assert after["state"] == "admitting"
 
 
 @pytest.mark.asyncio
@@ -429,7 +450,9 @@ async def test_a_vanished_pane_refuses_rather_than_typing_into_its_replacement(
         await v2.admit_reserved(reservation_id, _admit_request(v2.native_binding_digest(bound)))
 
     assert harness.keystrokes.events == []
-    assert v2.get(reservation_id)["admission"] is None
+    after = v2.get(reservation_id)
+    assert after["admission"]["status"] == "refused"
+    assert after["admission"]["retryable"] is False
 
 
 @pytest.mark.asyncio
@@ -441,6 +464,11 @@ async def test_a_busy_pane_refuses_admission_with_zero_task_bytes(
     ``PROCESSING`` also covers the boot window, which is the dangerous
     one: Kimi paints its status bar before it can accept input, and a
     task delivered there is absorbed with no error anywhere.
+
+    The refusal is durable and *retryable*, which is the whole shape of
+    this case: a pane that is booting will be ready shortly, so the
+    delivery is held open rather than closed, and the row stays at the
+    exact state a later claim requires.
     """
     reservation_id, bound = await _reserve_launch_bind(worktree, tmp_path)
     harness.turn_state = TerminalStatus.PROCESSING
@@ -450,8 +478,119 @@ async def test_a_busy_pane_refuses_admission_with_zero_task_bytes(
 
     assert harness.keystrokes.events == []
     after = v2.get(reservation_id)
+    admission = after["admission"]
+    assert admission["status"] == "refused"
+    assert admission["refusal_reason"] == v2.REFUSED_PROVIDER_NOT_YET_READY
+    assert admission["retryable"] is True
+    assert admission["delivery_id"] == DELIVERY_ID
+    # The evidence, not just the verdict: what was seen, of which pane.
+    assert admission["readiness_observation"]["provider_status"] == (
+        TerminalStatus.PROCESSING.value
+    )
+    assert admission["readiness_observation"]["pane_id"] == PANE_ID
+    assert admission["readiness_observation"]["input_ready"] is False
+    # Held at ``bound``: a refusal that advanced the row would become the
+    # thing that blocks the retry it exists to invite.
+    assert after["state"] == "bound"
+    # Zero control-operation rows, so nothing was even opened, let alone
+    # typed -- the delivery is provably absent from the pane's history.
+    assert knc.get(DELIVERY_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_the_same_delivery_is_admitted_exactly_once_after_the_pane_settles(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """The retry the refusal invites, and the duplicate it must not become.
+
+    The same delivery id that was refused during boot is the one that
+    completes -- no second reservation, no second binding, no second copy
+    of the task.  The keystroke record is the proof that matters: one
+    literal and one submitting key across both attempts.
+    """
+    reservation_id, bound = await _reserve_launch_bind(worktree, tmp_path)
+    request = _admit_request(v2.native_binding_digest(bound))
+    harness.turn_state = TerminalStatus.PROCESSING
+
+    with pytest.raises(ManagedLaunchConflict, match="not idle"):
+        await v2.admit_reserved(reservation_id, request)
+    assert v2.get(reservation_id)["admission"]["status"] == "refused"
+
+    harness.turn_state = TerminalStatus.IDLE
+    admitted = await v2.admit_reserved(reservation_id, request)
+
+    assert admitted["state"] == "admitted"
+    assert admitted["admission"]["delivery_id"] == DELIVERY_ID
+    # The refusal was superseded, not appended to: nothing of it survives
+    # on a record that now says the task was delivered.
+    assert "refusal_reason" not in admitted["admission"]
+    assert harness.keystrokes.events == [("literal", TASK_MESSAGE), ("enter", "")]
+
+
+@pytest.mark.asyncio
+async def test_repeated_pre_readiness_attempts_re_persist_one_refusal_and_nothing_else(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """Retrying while still booting must cost nothing anywhere.
+
+    The invariant is not "the record is byte-identical" -- each attempt
+    genuinely observed the pane again, and saying otherwise would be a
+    fabricated observation.  It is that no *delivery-bearing* artifact
+    accumulates: no control operation, no keystroke, no second admission,
+    and no drift in what the refusal says.
+    """
+    reservation_id, bound = await _reserve_launch_bind(worktree, tmp_path)
+    request = _admit_request(v2.native_binding_digest(bound))
+    harness.turn_state = TerminalStatus.PROCESSING
+
+    for _ in range(3):
+        with pytest.raises(ManagedLaunchConflict, match="not idle"):
+            await v2.admit_reserved(reservation_id, request)
+
+    after = v2.get(reservation_id)
+    assert after["state"] == "bound"
+    assert after["admission"]["refusal_reason"] == v2.REFUSED_PROVIDER_NOT_YET_READY
+    assert after["admission"]["retryable"] is True
+    assert knc.get(DELIVERY_ID) is None
+    assert harness.keystrokes.events == []
+    assert harness.bridge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_that_cannot_be_stored_is_never_reported_as_proven(
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
+):
+    """The failure that must not be papered over: an unstorable refusal.
+
+    A refusal answered but not stored is worse than no refusal at all.
+    The caller would be told "provably nothing was sent" while the only
+    durable state stays a bare ``bound`` row with no admission -- and
+    anyone who re-reads it, including the same caller after a lost
+    response, sees the silence that has to be read as maybe-delivered.
+    Two observers of one delivery would then disagree, which is exactly
+    the false ambiguity this seam exists to remove.
+
+    So the answer degrades to "unresolved" rather than up to "refused",
+    which leaves the response and the stored state saying the same thing.
+    """
+
+    def _cannot_persist(*args, **kwargs):
+        raise ManagedLaunchUnavailable("the reservation store is unreachable")
+
+    reservation_id, bound = await _reserve_launch_bind(worktree, tmp_path)
+    harness.turn_state = TerminalStatus.PROCESSING
+    monkeypatch.setattr(v2, "refuse_admission_before_io", _cannot_persist)
+
+    with pytest.raises(ManagedLaunchUnavailable, match="could not be recorded"):
+        await v2.admit_reserved(reservation_id, _admit_request(v2.native_binding_digest(bound)))
+
+    # No durable refusal was claimed, and none is pretended to exist.
+    after = v2.get(reservation_id)
     assert after["state"] == "bound"
     assert after["admission"] is None
+    # And it is still true that nothing was sent -- the honesty being
+    # protected here is about what can be *proven* to a later reader.
+    assert harness.keystrokes.events == []
 
 
 # --------------------------------------------------------------------
@@ -678,3 +817,180 @@ async def test_an_acp_row_cannot_complete_on_a_native_control_record(
         )
 
     assert v2.get(reservation_id)["state"] == "admitting"
+
+
+# --------------------------------------------------------------------
+# 5. two handlers, one delivery id: no caller is told the wrong thing
+# --------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_that_loses_its_race_reports_the_winner_not_a_zero_byte_verdict(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """The lie a lost compare-and-swap could otherwise tell.
+
+    Two handlers can hold the same delivery id at once -- a client that
+    timed out and retried is the ordinary way it happens.  If one reads
+    the pane as busy while the other has already claimed the admission
+    and may be typing, the first must not answer "provably nothing was
+    sent": that is a statement about the delivery, not about the request,
+    and the delivery is in the other handler's hands.
+
+    Staged deterministically by claiming the admission *during* the
+    readiness read, which is exactly the window the real race occupies.
+    """
+    reservation_id, bound = await _reserve_launch_bind(worktree, tmp_path)
+    request = _admit_request(v2.native_binding_digest(bound))
+
+    def _busy_while_a_sibling_claims(*_args, **_kwargs):
+        v2.claim_admission(reservation_id, request)
+        return TerminalStatus.PROCESSING
+
+    harness.observe_turn_state = _busy_while_a_sibling_claims
+
+    result = await v2.admit_reserved(reservation_id, request)
+
+    # No refusal was invented over the winner's record, and no exception
+    # claimed one either.
+    assert result["admission"]["status"] == "io-attempted"
+    assert result["admission"]["delivery_id"] == DELIVERY_ID
+    assert v2.get(reservation_id)["admission"]["status"] == "io-attempted"
+    # This handler still sent nothing, which was always true; what changed
+    # is that it no longer says so *about the delivery*.
+    assert harness.keystrokes.events == []
+
+
+@pytest.mark.asyncio
+async def test_losing_the_claim_race_never_publishes_a_crash_verdict_on_a_live_sibling(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """The symmetric path: the claim CAS loses instead of the refusal CAS.
+
+    An absent control operation is proof of a crash only when the handler
+    that would have opened it is gone.  When it is alive and merely has
+    not got there yet, the same absence means nothing -- and recording it
+    as a refusal would mark a delivery provably-unsent moments before its
+    bytes are written.
+    """
+    reservation_id, bound = await _reserve_launch_bind(worktree, tmp_path)
+    request = _admit_request(v2.native_binding_digest(bound))
+
+    def _idle_while_a_sibling_claims(*_args, **_kwargs):
+        v2.claim_admission(reservation_id, request)
+        return TerminalStatus.IDLE
+
+    harness.observe_turn_state = _idle_while_a_sibling_claims
+
+    result = await v2.admit_reserved(reservation_id, request)
+
+    assert knc.get(DELIVERY_ID) is None
+    assert result["admission"]["status"] == "io-attempted"
+    assert "refusal_reason" not in result["admission"]
+    assert harness.keystrokes.events == []
+
+
+@pytest.mark.asyncio
+async def test_a_replay_after_a_real_crash_still_refuses_on_the_absent_operation(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """The distinction above must not have disarmed the crash recovery.
+
+    Same absent operation record, opposite conclusion, because the
+    handler that would have opened it is gone rather than running: this
+    request arrived fresh from the wire against a claim nobody holds.
+    """
+    reservation_id, bound = await _reserve_launch_bind(worktree, tmp_path)
+    request = _admit_request(v2.native_binding_digest(bound))
+    claimed, should_send = v2.claim_admission(reservation_id, request)
+    assert should_send and claimed["admission"]["status"] == "io-attempted"
+
+    result = await v2.admit_reserved(reservation_id, request)
+
+    assert result["admission"]["status"] == "refused"
+    assert result["admission"]["refusal_reason"] == "no_control_operation"
+
+
+@pytest.mark.asyncio
+async def test_a_lost_response_is_answered_from_the_reservation_in_both_directions(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """Response loss on either side of readiness, recovered by re-reading.
+
+    This is the whole point of persisting the refusal.  Before readiness
+    a lost response used to leave a bare ``bound`` row -- indistinguishable
+    from a request still in flight, so the only safe reading was
+    maybe-delivered, and a delivery that provably never happened stayed
+    ambiguous forever.  After readiness the admitted receipt has to be
+    equally re-readable, and neither direction may type anything a second
+    time.
+    """
+    reservation_id, bound = await _reserve_launch_bind(worktree, tmp_path)
+    request = _admit_request(v2.native_binding_digest(bound))
+
+    # Direction one: the refusal's response is lost. A re-read finds the
+    # refusal itself, with the evidence it rested on.
+    harness.turn_state = TerminalStatus.PROCESSING
+    with pytest.raises(ManagedLaunchConflict):
+        await v2.admit_reserved(reservation_id, request)
+
+    reread = v2.get(reservation_id)
+    assert reread["admission"]["status"] == "refused"
+    assert reread["admission"]["refusal_reason"] == v2.REFUSED_PROVIDER_NOT_YET_READY
+    assert reread["admission"]["readiness_observation"]["input_ready"] is False
+    assert reread["state"] == "bound"
+    assert harness.keystrokes.events == []
+
+    # Direction two: the admission succeeds and *that* response is lost.
+    harness.turn_state = TerminalStatus.IDLE
+    admitted = await v2.admit_reserved(reservation_id, request)
+    assert admitted["state"] == "admitted"
+
+    reread = v2.get(reservation_id)
+    assert reread["admission"]["status"] == "admitted"
+    assert reread["admission"]["native_submission"]["payload_sha256"] == canonical_sha256(
+        TASK_MESSAGE
+    )
+
+    # And the replay that a lost response provokes types nothing again.
+    replay = await v2.admit_reserved(reservation_id, request)
+    assert replay["admission"]["native_submission"] == reread["admission"]["native_submission"]
+    assert harness.keystrokes.events == [("literal", TASK_MESSAGE), ("enter", "")]
+
+
+@pytest.mark.asyncio
+async def test_a_racing_delivery_id_carrying_other_bytes_is_refused_not_answered(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """Replay identity has to hold on the concurrent route too.
+
+    A delivery id that comes back carrying a different message is a
+    different delivery, and the ordinary replay check refuses it.  The
+    race opens a second way in: if a sibling's record can be handed back
+    *because* it won the write, the check is bypassed and one task's
+    outcome is reported for another's bytes -- worse than a plain
+    duplicate, because the answer looks authoritative.
+    """
+    reservation_id, bound = await _reserve_launch_bind(worktree, tmp_path)
+    digest = v2.native_binding_digest(bound)
+    mine = _admit_request(digest)
+
+    def _busy_while_a_sibling_claims(*_args, **_kwargs):
+        v2.claim_admission(reservation_id, mine)
+        return TerminalStatus.PROCESSING
+
+    harness.observe_turn_state = _busy_while_a_sibling_claims
+    other_message = "a different task entirely"
+    theirs = _admit_request(
+        digest,
+        message=other_message,
+        message_sha256=hashlib.sha256(other_message.encode()).hexdigest(),
+    )
+
+    with pytest.raises(ManagedLaunchConflict, match="different admission identity"):
+        await v2.admit_reserved(reservation_id, theirs)
+
+    # The winner's record is untouched and still describes its own bytes.
+    stored = v2.get(reservation_id)["admission"]
+    assert stored["message_sha256"] == mine.message_sha256
+    assert harness.keystrokes.events == []

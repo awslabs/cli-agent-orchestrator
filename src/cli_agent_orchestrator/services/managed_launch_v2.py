@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -91,6 +92,34 @@ _PINNED_PROVIDER = {
     "codex": "codex",
     "kimi_cli": "kimi",
 }
+
+#: How long a native launch watches for its pane to become input-ready,
+#: and how often it looks.
+#:
+#: A pane that has started is not a pane that can be typed into: the
+#: provider paints its status bar, connects its servers, and only then
+#: draws a composer.  Measured cold that takes about two thirds of a
+#: second, while a launcher that binds and admits in a straight line
+#: arrives about a fifth of a second in — so typing into the boot screen
+#: is the common ordering, not a rare race.
+#:
+#: Overshooting the bound only delays a launch that is already waiting on
+#: a process; undershooting publishes the false readiness this exists to
+#: remove.  The poll is fine because the window itself is sub-second.
+NATIVE_PANE_READY_TIMEOUT_SECONDS = 10.0
+_NATIVE_PANE_READY_POLL_SECONDS = 0.1
+
+#: Machine-readable reasons for a native admission that wrote no bytes.
+#:
+#: Recorded on the reservation rather than only in an HTTP body a lost
+#: response would destroy.  All three describe the same delivery fact —
+#: nothing was sent — and differ only in whether asking again could
+#: change the answer.  ``native_pane_unobservable`` is retryable because
+#: "we could not look" is not evidence about the pane.
+REFUSED_PROVIDER_NOT_YET_READY = "provider_not_yet_ready"
+REFUSED_PANE_UNOBSERVABLE = "native_pane_unobservable"
+REFUSED_NATIVE_IDENTITY = "native_binding_identity_refused"
+_RETRYABLE_REFUSAL_REASONS = frozenset({REFUSED_PROVIDER_NOT_YET_READY, REFUSED_PANE_UNOBSERVABLE})
 
 
 def _now() -> str:
@@ -999,6 +1028,88 @@ def _reconcile_and_complete_bind(
     db.refresh(row)
 
 
+def _admission_identity(request: ManagedLaunchV2AdmitRequest) -> dict[str, Any]:
+    """The immutable identity one delivery id is bound to.
+
+    Shared by the claim, the replay check, and the pre-I/O refusal so the
+    three cannot disagree about what "the same delivery" means.  A
+    refusal that recorded fewer fields than the claim would let a replay
+    carrying a different message be answered from it.
+    """
+    return {
+        "delivery_id": request.delivery_id,
+        "message_sha256": request.message_sha256,
+        "sender_id": request.sender_id,
+        "orchestration_type": request.orchestration_type,
+        "context": request.context.model_dump(mode="json"),
+        "native_binding_digest": request.native_binding_digest,
+    }
+
+
+def _assert_same_admission_identity(
+    existing: dict[str, Any], request: ManagedLaunchV2AdmitRequest
+) -> None:
+    """Refuse a delivery id that has come back carrying something else.
+
+    The same id with a changed message, sender, context, orchestration
+    type, or binding is a different immutable identity, never a safe
+    replay — answering it from the stored record would report one task's
+    outcome for another's bytes.
+    """
+    mismatches = [
+        key for key, value in _admission_identity(request).items() if existing.get(key) != value
+    ]
+    if mismatches:
+        raise ManagedLaunchConflict(
+            f"delivery_id is already bound to a different admission identity: {sorted(mismatches)}"
+        )
+
+
+def _readiness_observation(
+    *,
+    pane_id: Optional[str],
+    provider_status: Optional[str],
+    input_ready: bool,
+    detail: Optional[str],
+) -> dict[str, Any]:
+    """One record of whether a pane could actually be typed into, and when.
+
+    Deliberately the same shape wherever readiness is decided, because a
+    refusal that cited different evidence than the launch receipt would
+    let the two disagree about the very thing they both claim to know.
+    ``provider_status`` is ``None`` only when no observation was made at
+    all — "we could not look" is not a reading of the screen, and
+    flattening the two would let an unreadable pane pass as a quiet one.
+    """
+    return {
+        # Named so a reader of the stored record knows which detector
+        # produced it without having to guess from the status string.
+        "authority": "observe_kimi_turn_state",
+        "observed_at": _now(),
+        "pane_id": pane_id,
+        "provider_status": provider_status,
+        "input_ready": input_ready,
+        "detail": detail,
+    }
+
+
+def _is_retryable_refusal(admission: Optional[dict[str, Any]], delivery_id: str) -> bool:
+    """Whether a stored admission is a refusal that a retry may supersede.
+
+    True only for a refusal this exact delivery id earned for a reason
+    that may stop being true — never for one that wrote bytes, may have
+    written bytes, or named a permanent mismatch.  Everything this
+    returns False for is a record that must be answered, not replaced.
+    """
+    if not isinstance(admission, dict):
+        return False
+    return (
+        admission.get("status") == "refused"
+        and admission.get("delivery_id") == delivery_id
+        and admission.get("refusal_reason") in _RETRYABLE_REFUSAL_REASONS
+    )
+
+
 def claim_admission(
     reservation_id: str, request: ManagedLaunchV2AdmitRequest
 ) -> tuple[dict[str, Any], bool]:
@@ -1024,13 +1135,21 @@ def claim_admission(
                     "task admission requires the journaled native_bound reference; "
                     "zero task bytes are sent without it"
                 )
+            # A delivery refused before any I/O leaves a durable record so
+            # a lost response cannot read as maybe-sent. That record must
+            # not then become the thing that blocks the retry it exists to
+            # invite, so a claim may supersede it -- and only it. The swap
+            # is conditioned on those exact stored bytes rather than on
+            # "some refusal is present", so a refusal that changed between
+            # the read and the write loses the race instead of being
+            # silently overwritten.
+            prior_admission_json = row.admission_json
+            existing_before = _parse_json(prior_admission_json, None)
+            superseding_refusal = _is_retryable_refusal(existing_before, request.delivery_id)
+            if superseding_refusal:
+                _assert_same_admission_identity(existing_before or {}, request)
             admission = {
-                "delivery_id": request.delivery_id,
-                "message_sha256": request.message_sha256,
-                "sender_id": request.sender_id,
-                "orchestration_type": request.orchestration_type,
-                "context": request.context.model_dump(mode="json"),
-                "native_binding_digest": request.native_binding_digest,
+                **_admission_identity(request),
                 "status": "io-attempted",
                 "attempted_at": _now(),
             }
@@ -1040,7 +1159,12 @@ def claim_admission(
                     database.ManagedLaunchV2ReservationModel.reservation_id == reservation_id,
                     database.ManagedLaunchV2ReservationModel.state == "bound",
                     database.ManagedLaunchV2ReservationModel.binding_json.is_not(None),
-                    database.ManagedLaunchV2ReservationModel.admission_json.is_(None),
+                    (
+                        database.ManagedLaunchV2ReservationModel.admission_json
+                        == prior_admission_json
+                        if superseding_refusal
+                        else database.ManagedLaunchV2ReservationModel.admission_json.is_(None)
+                    ),
                 )
                 .update(
                     {
@@ -1061,22 +1185,7 @@ def claim_admission(
                 # delivery id with a changed message, sender, context,
                 # orchestration type, or binding is a different immutable
                 # identity and is refused — never treated as a safe replay.
-                replay_identity = {
-                    "delivery_id": request.delivery_id,
-                    "message_sha256": request.message_sha256,
-                    "sender_id": request.sender_id,
-                    "orchestration_type": request.orchestration_type,
-                    "context": request.context.model_dump(mode="json"),
-                    "native_binding_digest": request.native_binding_digest,
-                }
-                mismatches = [
-                    key for key, value in replay_identity.items() if existing.get(key) != value
-                ]
-                if mismatches:
-                    raise ManagedLaunchConflict(
-                        "delivery_id is already bound to a different admission "
-                        f"identity: {sorted(mismatches)}"
-                    )
+                _assert_same_admission_identity(existing, request)
                 return _row_dict(row), False
             raise ManagedLaunchConflict(f"task admission requires state 'bound', not {row.state!r}")
     except ManagedLaunchError:
@@ -1319,6 +1428,205 @@ def mark_admission_refused(
         raise
     except Exception as exc:  # noqa: BLE001
         raise ManagedLaunchUnavailable(f"refused admission persistence failed: {exc}") from exc
+
+
+def refuse_admission_before_io(
+    reservation_id: str,
+    request: ManagedLaunchV2AdmitRequest,
+    reason: str,
+    detail: str,
+    *,
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    """Close a delivery that provably never reached the pane, in one write.
+
+    The refusals this serves happen before the admission is claimed and
+    before a byte is written, so they used to exist only as an HTTP
+    status.  A caller whose response is lost then re-reads the
+    reservation, finds it still ``bound`` with no admission, and cannot
+    tell "refused, nothing sent" from "the request may still be in
+    flight" — and the only safe reading of that silence is
+    maybe-delivered.
+
+    Written as a single atomic update rather than a claim followed by
+    :func:`mark_admission_refused`, because the intermediate state that
+    pair passes through is ``io-attempted`` — the record that says bytes
+    may have gone out.  A crash between the two writes would manufacture
+    exactly the false ambiguity this exists to remove.
+
+    The same immutable identity a claim would have bound is recorded, so
+    a replayed delivery id is still checked against the full identity
+    rather than being answered from a thinner record, and the readiness
+    observation the refusal rests on is stored beside it.
+
+    A retryable refusal leaves the row ``bound``: the state a claim
+    requires is preserved, so the same delivery can complete later
+    without a new reservation, a new binding, or a second copy of the
+    task.  A permanent one advances to ``admitting`` — still zero bytes,
+    but closed.
+    """
+    actual_digest = hashlib.sha256(request.message.encode("utf-8")).hexdigest()
+    if actual_digest != request.message_sha256:
+        # A malformed request, not a delivery outcome. It gets the same
+        # non-durable refusal a claim would have given it: recording a
+        # refusal under an identity the caller misdescribed would bind
+        # the delivery id to bytes nobody can reproduce.
+        raise ManagedLaunchConflict("message_sha256 does not match message bytes")
+    retryable = reason in _RETRYABLE_REFUSAL_REASONS
+    try:
+        with database.SessionLocal() as db:
+            row = _query(db, reservation_id)
+            if row is None:
+                raise ManagedLaunchNotFound(f"v2 reservation not found: {reservation_id}")
+            if request.delivery_id != _parse_json(row.request_json, {}).get("delivery_id"):
+                raise ManagedLaunchConflict(
+                    "delivery_id does not match the immutable v2 reservation delivery identity"
+                )
+            prior_admission_json = row.admission_json
+            existing = _parse_json(prior_admission_json, None)
+            if existing is not None:
+                # Identity before anything else, including before handing
+                # the stored record back. A delivery id carrying different
+                # bytes is a different delivery, and answering it with the
+                # winner's record would report one task's outcome for
+                # another's — the same substitution the replay check
+                # exists to refuse, reached by the concurrent route.
+                _assert_same_admission_identity(existing, request)
+                if not _is_retryable_refusal(existing, request.delivery_id):
+                    # Admitted, maybe-sent, or a permanent refusal decided
+                    # first. Each is authoritative and is returned
+                    # unchanged — overwriting one could relabel a delivery
+                    # that did write bytes as one that never ran.
+                    return _row_dict(row)
+            admission = {
+                **_admission_identity(request),
+                "status": "refused",
+                "refusal_reason": reason,
+                # Stored rather than re-derived by a reader from the
+                # reason string: which reasons may be retried is this
+                # module's decision, and a caller re-implementing that
+                # table would drift from it silently.
+                "retryable": retryable,
+                "detail": detail,
+                "readiness_observation": observation,
+                "refused_at": _now(),
+            }
+            updated = (
+                db.query(database.ManagedLaunchV2ReservationModel)
+                .filter(
+                    database.ManagedLaunchV2ReservationModel.reservation_id == reservation_id,
+                    database.ManagedLaunchV2ReservationModel.state == "bound",
+                    database.ManagedLaunchV2ReservationModel.binding_json.is_not(None),
+                    # Compare-and-swap on the exact bytes just read, so a
+                    # refusal that changed underneath — including one a
+                    # concurrent claim replaced with io-attempted — loses
+                    # rather than being clobbered.
+                    (
+                        database.ManagedLaunchV2ReservationModel.admission_json
+                        == prior_admission_json
+                        if existing is not None
+                        else database.ManagedLaunchV2ReservationModel.admission_json.is_(None)
+                    ),
+                )
+                .update(
+                    {
+                        "admission_json": _canonical_json(admission),
+                        # Retryable refusals hold the row at ``bound``:
+                        # that is the state a later claim requires, and
+                        # advancing it would make the refusal the thing
+                        # that blocks the retry it invites. Permanent ones
+                        # advance no further than ``admitting`` — nothing
+                        # was delivered, so nothing downstream may treat
+                        # this generation as carrying a task.
+                        "state": "bound" if retryable else "admitting",
+                        "updated_at": _now(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            row = _query(db, reservation_id)
+            if updated == 1:
+                return _row_dict(row)
+            contender = _parse_json(row.admission_json, None)
+            if contender is not None:
+                # A concurrent request got there first. Its record is
+                # authoritative, but only for the delivery it belongs to —
+                # so the identity is checked again against what actually
+                # landed, not only against what was read before the swap.
+                _assert_same_admission_identity(contender, request)
+                return _row_dict(row)
+            raise ManagedLaunchConflict(f"task admission requires state 'bound', not {row.state!r}")
+    except ManagedLaunchError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ManagedLaunchUnavailable(f"refused admission persistence failed: {exc}") from exc
+
+
+def _refusal_was_persisted(record: dict[str, Any], delivery_id: str, reason: str) -> bool:
+    """Whether the refusal just attempted is the one now stored.
+
+    False means another handler for this same delivery id won the write
+    — its record may say the bytes were sent, or may be about to.  The
+    refusal is then true only of *this* request, and answering with it
+    would tell one caller nothing was sent while the other sends it.
+    """
+    admission = record.get("admission") or {}
+    return (
+        admission.get("delivery_id") == delivery_id
+        and admission.get("status") == "refused"
+        and admission.get("refusal_reason") == reason
+    )
+
+
+def _persist_pre_io_refusal(
+    reservation_id: str,
+    request: ManagedLaunchV2AdmitRequest,
+    reason: str,
+    detail: str,
+    *,
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    """Make the refusal durable, or refuse to claim one at all.
+
+    Ordering is the point: the response is the part that can be lost, so
+    the record has to exist first for a re-read to be able to answer the
+    question the lost response would have.
+
+    Which makes the failure path the whole contract.  A refusal that was
+    answered but not stored is worse than no refusal: the caller is told
+    "provably nothing was sent" while the only durable state remains a
+    bare ``bound`` row, so anyone who re-reads it — including the same
+    caller after a lost response — sees the silence that has to be read
+    as maybe-delivered.  Two observers of one delivery would disagree,
+    which is this seam's own defect reintroduced one layer up.
+
+    So a storage fault is never downgraded into a proven-refusal answer.
+    It is reported as what it is, leaving the response and the stored
+    state both saying "unresolved, ask again".
+
+    A :class:`ManagedLaunchConflict` is passed through untouched: it means
+    the request is not the delivery it claims to be, which is an accurate
+    answer about *this* request rather than a claim about the refusal.
+    """
+    try:
+        return refuse_admission_before_io(
+            reservation_id, request, reason, detail, observation=observation
+        )
+    except ManagedLaunchConflict:
+        raise
+    except ManagedLaunchError as exc:
+        logger.warning(
+            "v2 reservation %s: pre-I/O refusal %r could not be persisted: %s",
+            reservation_id,
+            reason,
+            exc,
+        )
+        raise ManagedLaunchUnavailable(
+            f"the task was not sent, but that refusal ({reason}) could not be recorded, so "
+            f"it is reported as unresolved rather than as a proven refusal a reader of this "
+            f"reservation would not find: {exc}"
+        ) from exc
 
 
 def mark_admission_ambiguous(reservation_id: str, delivery_id: str, detail: str) -> dict[str, Any]:
@@ -1659,6 +1967,26 @@ async def _launch_native_tui(
     except Exception as exc:  # noqa: BLE001 - the attachment store holds the detail
         return _mark_preflight_blocked(reservation_id, f"native TUI launch refused: {exc}")
 
+    # Waited for here, at the only place that knows the pane just started,
+    # and deliberately not at admission: a caller admits in a straight
+    # line with a request deadline of its own, so a wait moved there would
+    # have to fit inside a budget it cannot see, and a caller that gives
+    # up first cannot receive the truthful answer at all. The launch is
+    # already waiting on a process, so the wait costs nothing it was not
+    # spending. A pane that never becomes ready is not blocked here: the
+    # receipt says so, and the existing bind gate refuses on it.
+    #
+    # Read from the attachment's ``owner`` rather than from the launch
+    # handle: the handle is whatever the transport returned to name what
+    # it created, while the owner's ``pane_id`` is the exact pane the
+    # ownership store recorded — and is the same field admission later
+    # validates and delivers into. Watching anything else would let the
+    # receipt certify a pane that is not the one a task goes to.
+    readiness = await asyncio.to_thread(
+        _await_native_pane_input_ready,
+        record,
+        ((outcome.get("attachment") or {}).get("owner") or {}).get("pane_id"),
+    )
     try:
         await asyncio.to_thread(
             publish_native_ready_state,
@@ -1670,6 +1998,7 @@ async def _launch_native_tui(
                 outcome=outcome,
                 version_output=version_output,
                 bridge_version=BRIDGE_VERSION,
+                readiness=readiness,
             ),
         )
     except Exception as exc:  # noqa: BLE001 - a pane exists but bind cannot read it
@@ -1707,6 +2036,71 @@ def _mint_native_session(
     return receipt
 
 
+def _await_native_pane_input_ready(
+    record: dict[str, Any], pane_handle: Optional[str]
+) -> dict[str, Any]:
+    """Watch the launched pane until it can be typed into, or give up.
+
+    A pane that has started is not a pane that accepts input.  The
+    provider paints a screen and connects its servers first, and a task
+    delivered into that window is absorbed with no error anywhere — the
+    launch looks perfect and the task simply never happened.  Waiting
+    here is what lets the readiness receipt state something that was
+    observed instead of something that was assumed.
+
+    Elapsed time is a bound on how long to keep looking, never evidence
+    of readiness: the only thing that ends this loop successfully is the
+    provider's own detector reading its own screen, the same authority a
+    refusal at admission cites.  A pane that cannot be read at all is
+    reported as unread rather than as not-ready, because "we could not
+    look" and "we looked and it was busy" are different facts and only
+    the second describes the pane.
+
+    Returns the observation rather than raising, because a pane that
+    never became ready is not a launch failure to hide — it is a fact
+    the receipt must carry, so the bind gate can refuse on it.
+    """
+    from cli_agent_orchestrator.models.terminal import TerminalStatus
+    from cli_agent_orchestrator.services.native_pane_input import observe_kimi_turn_state
+
+    if not pane_handle:
+        return _readiness_observation(
+            pane_id=None,
+            provider_status=None,
+            input_ready=False,
+            detail="the launch outcome names no pane, so readiness could not be observed",
+        )
+    window_name = managed_window_name(record["terminal_id"], record["generation"])
+    deadline = time.monotonic() + NATIVE_PANE_READY_TIMEOUT_SECONDS
+    while True:
+        try:
+            status = observe_kimi_turn_state(
+                pane_handle,
+                terminal_id=record["terminal_id"],
+                session_name=record["session_name"],
+                window_name=window_name,
+            )
+        except Exception as exc:  # noqa: BLE001 - an unread pane, not a failed launch
+            observation = _readiness_observation(
+                pane_id=pane_handle,
+                provider_status=None,
+                input_ready=False,
+                detail=f"the pane could not be read: {exc}",
+            )
+        else:
+            observation = _readiness_observation(
+                pane_id=pane_handle,
+                provider_status=status.value,
+                input_ready=status is TerminalStatus.IDLE,
+                detail=None,
+            )
+            if observation["input_ready"]:
+                return observation
+        if time.monotonic() >= deadline:
+            return observation
+        time.sleep(_NATIVE_PANE_READY_POLL_SECONDS)
+
+
 def _native_readiness_receipt(
     *,
     record: dict[str, Any],
@@ -1715,6 +2109,7 @@ def _native_readiness_receipt(
     outcome: dict[str, Any],
     version_output: str,
     bridge_version: str,
+    readiness: dict[str, Any],
 ) -> dict[str, Any]:
     """The readiness receipt a native generation offers to ``bind_native``.
 
@@ -1743,7 +2138,14 @@ def _native_readiness_receipt(
         "provider_session_id": bootstrap["native_session_id"],
         "provider_version": version_output,
         "provider_receipt_kind": _NATIVE_TUI_READINESS_RECEIPT_KINDS[record["provider"]],
-        "model_input_ready": True,
+        # Observed, never asserted. This field is what bind takes as
+        # permission to admit a task, and it used to be a constant — so a
+        # generation whose pane was still booting was certified ready by a
+        # receipt that had never looked at it. Carrying the observation
+        # alongside it means a reader can check the claim rather than
+        # trust it, and a refusal at admission can cite the same evidence.
+        "model_input_ready": bool(readiness.get("input_ready")),
+        "model_input_ready_observation": readiness,
         "execution_mode": em.NATIVE_TUI,
         "native_launch_outcome": outcome["outcome"],
         "launch_argv_sha256": outcome["launch_argv_sha256"],
@@ -1952,6 +2354,8 @@ def _reconcile_native_admission(
     record: dict[str, Any],
     request: ManagedLaunchV2AdmitRequest,
     expected_payload_sha256: str,
+    *,
+    may_refuse_absent_operation: bool = True,
 ) -> dict[str, Any]:
     """Answer a replayed native admission from stored state, sending nothing.
 
@@ -1959,14 +2363,35 @@ def _reconcile_native_admission(
     by replaying the same delivery id, which lands here.  The delivery id
     is also the control operation id, so the exact operation is
     addressable — no scan, no recency guess, no "the last thing we typed".
+
+    ``may_refuse_absent_operation`` distinguishes the two ways of getting
+    here.  A replay arriving fresh from the wire against a stored claim
+    means the handler that made it is gone, so a missing operation record
+    is proof it crashed before opening one.  Losing a claim race means the
+    handler that won it is alive in this process right now, and the same
+    missing record only means "not opened yet" — reading it as proof would
+    publish a zero-byte verdict about bytes that are still being written.
     """
     from cli_agent_orchestrator.services import kimi_native_control
 
     admission = record.get("admission") or {}
     if admission.get("status") == "admitted":
         return record
+    if admission.get("status") == "refused":
+        # Already answered, with evidence. A refusal names why nothing was
+        # sent; re-deriving it from the control store would only overwrite
+        # that precise reason with the vaguer one this function infers
+        # from an absent operation — turning "the bound identity was
+        # wrong" into "no operation was opened", which is true but tells a
+        # reader nothing about what to fix.
+        return record
     operation = kimi_native_control.get(request.delivery_id)
     if operation is None:
+        if not may_refuse_absent_operation:
+            # A live sibling owns this delivery. Its record is returned as
+            # it stands — not-yet-admitted reads as unresolved, which is
+            # the honest answer while another handler may still be typing.
+            return record
         # The adapter journals its intent before any I/O, so an absent
         # operation record means the crash landed between claiming the
         # admission and opening the operation — provably before anything
@@ -2014,7 +2439,10 @@ async def _admit_native_tui(
     # the other's convention.
     expected_payload_sha256 = canonical_sha256(request.message)
 
-    if record.get("admission") is not None:
+    stored_admission = record.get("admission")
+    if stored_admission is not None and not _is_retryable_refusal(
+        stored_admission, request.delivery_id
+    ):
         # A replay is answered from stored state before anything looks at
         # the pane. Running the first-delivery checks here would ask the
         # wrong question: the control adapter blocks a session holding an
@@ -2036,36 +2464,124 @@ async def _admit_native_tui(
             expected_payload_sha256,
         )
 
-    identity = await asyncio.to_thread(_validate_native_admission_identity, record)
+    # Every refusal below is decided before the transport is touched, so
+    # each one is a proven zero-byte outcome — and each is written to the
+    # reservation before the caller is answered. Without that, the only
+    # trace of a refusal is an HTTP response, and a lost response leaves a
+    # bare bound row that has to be read as maybe-delivered: a delivery
+    # that provably never happened, preserved as ambiguous forever.
+    try:
+        identity = await asyncio.to_thread(_validate_native_admission_identity, record)
+    except ManagedLaunchConflict as exc:
+        # A permanent mismatch. Recorded as non-retryable and closed: the
+        # bound identity is not going to become correct by asking again.
+        refused = _persist_pre_io_refusal(
+            reservation_id,
+            request,
+            REFUSED_NATIVE_IDENTITY,
+            str(exc),
+            observation=_readiness_observation(
+                pane_id=None,
+                provider_status=None,
+                input_ready=False,
+                detail="the bound identity was refused before the pane's readiness was read",
+            ),
+        )
+        if not _refusal_was_persisted(refused, request.delivery_id, REFUSED_NATIVE_IDENTITY):
+            return refused
+        raise
+    except ManagedLaunchUnavailable as exc:
+        # The pane could not be observed at all. Recorded as retryable,
+        # because that is a statement about this attempt rather than about
+        # the generation, and closing the delivery on it would discard a
+        # session that may be perfectly alive.
+        refused = _persist_pre_io_refusal(
+            reservation_id,
+            request,
+            REFUSED_PANE_UNOBSERVABLE,
+            str(exc),
+            observation=_readiness_observation(
+                pane_id=None,
+                provider_status=None,
+                input_ready=False,
+                detail=str(exc),
+            ),
+        )
+        if not _refusal_was_persisted(refused, request.delivery_id, REFUSED_PANE_UNOBSERVABLE):
+            return refused
+        raise
 
     observed_at = _now()
-    status = await asyncio.to_thread(
-        observe_kimi_turn_state,
-        identity["pane_id"],
-        terminal_id=record["terminal_id"],
-        session_name=identity["session_name"],
-        window_name=identity["window_name"],
-    )
+    try:
+        status = await asyncio.to_thread(
+            observe_kimi_turn_state,
+            identity["pane_id"],
+            terminal_id=record["terminal_id"],
+            session_name=identity["session_name"],
+            window_name=identity["window_name"],
+        )
+    except Exception as exc:  # noqa: BLE001 - an unread pane, not a busy one
+        refused = _persist_pre_io_refusal(
+            reservation_id,
+            request,
+            REFUSED_PANE_UNOBSERVABLE,
+            f"the bound native pane could not be read, so the task was not sent: {exc}",
+            observation=_readiness_observation(
+                pane_id=identity["pane_id"],
+                provider_status=None,
+                input_ready=False,
+                detail=f"the pane could not be read: {exc}",
+            ),
+        )
+        if not _refusal_was_persisted(refused, request.delivery_id, REFUSED_PANE_UNOBSERVABLE):
+            return refused
+        raise ManagedLaunchUnavailable(
+            f"the bound native pane's readiness could not be observed, so the task was "
+            f"not sent: {exc}"
+        ) from exc
     if status is not TerminalStatus.IDLE:
         # Idle-gated by the provider's own reading of its own screen.
-        # The boot window is the case that matters: Kimi paints its
-        # status bar before it can accept input, and a task delivered
+        # The boot window is the case that matters: the provider paints
+        # its status bar before it can accept input, and a task delivered
         # into that window is absorbed with no error anywhere.
-        raise ManagedLaunchConflict(
+        #
+        # Retryable, and the row is held at ``bound`` so the same delivery
+        # id can still complete once the pane settles.
+        detail = (
             f"the bound native pane reads {status.value!r}, not idle; the task is refused "
             f"rather than typed into a session that is mid-turn or still booting. Zero "
-            f"task bytes were sent and the reservation is unchanged"
+            f"task bytes were sent and this delivery id may be admitted once it reads idle"
         )
+        refused = _persist_pre_io_refusal(
+            reservation_id,
+            request,
+            REFUSED_PROVIDER_NOT_YET_READY,
+            detail,
+            observation=_readiness_observation(
+                pane_id=identity["pane_id"],
+                provider_status=status.value,
+                input_ready=False,
+                detail=None,
+            ),
+        )
+        if not _refusal_was_persisted(refused, request.delivery_id, REFUSED_PROVIDER_NOT_YET_READY):
+            return refused
+        raise ManagedLaunchConflict(detail)
 
     record, should_send = claim_admission(reservation_id, request)
     if not should_send:
         # Lost the claim to a concurrent request for the same delivery id.
+        # The sibling that won it is running *now*, so an absent control
+        # operation here means "not opened yet", not "crashed before
+        # opening" — refusing on it would publish a zero-byte verdict
+        # about a delivery that is still being written.
         return await asyncio.to_thread(
             _reconcile_native_admission,
             reservation_id,
             record,
             request,
             expected_payload_sha256,
+            may_refuse_absent_operation=False,
         )
 
     # The delivery id is the operation id: it is caller-minted, immutable

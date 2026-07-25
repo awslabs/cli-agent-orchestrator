@@ -28,13 +28,18 @@ import pytest
 
 from cli_agent_orchestrator.models.managed_launch_v2 import (
     PROTOCOL_VERSION_V2,
+    ManagedLaunchV2BindRequest,
     ManagedLaunchV2ReserveRequest,
 )
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import kimi_native_bootstrap as boot
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
-from cli_agent_orchestrator.services import native_attachment, native_tui_launch
+from cli_agent_orchestrator.services import native_attachment
+from cli_agent_orchestrator.services import native_pane_input as npi
+from cli_agent_orchestrator.services import native_tui_launch
+from cli_agent_orchestrator.services.managed_launch import ManagedLaunchConflict
 
 PINNED_VERSION_BANNER = "kimi 0.29.0"
 SESSION_ID = "session_9f2c41ab"
@@ -152,6 +157,13 @@ class _Harness:
         # None means "the pane is where the reservation says"; a test
         # sets this to stage a pane that drifted.
         self.observed_cwd: Optional[str] = None
+        # The provider's own reading of its own screen, as a script the
+        # launch consumes one entry per look. A cold pane is not idle the
+        # instant it exists, so the boot window is staged rather than
+        # assumed away -- the last entry repeats once the script runs out,
+        # which is what a pane that settles actually does.
+        self.pane_status_script: list[TerminalStatus] = [TerminalStatus.IDLE]
+        self.pane_reads: list[str] = []
 
     @property
     def launched_argv(self) -> list[str]:
@@ -189,12 +201,30 @@ def harness(monkeypatch):
             "cwd": state.observed_cwd or self._record["working_directory"],
         }
 
+    def _turn_state(pane_id, **_kwargs):
+        state.pane_reads.append(pane_id)
+        status = (
+            state.pane_status_script.pop(0)
+            if len(state.pane_status_script) > 1
+            else state.pane_status_script[0]
+        )
+        if isinstance(status, Exception):
+            raise status
+        return status
+
     monkeypatch.setattr(boot, "StdioAcpBootstrap", _transport)
     monkeypatch.setattr(bridge, "provider_version_banner", lambda *a, **k: PINNED_VERSION_BANNER)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.create_terminal", _create_terminal
     )
     monkeypatch.setattr(v2._V2NativePane, "observe", _observe)
+    monkeypatch.setattr(npi, "observe_kimi_turn_state", _turn_state)
+    # Real durations would make every test in this file pay the boot
+    # budget. The behaviour under test is the sequence of observations and
+    # what the receipt says about them, neither of which is a function of
+    # wall-clock length.
+    monkeypatch.setattr(v2, "NATIVE_PANE_READY_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(v2, "_NATIVE_PANE_READY_POLL_SECONDS", 0.005)
     state.transport = _FakeAcp()
     return state
 
@@ -671,3 +701,131 @@ async def test_a_pane_running_in_another_directory_is_never_certified(
     # And the pane was never typed at: a native launch types nothing by
     # construction, and a blocked one must not have found an exception.
     assert harness.terminals[-1]["initial_message"] is None
+
+
+# --------------------------------------------------------------------
+# The boot window: a pane that exists is not a pane that accepts input
+# --------------------------------------------------------------------
+
+
+def _bind_request(record) -> ManagedLaunchV2BindRequest:
+    return ManagedLaunchV2BindRequest(
+        protocol_version=PROTOCOL_VERSION_V2,
+        terminal_id=record["terminal_id"],
+        generation=record["generation"],
+        attempt_id=str(uuid.uuid4()),
+    )
+
+
+@pytest.mark.asyncio
+async def test_launch_waits_out_the_boot_window_before_certifying_readiness(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """The cold start this whole seam exists for, staged exactly.
+
+    A real cold pane walks ``UNKNOWN`` (no TUI chrome painted yet) into
+    ``PROCESSING`` (connecting its servers) and only then into ``IDLE``
+    (a composer that accepts input).  A launch that published readiness
+    on the strength of the process existing would certify the first of
+    those, and the task admitted against it would be typed into a boot
+    screen that swallows it silently.
+
+    The assertion is therefore about *when* readiness was declared, not
+    merely that it was: the pane had to be looked at until it said so.
+    """
+    harness.pane_status_script = [
+        TerminalStatus.UNKNOWN,
+        TerminalStatus.PROCESSING,
+        TerminalStatus.PROCESSING,
+        TerminalStatus.IDLE,
+    ]
+
+    record, result = await _launch(worktree, tmp_path)
+
+    assert result["state"] == "launching"
+    receipt = _published_receipt(record["reservation_id"])
+    assert receipt["model_input_ready"] is True
+    # Four looks at the one bound pane: the three that said "not yet" and
+    # the one that said "now". A wait that had inferred readiness from
+    # elapsed time instead would show one.
+    assert harness.pane_reads == ["%7"] * 4
+    observed = receipt["model_input_ready_observation"]
+    assert observed["input_ready"] is True
+    assert observed["provider_status"] == TerminalStatus.IDLE.value
+    assert observed["pane_id"] == "%7"
+    # Named so a refusal at admission and this receipt can be checked
+    # against each other rather than each being taken on trust.
+    assert observed["authority"] == "observe_kimi_turn_state"
+
+
+@pytest.mark.asyncio
+async def test_a_pane_ready_on_the_first_look_is_certified_without_waiting(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """The other cold launch: readiness that is already true is not delayed.
+
+    The bound exists to cap a boot, not to impose one.  A launch that
+    slept out its budget regardless would make every generation pay for
+    the slowest possible provider start.
+    """
+    harness.pane_status_script = [TerminalStatus.IDLE]
+
+    record, _ = await _launch(worktree, tmp_path)
+
+    assert _published_receipt(record["reservation_id"])["model_input_ready"] is True
+    assert harness.pane_reads == ["%7"]
+
+
+@pytest.mark.asyncio
+async def test_a_pane_that_never_becomes_ready_is_reported_unready_and_bind_refuses(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """The receipt states what was seen, and the existing gate does the rest.
+
+    ``model_input_ready`` was a hardcoded ``True`` for the whole life of
+    this path, which made ``bind_native``'s check of it unreachable --
+    a gate that could never fire against a generation that was never
+    ready.  Making the field an observation is what turns that check back
+    on, so no new refusal had to be invented for this case.
+    """
+    harness.pane_status_script = [TerminalStatus.PROCESSING]
+
+    record, result = await _launch(worktree, tmp_path)
+
+    # The launch itself does not fail: a pane that is still booting is a
+    # fact to report, not an error to hide.
+    assert result["state"] == "launching"
+    receipt = _published_receipt(record["reservation_id"])
+    assert receipt["model_input_ready"] is False
+    assert receipt["model_input_ready_observation"]["provider_status"] == (
+        TerminalStatus.PROCESSING.value
+    )
+    # It was looked at repeatedly rather than written off after one read.
+    assert len(harness.pane_reads) > 1
+
+    with pytest.raises(ManagedLaunchConflict, match="model_input_ready"):
+        v2.bind_native(record["reservation_id"], _bind_request(record))
+
+    # Fail-closed: no binding, so no admission can name this generation.
+    assert v2.get(record["reservation_id"])["state"] == "launching"
+
+
+@pytest.mark.asyncio
+async def test_a_pane_that_cannot_be_read_is_never_certified_as_ready(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """ "We could not look" is not "we looked and it was fine".
+
+    An unreadable pane produces no status at all, and the receipt says
+    so -- an observation field left at ``None`` rather than filled in
+    with the reading that was never taken.
+    """
+    harness.pane_status_script = [npi.NativePaneInputUnavailable("tmux is not answering")]
+
+    record, _ = await _launch(worktree, tmp_path)
+
+    receipt = _published_receipt(record["reservation_id"])
+    assert receipt["model_input_ready"] is False
+    observed = receipt["model_input_ready_observation"]
+    assert observed["provider_status"] is None
+    assert "tmux is not answering" in observed["detail"]
