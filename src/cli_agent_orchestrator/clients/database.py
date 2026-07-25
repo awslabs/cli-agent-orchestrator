@@ -1629,6 +1629,63 @@ def upgrade_terminal_identity_from_observation(
         return updated == 1
 
 
+def upgrade_v2_terminal_identity_from_observation(
+    terminal_id: str,
+    *,
+    pane_id: str,
+    server_socket_path: str,
+    session_id: str,
+    pane_pid: int,
+) -> bool:
+    """The v2 twin of :func:`upgrade_terminal_identity_from_observation`.
+
+    The managed store carries the same three-of-five rows for the same
+    reason: the deployed build wrote ``pane_id``, ``window_id`` and
+    ``server_socket_path`` into ``managed_launch_v2_terminals`` too. With
+    only the shared-table writer, projecting a managed row matches zero
+    rows every time, the upgrade never lands, and the whole preserved
+    managed fleet is graded ``unknown-liveness`` permanently — the
+    fail-closed outcome, applied to rows that a single observation could
+    have answered.
+
+    Written as a separate function rather than a vintage argument on one
+    writer, for the same reason the native-session setters are split: the
+    two stores are isolated by design, and a single writer choosing its
+    table at runtime is one bug away from a v1 path touching a v2 row.
+
+    The guards are identical, on the v2 columns:
+
+    * matched on the row's existing ``pane_id`` **and**
+      ``server_socket_path``, so a row whose pane moved is not touched;
+    * matched on ``v2_session_id IS NULL AND v2_pane_pid IS NULL``, so an
+      already-complete row is never rewritten and two concurrent upgrades
+      cannot both win;
+    * a row with no pane or no socket is out of scope — there is nothing
+      to observe it against.
+
+    Returns True only when this call completed the row.
+    """
+    if not (pane_id and server_socket_path and session_id) or pane_pid <= 0:
+        return False
+    with SessionLocal() as db:
+        updated = (
+            db.query(ManagedLaunchV2TerminalModel)
+            .filter(
+                ManagedLaunchV2TerminalModel.id == terminal_id,
+                ManagedLaunchV2TerminalModel.pane_id == pane_id,
+                ManagedLaunchV2TerminalModel.server_socket_path == server_socket_path,
+                ManagedLaunchV2TerminalModel.v2_session_id.is_(None),
+                ManagedLaunchV2TerminalModel.v2_pane_pid.is_(None),
+            )
+            .update(
+                {"v2_session_id": session_id, "v2_pane_pid": pane_pid},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return updated == 1
+
+
 def set_terminal_native_session_id(terminal_id: str, native_session_id: str) -> bool:
     """Record the provider-native session this terminal's pane is running.
 

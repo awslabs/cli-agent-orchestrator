@@ -56,6 +56,7 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_terminal_shell_command,
     upgrade_terminal_identity_from_observation,
+    upgrade_v2_terminal_identity_from_observation,
 )
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
@@ -282,6 +283,13 @@ def upgrade_observed_identity(
     A row missing ``pane_id`` or ``server_socket_path`` is never upgraded:
     there is nothing to observe it against, and that is precisely the case
     where a guess would put a live handle on somebody else's pane.
+
+    The write is dispatched by protocol vintage, exactly as the
+    native-session writers are. The deployed build created three-of-five
+    rows in *both* stores, and the managed store is isolated with its own
+    prefixed columns, so a v2 row handed to the shared-table writer
+    matches nothing: the upgrade silently reports failure and the whole
+    preserved managed fleet stays demoted forever.
     """
     pane_id = metadata.get("pane_id")
     socket_path = metadata.get("server_socket_path")
@@ -310,8 +318,13 @@ def upgrade_observed_identity(
     if not session_id or not pane_pid:
         return None
 
+    writer = (
+        upgrade_v2_terminal_identity_from_observation
+        if metadata.get("protocol_vintage") == "v2"
+        else upgrade_terminal_identity_from_observation
+    )
     try:
-        completed = upgrade_terminal_identity_from_observation(
+        completed = writer(
             terminal_id,
             pane_id=pane_id,
             server_socket_path=socket_path,
@@ -2811,6 +2824,19 @@ def reattach_existing_output_pipelines() -> dict:
     reader and stop/start pipe-pane (stop-then-start, not a bare toggle — a
     stale pane still reports pane_pipe=1). Terminals whose window is gone are
     skipped (stale rows; deletion is left to normal lifecycle paths).
+
+    Every row is proven through the same identity boundary a control write
+    uses, before anything is piped or typed. This runs at server startup,
+    against rows written by a *previous* process, which is precisely when
+    the recorded names are least trustworthy: a session and window torn
+    down while the server was dead and recreated under the same names
+    resolve perfectly, so the unverified form both nudged Enter into a
+    stranger's pane and piped that stranger's output into this row's FIFO
+    — mislabelled as this terminal's, and read as its provider status
+    from then on. A row whose proof fails is skipped with zero bytes
+    written; a row with no recorded identity keeps resolving by name,
+    which is the documented boundary of the identity work rather than an
+    exemption.
     """
     from cli_agent_orchestrator.clients.database import list_all_terminals
 
@@ -2821,6 +2847,26 @@ def reattach_existing_output_pipelines() -> dict:
     for row in list_all_terminals():
         terminal_id = row["id"]
         session_name, window_name = row["tmux_session"], row["tmux_window"]
+        try:
+            # The listing is a display-shaped subset with no identity
+            # fields; verifying against it would grade every row absent
+            # and check nothing at all.
+            metadata = get_terminal_metadata(terminal_id) or row
+            target = verified_pane_target(
+                terminal_id, metadata, operation="output pipeline re-attach"
+            )
+        except TerminalIdentityMismatchError as exc:
+            logger.info("Refused to re-attach the output pipeline for %s: %s", terminal_id, exc)
+            skipped.append(terminal_id)
+            continue
+        pane_id = None
+        if target is not None:
+            # The names the verified pane answers to *now*. ``pipe-pane``
+            # and history addressing are name-shaped, so using the
+            # recorded names here would re-open the same hole the proof
+            # just closed.
+            pane_id = target.pane_id
+            session_name, window_name = target.session_name, target.window_name
         try:
             backend.get_history(session_name, window_name, tail_lines=1)
         except Exception:
@@ -2841,7 +2887,9 @@ def reattach_existing_output_pipelines() -> dict:
             backend.pipe_pane(session_name, window_name, str(fifo_path))
             # Nudge a fresh prompt line through the new pipe so StatusMonitor
             # leaves UNKNOWN promptly (same rationale as the create path).
-            backend.send_special_key(session_name, window_name, "Enter")
+            # Enter submits whatever a composer is holding, so it goes to
+            # the proven pane id when there is one.
+            backend.send_special_key(session_name, window_name, "Enter", pane_id=pane_id)
             reattached.append(terminal_id)
         except Exception:
             logger.warning("could not re-attach output pipeline for %s", terminal_id, exc_info=True)

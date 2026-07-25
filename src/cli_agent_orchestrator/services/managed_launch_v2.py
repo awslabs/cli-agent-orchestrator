@@ -153,14 +153,32 @@ PREFLIGHT_FAILURE_SCHEMA = "cao-managed-launch-v2-preflight-failure-v1"
 #: Machine-readable cause codes for a blocked generation.  The strings are
 #: informative for a recovering conductor, not a gate; every one of them
 #: means the same delivery fact — zero task bytes crossed.
-PREFLIGHT_REASON_LAUNCH_REQUEST = "launch-request"
+#:
+#: The set is *closed*.  A recovering caller is entitled to branch on these
+#: values, so a code it has never seen is worse than a coarse one: it
+#: reads as an unknown failure class and there is no safe default branch
+#: for that.  A new failure site therefore reuses the member that is true
+#: of it, or ``PREFLIGHT_REASON_GENERIC``, rather than inventing a name
+#: that describes the call site more precisely than the contract allows.
 PREFLIGHT_REASON_PROVIDER_UNSUPPORTED = "provider-unsupported"
 PREFLIGHT_REASON_NATIVE_PREFLIGHT = "native-preflight"
 PREFLIGHT_REASON_SESSION_BOOTSTRAP = "session-bootstrap"
 PREFLIGHT_REASON_TUI_LAUNCH_REFUSED = "tui-launch-refused"
 PREFLIGHT_REASON_READINESS = "readiness-receipt"
-PREFLIGHT_REASON_PROVIDER_LAUNCH = "provider-launch"
 PREFLIGHT_REASON_GENERIC = "native-generic"
+
+#: The closed set itself, held as data so that "is this reason lawful?" is
+#: a question about one object rather than about six scattered constants.
+PREFLIGHT_REASONS = frozenset(
+    {
+        PREFLIGHT_REASON_PROVIDER_UNSUPPORTED,
+        PREFLIGHT_REASON_NATIVE_PREFLIGHT,
+        PREFLIGHT_REASON_SESSION_BOOTSTRAP,
+        PREFLIGHT_REASON_TUI_LAUNCH_REFUSED,
+        PREFLIGHT_REASON_READINESS,
+        PREFLIGHT_REASON_GENERIC,
+    }
+)
 
 
 def _now() -> str:
@@ -2242,8 +2260,13 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
         }
         write_request(reservation_id, bridge_request)
     except Exception as exc:  # noqa: BLE001 - no provider I/O occurred
+        # Preflight in the literal sense: the pinned binary is checked and
+        # the durable request is written before anything is started, so a
+        # failure here is the same class as the native banner/environment
+        # check further down — verification that ran ahead of the launch,
+        # not a launch that went wrong.
         return _mark_preflight_blocked(
-            reservation_id, str(exc), reason=PREFLIGHT_REASON_LAUNCH_REQUEST
+            reservation_id, str(exc), reason=PREFLIGHT_REASON_NATIVE_PREFLIGHT
         )
 
     # The two modes diverge here and nowhere earlier: everything above is
@@ -2290,9 +2313,13 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             state = None
         if state and state.get("state") == "launch-failed-bridge":
             return _mark_launch_failed_bridge(reservation_id, state)
-        return _mark_preflight_blocked(
-            reservation_id, str(exc), reason=PREFLIGHT_REASON_PROVIDER_LAUNCH
-        )
+        # The generic bucket, and deliberately so: this is the ACP bridge
+        # branch, where no TUI is launched and no native session is
+        # bootstrapped, so every more specific member of the closed set
+        # would name something that did not happen.  The detail carries
+        # the actual cause; the code says only which class of answer a
+        # recovery is looking at.
+        return _mark_preflight_blocked(reservation_id, str(exc), reason=PREFLIGHT_REASON_GENERIC)
 
     try:
         status = await asyncio.to_thread(

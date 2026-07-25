@@ -118,9 +118,147 @@ def _cleanup_request(record, **changes) -> ManagedLaunchV2CleanupRequest:
     return ManagedLaunchV2CleanupRequest(**payload)
 
 
+def _emitted_preflight_reasons() -> dict[str, str]:
+    """Every reason this module can actually write, read out of its source.
+
+    Enumerated from the AST rather than from a hand-kept list, because a
+    hand-kept list is exactly what drifted: two call sites passed codes
+    that were never in the contract, and no test could notice because no
+    test knew the call sites existed. Parsing the real file means a new
+    emission added tomorrow is enumerated tomorrow, whether or not anyone
+    remembers this suite.
+
+    Returns ``{source location: reason value}`` so a failure names the
+    line to fix instead of only the offending string.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(v2))
+    emitted: dict[str, str] = {}
+
+    def _resolve(node: ast.AST, where: str) -> None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            # A bare literal at a call site — lawful only if it happens to
+            # spell a contract member, and recorded either way.
+            emitted[where] = node.value
+            return
+        if isinstance(node, ast.Name):
+            value = getattr(v2, node.id, None)
+            assert isinstance(value, str), f"{where}: {node.id} is not a string constant"
+            emitted[where] = value
+            return
+        raise AssertionError(
+            f"{where}: a preflight reason must be a module constant or a literal, "
+            f"so that it can be enumerated; got {type(node).__name__}"
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_mark_preflight_blocked":
+            # The default is an emission too: every caller that omits the
+            # keyword writes this value.
+            for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+                if arg.arg == "reason" and default is not None:
+                    _resolve(default, f"_mark_preflight_blocked default (line {node.lineno})")
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name != "_mark_preflight_blocked":
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "reason":
+                _resolve(keyword.value, f"call at line {node.lineno}")
+
+    return emitted
+
+
 # --------------------------------------------------------------------
 # A. The evidence envelope
 # --------------------------------------------------------------------
+
+
+class TestPreflightReasonsAreTheClosedContractSet:
+    """The reason codes are a closed enum, and every emission is in it.
+
+    A recovering conductor is entitled to branch on ``reason``. An
+    unrecognised code is therefore worse for it than a coarse one: there
+    is no safe default branch for "a failure class I have never heard
+    of", so it must treat the whole envelope as untrusted and cannot use
+    the zero-byte proof the envelope exists to carry.
+    """
+
+    #: The contract's six, written out as literals on purpose. Importing
+    #: the module's own set here would make this test agree with whatever
+    #: the code currently says, which is the one thing it must not do.
+    CONTRACT = {
+        "provider-unsupported",
+        "native-preflight",
+        "session-bootstrap",
+        "tui-launch-refused",
+        "readiness-receipt",
+        "native-generic",
+    }
+
+    def test_the_module_defines_exactly_the_contract_set(self):
+        assert v2.PREFLIGHT_REASONS == self.CONTRACT
+
+    def test_no_constant_holds_a_value_outside_the_contract(self):
+        """Catches a stray code that is defined but not yet wired up.
+
+        A constant is an invitation: the next failure site reaches for
+        the name that reads well at that call site, and an out-of-contract
+        string ships the moment one does.
+        """
+        stray = {
+            name: getattr(v2, name)
+            for name in dir(v2)
+            if name.startswith("PREFLIGHT_REASON_") and getattr(v2, name) not in self.CONTRACT
+        }
+        assert stray == {}
+
+    def test_every_emitted_reason_is_a_contract_member(self):
+        emitted = _emitted_preflight_reasons()
+        # The enumeration itself must have found something; an AST walk
+        # that silently matched nothing would pass every assertion below.
+        assert len(emitted) >= 6, f"only found {emitted}"
+        offenders = {where: value for where, value in emitted.items() if value not in self.CONTRACT}
+        assert offenders == {}
+
+    def test_every_contract_member_is_actually_emitted(self):
+        """No paper-only codes.
+
+        A member nothing writes is either a deletion that stopped halfway
+        or a failure class the launcher forgot to report, and both look
+        the same from the contract.
+        """
+        assert set(_emitted_preflight_reasons().values()) == self.CONTRACT
+
+    @pytest.mark.parametrize(
+        "reason",
+        sorted(
+            {
+                "provider-unsupported",
+                "native-preflight",
+                "session-bootstrap",
+                "tui-launch-refused",
+                "readiness-receipt",
+                "native-generic",
+            }
+        ),
+    )
+    def test_each_reason_reaches_a_reader_verbatim(
+        self, isolated_memory_db, worktree, tmp_path, reason
+    ):
+        """The stored envelope, as a recovery reads it back off the GET.
+
+        Source agreement is not delivery: the value a conductor branches
+        on is the one that survived being written, canonicalised into the
+        evidence JSON and re-parsed, so that is what is asserted.
+        """
+        record = _reserve(worktree, tmp_path)
+        v2._mark_preflight_blocked(record["reservation_id"], "cause", reason=reason)
+        assert v2.get(record["reservation_id"])["preflight_failure"]["reason"] == reason
 
 
 class TestPreflightFailureEnvelope:

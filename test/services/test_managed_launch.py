@@ -868,6 +868,120 @@ def test_zero_task_route_attestation_is_provider_bound(tmp_path, monkeypatch):
     assert calls == [(str(tmp_path), "kimi-code/k3", "max")]
 
 
+def _attest_request(tmp_path, provider, **changes):
+    payload = {
+        "protocol_version": PROTOCOL_VERSION,
+        "provider": provider,
+        "agent_profile": "reviewer",
+        "working_directory": str(tmp_path),
+        "expected_model": "claude-opus-5",
+        "expected_effort": "xhigh",
+    }
+    payload.update(changes)
+    return ManagedLaunchRouteAttestRequest(**payload)
+
+
+class TestRouteAttestationDispatchesByProvider:
+    """One attestor per provider, chosen by name, never by falling through.
+
+    The accepted provider set was widened to include ``claude_code`` when
+    the reserve request was, while the dispatch was still "codex, or
+    else" — so a Claude attestation ran the *Kimi* binary and returned a
+    Kimi receipt under ``provider: "claude_code"``. A breaker reading that
+    would open a Claude route on another provider's evidence, which is
+    exactly the substitution a route attestation exists to prevent.
+    """
+
+    def test_claude_reaches_the_claude_attestor_and_not_the_kimi_one(self, tmp_path, monkeypatch):
+        called = []
+
+        def _claude(root, *, expected_model, expected_effort):
+            called.append("claude")
+            return {"probe_version": "claude-cli-route-v1", "no_prompt_sent": True}
+
+        def _kimi(root, *, expected_model, expected_effort):
+            called.append("kimi")
+            return {"probe_version": "kimi-acp-route-v1", "no_prompt_sent": True}
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.claude_route.attest_claude_route", _claude
+        )
+        monkeypatch.setattr("cli_agent_orchestrator.services.kimi_route.attest_kimi_route", _kimi)
+
+        receipt = managed_launch.attest_route(_attest_request(tmp_path, "claude_code"))
+
+        assert called == ["claude"]
+        assert receipt["provider"] == "claude_code"
+        assert receipt["provider_route_receipt"]["probe_version"] == "claude-cli-route-v1"
+
+    def test_kimi_still_reaches_the_kimi_attestor(self, tmp_path, monkeypatch):
+        """The fix is a dispatch, not a redirect."""
+        called = []
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.kimi_route.attest_kimi_route",
+            lambda root, **kw: called.append("kimi") or {"probe_version": "kimi-acp-route-v1"},
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.claude_route.attest_claude_route",
+            lambda root, **kw: called.append("claude") or {},
+        )
+
+        managed_launch.attest_route(_attest_request(tmp_path, "kimi_cli"))
+
+        assert called == ["kimi"]
+
+    def test_claude_attestation_is_available_rather_than_a_dead_end(self, tmp_path, monkeypatch):
+        """Refusing every Claude attestation would wedge recovery instead.
+
+        The breaker calls this to decide whether one new launch attempt is
+        permitted; an endpoint that always refuses for Claude leaves a
+        failed managed Claude route unrecoverable. So the receipt is real
+        — it just names what it did not observe.
+        """
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.claude_route.shutil.which",
+            lambda binary: "/usr/local/bin/claude",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.claude_route.subprocess.run",
+            lambda *a, **k: SimpleNamespace(returncode=0, stdout="2.1.220 (Claude Code)\n"),
+        )
+
+        receipt = managed_launch.attest_route(_attest_request(tmp_path, "claude_code"))
+        provider_receipt = receipt["provider_route_receipt"]
+
+        assert receipt["no_task_admitted"] is True
+        assert provider_receipt["claude_version"] == "2.1.220"
+        # Requested is not resolved, and the receipt says so in both
+        # directions rather than leaving the reader to infer it.
+        assert provider_receipt["requested_model"] == "claude-opus-5"
+        assert provider_receipt["observed_model"] is None
+        assert provider_receipt["observed_effort"] is None
+        assert provider_receipt["pre_turn_route_surface"] is False
+        assert provider_receipt["unobserved_reason"]
+
+    def test_a_drifted_claude_build_is_refused(self, tmp_path, monkeypatch):
+        """The one thing this receipt does assert must be checked."""
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.claude_route.shutil.which",
+            lambda binary: "/usr/local/bin/claude",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.claude_route.subprocess.run",
+            lambda *a, **k: SimpleNamespace(returncode=0, stdout="2.1.218\n"),
+        )
+
+        with pytest.raises(managed_launch.ManagedLaunchConflict):
+            managed_launch.attest_route(_attest_request(tmp_path, "claude_code"))
+
+    def test_trusted_project_root_stays_codex_only_for_claude(self, tmp_path):
+        with pytest.raises(managed_launch.ManagedLaunchConflict):
+            managed_launch.attest_route(
+                _attest_request(tmp_path, "claude_code", trusted_project_root=str(tmp_path))
+            )
+
+
 def test_cleanup_is_exact_idempotent_and_refuses_admitted_generation(
     isolated_memory_db, tmp_path, monkeypatch
 ):

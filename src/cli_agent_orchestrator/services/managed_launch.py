@@ -1099,7 +1099,20 @@ def attest_route(request: ManagedLaunchRouteAttestRequest) -> dict[str, Any]:
     This is intentionally independent of reservations and terminal creation so
     an external launch breaker can prove that a failed route is healthy before
     permitting exactly one new launch attempt.
+
+    Dispatch is exhaustive by provider, never "codex or else". The accepted
+    provider set was widened to include ``claude_code`` when the reserve
+    request was, and an ``else`` branch silently made that a *Kimi* probe:
+    it ran the Kimi binary, produced a Kimi route receipt, and returned it
+    under ``provider: "claude_code"``. A breaker reading that receipt would
+    open a Claude route on evidence gathered from a different provider —
+    the one failure mode a route attestation exists to prevent. A provider
+    with no attestor is refused; there is no honest receipt to give.
     """
+    from cli_agent_orchestrator.services.claude_route import (
+        ClaudeRouteProbeError,
+        attest_claude_route,
+    )
     from cli_agent_orchestrator.services.codex_trust import (
         CodexTrustProbeError,
         attest_trusted_project,
@@ -1127,7 +1140,7 @@ def attest_route(request: ManagedLaunchRouteAttestRequest) -> dict[str, Any]:
             )
         except CodexTrustProbeError as exc:
             raise ManagedLaunchConflict(str(exc)) from exc
-    else:
+    elif request.provider == "kimi_cli":
         if request.trusted_project_root is not None:
             raise ManagedLaunchConflict("trusted_project_root is valid only for provider=codex")
         try:
@@ -1138,6 +1151,26 @@ def attest_route(request: ManagedLaunchRouteAttestRequest) -> dict[str, Any]:
             )
         except KimiRouteProbeError as exc:
             raise ManagedLaunchConflict(str(exc)) from exc
+    elif request.provider == "claude_code":
+        if request.trusted_project_root is not None:
+            raise ManagedLaunchConflict("trusted_project_root is valid only for provider=codex")
+        try:
+            provider_receipt = attest_claude_route(
+                worktree,
+                expected_model=request.expected_model,
+                expected_effort=request.expected_effort,
+            )
+        except ClaudeRouteProbeError as exc:
+            raise ManagedLaunchConflict(str(exc)) from exc
+    else:
+        # Unreachable through the typed request, which is the point: the
+        # branch exists so that widening the Literal without adding an
+        # attestor fails here rather than silently reaching whichever
+        # probe happened to be last.
+        raise ManagedLaunchConflict(
+            f"no route attestor exists for provider {request.provider!r}; refusing rather "
+            "than returning another provider's receipt under this provider's name"
+        )
     return {
         "protocol_version": PROTOCOL_VERSION,
         "attestation_id": str(uuid.uuid4()),

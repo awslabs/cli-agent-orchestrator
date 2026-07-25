@@ -236,6 +236,342 @@ class TestObservedUpgrade:
         assert projected["session_id"] == "$1"
 
 
+def _deployed_v2_row(terminal_id: str = "cccc3333", **changes: Any) -> None:
+    """A *managed* row exactly as the previously deployed build wrote it.
+
+    The same three-of-five shape as :func:`_deployed_build_row`, in the
+    isolated v2 store. The managed fleet is the half that must survive the
+    cutover intact: these are the workers a conductor preserved across the
+    upgrade precisely so it would not have to respawn them.
+    """
+    kwargs = {
+        "terminal_id": terminal_id,
+        "tmux_session": "cao-up",
+        "tmux_window": "worker",
+        "provider": "claude_code",
+        "generation": f"gen-{terminal_id}",
+        "pane_id": "%10",
+        "window_id": "@10",
+        "server_socket_path": SOCKET,
+    }
+    kwargs.update(changes)
+    database.create_terminal_v2(**kwargs)
+
+
+class TestV2ObservedUpgrade:
+    """The managed store gets the same cutover, through its own columns.
+
+    A v2 row handed to the shared-table writer matches zero rows — the id
+    is not in ``terminals`` at all — so the write reports failure, the
+    upgrade never lands, and every preserved managed worker is graded
+    ``unknown-liveness`` on every read, forever. Fail-closed applied to
+    rows a single observation could have answered is still a dead fleet.
+    """
+
+    def test_a_managed_three_of_five_row_is_completed_from_its_own_pane(
+        self, isolated_memory_db, backend
+    ):
+        backend({"%10": _pane()})
+        _deployed_v2_row()
+
+        metadata = database.get_terminal_metadata_v2("cccc3333")
+        assert metadata["v2_session_id"] is None
+
+        upgraded = terminal_service.upgrade_observed_identity(
+            "cccc3333",
+            {**metadata, "session_id": None, "pane_pid": None},
+        )
+
+        assert upgraded is not None
+        stored = database.get_terminal_metadata_v2("cccc3333")
+        assert stored["v2_session_id"] == "$1"
+        assert stored["v2_pane_pid"] == 4242
+
+    def test_the_managed_row_is_written_through_the_v2_columns_only(
+        self, isolated_memory_db, backend
+    ):
+        """The isolation invariant is not relaxed to make the upgrade work.
+
+        A managed row completed by writing into the shared table would
+        make an old-binary list/watchdog/cleanup path able to see a v2
+        terminal, which is the one thing the split store exists to
+        prevent.
+        """
+        backend({"%10": _pane()})
+        _deployed_v2_row()
+
+        terminal_service.upgrade_observed_identity(
+            "cccc3333",
+            {**database.get_terminal_metadata_v2("cccc3333"), "session_id": None, "pane_pid": None},
+        )
+
+        assert database.get_terminal_metadata("cccc3333") is None
+
+    def test_the_projection_recovers_a_preserved_managed_worker(self, isolated_memory_db, backend):
+        """End to end, through the reader that actually demoted the fleet.
+
+        The projection is where the damage showed: it graded the row
+        partial, called the upgrade, got nothing back, and published
+        ``unknown-liveness`` for a pane that was running the whole time.
+        """
+        backend({"%10": _pane()})
+        _deployed_v2_row()
+
+        projected = projection.project_terminal("cccc3333")
+
+        assert projected["lifecycle_state"] == projection.LIFECYCLE_LIVE
+        assert projected["session_id"] == "$1"
+        assert projected["pane_pid"] == 4242
+        assert projected["protocol_vintage"] == "v2"
+
+    def test_a_managed_row_whose_pane_moved_servers_is_not_upgraded(
+        self, isolated_memory_db, backend
+    ):
+        """Observed on a different socket is a different pane wearing the id."""
+        backend({"%10": _pane(socket=OTHER_SOCKET)})
+        _deployed_v2_row()
+
+        assert (
+            terminal_service.upgrade_observed_identity(
+                "cccc3333",
+                {
+                    **database.get_terminal_metadata_v2("cccc3333"),
+                    "session_id": None,
+                    "pane_pid": None,
+                },
+            )
+            is None
+        )
+        assert database.get_terminal_metadata_v2("cccc3333")["v2_session_id"] is None
+
+    def test_the_write_refuses_a_socket_that_is_not_the_rows_own(self, isolated_memory_db):
+        """The CAS itself carries the guard, not only the caller above it.
+
+        The service checks the observed socket before writing, but the
+        writer is reachable on its own; a guard that lives only in the
+        caller is one new call site away from being absent.
+        """
+        _deployed_v2_row()
+
+        assert (
+            database.upgrade_v2_terminal_identity_from_observation(
+                "cccc3333",
+                pane_id="%10",
+                server_socket_path=OTHER_SOCKET,
+                session_id="$1",
+                pane_pid=4242,
+            )
+            is False
+        )
+        assert database.get_terminal_metadata_v2("cccc3333")["v2_session_id"] is None
+
+    def test_a_managed_row_that_is_already_complete_is_never_rewritten(self, isolated_memory_db):
+        """Matched on both v2 columns being NULL.
+
+        So the second of two concurrent upgrades loses rather than
+        re-pointing a row that the first one already answered.
+        """
+        _deployed_v2_row()
+        first = database.upgrade_v2_terminal_identity_from_observation(
+            "cccc3333",
+            pane_id="%10",
+            server_socket_path=SOCKET,
+            session_id="$1",
+            pane_pid=4242,
+        )
+        second = database.upgrade_v2_terminal_identity_from_observation(
+            "cccc3333",
+            pane_id="%10",
+            server_socket_path=SOCKET,
+            session_id="$9",
+            pane_pid=9999,
+        )
+
+        assert (first, second) == (True, False)
+        stored = database.get_terminal_metadata_v2("cccc3333")
+        assert (stored["v2_session_id"], stored["v2_pane_pid"]) == ("$1", 4242)
+
+    def test_a_v1_row_is_untouched_by_the_v2_writer_and_the_reverse(self, isolated_memory_db):
+        """Neither writer can reach the other store.
+
+        Same id in both tables is the sharpest form of the question: if
+        either writer chose its table by anything other than the vintage
+        it was given, one of these assertions moves.
+        """
+        _deployed_build_row("dddd4444")
+        _deployed_v2_row("dddd4444")
+
+        assert (
+            database.upgrade_v2_terminal_identity_from_observation(
+                "dddd4444",
+                pane_id="%10",
+                server_socket_path=SOCKET,
+                session_id="$2",
+                pane_pid=777,
+            )
+            is True
+        )
+
+        assert database.get_terminal_metadata("dddd4444")["session_id"] is None
+        assert database.get_terminal_metadata_v2("dddd4444")["v2_session_id"] == "$2"
+
+    def test_the_vintage_decides_the_writer(self, isolated_memory_db, backend, monkeypatch):
+        """Dispatch is on the row's own ``protocol_vintage``.
+
+        Asserted by watching which writer is called, because both stores
+        answering correctly at the end could also be produced by writing
+        to both — and that would breach the isolation invariant while
+        every value-level assertion still passed.
+        """
+        backend({"%10": _pane()})
+        _deployed_v2_row()
+        called: list[str] = []
+
+        for name in (
+            "upgrade_terminal_identity_from_observation",
+            "upgrade_v2_terminal_identity_from_observation",
+        ):
+            monkeypatch.setattr(
+                terminal_service,
+                name,
+                lambda *a, _n=name, **k: called.append(_n) or True,
+            )
+
+        terminal_service.upgrade_observed_identity(
+            "cccc3333",
+            {**database.get_terminal_metadata_v2("cccc3333"), "session_id": None, "pane_pid": None},
+        )
+
+        assert called == ["upgrade_v2_terminal_identity_from_observation"]
+
+
+class _PipelineBackend(FakeBackend):
+    """A backend double that also answers the output-pipeline calls."""
+
+    def __init__(self, panes=None):
+        super().__init__(panes)
+        self.piped: list[tuple] = []
+        self.stopped: list[tuple] = []
+        self.history: list[tuple] = []
+
+    def supports_event_inbox(self) -> bool:
+        return False
+
+    def get_history(self, session_name, window_name, tail_lines=None, **kwargs) -> str:
+        self.history.append((session_name, window_name))
+        return ""
+
+    def pipe_pane(self, session_name, window_name, path) -> None:
+        self.piped.append((session_name, window_name, path))
+
+    def stop_pipe_pane(self, session_name, window_name) -> None:
+        self.stopped.append((session_name, window_name))
+
+
+class TestStartupReattachIsIdentityBound:
+    """Server-restart recovery types into a proven pane or into none.
+
+    This is the path where the recorded names are least trustworthy: it
+    runs against rows written by a *previous* process, and a session and
+    window torn down while the server was dead and recreated under the
+    same names resolve perfectly. The unverified form both nudged Enter
+    into whatever answered those names and piped that pane's output into
+    this row's FIFO, where it was then read as this terminal's provider
+    status.
+    """
+
+    @pytest.fixture
+    def pipeline(self, monkeypatch):
+        def _install(panes=None):
+            fake = _PipelineBackend(panes)
+            monkeypatch.setattr(terminal_service, "get_backend", lambda: fake)
+            monkeypatch.setattr(
+                terminal_service.fifo_manager,
+                "create_reader",
+                lambda *a, **k: None,
+            )
+            return fake
+
+        return _install
+
+    def _complete_row(self, terminal_id="eeee5555", **changes):
+        kwargs = {
+            "terminal_id": terminal_id,
+            "tmux_session": "cao-up",
+            "tmux_window": "worker",
+            "provider": "claude_code",
+            "pane_id": "%10",
+            "window_id": "@10",
+            "server_socket_path": SOCKET,
+            "session_id": "$1",
+            "pane_pid": 4242,
+        }
+        kwargs.update(changes)
+        database.create_terminal(**kwargs)
+
+    def test_a_reused_name_gets_no_enter_and_no_pipe(self, isolated_memory_db, pipeline):
+        """The row's own pane is gone; something else answers to its names.
+
+        Nothing is delivered and nothing is piped — the row is skipped,
+        which is the only outcome that does not act on a stranger's pane.
+        """
+        backend = pipeline({"%77": _pane(pane_id="%77")})
+        self._complete_row()
+
+        result = terminal_service.reattach_existing_output_pipelines()
+
+        assert result == {"reattached": [], "skipped": ["eeee5555"]}
+        assert backend.special_keys == []
+        assert backend.piped == []
+
+    def test_a_proven_pane_receives_enter_at_its_exact_pane_id(self, isolated_memory_db, pipeline):
+        backend = pipeline({"%10": _pane()})
+        self._complete_row()
+
+        result = terminal_service.reattach_existing_output_pipelines()
+
+        assert result["reattached"] == ["eeee5555"]
+        assert [key[2:] for key in backend.special_keys] == [("Enter", "%10")]
+
+    def test_the_pipe_follows_the_verified_pane_after_a_rename(self, isolated_memory_db, pipeline):
+        """Names are mutable, so the recorded ones are not addressed.
+
+        ``pipe-pane`` and history are name-shaped, so they use the names
+        the *verified* pane answers to now. Using the row's recorded names
+        would re-open the hole the proof just closed, one call later.
+        """
+        backend = pipeline({"%10": _pane(session_name="cao-renamed", window_name="worker-renamed")})
+        self._complete_row()
+
+        terminal_service.reattach_existing_output_pipelines()
+
+        assert backend.piped and backend.piped[0][:2] == ("cao-renamed", "worker-renamed")
+        assert backend.stopped[0][:2] == ("cao-renamed", "worker-renamed")
+
+    def test_a_row_with_no_recorded_identity_still_resolves_by_name(
+        self, isolated_memory_db, pipeline
+    ):
+        """The documented boundary, not an exemption.
+
+        A row that never recorded a pane has nothing to prove against;
+        refusing it would break restart recovery for every terminal that
+        predates the identity fields, and would do so without making any
+        delivery safer.
+        """
+        backend = pipeline({"%10": _pane()})
+        database.create_terminal(
+            terminal_id="ffff6666",
+            tmux_session="cao-up",
+            tmux_window="legacy",
+            provider="claude_code",
+        )
+
+        result = terminal_service.reattach_existing_output_pipelines()
+
+        assert result["reattached"] == ["ffff6666"]
+        assert backend.special_keys == [("cao-up", "legacy", "Enter", None)]
+
+
 class TestSupersessionNamesItsSuccessor:
     def test_a_demoted_row_records_which_terminal_now_holds_its_pane(
         self, isolated_memory_db, backend
