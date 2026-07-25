@@ -1598,6 +1598,26 @@ async def managed_launch_capabilities(
         "bridge_environment_inventory": "names-only-sha256",
         "post_allocation_bridge_failure_finalization": True,
         "launch_failure_evidence_schema": "cao-managed-bridge-launch-failure-v1",
+        # The one transient bind refusal, advertised so a caller can
+        # negotiate it instead of discovering it. Without this, a new
+        # consumer that treats 425 as "retry the same attempt" would send
+        # that behaviour at an old peer which uses 425 for nothing and
+        # answers every not-yet-ready bind with a permanent 409 — the
+        # retry never happens, and the launch fails on a contract neither
+        # side agreed to. Reading these two keys lets it fail closed
+        # before a reservation exists rather than mid-launch.
+        #
+        # Both values come from the *same constants the endpoint raises
+        # and maps*, never restated here: an advertisement that could
+        # drift from the behaviour it describes is worse than none, since
+        # a consumer would have negotiated against a promise nothing
+        # keeps. Absent keys mean an old peer with no typed refusal.
+        #
+        # Deliberately additive: no protocol-version bump, because an
+        # existing consumer that ignores these keys behaves exactly as it
+        # does today.
+        "native_bind_not_ready_status": status.HTTP_425_TOO_EARLY,
+        "native_bind_not_ready_reason": managed_launch.REASON_BIND_BRIDGE_NOT_DURABLY_READY,
         "trusted_project_root_providers": ["codex"],
         # The providers *this v1 bridged surface* has a readiness adapter
         # for, read from that adapter map rather than written out again.

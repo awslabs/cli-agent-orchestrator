@@ -485,3 +485,74 @@ def _terminal_of(reservation_id: str) -> str:
 
 def _generation_of(reservation_id: str) -> str:
     return v2.get(reservation_id)["generation"]
+
+
+def test_the_capabilities_advertise_the_typed_not_ready_contract(client):
+    """A new consumer can negotiate 425 instead of discovering it.
+
+    An old peer uses 425 for nothing and answers every not-yet-ready bind
+    with a permanent 409, so a consumer that assumed the typed contract
+    would never retry and the launch would fail on terms neither side
+    agreed to. These two keys let it fail closed before a reservation
+    exists; their absence is exactly the signal that the peer is old.
+    """
+    capabilities = client.get("/managed-launch/capabilities").json()
+
+    assert capabilities["native_bind_not_ready_status"] == 425
+    assert capabilities["native_bind_not_ready_reason"] == "bind-bridge-not-durably-ready"
+
+
+def test_the_advertisement_is_bound_to_the_behaviour_it_describes(client):
+    """Pinned against what the endpoint actually does, not a shared literal.
+
+    Two constants agreeing is not the property that matters — an
+    advertisement can drift from the behaviour it describes and still
+    match a literal a test copied from it. So the published values are
+    compared to the status and reason the error mapper really produces
+    for the typed refusal, which is the thing a consumer will meet.
+    """
+    from cli_agent_orchestrator.api.main import _managed_launch_http_error
+
+    raised = _managed_launch_http_error(
+        managed_launch.ManagedLaunchNotReady(
+            "early", reason=managed_launch.REASON_BIND_BRIDGE_NOT_DURABLY_READY
+        )
+    )
+    capabilities = client.get("/managed-launch/capabilities").json()
+
+    assert capabilities["native_bind_not_ready_status"] == raised.status_code
+    assert capabilities["native_bind_not_ready_reason"] == raised.detail["reason"]
+
+
+def test_the_advertisement_matches_the_live_wire_answer(
+    client, isolated_memory_db, worktree, tmp_path, monkeypatch
+):
+    """End to end: negotiate from the capabilities, then meet the refusal.
+
+    This is the sequence a consumer actually performs, so it is the one
+    worth asserting — a capability document that agreed with a helper but
+    not with the route would pass every test above.
+    """
+    capabilities = client.get("/managed-launch/capabilities").json()
+    payload = _reserve_payload(worktree, tmp_path)
+    assert client.post(V2_ROOT, json=payload).status_code == 201
+    reservation_id = payload["reservation_id"]
+    v2.claim_launch(reservation_id)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+        lambda _rid: {"state": "starting"},
+        raising=False,
+    )
+
+    response = client.post(
+        f"{V2_ROOT}/{reservation_id}/bind",
+        json=_bind_payload(
+            {
+                "terminal_id": _terminal_of(reservation_id),
+                "generation": _generation_of(reservation_id),
+            }
+        ),
+    )
+
+    assert response.status_code == capabilities["native_bind_not_ready_status"]
+    assert response.json()["detail"]["reason"] == capabilities["native_bind_not_ready_reason"]
