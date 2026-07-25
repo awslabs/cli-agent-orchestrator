@@ -259,8 +259,24 @@ def route_payload(
         )
     elif authority_status == "drifted":
         _require(present == 5, "a drifted route requires all five observed fields")
+        # Drift is the exact complement of agreement, so it must be decided
+        # by the same judge and simply negated. A second rule here does not
+        # merely duplicate the first, it disagrees with it: for a pair whose
+        # effort is unobservable, a receipt echoing the assigned effort into
+        # the observed slot is a claim nothing could have produced, which
+        # the agreement rule refuses -- while a raw ``!=`` reads the equal
+        # strings as agreement and refuses to call it drift. The tuple then
+        # satisfies neither status and the drift cannot be recorded at all,
+        # which is the one outcome a drift check exists to prevent.
         _require(
-            observed_model != assigned_model or observed_effort != assigned_effort,
+            observed_model != assigned_model
+            or not provider_contracts.effort_receipt_matches(
+                assigned_effort,
+                observed_effort,
+                observability=provider_contracts.effort_observability_for_recovery_provider(
+                    provider, assigned_model
+                ),
+            ),
             "a drifted route requires a mismatch against the assignment",
         )
     else:  # degraded
