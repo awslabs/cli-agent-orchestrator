@@ -7,11 +7,18 @@ import shutil
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import libtmux
 
 from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
+from cli_agent_orchestrator.services.control_input_contract import (
+    contains_bracketed_paste_sentinel,
+    is_valid_pane_id,
+    normalize_server_identity,
+    server_identity_refusal,
+)
 from cli_agent_orchestrator.utils.path_validation import (
     BLOCKED_SYSTEM_DIRECTORIES,
     resolve_and_validate_path,
@@ -21,6 +28,164 @@ from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 logger = logging.getLogger(__name__)
 
 _TMUX_BINARY: Optional[str] = None
+
+# Immutable pane facts, tab-separated.  The two variable-content fields
+# (session and window name) come last so a tab inside a foreign window's
+# name can shift only itself, never the identity fields ahead of it.
+_PANE_CONTROL_FORMAT = "\t".join(
+    (
+        "#{pane_id}",
+        "#{window_id}",
+        "#{pane_pid}",
+        "#{bracket_paste_flag}",
+        "#{pane_dead}",
+        # The server's own socket, ahead of the two name fields: a tab in
+        # someone's window name must not be able to shift the field that
+        # decides which tmux server a write is allowed to reach.
+        "#{socket_path}",
+        "#{session_name}",
+        "#{window_name}",
+    )
+)
+_PANE_CONTROL_FIELDS = 8
+
+# Just the server identity, for the check the write primitive makes
+# immediately before its first byte.  Kept separate from the full record
+# so the writer-boundary check is one small query rather than a full
+# identity resolution it would then ignore most of.
+_PANE_SERVER_FORMAT = "\t".join(("#{pane_id}", "#{socket_path}"))
+
+# Literal control text is written in bounded chunks so one oversized
+# control cannot produce a single unbounded argv.
+_LITERAL_CHUNK_CHARS = 1024
+
+# Bytes that must never appear in literal control text: ESC and its
+# single-byte C1 CSI equivalent U+009B would both let a payload
+# synthesise its own escape sequences (including the very paste sentinels
+# this path exists to eliminate), and CR/LF would submit at a point the
+# caller did not choose.  The control contract is one line plus one
+# explicit Enter.  Screening ESC alone would leave the 8-bit spelling as
+# a working way to write the identical bytes.
+_ILLEGAL_LITERAL_CHARS = ("\x1b", "\x9b", "\r", "\n")
+
+
+@dataclass(frozen=True)
+class PaneControlIdentity:
+    """Live tmux facts about one pane, as observed at a single instant.
+
+    ``pane_id`` and ``window_id`` are immutable for the resource's life;
+    ``pane_pid`` is immutable for one incarnation of the pane's root
+    process.  Together they are the only tmux facts a control call may
+    bind to — a window *name* is a label that can be reused by a later,
+    unrelated window.
+    """
+
+    pane_id: str
+    window_id: str
+    pane_pid: int
+    session_name: str
+    window_name: str
+    bracketed_paste_proven: bool
+    dead: bool
+    # The canonical identity of the tmux server that owns this pane
+    # (§24.7).  Optional because a tmux too old to know ``#{socket_path}``
+    # expands it to nothing, and an unproven identity must stay absent
+    # rather than become a value a check could pass against.
+    server_socket_path: Optional[str] = None
+
+
+class TmuxLiteralSendError(RuntimeError):
+    """A literal control write failed part-way through.
+
+    ``chunks_sent`` and ``enter_attempted`` bound what may already have
+    reached the pane, so the caller can distinguish "provably nothing
+    was written" from "the outcome is unknowable" instead of assuming
+    the write can simply be repeated.
+    """
+
+    def __init__(self, message: str, *, chunks_sent: int, enter_attempted: bool) -> None:
+        super().__init__(message)
+        # Writes tmux reported as successful before this failure.  The
+        # failing write itself may still have landed in part.
+        self.chunks_sent = chunks_sent
+        self.enter_attempted = enter_attempted
+
+
+class TmuxServerIdentityError(RuntimeError):
+    """The write target could not be shown to be on the bound tmux server.
+
+    Deliberately *not* a :class:`TmuxLiteralSendError`.  That error means
+    "something may already have reached the pane"; this one is raised
+    before the first subprocess exists and means the opposite — zero bytes
+    were written and none can have been.  Collapsing the two would hand a
+    caller an ambiguous outcome for the one failure whose whole value is
+    that it is unambiguous.
+
+    ``reason_code`` is a control-input contract reason, so the service can
+    report the refusal without re-deciding what happened here.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str,
+        bound: Optional[str],
+        observed: Optional[str],
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.bound = bound
+        self.observed = observed
+        # Named the same as TmuxLiteralSendError's so a caller reporting
+        # "what may have reached the pane" reads one attribute regardless
+        # of which failure it caught, and reads zero from this one.
+        self.chunks_sent = 0
+        self.enter_attempted = False
+
+
+def _parse_pane_control_record(line: str) -> Optional[PaneControlIdentity]:
+    """Parse one ``list-panes -F`` line, or None if it is not usable.
+
+    A line that cannot be parsed is dropped rather than repaired: partial
+    identity is worse than absent identity, because the caller would bind
+    a control to facts that were never observed.
+    """
+    fields = line.split("\t", _PANE_CONTROL_FIELDS - 1)
+    if len(fields) != _PANE_CONTROL_FIELDS:
+        return None
+    (
+        pane_id,
+        window_id,
+        pane_pid,
+        bracket_flag,
+        dead_flag,
+        socket_path,
+        session_name,
+        window_name,
+    ) = fields
+    if not is_valid_pane_id(pane_id) or not window_id.startswith("@"):
+        return None
+    try:
+        pid = int(pane_pid)
+    except ValueError:
+        return None
+    if pid <= 0:
+        return None
+    return PaneControlIdentity(
+        pane_id=pane_id,
+        window_id=window_id,
+        pane_pid=pid,
+        session_name=session_name,
+        window_name=window_name,
+        # Only an explicit '1' proves the pane's application advertised
+        # ?2004h.  An older tmux that does not know this format expands
+        # it to nothing, which stays unproven rather than becoming
+        # support the pane never claimed.
+        bracketed_paste_proven=bracket_flag == "1",
+        dead=dead_flag == "1",
+        server_socket_path=normalize_server_identity(socket_path),
+    )
 
 
 def tmux_binary() -> str:
@@ -323,12 +488,13 @@ class TmuxClient:
             enter_count: Number of Enter keys to send after pasting (default 1).
                 Some TUIs enter multi-line mode after bracketed paste,
                 requiring 2 Enters to submit.
-            force_bracketed_paste: If True, unconditionally wrap content in
-                bracketed paste sequences (\x1b[200~...\x1b[201~) instead of
-                relying on paste-buffer -p. Use for message delivery to TUIs.
-                Do NOT use for shell commands sent to bash during initialization
-                (bash 4.x does not support bracketed paste and will inject the
-                escape sequences literally into the command line).
+            force_bracketed_paste: If True, ask tmux to frame the payload as a
+                bracketed paste and to deliver newlines verbatim. Use for
+                message delivery to TUIs, where a multi-line message must
+                arrive as one input rather than as one submission per line.
+                Do NOT use for shell commands sent to bash during
+                initialization: those rely on each newline becoming an Enter
+                that runs the line.
         """
         # Defence-in-depth: re-validate at the sink even though callers
         # validate at the API/MCP boundary. Both halves flow into a
@@ -349,23 +515,37 @@ class TmuxClient:
             # available here at DEBUG for local delivery troubleshooting.
             logger.info(f"send_keys: {target} - keys length: {len(keys)}")
             logger.debug(f"send_keys: {target} - keys: {keys}")
+            # The payload is always loaded verbatim. Framing is tmux's job:
+            # tmux sanitizes control bytes on their way out of a paste buffer,
+            # so an ESC written into the buffer here does not reach the pane as
+            # an escape at all — it arrives as the seven printable characters
+            # ^[[200~, which a composer types out as visible text and then
+            # submits. Framing that tmux itself emits for -p is written outside
+            # that sanitizing path and arrives as real escape bytes.
+            buf_content = keys.encode()
             if force_bracketed_paste:
-                # Wrap unconditionally and use -r (no newline→CR conversion).
-                # paste-buffer -p only adds bracketed sequences if tmux tracks
-                # ?2004h for the pane — some TUIs (e.g. current Kiro) don't
-                # send ?2004h so -p is a no-op and \n becomes CR (Enter).
-                buf_content = b"\x1b[200~" + keys.encode() + b"\x1b[201~"
-                paste_flag = "-r"
+                # -p asks tmux to frame the paste, but only for a pane that has
+                # asked for bracketed paste (DECSET 2004). A pane that never
+                # asked cannot usefully be handed the markers anyway — it would
+                # render them instead of honouring them — so the absence of
+                # framing there is the correct outcome rather than a gap.
+                #
+                # -r is what makes this equivalent to a real paste for
+                # multi-line text: without it paste-buffer rewrites every LF as
+                # CR, and a composer reads each CR as Enter, submitting the
+                # message a line at a time.
+                paste_flags = ["-p", "-r"]
             else:
-                buf_content = keys.encode()
-                paste_flag = "-p"
+                # Shell commands, where each newline *should* become the Enter
+                # that runs the line.
+                paste_flags = ["-p"]
             subprocess.run(
                 ["tmux", "load-buffer", "-b", buf_name, "-"],
                 input=buf_content,
                 check=True,
             )
             subprocess.run(
-                ["tmux", "paste-buffer", paste_flag, "-b", buf_name, "-t", target],
+                ["tmux", "paste-buffer", *paste_flags, "-b", buf_name, "-t", target],
                 check=True,
             )
             # Delay to let the TUI process the bracketed paste end sequence before
@@ -601,7 +781,16 @@ class TmuxClient:
         """Server-owned immutable tmux identity of a window: its tmux-assigned
         ``window_id`` (``@N``) and active ``pane_id`` (``%N``). Unlike window
         names these are immutable for the resource's life — the only tmux
-        facts an attestation may bind a terminal to."""
+        facts an attestation may bind a terminal to.
+
+        ``server_socket_path`` names the tmux server those ids belong to
+        (§24.7) and is present only when it can be read: a pane id is
+        unique within one server, so a recorded pane id without a recorded
+        server is an identity that another server can answer for. The key
+        is absent rather than null when unreadable, so a caller storing
+        ``.get("server_socket_path")`` records an absence, never a value
+        that a later check could pass against.
+        """
         try:
             session = self.server.sessions.get(session_name=session_name)
             if not session:
@@ -614,7 +803,15 @@ class TmuxClient:
             window_id = getattr(window, "window_id", None)
             if not pane_id or not window_id:
                 return None
-            return {"pane_id": str(pane_id), "window_id": str(window_id)}
+            identity = {"pane_id": str(pane_id), "window_id": str(window_id)}
+            # Observed through the same query the write primitive uses, so
+            # what gets recorded here is exactly what will be compared
+            # there — a binding recorded by one reading and checked by a
+            # different one would be comparing two unrelated facts.
+            observed_server = self.observe_pane_server_identity(str(pane_id))
+            if observed_server is not None:
+                identity["server_socket_path"] = observed_server
+            return identity
         except Exception as e:
             logger.error(f"Failed to resolve window identity for {session_name}:{window_name}: {e}")
             return None
@@ -718,6 +915,285 @@ class TmuxClient:
                 exc,
             )
             return None
+
+    def list_pane_control_identities(self) -> Optional[List[PaneControlIdentity]]:
+        """Every pane on the server, with the facts a control call binds to.
+
+        Enumerates with ``list-panes -a`` and selects in Python.  A ``-t``
+        target is deliberately never used to resolve identity: tmux answers
+        ``display-message -t <session>:<missing-window>`` with a *different*
+        pane and exit status 0, so a lookup that trusted a target could
+        quietly bind a control to a pane the caller never named.
+
+        Returns None when the observation itself failed.  An unreadable
+        server is ambiguous, not empty — reporting "no panes" would let a
+        caller conclude a live pane had gone away.
+        """
+        try:
+            result = subprocess.run(
+                [tmux_binary(), "list-panes", "-a", "-F", _PANE_CONTROL_FORMAT],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("Could not enumerate tmux panes: %s", exc)
+            return None
+        if result.returncode != 0:
+            logger.warning(
+                "tmux could not enumerate panes: %s",
+                (result.stderr or "").strip(),
+            )
+            return None
+        records = []
+        for line in (result.stdout or "").splitlines():
+            record = _parse_pane_control_record(line)
+            if record is not None:
+                records.append(record)
+        return records
+
+    def observe_pane_server_identity(self, pane_id: str) -> Optional[str]:
+        """The canonical identity of the tmux server that owns ``pane_id``.
+
+        The narrow observation the write primitive makes immediately before
+        its first byte.  Enumerates with ``list-panes -a`` and matches in
+        Python for the same reason :meth:`list_pane_control_identities`
+        does: ``display-message -t`` answers for a *different* pane with
+        exit status 0 when the target does not resolve, so a ``-t`` lookup
+        could report the socket of a server the pane is not on.
+
+        Returns None when the pane is not on the server this process
+        reaches, when the server cannot be read, or when tmux does not
+        report a usable socket path.  All three are the same answer to the
+        only question being asked — "can this pane be *proven* to sit on
+        the bound server?" — and the answer is no.
+        """
+        if not is_valid_pane_id(pane_id):
+            return None
+        try:
+            result = subprocess.run(
+                [tmux_binary(), "list-panes", "-a", "-F", _PANE_SERVER_FORMAT],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("Could not observe tmux server identity: %s", exc)
+            return None
+        if result.returncode != 0:
+            logger.warning(
+                "tmux could not report server identity: %s",
+                (result.stderr or "").strip(),
+            )
+            return None
+        for line in (result.stdout or "").splitlines():
+            fields = line.split("\t", 1)
+            if len(fields) == 2 and fields[0] == pane_id:
+                return normalize_server_identity(fields[1])
+        return None
+
+    def pane_control_identity(
+        self,
+        *,
+        pane_id: Optional[str] = None,
+        session_name: Optional[str] = None,
+        window_name: Optional[str] = None,
+    ) -> Optional[PaneControlIdentity]:
+        """Resolve exactly one pane's live identity, or None.
+
+        Select either by immutable ``pane_id`` — the verification path,
+        asking whether this exact pane still exists and its facts are
+        unchanged — or by ``session_name``/``window_name``, the first-pin
+        path used before any pane id is known.  The selectors are mutually
+        exclusive.
+
+        Names are compared in Python and never reach a tmux argument, so an
+        unexpected name can only fail to match.
+
+        Returns None when the pane is absent, when the observation failed,
+        or when a name pair matches more than one pane: a window holding
+        several panes has no single control target, and choosing one would
+        be a guess rather than an observation.
+
+        Raises:
+            ValueError: No selector, or both selectors, were supplied.
+        """
+        by_pane = pane_id is not None
+        by_name = session_name is not None or window_name is not None
+        if by_pane == by_name:
+            raise ValueError("Select a pane by pane_id or by session_name/window_name, not both")
+        if by_name and (session_name is None or window_name is None):
+            raise ValueError("session_name and window_name must be supplied together")
+
+        records = self.list_pane_control_identities()
+        if records is None:
+            return None
+        if by_pane:
+            matches = [record for record in records if record.pane_id == pane_id]
+        else:
+            matches = [
+                record
+                for record in records
+                if record.session_name == session_name and record.window_name == window_name
+            ]
+        if len(matches) > 1:
+            logger.warning(
+                "Refusing ambiguous pane lookup: %d panes match %r",
+                len(matches),
+                pane_id if by_pane else (session_name, window_name),
+            )
+            return None
+        if not matches:
+            return None
+        return matches[0]
+
+    def send_literal_line(
+        self,
+        pane_id: str,
+        text: str,
+        submit: bool = True,
+        *,
+        expected_server_identity: Optional[str],
+    ) -> int:
+        """Write ``text`` to ``pane_id`` as literal bytes, then one Enter.
+
+        The control path's only write primitive.  It never loads or pastes
+        a tmux buffer, so no bracketed-paste sentinel can be produced for
+        any pane — whether or not that pane advertised ?2004h.  The leakage
+        this path exists to remove is structurally impossible here rather
+        than conditionally avoided.
+
+        ``send-keys -l`` writes the argument byte for byte: no key-name
+        lookup and no backslash-escape processing, so ``\\n`` in the text
+        stays two characters.  The trailing ``--`` keeps text beginning
+        with ``-`` as text instead of as an option.
+
+        The target is always an immutable pane id *on a named server*.  A
+        pane id is unique only within one tmux server, and several servers
+        routinely run on one host, so ``%3`` alone is not a target — it is
+        a target on whichever server this process happens to resolve.
+        ``expected_server_identity`` names the server the caller means, and
+        this method proves the pane is on it immediately before the first
+        byte.  tmux fails a send to a pane missing *from that server* with
+        a non-zero status and writes nothing, so between the two checks a
+        stale or foreign target cannot silently land in another pane.
+
+        The parameter is keyword-only and has no default on purpose.  The
+        failure this guards against (§24.7) was a helper that omitted its
+        socket pinning and wrote into six live production composers, so
+        the one thing this signature must not permit is a caller quietly
+        inheriting a default.  Passing ``None`` is allowed and always
+        refuses: "I have no binding" is a statement, not an omission.
+
+        Args:
+            pane_id: Immutable tmux pane id (``%N``).
+            text: Single-line literal text, free of ESC, CR and LF.
+            submit: Send one explicit Enter after the text.
+            expected_server_identity: The socket identity of the tmux
+                server the pane must be on. ``None`` refuses.
+
+        Returns:
+            The number of literal writes tmux accepted, not counting the
+            Enter.  Returned rather than left for the caller to recompute
+            from the chunk size: the caller journals this number as its
+            record of what reached the pane, and a recomputation would
+            silently stop matching the moment the chunking here changed.
+
+        Raises:
+            ValueError: The pane id or text violates the control contract.
+                Nothing is written.
+            TmuxServerIdentityError: The pane could not be proven to be on
+                the bound tmux server.  Nothing is written.
+            TmuxLiteralSendError: tmux rejected a write, possibly part-way
+                through.
+        """
+        # Defence-in-depth at the sink: the service layer rejects these
+        # payloads with a typed outcome, but the primitive must not be
+        # able to emit them even when called directly.
+        if not is_valid_pane_id(pane_id):
+            raise ValueError(f"Invalid pane_id: {pane_id!r}")
+        if contains_bracketed_paste_sentinel(text):
+            raise ValueError("Literal control text must not contain bracketed-paste sentinels")
+        for char in _ILLEGAL_LITERAL_CHARS:
+            if char in text:
+                raise ValueError(f"Literal control text must not contain {char!r}")
+        if not text and not submit:
+            raise ValueError("Literal control write would emit nothing")
+
+        # Metadata only at INFO: control text is caller-supplied and can
+        # carry a prompt or an argument the operator considers private.
+        # Full content stays available at DEBUG, matching send_keys.
+        logger.info(
+            "send_literal_line: %s - text length: %d, submit: %s",
+            pane_id,
+            len(text),
+            submit,
+        )
+        logger.debug("send_literal_line: %s - text: %s", pane_id, text)
+
+        # The last thing before the first byte, and deliberately after the
+        # payload screening above: screening decides whether these bytes
+        # may ever be written, this decides whether *this pane* may receive
+        # them.  Re-observed here rather than trusted from the caller's
+        # earlier resolution, because the whole failure class is a target
+        # that was correct when it was resolved and wrong by the time it
+        # was written.
+        # Observed exactly once: a second query could return a different
+        # answer, and an error that reported a reading other than the one
+        # it refused on would be evidence of nothing.
+        observed_server = self.observe_pane_server_identity(pane_id)
+        refusal = server_identity_refusal(bound=expected_server_identity, observed=observed_server)
+        if refusal is not None:
+            reason_code, detail = refusal
+            raise TmuxServerIdentityError(
+                f"refusing a literal write to pane {pane_id}: {detail}",
+                reason_code=reason_code,
+                bound=normalize_server_identity(expected_server_identity),
+                observed=observed_server,
+            )
+
+        chunks_sent = 0
+        for start in range(0, len(text), _LITERAL_CHUNK_CHARS):
+            self._run_literal_write(
+                [
+                    tmux_binary(),
+                    "send-keys",
+                    "-t",
+                    pane_id,
+                    "-l",
+                    "--",
+                    text[start : start + _LITERAL_CHUNK_CHARS],
+                ],
+                chunks_sent=chunks_sent,
+                enter_attempted=False,
+            )
+            chunks_sent += 1
+        if submit:
+            self._run_literal_write(
+                [tmux_binary(), "send-keys", "-t", pane_id, "Enter"],
+                chunks_sent=chunks_sent,
+                enter_attempted=True,
+            )
+        return chunks_sent
+
+    @staticmethod
+    def _run_literal_write(argv: List[str], *, chunks_sent: int, enter_attempted: bool) -> None:
+        """Run one control write, converting any failure into a bounded one."""
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, check=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise TmuxLiteralSendError(
+                f"tmux literal control write failed: {exc}",
+                chunks_sent=chunks_sent,
+                enter_attempted=enter_attempted,
+            ) from exc
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip() or (result.stdout or "").strip()
+            raise TmuxLiteralSendError(
+                f"tmux rejected a literal control write: {detail}",
+                chunks_sent=chunks_sent,
+                enter_attempted=enter_attempted,
+            )
 
     def session_exists(self, session_name: str) -> bool:
         """Check if session exists."""

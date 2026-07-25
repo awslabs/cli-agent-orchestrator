@@ -88,9 +88,27 @@ _V2_TERMINALS_DDL = (
     "CHECK (protocol_vintage = 'v2'), "
     "pane_id TEXT, "
     "window_id TEXT, "
+    "server_socket_path TEXT, "
     "last_active TEXT"
     ")"
 )
+
+#: Columns added to the v2 terminal table after its first release, on the
+#: same PRAGMA-guarded terms as the reservation ones above.
+_V2_TERMINALS_ADDITIVE_COLUMNS = (("server_socket_path", "TEXT"),)
+
+#: Every additive column, by the table it belongs to.  The receipt records
+#: bare column names, which stays unambiguous only while the names are
+#: distinct across the whole v2 surface — asserted here rather than left
+#: as a convention, because a silent collision would make a schema-change
+#: receipt name a change to a table it did not touch.
+_V2_ADDITIVE_COLUMNS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("managed_launch_v2_reservations", _V2_RESERVATIONS_ADDITIVE_COLUMNS),
+    ("managed_launch_v2_terminals", _V2_TERMINALS_ADDITIVE_COLUMNS),
+)
+assert len({column for _, columns in _V2_ADDITIVE_COLUMNS for column, _ in columns}) == sum(
+    len(columns) for _, columns in _V2_ADDITIVE_COLUMNS
+), "v2 additive column names must be unique across the vintage surface"
 
 _JOURNAL_DDL = (
     f"CREATE TABLE IF NOT EXISTS {JOURNAL_TABLE} ("
@@ -209,16 +227,14 @@ def migrate_v2(
         already = all(_table_exists(conn, table) for table in V2_TABLES)
         conn.execute(_V2_RESERVATIONS_DDL)
         conn.execute(_V2_TERMINALS_DDL)
-        cursor = conn.execute("PRAGMA table_info(managed_launch_v2_reservations)")
-        present = {row[1] for row in cursor.fetchall()}
         added_columns = []
-        for column, column_type in _V2_RESERVATIONS_ADDITIVE_COLUMNS:
-            if column not in present:
-                conn.execute(
-                    "ALTER TABLE managed_launch_v2_reservations "
-                    f"ADD COLUMN {column} {column_type}"
-                )
-                added_columns.append(column)
+        for table, columns in _V2_ADDITIVE_COLUMNS:
+            cursor = conn.execute(f"PRAGMA table_info({table})")
+            present = {row[1] for row in cursor.fetchall()}
+            for column, column_type in columns:
+                if column not in present:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+                    added_columns.append(column)
         conn.execute(_JOURNAL_DDL)
         event_id = str(uuid.uuid4())
         conn.execute(

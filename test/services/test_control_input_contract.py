@@ -1,0 +1,425 @@
+"""Tests for the shared control-input wire contract."""
+
+import hashlib
+
+import pytest
+
+from cli_agent_orchestrator.services import canonical_json
+from cli_agent_orchestrator.services import control_input_contract as contract
+
+
+class TestProtocolIdentity:
+    def test_protocol_and_schema_are_pinned(self):
+        """Both sides negotiate on these exact strings; drift is a break."""
+        assert contract.CONTROL_INPUT_PROTOCOL == "cao-control-input-v1"
+        assert contract.CONTROL_INPUT_SCHEMA_VERSION == 1
+
+    def test_outcomes_are_a_closed_set(self):
+        assert contract.CONTROL_INPUT_OUTCOMES == {
+            "accepted",
+            "refused",
+            "ambiguous",
+            "unsupported",
+        }
+
+    def test_only_a_refusal_may_be_reattempted(self):
+        """A refusal is decided before any write; nothing else proves that."""
+        assert contract.REATTEMPTABLE_OUTCOMES == {contract.REFUSED}
+        assert contract.ACCEPTED not in contract.REATTEMPTABLE_OUTCOMES
+        assert contract.AMBIGUOUS not in contract.REATTEMPTABLE_OUTCOMES
+        assert contract.UNSUPPORTED not in contract.REATTEMPTABLE_OUTCOMES
+
+    def test_reason_codes_cover_the_named_refusals(self):
+        for reason in (
+            contract.REASON_UNKNOWN_TERMINAL,
+            contract.REASON_IDENTITY_MISMATCH,
+            contract.REASON_STALE_GENERATION,
+            contract.REASON_PANE_BUSY,
+            contract.REASON_ILLEGAL_CONTROL_BYTES,
+            contract.REASON_MULTILINE_REJECTED,
+            contract.REASON_PROVIDER_UNSUPPORTED,
+            contract.REASON_CONTROL_ROUTE_ABSENT,
+        ):
+            assert reason in contract.CONTROL_INPUT_REASON_CODES
+
+
+class TestPaneIdValidation:
+    """One definition of a legal control target, shared by every layer.
+
+    A pane the arbiter would lock but the writer would reject — or the
+    reverse — is a hole, so the writer, the arbiter, and the journal all
+    ask this function.
+    """
+
+    @pytest.mark.parametrize("pane_id", ["%0", "%1", "%42", "%1234567890"])
+    def test_accepts_tmux_pane_ids(self, pane_id):
+        assert contract.is_valid_pane_id(pane_id) is True
+
+    @pytest.mark.parametrize(
+        "pane_id",
+        [
+            "",
+            "%",
+            "0",
+            "42",
+            "%4a",
+            "%-1",
+            "@1",
+            "$1",
+            "%1:2",  # ':' is a tmux target delimiter
+            "%1.0",  # '.' is a tmux target delimiter
+            "-t",  # would be read as an option, not a target
+            "%1 %2",
+            "%12345678901",  # longer than any real pane counter
+            "%1\n",
+            None,
+            42,
+            b"%1",
+        ],
+    )
+    def test_rejects_anything_a_target_argument_could_misread(self, pane_id):
+        assert contract.is_valid_pane_id(pane_id) is False
+
+
+class TestRequestDigest:
+    """The digest is the request id's binding to one exact control."""
+
+    @staticmethod
+    def _digest(**overrides):
+        fields = {
+            "control_id": "req-1",
+            "text": "/model opus",
+            "enter": True,
+            "expected_identity": {"terminal_id": "term-1", "terminal_generation": "gen-1"},
+        }
+        fields.update(overrides)
+        return contract.control_input_request_digest(**fields)
+
+    def test_is_deterministic(self):
+        assert self._digest() == self._digest()
+        assert len(self._digest()) == 64
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"control_id": "req-2"},
+            {"text": "/model haiku"},
+            {"enter": False},
+            {"expected_identity": {"terminal_id": "term-2", "terminal_generation": "gen-1"}},
+            {"expected_identity": {"terminal_id": "term-1", "terminal_generation": "gen-2"}},
+            {"expected_identity": {"terminal_id": "term-1"}},
+            {"expected_identity": None},
+        ],
+    )
+    def test_every_bound_field_changes_the_digest(self, override):
+        """Same text under a different expectation is a different request."""
+        assert self._digest(**override) != self._digest()
+
+    def test_an_absent_expectation_is_not_a_dropped_one(self):
+        """Explicit nulls: 'expects nothing' must not collide with 'lost in transit'."""
+        assert self._digest(expected_identity={}) == self._digest(expected_identity=None)
+        assert self._digest(expected_identity={}) != self._digest()
+
+    def test_the_field_order_is_fixed_not_lexicographic(self):
+        """Ordering is contract, not a property of whichever dict came first."""
+        assert contract.REQUEST_DIGEST_FIELD_ORDER == (
+            "domain",
+            "schema_version",
+            "control_id",
+            "text",
+            "enter",
+            "expected_identity",
+        )
+        assert contract.REQUEST_DIGEST_FIELD_ORDER != tuple(
+            sorted(contract.REQUEST_DIGEST_FIELD_ORDER)
+        )
+
+    def test_the_digest_domain_is_separate_from_the_protocol_id(self):
+        """Same bytes under another purpose must not collide with a request."""
+        assert contract.CONTROL_INPUT_DIGEST_DOMAIN != contract.CONTROL_INPUT_PROTOCOL
+
+    def test_a_bumped_schema_version_invalidates_old_digests(self):
+        assert self._digest(schema_version=2) != self._digest()
+
+    @pytest.mark.parametrize("enter", [1, 0, None, "true"])
+    def test_a_non_boolean_enter_is_refused(self, enter):
+        """1 and True encode differently; a silent coercion forks the digest."""
+        with pytest.raises(ValueError):
+            self._digest(enter=enter)
+
+    def test_owner_loss_is_two_named_reasons(self):
+        """One reason per outcome: the reason is readable without the state."""
+        assert contract.REASON_OWNER_LOST_BEFORE_WRITE in contract.CONTROL_INPUT_REASON_CODES
+        assert contract.REASON_OWNER_LOST_MID_WRITE in contract.CONTROL_INPUT_REASON_CODES
+
+
+class TestCrossImplementationDigest:
+    """The fork and the conductor must produce the same 64 hex characters.
+
+    Two independently-reasonable digests are each correct in isolation
+    and disagree only when a conflict actually needs detecting, so the
+    divergence would surface as a spurious rebind refusal on exactly the
+    request whose identity mattered most.  The vector below is not a
+    self-check: the expected preimage and hex were produced by the
+    conductor's own encoder and are asserted here byte for byte, so a
+    one-sided edit to either implementation fails this test rather than
+    being discovered in production.
+    """
+
+    # From conduct/lib/control_input.py's request_digest at conductor
+    # commit a72cc76, recorded in that lane's checkpoint-3 §3.2.
+    VECTOR = {
+        "control_id": "abc123def456",
+        "text": "/compact",
+        "enter": True,
+        "expected_identity": {"terminal_id": "t-1", "terminal_generation": "g-7"},
+    }
+    PREIMAGE = (
+        '{"domain":"cao-control-input-request-v1","schema_version":1,'
+        '"control_id":"abc123def456","text":"/compact","enter":true,'
+        '"expected_identity":{"terminal_id":"t-1","terminal_incarnation":null,'
+        '"terminal_generation":"g-7","pane_birth_id":null,"provider_process_id":null,'
+        '"provider":null,"native_session_id":null,"execution_mode":null,'
+        '"session_name":null}}\n'
+    )
+    DIGEST = "9199aa0a709bb05c3ba9c4ebff633368e2ebaf79fc3126f83cf9e4eca4ecddc6"
+
+    def test_matches_the_conductor_digest(self):
+        assert contract.control_input_request_digest(**self.VECTOR) == self.DIGEST
+
+    def test_matches_the_conductor_preimage_byte_for_byte(self):
+        """Pin the bytes too: equal hashes of different bytes is luck, not agreement."""
+        assert (
+            hashlib.sha256(self.PREIMAGE.encode("utf-8")).hexdigest() == self.DIGEST
+        ), "the recorded preimage does not hash to the recorded digest"
+        encoded = canonical_json.encode_canonical(
+            {
+                "domain": contract.CONTROL_INPUT_DIGEST_DOMAIN,
+                "schema_version": 1,
+                "control_id": self.VECTOR["control_id"],
+                "text": self.VECTOR["text"],
+                "enter": self.VECTOR["enter"],
+                "expected_identity": contract.normalize_expected_identity(
+                    self.VECTOR["expected_identity"]
+                ),
+            }
+        )
+        assert encoded.decode("utf-8") == self.PREIMAGE
+
+    def test_the_identity_field_set_is_the_conductor_s(self):
+        """Adding a tenth field here would silently fork the digest."""
+        assert contract.IDENTITY_FIELDS == (
+            "terminal_id",
+            "terminal_incarnation",
+            "terminal_generation",
+            "pane_birth_id",
+            "provider_process_id",
+            "provider",
+            "native_session_id",
+            "execution_mode",
+            "session_name",
+        )
+
+
+class TestExpectedIdentity:
+    def test_absences_become_explicit_nulls_in_fixed_order(self):
+        normalized = contract.normalize_expected_identity({"terminal_id": "t-1"})
+        assert tuple(normalized) == contract.IDENTITY_FIELDS
+        assert normalized["terminal_id"] == "t-1"
+        assert all(normalized[name] is None for name in contract.IDENTITY_FIELDS[1:])
+
+    def test_none_and_empty_agree(self):
+        assert contract.normalize_expected_identity(None) == contract.normalize_expected_identity(
+            {}
+        )
+
+    def test_an_unknown_field_is_refused_not_ignored(self):
+        """An ignored misspelling is 'no expectation for the field I meant'."""
+        with pytest.raises(ValueError) as excinfo:
+            contract.normalize_expected_identity({"terminal_generatoin": "g-1"})
+        assert "terminal_generatoin" in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "identity",
+        [
+            {"terminal_id": ""},  # empty string is not 'no expectation'
+            {"provider_process_id": -1},
+            {"provider_process_id": True},  # bool is an int in Python, not on the wire
+            {"terminal_id": 1.5},
+            {"terminal_id": b"t-1"},
+            {"terminal_id": ["t-1"]},
+        ],
+    )
+    def test_unencodable_expectations_are_refused(self, identity):
+        with pytest.raises(ValueError):
+            contract.normalize_expected_identity(identity)
+
+    def test_a_non_mapping_is_refused(self):
+        with pytest.raises(ValueError):
+            contract.normalize_expected_identity([("terminal_id", "t-1")])
+
+
+class TestReasonOutcomeBinding:
+    """Every reason carries exactly one outcome, and the map is total."""
+
+    def test_every_reason_is_bound(self):
+        assert set(contract.REASON_OUTCOMES) == set(contract.CONTROL_INPUT_REASON_CODES)
+
+    def test_every_bound_outcome_is_a_real_outcome(self):
+        assert set(contract.REASON_OUTCOMES.values()) <= contract.CONTROL_INPUT_OUTCOMES
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            contract.REASON_RESPONSE_LOST,
+            contract.REASON_WRITE_INCOMPLETE,
+            contract.REASON_OWNER_LOST_MID_WRITE,
+        ],
+    )
+    def test_post_attempt_uncertainty_is_never_reattemptable(self, reason):
+        """The whole point: these can never license a second delivery."""
+        outcome = contract.outcome_for_reason(reason)
+        assert outcome == contract.AMBIGUOUS
+        assert contract.is_reattemptable(outcome) is False
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            contract.REASON_UNKNOWN_TERMINAL,
+            contract.REASON_IDENTITY_MISMATCH,
+            contract.REASON_STALE_GENERATION,
+            contract.REASON_PANE_BUSY,
+            contract.REASON_ILLEGAL_CONTROL_BYTES,
+            contract.REASON_REQUEST_REBOUND,
+            contract.REASON_OWNER_LOST_BEFORE_WRITE,
+        ],
+    )
+    def test_pre_write_reasons_are_refusals(self, reason):
+        assert contract.outcome_for_reason(reason) == contract.REFUSED
+
+    @pytest.mark.parametrize(
+        "reason",
+        [contract.REASON_CONTROL_ROUTE_ABSENT, contract.REASON_PROTOCOL_MISMATCH],
+    )
+    def test_old_server_reasons_are_unsupported(self, reason):
+        """An old server is never a refusal a caller could retry into success."""
+        assert contract.outcome_for_reason(reason) == contract.UNSUPPORTED
+
+    def test_no_reason_is_bound_to_accepted(self):
+        """A delivered control has no reason; a reason there would explain away a write."""
+        assert contract.ACCEPTED not in set(contract.REASON_OUTCOMES.values())
+
+    def test_an_unknown_reason_raises_rather_than_defaulting(self):
+        """Both defaults are wrong: one invents a retry, one strands a request."""
+        with pytest.raises(ValueError):
+            contract.outcome_for_reason("owner-lost")
+
+    def test_only_refused_is_reattemptable(self):
+        assert contract.is_reattemptable(contract.REFUSED) is True
+        for outcome in (contract.ACCEPTED, contract.AMBIGUOUS, contract.UNSUPPORTED):
+            assert contract.is_reattemptable(outcome) is False
+
+
+class TestBracketedPasteSentinels:
+    def test_sentinels_are_the_decset_2004_sequences(self):
+        assert contract.BRACKETED_PASTE_START == "\x1b[200~"
+        assert contract.BRACKETED_PASTE_END == "\x1b[201~"
+
+    def test_the_c1_spellings_are_screened_too(self):
+        """U+009B is the 8-bit form of 'ESC ['; a terminal reads them alike."""
+        assert contract.BRACKETED_PASTE_START_C1 == "\x9b200~"
+        assert contract.BRACKETED_PASTE_END_C1 == "\x9b201~"
+        assert set(contract.BRACKETED_PASTE_SENTINELS) == {
+            "\x1b[200~",
+            "\x1b[201~",
+            "\x9b200~",
+            "\x9b201~",
+        }
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "\x1b[200~hello",
+            "hello\x1b[201~",
+            "a\x1b[200~b\x1b[201~c",
+            b"\x1b[200~hello",
+            b"hello\x1b[201~",
+            # The C1 spelling: a screen with a known bypass is not a screen.
+            "\x9b200~hello",
+            "hello\x9b201~",
+            # Raw off a terminal (0x9b) and the same text as UTF-8 (0xc2 0x9b).
+            b"\x9b200~hello",
+            b"hello\x9b201~",
+            "\x9b200~payload".encode("utf-8"),
+            "trailing\x9b201~".encode("utf-8"),
+        ],
+    )
+    def test_detects_sentinels_in_text_and_bytes(self, payload):
+        assert contract.contains_bracketed_paste_sentinel(payload) is True
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "/compact",
+            "",
+            "^[[200~ rendered by a leaking pane",
+            "\x1b[2J",
+            b"/compact",
+            b"",
+            # A C1 CSI that is not paste framing must still pass, or the
+            # screen becomes a ban on a byte rather than on a sequence.
+            "\x9b31m",
+            b"\x9b31m",
+        ],
+    )
+    def test_clean_payloads_are_clean(self, payload):
+        assert contract.contains_bracketed_paste_sentinel(payload) is False
+
+
+class TestTransportClassification:
+    def test_two_hundred_defers_to_the_typed_body(self):
+        assert contract.classify_transport_status(200) is None
+
+    def test_no_response_is_ambiguous_not_absent(self):
+        """A lost response is not evidence that nothing was delivered."""
+        assert contract.classify_transport_status(None) == contract.AMBIGUOUS
+
+    @pytest.mark.parametrize("status", [404, 405, 501])
+    def test_missing_route_is_unsupported(self, status):
+        assert contract.classify_transport_status(status) == contract.UNSUPPORTED
+
+    def test_protocol_literal_rejection_is_unsupported(self):
+        assert (
+            contract.classify_transport_status(422, protocol_mismatch=True) == contract.UNSUPPORTED
+        )
+
+    def test_plain_unprocessable_entity_is_a_refusal(self):
+        """A malformed body is the caller's bug, not an old server."""
+        assert contract.classify_transport_status(422) == contract.REFUSED
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 409, 429, 418])
+    def test_client_errors_are_refusals(self, status):
+        assert contract.classify_transport_status(status) == contract.REFUSED
+
+    @pytest.mark.parametrize("status", [408, 425, 500, 502, 503, 504, 599])
+    def test_interrupted_or_failed_requests_are_ambiguous(self, status):
+        assert contract.classify_transport_status(status) == contract.AMBIGUOUS
+
+    @pytest.mark.parametrize("status", [100, 204, 302, 0, -1])
+    def test_unrecognised_results_fail_towards_ambiguous(self, status):
+        assert contract.classify_transport_status(status) == contract.AMBIGUOUS
+
+    def test_every_status_yields_a_typed_outcome_or_a_body_read(self):
+        """No status may leave a caller without a typed answer to report."""
+        statuses = [None] + list(range(100, 600))
+        for status in statuses:
+            for mismatch in (False, True):
+                outcome = contract.classify_transport_status(status, protocol_mismatch=mismatch)
+                assert outcome is None or outcome in contract.CONTROL_INPUT_OUTCOMES
+                if status != 200:
+                    assert outcome is not None
+
+    def test_no_status_is_reported_as_accepted_without_a_body(self):
+        """Acceptance is a fact the server states, never one inferred here."""
+        for status in [None] + list(range(100, 600)):
+            assert contract.classify_transport_status(status) != contract.ACCEPTED

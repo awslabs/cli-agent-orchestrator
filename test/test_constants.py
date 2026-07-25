@@ -295,11 +295,30 @@ class TestCaoHomeDir:
     """Tests for CAO home directory constants."""
 
     def test_cao_home_dir_is_under_aws_cli_agent_orchestrator(self):
-        """Test that CAO_HOME_DIR is under ~/.aws/cli-agent-orchestrator."""
-        from cli_agent_orchestrator.constants import CAO_HOME_DIR
+        """Test that the default state root is ~/.aws/cli-agent-orchestrator.
 
-        expected = Path.home() / ".aws" / "cli-agent-orchestrator"
-        assert CAO_HOME_DIR == expected
+        Asks the resolver, rather than reading the imported constant: that
+        constant is whatever the runner chose, and pointing a run at a scratch
+        state root is the reason ``CAO_STATE_ROOT`` exists. Neither reloading
+        the module nor re-importing it would do — both re-run the import-time
+        ``mkdir`` calls against the real home, which is the live tree this
+        variable was added to keep out of. The unset branch canonicalizes
+        nothing and creates nothing, so with a synthetic home this touches no
+        disk at all.
+        """
+        import os
+
+        from cli_agent_orchestrator.constants import _resolve_cao_home_dir
+
+        synthetic_home = Path("/synthetic-home-that-does-not-exist")
+        env = os.environ.copy()
+        env.pop("CAO_STATE_ROOT", None)
+        with patch.dict("os.environ", env, clear=True):
+            with patch.object(Path, "home", return_value=synthetic_home):
+                resolved = _resolve_cao_home_dir()
+
+        assert resolved == synthetic_home / ".aws" / "cli-agent-orchestrator"
+        assert not synthetic_home.exists()
 
     def test_cao_home_dir_is_pathlib_path(self):
         """Test that CAO_HOME_DIR is a Path object."""
