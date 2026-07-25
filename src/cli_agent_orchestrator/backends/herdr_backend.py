@@ -58,6 +58,7 @@ _HERDR_ALLOWED_FLAGS = frozenset(
         "--format",
         "--label",
         "--lines",
+        "--pane",
         "--source",
         "--workspace",
     }
@@ -577,17 +578,32 @@ class HerdrBackend(TerminalBackend):
             return None
 
     def get_pane_current_command(self, session_name: str, window_name: str) -> Optional[str]:
-        """Get foreground process via herdr pane get."""
+        """Get the pane's live foreground process name via ``herdr pane
+        process-info``.
+
+        NOT ``herdr pane get``: that command's ``foreground_process`` field
+        is null/absent across all pane states on herdr 0.7.5 (confirmed
+        live against a running herdr server), so this callable would always
+        return ``None`` and every caller that branches on it (this class's
+        own ``_pane_is_bracketed_paste_incompatible``, plus
+        ``codex``/``kiro_cli``'s ``shell_baseline`` TUI-exit detection) would
+        silently never fire on herdr. ``pane process-info`` instead reports
+        real process names (``"bash"``, ``"claude"``, etc.) via
+        ``foreground_processes``.
+        """
         pane_id = self._resolve_pane_id_from_window(session_name, window_name)
 
-        result = self._run_herdr(["pane", "get", pane_id], check=False)
+        result = self._run_herdr(["pane", "process-info", "--pane", pane_id], check=False)
         if result.returncode != 0:
             return None
         try:
             data = self._parse_herdr_json(result.stdout)
-            pane_info = data.get("pane", data) if isinstance(data, dict) else data
-            return cast(Optional[str], pane_info.get("foreground_process"))
-        except (json.JSONDecodeError, AttributeError):
+            info = data.get("pane", data) if isinstance(data, dict) else data
+            processes = info.get("foreground_processes")
+            if not processes:
+                return None
+            return cast(Optional[str], processes[0].get("name"))
+        except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
             return None
 
     # --- Attach ---
