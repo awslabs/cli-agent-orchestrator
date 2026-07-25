@@ -202,6 +202,19 @@ PYTE_QUIESCENCE_DELAY_S = 0.2
 # for capable providers (e.g., Claude Code).
 EAGER_INBOX_DELIVERY = os.environ.get("CAO_EAGER_INBOX_DELIVERY", "false").lower() == "true"
 
+# Opt-in for starting a Kiro Agent System (KAS) process (FR-102, ADR-007).
+#
+# Gates **launch only** — render, lint, and install stay unflagged, so an
+# operator can run `cao profile lint <name>` to check KAS translatability
+# *before* opting into execution. Resolved once here, at import, so the launch
+# decision site (utils/kiro_launch_guard.check_kas_launch) reads a constant
+# rather than the environment, and two calls in one run cannot disagree.
+#
+# Only the exact word "true" (case-insensitive) enables it: a wider truth set
+# ("1", "yes") means more ways an experimental authorization path flips on by
+# accident. Mirrors EAGER_INBOX_DELIVERY's narrow convention above; default off.
+ENABLE_KAS_LAUNCH = os.environ.get("CAO_ENABLE_KAS_LAUNCH", "false").lower() == "true"
+
 # Poll interval (seconds) for the OpenCode inbox poller. OpenCode buffers input
 # and its pipe-pane output can stop changing once the TUI settles, so the
 # FIFO/StatusMonitor pipeline may never emit an IDLE/COMPLETED status event to

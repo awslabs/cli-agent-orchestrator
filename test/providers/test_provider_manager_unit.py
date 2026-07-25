@@ -268,7 +268,9 @@ def test_get_provider_rejects_persisted_kas_before_provider_construction():
         ),
         patch("cli_agent_orchestrator.providers.manager.KiroCliProvider") as provider_class,
     ):
-        with pytest.raises(KiroPhase0KASError, match="Cedar"):
+        # Phase 1 (FR-101): the raise moved into the central launch guard, so the
+        # message is now the guard's structured refusal rather than Phase 0 prose.
+        with pytest.raises(KiroPhase0KASError, match="not enabled"):
             manager.get_provider("t1")
 
     provider_class.assert_not_called()

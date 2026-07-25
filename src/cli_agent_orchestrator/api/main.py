@@ -73,6 +73,7 @@ from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+from cli_agent_orchestrator.models.kiro_launch import KiroLaunchRefusedError
 from cli_agent_orchestrator.models.memory import (
     MemoryKey,
     MemoryScope,
@@ -685,6 +686,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(KiroLaunchRefusedError)
+async def _render_kas_launch_refusal(request: Request, exc: KiroLaunchRefusedError) -> JSONResponse:
+    """Serialise a KAS launch refusal as structured JSON (FR-104, ADR-005).
+
+    An API consumer gets stable machine-readable ``code`` and ``profile_field``
+    instead of parsing prose. Registered app-wide so every route that can reach
+    a guarded path renders the refusal identically — a per-route ``except``
+    ladder would leave the next new route falling back to a 500.
+
+    403 rather than 400: this is an authorization decision (the operator has not
+    opted in, or the profile is not admissible), not a malformed request.
+    ``profile_field`` is legitimately ``None`` when the diagnostic is ambiguous
+    (ADR-009), so consumers must not assume it is present.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={
+            "detail": str(exc),
+            "code": exc.code,
+            "profile_field": exc.profile_field,
+            "engine": exc.engine.value,
+        },
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -1685,12 +1711,24 @@ async def create_session(
                         registry=registry,
                     )
                 except Exception as e:
+                    # Background task: swallow-and-log is deliberate — the HTTP
+                    # response must not block on sidecar failure. Note this also
+                    # silences KiroLaunchRefusedError (FR-101): if the
+                    # memory_manager profile ever sets `engine: kas`, a refusal
+                    # surfaces here as a warning rather than the 403 an operator
+                    # would expect. Route it explicitly before tightening this.
                     logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
 
             background_tasks.add_task(_spawn_sidecar)
 
         return result
 
+    except KiroLaunchRefusedError:
+        # FR-104/ADR-005: re-raise so the app-level handler renders the
+        # structured refusal (code + causative field). Without this, the
+        # `except ValueError` below would flatten it — KiroLaunchRefusedError is
+        # a ValueError subclass by design (BR-U1-3).
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
@@ -1862,6 +1900,12 @@ async def create_terminal_in_session(
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except KiroLaunchRefusedError:
+        # FR-104/ADR-005: re-raise so the app-level handler renders the
+        # structured refusal (code + causative field). Without this, the
+        # `except ValueError` below would flatten it — KiroLaunchRefusedError is
+        # a ValueError subclass by design (BR-U1-3).
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -1974,6 +2018,12 @@ async def send_terminal_input(
         return {"success": success}
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except KiroLaunchRefusedError:
+        # FR-104/ADR-005: re-raise so the app-level handler renders the
+        # structured refusal (code + causative field). Without this, the
+        # `except ValueError` below would flatten it — KiroLaunchRefusedError is
+        # a ValueError subclass by design (BR-U1-3).
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -2196,6 +2246,13 @@ async def run_step(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
         )
+    except KiroLaunchRefusedError as e:
+        # FR-104/ADR-005: settle the script step, then re-raise so the app-level
+        # handler renders the structured refusal (code + causative field).
+        # Without this clause the `except ValueError` below would flatten it —
+        # KiroLaunchRefusedError is a ValueError subclass by design (BR-U1-3).
+        _settle_step(None, str(e))
+        raise
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))

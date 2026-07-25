@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -29,6 +30,55 @@ def kiro_artifact_path(directory: Path, name: str, engine: KiroEngine) -> Path:
         raise ValueError("Kiro profile name must match [A-Za-z0-9_-]{1,64}")
     suffix = ".json" if engine == KiroEngine.V2 else ".kas.json"
     return directory / f"{name}{suffix}"
+
+
+def kiro_summary_path(directory: Path, name: str, engine: KiroEngine) -> Path:
+    """Return the redacted-policy sidecar path for a KAS artifact (ADR-006).
+
+    Reuses ``_SAFE_PROFILE_NAME_RE`` — the same regex ``kiro_artifact_path``
+    applies — so the traversal defense is identical by construction rather than
+    reimplemented (SEC-U7-6). The extension deliberately differs from the
+    artifact's (``.kas.summary.json`` vs ``.kas.json``) so the sidecar can never
+    be mistaken for KAS engine input (SEC-U7-7).
+    """
+    if not _SAFE_PROFILE_NAME_RE.fullmatch(name):
+        raise ValueError("Kiro profile name must match [A-Za-z0-9_-]{1,64}")
+    if engine != KiroEngine.KAS:
+        raise ValueError("Only KAS profiles have a compiled policy summary")
+    return directory / f"{name}.kas.summary.json"
+
+
+def redacted_policy_summary(policy: CompiledKiroPolicy) -> dict[str, object]:
+    """Build the audit summary for one compiled policy (FR-105, NFR-104).
+
+    An explicit dict **literal** — a whitelist, not a filtered projection of the
+    policy object (SEC-U7-1). A filter would leak any newly-added policy
+    attribute by default; a literal leaks nothing unless someone types it in.
+
+    Cedar rule *bodies* never appear: only the existing ``allow_rule_count`` /
+    ``deny_rule_count`` properties are read (SEC-U7-2). The prompt and MCP
+    ``env`` values are not reachable from the parameter type at all — the narrow
+    input is itself the control (SEC-U7-3/4).
+
+    Key names are a pinned cross-unit contract. Note ``excluded_tools``
+    (snake_case, consistent with the other five keys) sources
+    ``CompiledKiroPolicy.denied_tools``; it is deliberately *not* named after
+    either that attribute or the rendered envelope's ``KASPermissions.
+    excludedTools``. Do not "correct" it to match either.
+    """
+    return {
+        "policy_source": str(policy.source),
+        "unrestricted": policy.unrestricted,
+        "visible_tools": list(policy.visible_tools),
+        "excluded_tools": list(policy.denied_tools),
+        "allow_rule_count": policy.allow_rule_count,
+        "deny_rule_count": policy.deny_rule_count,
+    }
+
+
+def redacted_policy_summary_json(policy: CompiledKiroPolicy) -> str:
+    """Serialise the redacted summary for an atomic sidecar write (NFR-103)."""
+    return json.dumps(redacted_policy_summary(policy), indent=2) + "\n"
 
 
 def render_kiro_v2(

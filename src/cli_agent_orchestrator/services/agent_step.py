@@ -30,10 +30,10 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_eng
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import OutputMode
+from cli_agent_orchestrator.utils.kiro_launch_guard import assert_kas_launch_allowed
 from cli_agent_orchestrator.utils.terminal import wait_until_status
 
 logger = logging.getLogger(__name__)
@@ -81,10 +81,10 @@ async def _validate_reused_terminal(
 
     explicit_engine = parse_kiro_engine(requested_engine)
     assert explicit_engine is not None
-    if explicit_engine == KiroEngine.KAS:
-        # KAS remains unavailable regardless of which engine the terminal
-        # persisted; use the same structured Phase 0 guard as terminal creation.
-        raise KiroPhase0KASError(profile_has_v2_policy=False)
+    # Site 7 of 7 — **flag-only** (ADR-008): terminal reuse holds a requested
+    # engine plus DB metadata, never a parsed profile. Checked regardless of which
+    # engine the terminal persisted, and before any pane write.
+    assert_kas_launch_allowed(engine=explicit_engine)
 
     persisted_engine = parse_kiro_engine(metadata.get("engine"))
     if persisted_engine is None:

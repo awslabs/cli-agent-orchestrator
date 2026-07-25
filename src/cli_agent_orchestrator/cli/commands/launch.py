@@ -35,6 +35,32 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "opencode_cli",
 }
 
+
+def _raise_launch_refusal(response: requests.Response) -> None:
+    """Render a structured KAS launch refusal for a human (FR-104, ADR-005).
+
+    The API serialises the refusal as JSON; the CLI's audience is an operator at
+    a terminal, so it gets an actionable sentence plus the machine-readable code
+    and — when the diagnostic is attributable (ADR-009) — the causative profile
+    field. A refusal that lacks the structured keys falls back to the ordinary
+    HTTP error path rather than guessing.
+    """
+    if response.status_code != 403:
+        return
+    try:
+        body = response.json()
+    except ValueError:
+        return
+    if not isinstance(body, dict) or "code" not in body:
+        return
+
+    lines = [f"KAS launch refused: {body.get('detail') or body['code']}"]
+    lines.append(f"  code:  {body['code']}")
+    if body.get("profile_field"):
+        lines.append(f"  field: {body['profile_field']}")
+    raise click.ClickException("\n".join(lines))
+
+
 # Validation constraints for ``--env`` forwarded vars (mirrored server-side
 # in ``TmuxClient._merge_extra_env``). See issue #248.
 _FORWARDED_ENV_BLOCKED_PREFIXES = ("CLAUDE", "CODEX_", "__MISE_")
@@ -303,6 +329,7 @@ def launch(
             post_kwargs["json"] = {"env_vars": forwarded_env}
 
         response = requests.post(url, **post_kwargs)
+        _raise_launch_refusal(response)
         response.raise_for_status()
 
         terminal = response.json()
@@ -351,6 +378,7 @@ def launch(
                 params={"message": message},
                 timeout=request_timeout,
             )
+            _raise_launch_refusal(response)
             response.raise_for_status()
             time.sleep(3)
             if is_async:

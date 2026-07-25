@@ -26,12 +26,10 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.providers.kiro_capabilities import (
-    KiroPhase0KASError,
-    build_kiro_command,
-)
+from cli_agent_orchestrator.providers.kiro_capabilities import build_kiro_command
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.kiro_launch_guard import assert_kas_launch_allowed
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -265,11 +263,12 @@ class KiroCliProvider(BaseProvider):
         """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-        if self._engine == KiroEngine.KAS:
-            # This defensive guard makes direct provider use fail closed too.
-            # Normal terminal creation has already probed and rejected KAS before
-            # a backend window or provider is allocated.
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
+        # Site 3 of 7 — **flag-only** (ADR-008): only ``self._engine`` is in
+        # scope. This makes direct provider use fail closed too; normal terminal
+        # creation has already run the authoritative lint-gated check before a
+        # backend window or provider was allocated. Placed before the shell wait
+        # so a refusal starts no process.
+        assert_kas_launch_allowed(engine=self._engine)
 
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands

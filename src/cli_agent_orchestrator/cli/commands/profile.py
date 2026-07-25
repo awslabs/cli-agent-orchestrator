@@ -258,9 +258,12 @@ def lint_cmd(name_or_path: str, as_json: bool):
         parsed = frontmatter.loads(profile_text)
         fallback_name = parsed.metadata.get("name") or Path(name_or_path).stem
         agent_profile = parse_agent_profile_text(profile_text, str(fallback_name))
-        from cli_agent_orchestrator.services.kiro_profile_lint import lint_kiro_profile
+        # ADR-004: go through the profile facade rather than reaching into the
+        # lint module directly. lint_profile is a pure passthrough, so the report
+        # shape and its redaction guarantees are unchanged (BR-U6-9).
+        from cli_agent_orchestrator.services.kiro_profile_service import lint_profile
 
-        result = lint_kiro_profile(agent_profile)
+        result = lint_profile(agent_profile)
     except Exception as exc:
         raise click.ClickException(f"Kiro profile lint failed: {exc}") from exc
 

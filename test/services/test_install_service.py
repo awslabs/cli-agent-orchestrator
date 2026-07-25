@@ -293,6 +293,170 @@ class TestInstallAgent:
         assert "allowedTools" not in kas_config
         assert "toolsSettings" not in kas_config
 
+    def test_kas_install_writes_the_redacted_policy_sidecar(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """U7/FR-105: the sidecar lands beside the artifact through install.
+
+        Sentinel prompt and MCP env values must not reach it (NFR-104).
+        """
+        profile_path = install_paths["local_store_dir"] / "kas-sidecar.md"
+        profile_path.write_text(
+            "---\n"
+            "name: kas-sidecar\n"
+            "description: KAS agent\n"
+            "engine: kas\n"
+            "allowedTools: [fs_*]\n"
+            "deniedTools: [fs_write]\n"
+            "mcpServers:\n"
+            "  service:\n"
+            "    command: service-mcp\n"
+            "    env:\n"
+            "      API_TOKEN: SENTINEL-INSTALL-TOKEN-8e31\n"
+            "---\n"
+            "SENTINEL-INSTALL-PROMPT-2c9d\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("kas-sidecar", "kiro_cli")
+
+        assert result.success is True
+        sidecar = install_paths["kiro_dir"] / "kas-sidecar.kas.summary.json"
+        raw = sidecar.read_text(encoding="utf-8")
+        summary = json.loads(raw)
+        assert set(summary) == {
+            "policy_source",
+            "unrestricted",
+            "visible_tools",
+            "excluded_tools",
+            "allow_rule_count",
+            "deny_rule_count",
+        }
+        assert summary["visible_tools"] == ["fs_read", "glob", "grep"]
+        assert "fs_write" in summary["excluded_tools"]
+        assert "SENTINEL-INSTALL-TOKEN-8e31" not in raw
+        assert "SENTINEL-INSTALL-PROMPT-2c9d" not in raw
+        assert "permit(" not in raw and "forbid(" not in raw
+
+    def test_v2_install_writes_no_policy_sidecar(self, install_paths: dict[str, Path]) -> None:
+        """BR-U6-7/SEC-U7-8: no `.summary.json` beside a v2 artifact."""
+        profile_path = install_paths["local_store_dir"] / "v2-agent.md"
+        profile_path.write_text(
+            "---\nname: v2-agent\ndescription: V2 agent\nallowedTools: [fs_read]\n---\nBody\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("v2-agent", "kiro_cli")
+
+        assert result.success is True
+        assert result.agent_file == str(install_paths["kiro_dir"] / "v2-agent.json")
+        assert list(install_paths["kiro_dir"].glob("*.summary.json")) == []
+
+    def test_failed_kas_install_writes_neither_artifact_nor_sidecar(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """BR-U6-6: an untranslatable profile surfaces InstallResult(success=False)."""
+        profile_path = install_paths["local_store_dir"] / "alias-agent.md"
+        profile_path.write_text(
+            "---\n"
+            "name: alias-agent\n"
+            "description: KAS agent\n"
+            "engine: kas\n"
+            "allowedTools: [fs_read]\n"
+            "toolAliases:\n"
+            "  ls: fs_list\n"
+            "---\n"
+            "KAS profile.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("alias-agent", "kiro_cli")
+
+        assert result.success is False
+        assert "unsafe-aliases" in result.message
+        assert not (install_paths["kiro_dir"] / "alias-agent.kas.json").exists()
+        assert not (install_paths["kiro_dir"] / "alias-agent.kas.summary.json").exists()
+
+    def test_deny_only_narrows_install_end_to_end(self, install_paths: dict[str, Path]) -> None:
+        """FR-107: deny narrows the effective grant through the install path.
+
+        The effective set is `allowed - denied`, and the deny surface stays the
+        grant's complement (FR-106) — asserted on the written artifact, not just
+        at the policy unit level.
+        """
+        from cli_agent_orchestrator.utils.kiro_policy import KNOWN_KAS_ACTIONS
+
+        profile_path = install_paths["local_store_dir"] / "deny-narrows.md"
+        profile_path.write_text(
+            "---\n"
+            "name: deny-narrows\n"
+            "description: Deny narrows\n"
+            "engine: kas\n"
+            "allowedTools: [fs_*, execute_bash]\n"
+            "deniedTools: [fs_write, execute_bash]\n"
+            "---\n"
+            "Deny narrows.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("deny-narrows", "kiro_cli")
+
+        assert result.success is True
+        artifact = json.loads(
+            (install_paths["kiro_dir"] / "deny-narrows.kas.json").read_text(encoding="utf-8")
+        )
+        effective = {"fs_read", "glob", "grep"}
+        assert set(artifact["tools"]) == effective
+        assert set(artifact["permissions"]["excludedTools"]) == set(KNOWN_KAS_ACTIONS) - effective
+        permitted = {
+            rule.split('Action::"')[1].split('"')[0]
+            for rule in artifact["permissions"]["rules"]
+            if rule.startswith("permit(")
+        }
+        assert permitted == effective
+        assert "fs_write" not in permitted and "execute_bash" not in permitted
+
+    def test_role_sourced_kas_render_golden(self, install_paths: dict[str, Path]) -> None:
+        """FR-107: a profile with no allowedTools exercises ROLE_TOOL_DEFAULTS."""
+        profile_path = install_paths["local_store_dir"] / "role-sourced.md"
+        profile_path.write_text(
+            "---\n"
+            "name: role-sourced\n"
+            "description: Role sourced\n"
+            "engine: kas\n"
+            "role: reviewer\n"
+            "mcpServers:\n"
+            "  cao-mcp-server:\n"
+            "    command: fixture-cao-mcp\n"
+            "---\n"
+            "Role sourced.\n",
+            encoding="utf-8",
+        )
+
+        result = install_agent("role-sourced", "kiro_cli")
+
+        assert result.success is True
+        artifact = json.loads(
+            (install_paths["kiro_dir"] / "role-sourced.kas.json").read_text(encoding="utf-8")
+        )
+        # role "reviewer" -> ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]
+        assert artifact["tools"] == [
+            "agent_crew",
+            "fs_read",
+            "glob",
+            "grep",
+            "mcp::cao-mcp-server::*",
+            "use_subagent",
+        ]
+        summary = json.loads(
+            (install_paths["kiro_dir"] / "role-sourced.kas.summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert summary["policy_source"] == "role"
+        assert summary["allow_rule_count"] == 6
+        assert summary["unrestricted"] is False
+
     def test_failed_kas_install_does_not_write_kas_or_alter_v2_artifact(
         self, install_paths: dict[str, Path]
     ) -> None:

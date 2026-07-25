@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional, Sequence
 
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+from cli_agent_orchestrator.models.kiro_launch import KiroLaunchRefusedError
 
 ProbeRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -100,21 +101,17 @@ class KiroCapabilityError(ValueError):
         self.version = version
 
 
-class KiroPhase0KASError(ValueError):
-    """Raised after KAS capability probing, before runtime allocation."""
-
-    def __init__(self, profile_has_v2_policy: bool) -> None:
-        profile_note = (
-            " The selected profile contains v2 allowedTools/toolsSettings that "
-            "cannot be translated to Cedar in Phase 0."
-            if profile_has_v2_policy
-            else ""
-        )
-        super().__init__(
-            "Kiro engine 'kas' is not available in Phase 0: KAS profiles and Cedar "
-            "policy translation are not implemented. Retry with engine 'v2'." + profile_note
-        )
-        self.engine = KiroEngine.KAS
+#: Compatibility surface for the KAS launch-refusal exception (ADR-002).
+#:
+#: The canonical definition lives in
+#: ``cli_agent_orchestrator.models.kiro_launch``; it was relocated there so the
+#: ``utils``-layer launch guard can raise it without a ``utils -> providers``
+#: import (BR-U1-1). This is an **alias to the same class object**, not a
+#: subclass (BR-U1-3): ``except`` matching is by class identity, so every
+#: pre-existing ``except KiroPhase0KASError`` handler keeps binding to refusals
+#: raised under the canonical name. A subclass would silently stop catching
+#: parent instances on a security path.
+KiroPhase0KASError = KiroLaunchRefusedError
 
 
 @dataclass(frozen=True)

@@ -14,10 +14,10 @@ from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
-from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
+from cli_agent_orchestrator.utils.kiro_launch_guard import assert_kas_launch_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +47,10 @@ class ProviderManager:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
                 resolved_engine = resolve_kiro_engine(persisted=engine)
-                if resolved_engine == KiroEngine.KAS:
-                    raise KiroPhase0KASError(profile_has_v2_policy=False)
+                # Site 2 of 7 — **flag-only** (ADR-008): ``agent_profile`` here is
+                # a name string, not a parsed profile. Before the provider object
+                # is constructed, so a refusal allocates nothing.
+                assert_kas_launch_allowed(engine=resolved_engine)
                 provider = KiroCliProvider(
                     terminal_id,
                     tmux_session,
@@ -168,11 +170,13 @@ class ProviderManager:
         # Check if already exists
         provider = self._providers.get(terminal_id)
         if provider:
-            if (
-                isinstance(provider, KiroCliProvider)
-                and getattr(provider, "_engine", None) == KiroEngine.KAS
-            ):
-                raise KiroPhase0KASError(profile_has_v2_policy=False)
+            # Site 4 of 7 — **flag-only**: a cached provider carries only its
+            # resolved engine. Topologically a cached KAS provider cannot exist
+            # unless creation admitted it, so this is defence in depth.
+            if isinstance(provider, KiroCliProvider):
+                cached_engine = getattr(provider, "_engine", None)
+                if cached_engine is not None:
+                    assert_kas_launch_allowed(engine=cached_engine)
             return provider
 
         # Try to create on-demand from database metadata
@@ -185,8 +189,12 @@ class ProviderManager:
             if metadata["provider"] == ProviderType.KIRO_CLI.value
             else None
         )
-        if persisted_engine == KiroEngine.KAS:
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
+        # Site 5 of 7 — **flag-only**: reconstruction from DB metadata. A KAS row
+        # cannot exist unless creation admitted it (creation refuses before
+        # ``db_create_terminal``), so this is a defence-in-depth backstop across
+        # a CAO restart.
+        if persisted_engine is not None:
+            assert_kas_launch_allowed(engine=persisted_engine)
 
         # Create provider on-demand
         provider = self.create_provider(

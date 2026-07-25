@@ -56,7 +56,6 @@ from cli_agent_orchestrator.plugins import (
 )
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
-    KiroPhase0KASError,
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
@@ -72,6 +71,7 @@ from cli_agent_orchestrator.services.session_env import (
 )
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.kiro_launch_guard import assert_kas_launch_allowed
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
@@ -254,10 +254,13 @@ async def create_terminal(
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
             await asyncio.to_thread(probe, resolved_engine, requested)
-            if resolved_engine == KiroEngine.KAS:
-                raise KiroPhase0KASError(
-                    bool(profile and (profile.allowedTools or profile.toolsSettings))
-                )
+            # Site 1 of 7, and the authoritative gate (FR-101, ADR-008): this is
+            # the only path that creates a KAS terminal, and the only one holding
+            # a parsed profile — so it runs **lint-gated**, recomputing
+            # translatability now. Placed after engine resolution and before any
+            # allocation, so a refusal leaves zero residue: no window, database
+            # row, FIFO, Herdr registration, or provider process.
+            assert_kas_launch_allowed(engine=resolved_engine, profile=profile)
         else:
             if engine is not None:
                 raise ValueError("Kiro engine selection is only valid for provider 'kiro_cli'")
@@ -907,11 +910,12 @@ def send_input(
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        if (
-            metadata.get("provider") == ProviderType.KIRO_CLI.value
-            and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
-        ):
-            raise KiroPhase0KASError(profile_has_v2_policy=False)
+        # Site 6 of 7 — **flag-only** (ADR-008). This is a per-message hot path
+        # with no parsed profile in scope, so the guard costs one boolean read
+        # rather than a policy compile. Defence in depth: turning the opt-in off
+        # stops an existing KAS terminal from accepting further input.
+        if metadata.get("provider") == ProviderType.KIRO_CLI.value:
+            assert_kas_launch_allowed(engine=resolve_kiro_engine(persisted=metadata.get("engine")))
 
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = (

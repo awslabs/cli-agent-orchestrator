@@ -168,7 +168,9 @@ class TestHappyPath:
                 f"{_MODULE}.terminal_service.get_terminal_metadata",
                 return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
             ),
-            pytest.raises(KiroPhase0KASError, match="Phase 0"),
+            # Phase 1: the refusal is now the central guard's structured message
+            # (FR-104). Same type, same position, same zero-residue property.
+            pytest.raises(KiroPhase0KASError, match="not enabled"),
         ):
             asyncio.run(
                 run_agent_step(

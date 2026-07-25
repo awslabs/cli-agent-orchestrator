@@ -24,12 +24,7 @@ from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.services.kiro_profiles import (
-    atomic_write_text,
-    kiro_artifact_path,
-    render_kiro_kas,
-    render_kiro_v2,
-)
+from cli_agent_orchestrator.services.kiro_profile_service import install_profile
 from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
@@ -353,17 +348,20 @@ def install_agent(
             ]
             mcp_servers = _inject_kiro_mcp_timeout(profile.mcpServers)
             engine = profile.engine or KiroEngine.V2
-            agent_file = kiro_artifact_path(KIRO_AGENTS_DIR, safe_filename, engine)
-            if engine == KiroEngine.KAS:
-                rendered, _ = render_kiro_kas(profile, kiro_resources, mcp_servers)
-            else:
-                rendered = render_kiro_v2(
-                    profile,
-                    allowed_tools,
-                    kiro_resources,
-                    mcp_servers,
-                )
-            atomic_write_text(agent_file, rendered)
+            # FR-105/ADR-004: one facade call replaces the render + path + write
+            # trio this function used to assemble itself. The compiled policy is
+            # returned rather than discarded, and a KAS install also writes its
+            # redacted sidecar.
+            outcome = install_profile(
+                profile,
+                directory=KIRO_AGENTS_DIR,
+                engine=engine,
+                resources=kiro_resources,
+                mcp_servers=mcp_servers,
+                allowed_tools=allowed_tools,
+                artifact_name=safe_filename,
+            )
+            agent_file = outcome.artifact_path
 
         elif provider == ProviderType.COPILOT_CLI.value:
             COPILOT_AGENTS_DIR.mkdir(parents=True, exist_ok=True)

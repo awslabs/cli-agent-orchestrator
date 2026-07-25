@@ -29,7 +29,17 @@ KNOWN_KAS_ACTIONS = frozenset(
 )
 _MCP_REF_RE = re.compile(r"^@([A-Za-z0-9_-]{1,64})(?:/([A-Za-z0-9_.:*?-]{1,128}))?$")
 _MCP_SERVER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_SAFE_ACTION_RE = re.compile(r"^[A-Za-z0-9_.:*?/-]{1,256}$")
+# One definition of a safe action identifier, shared by the action check and the
+# emitted-rule frame below (FR-103) so the two can never drift apart.
+_SAFE_ACTION_BODY = r"[A-Za-z0-9_.:*?/-]{1,256}"
+_SAFE_ACTION_RE = re.compile(rf"^{_SAFE_ACTION_BODY}$")
+# FR-103: the complete, anchored grammar of every Cedar rule CAO emits. Anchoring
+# is the control — nothing may precede or follow, so no extra clause (a `when
+# { ... }` block, a second appended statement) can ride along and widen the
+# effective grant. Matched with ``fullmatch``, never ``search``.
+_RULE_FRAME = re.compile(
+    rf'^(?:permit|forbid)\(principal, action == Action::"{_SAFE_ACTION_BODY}", resource\);$'
+)
 _MCP_CONFIG_FIELDS = frozenset({"type", "command", "args", "env", "timeout"})
 
 
@@ -178,6 +188,25 @@ def _cedar_rule(effect: Literal["permit", "forbid"], action: str) -> str:
     return f'{effect}(principal, action == Action::"{action}", resource);'
 
 
+def _validate_rule_shape(rule: str) -> None:
+    """Assert one emitted rule matches CAO's Cedar grammar exactly (FR-103).
+
+    Refuses; never repairs, normalises, or drops the rule (BR-U4-3) — repairing
+    would mean guessing intent on an authorization boundary. Because this raises
+    out of ``compile_kiro_policy``, one malformed rule refuses the **whole**
+    profile (BR-U4-4): a profile minus one rule is a different, possibly broader
+    policy.
+
+    Scope limit: this proves *shape*, not Cedar semantics as the KAS engine
+    evaluates them (NFR-101 boundary).
+    """
+    if not _RULE_FRAME.fullmatch(rule):
+        raise KiroPolicyError(
+            "malformed-cedar-rule",
+            f"emitted Cedar rule does not match CAO's permitted shape: {rule!r}",
+        )
+
+
 def compile_kiro_policy(profile: AgentProfile) -> CompiledKiroPolicy:
     """Compile one profile to deterministic KAS visibility and Cedar rules."""
     if profile.toolAliases:
@@ -233,6 +262,12 @@ def compile_kiro_policy(profile: AgentProfile) -> CompiledKiroPolicy:
             + [_cedar_rule("forbid", action) for action in sorted(all_denies)]
         )
         excluded = tuple(sorted(all_denies))
+
+    # FR-103 / BR-U4-1: every emitted rule is validated, unconditionally, before
+    # the policy is returned — and therefore long before any caller writes an
+    # artifact (BR-U4-2). There is no configuration under which this is skipped.
+    for rule in rules:
+        _validate_rule_shape(rule)
 
     permissions = KASPermissions(
         rules=list(rules),
