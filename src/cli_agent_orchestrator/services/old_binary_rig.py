@@ -252,8 +252,16 @@ def run_exact_old_binary(
     log_path = workdir / "access-log.json"
     import os
 
+    from cli_agent_orchestrator.constants import STATE_ROOT_ENV
+
     env = dict(os.environ)
     env["HOME"] = str(state_home)
+    # The disposable home is the only state root this child may use. A state
+    # root exported in the surrounding environment would otherwise be
+    # inherited and point the child at live state, voiding the isolation the
+    # rig exists to provide -- and it would do so silently, because the probe
+    # would still run and still produce a verdict.
+    env.pop(STATE_ROOT_ENV, None)
     pythonpath = str(src)
     if extra_pythonpath is not None:
         pythonpath = f"{src}{os.pathsep}{extra_pythonpath}"
@@ -438,12 +446,17 @@ def _build_forward_state(
     import sqlite3
     import time
 
+    from cli_agent_orchestrator.constants import STATE_ROOT_ENV
+
     layout = _home_layout(state_home)
     old_tree = extract_exact_source(ref, repo=repo, dest=workdir / "old-tree")
     bootstrap = workdir / "bootstrap.py"
     bootstrap.write_text(_BOOTSTRAP, encoding="utf-8")
     env = dict(os.environ)
     env["HOME"] = str(state_home)
+    # Same reason as the probe runner: an inherited state root would move the
+    # bootstrap's writes out of the disposable home and into live state.
+    env.pop(STATE_ROOT_ENV, None)
     env["PYTHONPATH"] = str(old_tree / "src")
     completed = subprocess.run(
         [sys.executable, str(bootstrap)],

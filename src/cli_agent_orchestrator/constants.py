@@ -71,8 +71,75 @@ TMUX_HISTORY_LINES = 200
 # =============================================================================
 # Application Directory Structure
 # =============================================================================
-# Base directory for all CAO data (~/.aws/cli-agent-orchestrator)
-CAO_HOME_DIR = Path.home() / ".aws" / "cli-agent-orchestrator"
+# Name of the one environment variable that relocates all CAO state.
+STATE_ROOT_ENV = "CAO_STATE_ROOT"
+
+
+class StateRootError(RuntimeError):
+    """``CAO_STATE_ROOT`` named something CAO will not accept as a state root.
+
+    Raised while this module is being imported, so it surfaces as a startup
+    failure rather than as a surprise halfway through a run.
+    """
+
+
+def _resolve_cao_home_dir() -> Path:
+    """Decide where CAO keeps its state. The only place that decision is made.
+
+    Unset — ``~/.aws/cli-agent-orchestrator``, spelled exactly as it always
+    has been. The default is deliberately *not* canonicalized: resolving it
+    would rewrite the path every existing installation already has on disk
+    whenever a home directory is reached through a symlink.
+
+    Set — every path derived below moves beneath it, and so does the database
+    engine that ``clients/database.py`` builds from ``DATABASE_URL`` while it
+    is being imported. That import-time engine is why this is an environment
+    variable and not an argument: by the time any caller could pass a path,
+    the engine is already bound to one.
+
+    A value that cannot be honoured raises instead of falling back. Whoever
+    set this asked for state to live somewhere else — usually a test, a
+    rehearsal, or a second install that must not disturb the first. Answering
+    that request by quietly using the operator's live state is the only
+    outcome worse than refusing to start.
+    """
+    raw = os.environ.get(STATE_ROOT_ENV)
+    if raw is None:
+        return Path.home() / ".aws" / "cli-agent-orchestrator"
+    if not raw.strip():
+        raise StateRootError(
+            f"{STATE_ROOT_ENV} is set but empty. Unset it to use the default state root."
+        )
+    if "\x00" in raw:
+        raise StateRootError(f"{STATE_ROOT_ENV} contains a NUL byte and is not a path.")
+    if not os.path.isabs(raw):
+        raise StateRootError(
+            f"{STATE_ROOT_ENV} must be an absolute path; got {raw!r}. A relative root "
+            "would follow the working directory of whichever process happened to "
+            "start, so two CAO processes could disagree about where state lives."
+        )
+    # Canonicalized so that two spellings of one directory are one state root.
+    # ``realpath`` rather than ``resolve(strict=True)``: the root is allowed
+    # not to exist yet, and is created immediately below.
+    root = Path(os.path.realpath(raw))
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise StateRootError(
+            f"{STATE_ROOT_ENV}={raw!r} resolved to {root}, which cannot be used as a "
+            f"directory: {exc}"
+        ) from exc
+    if not os.access(root, os.R_OK | os.W_OK | os.X_OK):
+        raise StateRootError(
+            f"{STATE_ROOT_ENV}={raw!r} resolved to {root}, which is not readable, "
+            "writable and searchable by this process."
+        )
+    return root
+
+
+# Base directory for all CAO data (~/.aws/cli-agent-orchestrator by default,
+# or the canonicalized CAO_STATE_ROOT when one is set).
+CAO_HOME_DIR = _resolve_cao_home_dir()
 
 # Managed environment variable file
 CAO_ENV_FILE = CAO_HOME_DIR / ".env"

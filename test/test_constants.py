@@ -295,11 +295,29 @@ class TestCaoHomeDir:
     """Tests for CAO home directory constants."""
 
     def test_cao_home_dir_is_under_aws_cli_agent_orchestrator(self):
-        """Test that CAO_HOME_DIR is under ~/.aws/cli-agent-orchestrator."""
-        from cli_agent_orchestrator.constants import CAO_HOME_DIR
+        """Test that CAO_HOME_DIR is under ~/.aws/cli-agent-orchestrator.
 
-        expected = Path.home() / ".aws" / "cli-agent-orchestrator"
-        assert CAO_HOME_DIR == expected
+        This one is about the *default* location, so the module is re-imported
+        with ``CAO_STATE_ROOT`` absent. Reading the already-imported value
+        would instead assert whatever the person running the suite chose —
+        and pointing the suite at a scratch state root is the whole reason
+        that variable exists. Reloaded again afterwards so the rest of the
+        session keeps the root the environment actually asked for.
+        """
+        import importlib
+        import os
+
+        env = os.environ.copy()
+        env.pop("CAO_STATE_ROOT", None)
+        import cli_agent_orchestrator.constants as constants_module
+
+        try:
+            with patch.dict("os.environ", env, clear=True):
+                importlib.reload(constants_module)
+                expected = Path.home() / ".aws" / "cli-agent-orchestrator"
+                assert constants_module.CAO_HOME_DIR == expected
+        finally:
+            importlib.reload(constants_module)
 
     def test_cao_home_dir_is_pathlib_path(self):
         """Test that CAO_HOME_DIR is a Path object."""

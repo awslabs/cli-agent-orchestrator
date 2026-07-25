@@ -244,6 +244,36 @@ The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six
 | `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` | `3.0` | float | Grace period after a terminal is registered before a FIFO that has never delivered a single byte is treated as a cold-start stall (harness-control#93) instead of "still booting". |
 | `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` | `5` | int | Consecutive cold-start re-arm attempts (rearm() succeeded but the pipe still never delivered) before the watchdog gives up on a terminal — a separate failure class and counter from `CAO_PIPE_LIVENESS_MAX_REARM_FAILURES`, which only counts rearm() raising. |
 
+### State root (`CAO_STATE_ROOT`)
+
+| Env var | Default | Type | Purpose |
+|---|---|---|---|
+| `CAO_STATE_ROOT` | `~/.aws/cli-agent-orchestrator` | absolute path | Base directory for **all** CAO state — the SQLite database, logs, FIFOs, companion receipts, agent store, skills, workflows, settings, and everything else derived from it. |
+
+Set this to run CAO against a state tree that is not the operator's live one: a
+second install, a migration rehearsal, or a test that must not disturb real
+terminals. Everything below `CAO_HOME_DIR` follows it, including the SQLAlchemy
+engine, which is built while `clients/database.py` is being imported. That
+import-time binding is why this is an environment variable rather than a
+configuration key — by the time `settings.json` could be read, the engine
+already exists.
+
+Rules:
+
+- **Unset is the default and is unchanged.** No canonicalization is applied, so
+  an existing installation whose home directory is reached through a symlink
+  keeps the exact paths it already has on disk.
+- **Must be absolute.** A relative root would follow the working directory of
+  whichever process started, so two CAO processes could disagree about where
+  state lives.
+- **Canonicalized when set.** The value is resolved with `realpath`, so two
+  spellings of one directory are one state root.
+- **Created if missing**, then checked for read, write, and search access.
+- **A bad value refuses to start.** Empty, relative, or unusable values raise
+  `StateRootError` while `constants.py` is being imported; CAO never falls back
+  to the default. Whoever set this asked for state to live somewhere else, and
+  quietly writing to live state instead is worse than not starting.
+
 ## API Endpoints
 
 | Method | Endpoint | Description |
