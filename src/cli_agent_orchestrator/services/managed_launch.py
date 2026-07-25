@@ -31,6 +31,7 @@ from cli_agent_orchestrator.models.managed_launch import (
 )
 from cli_agent_orchestrator.services import companion_receipts
 from cli_agent_orchestrator.services import execution_mode as em
+from cli_agent_orchestrator.services import provider_contracts
 
 logger = logging.getLogger(__name__)
 from cli_agent_orchestrator.utils.terminal import generate_terminal_id, managed_window_name
@@ -266,6 +267,15 @@ _SUBMISSION_RECEIPT_KINDS = {
     "kimi_cli": "kimi-session-update",
 }
 
+#: The providers *this* surface can prove readiness for, derived from the
+#: allowlist above rather than restated.  Every place that used to write
+#: the pair out by hand was a second source of truth, and one of them
+#: drifted: the published capability list said which providers a caller
+#: may probe, and stayed behind when a provider gained an adapter
+#: elsewhere.  Deriving it means a provider appears the moment its
+#: receipt kind exists and never before.
+READINESS_PROVIDERS: frozenset[str] = frozenset(_READINESS_RECEIPT_KINDS)
+
 
 def _validate_native_receipt(
     row: Any,
@@ -409,6 +419,14 @@ def _validate_request_identity(request: ManagedLaunchReserveRequest) -> dict[str
         )
     if not os.path.isabs(request.provider_executable):
         raise ManagedLaunchConflict("provider_executable must be an absolute path")
+    # Refused before the payload is built, so a route the provider cannot
+    # honor never becomes a durable reservation. Reaching the provider with
+    # it instead costs an allocated terminal id and a reservation that must
+    # then be finalized, to learn something knowable here.
+    try:
+        provider_contracts.validate_route_effort(request.expected_model, request.expected_effort)
+    except provider_contracts.ProviderContractError as exc:
+        raise ManagedLaunchConflict(str(exc)) from exc
     # Resolved and admitted before the payload is built, so an
     # unsupported or contradictory mode fails with nothing persisted.
     _resolve_execution_mode(request)
@@ -1553,7 +1571,7 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
     if not should_launch:
         return _adopt_durable_provider_fact(record)
     request = record["request"]
-    if record["provider"] not in {"codex", "kimi_cli"}:
+    if record["provider"] not in READINESS_PROVIDERS:
         return mark_preflight_blocked(
             reservation_id,
             preflight_class="unsupported-provider-readiness",

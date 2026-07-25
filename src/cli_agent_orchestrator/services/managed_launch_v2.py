@@ -55,6 +55,7 @@ from cli_agent_orchestrator.services import (
     heartbeat_store,
     native_attachment,
     native_tui_launch,
+    provider_contracts,
     recovery_receipts,
     secret_gate,
 )
@@ -390,6 +391,13 @@ def _validate_reserve_identity(request: ManagedLaunchV2ReserveRequest) -> dict[s
         raise ManagedLaunchConflict("trusted_project_root is valid only for provider=codex")
     if not os.path.isabs(request.provider_executable):
         raise ManagedLaunchConflict("provider_executable must be an absolute path")
+    # Refused before anything persists, for the same reason the v1 surface
+    # refuses it: a route the provider cannot honor should not become a
+    # durable reservation that then has to be finalized.
+    try:
+        provider_contracts.validate_route_effort(request.expected_model, request.expected_effort)
+    except provider_contracts.ProviderContractError as exc:
+        raise ManagedLaunchConflict(str(exc)) from exc
     payload = request.model_dump(mode="json")
     # The raw nonce never persists; only its digest is stored.
     payload.pop("launch_nonce")
@@ -1149,7 +1157,6 @@ def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
         "provider": row.provider,
         "agent_profile": row.agent_profile,
         "model": request.get("expected_model"),
-        "effort": request.get("expected_effort"),
         "working_directory": row.working_directory,
     }
     mismatches = {
@@ -1157,6 +1164,20 @@ def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
         for key, value in expected.items()
         if receipt.get(key) != value
     }
+    # Effort is compared through the effort vocabulary rather than by
+    # string equality, because the route and a truthful receipt speak
+    # different alphabets here: a provider-default route says
+    # ``provider-default`` and an honest native receipt says ``None``,
+    # since that session was never told an effort and never read one back.
+    # Raw equality refuses every such launch — after the pane exists and
+    # the reservation is open — which moves the very symptom this sentinel
+    # was introduced to remove from attestation to bind. The check is not
+    # relaxed: a receipt reporting a concrete effort for such a route is
+    # still a mismatch, because it means the session settled somewhere
+    # nobody selected.
+    expected_effort = request.get("expected_effort")
+    if not provider_contracts.effort_receipt_matches(expected_effort, receipt.get("effort")):
+        mismatches["effort"] = {"expected": expected_effort, "observed": receipt.get("effort")}
     for field in ("receipt_id", "provider_session_id", "provider_version"):
         if not isinstance(receipt.get(field), str) or not receipt[field]:
             mismatches[field] = {"expected": "non-empty string", "observed": receipt.get(field)}

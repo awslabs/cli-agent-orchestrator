@@ -1589,7 +1589,22 @@ async def managed_launch_capabilities(
         "post_allocation_bridge_failure_finalization": True,
         "launch_failure_evidence_schema": "cao-managed-bridge-launch-failure-v1",
         "trusted_project_root_providers": ["codex"],
-        "readiness_providers": ["codex", "kimi_cli"],
+        # The providers *this v1 bridged surface* has a readiness adapter
+        # for, read from that adapter map rather than written out again.
+        # The hand-written pair here was a second source of truth and it
+        # drifted; deriving it means the list can only ever name providers
+        # whose receipt kind exists.
+        #
+        # Deliberately NOT widened to include native-only providers. A
+        # consumer gates a *bridged* launch on this key, so a provider
+        # listed here without a v1 adapter would pass that gate on the
+        # strength of this advertisement and be refused at preflight —
+        # after a reservation exists. Native readiness is a different
+        # question with its own answer below: `native_tui.providers`,
+        # ANDed with `v2_launchable_execution_modes`. Two lists, two
+        # questions; merging them would make one list wrong for whichever
+        # caller read it next.
+        "readiness_providers": sorted(managed_launch.READINESS_PROVIDERS),
         # The caller may name an execution mode on a reservation, and a
         # mode this surface cannot run is refused rather than silently
         # substituted.  A caller that omits the field is unaffected.

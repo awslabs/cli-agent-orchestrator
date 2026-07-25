@@ -78,6 +78,92 @@ NATIVE_ID_SOURCES = {
     PROVIDER_CLAUDE: "cli_session_id",  # explicit --session-id <uuid> at start
 }
 
+#: The reserved ``expected_effort`` meaning "this route selects no effort;
+#: use whatever the provider does by default, and attest none".
+#:
+#: An explicit string rather than null or an omitted field, agreed with the
+#: conductor side: the breaker's failure domain hashes effort as a string,
+#: so a null would both weaken a deterministic domain key and read as
+#: "unspecified" — which is a different claim from "this model has no
+#: effort to specify". Callers echo it back byte-identically, so every
+#: existing ``expected_effort`` identity comparison keeps matching.
+EFFORT_PROVIDER_DEFAULT = "provider-default"
+
+#: Models that expose no thinking-effort surface at all, so *any* concrete
+#: effort is a protocol error rather than a preference the provider will
+#: approximate.
+#:
+#: Read from the installed Kimi 0.29.1: ``kimi-code/kimi-for-coding`` (the
+#: K2.7 route) advertises no ``support_efforts``, and both ``max`` and
+#: ``high`` come back ``Invalid params`` — from the ACP probe and from a
+#: real managed launch alike. An exact set rather than a capability probe,
+#: for the same reason the version pins are exact: this is a fact about
+#: specific builds that were read, and guessing at others would assert
+#: something nobody verified.
+EFFORTLESS_MODELS = frozenset({"kimi-code/kimi-for-coding"})
+
+
+def route_selects_effort(effort: Optional[str]) -> bool:
+    """Whether this route names an effort the provider should be told about.
+
+    The single question every materialization point asks, so that "does an
+    effort get sent?" has one answer rather than one per call site. Gating
+    inside any individual probe would leave the others as traps: the first
+    launch down an ungated path silently reinstates the override, and the
+    failure surfaces as a provider protocol error far from its cause.
+    """
+    return bool(effort) and effort != EFFORT_PROVIDER_DEFAULT
+
+
+def validate_route_effort(model: Optional[str], effort: Optional[str]) -> None:
+    """Refuse a concrete effort for a model that has no effort surface.
+
+    Fails here, with the sentinel named, rather than part-way through a
+    provider probe with ``Invalid params`` — which says only that some
+    parameter was wrong, in a response the caller has to map back to a
+    field it did not know was unsupported.
+    """
+    if model in EFFORTLESS_MODELS and route_selects_effort(effort):
+        raise ProviderContractError(
+            f"model {model!r} exposes no thinking-effort surface, so effort "
+            f"{effort!r} cannot be honored; route it with "
+            f"expected_effort={EFFORT_PROVIDER_DEFAULT!r} to run at the "
+            "provider default and attest no effort"
+        )
+
+
+def effort_receipt_matches(expected: Optional[str], observed: Optional[str]) -> bool:
+    """Whether a receipt's observed effort is the one this route asked for.
+
+    The comparison lives here, with the rest of the effort vocabulary,
+    because the sentinel and the value a truthful receipt reports are two
+    different alphabets and only this module knows both. A raw string
+    equality between them refuses every provider-default launch: the route
+    says ``provider-default`` and an honest native receipt says ``None``,
+    because that session was never told an effort and never checked one.
+
+    * A selecting route requires ``observed == expected``, unchanged.
+    * A provider-default route requires ``observed is None``. A non-null
+      observed value is a genuine mismatch, not a formality — it means the
+      session settled on an effort nobody selected, which is exactly the
+      drift the exact-route check exists to catch, and accepting it would
+      certify a route this side never chose.
+    """
+    if route_selects_effort(expected):
+        return observed == expected
+    return observed is None
+
+
+def kimi_effort_env(effort: Optional[str]) -> dict:
+    """The Kimi effort environment for a route — empty when it selects none.
+
+    Empty rather than absent-keyed-to-a-default: the override is *omitted*,
+    never translated into some other value, so the provider applies its own
+    default and nothing here claims to know what that is.
+    """
+    return {"KIMI_MODEL_THINKING_EFFORT": effort} if route_selects_effort(effort) else {}
+
+
 # Resume outcome codes (the public CLI contract).
 OUTCOME_RESUMED = 0
 OUTCOME_REFUSED_MISMATCH = 40
