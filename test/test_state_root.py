@@ -6,10 +6,18 @@ from the result during that same import — so no assertion made inside an
 already-running interpreter can observe the decision honestly. A subprocess
 can.
 
-The probe records, through an audit hook installed before CAO is imported,
-every path the child touches under the *default* state root. That is the
-claim worth proving: an isolated root is only isolated if the live tree is
-left alone, and "I set an env var" is not evidence of that.
+**No test in this file ever imports CAO with the knob absent.** Every child
+either runs under a scratch state root or refuses to start, so none of them
+can create or write anything under the operator's live tree. A suite that
+proved isolation by exercising the un-isolated path would be writing to the
+very directories it claims to protect — the first draft of this file did
+exactly that, and the audit hook below is what makes the claim checkable
+rather than asserted.
+
+The default location is proven instead by calling ``_resolve_cao_home_dir``
+directly, after the module has already been imported under a scratch root,
+with ``Path.home`` pointed at a synthetic directory. The unset branch neither
+canonicalizes nor creates, so that call touches no disk at all.
 
 Nothing here sets or overrides ``HOME``. The point of the knob is that
 isolating CAO's state no longer requires lying to the process about who is
@@ -30,20 +38,21 @@ SRC_DIR = str(Path(cli_agent_orchestrator.__file__).resolve().parent.parent)
 
 STATE_ROOT_ENV = "CAO_STATE_ROOT"
 
-# The historical location, spelled the way the shipped code spells it.
-DEFAULT_ROOT = Path.home() / ".aws" / "cli-agent-orchestrator"
-
 PROBE = '''
 """Import CAO in a fresh interpreter and report where its state landed."""
 import json
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
-DEFAULT_ROOT = str(Path.home() / ".aws" / "cli-agent-orchestrator")
-DEFAULT_ROOT_REAL = os.path.realpath(DEFAULT_ROOT)
+STATE_ROOT_ENV = "CAO_STATE_ROOT"
 
-# Events that create, read, or rearrange a file. ``os.stat`` is not among
+DEFAULT_ROOT = os.path.realpath(str(Path.home() / ".aws" / "cli-agent-orchestrator"))
+_requested = os.environ.get(STATE_ROOT_ENV) or ""
+STATE_ROOT = os.path.realpath(_requested) if _requested.strip() else None
+
+# Events that create, open, or rearrange a file. ``os.stat`` is not among
 # CPython's audit events, so a bare existence check is invisible here; every
 # event that actually opens or mutates something is not.
 WATCHED = {
@@ -65,6 +74,11 @@ WATCHED = {
 }
 
 default_hits = []
+root_hits = []
+
+
+def _under(path, base):
+    return path == base or path.startswith(base + os.sep)
 
 
 def _record(event, args):
@@ -77,8 +91,11 @@ def _record(event, args):
             arg = arg.decode("utf-8", "replace")
         if not isinstance(arg, str) or not (os.path.isabs(arg) or os.sep in arg):
             continue
-        if arg.startswith(DEFAULT_ROOT) or os.path.realpath(arg).startswith(DEFAULT_ROOT_REAL):
+        real = os.path.realpath(arg)
+        if _under(real, DEFAULT_ROOT) or _under(arg, DEFAULT_ROOT):
             default_hits.append(event + " " + arg)
+        elif STATE_ROOT is not None and _under(real, STATE_ROOT):
+            root_hits.append(event + " " + (real[len(STATE_ROOT):] or os.sep))
 
 
 sys.addaudithook(_record)
@@ -107,25 +124,49 @@ report["paths"] = {name: str(value) for name, value in paths.items()}
 report["existing_dirs"] = sorted(name for name, value in paths.items() if Path(value).is_dir())
 report["database_url"] = constants.DATABASE_URL
 report["engine_url"] = str(database.engine.url)
+
+# What the resolver answers with no state root set. The module is already
+# imported -- under the scratch root above -- so this runs the unset branch
+# and nothing else: no import, no engine, and (because the unset branch does
+# not canonicalize or create) no filesystem contact whatsoever. The home it
+# is shown is synthetic, so the real one is never even named.
+synthetic_home = sys.argv[1] if len(sys.argv) > 1 else None
+if synthetic_home:
+    restore = os.environ.pop(STATE_ROOT_ENV, None)
+    try:
+        with patch.object(Path, "home", return_value=Path(synthetic_home)):
+            report["unset_root"] = str(constants._resolve_cao_home_dir())
+    finally:
+        if restore is not None:
+            os.environ[STATE_ROOT_ENV] = restore
+
 report["default_hits"] = default_hits
+report["root_hits"] = root_hits
 sys.stdout.write(json.dumps(report))
 '''
 
 
-def _run_probe(probe_path, state_root):
-    """Run the probe in a fresh interpreter; ``state_root=None`` means unset.
+def _run_probe(probe_path, state_root, synthetic_home=None):
+    """Run the probe in a fresh interpreter under ``state_root``.
 
-    ``HOME`` is inherited untouched, deliberately: a knob that only works
-    when the process is also lied to about its home directory would not be
+    ``state_root`` is mandatory, including for the cases that expect a
+    refusal. A child launched without one would import CAO against the real
+    home and create directories there, which is the outcome this whole file
+    exists to rule out.
+
+    ``HOME`` is inherited untouched, deliberately: a knob that only worked
+    when the process was also lied to about its home directory would not be
     the knob this is meant to be.
     """
+    assert state_root is not None, "a probe without a state root would write to live state"
     env = dict(os.environ)
-    env.pop(STATE_ROOT_ENV, None)
-    if state_root is not None:
-        env[STATE_ROOT_ENV] = str(state_root)
+    env[STATE_ROOT_ENV] = str(state_root)
     env["PYTHONPATH"] = os.pathsep.join(part for part in (SRC_DIR, env.get("PYTHONPATH")) if part)
+    argv = [sys.executable, str(probe_path)]
+    if synthetic_home is not None:
+        argv.append(str(synthetic_home))
     completed = subprocess.run(
-        [sys.executable, str(probe_path)],
+        argv,
         capture_output=True,
         text=True,
         env=env,
@@ -151,16 +192,27 @@ def scratch(tmp_path):
     ``/var/folders``, so an un-resolved expectation would pass there for the
     wrong reason and fail on Linux.
     """
-    base = Path(os.path.realpath(tmp_path)) / "state"
-    return base
+    return Path(os.path.realpath(tmp_path)) / "state"
 
 
-@pytest.fixture(scope="module")
-def default_run(tmp_path_factory):
-    """One unset run, shared: it is both the compatibility case and the control."""
-    path = tmp_path_factory.mktemp("default-probe") / "state_root_probe.py"
-    path.write_text(PROBE, encoding="utf-8")
-    return _run_probe(path, None)
+@pytest.fixture
+def aliased_home(tmp_path):
+    """``(aliased, real)`` — one directory named two ways, neither in use.
+
+    Stands in for a home directory so the unset branch can be checked against
+    a spelling that ``realpath`` would visibly change. Nothing is created
+    inside either one; the test asserts that.
+    """
+    base = Path(os.path.realpath(tmp_path))
+    real = base / "home-real"
+    real.mkdir()
+    alias = base / "home-alias"
+    alias.symlink_to(real, target_is_directory=True)
+    # Asserted, not assumed: were these one string, the canonicalization
+    # assertions below would pass while proving nothing.
+    assert str(alias) != str(real)
+    assert os.path.realpath(alias) == str(real)
+    return alias, real
 
 
 class TestStateRootBindsEveryDerivedPath:
@@ -175,6 +227,26 @@ class TestStateRootBindsEveryDerivedPath:
             assert value.startswith(f"{scratch}{os.sep}") or value == str(
                 scratch
             ), f"{name} escaped the state root: {value}"
+
+    def test_the_derived_names_are_the_historical_ones(self, probe, scratch):
+        """Relocated, not renamed — the tree's shape below the root is fixed."""
+        completed, report = _run_probe(probe, scratch)
+        assert completed.returncode == 0, completed.stderr[-2000:]
+
+        relative = {
+            name: str(Path(value).relative_to(scratch))
+            for name, value in report["paths"].items()
+            if name != "root"
+        }
+        assert relative == {
+            "db_dir": "db",
+            "database_file": os.path.join("db", "cli-agent-orchestrator.db"),
+            "log_dir": "logs",
+            "terminal_log_dir": os.path.join("logs", "terminal"),
+            "fifo_dir": "fifos",
+            "companion_dir": "companion",
+            "env_file": ".env",
+        }
 
     def test_the_import_time_engine_follows_it(self, probe, scratch):
         """The engine is the reason this is an env var and not an argument."""
@@ -208,16 +280,27 @@ class TestStateRootBindsEveryDerivedPath:
 
         assert report["default_hits"] == []
 
-    def test_the_recorder_would_have_noticed(self, default_run):
+    def test_the_recorder_sees_those_writes_at_the_scratch_root(self, probe, scratch):
         """Control for the assertion above, which is otherwise unfalsifiable.
 
-        An audit hook that recorded nothing at all would make the empty list
-        above look like proof of isolation. The unset run touches the default
-        tree by definition, so a non-empty list here is what makes the empty
-        one mean something.
+        A hook that recorded nothing at all would make an empty
+        ``default_hits`` look like proof of isolation. The same hook, watching
+        the same events, records the import-time writes at the scratch root —
+        so the empty list means they went there instead of somewhere else,
+        not that the recorder was asleep.
         """
-        _, report = default_run
-        assert report["default_hits"], "the recorder saw no default-root access at all"
+        completed, report = _run_probe(probe, scratch)
+        assert completed.returncode == 0, completed.stderr[-2000:]
+
+        recorded = set(report["root_hits"])
+        expected = {
+            f"os.mkdir {os.sep}{os.path.join('logs', 'terminal')}",
+            f"os.mkdir {os.sep}fifos",
+            f"os.mkdir {os.sep}companion",
+            f"os.mkdir {os.sep}db",
+            f"os.chmod {os.sep}db",
+        }
+        assert expected <= recorded, sorted(expected - recorded)
 
     def test_two_spellings_of_one_root_are_one_root(self, probe, tmp_path):
         """A symlinked directory in the path does not make it a second root.
@@ -242,36 +325,54 @@ class TestStateRootBindsEveryDerivedPath:
 
 
 class TestNoStateRootChangesNothing:
-    """Unset is the shipped default and must stay byte-for-byte what it was."""
+    """Unset is the shipped default and must stay byte-for-byte what it was.
 
-    def test_the_root_keeps_its_historical_spelling(self, default_run):
-        completed, report = default_run
+    Checked by asking the resolver, never by importing CAO without a state
+    root — that import is precisely the thing that would write to the live
+    tree.
+    """
+
+    def test_the_unset_branch_returns_the_historical_path(self, probe, scratch, aliased_home):
+        alias, _ = aliased_home
+        completed, report = _run_probe(probe, scratch, synthetic_home=alias)
         assert completed.returncode == 0, completed.stderr[-2000:]
-        assert report["paths"]["root"] == str(DEFAULT_ROOT)
 
-    def test_the_derived_paths_keep_their_historical_spellings(self, default_run):
-        _, report = default_run
-        assert report["paths"]["db_dir"] == str(DEFAULT_ROOT / "db")
-        assert report["paths"]["log_dir"] == str(DEFAULT_ROOT / "logs")
-        assert report["paths"]["terminal_log_dir"] == str(DEFAULT_ROOT / "logs" / "terminal")
-        assert report["paths"]["fifo_dir"] == str(DEFAULT_ROOT / "fifos")
-        assert report["paths"]["companion_dir"] == str(DEFAULT_ROOT / "companion")
-        assert report["paths"]["env_file"] == str(DEFAULT_ROOT / ".env")
+        assert report["unset_root"] == str(alias / ".aws" / "cli-agent-orchestrator")
 
-    def test_the_engine_keeps_its_historical_url(self, default_run):
-        _, report = default_run
-        expected = f"sqlite:///{DEFAULT_ROOT / 'db' / 'cli-agent-orchestrator.db'}"
-        assert report["database_url"] == expected
-        assert report["engine_url"] == expected
-
-    def test_the_default_is_left_unresolved(self, default_run):
-        """Canonicalization applies to a value we were given, never to the default.
+    def test_the_unset_branch_does_not_canonicalize(self, probe, scratch, aliased_home):
+        """The aliased spelling survives.
 
         Resolving the default would silently rewrite the path of every
         installation whose home directory is reached through a symlink.
         """
-        _, report = default_run
-        assert report["paths"]["root"] == str(Path.home() / ".aws" / "cli-agent-orchestrator")
+        alias, real = aliased_home
+        completed, report = _run_probe(probe, scratch, synthetic_home=alias)
+        assert completed.returncode == 0, completed.stderr[-2000:]
+
+        assert report["unset_root"] != str(real / ".aws" / "cli-agent-orchestrator")
+        assert report["unset_root"].startswith(f"{alias}{os.sep}")
+
+    def test_the_unset_branch_creates_nothing(self, probe, scratch, aliased_home):
+        """Naming a default is not the same as building it.
+
+        Only the ``CAO_STATE_ROOT`` branch may create a directory; the unset
+        branch hands back a path and leaves the disk alone, which is what
+        makes it safe to ask this question at all.
+        """
+        alias, real = aliased_home
+        completed, report = _run_probe(probe, scratch, synthetic_home=alias)
+        assert completed.returncode == 0, completed.stderr[-2000:]
+
+        assert not (real / ".aws").exists()
+        assert not (alias / ".aws").exists()
+        assert sorted(p.name for p in real.iterdir()) == []
+
+    def test_asking_the_question_touches_no_live_state(self, probe, scratch, aliased_home):
+        alias, _ = aliased_home
+        completed, report = _run_probe(probe, scratch, synthetic_home=alias)
+        assert completed.returncode == 0, completed.stderr[-2000:]
+
+        assert report["default_hits"] == []
 
 
 class TestAnUnusableStateRootRefusesToStart:

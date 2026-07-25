@@ -295,29 +295,30 @@ class TestCaoHomeDir:
     """Tests for CAO home directory constants."""
 
     def test_cao_home_dir_is_under_aws_cli_agent_orchestrator(self):
-        """Test that CAO_HOME_DIR is under ~/.aws/cli-agent-orchestrator.
+        """Test that the default state root is ~/.aws/cli-agent-orchestrator.
 
-        This one is about the *default* location, so the module is re-imported
-        with ``CAO_STATE_ROOT`` absent. Reading the already-imported value
-        would instead assert whatever the person running the suite chose —
-        and pointing the suite at a scratch state root is the whole reason
-        that variable exists. Reloaded again afterwards so the rest of the
-        session keeps the root the environment actually asked for.
+        Asks the resolver, rather than reading the imported constant: that
+        constant is whatever the runner chose, and pointing a run at a scratch
+        state root is the reason ``CAO_STATE_ROOT`` exists. Neither reloading
+        the module nor re-importing it would do — both re-run the import-time
+        ``mkdir`` calls against the real home, which is the live tree this
+        variable was added to keep out of. The unset branch canonicalizes
+        nothing and creates nothing, so with a synthetic home this touches no
+        disk at all.
         """
-        import importlib
         import os
 
+        from cli_agent_orchestrator.constants import _resolve_cao_home_dir
+
+        synthetic_home = Path("/synthetic-home-that-does-not-exist")
         env = os.environ.copy()
         env.pop("CAO_STATE_ROOT", None)
-        import cli_agent_orchestrator.constants as constants_module
+        with patch.dict("os.environ", env, clear=True):
+            with patch.object(Path, "home", return_value=synthetic_home):
+                resolved = _resolve_cao_home_dir()
 
-        try:
-            with patch.dict("os.environ", env, clear=True):
-                importlib.reload(constants_module)
-                expected = Path.home() / ".aws" / "cli-agent-orchestrator"
-                assert constants_module.CAO_HOME_DIR == expected
-        finally:
-            importlib.reload(constants_module)
+        assert resolved == synthetic_home / ".aws" / "cli-agent-orchestrator"
+        assert not synthetic_home.exists()
 
     def test_cao_home_dir_is_pathlib_path(self):
         """Test that CAO_HOME_DIR is a Path object."""
