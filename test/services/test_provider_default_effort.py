@@ -25,11 +25,22 @@ cause.
 
 from __future__ import annotations
 
+import hashlib
+import subprocess
+import uuid
+
 import pytest
 
+from cli_agent_orchestrator.clients import database
+from cli_agent_orchestrator.models.managed_launch_v2 import (
+    PROTOCOL_VERSION_V2,
+    ManagedLaunchV2ReserveRequest,
+)
 from cli_agent_orchestrator.services import kimi_native_bootstrap, kimi_route
+from cli_agent_orchestrator.services import managed_launch_v2 as v2
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services import provider_contracts
+from cli_agent_orchestrator.services.managed_launch import ManagedLaunchConflict
 
 SENTINEL = "provider-default"
 K27 = "kimi-code/kimi-for-coding"
@@ -341,3 +352,195 @@ class TestTheNativeBootstrapSetsNoEffort:
         assert ("thinking", "max") in [
             (p.get("configId"), p.get("value")) for _m, p in transport.sent
         ]
+
+
+# --------------------------------------------------------------------
+# The consumer of the honest receipt: bind
+# --------------------------------------------------------------------
+
+
+@pytest.fixture
+def _companion(tmp_path, monkeypatch):
+    monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companion")
+
+
+@pytest.fixture
+def worktree(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    (repo / "f.txt").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+    return repo
+
+
+def _reserve(worktree, tmp_path, *, model, effort) -> dict:
+    executable = tmp_path / "fake-kimi"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    record, _created = v2.reserve(
+        ManagedLaunchV2ReserveRequest(
+            protocol_version=PROTOCOL_VERSION_V2,
+            reservation_id=str(uuid.uuid4()),
+            session_name="cao-test",
+            provider="kimi_cli",
+            agent_profile="reviewer",
+            caller_id="deadbeef",
+            working_directory=str(worktree),
+            expected_model=model,
+            expected_effort=effort,
+            provider_executable=str(executable),
+            provider_executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
+            obligation_generation="obgen-7c2e4a1b",
+            task_id="self-heal-demo-task",
+            run_id="run-0001",
+            delivery_id=str(uuid.uuid4()),
+            launch_nonce="n" * 40,
+            execution_mode="native_tui",
+            worker_class="persistent",
+        )
+    )
+    return record
+
+
+def _native_receipt(record, *, model, effort) -> dict:
+    """The receipt shape ``_native_readiness_receipt`` actually publishes.
+
+    Built from that function's own key list rather than a convenient
+    subset, so a test that passes here is asserting about the object bind
+    really receives.
+    """
+    session_id = str(uuid.uuid4())
+    return {
+        "bridge_version": bridge.BRIDGE_VERSION,
+        "reservation_id": record["reservation_id"],
+        "terminal_id": record["terminal_id"],
+        "generation": record["generation"],
+        "provider": record["provider"],
+        "agent_profile": record["agent_profile"],
+        "model": model,
+        "effort": effort,
+        "working_directory": record["working_directory"],
+        "receipt_id": session_id,
+        "provider_session_id": session_id,
+        "provider_version": "0.29.1",
+        "provider_receipt_kind": "kimi-native-tui-attached",
+        "model_input_ready": True,
+    }
+
+
+def _validate(reservation_id: str, receipt: dict) -> None:
+    with database.SessionLocal() as db:
+        row = v2._query(db, reservation_id)
+        assert row is not None
+        v2._validate_readiness_for_bind(row, receipt)
+
+
+class TestBindAcceptsTheHonestNoEffortReceipt:
+    """Where cond-0109 reappeared after being fixed everywhere else.
+
+    The native mint reports ``effort: None`` for a provider-default route
+    — deliberately, because a read-back value there is an artifact of the
+    session rather than a route fact. Bind then compared that ``None`` to
+    the literal ``"provider-default"`` by string equality and refused
+    every such launch, *after* the pane existed and the reservation was
+    open. The symptom moved from attestation to bind instead of being
+    removed: fixed on one path, sibling left behind.
+
+    The bridged path never showed it, because the bridge echoes the
+    request rather than reading the session back, so its receipt carries
+    the sentinel and matched. Only the native receipt is honest enough to
+    fail.
+    """
+
+    def test_a_null_effort_binds_for_a_provider_default_route(
+        self, isolated_memory_db, _companion, worktree, tmp_path
+    ):
+        record = _reserve(worktree, tmp_path, model=K27, effort=SENTINEL)
+
+        _validate(record["reservation_id"], _native_receipt(record, model=K27, effort=None))
+
+    def test_the_route_is_still_exact_on_everything_else(
+        self, isolated_memory_db, _companion, worktree, tmp_path
+    ):
+        """Declining to pin the effort does not loosen the model check."""
+        record = _reserve(worktree, tmp_path, model=K27, effort=SENTINEL)
+
+        with pytest.raises(ManagedLaunchConflict, match="exact v2 reservation"):
+            _validate(
+                record["reservation_id"],
+                _native_receipt(record, model="kimi-code/something-else", effort=None),
+            )
+
+    def test_a_concrete_effort_for_a_provider_default_route_is_refused(
+        self, isolated_memory_db, _companion, worktree, tmp_path
+    ):
+        """The check is not relaxed, it is translated.
+
+        A receipt naming an effort here means the session settled on one
+        nobody selected — the drift the exact-route check exists to catch.
+        Accepting it would certify a route this side never chose, which is
+        worse than the refusal it replaces.
+        """
+        record = _reserve(worktree, tmp_path, model=K27, effort=SENTINEL)
+
+        with pytest.raises(ManagedLaunchConflict) as raised:
+            _validate(record["reservation_id"], _native_receipt(record, model=K27, effort="high"))
+        assert "effort" in str(raised.value)
+
+    def test_the_sentinel_itself_is_not_accepted_as_an_observation(
+        self, isolated_memory_db, _companion, worktree, tmp_path
+    ):
+        """Echoing the sentinel back is not evidence of anything.
+
+        Accepting it would make the receipt's effort field unfalsifiable
+        for exactly the routes where nothing was measured.
+        """
+        record = _reserve(worktree, tmp_path, model=K27, effort=SENTINEL)
+
+        with pytest.raises(ManagedLaunchConflict):
+            _validate(record["reservation_id"], _native_receipt(record, model=K27, effort=SENTINEL))
+
+
+class TestBindStillEnforcesASelectedEffort:
+    """K3 behavior at the bind seam, unchanged in both directions."""
+
+    def test_a_matching_effort_binds(self, isolated_memory_db, _companion, worktree, tmp_path):
+        record = _reserve(worktree, tmp_path, model=K3, effort="max")
+
+        _validate(record["reservation_id"], _native_receipt(record, model=K3, effort="max"))
+
+    def test_a_different_effort_is_refused(
+        self, isolated_memory_db, _companion, worktree, tmp_path
+    ):
+        record = _reserve(worktree, tmp_path, model=K3, effort="max")
+
+        with pytest.raises(ManagedLaunchConflict, match="effort"):
+            _validate(record["reservation_id"], _native_receipt(record, model=K3, effort="low"))
+
+    def test_a_null_effort_is_refused_for_a_selecting_route(
+        self, isolated_memory_db, _companion, worktree, tmp_path
+    ):
+        """The mirror of the fix, and the reason it is a helper not a skip.
+
+        A selecting route whose receipt reports nothing has not been
+        proven; treating null as universally acceptable would have fixed
+        the K2.7 refusal by making every route's effort unverifiable.
+        """
+        record = _reserve(worktree, tmp_path, model=K3, effort="max")
+
+        with pytest.raises(ManagedLaunchConflict, match="effort"):
+            _validate(record["reservation_id"], _native_receipt(record, model=K3, effort=None))
+
+
+class TestTheHelperIsTheOneComparison:
+    def test_it_answers_both_alphabets(self):
+        assert provider_contracts.effort_receipt_matches("max", "max") is True
+        assert provider_contracts.effort_receipt_matches("max", "low") is False
+        assert provider_contracts.effort_receipt_matches("max", None) is False
+        assert provider_contracts.effort_receipt_matches(SENTINEL, None) is True
+        assert provider_contracts.effort_receipt_matches(SENTINEL, "high") is False
+        assert provider_contracts.effort_receipt_matches(SENTINEL, SENTINEL) is False

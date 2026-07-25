@@ -1157,7 +1157,6 @@ def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
         "provider": row.provider,
         "agent_profile": row.agent_profile,
         "model": request.get("expected_model"),
-        "effort": request.get("expected_effort"),
         "working_directory": row.working_directory,
     }
     mismatches = {
@@ -1165,6 +1164,20 @@ def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
         for key, value in expected.items()
         if receipt.get(key) != value
     }
+    # Effort is compared through the effort vocabulary rather than by
+    # string equality, because the route and a truthful receipt speak
+    # different alphabets here: a provider-default route says
+    # ``provider-default`` and an honest native receipt says ``None``,
+    # since that session was never told an effort and never read one back.
+    # Raw equality refuses every such launch — after the pane exists and
+    # the reservation is open — which moves the very symptom this sentinel
+    # was introduced to remove from attestation to bind. The check is not
+    # relaxed: a receipt reporting a concrete effort for such a route is
+    # still a mismatch, because it means the session settled somewhere
+    # nobody selected.
+    expected_effort = request.get("expected_effort")
+    if not provider_contracts.effort_receipt_matches(expected_effort, receipt.get("effort")):
+        mismatches["effort"] = {"expected": expected_effort, "observed": receipt.get("effort")}
     for field in ("receipt_id", "provider_session_id", "provider_version"):
         if not isinstance(receipt.get(field), str) or not receipt[field]:
             mismatches[field] = {"expected": "non-empty string", "observed": receipt.get(field)}

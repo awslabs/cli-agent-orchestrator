@@ -132,6 +132,28 @@ def validate_route_effort(model: Optional[str], effort: Optional[str]) -> None:
         )
 
 
+def effort_receipt_matches(expected: Optional[str], observed: Optional[str]) -> bool:
+    """Whether a receipt's observed effort is the one this route asked for.
+
+    The comparison lives here, with the rest of the effort vocabulary,
+    because the sentinel and the value a truthful receipt reports are two
+    different alphabets and only this module knows both. A raw string
+    equality between them refuses every provider-default launch: the route
+    says ``provider-default`` and an honest native receipt says ``None``,
+    because that session was never told an effort and never checked one.
+
+    * A selecting route requires ``observed == expected``, unchanged.
+    * A provider-default route requires ``observed is None``. A non-null
+      observed value is a genuine mismatch, not a formality — it means the
+      session settled on an effort nobody selected, which is exactly the
+      drift the exact-route check exists to catch, and accepting it would
+      certify a route this side never chose.
+    """
+    if route_selects_effort(expected):
+        return observed == expected
+    return observed is None
+
+
 def kimi_effort_env(effort: Optional[str]) -> dict:
     """The Kimi effort environment for a route — empty when it selects none.
 
