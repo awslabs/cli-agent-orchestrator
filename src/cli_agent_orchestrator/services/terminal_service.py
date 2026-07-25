@@ -246,9 +246,15 @@ def _register_incarnation(
     identity-addressed operation resolves against, so a launch that
     proceeds without it produces exactly what was observed in production —
     a live pane whose terminal nothing can find, status stuck unknown, and
-    a lookup failure repeating for as long as the pane lives. Failing here
-    costs a pane that is torn down; passing over it costs a pane that
-    cannot be addressed and cannot be cleaned up. This happens before any
+    a lookup failure repeating for as long as the pane lives.
+
+    Raising does not tear that pane down. A managed v2 launch runs under
+    ``preserve_on_init_failure``, so this refusal preserves the generation
+    and exposes it as a zero-byte failure -- one that can then be finalized
+    negative, because no binding, bind intent or admission was ever
+    published. So the choice is not between a live pane and a dead one: it
+    is between a preserved generation somebody can close and a live pane
+    that can be neither addressed nor cleaned up. This happens before any
     task byte can be delivered, and is the only reason this function is
     allowed to raise at all.
     """

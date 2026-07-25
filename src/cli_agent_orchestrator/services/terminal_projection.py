@@ -39,6 +39,7 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata_v2,
     list_terminals_by_session,
 )
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import terminal_service
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ PROJECTION_FIELDS = (
     "superseded_by_terminal_id",
     "superseded_by_generation",
     "status",
+    "fifo_monitored",
     "last_active",
 )
 
@@ -184,6 +186,34 @@ def _provider_status(terminal_id: str) -> Optional[str]:
         return None
 
 
+def _is_native_tui(terminal_id: str) -> bool:
+    """Whether this terminal's pane runs a provider's own full-screen TUI.
+
+    Read from the reservation's ``execution_mode``, which is the fact the
+    launch decided and stored, rather than inferred from the presence of a
+    FIFO or the shape of the argv. Both of those are consequences of the
+    mode and would invert the dependency: the ACP bridge is also launched
+    by argv and does have a FIFO, so either inference would call it native.
+    """
+    try:
+        from cli_agent_orchestrator.clients.database import (
+            ManagedLaunchV2ReservationModel,
+            SessionLocal,
+        )
+        from cli_agent_orchestrator.services import execution_mode as em
+
+        with SessionLocal() as db:
+            row = (
+                db.query(ManagedLaunchV2ReservationModel)
+                .filter(ManagedLaunchV2ReservationModel.terminal_id == terminal_id)
+                .first()
+            )
+            return row is not None and row.execution_mode == em.NATIVE_TUI
+    except Exception as exc:  # pragma: no cover - an absent v2 surface is not native
+        logger.debug("Execution mode unavailable for %s: %s", terminal_id, exc)
+        return False
+
+
 def project_row(
     row: Dict[str, Any],
     panes: Optional[Dict[str, Dict[str, str]]],
@@ -194,7 +224,17 @@ def project_row(
     if vintage == "v2":
         row = {**row, **_v2_row_identity(row)}
     state, reason = observed_lifecycle(row, panes)
-    if state == LIFECYCLE_LIVE:
+    native_tui = vintage == "v2" and _is_native_tui(row["id"])
+    if state == LIFECYCLE_LIVE and native_tui:
+        # A native TUI has no FIFO monitor, so no provider will ever
+        # classify it. Reporting ``unknown`` here promised a detection that
+        # was never coming and left every native worker looking pending
+        # forever; the truthful answer names the absence instead. The rest
+        # of the projection is unchanged -- identity and lifecycle are read
+        # from the row exactly as for any other terminal, because those are
+        # observed and only the classification is missing.
+        status = TerminalStatus.NOT_FIFO_MONITORED.value
+    elif state == LIFECYCLE_LIVE:
         # ``unknown`` is a legitimate provider answer here and means only
         # "live pane, state not yet detected".
         status = _provider_status(row["id"]) or "unknown"
@@ -229,6 +269,11 @@ def project_row(
         "native_session_id": row.get("native_session_id"),
         "lifecycle_state": state,
         "lifecycle_reason": reason,
+        # Stated rather than left to be inferred from the status: a
+        # consumer deciding whether to wait for a classification needs to
+        # know none is coming, and that is a different fact from whichever
+        # status happens to be showing.
+        "fifo_monitored": not native_tui,
         "superseded_by_terminal_id": row.get("superseded_by_terminal_id"),
         "superseded_by_generation": row.get("superseded_by_generation"),
         "status": status,

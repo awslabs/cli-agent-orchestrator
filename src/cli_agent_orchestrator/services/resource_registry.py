@@ -920,10 +920,10 @@ _BRIDGE = "managed_provider_bridge._serve"
 # to either file will fail that test until these are re-pinned.  The
 # trailing comment on each entry names the helper the line must sit in, so
 # re-pinning is a search for the verb inside that helper, never a guess.
-_TS_DECLARE = f"{_TS}:799"  # registry.declare in _register_v2_terminal_resources
-_TS_MARK = f"{_TS}:847"  # registry.register_created in _mark_v2_resource_created
-_TS_MONITOR = f"{_TS}:815"  # registry.monitor in _register_v2_terminal_resources
-_TS_DELETE = f"{_TS}:1090"  # registry.delete in _deregister_v2_terminal_resources
+_TS_DECLARE = f"{_TS}:855"  # registry.declare in _register_v2_terminal_resources
+_TS_MARK = f"{_TS}:903"  # registry.register_created in _mark_v2_resource_created
+_TS_MONITOR = f"{_TS}:871"  # registry.monitor in _register_v2_terminal_resources
+_TS_DELETE = f"{_TS}:1146"  # registry.delete in _deregister_v2_terminal_resources
 _CS_RESOLVE = f"{_CS}:112"  # registry.resolve_fs_path in cleanup_old_data
 _BR_DECLARE = f"{_BR}:3012"  # registry.declare in _declare_bridge_resources
 _BR_MARK = f"{_BR}:3056"  # registry.register_created in _mark_bridge_resource_created
