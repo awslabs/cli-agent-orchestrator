@@ -1657,11 +1657,19 @@ def _build_bind_intent(
         if terminal is not None
         else f"tmux:{row.session_name}:unknown:unknown"
     )
+    # This digest hashes the **assigned** route, stated here because it
+    # binds a failure domain and must be the same value on both sides of
+    # every later comparison. Assigned is the only choice that is always
+    # present: the observed effort is null for a provider-default route
+    # and for any pair whose effort cannot be read before a turn, so a
+    # digest over the observation would change meaning with the provider
+    # rather than with the route, and two peers comparing it would differ
+    # for reasons neither could see.
     route_digest = hashlib.sha256(
         _canonical_json(
             {
-                "model": receipt["model"],
-                "effort": receipt["effort"],
+                "model": reserved_request["expected_model"],
+                "effort": reserved_request["expected_effort"],
                 "agent_profile": row.agent_profile,
             }
         ).encode()

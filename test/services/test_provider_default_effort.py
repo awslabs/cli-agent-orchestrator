@@ -25,7 +25,9 @@ cause.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import subprocess
 import uuid
 
@@ -34,6 +36,7 @@ import pytest
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.managed_launch_v2 import (
     PROTOCOL_VERSION_V2,
+    ManagedLaunchV2BindRequest,
     ManagedLaunchV2ReserveRequest,
 )
 from cli_agent_orchestrator.services import kimi_native_bootstrap, kimi_route
@@ -624,3 +627,95 @@ class TestBindSurvivesAProviderDefaultRoute:
 
         assert bound["state"] == "bound"
         assert bound["binding"] is not None
+
+
+class TestTheRouteDigestIsOverTheAssignedRoute:
+    """The digest binds a failure domain, so both peers must compute it alike.
+
+    ``assigned_route_digest`` rides in the binding payload and is compared
+    against a value the conductor derives from the route it reserved. It
+    was hashed from the receipt -- the *observation* -- which is a
+    different fact and, for the two classes that cannot be observed,
+    literally a different value: a provider-default Kimi route observes
+    null effort, and a Claude route observes a resolved model rather than
+    the alias that was requested.
+
+    So the digest changed with the provider rather than with the route,
+    and two peers comparing it would disagree for a reason neither could
+    see from its own side. Nothing asserted this value anywhere, which is
+    how it stayed wrong through the receipt fix.
+    """
+
+    def _digest_for(self, record, receipt_model, receipt_effort):
+        request = ManagedLaunchV2BindRequest(
+            protocol_version=PROTOCOL_VERSION_V2,
+            reservation_id=record["reservation_id"],
+            terminal_id=record["terminal_id"],
+            generation=record["generation"],
+            caller_id="deadbeef",
+            attempt_id=str(uuid.uuid4()),
+        )
+        receipt = _native_receipt(record, model=receipt_model, effort=receipt_effort)
+        with database.SessionLocal() as db:
+            row = v2._query(db, record["reservation_id"])
+            intent = v2._build_bind_intent(
+                db, row, record["reservation_id"], request, receipt, "native_tui"
+            )
+        return intent
+
+    def _route_digest(self, intent):
+        # The exact canonical bytes the peer receives, decoded rather than
+        # read from a convenient in-memory field, so this asserts about
+        # what actually crosses the wire.
+        payload = base64.b64decode(intent["binding_payload_b64"])
+        return json.loads(payload.decode())["assigned_route_digest"]
+
+    def test_the_observation_does_not_move_the_digest(
+        self, isolated_memory_db, _companion, worktree, tmp_path
+    ):
+        """Two truthful receipts, one route: one domain key.
+
+        The observed effort is null for this route and the observed model
+        is whatever the session resolved. Neither is the route, so neither
+        may change the value the two peers compare.
+        """
+        record = _reserve(worktree, tmp_path, model=K27, effort=SENTINEL)
+
+        from_null = self._route_digest(self._digest_for(record, K27, None))
+        from_echo = self._route_digest(self._digest_for(record, K27, SENTINEL))
+
+        assert from_null == from_echo
+
+    def test_the_digest_is_the_hash_of_the_reserved_route(
+        self, isolated_memory_db, _companion, worktree, tmp_path
+    ):
+        """Recomputed independently from the reservation, not from the code.
+
+        A peer holding only the reservation must arrive at this exact
+        value, so the test derives it the way that peer would rather than
+        calling the same helper and comparing it to itself.
+        """
+        record = _reserve(worktree, tmp_path, model=K27, effort=SENTINEL)
+
+        expected = hashlib.sha256(
+            v2._canonical_json(
+                {
+                    "model": K27,
+                    "effort": SENTINEL,
+                    "agent_profile": record["agent_profile"],
+                }
+            ).encode()
+        ).hexdigest()
+
+        assert self._route_digest(self._digest_for(record, K27, None)) == expected
+
+    def test_a_different_route_is_a_different_domain(
+        self, isolated_memory_db, _companion, worktree, tmp_path
+    ):
+        """The digest still discriminates; it is pinned, not neutralized."""
+        k27 = _reserve(worktree, tmp_path, model=K27, effort=SENTINEL)
+        k3 = _reserve(worktree, tmp_path, model=K3, effort="max")
+
+        assert self._route_digest(self._digest_for(k27, K27, None)) != self._route_digest(
+            self._digest_for(k3, K3, "max")
+        )

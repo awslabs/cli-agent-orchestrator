@@ -198,6 +198,49 @@ def effort_observability(provider: Optional[str], model: Optional[str]) -> str:
     return by_model.get(None, EFFORT_OBSERVABLE)
 
 
+#: The one lawful crossing from the recovery-capability short names to the
+#: wire keys, written down once because the two namespaces are deliberately
+#: not merged and a caller guessing at the crossing gets no error — only a
+#: wrong answer.
+#:
+#: ``effort_observability`` is keyed by wire name, but the recovery receipt
+#: surface is closed over the short names, so asking it ``"claude"`` finds
+#: no declaration and silently returns the default ``observable``. That is
+#: the worst possible failure: the call *looks* like it consults the
+#: authority while actually restoring the strict equality the declaration
+#: exists to relax, and nothing raises to say so.
+_WIRE_FOR_RECOVERY_NAME = {
+    PROVIDER_CODEX: PROVIDER_CODEX_WIRE,
+    PROVIDER_KIMI: PROVIDER_KIMI_CLI,
+    PROVIDER_CLAUDE: PROVIDER_CLAUDE_CODE,
+}
+
+
+def effort_observability_for_recovery_provider(
+    provider: Optional[str], model: Optional[str]
+) -> str:
+    """``effort_observability`` for a *recovery-capability* short name.
+
+    The recovery receipt surface speaks ``codex|kimi|claude``; the
+    observability declarations are keyed by the wire names. This is the
+    only supported way to ask the observability question from that side,
+    so the translation is not repeated at call sites where a silent miss
+    would read as a real ``observable`` answer.
+
+    An unknown short name raises rather than defaulting: the caller has
+    already validated its provider against ``PROVIDERS``, so a miss here
+    means the two namespaces have drifted and the safe answer is not a
+    guess.
+    """
+    wire = _WIRE_FOR_RECOVERY_NAME.get(provider or "")
+    if wire is None:
+        raise ProviderContractError(
+            f"unknown recovery-capability provider: {provider!r}; expected one "
+            f"of {list(_WIRE_FOR_RECOVERY_NAME)}"
+        )
+    return effort_observability(wire, model)
+
+
 def effort_receipt_matches(
     expected: Optional[str],
     observed: Optional[str],
