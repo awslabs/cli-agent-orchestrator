@@ -90,6 +90,43 @@ class TmuxBackend(TerminalBackend):
     ) -> Optional[Dict[str, str]]:
         return self._client.terminal_bound_window_identity(terminal_id, session_name, window_name)
 
+    @property
+    def supports_pane_identity(self) -> bool:
+        return True
+
+    def observe_pane_identity(self, pane_id: str) -> Optional[Dict[str, str]]:
+        # Enumerated, then matched here, so that "the server answered and
+        # this pane is not on it" stays distinguishable from "the server
+        # did not answer". A single ``-t`` lookup collapses the two, and
+        # collapsing them would let an unreadable server reap live rows.
+        records = self._client.list_pane_control_identities()
+        if records is None:
+            return {"outcome": "unreadable"}
+        matches = [record for record in records if record.pane_id == pane_id]
+        if len(matches) > 1:
+            # One id matching several panes is not an observation of
+            # either of them.
+            return {"outcome": "unreadable"}
+        if not matches:
+            return {"outcome": "absent"}
+        observed = matches[0]
+        identity = {
+            "outcome": "observed",
+            "pane_id": observed.pane_id,
+            "window_id": observed.window_id,
+            "session_id": observed.session_id,
+            "pane_pid": str(observed.pane_pid),
+            "session_name": observed.session_name,
+            "window_name": observed.window_name,
+            "dead": "1" if observed.dead else "0",
+        }
+        # Absent rather than null when the owning server could not be
+        # proven, so a comparison against a recorded socket has nothing to
+        # pass against instead of comparing None to None and agreeing.
+        if observed.server_socket_path is not None:
+            identity["server_socket_path"] = observed.server_socket_path
+        return identity
+
     def create_window_with_argv(
         self,
         session_name: str,
@@ -124,6 +161,7 @@ class TmuxBackend(TerminalBackend):
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        pane_id: Optional[str] = None,
     ) -> None:
         self._client.send_keys(
             session_name,
@@ -132,6 +170,7 @@ class TmuxBackend(TerminalBackend):
             enter_count=enter_count,
             force_bracketed_paste=force_bracketed_paste,
             submit_delay=submit_delay,
+            pane_id=pane_id,
         )
 
     def send_special_key(self, session_name: str, window_name: str, key: str) -> None:

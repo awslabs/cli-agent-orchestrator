@@ -59,6 +59,48 @@ class TerminalModel(Base):
     # NULL never satisfies the writer-boundary check: an unbound terminal
     # refuses control input rather than being written somewhere plausible.
     server_socket_path = Column(Text, nullable=True)
+    # The remaining two immutable tmux ids, recorded for the same reason as
+    # the pane and window ids. A session NAME is mutable and reusable just
+    # as a window name is, so "$N" is what a reattach means when it says
+    # "this session". ``pane_pid`` is the pane's primary process, which
+    # distinguishes the incarnation that was registered from a later one
+    # that inherited its ids; it is one component of the tuple and never a
+    # sufficient check by itself — a survival test that consulted only the
+    # pid, or only the window, is what previously let a write land in an
+    # unrelated live composer.
+    session_id = Column(Text, nullable=True)
+    pane_pid = Column(Integer, nullable=True)
+    # The provider-side session this incarnation is resumable as, projected
+    # onto the terminal row rather than left only in the native-attachment
+    # table. A human view that has to join another table to answer "which
+    # provider session is this card?" will eventually be written without the
+    # join, and will then show a card that cannot be traced back to a
+    # resumable session.
+    native_session_id = Column(Text, nullable=True)
+    # Durable lifecycle, so a row that no longer names a live pane can say
+    # so instead of reporting a provider status forever. Without it a
+    # deleted window's row is indistinguishable from a live worker whose
+    # provider state has not been detected yet, and every human view keeps
+    # showing it as an ordinary terminal in an unknown state.
+    #
+    #   live               the recorded identity was observed intact
+    #   superseded         the identity resolves to a different incarnation;
+    #                      superseded_by_* names the row that replaced it
+    #   dead               the recorded pane is provably absent
+    #   unknown-liveness   the identity could not be observed at all
+    #
+    # ``unknown-liveness`` is deliberately not a synonym for dead. "We could
+    # not look" is not evidence: such a row is not live, is not reaped, is
+    # not attachable, and is never a control or task target.
+    lifecycle_state = Column(Text, nullable=True)
+    lifecycle_reason = Column(Text, nullable=True)
+    liveness_checked_at = Column(DateTime, nullable=True)
+    # A demotion points at the incarnation that replaced this one rather
+    # than editing this row's identity in place. Re-pointing a live row is
+    # the forbidden operation: it is exactly the aliasing that turns a
+    # stale row into a writable handle on somebody else's pane.
+    superseded_by_terminal_id = Column(Text, nullable=True)
+    superseded_by_generation = Column(Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -1027,6 +1069,37 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN server_socket_path TEXT")
             conn.commit()
             logger.info("Migration: added server_socket_path column to terminals table")
+        # The rest of the canonical identity tuple, and the lifecycle that
+        # lets a row stop claiming to be a terminal once its pane is gone.
+        # Every one of these lands NULL on existing rows and none is
+        # backfilled, for the same reason server_socket_path is not: the
+        # process running the migration would be inventing the facts from
+        # whatever tmux server it happens to reach. A NULL lifecycle_state
+        # therefore reads as "never observed", which the projection reports
+        # as unknown liveness rather than promoting to live.
+        for column, ddl in (
+            ("session_id", "ALTER TABLE terminals ADD COLUMN session_id TEXT"),
+            ("pane_pid", "ALTER TABLE terminals ADD COLUMN pane_pid INTEGER"),
+            ("native_session_id", "ALTER TABLE terminals ADD COLUMN native_session_id TEXT"),
+            ("lifecycle_state", "ALTER TABLE terminals ADD COLUMN lifecycle_state TEXT"),
+            ("lifecycle_reason", "ALTER TABLE terminals ADD COLUMN lifecycle_reason TEXT"),
+            (
+                "liveness_checked_at",
+                "ALTER TABLE terminals ADD COLUMN liveness_checked_at DATETIME",
+            ),
+            (
+                "superseded_by_terminal_id",
+                "ALTER TABLE terminals ADD COLUMN superseded_by_terminal_id TEXT",
+            ),
+            (
+                "superseded_by_generation",
+                "ALTER TABLE terminals ADD COLUMN superseded_by_generation TEXT",
+            ),
+        ):
+            if column not in columns:
+                conn.execute(ddl)
+                conn.commit()
+                logger.info("Migration: added %s column to terminals table", column)
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -1045,6 +1118,9 @@ def create_terminal(
     pane_id: Optional[str] = None,
     window_id: Optional[str] = None,
     server_socket_path: Optional[str] = None,
+    session_id: Optional[str] = None,
+    pane_pid: Optional[int] = None,
+    native_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -1063,6 +1139,9 @@ def create_terminal(
             pane_id=pane_id,
             window_id=window_id,
             server_socket_path=server_socket_path,
+            session_id=session_id,
+            pane_pid=pane_pid,
+            native_session_id=native_session_id,
         )
         db.add(terminal)
         db.commit()
@@ -1079,6 +1158,9 @@ def create_terminal(
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
             "server_socket_path": terminal.server_socket_path,
+            "session_id": terminal.session_id,
+            "pane_pid": terminal.pane_pid,
+            "native_session_id": terminal.native_session_id,
         }
 
 
@@ -1222,8 +1304,164 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
             "server_socket_path": terminal.server_socket_path,
+            "session_id": terminal.session_id,
+            "pane_pid": terminal.pane_pid,
+            "native_session_id": terminal.native_session_id,
+            "lifecycle_state": terminal.lifecycle_state,
+            "lifecycle_reason": terminal.lifecycle_reason,
+            "liveness_checked_at": terminal.liveness_checked_at,
+            "superseded_by_terminal_id": terminal.superseded_by_terminal_id,
+            "superseded_by_generation": terminal.superseded_by_generation,
             "last_active": terminal.last_active,
         }
+
+
+def register_terminal_incarnation(
+    terminal_id: str,
+    *,
+    generation: Optional[str],
+    server_socket_path: str,
+    session_id: str,
+    window_id: str,
+    pane_id: str,
+    pane_pid: int,
+    native_session_id: Optional[str] = None,
+) -> bool:
+    """Write one live incarnation's complete canonical identity in a single
+    transaction, and mark it live.
+
+    Returns True when the row now carries exactly this tuple — whether this
+    call wrote it or an identical earlier call already had. Returns False
+    when the row is absent, or when it already carries a *different*
+    identity for the same generation.
+
+    Two properties the callers depend on:
+
+    Idempotent by ``(terminal_id, generation)``. Re-driving a registration
+    is how recovery works, so it has to be free: the second call observes
+    that every field already matches and writes nothing.
+
+    Never re-points. A row already registered to a different pane is left
+    exactly as it is and the call fails. Overwriting it would silently move
+    a handle from the pane somebody registered onto a pane they did not,
+    which is the aliasing that makes a stale row dangerous. A genuinely new
+    incarnation gets a new row with a fresh generation and points the old
+    one at it through :func:`supersede_terminal`.
+    """
+    if not (server_socket_path and session_id and window_id and pane_id) or pane_pid <= 0:
+        # Partial identity is refused outright rather than stored with the
+        # unreadable parts left NULL: a row published with three of five
+        # fields is a row some later check will pass against.
+        return False
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal is None:
+            return False
+        already = (
+            terminal.pane_id is not None
+            or terminal.window_id is not None
+            or terminal.session_id is not None
+        )
+        matches = (
+            terminal.pane_id == pane_id
+            and terminal.window_id == window_id
+            and terminal.session_id == session_id
+            and terminal.pane_pid == pane_pid
+            and terminal.server_socket_path == server_socket_path
+        )
+        if already and not matches:
+            logger.warning(
+                "Refusing to re-point terminal %s from pane %s to %s",
+                terminal_id,
+                terminal.pane_id,
+                pane_id,
+            )
+            return False
+        if generation is not None and terminal.generation not in (None, generation):
+            logger.warning(
+                "Refusing to register terminal %s under generation %s; row holds %s",
+                terminal_id,
+                generation,
+                terminal.generation,
+            )
+            return False
+        terminal.server_socket_path = server_socket_path
+        terminal.session_id = session_id
+        terminal.window_id = window_id
+        terminal.pane_id = pane_id
+        terminal.pane_pid = pane_pid
+        if generation is not None:
+            terminal.generation = generation
+        if native_session_id is not None:
+            terminal.native_session_id = native_session_id
+        terminal.lifecycle_state = "live"
+        terminal.lifecycle_reason = None
+        terminal.liveness_checked_at = datetime.now()
+        terminal.superseded_by_terminal_id = None
+        terminal.superseded_by_generation = None
+        db.commit()
+        return True
+
+
+def refresh_terminal_window_names(
+    terminal_id: str,
+    *,
+    tmux_session: str,
+    tmux_window: str,
+    pane_id: str,
+) -> bool:
+    """Update a terminal's mutable tmux labels to what its own pane reports.
+
+    Guarded on ``pane_id`` so this can only ever relabel the row whose
+    identity the caller has just verified. The labels are the only things
+    that change: a rename moves a window's name, not the window.
+
+    Callers must have proven the identity first. Without that proof this
+    would be indistinguishable from re-pointing a row at whatever currently
+    wears the name — the exact aliasing the identity boundary exists to
+    prevent — so the pane-id filter is the safety property, not an
+    optimisation.
+    """
+    if not pane_id:
+        return False
+    with SessionLocal() as db:
+        updated = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id == terminal_id, TerminalModel.pane_id == pane_id)
+            .update(
+                {"tmux_session": tmux_session, "tmux_window": tmux_window},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return updated == 1
+
+
+def record_terminal_lifecycle(
+    terminal_id: str,
+    *,
+    state: str,
+    reason: Optional[str] = None,
+    superseded_by_terminal_id: Optional[str] = None,
+    superseded_by_generation: Optional[str] = None,
+) -> bool:
+    """Record the outcome of one liveness observation against a terminal.
+
+    The row's *identity* is never touched here — only what was observed
+    about it. A demotion says "this identity no longer resolves to what was
+    registered"; it does not get to decide what the identity now is.
+    """
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal is None:
+            return False
+        terminal.lifecycle_state = state
+        terminal.lifecycle_reason = reason
+        terminal.liveness_checked_at = datetime.now()
+        terminal.superseded_by_terminal_id = superseded_by_terminal_id
+        terminal.superseded_by_generation = superseded_by_generation
+        db.commit()
+        return True
 
 
 def backfill_terminal_identity_if_missing(terminal_id: str, pane_id: str, window_id: str) -> bool:

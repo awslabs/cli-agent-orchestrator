@@ -282,6 +282,104 @@ class TestFinalizeNegative:
             v2.finalize_negative(str(uuid.uuid4()), _negative_request(record))
 
 
+class TestFinalizeNegativeFromBound:
+    """A launch that dies after binding but before admitting.
+
+    That row is bound, so the older rule refused to finalize it, and §C
+    forbids reusing its generation — leaving it neither finalizable nor
+    replaceable, which wedges the run for good. Bind-before-admit is what
+    makes the narrow exception provable: an admission journals its intent
+    before it touches the transport, so a bound row carrying no admission
+    has never reached the write path and no task byte can have crossed.
+
+    These tests set the durable row shape directly rather than driving a
+    real bind, because the property under test belongs to the recovery
+    verb's state machine, not to how the row got there.
+    """
+
+    def _bound(self, worktree, tmp_path, *, admission=None, state="bound"):
+        record = _reserve(worktree, tmp_path)
+        with database.SessionLocal() as db:
+            row = (
+                db.query(database.ManagedLaunchV2ReservationModel)
+                .filter(
+                    database.ManagedLaunchV2ReservationModel.reservation_id
+                    == record["reservation_id"]
+                )
+                .first()
+            )
+            row.state = state
+            row.binding_json = '{"schema":"cao-native-binding-v1","provider":"kimi_cli"}'
+            row.admission_json = admission
+            db.commit()
+        return record
+
+    def test_finalizes_a_bound_generation_with_no_admission(
+        self, isolated_memory_db, worktree, tmp_path
+    ):
+        record = self._bound(worktree, tmp_path)
+
+        out = v2.finalize_negative(record["reservation_id"], _negative_request(record))
+
+        assert out["state"] == "negative"
+        assert out["admission"]["task_bytes_submitted"] is False
+        # The finalization says which zero-byte state proved it, so an
+        # auditor need not infer whether the launch died before or after
+        # its binding.
+        assert out["admission"]["finalized_from_state"] == "bound"
+
+    def test_is_idempotent_from_bound(self, isolated_memory_db, worktree, tmp_path):
+        record = self._bound(worktree, tmp_path)
+        req = _negative_request(record)
+
+        first = v2.finalize_negative(record["reservation_id"], req)
+        again = v2.finalize_negative(record["reservation_id"], req)
+
+        assert again["admission"] == first["admission"]
+
+    def test_refuses_a_bound_row_that_carries_an_admission(
+        self, isolated_memory_db, worktree, tmp_path
+    ):
+        """The row reached the write path, so zero bytes cannot be claimed.
+
+        Asserted on the reason, not merely on the refusal: the write's own
+        compare-and-set would also reject this row, but only after the verb
+        had decided the finalization was lawful. The refusal has to be the
+        decision, so that what the caller is told is "submission was
+        attempted" rather than "a database write raced".
+        """
+        record = self._bound(
+            worktree,
+            tmp_path,
+            admission='{"schema":"cao-kimi-native-control-v1","state":"AMBIGUOUS"}',
+        )
+
+        with pytest.raises(ManagedLaunchConflict, match="carries an admission record"):
+            v2.finalize_negative(record["reservation_id"], _negative_request(record))
+
+    @pytest.mark.parametrize("state", ["admitting", "admitted"])
+    def test_refuses_every_admission_bearing_state(
+        self, isolated_memory_db, worktree, tmp_path, state
+    ):
+        record = self._bound(worktree, tmp_path, state=state)
+
+        with pytest.raises(ManagedLaunchConflict):
+            v2.finalize_negative(record["reservation_id"], _negative_request(record))
+
+    def test_a_refused_finalization_leaves_the_row_untouched(
+        self, isolated_memory_db, worktree, tmp_path
+    ):
+        """The refusal is not a partial write: the run stays recoverable."""
+        record = self._bound(worktree, tmp_path, state="admitted")
+
+        with pytest.raises(ManagedLaunchConflict):
+            v2.finalize_negative(record["reservation_id"], _negative_request(record))
+
+        after = v2.get(record["reservation_id"])
+        assert after["state"] == "admitted"
+        assert after["admission"] is None
+
+
 # --------------------------------------------------------------------
 # C. reconcile
 # --------------------------------------------------------------------

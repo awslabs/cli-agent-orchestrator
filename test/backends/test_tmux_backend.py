@@ -126,7 +126,18 @@ class TestTmuxBackendDelegation:
             enter_count=2,
             force_bracketed_paste=False,
             submit_delay=0.3,
+            pane_id=None,
         )
+
+    def test_send_keys_passes_a_verified_pane_id_through(self, backend, mock_client):
+        """A caller that supplies an exact pane must reach the client with it.
+
+        Dropping it here would be silent: the delegation would still
+        succeed and the write would still land — by name, at whatever
+        currently answers to it, which is what the caller declined.
+        """
+        backend.send_keys("cao-test", "window-0", "hello", pane_id="%263")
+        assert mock_client.send_keys.call_args.kwargs["pane_id"] == "%263"
 
     def test_send_special_key_delegates(self, backend, mock_client):
         backend.send_special_key("cao-test", "window-0", "C-c")

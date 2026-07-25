@@ -27,7 +27,7 @@ import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 from sqlalchemy.exc import OperationalError
 
@@ -48,6 +48,8 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     get_terminal_metadata_v2,
+    record_terminal_lifecycle,
+    refresh_terminal_window_names,
     update_last_active,
     update_terminal_shell_command,
 )
@@ -102,6 +104,184 @@ _deferred_init_tasks: set = set()
 
 class TerminalInputBlockedError(Exception):
     """Raised when orchestrated input would answer an active interactive prompt."""
+
+
+class TerminalIdentityMismatchError(TerminalInputBlockedError):
+    """The terminal's recorded pane no longer resolves to what was recorded.
+
+    Deliberately a subclass of the input-blocked error rather than a new
+    exception family: to every caller this is the same kind of answer —
+    "this terminal is not a lawful target right now, and nothing was
+    delivered" — and it inherits the refusal mapping the API boundary
+    already applies. Read paths raise it too, which reads oddly by name but
+    is the honest outcome: a read resolved by a stale name returns another
+    worker's screen, so refusing is the same decision as refusing a write.
+    """
+
+
+LIFECYCLE_LIVE = "live"
+LIFECYCLE_SUPERSEDED = "superseded"
+LIFECYCLE_DEAD = "dead"
+LIFECYCLE_UNKNOWN_LIVENESS = "unknown-liveness"
+
+
+class VerifiedPaneTarget(NamedTuple):
+    """One pane, proven at a single instant to still be the registered one.
+
+    ``pane_id`` is what a write targets: it is immutable, so nothing can
+    slip between the proof and the write. ``session_name``/``window_name``
+    are the names that pane answers to *now* — not the names recorded on
+    the row, which a rename or a later unrelated window may since have
+    taken. Read paths that can only address a name use these, so they read
+    the pane that was verified rather than whatever currently occupies the
+    recorded name.
+    """
+
+    pane_id: str
+    session_name: str
+    window_name: str
+
+
+def verified_pane_target(
+    terminal_id: str,
+    metadata: Dict[str, Any],
+    *,
+    operation: str,
+) -> Optional[VerifiedPaneTarget]:
+    """Prove the terminal's recorded pane is still the pane it registered.
+
+    Returns the verified target, or ``None`` when this row is outside the
+    identity boundary and the caller should keep resolving by name. Raises
+    :class:`TerminalIdentityMismatchError` when the row *is* inside the
+    boundary and the proof fails — before anything is written or read.
+
+    A row is inside the boundary when it records a pane id together with at
+    least one discriminator that a coincidence cannot supply: the owning
+    tmux server, or the pane's primary process id. Pane and window ids are
+    small integers that different tmux servers hand out independently, so
+    those two alone would let a pane on some other server answer for this
+    one. Rows predating identity persistence record neither discriminator;
+    they keep resolving by name exactly as before, which is the documented
+    boundary of this change rather than an oversight.
+
+    The check is read-only. It spends no provider turn, delivers no byte,
+    and its whole cost is one enumeration of the panes tmux already knows
+    about — so a refused operation costs nothing and a demotion is never
+    something the system did to a worker, only something it noticed.
+    """
+    recorded_pane = metadata.get("pane_id")
+    if not isinstance(recorded_pane, str) or not recorded_pane:
+        return None
+    recorded_socket = metadata.get("server_socket_path")
+    recorded_pid = metadata.get("pane_pid")
+    if not recorded_socket and not recorded_pid:
+        return None
+
+    backend = get_backend()
+    # ``is True`` rather than a truthiness test: a backend double answers
+    # every attribute with a stand-in object, and treating that as a
+    # declared capability would start enforcing a boundary against evidence
+    # the double never gathered.
+    if getattr(backend, "supports_pane_identity", False) is not True:
+        return None
+
+    observed = backend.observe_pane_identity(recorded_pane)
+    if not isinstance(observed, dict):
+        return None
+
+    outcome = observed.get("outcome")
+    if outcome == "absent":
+        # The server answered and the pane is not on it. That is evidence,
+        # and the row can say so.
+        _demote(terminal_id, LIFECYCLE_DEAD, f"pane {recorded_pane} is absent from its server")
+        raise TerminalIdentityMismatchError(
+            f"Terminal {terminal_id} cannot be used for {operation}: its recorded pane "
+            f"{recorded_pane} no longer exists. Nothing was delivered."
+        )
+    if outcome != "observed":
+        # Nothing was learned. The operation is refused all the same — an
+        # unverifiable target is not a lawful one — but the row is recorded
+        # as unknown rather than reaped, because "we could not look" is not
+        # evidence that the worker is gone.
+        _demote(
+            terminal_id,
+            LIFECYCLE_UNKNOWN_LIVENESS,
+            f"pane {recorded_pane} could not be observed",
+        )
+        raise TerminalIdentityMismatchError(
+            f"Terminal {terminal_id} cannot be used for {operation}: its recorded pane "
+            f"{recorded_pane} could not be observed. Nothing was delivered."
+        )
+
+    if observed.get("dead") == "1":
+        _demote(terminal_id, LIFECYCLE_DEAD, f"pane {recorded_pane} is dead")
+        raise TerminalIdentityMismatchError(
+            f"Terminal {terminal_id} cannot be used for {operation}: its pane "
+            f"{recorded_pane} is dead. Nothing was delivered."
+        )
+
+    mismatches = []
+    if recorded_socket and observed.get("server_socket_path") != recorded_socket:
+        mismatches.append(
+            f"tmux server {observed.get('server_socket_path')!r} != {recorded_socket!r}"
+        )
+    recorded_window = metadata.get("window_id")
+    if recorded_window and observed.get("window_id") != recorded_window:
+        mismatches.append(f"window {observed.get('window_id')!r} != {recorded_window!r}")
+    recorded_session_id = metadata.get("session_id")
+    if recorded_session_id and observed.get("session_id") != recorded_session_id:
+        mismatches.append(f"session {observed.get('session_id')!r} != {recorded_session_id!r}")
+    if recorded_pid and str(observed.get("pane_pid")) != str(recorded_pid):
+        mismatches.append(f"pane process {observed.get('pane_pid')!r} != {recorded_pid!r}")
+
+    if mismatches:
+        detail = "; ".join(mismatches)
+        _demote(terminal_id, LIFECYCLE_SUPERSEDED, detail)
+        raise TerminalIdentityMismatchError(
+            f"Terminal {terminal_id} cannot be used for {operation}: the pane at "
+            f"{recorded_pane} is a different incarnation ({detail}). Nothing was delivered."
+        )
+
+    # Names are read from the observation, never from the row. A worker
+    # that renamed its own window is still the right worker — a name is a
+    # label, and demoting on one would reap live terminals for relabelling
+    # themselves.
+    session_name = observed.get("session_name") or metadata["tmux_session"]
+    window_name = observed.get("window_name") or metadata["tmux_window"]
+    _note_live(terminal_id)
+    if session_name != metadata["tmux_session"] or window_name != metadata["tmux_window"]:
+        # Refresh the row's cached labels to the ones the *proven* pane now
+        # answers to. This is not re-pointing: the identity — server, pane,
+        # window, session, pid — was just verified unchanged, and only the
+        # mutable labels moved. Leaving them stale would keep every
+        # name-addressed reader (status detection, history capture, the
+        # dashboard) pointed at a name this pane no longer has.
+        try:
+            refresh_terminal_window_names(
+                terminal_id,
+                tmux_session=session_name,
+                tmux_window=window_name,
+                pane_id=recorded_pane,
+            )
+        except Exception as exc:  # pragma: no cover - a stale label is not fatal
+            logger.warning("Could not refresh window labels for %s: %s", terminal_id, exc)
+    return VerifiedPaneTarget(recorded_pane, session_name, window_name)
+
+
+def _demote(terminal_id: str, state: str, reason: str) -> None:
+    """Record an observed demotion, never letting the bookkeeping decide the
+    outcome: if the row cannot be updated the caller still refuses."""
+    try:
+        record_terminal_lifecycle(terminal_id, state=state, reason=reason)
+    except Exception as exc:  # pragma: no cover - bookkeeping must not mask the refusal
+        logger.warning("Could not record %s lifecycle for %s: %s", state, terminal_id, exc)
+
+
+def _note_live(terminal_id: str) -> None:
+    try:
+        record_terminal_lifecycle(terminal_id, state=LIFECYCLE_LIVE)
+    except Exception as exc:  # pragma: no cover - see _demote
+        logger.debug("Could not record live lifecycle for %s: %s", terminal_id, exc)
 
 
 class TerminalGenerationMismatchError(ValueError):
@@ -1648,9 +1828,10 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        working_dir = get_backend().get_pane_working_directory(
-            metadata["tmux_session"], metadata["tmux_window"]
-        )
+        verified = verified_pane_target(terminal_id, metadata, operation="working-directory")
+        session_name = verified.session_name if verified else metadata["tmux_session"]
+        window_name = verified.window_name if verified else metadata["tmux_window"]
+        working_dir = get_backend().get_pane_working_directory(session_name, window_name)
         return working_dir
 
     except Exception as e:
@@ -1687,6 +1868,12 @@ def send_input(
         metadata = _get_terminal_metadata_any(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        # Prove the recorded pane is still the registered one before any of
+        # the work below — the status arming and buffer clear mutate state,
+        # and doing them for a write that is about to be refused would leave
+        # the wrong terminal's detection disturbed.
+        verified = verified_pane_target(terminal_id, metadata, operation="send-input")
 
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = (
@@ -1754,13 +1941,20 @@ def send_input(
         # latch-block the IDLE→PROCESSING transition for the whole turn.
         status_monitor.clear_rolling_buffer(terminal_id)
 
+        # Target the verified pane id, not the recorded names. The proof
+        # above and the write below are then about the same pane with no
+        # name resolution in between for a later window to answer.
+        send_kwargs: Dict[str, Any] = {}
+        if verified is not None:
+            send_kwargs["pane_id"] = verified.pane_id
         get_backend().send_keys(
-            metadata["tmux_session"],
-            metadata["tmux_window"],
+            verified.session_name if verified else metadata["tmux_session"],
+            verified.window_name if verified else metadata["tmux_window"],
             message,
             enter_count=enter_count,
             force_bracketed_paste=True,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
+            **send_kwargs,
         )
 
         # Notify the provider that external input was received.
@@ -1911,13 +2105,19 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        # Every history capture below reads the names the verified pane
+        # answers to now. Reading the recorded names instead would return a
+        # later, unrelated window's screen as this terminal's output — the
+        # same misdelivery as a write, just in the other direction.
+        verified = verified_pane_target(terminal_id, metadata, operation="get-output")
+        capture_session = verified.session_name if verified else metadata["tmux_session"]
+        capture_window = verified.window_name if verified else metadata["tmux_window"]
+
         # Get output from StatusMonitor buffer (instant, no tmux call)
         full_output = status_monitor.get_buffer(terminal_id)
         if not full_output:
             # Fallback to backend history only if buffer not available (edge case)
-            full_output = get_backend().get_history(
-                metadata["tmux_session"], metadata["tmux_window"]
-            )
+            full_output = get_backend().get_history(capture_session, capture_window)
 
         if mode == OutputMode.FULL:
             return full_output
@@ -1931,8 +2131,8 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             fixed_extract_lines = getattr(provider, "extraction_tail_lines", None)
             if fixed_extract_lines is not None:
                 full_output = get_backend().get_history(
-                    metadata["tmux_session"],
-                    metadata["tmux_window"],
+                    capture_session,
+                    capture_window,
                     tail_lines=fixed_extract_lines,
                 )
                 retries = provider.extraction_retries
@@ -1942,8 +2142,8 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                         if attempt > 0:
                             time.sleep(10.0)
                             full_output = get_backend().get_history(
-                                metadata["tmux_session"],
-                                metadata["tmux_window"],
+                                capture_session,
+                                capture_window,
                                 tail_lines=fixed_extract_lines,
                             )
                         return provider.extract_last_message_from_script(full_output)
@@ -1964,8 +2164,8 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             full_output = ""
             for step_lines in _ESCALATION_STEPS:
                 full_output = get_backend().get_history(
-                    metadata["tmux_session"],
-                    metadata["tmux_window"],
+                    capture_session,
+                    capture_window,
                     tail_lines=step_lines,
                 )
                 try:

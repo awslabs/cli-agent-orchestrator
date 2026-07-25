@@ -409,6 +409,7 @@ class HerdrBackend(TerminalBackend):
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        pane_id: Optional[str] = None,
     ) -> None:
         """Send text to a pane via herdr pane send-text + send-keys Enter.
 
@@ -420,7 +421,18 @@ class HerdrBackend(TerminalBackend):
         ``submit_delay`` is accepted for parity with the backend interface; herdr
         governs its own post-paste timing below (the generous 2s bracketed wait
         already covers Claude Code's Ink renderer), so the value is not used here.
+
+        ``pane_id`` names a tmux pane, which this backend does not address —
+        its panes are herdr's, resolved from the terminal id below. A caller
+        supplying one is asking for a guarantee this backend cannot give, so
+        it is refused rather than dropped: quietly ignoring it would deliver
+        by name to a caller who had specifically declined name resolution.
         """
+        if pane_id is not None:
+            raise TerminalBackendError(
+                "herdr backend cannot target a tmux pane id; "
+                "refusing to fall back to name resolution"
+            )
         # Resolve pane_id from terminal_id stored in DB metadata
         # The window_name is used as a lookup key in CAO's DB → terminal_id mapping
         # For herdr, we need the terminal_id. The service layer passes session:window

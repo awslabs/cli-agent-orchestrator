@@ -153,6 +153,44 @@ class TerminalBackend(ABC):
         the live pane is still bound to ``terminal_id``."""
         return None
 
+    @property
+    def supports_pane_identity(self) -> bool:
+        """Whether this backend can observe a pane's live identity and target
+        a write at an immutable pane id.
+
+        Default ``False``. Callers that enforce the identity boundary must
+        test it with ``is True`` rather than for truthiness: a backend double
+        that answers every attribute with a stand-in object would otherwise
+        appear to declare a capability it does not have, and the boundary
+        would start refusing writes on evidence nobody actually gathered.
+        Declaring the capability is a positive act.
+        """
+        return False
+
+    def observe_pane_identity(self, pane_id: str) -> Optional[Dict[str, str]]:
+        """The live facts of exactly ``pane_id``.
+
+        Always carries ``outcome``, which is the part callers must branch
+        on, because "the pane is gone" and "we could not look" are
+        different facts and only one of them is evidence:
+
+        ``observed``   the pane exists; the record also carries
+                       ``pane_id``, ``window_id``, ``session_id``,
+                       ``pane_pid``, ``session_name``, ``window_name`` and
+                       ``dead``, plus ``server_socket_path`` when the
+                       owning server can be proven (absent, never null,
+                       when it cannot).
+        ``absent``     the server answered and this pane is not on it. The
+                       pane is provably gone.
+        ``unreadable`` the server could not be read, or the pane id matched
+                       more than once. Nothing was learned, so nothing may
+                       be concluded — in particular this is not a licence
+                       to reap the row or to fall back to a name.
+
+        ``None`` means the backend does not implement the probe at all.
+        """
+        return None
+
     def create_window_with_argv(
         self,
         session_name: str,
@@ -181,6 +219,7 @@ class TerminalBackend(ABC):
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        pane_id: Optional[str] = None,
     ) -> None:
         """Send text input to a window.
 
@@ -193,6 +232,13 @@ class TerminalBackend(ABC):
             submit_delay: Seconds to wait after pasting before sending Enter, so
                 a TUI (e.g. Claude Code's Ink renderer) finishes processing the
                 paste before submission. Backends without a paste step may ignore.
+            pane_id: Immutable pane id the caller has already verified. When
+                supplied it is the target, and the two names are diagnostic
+                only. A backend that cannot address a pane id must raise
+                rather than fall back to the names: the caller passed an id
+                precisely because it does not accept a name-resolved target,
+                and a silent downgrade would reinstate the delivery it asked
+                to rule out.
         """
         ...
 

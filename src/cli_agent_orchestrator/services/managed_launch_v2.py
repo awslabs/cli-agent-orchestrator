@@ -670,7 +670,22 @@ def _mark_launch_failed_bridge(
 # generation is finalized and replaced, never reused.
 # ---------------------------------------------------------------------------
 
-_NEGATIVE_FINALIZABLE_STATES = frozenset({"preflight_blocked", "negative"})
+# States a zero-byte finalization may be claimed from.
+#
+# ``preflight_blocked`` never reached a binding at all.  ``bound`` is
+# admitted here on a narrower condition, enforced below: only while the row
+# carries no durable admission record.  The bind-before-admit seam is what
+# makes that safe — an admission journals its intent before it touches the
+# transport, so a bound row with no admission has provably never reached the
+# write path and no task byte can have crossed.  Without this a launch that
+# died between bind and admit was unfinalizable: it could not be finalized
+# negative, and it could not be replaced either, because §C forbids reusing
+# its generation.  The generation stayed live forever and wedged the run.
+#
+# ``admitting`` and ``admitted`` are never finalizable, and neither is a
+# bound row that does carry an admission: for those, "never submitted" is
+# exactly the claim that cannot be proven.
+_NEGATIVE_FINALIZABLE_STATES = frozenset({"preflight_blocked", "bound", "negative"})
 
 
 def _assert_recovery_identity(row: Any, *, terminal_id: str, generation: str) -> None:
@@ -685,12 +700,22 @@ def _assert_recovery_identity(row: Any, *, terminal_id: str, generation: str) ->
 def finalize_negative(
     reservation_id: str, request: ManagedLaunchV2NegativeRequest
 ) -> dict[str, Any]:
-    """Finalize a proven zero-byte preflight failure: ``preflight_blocked`` → ``negative``.
+    """Finalize a proven zero-byte failure → ``negative``.
 
-    Idempotent by construction: the transition is valid only from
-    ``preflight_blocked``, a no-op from ``negative``, and refused from any
-    live state (a bound/admitting/admitted generation may have crossed task
-    bytes, so a "never submitted" finalization would be a lie).  The first
+    Two states can prove it.  ``preflight_blocked`` never reached a binding.
+    ``bound`` proves it too, but only while the row carries no admission
+    record: bind-before-admit means an admission journals its intent before
+    it touches the transport, so a bound row without one has never reached
+    the write path.  That case is not hypothetical — a launch that dies
+    between bind and admit lands there, and before this it was unfinalizable
+    *and* unreplaceable, because §C forbids reusing the generation.
+
+    Everything else is refused, and refused for the same reason: for
+    ``admitting``, ``admitted``, or a bound row that does carry an
+    admission, "never submitted" is precisely the claim that cannot be
+    proven, and asserting it would be a lie about spend.
+
+    Idempotent by construction: a no-op from ``negative``, and the first
     finalization wins — a later call with a different ``finalize_id`` is an
     idempotent success that does not rewrite the recorded finalization.
 
@@ -712,14 +737,26 @@ def finalize_negative(
                 )
             if row.state not in _NEGATIVE_FINALIZABLE_STATES:
                 raise ManagedLaunchConflict(
-                    f"zero-byte finalization requires state 'preflight_blocked', "
-                    f"not {row.state!r}"
+                    f"zero-byte finalization requires state 'preflight_blocked' or a "
+                    f"'bound' row with no admission, not {row.state!r}"
+                )
+            if row.state == "bound" and row.admission_json is not None:
+                # The row reached the write path. Whether a byte actually
+                # landed is exactly what an admission record exists to say,
+                # and it is not this verb's to decide: finalizing here would
+                # be asserting "never submitted" over the top of evidence
+                # that submission was attempted.
+                raise ManagedLaunchConflict(
+                    "zero-byte finalization refused: the bound reservation carries an "
+                    "admission record, so no-bytes-submitted cannot be proven — "
+                    "reconcile the admission instead"
                 )
             if row.state == "negative":
                 # Already finalized: return the durable record unchanged so
                 # a re-driven recovery converges instead of double-writing.
                 return _row_dict(row)
             redacted_reason, _fired = secret_gate.redact_secrets(request.reason or "")
+            claimed_state = row.state
             negative = {
                 "schema": "cao-managed-launch-v2-negative-v1",
                 "finalize_id": request.finalize_id,
@@ -728,21 +765,34 @@ def finalize_negative(
                 "obligation_generation": row.obligation_generation,
                 "reason": redacted_reason,
                 "task_bytes_submitted": False,
+                # Which zero-byte state this was claimed from. A reader
+                # auditing the finalization should not have to infer whether
+                # the launch died before its binding or after it.
+                "finalized_from_state": claimed_state,
                 "finalized_at": _now(),
             }
-            # A blocked generation never wrote a binding or admission, so
-            # both columns must still be NULL: the CAS proves nothing raced
-            # this finalization into a live state between the read and write.
+            # The CAS re-states, as a write condition, exactly the property
+            # that was just proven by reading — so nothing can race the row
+            # into a live state between the two.  ``admission_json`` must
+            # still be NULL in both cases: that column is what a crossing
+            # admission would have written, and its absence at write time is
+            # the whole proof that no task byte was submitted.  The binding
+            # column differs by state: a blocked generation never wrote one,
+            # while a bound one is expected to carry it.
+            filters = [
+                database.ManagedLaunchV2ReservationModel.reservation_id == reservation_id,
+                database.ManagedLaunchV2ReservationModel.terminal_id == row.terminal_id,
+                database.ManagedLaunchV2ReservationModel.generation == row.generation,
+                database.ManagedLaunchV2ReservationModel.state == claimed_state,
+                database.ManagedLaunchV2ReservationModel.admission_json.is_(None),
+            ]
+            if claimed_state == "preflight_blocked":
+                filters.append(database.ManagedLaunchV2ReservationModel.binding_json.is_(None))
+            else:
+                filters.append(database.ManagedLaunchV2ReservationModel.binding_json.isnot(None))
             updated = (
                 db.query(database.ManagedLaunchV2ReservationModel)
-                .filter(
-                    database.ManagedLaunchV2ReservationModel.reservation_id == reservation_id,
-                    database.ManagedLaunchV2ReservationModel.terminal_id == row.terminal_id,
-                    database.ManagedLaunchV2ReservationModel.generation == row.generation,
-                    database.ManagedLaunchV2ReservationModel.state == "preflight_blocked",
-                    database.ManagedLaunchV2ReservationModel.admission_json.is_(None),
-                    database.ManagedLaunchV2ReservationModel.binding_json.is_(None),
-                )
+                .filter(*filters)
                 .update(
                     {
                         "state": "negative",
@@ -755,7 +805,7 @@ def finalize_negative(
             db.commit()
             if updated != 1:
                 raise ManagedLaunchConflict(
-                    "v2 zero-byte finalization lost the exact preflight_blocked CAS"
+                    f"v2 zero-byte finalization lost the exact {claimed_state} CAS"
                 )
             return _row_dict(_query(db, reservation_id))
     except ManagedLaunchError:
