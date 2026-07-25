@@ -470,16 +470,26 @@ class ClaudeCodeProvider(BaseProvider):
 
             settings["skipDangerousModePermissionPrompt"] = True
             settings_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = settings_path.with_suffix(".json.tmp")
-            # Preserve the existing file's mode (or default to 0600 for a
-            # freshly-created settings file, since it may carry `env`/
-            # `apiKeyHelper` secrets) -- the tmp file would otherwise pick up
-            # the process umask (typically 0644) and os.replace would make
-            # the target adopt that on every launch that toggles this flag.
-            with open(tmp_path, "w") as f:
-                json.dump(settings, f, indent=2)
-            os.chmod(tmp_path, existing_mode if existing_mode is not None else 0o600)
-            os.replace(tmp_path, settings_path)
+            # PID-suffixed so a stale tmp file from a prior crashed process
+            # can never collide with -- or be clobbered by -- this write.
+            tmp_path = settings_path.with_suffix(f".json.tmp.{os.getpid()}")
+            try:
+                # Preserve the existing file's mode (or default to 0600 for a
+                # freshly-created settings file, since it may carry `env`/
+                # `apiKeyHelper` secrets) -- the tmp file would otherwise pick
+                # up the process umask (typically 0644) and os.replace would
+                # make the target adopt that on every launch that toggles
+                # this flag.
+                with open(tmp_path, "w") as f:
+                    json.dump(settings, f, indent=2)
+                os.chmod(tmp_path, existing_mode if existing_mode is not None else 0o600)
+                os.replace(tmp_path, settings_path)
+            except BaseException:
+                # An exception between tmp-file creation and the replace
+                # (e.g. a chmod/disk-full failure) would otherwise orphan
+                # the tmp file indefinitely.
+                tmp_path.unlink(missing_ok=True)
+                raise
         logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
 
     async def _handle_startup_prompts(
@@ -514,27 +524,12 @@ class ClaudeCodeProvider(BaseProvider):
         any prompt has been observed, only ``outer_timeout`` can end the loop;
         the idle-gap clock starts only once a prompt has actually been handled.
 
-        harness-control#215: this method is awaited directly from initialize(),
-        which itself runs on cao-server's single asyncio event loop (uvicorn is
-        started with no ``workers=``, so there is exactly one). Every
-        tmux-backed call here (``get_history``/``send_keys``/``send_special_key``)
-        is a blocking subprocess exec, and every sleep used to be a plain
-        ``time.sleep`` — which blocks the WHOLE OS thread, not just this
-        coroutine. Under N concurrent ``POST /sessions`` calls, that froze
-        every other in-flight request (including other terminals' own
-        wait_for_shell/initialize/wait_until_status, and unrelated endpoints
-        like GET /health) for as long as this loop ran, turning N-way-concurrent
-        session creation into a fully serial queue whose wall-clock length
-        scaled with N — live-reproduced: 18 concurrent creates against this
-        exact method clustered at ~56.5s each (vs. ~18-35s at N=6-12, ~18s at
-        N=1), converging on CAO's own 60s provider_init_timeout purely from
-        this self-inflicted queueing, not from Claude Code itself being slow
-        (a plain, CAO-uninvolved `claude --remote-control` launch reached its
-        own equivalent trust-dialog prompt in low single-digit seconds under
-        the identical real host load). All blocking calls are now offloaded to
-        a worker thread via asyncio.to_thread and all sleeps are
-        asyncio.sleep, so this coroutine yields the event loop instead of
-        freezing it.
+        This method is awaited directly from initialize(), which runs on
+        cao-server's single asyncio event loop. Every tmux-backed call here
+        is offloaded via ``asyncio.to_thread`` and every sleep is
+        ``asyncio.sleep`` (see #451): a blocking ``time.sleep``/subprocess
+        exec here would freeze the WHOLE OS thread, serializing every other
+        in-flight request for as long as this loop ran.
 
         Args:
             idle_gap: Seconds of no-new-prompt quiet that ends the loop. Defaults
@@ -640,10 +635,12 @@ class ClaudeCodeProvider(BaseProvider):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Prevent bypass permissions dialog from appearing (settings-based fix).
-        # harness-control#215 self-ROAST finding: this does blocking file I/O
-        # (~/.claude/settings.json read+write) directly on the event loop this
-        # coroutine runs on -- small in practice, but offloaded for the same
-        # reason as the calls below, so nothing in initialize() blocks the loop.
+        # This does blocking file I/O (~/.claude/settings.json read+write)
+        # directly on the event loop this coroutine runs on -- small in
+        # practice, but offloaded for the same reason as the calls below (#451).
+        # Not exhaustive: wait_for_shell's own backend polling, _load_profile(),
+        # and _build_claude_command's temp-file I/O above/below are still
+        # loop-side -- tens of ms each, not the multi-second pileup #451 fixes.
         await asyncio.to_thread(self._ensure_skip_bypass_prompt_setting)
 
         # Build properly escaped command string
@@ -651,10 +648,10 @@ class ClaudeCodeProvider(BaseProvider):
 
         # Send Claude Code command using the backend. Arm the StatusMonitor
         # stickiness gate so the launching command can drive a fresh
-        # PROCESSING transition past any stale ready latch.
-        # harness-control#215: offloaded to a thread (see _handle_startup_prompts'
-        # own docstring) so this single subprocess exec can't add to the
-        # same event-loop-blocking pileup under concurrent session creation.
+        # PROCESSING transition past any stale ready latch. Offloaded to a
+        # thread (see _handle_startup_prompts' own docstring, #451) so this
+        # single subprocess exec can't add to the same event-loop-blocking
+        # pileup under concurrent session creation.
         status_monitor.notify_input_sent(self.terminal_id)
         await asyncio.to_thread(
             get_backend().send_keys, self.session_name, self.window_name, command

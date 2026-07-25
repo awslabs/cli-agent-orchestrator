@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shlex
 import stat
 import threading
@@ -2015,7 +2016,7 @@ class TestClaudeCodeProviderSettings:
         for key, value in seed.items():
             assert result[key] == value
         assert result["skipDangerousModePermissionPrompt"] is True
-        assert not settings_file.with_suffix(".json.tmp").exists()
+        assert list(settings_file.parent.glob("*.json.tmp.*")) == []
 
     def test_ensure_skip_bypass_prompt_uses_atomic_replace(self, tmp_path):
         """Pin the atomic-write mechanics: os.replace must be the mechanism
@@ -2040,7 +2041,9 @@ class TestClaudeCodeProviderSettings:
 
         mock_replace.assert_called_once()
         tmp_arg = mock_replace.call_args[0][0]
-        assert str(tmp_arg).endswith(".json.tmp")
+        # PID-suffixed (e.g. "settings.json.tmp.12345") so a stale tmp file
+        # from a prior crashed process can never collide with this write.
+        assert re.search(r"\.json\.tmp\.\d+$", str(tmp_arg))
 
 
 class TestClaudeCodeMcpCallNotCompleted:

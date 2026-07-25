@@ -53,8 +53,9 @@ class TestHandleStartupPromptsBranches:
     """Test _handle_startup_prompts branches."""
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    async def test_bypass_permissions_prompt(self, mock_backend, provider):
+    async def test_bypass_permissions_prompt(self, mock_backend, mock_sleep, provider):
         """Detects bypass permissions prompt and sends Down arrow + Enter via backend."""
         mock_backend.get_history.return_value = (
             "⚠ Bypass Permissions mode\n" "1. No, exit\n" "2. Yes, I accept\n"
@@ -106,16 +107,18 @@ class TestHandleStartupPromptsBranches:
         )
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    async def test_welcome_banner_detected_early_return(self, mock_backend, provider):
+    async def test_welcome_banner_detected_early_return(self, mock_backend, mock_sleep, provider):
         """When welcome banner is visible, returns immediately."""
         mock_backend.get_history.return_value = "Welcome to Claude Code v2.5.0"
 
         await provider._handle_startup_prompts(idle_gap=1.0)
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep")
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    async def test_trust_prompt_detected(self, mock_backend, provider):
+    async def test_trust_prompt_detected(self, mock_backend, mock_sleep, provider):
         """Trust prompt sends Enter to accept via backend send_special_key."""
         mock_backend.get_history.return_value = (
             "Do you trust the files in this folder?\n" "❯ Yes, I trust this folder"
