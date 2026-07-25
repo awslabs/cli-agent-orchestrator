@@ -24,6 +24,7 @@ import pytest
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import kimi_native_control as knc
 from cli_agent_orchestrator.services import native_attachment as na
+from cli_agent_orchestrator.services.canonical_json import canonical_sha256
 
 SESSION = "session_9f21ac30"
 TERMINAL = "terminal_4d7b"
@@ -54,6 +55,9 @@ class Recorder:
 
     def send_enter(self) -> None:
         self.calls.append("enter")
+
+    def send_key(self, keystroke: str) -> None:
+        self.calls.append(f"key:{keystroke}")
 
 
 class FailsOnLiteral(Recorder):
@@ -136,6 +140,7 @@ def _queue(
     execution_mode: str = em.NATIVE_TUI,
     text: str = "please also update the changelog",
     observation: dict | None = None,
+    provider_version: str | None = None,
 ) -> dict:
     return knc.queue(
         operation_id=operation_id,
@@ -146,6 +151,7 @@ def _queue(
         text=text,
         observation=_idle() if observation is None else observation,
         transport=transport,
+        provider_version=provider_version,
     )
 
 
@@ -156,6 +162,7 @@ def _steer(
     turn_id: str = "turn_a1",
     text: str = "stop and summarize what you have",
     observation: dict | None = None,
+    provider_version: str | None = None,
 ) -> dict:
     return knc.steer(
         operation_id=operation_id,
@@ -167,6 +174,7 @@ def _steer(
         text=text,
         observation=_busy() if observation is None else observation,
         transport=transport,
+        provider_version=provider_version,
     )
 
 
@@ -552,10 +560,9 @@ def test_an_unclaimed_session_accepts_no_control_input():
     [
         "\x1b[200~pasted\x1b[201~",  # bracketed-paste sentinels
         "\x1b[A",  # a cursor key, which would move the composer
-        "two\nlines",  # would submit early and strand the remainder
         "carriage\rreturn",
     ],
-    ids=["bracketed-paste", "cursor-key", "newline", "carriage-return"],
+    ids=["bracketed-paste", "cursor-key", "carriage-return"],
 )
 def test_artifact_bearing_payloads_are_refused_not_sanitized(payload):
     """Refusing beats stripping: stripping changes the message silently."""
@@ -581,7 +588,7 @@ def test_a_steer_payload_is_held_to_the_same_rule():
     transport = Recorder()
 
     with pytest.raises(knc.NativeControlInvalid):
-        _steer(transport, text="interrupt\nand stop")
+        _steer(transport, text="interrupt\rand stop")
 
     assert transport.calls == []
 
@@ -641,7 +648,7 @@ def test_a_failure_writing_the_payload_is_ambiguous_not_failed():
     assert record["posted"] is False
     assert record["provider_accepted"] is False
     assert record["is_resolved"] is False
-    assert "writing the payload" in record["ambiguity_reason"]
+    assert "typing line 1 of 1" in record["ambiguity_reason"]
 
 
 def test_a_failure_at_the_enter_boundary_is_its_own_ambiguity():
@@ -1000,7 +1007,7 @@ def test_the_record_keeps_transport_and_provider_truth_in_separate_fields():
     }
     # Posted is a transport fact and carries transport evidence; the
     # provider fields are still empty because nothing was observed.
-    assert record["transport"]["literal_sha256"]
+    assert record["transport"]["payload_sha256"]
     assert record["observation"] is None
 
 
@@ -1151,3 +1158,273 @@ def test_an_unreadable_attachment_store_is_not_read_as_ownership(monkeypatch):
         _queue(transport)
 
     assert transport.calls == []
+
+
+# --------------------------------------------------------------------------
+# Content-lossless multi-line delivery
+#
+# The defect these cover: an ordinary task file ends with a newline, and
+# a rule that refused every newline refused every ordinary task. The fix
+# has to deliver newlines as *content* without ever letting one of them
+# do the submitting.
+# --------------------------------------------------------------------------
+
+PINNED = "0.29.0"
+
+
+def test_an_ordinary_newline_terminated_task_is_delivered_not_refused():
+    """The reproduced defect: a trailing newline is the submit, not content."""
+    _attach()
+    transport = Recorder()
+
+    record = _queue(transport, text="review the diff and report\n", provider_version=PINNED)
+
+    assert record["state"] == knc.POSTED
+    # The terminator became the Enter; it was never typed as a character.
+    assert transport.calls == ["literal:review the diff and report", "key:End", "enter"]
+    assert record["transport"]["encoding"] == knc.ENCODING_SINGLE_LINE
+    assert record["transport"]["line_count"] == 1
+
+
+def test_embedded_and_blank_lines_arrive_as_content_in_exactly_one_turn():
+    _attach()
+    transport = Recorder()
+
+    record = _queue(
+        transport,
+        text="first line\n\nthird line\n",
+        provider_version=PINNED,
+    )
+
+    assert record["state"] == knc.POSTED
+    # The blank middle line is a break with nothing typed after it, and
+    # every break is a composer key -- so one Enter, one turn.
+    assert transport.calls == [
+        "literal:first line",
+        "key:C-j",
+        "key:C-j",
+        "literal:third line",
+        "key:End",
+        "enter",
+    ]
+    assert transport.calls.count("enter") == 1
+    assert record["transport"]["enter_count"] == 1
+    assert record["transport"]["encoding"] == knc.ENCODING_SOFT_NEWLINE
+    assert record["transport"]["line_count"] == 3
+
+
+def test_the_final_enter_is_never_typed_as_a_newline_character():
+    """No literal write may contain CR or LF, whatever the payload holds."""
+    _attach()
+    transport = Recorder()
+
+    _queue(transport, text="alpha\nbeta\ngamma\n", provider_version=PINNED)
+
+    for call in transport.calls:
+        if call.startswith("literal:"):
+            assert "\n" not in call and "\r" not in call
+
+
+def test_digests_are_computed_over_the_original_bytes_not_the_encoding():
+    """Encoding must never redefine what the caller asked to send."""
+    _attach()
+    original = "line one\nline two\n"
+
+    record = _queue(Recorder(), text=original, provider_version=PINNED)
+
+    assert record["payload_sha256"] == canonical_sha256(original)
+    assert record["transport"]["payload_sha256"] == canonical_sha256(original)
+    # The composer image is the content without the submitting terminator.
+    assert record["transport"]["composer_sha256"] == canonical_sha256("line one\nline two")
+
+
+def test_the_keystroke_plan_is_journaled_before_any_composer_io():
+    _attach()
+    transport = FailsOnLiteral()
+
+    record = _queue(transport, text="a\nb\n", provider_version=PINNED)
+
+    # Nothing was typed, yet the plan that was about to run is durable.
+    plan = knc.get("op_queue_1")["intent"]["keystroke_plan"]
+    assert plan["schema"] == knc.KEYSTROKE_PLAN_SCHEMA
+    assert plan["encoding"] == knc.ENCODING_SOFT_NEWLINE
+    assert plan["line_count"] == 2
+    assert plan["plan_sha256"]
+    # The plan records shape and digests, never a second copy of the text.
+    assert "lines" not in plan
+    assert record["state"] == knc.AMBIGUOUS
+
+
+def test_model_input_is_recorded_as_the_provider_normalized_image():
+    """Say what the model got, not what we wish it got."""
+    _attach()
+
+    exact = _queue(Recorder(), text="body\n", provider_version=PINNED)
+    assert exact["transport"]["model_input_is_composer_exact"] is True
+    assert exact["transport"]["provider_normalization"] == knc.NORMALIZATION_JOIN_LF_THEN_TRIM
+
+    # A blank final line survives into the composer but the provider trims
+    # it on submit. The receipt says so rather than claiming exactness.
+    trimmed = _queue(
+        Recorder(),
+        operation_id="op_queue_trim",
+        text="body\n\n",
+        provider_version=PINNED,
+    )
+    assert trimmed["transport"]["model_input_is_composer_exact"] is False
+    assert trimmed["transport"]["composer_sha256"] == canonical_sha256("body\n")
+    assert trimmed["transport"]["model_input_sha256"] == canonical_sha256("body")
+
+
+def test_interior_bytes_are_exact_even_when_the_edges_are_trimmed():
+    _attach()
+
+    record = _queue(
+        Recorder(),
+        text="  keep\n\ninterior\n",
+        provider_version=PINNED,
+    )
+
+    # Leading spaces go; everything between the edges is untouched.
+    assert record["transport"]["model_input_sha256"] == canonical_sha256("keep\n\ninterior")
+
+
+def test_nel_is_not_trimmed_by_the_provider_and_is_not_treated_as_whitespace():
+    """U+0085 is a line terminator in other standards but not in ECMAScript.
+
+    Folding it in by analogy would understate the model's input by a
+    character, so the normalization must leave it alone.
+    """
+    _attach()
+
+    record = _queue(Recorder(), text="\x85body\x85\n", provider_version=PINNED)
+
+    assert record["transport"]["model_input_sha256"] == canonical_sha256("\x85body\x85")
+    assert record["transport"]["model_input_is_composer_exact"] is True
+
+
+def test_the_paste_burst_window_is_cleared_before_the_submitting_enter():
+    """Enter inside the provider's paste-burst window inserts a newline.
+
+    Without clearing it the task is silently never submitted: no error,
+    no turn, the message left sitting in the composer.
+    """
+    _attach()
+    transport = Recorder()
+
+    _queue(transport, text="anything\n", provider_version=PINNED)
+
+    assert transport.calls[-2:] == ["key:End", "enter"]
+
+
+# --------------------------------------------------------------------------
+# No proven mechanism: a durable, typed, zero-byte refusal
+# --------------------------------------------------------------------------
+
+
+def test_an_unprovable_multiline_payload_is_a_durable_refusal_not_a_raise():
+    """A well-formed payload an installed build cannot take is operational.
+
+    It is a fact about the provider, not caller fiction, so it has to be
+    findable afterwards -- otherwise a lost response leaves the caller
+    unable to tell "refused, nothing sent" from "maybe sent".
+    """
+    _attach()
+    transport = Recorder()
+
+    record = _queue(transport, text="a\nb\n", provider_version="99.99.99")
+
+    assert record["state"] == knc.REFUSED
+    assert record["refusal_reason"] == knc.REFUSED_UNPROVEN_COMPOSER_NEWLINE
+    assert record["is_resolved"] is True
+    assert transport.calls == []
+    assert record["posted"] is False
+
+
+def test_a_lost_response_finds_the_refusal_by_exact_id_without_retyping():
+    _attach()
+    transport = Recorder()
+
+    _queue(transport, text="a\nb\n", provider_version="99.99.99")
+
+    # The caller never saw the response; it asks by the id it minted.
+    found = knc.get("op_queue_1")
+    assert found["state"] == knc.REFUSED
+    assert found["refusal_reason"] == knc.REFUSED_UNPROVEN_COMPOSER_NEWLINE
+    assert found["payload_sha256"] == canonical_sha256("a\nb\n")
+
+    # Replaying the identical request returns the same record and types
+    # nothing: at-most-once survives the refusal path too.
+    replay = _queue(transport, text="a\nb\n", provider_version="99.99.99")
+    assert replay["state"] == knc.REFUSED
+    assert transport.calls == []
+
+
+def test_an_absent_provider_version_refuses_multiline_but_still_sends_one_line():
+    """Old callers keep working; only the case that needs a pin needs one."""
+    _attach()
+
+    single = Recorder()
+    record = _queue(single, text="just one line")
+    assert record["state"] == knc.POSTED
+    # No pin, so no burst-reset key -- the pre-existing behaviour exactly.
+    assert single.calls == ["literal:just one line", "enter"]
+
+    multi = Recorder()
+    refused = _queue(multi, operation_id="op_queue_2", text="two\nlines")
+    assert refused["state"] == knc.REFUSED
+    assert multi.calls == []
+
+
+def test_a_payload_that_is_only_a_terminator_has_no_content_to_send():
+    _attach()
+    transport = Recorder()
+
+    with pytest.raises(knc.NativeControlInvalid):
+        _queue(transport, text="\n", provider_version=PINNED)
+
+    assert transport.calls == []
+    assert knc.get("op_queue_1") is None
+
+
+# --------------------------------------------------------------------------
+# Response loss around the keystrokes
+# --------------------------------------------------------------------------
+
+
+def test_loss_midway_through_typing_never_sends_a_second_enter():
+    _attach()
+
+    class FailsOnSecondLine(Recorder):
+        def send_literal(self, text: str) -> None:
+            if any(call.startswith("literal:") for call in self.calls):
+                raise RuntimeError("pane vanished between lines")
+            super().send_literal(text)
+
+    transport = FailsOnSecondLine()
+    record = _queue(transport, text="first\nsecond\n", provider_version=PINNED)
+
+    assert record["state"] == knc.AMBIGUOUS
+    assert record["posted"] is False
+    assert "enter" not in transport.calls
+    assert "typing line 2 of 2" in record["ambiguity_reason"]
+
+
+def test_loss_at_the_enter_boundary_stays_ambiguous_and_is_never_resent():
+    _attach()
+
+    class FailsOnEnter(Recorder):
+        def send_enter(self) -> None:
+            self.calls.append("enter")
+            raise RuntimeError("pane vanished at submit")
+
+    transport = FailsOnEnter()
+    record = _queue(transport, text="body\n", provider_version=PINNED)
+
+    assert record["state"] == knc.AMBIGUOUS
+    assert "composer may hold unsubmitted text" in record["ambiguity_reason"]
+    # Exactly one Enter was ever attempted, and the replay adds none.
+    assert transport.calls.count("enter") == 1
+    replay = _queue(transport, text="body\n", provider_version=PINNED)
+    assert replay["state"] == knc.AMBIGUOUS
+    assert transport.calls.count("enter") == 1

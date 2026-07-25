@@ -13,13 +13,19 @@ terminal and report success. The pane id is minted once per pane and is
 never reused while the server lives, so a write targeted at one either
 reaches that pane or fails.
 
-The writing side is deliberately two calls. ``send_literal`` types and
-never submits; ``send_enter`` submits and types nothing. A single
-``send(text)`` would let a newline inside a payload do the submitting,
-which is how a half-composed message becomes a sent one. ``tmux
-send-keys -l`` writes the argument as literal characters -- no key-name
-interpretation, and no paste buffer, so no bracketed-paste sentinel can
-be introduced by this path at all.
+The writing side is deliberately split by effect. ``send_literal`` types
+and never submits; ``send_enter`` submits and types nothing;
+``send_soft_newline`` opens a new line inside the composer and submits
+nothing. A single ``send(text)`` would let a newline inside a payload do
+the submitting, which is how a half-composed message becomes a sent one.
+``tmux send-keys -l`` writes the argument as literal characters -- no
+key-name interpretation, and no paste buffer, so no bracketed-paste
+sentinel can be introduced by this path at all.
+
+Multi-line content is therefore delivered as content, not as newlines:
+each line is typed literally and the line breaks between them are
+composer keystrokes. The bytes ``\\r`` and ``\\n`` never reach the pane
+from here in any mode.
 """
 
 from __future__ import annotations
@@ -175,6 +181,44 @@ class TmuxPaneInput:
             detail = (result.stderr or "").strip() or f"tmux exited {result.returncode}"
             raise NativePaneInputUnavailable(
                 f"the submitting Enter was refused by tmux for {self._pane_id}: {detail}"
+            )
+
+    def send_key(self, keystroke: str) -> None:
+        """Send one named, non-submitting key -- never text.
+
+        Used for the keys that shape the composer rather than fill it:
+        the newline that breaks a line without sending, and any key a
+        provider pin needs before submitting. The argument is a tmux key
+        *name*, so this cannot emit a literal ``\\n`` -- which would
+        submit -- no matter what is passed.
+
+        Deliberately without a default. Which key inserts a newline
+        instead of sending is a per-provider, per-version fact that has
+        to be proven against the installed build; a default here would be
+        this module guessing on behalf of every provider, and the failure
+        mode of a wrong guess is a message submitted in pieces.
+        """
+        if not isinstance(keystroke, str) or not keystroke.strip():
+            raise NativePaneInputInvalid(
+                f"keystroke must be a non-empty tmux key name; got {keystroke!r}"
+            )
+        for forbidden in _ILLEGAL_LITERAL_CHARS:
+            if forbidden in keystroke:
+                # A key *name* carrying CR/LF/ESC is a caller that built a
+                # raw byte sequence and called it a keystroke.
+                raise NativePaneInputInvalid(
+                    f"keystroke {keystroke!r} contains {forbidden!r}; it must be a tmux key "
+                    f"name such as 'C-j', not raw bytes"
+                )
+        result = _run(
+            [_tmux_binary(), "send-keys", "-t", self._pane_id, keystroke],
+            timeout=self._timeout,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip() or f"tmux exited {result.returncode}"
+            raise NativePaneInputUnavailable(
+                f"the composer keystroke {keystroke!r} was refused by tmux for "
+                f"{self._pane_id}: {detail}"
             )
 
 

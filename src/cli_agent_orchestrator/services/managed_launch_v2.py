@@ -2603,6 +2603,11 @@ async def _admit_native_tui(
             text=request.message,
             observation=observation,
             transport=TmuxPaneInput(identity["pane_id"]),
+            # The version the generation was *bound* to, not one probed
+            # now. Which keystroke breaks a composer line without sending
+            # is a fact about the build that is running, and the binding
+            # is the record of which build that is.
+            provider_version=(record.get("binding") or {}).get("provider_version"),
         )
     except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
         # Deliberately conservative. The adapter turns transport failures

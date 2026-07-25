@@ -34,6 +34,8 @@ session until it is resolved.
 from __future__ import annotations
 
 import json
+import time
+import unicodedata
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any, Optional, Protocol, cast
@@ -98,6 +100,12 @@ REFUSED_UNSUPPORTED_CONTROL = "unsupported_control"
 REFUSED_ATTACHMENT = "attachment_not_owned"
 REFUSED_UNRESOLVED_AMBIGUITY = "unresolved_ambiguity"
 REFUSED_PROVIDER = "provider_refused"
+#: The payload is well formed but this provider build has no proven way
+#: to type it.  An operational answer about the installed provider, not a
+#: caller mistake -- so it is a durable typed refusal rather than a
+#: raised error, and a caller whose response was lost finds it by exact
+#: id instead of having to guess whether anything was sent.
+REFUSED_UNPROVEN_COMPOSER_NEWLINE = "composer_newline_unproven"
 REFUSAL_REASONS = frozenset(
     {
         REFUSED_ACTIVE_TURN,
@@ -107,6 +115,7 @@ REFUSAL_REASONS = frozenset(
         REFUSED_ATTACHMENT,
         REFUSED_UNRESOLVED_AMBIGUITY,
         REFUSED_PROVIDER,
+        REFUSED_UNPROVEN_COMPOSER_NEWLINE,
     }
 )
 
@@ -126,7 +135,239 @@ CONTROL_COMPACT = "/compact"
 #: cross-provider control-input contract.  CR and LF are refused with it
 #: because an embedded newline submits the composer early -- sending
 #: half a message and leaving the remainder as a stray line.
+#:
+#: This governs one *literal write*.  Message text may legitimately
+#: contain newlines; they are delivered as composer keystrokes between
+#: literal writes rather than as bytes, so no newline ever reaches a
+#: literal write and this rule is unweakened by multi-line support.
 _FORBIDDEN_CHARACTERS = ("\x1b", "\r", "\n")
+
+#: How a payload was turned into keystrokes.  Recorded in the delivery
+#: receipt so a reader can tell what was typed without re-deriving it,
+#: and so a future encoding cannot be mistaken for this one.
+ENCODING_SINGLE_LINE = "single-line-then-enter"
+ENCODING_SOFT_NEWLINE = "soft-newline-lines-then-enter"
+
+KEYSTROKE_PLAN_SCHEMA = "cao-kimi-native-keystroke-plan-v1"
+
+#: What the pinned provider does to the composer image when it submits.
+#:
+#: Named and recorded rather than assumed away.  Kimi 0.29.0's
+#: ``submitValue()`` computes ``lines.join("\n").trim()`` *before* the
+#: model sees anything, so the composer image and the model's input are
+#: two different strings whenever the content has leading or trailing
+#: whitespace.  Both are recorded; neither is presented as the other.
+#:
+#: Defeating this with sentinel or framing bytes is forbidden: it would
+#: put artifact bytes into model input to win an argument about
+#: whitespace.  The honest move is to say what the model actually got.
+NORMALIZATION_JOIN_LF_THEN_TRIM = "kimi-0.29.0:join-lf+trim"
+
+#: Composer newline keystrokes proven against one exact provider build.
+#:
+#: Keyed by the full version string and never by a range.  Which key
+#: inserts a newline instead of submitting is a fact about one bundle;
+#: a range would be this table asserting something about builds nobody
+#: has read, and the failure mode of being wrong is a task submitted in
+#: pieces as several turns.
+#:
+#: ``0.29.0`` is read from the installed bundle, which declares
+#: ``"tui.input.newLine": {defaultKeys: ["shift+enter", "ctrl+j"]}`` and
+#: ``"tui.input.submit": {defaultKeys: "enter"}``.  Ctrl-J is chosen over
+#: shift+enter because it is one unambiguous control byte that terminals
+#: transmit identically, whereas shift+enter depends on the terminal
+#: emitting a modifyOtherKeys/CSI-u sequence that many do not.
+#:
+#: ``submit_settle_seconds`` exists because the same bundle suppresses
+#: submission during a paste burst: while ``enterSuppressUntil`` is in
+#: the future, Enter *inserts a newline instead of submitting*
+#: (``PASTE_ENTER_SUPPRESS_WINDOW_MS = 120``).  A task typed quickly and
+#: submitted immediately can therefore land in that window and never be
+#: sent at all -- no error, no turn, the message left in the composer.
+#: Waiting past the window closes that hole.  This is a mechanical
+#: debounce required by the pinned TUI, not a substitute for observing
+#: readiness: readiness is observed separately, before any typing.
+#: ``burst_reset_keystroke`` is what makes the final Enter *provably*
+#: submit rather than probably submit.  The same bundle resets the burst
+#: on any key event that is neither Enter nor a single printable
+#: character::
+#:
+#:     if (!disablePasteBurst && !isEnterKey && printableForBurst === void 0)
+#:         this.pasteBurst.reset();
+#:
+#: and ``reset()`` zeroes ``enterSuppressUntil``.  So one content-neutral
+#: key immediately before Enter clears the suppression window outright,
+#: with no dependence on how fast the pty delivered the preceding bytes.
+#: ``End`` is chosen because it cannot alter composer content and leaves
+#: the cursor where Enter expects it.  The settle is kept as well: the
+#: two defences fail independently, and a quarter second is cheap next
+#: to silently not submitting a task at all.
+#:
+#: ``normalization`` names what the provider does to the composer image
+#: on submit, so a receipt can state model-visible input honestly rather
+#: than implying the composer bytes reached the model untouched.
+_PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
+    "0.29.0": {
+        "keystroke": "C-j",
+        "burst_reset_keystroke": "End",
+        "submit_settle_seconds": 0.25,
+        "normalization": NORMALIZATION_JOIN_LF_THEN_TRIM,
+        "evidence": (
+            "dist/main.mjs declares tui.input.newLine defaultKeys "
+            "['shift+enter', 'ctrl+j'] with tui.input.submit 'enter'; "
+            "submitValue() computes lines.join('\\n').trim(); "
+            "PASTE_ENTER_SUPPRESS_WINDOW_MS = 120 and reset() clears it"
+        ),
+    },
+}
+
+#: Characters ECMAScript ``String.prototype.trim`` removes: its
+#: WhiteSpace production plus its LineTerminator production.  Listed
+#: explicitly rather than reusing Python's ``str.strip``, whose set is
+#: close but not equal -- and "close" here decides whether a receipt
+#: claims content reached the model that in fact did not.  Unicode
+#: ``Zs`` is folded in by :func:`_is_js_whitespace`.
+#:
+#: U+0085 NEL is deliberately absent.  It is a line terminator in several
+#: other standards, which makes it the obvious thing to include by
+#: analogy, but ECMAScript's WhiteSpace and LineTerminator productions
+#: both exclude it -- verified against the installed node, where
+#: ``String.fromCodePoint(0x85).trim().length === 1`` while every other
+#: code point listed here trims away.  Including it would understate the
+#: model's input by a character.
+_JS_TRIM_CHARACTERS = frozenset("\t\n\x0b\x0c\r \xa0\u1680\u2028\u2029\u202f\u205f\u3000\ufeff")
+
+
+def _is_js_whitespace(char: str) -> bool:
+    return char in _JS_TRIM_CHARACTERS or unicodedata.category(char) == "Zs"
+
+
+def _js_trim(text: str) -> str:
+    """``String.prototype.trim`` as the pinned provider applies it."""
+    start, end = 0, len(text)
+    while start < end and _is_js_whitespace(text[start]):
+        start += 1
+    while end > start and _is_js_whitespace(text[end - 1]):
+        end -= 1
+    return text[start:end]
+
+
+def split_submission_terminator(text: str) -> tuple[str, Optional[str]]:
+    """Separate the one submitting terminator from the content.
+
+    Exactly one trailing ``\\n`` (or ``\\r\\n``, which is the same
+    intent) is the *submit*, not content: it is what the explicit final
+    Enter delivers.  Everything else -- including the blank line that a
+    trailing ``\\n\\n`` leaves behind -- is content.
+
+    Deliberately "exactly one", never ``rstrip``.  Stripping all of them
+    would silently delete content, and this module refuses to guess how
+    much of a message a caller meant.
+    """
+    if text.endswith("\r\n"):
+        return text[:-2], "\r\n"
+    if text.endswith("\n"):
+        return text[:-1], "\n"
+    return text, None
+
+
+def plan_composer_keystrokes(
+    text: str,
+    *,
+    provider_version: Optional[str] = None,
+    field: str = "text",
+) -> dict[str, Any]:
+    """Decide every keystroke before a single one is sent.
+
+    Built as a whole, up front, so the plan can be journaled before any
+    composer I/O and so an undeliverable payload is refused with nothing
+    typed rather than discovered halfway through a message.
+
+    The digests are the point of this record.  ``payload_sha256`` is over
+    the caller's **original** bytes and is unaffected by any encoding
+    decision here, so delivery can never quietly redefine what was asked
+    for.  ``composer_sha256`` is what the composer will hold before
+    submit.  ``model_input_sha256`` is what the provider will actually
+    hand the model after its own normalization -- recorded separately
+    precisely because it is sometimes *not* the same string, and a single
+    digest would have to lie about one of them.
+    """
+    if not isinstance(text, str) or not text:
+        raise NativeControlInvalid(f"{field} must be a non-empty string; got {text!r}")
+
+    content, terminator = split_submission_terminator(text)
+    if not content:
+        raise NativeControlInvalid(
+            f"{field} is only a line terminator, so there is no content to deliver; "
+            f"the terminator is the submit keystroke, not a message"
+        )
+
+    lines = content.split("\n")
+    for forbidden in _FORBIDDEN_CHARACTERS:
+        if forbidden == "\n":
+            continue
+        if forbidden in content:
+            raise NativeControlInvalid(
+                f"{field} contains {forbidden!r}, which must never reach a provider "
+                f"composer; native control types literal lines and sends composer "
+                f"keystrokes for the breaks between them"
+            )
+
+    pin = _PROVEN_COMPOSER_NEWLINE.get((provider_version or "").strip())
+    undeliverable = None
+    if len(lines) > 1 and pin is None:
+        # Recorded on the plan rather than raised. The payload is well
+        # formed; what is missing is a proven keystroke for the *installed
+        # build*, which is an operational fact about this session. The
+        # caller turns it into a durable typed refusal so a lost response
+        # is answerable by exact id -- raising here would leave no row and
+        # reproduce the maybe-sent ambiguity this whole seam exists to
+        # remove. Multi-turn chunking, bracketed paste, and flattening the
+        # newlines away are each a way of appearing to deliver a message
+        # that was not delivered, so none of them is the alternative.
+        undeliverable = (
+            f"{field} spans {len(lines)} lines but no composer newline keystroke is proven "
+            f"for provider version {provider_version!r}; refusing rather than splitting the "
+            f"message across turns, pasting it, or flattening the newlines out of it"
+        )
+
+    composer_image = "\n".join(lines)
+    normalization = None if pin is None else pin["normalization"]
+    model_input = composer_image if pin is None else _js_trim(composer_image)
+
+    plan: dict[str, Any] = {
+        "schema": KEYSTROKE_PLAN_SCHEMA,
+        "encoding": ENCODING_SINGLE_LINE if len(lines) == 1 else ENCODING_SOFT_NEWLINE,
+        # Over the caller's original bytes, terminator included.
+        "payload_sha256": canonical_sha256(text),
+        "composer_sha256": canonical_sha256(composer_image),
+        "model_input_sha256": canonical_sha256(model_input),
+        "provider_normalization": normalization,
+        # False means the provider's own submit-time normalization will
+        # change the content -- leading/trailing whitespace only. Stated
+        # as a fact rather than left for a reader to infer from digests.
+        "model_input_is_composer_exact": model_input == composer_image,
+        "line_count": len(lines),
+        "trailing_terminator": terminator,
+        "provider_version": provider_version,
+        "soft_newline_keystroke": None if pin is None else pin["keystroke"],
+        "burst_reset_keystroke": None if pin is None else pin.get("burst_reset_keystroke"),
+        "submit_settle_seconds": 0.0 if pin is None else float(pin["submit_settle_seconds"]),
+        "final_enter": True,
+        "deliverable": undeliverable is None,
+        "undeliverable_reason": undeliverable,
+    }
+    # Bound to the plan's own contents, which already carry the payload
+    # digest -- so the plan digest identifies the exact keystrokes without
+    # this record ever storing the message text.
+    plan["plan_sha256"] = canonical_sha256(_canonical(plan))
+    plan["lines"] = lines
+    return plan
+
+
+def _journalable_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """The plan without the message text, for durable storage."""
+    return {key: value for key, value in plan.items() if key != "lines"}
 
 
 class NativeControlError(RuntimeError):
@@ -183,6 +424,15 @@ class NativeControlTransport(Protocol):
 
     def send_enter(self) -> None:
         """Send the submitting key as its own separate keystroke."""
+
+    def send_key(self, keystroke: str) -> None:
+        """Send one named, non-submitting key: a composer newline or a
+        key a provider pin requires before submitting.
+
+        Only reached for payloads whose plan needs it, so a transport
+        that predates multi-line delivery keeps working for the
+        single-line payloads it already handled.
+        """
 
 
 def _now() -> str:
@@ -296,13 +546,21 @@ def _intent(
     turn_id: Optional[str],
     payload_sha256: str,
     turn_observation_record: Mapping[str, Any],
+    keystroke_plan: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """The record written before anything is typed.
 
     Everything needed to adjudicate a crash between this write and the
     keystroke is here: which operation, against which exact session and
-    generation, in which mode, with which payload, and what the pane
-    looked like at the moment the decision was made.
+    generation, in which mode, with which payload, what the pane looked
+    like at the moment the decision was made, and -- for text payloads --
+    the exact keystroke plan that was about to be executed.
+
+    The plan is journaled *before* composer I/O rather than recorded
+    after it, because its whole purpose is to be readable when the write
+    did not finish.  It carries digests and shape, never the message
+    text: a recovery reader needs to know what was going to be typed,
+    not to hold a second copy of it.
     """
     return {
         "schema": INTENT_SCHEMA,
@@ -316,6 +574,7 @@ def _intent(
         "turn_id": turn_id,
         "payload_sha256": payload_sha256,
         "turn_observation": dict(turn_observation_record),
+        "keystroke_plan": None if keystroke_plan is None else _journalable_plan(keystroke_plan),
     }
 
 
@@ -515,6 +774,7 @@ def _open(
     turn_id: Optional[str],
     payload_sha256: str,
     observation: Mapping[str, Any],
+    keystroke_plan: Optional[Mapping[str, Any]] = None,
 ) -> tuple[dict[str, Any], bool]:
     """Journal the intent, or return the existing operation unchanged.
 
@@ -540,6 +800,7 @@ def _open(
                 turn_id=turn_id,
                 payload_sha256=payload_sha256,
                 turn_observation_record=observation,
+                keystroke_plan=keystroke_plan,
             )
         ),
         "epoch": 0,
@@ -648,28 +909,89 @@ def _refuse(operation_id: str, refusal: _Refusal) -> dict[str, Any]:
     )
 
 
+def _assert_deliverable(plan: Mapping[str, Any]) -> None:
+    """Refuse a payload this provider build cannot be made to accept.
+
+    Checked after ownership, because "you do not hold this session" is a
+    more fundamental answer, and before the idle gate, because a busy
+    provider is a transient condition while an unproven keystroke is a
+    permanent one -- reporting the transient reason would invite a retry
+    that can never succeed.
+    """
+    if not plan.get("deliverable", True):
+        raise _Refusal(
+            REFUSED_UNPROVEN_COMPOSER_NEWLINE,
+            cast(str, plan["undeliverable_reason"]),
+        )
+
+
 def _post(
     *,
     operation_id: str,
-    payload: str,
+    plan: Mapping[str, Any],
     transport: NativeControlTransport,
 ) -> dict[str, Any]:
-    """Type the payload, then send Enter as a separate explicit keystroke.
+    """Execute the keystroke plan, then submit with one explicit Enter.
 
-    Any transport failure -- at either boundary -- becomes ambiguous
-    rather than failed.  A raised exception does not prove the bytes did
-    not land, and treating it as proof of non-delivery is precisely what
+    Any transport failure -- at any boundary -- becomes ambiguous rather
+    than failed.  A raised exception does not prove the bytes did not
+    land, and treating it as proof of non-delivery is precisely what
     would justify a retry and produce a duplicate.  The Enter boundary is
-    recorded separately because a payload that was typed but not
-    submitted is a real, different state: it sits in the composer.
+    recorded separately, and the ambiguity says which side of it was
+    reached, because "typed but not submitted" is a real, recoverable
+    state while "may have submitted" is not.
+
+    Exactly one Enter is sent, ever, for exactly one provider turn.  The
+    line breaks inside a multi-line payload are composer keystrokes, not
+    submissions, so a message with ten newlines is still one turn.
     """
-    literal_digest = canonical_sha256(payload)
+    if not plan.get("deliverable", True):
+        # Belt and braces: reaching the transport with an undeliverable
+        # plan would be a bug in this module, not a caller error, and it
+        # must not be discovered by half-typing a message.
+        raise NativeControlInvalid(
+            f"refusing to type an undeliverable plan: {plan['undeliverable_reason']}"
+        )
+    lines = list(plan["lines"])
+    newline_key = plan["soft_newline_keystroke"]
+
     try:
-        transport.send_literal(payload)
+        for index, line in enumerate(lines):
+            if index:
+                # The break comes first, so a blank content line is a
+                # break with nothing typed after it rather than a
+                # special case that could be silently dropped.
+                transport.send_key(newline_key)
+            if line:
+                transport.send_literal(line)
     except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
         return mark_ambiguous(
             operation_id=operation_id,
-            reason=f"transport raised while writing the payload: {exc}",
+            reason=(
+                f"transport raised while typing line {index + 1} of {len(lines)}: {exc}; "
+                f"no Enter was sent, so the composer may hold a partial message"
+            ),
+        )
+
+    # Clear the provider's paste-burst window before submitting. Without
+    # this the final Enter can be swallowed and turned into yet another
+    # composer newline -- no error, no turn, the task simply never sent.
+    # The reset key is content-neutral; the settle covers the same window
+    # by a second, independent route.
+    reset_key = plan.get("burst_reset_keystroke")
+    settle = float(plan.get("submit_settle_seconds") or 0.0)
+    try:
+        if reset_key:
+            transport.send_key(reset_key)
+        if settle > 0:
+            time.sleep(settle)
+    except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
+        return mark_ambiguous(
+            operation_id=operation_id,
+            reason=(
+                f"the payload was typed but the pre-submit keystroke raised: {exc}; "
+                f"the composer may hold unsubmitted text"
+            ),
         )
 
     try:
@@ -691,14 +1013,25 @@ def _post(
             "posted_at": _now(),
             "transport_json": _canonical(
                 {
-                    "literal_sha256": literal_digest,
                     # Recorded as observed facts about what this adapter
-                    # did, never as a claim about the provider. The payload
-                    # was checked to be a single artifact-free line, and
-                    # Enter went as its own call after the text returned.
+                    # did, never as a claim about the provider.
                     "enter_sent_separately": True,
-                    "payload_single_line": True,
-                    "transport_contract": "literal-write-then-explicit-enter",
+                    "enter_count": 1,
+                    "transport_contract": "literal-lines-composer-breaks-then-explicit-enter",
+                    "encoding": plan["encoding"],
+                    "plan_sha256": plan["plan_sha256"],
+                    "payload_sha256": plan["payload_sha256"],
+                    "composer_sha256": plan["composer_sha256"],
+                    # What the provider hands the model after its own
+                    # submit-time normalization. Separate from the
+                    # composer digest because for content with leading or
+                    # trailing whitespace they genuinely differ, and one
+                    # digest would have to misdescribe one of them.
+                    "model_input_sha256": plan["model_input_sha256"],
+                    "provider_normalization": plan["provider_normalization"],
+                    "model_input_is_composer_exact": plan["model_input_is_composer_exact"],
+                    "line_count": plan["line_count"],
+                    "payload_single_line": plan["line_count"] == 1,
                 }
             ),
         },
@@ -715,6 +1048,7 @@ def queue(
     text: str,
     observation: Mapping[str, Any],
     transport: NativeControlTransport,
+    provider_version: Optional[str] = None,
 ) -> dict[str, Any]:
     """Send ordinary follow-up, gated on the provider being idle.
 
@@ -731,15 +1065,16 @@ def queue(
         generation=generation,
         execution_mode=execution_mode,
     )
-    payload = assert_artifact_free(text, field="text")
+    plan = plan_composer_keystrokes(text, provider_version=provider_version, field="text")
     observed = _validated_turn_observation(observation)
 
     record, is_new = _open(
         kind=KIND_QUEUE,
         binding=binding,
         turn_id=None,
-        payload_sha256=canonical_sha256(payload),
+        payload_sha256=plan["payload_sha256"],
         observation=observed,
+        keystroke_plan=plan,
     )
     if not is_new:
         return record
@@ -755,6 +1090,7 @@ def queue(
             generation=binding["generation"],
             execution_mode=binding["execution_mode"],
         )
+        _assert_deliverable(plan)
         if observed["active_turn_id"] is not None:
             raise _Refusal(
                 REFUSED_ACTIVE_TURN,
@@ -764,7 +1100,7 @@ def queue(
     except _Refusal as refusal:
         return _refuse(binding["operation_id"], refusal)
 
-    return _post(operation_id=binding["operation_id"], payload=payload, transport=transport)
+    return _post(operation_id=binding["operation_id"], plan=plan, transport=transport)
 
 
 def steer(
@@ -778,6 +1114,7 @@ def steer(
     text: str,
     observation: Mapping[str, Any],
     transport: NativeControlTransport,
+    provider_version: Optional[str] = None,
 ) -> dict[str, Any]:
     """Deliberately steer one exact active turn.
 
@@ -794,7 +1131,7 @@ def steer(
         generation=generation,
         execution_mode=execution_mode,
     )
-    payload = assert_artifact_free(text, field="text")
+    plan = plan_composer_keystrokes(text, provider_version=provider_version, field="text")
     target_turn = _require_text(turn_id, field="turn_id")
     observed = _validated_turn_observation(observation)
 
@@ -802,8 +1139,9 @@ def steer(
         kind=KIND_STEER,
         binding=binding,
         turn_id=target_turn,
-        payload_sha256=canonical_sha256(payload),
+        payload_sha256=plan["payload_sha256"],
         observation=observed,
+        keystroke_plan=plan,
     )
     if not is_new:
         return record
@@ -819,6 +1157,7 @@ def steer(
             generation=binding["generation"],
             execution_mode=binding["execution_mode"],
         )
+        _assert_deliverable(plan)
         active = observed["active_turn_id"]
         if active is None:
             raise _Refusal(
@@ -835,7 +1174,7 @@ def steer(
     except _Refusal as refusal:
         return _refuse(binding["operation_id"], refusal)
 
-    return _post(operation_id=binding["operation_id"], payload=payload, transport=transport)
+    return _post(operation_id=binding["operation_id"], plan=plan, transport=transport)
 
 
 def control(
@@ -849,6 +1188,7 @@ def control(
     advertised_commands: Sequence[str],
     observation: Mapping[str, Any],
     transport: NativeControlTransport,
+    provider_version: Optional[str] = None,
 ) -> dict[str, Any]:
     """Send a literal slash command, with an explicit separate Enter.
 
@@ -884,12 +1224,17 @@ def control(
         )
     observed = _validated_turn_observation(observation)
 
+    # A slash command stays one literal line: the assertion above already
+    # refused any newline, so this plan is always single-line and shares
+    # the one executor rather than keeping a second typing path alive.
+    plan = plan_composer_keystrokes(payload, provider_version=provider_version, field="command")
     record, is_new = _open(
         kind=KIND_CONTROL,
         binding=binding,
         turn_id=None,
-        payload_sha256=canonical_sha256(payload),
+        payload_sha256=plan["payload_sha256"],
         observation=observed,
+        keystroke_plan=plan,
     )
     if not is_new:
         return record
@@ -905,6 +1250,7 @@ def control(
             generation=binding["generation"],
             execution_mode=binding["execution_mode"],
         )
+        _assert_deliverable(plan)
         if payload not in set(advertised_commands):
             raise _Refusal(
                 REFUSED_UNSUPPORTED_CONTROL,
@@ -914,7 +1260,7 @@ def control(
     except _Refusal as refusal:
         return _refuse(binding["operation_id"], refusal)
 
-    return _post(operation_id=binding["operation_id"], payload=payload, transport=transport)
+    return _post(operation_id=binding["operation_id"], plan=plan, transport=transport)
 
 
 def _validated_turn_observation(observation: Mapping[str, Any]) -> dict[str, Any]:
