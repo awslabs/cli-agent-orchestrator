@@ -11,12 +11,18 @@ import subprocess
 import time
 from typing import Any, Optional, cast
 
+from cli_agent_orchestrator.services import provider_contracts
 from cli_agent_orchestrator.services.provider_contracts import PROVIDER_KIMI, SUPPORTED_VERSIONS
 
 #: Exact Kimi builds this probe accepts, current first — never a range.
 #: 0.29.0 is retained alongside 0.29.1 for already-minted sessions.
 SUPPORTED_KIMI_VERSIONS = SUPPORTED_VERSIONS[PROVIDER_KIMI]
 PROBE_VERSION = "kimi-acp-route-v1"
+
+#: The receipt's ``effort_mode`` when the route selected no effort. Named
+#: rather than spelled inline so a reader can grep the receipt value back
+#: to the contract that produced it.
+EFFORT_MODE_PROVIDER_DEFAULT = "provider-default"
 
 
 class KimiRouteProbeError(RuntimeError):
@@ -134,6 +140,15 @@ def attest_kimi_route(
     if not os.path.isdir(project_root) or os.path.realpath(project_root) != project_root:
         raise KimiRouteProbeError("project_root must be an existing canonical directory")
 
+    # Refused here, before the binary is started, rather than mid-probe:
+    # this model rejects every effort value with ``Invalid params``, which
+    # tells a caller only that *some* parameter was wrong, after a session
+    # already exists.
+    try:
+        provider_contracts.validate_route_effort(expected_model, expected_effort)
+    except provider_contracts.ProviderContractError as exc:
+        raise KimiRouteProbeError(str(exc)) from exc
+
     try:
         version_proc = subprocess.run(
             [kimi_bin, "--version"],
@@ -154,7 +169,15 @@ def attest_kimi_route(
     config_path = user_config_path or pathlib.Path(os.path.expanduser("~/.kimi/config.toml"))
     before = _digest_or_absent(config_path)
     env = dict(os.environ)
-    env["KIMI_MODEL_THINKING_EFFORT"] = expected_effort
+    # A route that selects no effort contributes no override here, and the
+    # inherited environment must not supply one either: a stale
+    # KIMI_MODEL_THINKING_EFFORT in the parent would otherwise reach the
+    # probe as though this route had asked for it.
+    selects_effort = provider_contracts.route_selects_effort(expected_effort)
+    if selects_effort:
+        env["KIMI_MODEL_THINKING_EFFORT"] = expected_effort
+    else:
+        env.pop("KIMI_MODEL_THINKING_EFFORT", None)
     client = _AcpClient([kimi_bin, "acp"], env, timeout)
     probe_error: Optional[Exception] = None
     result: dict[str, Any] = {}
@@ -188,7 +211,8 @@ def attest_kimi_route(
             )
             options = changed.get("configOptions")
         if (
-            _current_option(options, category="thought_level", option_id="thinking")
+            selects_effort
+            and _current_option(options, category="thought_level", option_id="thinking")
             != expected_effort
         ):
             changed = client.request(
@@ -207,7 +231,7 @@ def attest_kimi_route(
             raise KimiRouteProbeError(
                 f"Kimi ACP resolved model {actual_model!r}, expected {expected_model!r}"
             )
-        if actual_effort != expected_effort:
+        if selects_effort and actual_effort != expected_effort:
             raise KimiRouteProbeError(
                 f"Kimi ACP resolved effort {actual_effort!r}, expected {expected_effort!r}"
             )
@@ -219,15 +243,29 @@ def attest_kimi_route(
             "kimi_version": version,
             "project_root": project_root,
             "model": actual_model,
-            "reasoning_effort": actual_effort,
+            # Only ever the effort this probe actually selected and then
+            # read back. A route that selected none reports null and says
+            # so in the three keys below, rather than passing off whatever
+            # the session happened to be sitting at as a resolution: this
+            # model exposes no thought_level option, so a value read there
+            # would be an artifact, not an answer.
+            "reasoning_effort": actual_effort if selects_effort else None,
+            "effort_mode": "selected" if selects_effort else EFFORT_MODE_PROVIDER_DEFAULT,
+            "effort_observed": bool(selects_effort),
             "acp_protocol_version": initialized.get("protocolVersion"),
             "probe_session_id": session_id,
             "route_source": "acp-session-config",
             "protected_config_sha256": before,
             "terminal_model_argv": ["--model", expected_model],
-            "terminal_effort_env": {"KIMI_MODEL_THINKING_EFFORT": expected_effort},
+            "terminal_effort_env": provider_contracts.kimi_effort_env(expected_effort),
             "no_prompt_sent": True,
         }
+        if not selects_effort:
+            result["effort_unsupported_reason"] = (
+                f"{expected_model} exposes no thinking-effort surface on Kimi {version}; "
+                "the probe sent no KIMI_MODEL_THINKING_EFFORT and no thinking config "
+                "option, so no effort was observed and none is claimed"
+            )
     except Exception as exc:  # noqa: BLE001 - config integrity is checked below
         probe_error = exc
     finally:
@@ -243,9 +281,13 @@ def attest_kimi_route(
     if returncode not in (0, -15):
         raise KimiRouteProbeError(f"Kimi ACP server exited {returncode}: {stderr[-500:]}")
 
+    # The digest binds the invocation the terminal will actually run, so it
+    # has to reflect the omission too: a route that sends no effort env and
+    # one that sends an override are different invocations, and hashing
+    # them alike would let either satisfy a receipt written for the other.
     invocation = {
         "argv": [kimi_bin, "--yolo", "--model", expected_model],
-        "env": {"KIMI_MODEL_THINKING_EFFORT": expected_effort},
+        "env": provider_contracts.kimi_effort_env(expected_effort),
     }
     result["terminal_route_sha256"] = hashlib.sha256(
         json.dumps(invocation, sort_keys=True, separators=(",", ":")).encode("utf-8")

@@ -55,6 +55,7 @@ from cli_agent_orchestrator.services import (
     heartbeat_store,
     native_attachment,
     native_tui_launch,
+    provider_contracts,
     recovery_receipts,
     secret_gate,
 )
@@ -390,6 +391,13 @@ def _validate_reserve_identity(request: ManagedLaunchV2ReserveRequest) -> dict[s
         raise ManagedLaunchConflict("trusted_project_root is valid only for provider=codex")
     if not os.path.isabs(request.provider_executable):
         raise ManagedLaunchConflict("provider_executable must be an absolute path")
+    # Refused before anything persists, for the same reason the v1 surface
+    # refuses it: a route the provider cannot honor should not become a
+    # durable reservation that then has to be finalized.
+    try:
+        provider_contracts.validate_route_effort(request.expected_model, request.expected_effort)
+    except provider_contracts.ProviderContractError as exc:
+        raise ManagedLaunchConflict(str(exc)) from exc
     payload = request.model_dump(mode="json")
     # The raw nonce never persists; only its digest is stored.
     payload.pop("launch_nonce")

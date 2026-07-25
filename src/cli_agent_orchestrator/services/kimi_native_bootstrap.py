@@ -52,7 +52,11 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
-from cli_agent_orchestrator.services import kimi_native_launch, native_attachment
+from cli_agent_orchestrator.services import (
+    kimi_native_launch,
+    native_attachment,
+    provider_contracts,
+)
 from cli_agent_orchestrator.services.kimi_route import _current_option
 from cli_agent_orchestrator.services.provider_contracts import (
     PROVIDER_KIMI,
@@ -350,8 +354,18 @@ def mint_session(
         "working_directory": cwd,
         # The read-back route, not the requested one.  They are equal
         # here only because ``_apply_route`` refuses to return otherwise.
+        #
+        # ``effort`` is null for a route that selected none: this session
+        # was never told an effort and never checked one, so whatever the
+        # thought_level option happens to read is an artifact of the
+        # session rather than a route fact, and reporting it would turn a
+        # value nobody asked for into a value this receipt vouches for.
         "model": _current_option(options, category="model", option_id="model"),
-        "effort": _current_option(options, category="thought_level", option_id="thinking"),
+        "effort": (
+            _current_option(options, category="thought_level", option_id="thinking")
+            if provider_contracts.route_selects_effort(effort)
+            else None
+        ),
         # Both are facts about this module's shape, not caller claims:
         # there is no prompt call here, and the exit proof above is the
         # only way past this line.
@@ -386,15 +400,21 @@ def _apply_route(
 
     Each option is only set when it is not already the wanted value, so a
     session that already carries the route costs no extra provider calls.
-    The final check is unconditional and covers both options together: a
-    ``set`` that returned success while leaving the record unchanged is
-    exactly the failure this exists to catch, and it is indistinguishable
-    from success unless the values are re-read.
+    The final check covers every option this call actually set: a ``set``
+    that returned success while leaving the record unchanged is exactly the
+    failure this exists to catch, and it is indistinguishable from success
+    unless the values are re-read.
+
+    A route that selects no effort sets no thinking option and checks none.
+    The model half is unchanged and still exact — what such a route
+    declines to pin is the effort, not the model — and the option is
+    *omitted* rather than set to some stand-in value, so the provider
+    applies its own default.
     """
-    for config_id, category, value in (
-        ("model", "model", model),
-        ("thinking", "thought_level", effort),
-    ):
+    wanted = [("model", "model", model)]
+    if provider_contracts.route_selects_effort(effort):
+        wanted.append(("thinking", "thought_level", effort))
+    for config_id, category, value in wanted:
         if _current_option(options, category=category, option_id=config_id) != value:
             changed = transport.request(
                 "session/set_config_option",
@@ -408,7 +428,9 @@ def _apply_route(
 
     observed_model = _current_option(options, category="model", option_id="model")
     observed_effort = _current_option(options, category="thought_level", option_id="thinking")
-    if observed_model != model or observed_effort != effort:
+    if observed_model != model or (
+        provider_contracts.route_selects_effort(effort) and observed_effort != effort
+    ):
         raise KimiBootstrapProtocol(
             f"session {session_id} settled on model={observed_model!r} effort="
             f"{observed_effort!r} rather than the requested model={model!r} effort={effort!r}; "

@@ -38,7 +38,7 @@ from cli_agent_orchestrator.providers.codex import (
     _validate_config_key,
     render_trusted_project_override,
 )
-from cli_agent_orchestrator.services import actor_broker, companion_receipts
+from cli_agent_orchestrator.services import actor_broker, companion_receipts, provider_contracts
 from cli_agent_orchestrator.services.codex_trust import (
     SUPPORTED_CODEX_VERSION,
     _contains_session_flags,
@@ -222,12 +222,25 @@ def _provider_env(overrides: Optional[dict[str, str]] = None) -> dict[str, str]:
 
 
 def _provider_route_environment(request: dict[str, Any]) -> dict[str, str]:
-    """Return route controls pinned by the immutable launch request."""
+    """Return route controls pinned by the immutable launch request.
+
+    This is the one place a Kimi effort override becomes a real environment
+    variable, for both the ACP bridge child and the native TUI child, so it
+    is the one place the provider-default sentinel has to be honored. A gate
+    placed inside a particular probe instead would leave every other path a
+    trap: the first launch that took one would silently reinstate the
+    override, and it would surface as a provider protocol error nowhere near
+    its cause.
+    """
     if request["provider"] == "kimi_cli":
         effort = request.get("effort")
         if not isinstance(effort, str) or not effort:
             raise BridgeError("Kimi managed launch requires a pinned effort")
-        return {"KIMI_MODEL_THINKING_EFFORT": effort}
+        # A route that selects no effort contributes no variable at all —
+        # not the sentinel, and not a substituted default. The provider
+        # then applies its own, which is the only value anyone here has
+        # grounds to run under.
+        return provider_contracts.kimi_effort_env(effort)
     return {}
 
 
@@ -1944,8 +1957,13 @@ class _ProviderSession:
                 {"sessionId": session_id, "configId": "model", "value": self.request["model"]},
             )
             options = changed.get("configOptions")
+        # A route that selects no effort sets none and checks none. The
+        # model half is unchanged and still exact: what this route declines
+        # to pin is the effort, not the model.
+        selects_effort = provider_contracts.route_selects_effort(self.request["effort"])
         if (
-            _current_option(options, category="thought_level", option_id="thinking")
+            selects_effort
+            and _current_option(options, category="thought_level", option_id="thinking")
             != self.request["effort"]
         ):
             changed = self.rpc.request(
@@ -1957,9 +1975,11 @@ class _ProviderSession:
                 },
             )
             options = changed.get("configOptions")
-        if (
-            _current_option(options, category="model", option_id="model") != self.request["model"]
-            or _current_option(options, category="thought_level", option_id="thinking")
+        if _current_option(options, category="model", option_id="model") != self.request[
+            "model"
+        ] or (
+            selects_effort
+            and _current_option(options, category="thought_level", option_id="thinking")
             != self.request["effort"]
         ):
             raise BridgeError("Kimi exact session resolved the wrong route")
