@@ -9,6 +9,19 @@ When an agent calls `send_message(terminal_id, message)`, the message is queued 
 
 Both paths converge on `check_and_send_pending_messages()`, which gates delivery based on terminal status.
 
+## How the Paste Is Framed
+
+Delivery loads the message into a tmux buffer verbatim and pastes it with `paste-buffer -p -r`. Each flag is load-bearing:
+
+- `-p` asks **tmux** to emit the bracketed-paste markers (`ESC[200~` / `ESC[201~`). tmux emits them only for a pane that advertised `DECSET 2004`; a pane that never asked — a bare shell, say — correctly receives the message unframed.
+- `-r` suppresses tmux's LF→CR rewrite. Without it a composer reads each newline as Enter and submits a multi-line message one line at a time, with every line but the last truncated.
+
+CAO must never write the markers into the buffer itself. tmux sanitizes control bytes on their way out of a paste buffer, so an `ESC` placed there does not reach the pane as an escape at all — it arrives as the printable text `^[[200~`, which a composer types into the prompt and submits along with the message. Only markers that tmux generates for `-p` are written outside that sanitizing path.
+
+Shell commands sent during terminal initialization use `-p` **without** `-r`, because there each newline *should* become the Enter that runs the line.
+
+The argv is asserted in `test/clients/test_tmux_paste_framing.py`; what actually arrives at a real pane is measured in `test/e2e/test_ordinary_input_live.py`.
+
 ## Standard Delivery
 
 By default, messages are only delivered when the terminal status is **IDLE** or **COMPLETED**. This ensures the provider's TUI is ready to accept input and the message won't be lost or corrupt the terminal state.

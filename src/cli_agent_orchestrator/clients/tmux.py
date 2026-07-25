@@ -488,12 +488,13 @@ class TmuxClient:
             enter_count: Number of Enter keys to send after pasting (default 1).
                 Some TUIs enter multi-line mode after bracketed paste,
                 requiring 2 Enters to submit.
-            force_bracketed_paste: If True, unconditionally wrap content in
-                bracketed paste sequences (\x1b[200~...\x1b[201~) instead of
-                relying on paste-buffer -p. Use for message delivery to TUIs.
-                Do NOT use for shell commands sent to bash during initialization
-                (bash 4.x does not support bracketed paste and will inject the
-                escape sequences literally into the command line).
+            force_bracketed_paste: If True, ask tmux to frame the payload as a
+                bracketed paste and to deliver newlines verbatim. Use for
+                message delivery to TUIs, where a multi-line message must
+                arrive as one input rather than as one submission per line.
+                Do NOT use for shell commands sent to bash during
+                initialization: those rely on each newline becoming an Enter
+                that runs the line.
         """
         # Defence-in-depth: re-validate at the sink even though callers
         # validate at the API/MCP boundary. Both halves flow into a
@@ -514,23 +515,37 @@ class TmuxClient:
             # available here at DEBUG for local delivery troubleshooting.
             logger.info(f"send_keys: {target} - keys length: {len(keys)}")
             logger.debug(f"send_keys: {target} - keys: {keys}")
+            # The payload is always loaded verbatim. Framing is tmux's job:
+            # tmux sanitizes control bytes on their way out of a paste buffer,
+            # so an ESC written into the buffer here does not reach the pane as
+            # an escape at all — it arrives as the seven printable characters
+            # ^[[200~, which a composer types out as visible text and then
+            # submits. Framing that tmux itself emits for -p is written outside
+            # that sanitizing path and arrives as real escape bytes.
+            buf_content = keys.encode()
             if force_bracketed_paste:
-                # Wrap unconditionally and use -r (no newline→CR conversion).
-                # paste-buffer -p only adds bracketed sequences if tmux tracks
-                # ?2004h for the pane — some TUIs (e.g. current Kiro) don't
-                # send ?2004h so -p is a no-op and \n becomes CR (Enter).
-                buf_content = b"\x1b[200~" + keys.encode() + b"\x1b[201~"
-                paste_flag = "-r"
+                # -p asks tmux to frame the paste, but only for a pane that has
+                # asked for bracketed paste (DECSET 2004). A pane that never
+                # asked cannot usefully be handed the markers anyway — it would
+                # render them instead of honouring them — so the absence of
+                # framing there is the correct outcome rather than a gap.
+                #
+                # -r is what makes this equivalent to a real paste for
+                # multi-line text: without it paste-buffer rewrites every LF as
+                # CR, and a composer reads each CR as Enter, submitting the
+                # message a line at a time.
+                paste_flags = ["-p", "-r"]
             else:
-                buf_content = keys.encode()
-                paste_flag = "-p"
+                # Shell commands, where each newline *should* become the Enter
+                # that runs the line.
+                paste_flags = ["-p"]
             subprocess.run(
                 ["tmux", "load-buffer", "-b", buf_name, "-"],
                 input=buf_content,
                 check=True,
             )
             subprocess.run(
-                ["tmux", "paste-buffer", paste_flag, "-b", buf_name, "-t", target],
+                ["tmux", "paste-buffer", *paste_flags, "-b", buf_name, "-t", target],
                 check=True,
             )
             # Delay to let the TUI process the bracketed paste end sequence before
