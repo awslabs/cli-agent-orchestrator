@@ -163,6 +163,22 @@ def _records(path: Path) -> List[Dict[str, Any]]:
     return records
 
 
+#: The key under which a readiness receipt publishes the session id the
+#: provider itself reported. Named rather than spelled twice because it is
+#: a cross-module contract: the consumer that assembles the bind proof
+#: reads this exact key, and when the two were independent literals they
+#: drifted -- the receipt said ``native_session_id`` while the consumer
+#: asked for ``session_id``, so the field was silently always absent and
+#: every real Claude native launch was refused as not-yet-ready forever.
+#:
+#: Deliberately NOT the raw hook payload's own spelling. Claude's
+#: SessionStart record calls it ``session_id``; a receipt is a published
+#: statement rather than a copy of the input, and the two namespaces
+#: staying distinct is what lets the raw records be matched on one key
+#: while the receipt publishes another.
+SESSION_START_ID_KEY = "native_session_id"
+
+
 def observed_session_ids(path: Path) -> List[str]:
     """The session ids that have started, in the order they were recorded."""
     return [
@@ -219,7 +235,7 @@ def await_session_start(
     return {
         "schema": READINESS_SCHEMA,
         "hook_event": READINESS_HOOK_EVENT,
-        "native_session_id": native_session_id,
+        SESSION_START_ID_KEY: native_session_id,
         "readiness_path": str(path),
         # Corroboration only. The transcript path is Claude's own view of
         # where the session lives; it is recorded because a human

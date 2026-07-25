@@ -27,6 +27,7 @@ from __future__ import annotations
 import pytest
 
 from cli_agent_orchestrator.services import claude_native_launch as cl
+from cli_agent_orchestrator.services import claude_native_readiness
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
 from cli_agent_orchestrator.services import provider_contracts as pc
 
@@ -340,7 +341,9 @@ class TestTheReadinessSiblingHasThreeStates:
                 "readiness": {
                     "model_input_ready": True,
                     "provider_session_id": "sess-1",
-                    "provider_session_start": {"session_id": "sess-1"},
+                    "provider_session_start": {
+                        claude_native_readiness.SESSION_START_ID_KEY: "sess-1"
+                    },
                     "model_input_ready_observation": {"pane_id": "%3"},
                     "process_identity": {"pid": 42, "start_marker": "m"},
                 },
@@ -357,7 +360,9 @@ class TestTheReadinessSiblingHasThreeStates:
                 "readiness": {
                     "model_input_ready": True,
                     "provider_session_id": "sess-1",
-                    "provider_session_start": {"session_id": "sess-1"},
+                    "provider_session_start": {
+                        claude_native_readiness.SESSION_START_ID_KEY: "sess-1"
+                    },
                     "model_input_ready_observation": {
                         "pane_id": "%3",
                         "provider_status": "idle",
@@ -508,7 +513,9 @@ class TestOneCompletenessRuleForBindAndProjection:
 
     def test_a_complete_proof_satisfies_both(self, monkeypatch):
         complete = dict(self.THIN)
-        complete["provider_session_start"] = {"session_id": "sess-1"}
+        complete["provider_session_start"] = {
+            claude_native_readiness.SESSION_START_ID_KEY: "sess-1"
+        }
         complete["process_identity"] = {"pid": 7, "start_marker": "mk"}
         row = _Row(provider="claude_code")
 
