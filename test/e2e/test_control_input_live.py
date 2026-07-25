@@ -93,6 +93,11 @@ REGISTER = r"""
 import sys
 from cli_agent_orchestrator.clients.database import create_terminal
 (terminal_id, session, window, pane_id, window_id, generation, provider) = sys.argv[1:8]
+# Empty means "this terminal has no recorded server", which is what a row
+# written before the pane id was server-qualified looks like.  It is passed
+# through as None rather than as a path so the unbound case is a real
+# absence in the database, not a value that happens not to match.
+socket_path = sys.argv[8] or None
 create_terminal(
     terminal_id=terminal_id,
     tmux_session=session,
@@ -102,6 +107,7 @@ create_terminal(
     generation=generation,
     pane_id=pane_id,
     window_id=window_id,
+    server_socket_path=socket_path,
 )
 """
 
@@ -116,6 +122,9 @@ class LivePane:
     window_id: str
     generation: str
     capture: Optional[Path]
+    # The tmux server the pane id belongs to, as that server names itself.
+    # Empty for a terminal registered without one.
+    server_socket_path: str = ""
 
     def bytes_since(self, offset: int) -> bytes:
         if self.capture is None or not self.capture.exists():
@@ -183,6 +192,7 @@ def _register(server: CaoServer, pane: LivePane, provider: str) -> None:
             pane.window_id,
             pane.generation,
             provider,
+            pane.server_socket_path,
         ],
         env={**sanitized_env(), "HOME": str(server.home_dir)},
         check=False,
@@ -202,8 +212,14 @@ def _spawn(
     command: List[str],
     provider: str,
     capture: Optional[Path],
+    bind_server: bool = True,
 ) -> LivePane:
     session = f"cao-accept-{uuid.uuid4().hex[:6]}"
+    # The socket is read back from the pane's own server at the moment the
+    # pane exists, rather than taken from the fixture handle, because that
+    # is what a real registration records: the server that answered for
+    # this pane id, not the one the caller believed it was talking to.
+    # Tab-separated so a socket path is never split on its own contents.
     printed = tmux.out(
         "new-session",
         "-d",
@@ -213,10 +229,14 @@ def _spawn(
         "acceptance",
         "-P",
         "-F",
-        "#{pane_id} #{window_id}",
+        "#{pane_id}\t#{window_id}\t#{socket_path}",
         " ".join(f"'{part}'" for part in command),
     )
-    pane_id, window_id = printed.split()
+    pane_id, window_id, socket_path = printed.split("\t")
+    assert Path(socket_path).resolve() == tmux.socket_path.resolve(), (
+        "the pane reports a different server than the fixture created it on: "
+        f"{socket_path} vs {tmux.socket_path}"
+    )
     pane = LivePane(
         terminal_id=uuid.uuid4().hex[:8],
         session=session,
@@ -228,6 +248,7 @@ def _spawn(
         # incarnation of one terminal, not a test run.
         generation=f"gen-live-{uuid.uuid4().hex[:8]}",
         capture=capture,
+        server_socket_path=socket_path if bind_server else "",
     )
     _register(server, pane, provider)
     return pane
@@ -393,6 +414,61 @@ class TestIdentityRefusalsAgainstARealPane:
         assert body["reason_code"] == "identity-mismatch"
         time.sleep(0.3)
         assert recorder.bytes_since(start) == b""
+
+    def test_a_terminal_with_no_recorded_server_is_refused(
+        self, control_server, tmux_server, tmp_path
+    ):
+        """A row written before pane ids were server-qualified.
+
+        The migration adds the column but deliberately does not backfill
+        it, so every terminal registered by an older binary reaches this
+        path.  It has to refuse: the pane id in that row is a real pane
+        id on *some* server, and the only way to guess which would be to
+        ask whichever server happens to answer — which is the delivery
+        to a stranger's pane this whole binding exists to prevent.
+
+        ``refused`` rather than a hard error is the point: it is the one
+        re-attemptable outcome, so a caller re-registers the terminal and
+        the same control succeeds.  The bound twin below is that proof,
+        and it is also what makes the empty capture below mean *refused*
+        rather than *not yet*.
+        """
+        script = tmp_path / "recorder.py"
+        script.write_text(RECORDER)
+
+        def _pane(name: str, *, bind_server: bool) -> LivePane:
+            capture = tmp_path / f"{name}.bin"
+            capture.touch()
+            ready = tmp_path / f"{name}.ready"
+            pane = _spawn(
+                control_server,
+                tmux_server,
+                command=[sys.executable, str(script), str(capture), str(ready)],
+                provider="mock_cli",
+                capture=capture,
+                bind_server=bind_server,
+            )
+            assert _await(ready.exists), f"the {name} recorder never signalled ready"
+            return pane
+
+        unbound = _pane("unbound", bind_server=False)
+        bound = _pane("bound", bind_server=True)
+        try:
+            start = unbound.size()
+            body = _send(control_server, unbound).json()
+            assert body["outcome"] == "refused", body
+            assert body["reason_code"] == "server-identity-unbound", body
+            assert body["chunks_sent"] in (0, None), body
+
+            # The same request, on a pane identical but for the recorded
+            # server, does arrive — so the refusal above is the binding
+            # and nothing else about this pane or this text.
+            assert _send(control_server, bound).json()["outcome"] == "accepted"
+            _settled(bound, 0, TEXT.encode())
+            assert unbound.bytes_since(start) == b"", unbound.bytes_since(start)
+        finally:
+            tmux_server.kill_session(unbound.session)
+            tmux_server.kill_session(bound.session)
 
     def test_a_killed_pane_is_refused_rather_than_landing_elsewhere(
         self, control_server, tmux_server, recorder
