@@ -603,3 +603,97 @@ class TestReserveAcceptsTheCanonicalProvider:
                 delivery_id=str(uuid.uuid4()),
                 launch_nonce=str(uuid.uuid4()),
             )
+
+
+class TestProviderDispatchRefusesAnUnknownProvider:
+    """Each provider's rendering gets its own reader.
+
+    A shared one would eventually read a Claude screen with Kimi's rules
+    and call a busy pane idle, which is the class of mistake the whole
+    separate-adapter design exists to prevent — so an unmapped provider is
+    refused rather than defaulted to whichever adapter is first.
+    """
+
+    def test_the_control_adapter_is_chosen_by_canonical_provider(self):
+        assert v2._control_adapter("claude_code") is control
+        with pytest.raises(Exception, match="no native control adapter"):
+            v2._control_adapter("codex")
+
+    def test_the_turn_observer_is_chosen_by_canonical_provider(self):
+        with pytest.raises(Exception, match="no native turn-state observer"):
+            v2._observe_turn_state("codex", pane_id="%1")
+
+    def test_the_executable_name_is_not_a_provider_key(self):
+        """``claude`` is the binary; ``claude_code`` is the provider."""
+        with pytest.raises(Exception, match="no native control adapter"):
+            v2._control_adapter("claude")
+
+
+class TestClaudeSessionIsMintedBeforeAnyProviderIO:
+    """The identity exists before the provider does.
+
+    So a launch that dies before its first turn still has a recorded
+    identity — the structural opposite of the Kimi path, where the id is
+    read back out of a transport and does not exist until it answers.
+    """
+
+    def _record(self, tmp_path):
+        return {
+            "terminal_id": "abc12345",
+            "generation": "gen-claude-1",
+            "working_directory": str(tmp_path),
+        }
+
+    def _request(self):
+        return {"expected_model": "claude-opus-4-8", "expected_effort": "high"}
+
+    def test_minting_spends_no_provider_io_and_prepares_the_hook(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companion")
+
+        bootstrap, hook = v2._mint_claude_native_session(
+            record=self._record(tmp_path),
+            request=self._request(),
+            version_output=f"{PINNED} (Claude Code)",
+            digest="d" * 64,
+        )
+
+        assert bootstrap["provider"] == "claude_code"
+        assert bootstrap["id_source"] == "cli_session_id"
+        launch.validate_session_id(bootstrap["native_session_id"])
+        # No turn can have been submitted: nothing was started at all.
+        assert bootstrap["task_bytes_submitted"] is False
+        # The hook file is prepared *before* the launch, so Claude has
+        # somewhere to write the instant it starts.
+        assert Path(hook["readiness_path"]).parent.exists()
+        assert bootstrap["readiness_path"] == str(hook["readiness_path"])
+
+    def test_a_drifted_build_is_refused_before_an_identity_is_minted(self, tmp_path, monkeypatch):
+        """Refusing after minting would record a session never to be started."""
+        monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companion")
+
+        with pytest.raises(Exception):
+            v2._mint_claude_native_session(
+                record=self._record(tmp_path),
+                request=self._request(),
+                version_output="2.0.1 (Claude Code)",
+                digest="d" * 64,
+            )
+
+    def test_each_mint_chooses_a_fresh_identity(self, tmp_path, monkeypatch):
+        """A generation is never reused, so neither is the session it names."""
+        monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companion")
+
+        first, _ = v2._mint_claude_native_session(
+            record=self._record(tmp_path),
+            request=self._request(),
+            version_output=f"{PINNED} (Claude Code)",
+            digest="d" * 64,
+        )
+        second, _ = v2._mint_claude_native_session(
+            record={**self._record(tmp_path), "generation": "gen-claude-2"},
+            request=self._request(),
+            version_output=f"{PINNED} (Claude Code)",
+            digest="d" * 64,
+        )
+
+        assert first["native_session_id"] != second["native_session_id"]

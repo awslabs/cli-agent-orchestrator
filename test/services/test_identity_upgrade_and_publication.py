@@ -603,3 +603,125 @@ class TestV2ReservationPublishesWhatTheConductorReads:
 
         assert set(published) == set(v2.PUBLISHED_TERMINAL_FIELDS)
         assert published["lifecycle_state"] is None
+
+
+class TestVerificationOutcomesAreDistinguished:
+    """Absent, unreadable and dead are three answers, not one.
+
+    Collapsing them is what turned "we could not look" into "the worker is
+    gone" — a durable demotion, on no evidence.
+    """
+
+    def test_a_backend_that_cannot_answer_leaves_the_name_path_alone(
+        self, isolated_memory_db, monkeypatch
+    ):
+        """A double answers every attribute with a stand-in object.
+
+        Treating that as a declared capability would enforce the boundary
+        against evidence the double never gathered, so the check is
+        ``is True`` and anything else opts out.
+        """
+
+        class Undeclared:
+            supports_pane_identity = "yes, obviously"
+
+        monkeypatch.setattr(terminal_service, "get_backend", lambda: Undeclared())
+        database.create_terminal(
+            terminal_id="aa00aa00",
+            tmux_session="cao-up",
+            tmux_window="worker",
+            provider="claude_code",
+            pane_id="%10",
+            window_id="@10",
+            session_id="$1",
+            pane_pid=4242,
+            server_socket_path=SOCKET,
+        )
+
+        target = terminal_service.verified_pane_target(
+            "aa00aa00", database.get_terminal_metadata("aa00aa00"), operation="control input"
+        )
+
+        assert target is None
+
+    def test_an_unreadable_pane_is_unknown_liveness_not_dead(self, isolated_memory_db, backend):
+        """The server could not be asked. That is not evidence either way."""
+        fake = backend({})
+        fake._panes = {}
+        monkey = {"outcome": "unreadable", "pane_id": "%10"}
+        fake.observe_pane_identity = lambda pane_id: dict(monkey)
+        database.create_terminal(
+            terminal_id="bb00bb00",
+            tmux_session="cao-up",
+            tmux_window="worker",
+            provider="claude_code",
+            pane_id="%10",
+            window_id="@10",
+            session_id="$1",
+            pane_pid=4242,
+            server_socket_path=SOCKET,
+        )
+
+        with pytest.raises(terminal_service.TerminalIdentityMismatchError, match="could not be"):
+            terminal_service.verified_pane_target(
+                "bb00bb00",
+                database.get_terminal_metadata("bb00bb00"),
+                operation="control input",
+            )
+
+        row = database.get_terminal_metadata("bb00bb00")
+        assert row["lifecycle_state"] == terminal_service.LIFECYCLE_UNKNOWN_LIVENESS
+        # Not reaped: an unreadable worker may be perfectly alive.
+        assert row["lifecycle_state"] != terminal_service.LIFECYCLE_DEAD
+
+    def test_a_dead_pane_is_reported_as_dead(self, isolated_memory_db, backend):
+        backend({"%10": _pane(dead="1")})
+        database.create_terminal(
+            terminal_id="cc00cc00",
+            tmux_session="cao-up",
+            tmux_window="worker",
+            provider="claude_code",
+            pane_id="%10",
+            window_id="@10",
+            session_id="$1",
+            pane_pid=4242,
+            server_socket_path=SOCKET,
+        )
+
+        with pytest.raises(terminal_service.TerminalIdentityMismatchError, match="is dead"):
+            terminal_service.verified_pane_target(
+                "cc00cc00",
+                database.get_terminal_metadata("cc00cc00"),
+                operation="control input",
+            )
+        assert (
+            database.get_terminal_metadata("cc00cc00")["lifecycle_state"]
+            == terminal_service.LIFECYCLE_DEAD
+        )
+
+    def test_a_renamed_window_is_still_the_right_worker(self, isolated_memory_db, backend):
+        """A name is a label. Demoting on one would reap live terminals.
+
+        The verified names are the ones the pane answers to *now*, and the
+        row's cached labels are refreshed to match — not re-pointed, since
+        the identity was just proven unchanged.
+        """
+        backend({"%10": _pane(window_name="renamed-itself")})
+        database.create_terminal(
+            terminal_id="dd00dd00",
+            tmux_session="cao-up",
+            tmux_window="worker",
+            provider="claude_code",
+            pane_id="%10",
+            window_id="@10",
+            session_id="$1",
+            pane_pid=4242,
+            server_socket_path=SOCKET,
+        )
+
+        target = terminal_service.verified_pane_target(
+            "dd00dd00", database.get_terminal_metadata("dd00dd00"), operation="control input"
+        )
+
+        assert target.window_name == "renamed-itself"
+        assert database.get_terminal_metadata("dd00dd00")["tmux_window"] == "renamed-itself"
