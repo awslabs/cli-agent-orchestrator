@@ -7,10 +7,21 @@ leaves the pane showing raw JSON-RPC.  This branch starts the provider's
 own terminal UI instead, so the pane a human opens is the session, not a
 transport log.
 
-``kimi_native_launch`` builds the argv; this module runs the launch.  The
-split matters because argv construction is pure and the launch is not:
-everything here either changes durable ownership or starts a process, and
-the ordering between those two is the whole point.
+A per-provider argv binder builds the argv; this module runs the launch.
+The split matters because argv construction is pure and the launch is
+not: everything here either changes durable ownership or starts a
+process, and the ordering between those two is the whole point.
+
+The binder is chosen by canonical provider rather than hardcoded, because
+the two supported providers acquire their identity in opposite
+directions. Kimi's session is minted by a separate ACP process and the
+TUI *resumes* it, so a Kimi launch is always a resume. Claude's identity
+is a uuid chosen before any provider I/O and handed to the TUI as
+``--session-id``, so a first Claude launch *starts* the session and only
+a recovery resumes it. That is why :func:`start` takes ``launch_kind``:
+the difference is not a detail of argv formatting, it is which of the two
+things is happening, and a caller that gets it wrong must be refused
+rather than quietly given the other form.
 
 Three orderings are load-bearing, and each exists because of a specific
 way a native launch corrupts a live provider session:
@@ -63,6 +74,7 @@ import subprocess
 from datetime import datetime, timezone
 from typing import Any, Mapping, NoReturn, Optional, Protocol, Sequence
 
+from cli_agent_orchestrator.services import claude_native_launch
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import kimi_native_launch, native_attachment
 
@@ -359,15 +371,16 @@ def _publish(
     the provider will refuse to open, and it fails after the launch has
     already reported success.
     """
-    if not kimi_native_launch.resumes_exactly(observation["argv"], native_session_id):
+    if not _binder(provider)["binds_exactly"](observation["argv"], native_session_id):
         _freeze(
             provider=provider,
             native_session_id=native_session_id,
             reason=AMBIGUOUS_ARGV_MISMATCH,
             detail=(
-                f"the pane's primary process does not resume exactly {native_session_id!r}; "
-                "a resume that lost its id opens an interactive picker rather than failing, "
-                "so the running session may be a different one"
+                f"the pane's primary process does not bind exactly {native_session_id!r}; "
+                "on both supported providers a resume that lost its id opens an "
+                "interactive picker rather than failing, so the running session may be "
+                "a different one"
             ),
         )
     observed_cwd = os.path.realpath(observation["cwd"])
@@ -453,6 +466,69 @@ def _result(
     }
 
 
+#: A launch that starts a session whose id was chosen before it, versus
+#: one that reattaches to a session that already exists. Named rather
+#: than inferred: "is this the first launch?" is a fact the caller holds
+#: and this module cannot recover, and guessing it would mean sometimes
+#: resuming a session that was never started.
+LAUNCH_KIND_NEW = "new"
+LAUNCH_KIND_RESUME = "resume"
+LAUNCH_KINDS = (LAUNCH_KIND_NEW, LAUNCH_KIND_RESUME)
+
+
+def _kimi_argv(
+    *, session_id: str, binary: str, extra_args: Optional[Sequence[str]], launch_kind: str
+) -> list[str]:
+    if launch_kind != LAUNCH_KIND_RESUME:
+        raise NativeLaunchInvalid(
+            "kimi native sessions are minted by the ACP bootstrap before the TUI starts, "
+            f"so the only lawful launch form is a resume; got launch_kind {launch_kind!r}"
+        )
+    try:
+        return kimi_native_launch.build_resume_argv(
+            session_id=session_id, kimi_binary=binary, extra_args=extra_args
+        )
+    except kimi_native_launch.KimiNativeLaunchError as exc:
+        raise NativeLaunchInvalid(str(exc)) from exc
+
+
+def _claude_argv(
+    *, session_id: str, binary: str, extra_args: Optional[Sequence[str]], launch_kind: str
+) -> list[str]:
+    builder = (
+        claude_native_launch.build_launch_argv
+        if launch_kind == LAUNCH_KIND_NEW
+        else claude_native_launch.build_resume_argv
+    )
+    try:
+        return builder(session_id=session_id, claude_binary=binary, extra_args=extra_args)
+    except claude_native_launch.ClaudeNativeLaunchError as exc:
+        raise NativeLaunchInvalid(str(exc)) from exc
+
+
+#: Per-provider argv construction and the matching "does this argv bind
+#: exactly that session?" check. The two halves are registered together
+#: on purpose: a builder paired with the wrong checker would construct a
+#: correct argv and then verify it against a different provider's rules,
+#: which passes and means nothing.
+_ARGV_BINDERS: dict[str, dict[str, Any]] = {
+    "kimi_cli": {"build": _kimi_argv, "binds_exactly": kimi_native_launch.resumes_exactly},
+    "claude_code": {"build": _claude_argv, "binds_exactly": claude_native_launch.binds_exactly},
+}
+
+SUPPORTED_NATIVE_PROVIDERS = frozenset(_ARGV_BINDERS)
+
+
+def _binder(provider: str) -> dict[str, Any]:
+    binder = _ARGV_BINDERS.get(provider)
+    if binder is None:
+        raise NativeLaunchInvalid(
+            f"no native-TUI argv binding is implemented for provider {provider!r}; "
+            f"implemented: {sorted(SUPPORTED_NATIVE_PROVIDERS)}"
+        )
+    return binder
+
+
 def start(
     *,
     provider: str,
@@ -466,6 +542,7 @@ def start(
     working_directory: str,
     transport: NativePaneTransport,
     extra_args: Optional[Sequence[str]] = None,
+    launch_kind: str = LAUNCH_KIND_RESUME,
 ) -> dict[str, Any]:
     """Claim, launch, prove, and publish one native TUI attachment.
 
@@ -502,18 +579,23 @@ def start(
     # attachment.
     working_directory = _validate_working_directory(working_directory)
 
-    try:
-        argv = kimi_native_launch.build_resume_argv(
-            session_id=native_session_id, kimi_binary=binary, extra_args=extra_args
+    if launch_kind not in LAUNCH_KINDS:
+        raise NativeLaunchInvalid(
+            f"launch_kind must be one of {list(LAUNCH_KINDS)}; got {launch_kind!r}"
         )
-    except kimi_native_launch.KimiNativeLaunchError as exc:
-        raise NativeLaunchInvalid(str(exc)) from exc
-    if not kimi_native_launch.resumes_exactly(argv, native_session_id):
-        # Unreachable through build_resume_argv, and checked anyway: this
-        # is the last point before a claim at which a wrong argv costs
+    binder = _binder(provider)
+    argv = binder["build"](
+        session_id=native_session_id,
+        binary=binary,
+        extra_args=extra_args,
+        launch_kind=launch_kind,
+    )
+    if not binder["binds_exactly"](argv, native_session_id):
+        # Unreachable through the builders, and checked anyway: this is
+        # the last point before a claim at which a wrong argv costs
         # nothing, and the first point after it at which it costs a
         # frozen session.
-        raise NativeLaunchInvalid("the constructed argv does not resume exactly the bound session")
+        raise NativeLaunchInvalid("the constructed argv does not bind exactly the bound session")
 
     try:
         record, _acquired = native_attachment.declare(

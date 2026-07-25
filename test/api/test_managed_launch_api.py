@@ -80,6 +80,36 @@ def test_capability_handshake_is_exact_and_versioned(client):
         # only what it has a branch for, so the two permissions are
         # advertised separately.
         "v2_launchable_execution_modes": ["acp", "native_tui"],
+        # Additive and per-provider. The flat mode list above cannot say
+        # *which* providers have a native adapter, and relaxing it to mean
+        # "all of them" would advertise a launch for providers with no
+        # branch. A consumer must satisfy both gates, from this one
+        # response: native_tui in the launchable modes AND
+        # providers[<provider>].supported. An older peer omits this key
+        # entirely, which reads as unsupported.
+        "native_tui": {
+            "schema_version": 1,
+            "providers": {
+                "claude_code": {
+                    "supported": True,
+                    "id_source": "cli_session_id",
+                    "readiness_receipt_kind": "claude-native-session-start",
+                    # The executable, which is a different namespace from
+                    # the canonical provider key this map is keyed by.
+                    "executable": "claude",
+                    "pinned_version": "2.1.220",
+                    "supported_versions": ["2.1.220"],
+                },
+                "kimi_cli": {
+                    "supported": True,
+                    "id_source": "acp_session_new",
+                    "readiness_receipt_kind": "kimi-native-tui-attached",
+                    "executable": "kimi",
+                    "pinned_version": "0.29.1",
+                    "supported_versions": ["0.29.1", "0.29.0"],
+                },
+            },
+        },
     }
 
 

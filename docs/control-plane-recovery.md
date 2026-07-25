@@ -25,7 +25,7 @@ negotiation surface:
   receipt from the human-authorized artifact; otherwise `unproven`
   (always, today).
 - `observed_route`: per provider. No pinned provider (Codex 0.145.0,
-  Claude Code 2.1.218, Kimi 0.29.0) emits a model-input-bound non-echo
+  Claude Code 2.1.220, Kimi 0.29.1/0.29.0) emits a model-input-bound non-echo
   receipt carrying resolved model and effective effort, so Codex and
   Claude report `unsupported` and Kimi reports `unproven`. Provider
   echo, manifest requests, TUI/footer state, logs, and client-local

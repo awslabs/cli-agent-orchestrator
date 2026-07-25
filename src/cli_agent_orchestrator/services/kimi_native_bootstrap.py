@@ -55,11 +55,11 @@ from typing import Any, Mapping, Optional, Protocol, Sequence
 from cli_agent_orchestrator.services import kimi_native_launch, native_attachment
 from cli_agent_orchestrator.services.kimi_route import _current_option
 from cli_agent_orchestrator.services.provider_contracts import (
-    PINNED_VERSIONS,
     PROVIDER_KIMI,
     ProviderContractError,
     check_pinned_version,
     native_id_source,
+    normalized_version,
 )
 
 BOOTSTRAP_SCHEMA = "cao-kimi-native-bootstrap-v1"
@@ -279,28 +279,35 @@ def mint_session(
     not take would otherwise become a worker quietly running the wrong
     model under a receipt that says otherwise.
     """
-    digest = _validate_binary(kimi_binary, binary_sha256, version_output)
-    cwd = _validate_working_directory(working_directory)
-    wanted_model = _require_text(model, field="model")
-    wanted_effort = _require_text(effort, field="effort")
-    servers = [dict(server) for server in mcp_servers]
-
-    initialize_params: dict[str, Any] = {
-        "protocolVersion": ACP_PROTOCOL_VERSION,
-        "clientCapabilities": {
-            "fs": {"readTextFile": False, "writeTextFile": False},
-            "terminal": False,
-        },
-        "clientInfo": {"name": CLIENT_NAME, "version": BOOTSTRAP_SCHEMA},
-    }
-    session_params: dict[str, Any] = {"cwd": cwd, "mcpServers": servers}
-
-    # The exchange runs inside try/finally so that a protocol failure
-    # still tears the minting process down.  ``_prove_exit`` raising from
-    # the finally block deliberately displaces an exchange error that was
-    # already propagating: a live unowned process outranks a failed mint,
-    # and the original remains attached as the exception's context.
+    # Everything below runs under a finally that terminates the injected
+    # transport.  The minting process already exists — the caller spawned
+    # it before handing the transport here — so a refusal from the binary,
+    # working-directory, version, or route validation must not return
+    # while that process is still attached to a session.  Pulling those
+    # validations inside the try is the whole point: an ESC-less exit that
+    # sends no ACP request at all still passes through ``_terminate``
+    # exactly once, so no refusal ever leaks a running provider behind a
+    # ``preflight_blocked`` reservation.  ``_validated_exit_proof`` raising
+    # from the finally deliberately displaces an error already
+    # propagating: a live unowned process outranks whatever failed the
+    # mint, and the original remains attached as the exception's context.
     try:
+        digest = _validate_binary(kimi_binary, binary_sha256, version_output)
+        cwd = _validate_working_directory(working_directory)
+        wanted_model = _require_text(model, field="model")
+        wanted_effort = _require_text(effort, field="effort")
+        servers = [dict(server) for server in mcp_servers]
+
+        initialize_params: dict[str, Any] = {
+            "protocolVersion": ACP_PROTOCOL_VERSION,
+            "clientCapabilities": {
+                "fs": {"readTextFile": False, "writeTextFile": False},
+                "terminal": False,
+            },
+            "clientInfo": {"name": CLIENT_NAME, "version": BOOTSTRAP_SCHEMA},
+        }
+        session_params: dict[str, Any] = {"cwd": cwd, "mcpServers": servers}
+
         initialized = transport.request("initialize", initialize_params)
         session = transport.request("session/new", session_params)
         if not isinstance(session, Mapping):
@@ -334,7 +341,10 @@ def mint_session(
         "provider": PROVIDER_KIMI,
         "native_session_id": session_id,
         "id_source": native_id_source(PROVIDER_KIMI),
-        "provider_version": PINNED_VERSIONS[PROVIDER_KIMI],
+        # The exact version the pinned binary reports (0.29.0 or 0.29.1),
+        # validated by _validate_binary above — not a pin constant that
+        # could name the wrong one of several accepted builds.
+        "provider_version": normalized_version(version_output),
         "binary_path": kimi_binary,
         "binary_sha256": digest,
         "working_directory": cwd,

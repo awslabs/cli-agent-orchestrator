@@ -34,7 +34,11 @@ class ManagedLaunchV2ReserveRequest(BaseModel):
     protocol_version: ProtocolVersionV2
     reservation_id: str
     session_name: str
-    provider: Literal["codex", "kimi_cli"]
+    # Canonical provider keys. ``claude_code`` is the provider; ``claude``
+    # is only the executable name and never appears here — the two are
+    # kept apart deliberately, because a surface that accepted both would
+    # make "which provider is this?" answerable two ways.
+    provider: Literal["codex", "kimi_cli", "claude_code"]
     agent_profile: str
     caller_id: str
     working_directory: str
@@ -189,6 +193,69 @@ class ManagedLaunchV2AdmitRequest(BaseModel):
     def _sender_hex(cls, value: str) -> str:
         if not _CALLER_RE.fullmatch(value):
             raise ValueError("sender_id must be 8 lowercase hex characters")
+        return value
+
+
+class ManagedLaunchV2NegativeRequest(BaseModel):
+    """Finalize a proven zero-byte preflight failure for recovery.
+
+    Carries the generation-bound identity that must match the fork's
+    durable reservation row exactly, plus a single-use ``finalize_id`` so
+    a re-driven recovery is idempotent rather than a second finalization.
+    The reason is free text; the fork redacts it before persisting.
+    """
+
+    protocol_version: ProtocolVersionV2
+    finalize_id: str
+    terminal_id: str
+    generation: str
+    obligation_generation: str
+    reason: str
+
+    @field_validator("finalize_id", "generation")
+    @classmethod
+    def _negative_uuids(cls, value: str) -> str:
+        return _uuid_text(value)
+
+    @field_validator("terminal_id")
+    @classmethod
+    def _negative_terminal_hex(cls, value: str) -> str:
+        if not _CALLER_RE.fullmatch(value):
+            raise ValueError("terminal_id must be 8 lowercase hex characters")
+        return value
+
+    @field_validator("obligation_generation", "reason")
+    @classmethod
+    def _negative_non_empty(cls, value: str) -> str:
+        if not value:
+            raise ValueError("must be non-empty")
+        return value
+
+
+class ManagedLaunchV2CleanupRequest(BaseModel):
+    """Release the terminal record for a finalized zero-byte generation.
+
+    Idempotent by ``cleanup_id``; the terminal/generation identity must
+    match the reservation row.  This releases only the fork-owned terminal
+    metadata record — it never tears down a pane or process, which remains
+    the destructive endpoint's job under its own containment gate.
+    """
+
+    protocol_version: ProtocolVersionV2
+    cleanup_id: str
+    terminal_id: str
+    generation: str
+
+    @field_validator("cleanup_id", "generation")
+    @classmethod
+    def _cleanup_uuids(cls, value: str) -> str:
+        return _uuid_text(value)
+
+    @field_validator("terminal_id")
+    @classmethod
+    def _cleanup_terminal_hex(cls, value: str) -> str:
+        if not _CALLER_RE.fullmatch(value):
+            raise ValueError("terminal_id must be 8 lowercase hex characters")
         return value
 
 

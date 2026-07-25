@@ -27,7 +27,7 @@ import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 from sqlalchemy.exc import OperationalError
 
@@ -46,10 +46,17 @@ from cli_agent_orchestrator.clients.database import (
     delete_terminal_v2_if_generation as db_delete_terminal_v2_if_generation,
 )
 from cli_agent_orchestrator.clients.database import (
+    find_terminal_by_pane_identity,
     get_terminal_metadata,
     get_terminal_metadata_v2,
+    record_terminal_lifecycle,
+    refresh_terminal_window_names,
+    register_terminal_incarnation,
+    set_terminal_native_session_id,
     update_last_active,
     update_terminal_shell_command,
+    upgrade_terminal_identity_from_observation,
+    upgrade_v2_terminal_identity_from_observation,
 )
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
@@ -102,6 +109,454 @@ _deferred_init_tasks: set = set()
 
 class TerminalInputBlockedError(Exception):
     """Raised when orchestrated input would answer an active interactive prompt."""
+
+
+class TerminalIdentityMismatchError(TerminalInputBlockedError):
+    """The terminal's recorded pane no longer resolves to what was recorded.
+
+    Deliberately a subclass of the input-blocked error rather than a new
+    exception family: to every caller this is the same kind of answer —
+    "this terminal is not a lawful target right now, and nothing was
+    delivered" — and it inherits the refusal mapping the API boundary
+    already applies. Read paths raise it too, which reads oddly by name but
+    is the honest outcome: a read resolved by a stale name returns another
+    worker's screen, so refusing is the same decision as refusing a write.
+    """
+
+
+LIFECYCLE_LIVE = "live"
+LIFECYCLE_SUPERSEDED = "superseded"
+LIFECYCLE_DEAD = "dead"
+LIFECYCLE_UNKNOWN_LIVENESS = "unknown-liveness"
+
+#: The canonical identity of one live incarnation. All five or none —
+#: there is no useful subset.
+#:
+#: Each field closes a way the others can be wrong. ``server_socket_path``
+#: is not optional context: a pane id is unique only *within* one tmux
+#: server, several run on one host, and an id with no server named is an
+#: id on whichever server the reading process happens to reach.
+#: ``pane_pid`` closes the remaining gap, which is not hypothetical — a
+#: tmux server restart hands out ``%0``/``%1`` again, so the old ids
+#: resolve to different live panes on a socket with the same path.
+IDENTITY_FIELDS = ("server_socket_path", "session_id", "window_id", "pane_id", "pane_pid")
+
+IDENTITY_ABSENT = "absent"
+IDENTITY_PARTIAL = "partial"
+IDENTITY_COMPLETE = "complete"
+
+
+def identity_completeness(metadata: Dict[str, Any]) -> str:
+    """Whether a row carries a whole canonical identity, some of one, or none.
+
+    The three answers get three different treatments, and the middle one
+    is the point:
+
+    ``complete``  every field present — the row may be verified and
+                  addressed by id.
+    ``partial``   some fields present — **fail closed**. The missing
+                  fields cannot be inferred, and inferring them is the
+                  specific mistake: a pane id without its server silently
+                  means "this pane on the default server", which after a
+                  tmux restart is a different live pane wearing the same
+                  id. Refusing costs an operator a re-registration;
+                  guessing costs somebody else's session.
+    ``absent``    no fields at all — a row predating identity
+                  persistence. Unmanaged, and left on the name-resolved
+                  path it has always used.
+    """
+    present = [field for field in IDENTITY_FIELDS if metadata.get(field)]
+    if not present:
+        return IDENTITY_ABSENT
+    if len(present) == len(IDENTITY_FIELDS):
+        return IDENTITY_COMPLETE
+    return IDENTITY_PARTIAL
+
+
+class VerifiedPaneTarget(NamedTuple):
+    """One pane, proven at a single instant to still be the registered one.
+
+    ``pane_id`` is what a write targets: it is immutable, so nothing can
+    slip between the proof and the write. ``session_name``/``window_name``
+    are the names that pane answers to *now* — not the names recorded on
+    the row, which a rename or a later unrelated window may since have
+    taken. Read paths that can only address a name use these, so they read
+    the pane that was verified rather than whatever currently occupies the
+    recorded name.
+    """
+
+    pane_id: str
+    session_name: str
+    window_name: str
+
+
+def _register_incarnation(
+    terminal_id: str,
+    generation: Optional[str],
+    identity: Dict[str, Any],
+    *,
+    native_session_id: Optional[str] = None,
+) -> bool:
+    """Register the live incarnation this create just produced.
+
+    The insert above already wrote the tuple, so on a first launch this
+    call finds every field equal and writes nothing. That is the point: it
+    makes the registration path the one both a new launch and a later
+    re-drive go through, so idempotency by ``(terminal_id, generation)``
+    and the refusal to re-point are exercised by ordinary use rather than
+    being guarantees nothing ever tests.
+
+    Failure is logged, never raised. The row is already correct — this call
+    can only confirm it — so treating a bookkeeping hiccup as a launch
+    failure would tear down a working terminal over a redundant write.
+    """
+    try:
+        registered = register_terminal_incarnation(
+            terminal_id,
+            generation=generation,
+            server_socket_path=identity.get("server_socket_path") or "",
+            session_id=identity.get("session_id") or "",
+            window_id=identity.get("window_id") or "",
+            pane_id=identity.get("pane_id") or "",
+            pane_pid=int(identity["pane_pid"]) if identity.get("pane_pid") else 0,
+            native_session_id=native_session_id,
+        )
+    except Exception as exc:  # pragma: no cover - see the docstring
+        logger.warning("Could not register incarnation for %s: %s", terminal_id, exc)
+        return False
+    if not registered:
+        # Reached when the observation was incomplete, or when the row
+        # already holds a different pane. Neither is fatal here, and both
+        # are worth a line: the first means this terminal will refuse
+        # identity-addressed use, the second that something tried to move
+        # an existing handle.
+        logger.info(
+            "Terminal %s was not registered as a live incarnation (identity %s)",
+            terminal_id,
+            {field: identity.get(field) for field in IDENTITY_FIELDS},
+        )
+    return registered
+
+
+def record_native_session(terminal_id: str, native_session_id: str) -> bool:
+    """Bind a proven provider-native session to this terminal's row.
+
+    Called once the provider has answered — the SessionStart hook for
+    Claude, the ACP bootstrap for Kimi — rather than when the launcher
+    chose the id, so the row records what was observed rather than what was
+    intended. Without it the field stays NULL on every managed row, which
+    costs the native-session half of the supersession test: a pane running
+    a *different* session than the one registered would otherwise look
+    identical to the right one.
+    """
+    try:
+        return set_terminal_native_session_id(terminal_id, native_session_id)
+    except Exception as exc:  # pragma: no cover - a missing label is not fatal
+        logger.warning("Could not record native session for %s: %s", terminal_id, exc)
+        return False
+
+
+def upgrade_observed_identity(
+    terminal_id: str, metadata: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Complete a pre-upgrade row from an observation of its own pane.
+
+    Returns the updated metadata when the row was completed, or ``None``
+    when it was not — in which case the caller refuses exactly as before.
+
+    The build deployed before this one recorded ``pane_id``, ``window_id``
+    and ``server_socket_path``. Adding ``session_id`` and ``pane_pid`` to
+    the canonical tuple makes every one of those rows partial, and partial
+    fails closed, so without this step installing over an existing database
+    would leave the running fleet unable to take control input, unreadable,
+    and unattachable — fail-closed, so nothing is misdelivered, but dead.
+
+    The distinction that makes this lawful is *observed* versus *invented*.
+    The migration declines to backfill because it runs against whichever
+    tmux server the upgrading process reaches, so what it wrote would be a
+    guess that the later identity check then confirms — the check agreeing
+    with itself. Here the row already names a pane and a server; the pane
+    is looked up on that server, and the two missing fields are read from
+    that same record. If the pane is not there, or the enumeration cannot
+    be made, nothing is written and the refusal stands.
+
+    A row missing ``pane_id`` or ``server_socket_path`` is never upgraded:
+    there is nothing to observe it against, and that is precisely the case
+    where a guess would put a live handle on somebody else's pane.
+
+    The write is dispatched by protocol vintage, exactly as the
+    native-session writers are. The deployed build created three-of-five
+    rows in *both* stores, and the managed store is isolated with its own
+    prefixed columns, so a v2 row handed to the shared-table writer
+    matches nothing: the upgrade silently reports failure and the whole
+    preserved managed fleet stays demoted forever.
+    """
+    pane_id = metadata.get("pane_id")
+    socket_path = metadata.get("server_socket_path")
+    if not pane_id or not socket_path:
+        return None
+    if metadata.get("session_id") and metadata.get("pane_pid"):
+        return None
+
+    backend = get_backend()
+    if getattr(backend, "supports_pane_identity", False) is not True:
+        return None
+    try:
+        observed = backend.observe_pane_identity(pane_id)
+    except Exception as exc:  # pragma: no cover - an unreadable server is a refusal
+        logger.debug("Identity upgrade could not observe pane %s: %s", pane_id, exc)
+        return None
+    if not isinstance(observed, dict) or observed.get("outcome") != "observed":
+        return None
+    # The observation has to be of the pane on *this row's* server. A pane
+    # id read from a different server is a different pane wearing the same
+    # id, which is the whole reason the socket is part of the identity.
+    if str(observed.get("server_socket_path")) != str(socket_path):
+        return None
+    session_id = observed.get("session_id")
+    pane_pid = observed.get("pane_pid")
+    if not session_id or not pane_pid:
+        return None
+
+    writer = (
+        upgrade_v2_terminal_identity_from_observation
+        if metadata.get("protocol_vintage") == "v2"
+        else upgrade_terminal_identity_from_observation
+    )
+    try:
+        completed = writer(
+            terminal_id,
+            pane_id=pane_id,
+            server_socket_path=socket_path,
+            session_id=str(session_id),
+            pane_pid=int(pane_pid),
+        )
+    except Exception as exc:  # pragma: no cover - a failed upgrade is a refusal
+        logger.warning("Could not persist observed identity for %s: %s", terminal_id, exc)
+        return None
+    if not completed:
+        return None
+
+    logger.info(
+        "Completed pre-upgrade identity for terminal %s from its own pane %s",
+        terminal_id,
+        pane_id,
+    )
+    upgraded = dict(metadata)
+    upgraded["session_id"] = str(session_id)
+    upgraded["pane_pid"] = int(pane_pid)
+    return upgraded
+
+
+def verified_pane_target(
+    terminal_id: str,
+    metadata: Dict[str, Any],
+    *,
+    operation: str,
+) -> Optional[VerifiedPaneTarget]:
+    """Prove the terminal's recorded pane is still the pane it registered.
+
+    Returns the verified target, or ``None`` when this row is outside the
+    identity boundary and the caller should keep resolving by name. Raises
+    :class:`TerminalIdentityMismatchError` when the row *is* inside the
+    boundary and the proof fails — before anything is written or read.
+
+    A row is inside the boundary only when it records the *whole*
+    canonical identity (see :func:`identity_completeness`). A partial
+    identity is refused rather than partially trusted, and a row with no
+    identity at all keeps resolving by name exactly as before — the
+    documented boundary of this change rather than an oversight.
+
+    The check is read-only. It spends no provider turn, delivers no byte,
+    and its whole cost is one enumeration of the panes tmux already knows
+    about — so a refused operation costs nothing and a demotion is never
+    something the system did to a worker, only something it noticed.
+    """
+    completeness = identity_completeness(metadata)
+    if completeness == IDENTITY_ABSENT:
+        return None
+    if completeness == IDENTITY_PARTIAL:
+        # A row created by the previously deployed build carries exactly
+        # three of the five fields, so every one of them lands here on the
+        # first read after an upgrade. Try to complete it from an
+        # observation of its own pane before refusing — see
+        # :func:`upgrade_observed_identity` for why an observation may do
+        # what the migration must not.
+        upgraded = upgrade_observed_identity(terminal_id, metadata)
+        if upgraded is not None:
+            metadata = upgraded
+            completeness = identity_completeness(metadata)
+    if completeness == IDENTITY_PARTIAL:
+        recorded = {field: metadata.get(field) for field in IDENTITY_FIELDS}
+        missing = ", ".join(field for field in IDENTITY_FIELDS if not metadata.get(field))
+        _demote(terminal_id, LIFECYCLE_UNKNOWN_LIVENESS, f"identity incomplete: missing {missing}")
+        raise TerminalIdentityMismatchError(
+            f"Terminal {terminal_id} cannot be used for {operation}: its recorded identity "
+            f"is incomplete (missing {missing}; have {recorded}). The missing fields are not "
+            "inferred — a pane id resolved against an unnamed server can be a different live "
+            "pane. Nothing was delivered."
+        )
+    recorded_pane = metadata["pane_id"]
+
+    backend = get_backend()
+    # ``is True`` rather than a truthiness test: a backend double answers
+    # every attribute with a stand-in object, and treating that as a
+    # declared capability would start enforcing a boundary against evidence
+    # the double never gathered.
+    if getattr(backend, "supports_pane_identity", False) is not True:
+        return None
+
+    observed = backend.observe_pane_identity(recorded_pane)
+    if not isinstance(observed, dict):
+        return None
+
+    outcome = observed.get("outcome")
+    if outcome == "absent":
+        # The server answered and the pane is not on it. That is evidence,
+        # and the row can say so.
+        _demote(terminal_id, LIFECYCLE_DEAD, f"pane {recorded_pane} is absent from its server")
+        raise TerminalIdentityMismatchError(
+            f"Terminal {terminal_id} cannot be used for {operation}: its recorded pane "
+            f"{recorded_pane} no longer exists. Nothing was delivered."
+        )
+    if outcome != "observed":
+        # Nothing was learned. The operation is refused all the same — an
+        # unverifiable target is not a lawful one — but the row is recorded
+        # as unknown rather than reaped, because "we could not look" is not
+        # evidence that the worker is gone.
+        _demote(
+            terminal_id,
+            LIFECYCLE_UNKNOWN_LIVENESS,
+            f"pane {recorded_pane} could not be observed",
+        )
+        raise TerminalIdentityMismatchError(
+            f"Terminal {terminal_id} cannot be used for {operation}: its recorded pane "
+            f"{recorded_pane} could not be observed. Nothing was delivered."
+        )
+
+    if observed.get("dead") == "1":
+        _demote(terminal_id, LIFECYCLE_DEAD, f"pane {recorded_pane} is dead")
+        raise TerminalIdentityMismatchError(
+            f"Terminal {terminal_id} cannot be used for {operation}: its pane "
+            f"{recorded_pane} is dead. Nothing was delivered."
+        )
+
+    # Every field is compared, because the identity was required to be
+    # complete to get here. A conditional comparison would quietly skip
+    # whichever field happened to be missing, which is the partial-trust
+    # this boundary refuses.
+    mismatches = []
+    for field, label in (
+        ("server_socket_path", "tmux server"),
+        ("window_id", "window"),
+        ("session_id", "session"),
+        ("pane_pid", "pane process"),
+    ):
+        recorded = metadata[field]
+        seen = observed.get(field)
+        if str(seen) != str(recorded):
+            mismatches.append(f"{label} {seen!r} != {recorded!r}")
+
+    if mismatches:
+        detail = "; ".join(mismatches)
+        # Name the successor if a row claims the pane as it is *now*. A
+        # superseded row that can only say it lost its pane leaves an
+        # operator and the conductor with nothing to act on; the point of
+        # the pointer is that the next action ("read the superseding
+        # terminal's identity, then replace") is answerable from the row.
+        successor = _successor_of(terminal_id, observed)
+        _demote(terminal_id, LIFECYCLE_SUPERSEDED, detail, successor=successor)
+        named = (
+            f" It now belongs to terminal {successor['terminal_id']} "
+            f"(generation {successor['generation']})."
+            if successor
+            else ""
+        )
+        raise TerminalIdentityMismatchError(
+            f"Terminal {terminal_id} cannot be used for {operation}: the pane at "
+            f"{recorded_pane} is a different incarnation ({detail}).{named} "
+            "Nothing was delivered."
+        )
+
+    # Names are read from the observation, never from the row. A worker
+    # that renamed its own window is still the right worker — a name is a
+    # label, and demoting on one would reap live terminals for relabelling
+    # themselves.
+    session_name = observed.get("session_name") or metadata["tmux_session"]
+    window_name = observed.get("window_name") or metadata["tmux_window"]
+    _note_live(terminal_id)
+    if session_name != metadata["tmux_session"] or window_name != metadata["tmux_window"]:
+        # Refresh the row's cached labels to the ones the *proven* pane now
+        # answers to. This is not re-pointing: the identity — server, pane,
+        # window, session, pid — was just verified unchanged, and only the
+        # mutable labels moved. Leaving them stale would keep every
+        # name-addressed reader (status detection, history capture, the
+        # dashboard) pointed at a name this pane no longer has.
+        try:
+            refresh_terminal_window_names(
+                terminal_id,
+                tmux_session=session_name,
+                tmux_window=window_name,
+                pane_id=recorded_pane,
+            )
+        except Exception as exc:  # pragma: no cover - a stale label is not fatal
+            logger.warning("Could not refresh window labels for %s: %s", terminal_id, exc)
+    return VerifiedPaneTarget(recorded_pane, session_name, window_name)
+
+
+def _successor_of(terminal_id: str, observed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Which terminal, if any, is registered to the pane as it now stands.
+
+    Answered from the observation rather than by searching for something
+    that looks similar: the full observed tuple has to match a row, so a
+    pane id reissued by a restarted server cannot name an unrelated
+    terminal as the successor. No match is a normal answer — the pane may
+    belong to nothing this system registered — and it means the demotion
+    records the loss without inventing a destination for it.
+    """
+    socket_path = observed.get("server_socket_path")
+    pane_id = observed.get("pane_id")
+    if not socket_path or not pane_id:
+        return None
+    try:
+        return find_terminal_by_pane_identity(
+            server_socket_path=str(socket_path),
+            pane_id=str(pane_id),
+            session_id=str(observed["session_id"]) if observed.get("session_id") else None,
+            pane_pid=int(observed["pane_pid"]) if observed.get("pane_pid") else None,
+            exclude_terminal_id=terminal_id,
+        )
+    except Exception as exc:  # pragma: no cover - an unanswerable lookup is not fatal
+        logger.debug("Could not resolve a successor for %s: %s", terminal_id, exc)
+        return None
+
+
+def _demote(
+    terminal_id: str,
+    state: str,
+    reason: str,
+    *,
+    successor: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Record an observed demotion, never letting the bookkeeping decide the
+    outcome: if the row cannot be updated the caller still refuses."""
+    try:
+        record_terminal_lifecycle(
+            terminal_id,
+            state=state,
+            reason=reason,
+            superseded_by_terminal_id=(successor or {}).get("terminal_id"),
+            superseded_by_generation=(successor or {}).get("generation"),
+        )
+    except Exception as exc:  # pragma: no cover - bookkeeping must not mask the refusal
+        logger.warning("Could not record %s lifecycle for %s: %s", state, terminal_id, exc)
+
+
+def _note_live(terminal_id: str) -> None:
+    try:
+        record_terminal_lifecycle(terminal_id, state=LIFECYCLE_LIVE)
+    except Exception as exc:  # pragma: no cover - see _demote
+        logger.debug("Could not record live lifecycle for %s: %s", terminal_id, exc)
 
 
 class TerminalGenerationMismatchError(ValueError):
@@ -940,7 +1395,15 @@ async def create_terminal(
                 pane_id=identity.get("pane_id"),
                 window_id=identity.get("window_id"),
                 server_socket_path=identity.get("server_socket_path"),
+                # The rest of the canonical tuple, from the same single
+                # observation. Recorded now rather than repaired later:
+                # every consumer of this row treats a partial identity as
+                # unusable, so a row born incomplete is a row that has to
+                # be replaced rather than one that merely reads oddly.
+                session_id=identity.get("session_id"),
+                pane_pid=int(identity["pane_pid"]) if identity.get("pane_pid") else None,
             )
+            _register_incarnation(terminal_id, terminal_generation, identity)
             # The v2 DB row is durably committed: observed creation.
             _mark_v2_resource_created(
                 f"{terminal_id}.db-row",
@@ -981,7 +1444,15 @@ async def create_terminal(
                 pane_id=identity.get("pane_id"),
                 window_id=identity.get("window_id"),
                 server_socket_path=identity.get("server_socket_path"),
+                # The rest of the canonical tuple, from the same single
+                # observation. Recorded now rather than repaired later:
+                # every consumer of this row treats a partial identity as
+                # unusable, so a row born incomplete is a row that has to
+                # be replaced rather than one that merely reads oddly.
+                session_id=identity.get("session_id"),
+                pane_pid=int(identity["pane_pid"]) if identity.get("pane_pid") else None,
             )
+            _register_incarnation(terminal_id, terminal_generation, identity)
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
         # backends (tmux). Event-inbox backends (herdr) deliver via their own
@@ -1648,9 +2119,10 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        working_dir = get_backend().get_pane_working_directory(
-            metadata["tmux_session"], metadata["tmux_window"]
-        )
+        verified = verified_pane_target(terminal_id, metadata, operation="working-directory")
+        session_name = verified.session_name if verified else metadata["tmux_session"]
+        window_name = verified.window_name if verified else metadata["tmux_window"]
+        working_dir = get_backend().get_pane_working_directory(session_name, window_name)
         return working_dir
 
     except Exception as e:
@@ -1687,6 +2159,12 @@ def send_input(
         metadata = _get_terminal_metadata_any(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        # Prove the recorded pane is still the registered one before any of
+        # the work below — the status arming and buffer clear mutate state,
+        # and doing them for a write that is about to be refused would leave
+        # the wrong terminal's detection disturbed.
+        verified = verified_pane_target(terminal_id, metadata, operation="send-input")
 
         provider = provider_manager.get_provider(terminal_id)
         orchestration_value = (
@@ -1754,13 +2232,20 @@ def send_input(
         # latch-block the IDLE→PROCESSING transition for the whole turn.
         status_monitor.clear_rolling_buffer(terminal_id)
 
+        # Target the verified pane id, not the recorded names. The proof
+        # above and the write below are then about the same pane with no
+        # name resolution in between for a later window to answer.
+        send_kwargs: Dict[str, Any] = {}
+        if verified is not None:
+            send_kwargs["pane_id"] = verified.pane_id
         get_backend().send_keys(
-            metadata["tmux_session"],
-            metadata["tmux_window"],
+            verified.session_name if verified else metadata["tmux_session"],
+            verified.window_name if verified else metadata["tmux_window"],
             message,
             enter_count=enter_count,
             force_bracketed_paste=True,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
+            **send_kwargs,
         )
 
         # Notify the provider that external input was received.
@@ -1813,6 +2298,13 @@ def send_special_key(terminal_id: str, key: str) -> bool:
     Unlike send_input(), this sends the key as a tmux key name (not literal text)
     and does not append a carriage return. Used for control signals like Ctrl+D (EOF).
 
+    Held to the same identity boundary as ``send_input``, and for a sharper
+    reason. A control key is not a smaller write than a message: ``Enter``
+    submits whatever is sitting in a composer, and ``C-c`` interrupts
+    whatever is running. Delivered to a window resolved by *name*, after
+    that name has been reused, both act on a stranger's session — and
+    neither leaves the trace a mistyped message would.
+
     Args:
         terminal_id: Target terminal identifier
         key: Tmux key name (e.g., "C-d", "C-c", "Escape")
@@ -1822,6 +2314,8 @@ def send_special_key(terminal_id: str, key: str) -> bool:
 
     Raises:
         ValueError: If terminal not found
+        TerminalIdentityMismatchError: If the recorded pane is no longer the
+            registered one. Nothing is delivered.
     """
     try:
         from cli_agent_orchestrator.services import managed_launch
@@ -1834,12 +2328,23 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        # Proven before the key is armed, let alone sent: a refusal here
+        # must leave the status monitor untouched as well as the pane, or a
+        # terminal nobody wrote to would still be marked as having received
+        # input.
+        target = verified_pane_target(terminal_id, metadata, operation=f"special key {key!r}")
+
         # Arm StatusMonitor stickiness: special keys (Enter on a permission
         # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
         # processing cycle that must be allowed to push past any latched
         # ready status.
         status_monitor.notify_input_sent(terminal_id)
-        get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+        if target is not None:
+            get_backend().send_special_key(
+                target.session_name, target.window_name, key, pane_id=target.pane_id
+            )
+        else:
+            get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
         update_last_active(terminal_id)
         logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
@@ -1911,13 +2416,19 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        # Every history capture below reads the names the verified pane
+        # answers to now. Reading the recorded names instead would return a
+        # later, unrelated window's screen as this terminal's output — the
+        # same misdelivery as a write, just in the other direction.
+        verified = verified_pane_target(terminal_id, metadata, operation="get-output")
+        capture_session = verified.session_name if verified else metadata["tmux_session"]
+        capture_window = verified.window_name if verified else metadata["tmux_window"]
+
         # Get output from StatusMonitor buffer (instant, no tmux call)
         full_output = status_monitor.get_buffer(terminal_id)
         if not full_output:
             # Fallback to backend history only if buffer not available (edge case)
-            full_output = get_backend().get_history(
-                metadata["tmux_session"], metadata["tmux_window"]
-            )
+            full_output = get_backend().get_history(capture_session, capture_window)
 
         if mode == OutputMode.FULL:
             return full_output
@@ -1931,8 +2442,8 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             fixed_extract_lines = getattr(provider, "extraction_tail_lines", None)
             if fixed_extract_lines is not None:
                 full_output = get_backend().get_history(
-                    metadata["tmux_session"],
-                    metadata["tmux_window"],
+                    capture_session,
+                    capture_window,
                     tail_lines=fixed_extract_lines,
                 )
                 retries = provider.extraction_retries
@@ -1942,8 +2453,8 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                         if attempt > 0:
                             time.sleep(10.0)
                             full_output = get_backend().get_history(
-                                metadata["tmux_session"],
-                                metadata["tmux_window"],
+                                capture_session,
+                                capture_window,
                                 tail_lines=fixed_extract_lines,
                             )
                         return provider.extract_last_message_from_script(full_output)
@@ -1964,8 +2475,8 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             full_output = ""
             for step_lines in _ESCALATION_STEPS:
                 full_output = get_backend().get_history(
-                    metadata["tmux_session"],
-                    metadata["tmux_window"],
+                    capture_session,
+                    capture_window,
                     tail_lines=step_lines,
                 )
                 try:
@@ -2313,6 +2824,19 @@ def reattach_existing_output_pipelines() -> dict:
     reader and stop/start pipe-pane (stop-then-start, not a bare toggle — a
     stale pane still reports pane_pipe=1). Terminals whose window is gone are
     skipped (stale rows; deletion is left to normal lifecycle paths).
+
+    Every row is proven through the same identity boundary a control write
+    uses, before anything is piped or typed. This runs at server startup,
+    against rows written by a *previous* process, which is precisely when
+    the recorded names are least trustworthy: a session and window torn
+    down while the server was dead and recreated under the same names
+    resolve perfectly, so the unverified form both nudged Enter into a
+    stranger's pane and piped that stranger's output into this row's FIFO
+    — mislabelled as this terminal's, and read as its provider status
+    from then on. A row whose proof fails is skipped with zero bytes
+    written; a row with no recorded identity keeps resolving by name,
+    which is the documented boundary of the identity work rather than an
+    exemption.
     """
     from cli_agent_orchestrator.clients.database import list_all_terminals
 
@@ -2323,6 +2847,26 @@ def reattach_existing_output_pipelines() -> dict:
     for row in list_all_terminals():
         terminal_id = row["id"]
         session_name, window_name = row["tmux_session"], row["tmux_window"]
+        try:
+            # The listing is a display-shaped subset with no identity
+            # fields; verifying against it would grade every row absent
+            # and check nothing at all.
+            metadata = get_terminal_metadata(terminal_id) or row
+            target = verified_pane_target(
+                terminal_id, metadata, operation="output pipeline re-attach"
+            )
+        except TerminalIdentityMismatchError as exc:
+            logger.info("Refused to re-attach the output pipeline for %s: %s", terminal_id, exc)
+            skipped.append(terminal_id)
+            continue
+        pane_id = None
+        if target is not None:
+            # The names the verified pane answers to *now*. ``pipe-pane``
+            # and history addressing are name-shaped, so using the
+            # recorded names here would re-open the same hole the proof
+            # just closed.
+            pane_id = target.pane_id
+            session_name, window_name = target.session_name, target.window_name
         try:
             backend.get_history(session_name, window_name, tail_lines=1)
         except Exception:
@@ -2343,7 +2887,9 @@ def reattach_existing_output_pipelines() -> dict:
             backend.pipe_pane(session_name, window_name, str(fifo_path))
             # Nudge a fresh prompt line through the new pipe so StatusMonitor
             # leaves UNKNOWN promptly (same rationale as the create path).
-            backend.send_special_key(session_name, window_name, "Enter")
+            # Enter submits whatever a composer is holding, so it goes to
+            # the proven pane id when there is one.
+            backend.send_special_key(session_name, window_name, "Enter", pane_id=pane_id)
             reattached.append(terminal_id)
         except Exception:
             logger.warning("could not re-attach output pipeline for %s", terminal_id, exc_info=True)

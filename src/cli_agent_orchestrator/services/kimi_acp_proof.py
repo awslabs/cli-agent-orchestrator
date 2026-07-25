@@ -28,10 +28,11 @@ from typing import Any, Callable, Optional
 
 from cli_agent_orchestrator.services.durable_publish import publish_immutable
 from cli_agent_orchestrator.services.provider_contracts import (
-    PINNED_VERSIONS,
     PROVIDER_KIMI,
+    SUPPORTED_VERSIONS,
     ProviderVersionDrift,
     check_pinned_version,
+    normalized_version,
 )
 
 PROOF_SCHEMA = "cao-kimi-acp-identity-proof-v1"
@@ -97,7 +98,10 @@ def run_identity_proof(
     binary_digest = hashlib.sha256(binary.read_bytes()).hexdigest()
     receipt = {
         "schema": PROOF_SCHEMA,
-        "kimi_version": PINNED_VERSIONS[PROVIDER_KIMI],
+        # The exact version this binary reports, not a pin constant: with
+        # more than one accepted build a constant could name the wrong one.
+        # check_pinned_version above already proved it is an accepted build.
+        "kimi_version": normalized_version(version_output),
         "binary_path": str(binary),
         "binary_sha256": binary_digest,
         "session_id": session_id,
@@ -180,7 +184,10 @@ def load_valid_proof(
             and receipt.get("schema") == PROOF_SCHEMA
             and receipt.get("binary_sha256") == binary_digest
             and receipt.get("binary_path") == str(kimi_binary)
-            and receipt.get("kimi_version") == PINNED_VERSIONS[PROVIDER_KIMI]
+            # Any accepted exact build, so a proof minted under a retained
+            # version still validates; the binary digest above binds it to
+            # the exact installed binary regardless.
+            and receipt.get("kimi_version") in SUPPORTED_VERSIONS[PROVIDER_KIMI]
             and receipt.get("resumed_after_kill") is True
             and _exchange_valid(receipt)
         ):

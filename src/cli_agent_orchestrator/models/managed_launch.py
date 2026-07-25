@@ -192,7 +192,10 @@ class ManagedLaunchCleanupRequest(BaseModel):
 
 class ManagedLaunchRouteAttestRequest(BaseModel):
     protocol_version: ProtocolVersion
-    provider: Literal["codex", "kimi_cli"]
+    # Widened alongside the v2 reserve request: the route receipt names
+    # the same canonical provider a reservation does, so the two surfaces
+    # accepting different sets would make a lawful launch unattestable.
+    provider: Literal["codex", "kimi_cli", "claude_code"]
     agent_profile: str = Field(min_length=1)
     working_directory: str = Field(min_length=1)
     trusted_project_root: Optional[str] = None

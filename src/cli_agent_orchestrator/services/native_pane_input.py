@@ -298,3 +298,41 @@ def observe_kimi_turn_state(
         window_name=window_name,
     )
     return provider.get_status_from_screen(rows)
+
+
+def observe_claude_turn_state(
+    pane_id: str,
+    *,
+    terminal_id: str,
+    session_name: str,
+    window_name: str,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+    screen: Optional[Sequence[str]] = None,
+) -> TerminalStatus:
+    """Read whether the Claude TUI in ``pane_id`` is mid-turn, right now.
+
+    Delegates to the Claude provider's own detector for the same reason
+    the Kimi observation delegates to Kimi's: there must be exactly one
+    description of what a Claude screen means, and a second matcher here
+    would drift from it silently.
+
+    A separate function rather than a provider parameter, because the two
+    detectors answer different questions about different renderings and
+    the choice of which to use is made by the caller's provider binding,
+    not at runtime from a string. That binding is checked before any
+    write, so picking the detector from it keeps the observation and the
+    delivery talking about the same provider.
+
+    Raises rather than returning ``UNKNOWN`` when the pane cannot be read
+    at all. "The pane says nothing" and "we could not look" must stay
+    distinguishable: only the first is an observation.
+    """
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+    rows = list(screen) if screen is not None else capture_pane_screen(pane_id, timeout=timeout)
+    provider = ClaudeCodeProvider(
+        terminal_id=terminal_id,
+        session_name=session_name,
+        window_name=window_name,
+    )
+    return provider.get_status_from_screen(rows)

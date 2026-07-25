@@ -26,6 +26,7 @@ from typing import Any, Mapping, Optional
 
 import pytest
 
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.managed_launch_v2 import (
     PROTOCOL_VERSION_V2,
     ManagedLaunchV2BindRequest,
@@ -188,7 +189,25 @@ def harness(monkeypatch):
 
     async def _create_terminal(**kwargs):
         state.terminals.append(kwargs)
-        return {"terminal_id": kwargs["reserved_terminal_id"]}
+        terminal_id = kwargs["reserved_terminal_id"]
+        # A real row in the v2 store, because the launch path writes one
+        # and later steps read it back. A fake that returned an id without
+        # a row would let those steps be tested against a terminal that
+        # does not exist — which is the state the fail-closed persistence
+        # check exists to catch.
+        database.create_terminal_v2(
+            terminal_id,
+            kwargs.get("session_name") or "cao-test",
+            kwargs.get("window_name") or f"w-{terminal_id}",
+            kwargs.get("provider") or "kimi_cli",
+            generation=kwargs.get("terminal_generation"),
+            pane_id="%7",
+            window_id="@7",
+            server_socket_path="/private/tmp/cao-native.sock",
+            session_id="$1",
+            pane_pid=4242,
+        )
+        return {"terminal_id": terminal_id}
 
     def _observe(self):
         return {
@@ -840,3 +859,82 @@ async def test_a_pane_that_cannot_be_read_is_never_certified_as_ready(
     observed = receipt["model_input_ready_observation"]
     assert observed["provider_status"] is None
     assert "tmux is not answering" in observed["detail"]
+
+
+# --------------------------------------------------------------------
+# The proven native session reaches the durable row
+# --------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_proven_native_session_is_written_to_the_terminal_row(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """Persisted on the real launch path, not only by a setter under test.
+
+    Before this, ``native_session_id`` was NULL on every managed row, which
+    silently costs the native-session half of the supersession test: a pane
+    later running a *different* session looks identical to the right one,
+    because the comparison has nothing to compare.
+    """
+    record, _ = await _launch(worktree, tmp_path)
+
+    row = database.get_terminal_metadata_v2(record["terminal_id"])
+    assert row["v2_native_session_id"] == SESSION_ID
+    # And it reaches the surface the conductor reads.
+    assert v2._published_terminal_facts(record["terminal_id"])["native_session_id"] == SESSION_ID
+
+
+@pytest.mark.asyncio
+async def test_a_session_that_cannot_be_recorded_blocks_instead_of_certifying(
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
+):
+    """Fail closed: no readiness receipt for a row that cannot name its session.
+
+    Zero task bytes have been submitted by this point, so refusing costs a
+    finalizable reservation rather than a lost turn — while publishing
+    anyway would certify a pane nothing can later prove the identity of.
+    """
+    monkeypatch.setattr(database, "set_terminal_v2_native_session_id", lambda *_a, **_k: False)
+
+    record, result = await _launch(worktree, tmp_path)
+
+    assert result["state"] == "preflight_blocked"
+    failure = result["preflight_failure"]
+    assert failure["reason"] == v2.PREFLIGHT_REASON_READINESS
+    assert "could not be durably recorded" in failure["detail"]
+    # The zero-byte claim is what makes this finalizable.
+    assert failure["task_bytes_submitted"] is False
+    # No readiness was published, so nothing downstream can bind it.
+    state = bridge.read_state(record["reservation_id"])
+    assert (state or {}).get("state") != "ready"
+
+
+@pytest.mark.asyncio
+async def test_the_session_is_recorded_before_the_readiness_receipt(
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
+):
+    """Ordering is the guarantee: a published receipt implies a recorded session.
+
+    A consumer that sees ``ready`` may act on the row immediately, so the
+    row has to be complete first — the reverse order would leave a window
+    in which readiness is public and the identity is not.
+    """
+    order: list[str] = []
+    real_setter = database.set_terminal_v2_native_session_id
+    real_publish = bridge.publish_native_ready_state
+
+    def _setter(terminal_id, native_session_id):
+        order.append("recorded")
+        return real_setter(terminal_id, native_session_id)
+
+    def _publish(reservation_id, receipt):
+        order.append("published")
+        return real_publish(reservation_id, receipt)
+
+    monkeypatch.setattr(database, "set_terminal_v2_native_session_id", _setter)
+    monkeypatch.setattr(bridge, "publish_native_ready_state", _publish)
+
+    await _launch(worktree, tmp_path)
+
+    assert order == ["recorded", "published"]

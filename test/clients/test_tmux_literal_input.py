@@ -37,7 +37,7 @@ SOCKET = "/private/tmp/tmux-501/cao-fixture.sock"
 OTHER_SOCKET = "/private/tmp/tmux-501/somebody-elses.sock"
 
 PANE_FORMAT = (
-    "#{pane_id}\t#{window_id}\t#{pane_pid}\t"
+    "#{pane_id}\t#{window_id}\t#{session_id}\t#{pane_pid}\t"
     "#{bracket_paste_flag}\t#{pane_dead}\t#{socket_path}\t"
     "#{session_name}\t#{window_name}"
 )
@@ -51,6 +51,7 @@ SERVER_FORMAT = "#{pane_id}\t#{socket_path}"
 def _pane_line(
     pane_id: str = "%263",
     window_id: str = "@261",
+    session_id: str = "$7",
     pane_pid: str = "74654",
     bracket: str = "1",
     dead: str = "0",
@@ -58,7 +59,9 @@ def _pane_line(
     session: str = "cao-1a2b3c4d",
     window: str = "claude-9f8e",
 ) -> str:
-    return "\t".join([pane_id, window_id, pane_pid, bracket, dead, socket, session, window])
+    return "\t".join(
+        [pane_id, window_id, session_id, pane_pid, bracket, dead, socket, session, window]
+    )
 
 
 def _server_line(pane_id: str = "%263", socket: str = SOCKET) -> str:
@@ -657,6 +660,7 @@ class TestPaneControlIdentityLookup:
         assert identity is not None
         assert identity.pane_id == "%263"
         assert identity.window_id == "@261"
+        assert identity.session_id == "$7"
         assert identity.pane_pid == 74654
         assert identity.session_name == "cao-1a2b3c4d"
         assert identity.window_name == "claude-9f8e"
@@ -786,6 +790,7 @@ class TestPaneControlIdentityLookup:
         assert identity is not None
         assert identity.pane_id == "%263"
         assert identity.window_id == "@261"
+        assert identity.session_id == "$7"
         assert identity.pane_pid == 74654
         # The field that decides which server a write may reach sits ahead
         # of both name fields, so a tab in a foreign window's name cannot

@@ -43,7 +43,7 @@ from cli_agent_orchestrator.services.codex_trust import (
     SUPPORTED_CODEX_VERSION,
     _contains_session_flags,
 )
-from cli_agent_orchestrator.services.kimi_route import SUPPORTED_KIMI_VERSION, _current_option
+from cli_agent_orchestrator.services.kimi_route import SUPPORTED_KIMI_VERSIONS, _current_option
 from cli_agent_orchestrator.services.managed_event_renderer import ManagedEventRenderer
 from cli_agent_orchestrator.services.managed_session_control import ACCEPTED as CONTROL_ACCEPTED
 from cli_agent_orchestrator.services.managed_session_control import AMBIGUOUS as CONTROL_AMBIGUOUS
@@ -1788,7 +1788,7 @@ class _ProviderSession:
         )
         return readiness
 
-    def _version(self, executable: str, expected: str) -> str:
+    def _version(self, executable: str, accepted: tuple[str, ...]) -> str:
         if not os.path.isabs(executable) or os.path.realpath(executable) != executable:
             raise BridgeError("provider executable must be a canonical absolute path")
         if (
@@ -1805,13 +1805,18 @@ class _ProviderSession:
             env=_provider_child_environment(self.request),
         )
         actual = proc.stdout.strip()
-        if proc.returncode != 0 or actual != expected:
-            raise BridgeError(f"unsupported provider version {actual!r}; expected {expected!r}")
+        # Exact-set membership, never a range: a provider may accept more
+        # than one proven build (Kimi retains 0.29.0 alongside 0.29.1), and
+        # the receipt records the actual installed one.
+        if proc.returncode != 0 or actual not in accepted:
+            raise BridgeError(
+                f"unsupported provider version {actual!r}; expected one of {list(accepted)!r}"
+            )
         return actual
 
     def _initialize_codex(self) -> dict[str, Any]:
         codex_bin = self.request["provider_executable"]
-        version = self._version(codex_bin, SUPPORTED_CODEX_VERSION)
+        version = self._version(codex_bin, (SUPPORTED_CODEX_VERSION,))
         worktree = self.request["working_directory"]
         argv = [codex_bin, "-c", render_trusted_project_override(worktree)]
         argv.extend(["-c", _toml_override("model", self.request["model"])])
@@ -1901,7 +1906,7 @@ class _ProviderSession:
 
     def _initialize_kimi(self) -> dict[str, Any]:
         kimi_bin = self.request["provider_executable"]
-        version = self._version(kimi_bin, SUPPORTED_KIMI_VERSION)
+        version = self._version(kimi_bin, SUPPORTED_KIMI_VERSIONS)
         # Route control (thinking effort) comes ONLY from the reservation
         # request and is part of the final inventoried child environment.
         env = _provider_child_environment(self.request)

@@ -43,10 +43,46 @@ def _get_terminal_output(terminal_id):
 
 
 def _resolve_conductor(session_name):
+    """The session's conductor, resolved over live terminals only.
+
+    This used to return ``terminals[0]`` of the raw listing. With several
+    stale rows in a session that reliably named a dead one and reported
+    its status, which is a guaranteed disagreement with the dashboard
+    rather than a race. A demoted row is now excluded outright rather than
+    ranked last: ranking still picks a dead row when that is all there is,
+    which is exactly the case that went wrong.
+    """
     terminals = _get_terminals(session_name)
     if not terminals:
         raise click.ClickException(f"No terminals found for session '{session_name}'")
-    return terminals[0], terminals
+    # An absent lifecycle is not live. It used to default to ``live``,
+    # which reads "we do not know" as "it is fine" — and the peer that
+    # answers with no lifecycle at all is exactly the too-old server this
+    # check exists for. Fail closed and say why, rather than selecting a
+    # conductor on the strength of a field nobody sent.
+    live = [t for t in terminals if t.get("lifecycle_state") == "live"]
+    if not live:
+        unanswered = [t for t in terminals if t.get("lifecycle_state") is None]
+        if len(unanswered) == len(terminals):
+            raise click.ClickException(
+                f"No conductor can be resolved for session '{session_name}': the server "
+                f"published no lifecycle for any of its {len(terminals)} terminals, so none "
+                "of them can be shown to be live. A server that predates observed liveness "
+                "cannot answer this, and guessing would name a dead row."
+            )
+        # Says what was found instead of silently substituting one of them:
+        # the operator needs to know these rows exist and are finalizable,
+        # not be handed one as though it were serving.
+        demoted = ", ".join(
+            f"{t.get('terminal_id', t.get('id'))}="
+            f"{t.get('lifecycle_state') or 'no-lifecycle-published'}"
+            for t in terminals
+        )
+        raise click.ClickException(
+            f"No live conductor for session '{session_name}'; "
+            f"{len(terminals)} superseded/dead rows ({demoted})"
+        )
+    return live[0], live
 
 
 @click.group()

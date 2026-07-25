@@ -90,6 +90,8 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
     ManagedDestructiveRequest,
     ManagedLaunchV2AdmitRequest,
     ManagedLaunchV2BindRequest,
+    ManagedLaunchV2CleanupRequest,
+    ManagedLaunchV2NegativeRequest,
     ManagedLaunchV2ReserveRequest,
     ManagedV2FenceInstallRequest,
 )
@@ -120,6 +122,7 @@ from cli_agent_orchestrator.services import (
     managed_launch_v2,
     secret_gate,
     session_service,
+    terminal_projection,
     terminal_service,
 )
 from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
@@ -1039,7 +1042,11 @@ async def agui_stream(
         terminals: List[Dict] = []
         for sess in sessions:
             try:
-                terminals.extend(list_terminals_by_session(sess["id"]))
+                # Through the projection, like every other dashboard
+                # surface. Reading raw rows here would make this stream the
+                # one view that still shows a dead terminal as live and
+                # cannot see a managed v2 worker at all.
+                terminals.extend(terminal_projection.project_session(sess["id"]))
             except Exception:
                 logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
         return build_dashboard_snapshot(sessions, terminals, list(scopes))
@@ -1604,6 +1611,26 @@ async def managed_launch_capabilities(
         # read from the surface's own tuple for the same
         # no-second-source-of-truth reason as above.
         "v2_launchable_execution_modes": list(managed_launch_v2.LAUNCHABLE_EXECUTION_MODES),
+        # Native-TUI support, per provider. Additive: the mode gate above
+        # is unchanged and still decides whether native TUI can be
+        # launched at all. This block answers the narrower question of
+        # *which providers* have a real native adapter, which the flat
+        # mode list cannot express — and a flat relaxation of that list
+        # would have advertised native launch for providers with no
+        # branch to run it.
+        #
+        # Both gates are required, and both come from this one response
+        # so they cannot be read at two different moments: a caller may
+        # route native TUI to a provider only when `native_tui` appears
+        # in `v2_launchable_execution_modes` AND
+        # `native_tui.providers[<provider>].supported` is true. An older
+        # peer returns no `native_tui` key at all, which is the same
+        # answer as unsupported and must be treated as a typed refusal
+        # before any reservation is created.
+        #
+        # Keyed by canonical provider. `claude` is the executable name
+        # and appears only as the `executable` field.
+        "native_tui": managed_launch_v2.native_tui_capabilities(),
     }
 
 
@@ -1978,6 +2005,51 @@ async def resume_managed_launch_v2(
         raise _managed_launch_http_error(exc)
 
 
+@app.post("/managed-launch/v2/reservations/{reservation_id}/negative")
+async def finalize_managed_launch_v2_negative(
+    reservation_id: str,
+    body: ManagedLaunchV2NegativeRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Finalize a v2 reservation whose failure is proven to have sent no bytes.
+
+    Idempotent and re-drivable with zero task/provider I/O. The presence of
+    this route is itself the recovery-supported signal: a peer old enough to
+    lack it returns 404, which the caller reads as typed
+    ``recovery-unsupported`` (preserve the run and its breaker) — never a v1
+    fallback or a faked finalization.
+    """
+    try:
+        return await asyncio.to_thread(managed_launch_v2.finalize_negative, reservation_id, body)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/reconcile")
+async def reconcile_managed_launch_v2(
+    reservation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Read-only adoption of durable v2 facts; never launches, sends, or deletes."""
+    try:
+        return await asyncio.to_thread(managed_launch_v2.reconcile, reservation_id)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
+@app.post("/managed-launch/v2/reservations/{reservation_id}/cleanup")
+async def cleanup_managed_launch_v2(
+    reservation_id: str,
+    body: ManagedLaunchV2CleanupRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Release the fork-owned v2 terminal record for a finalized generation."""
+    try:
+        return await asyncio.to_thread(managed_launch_v2.cleanup, reservation_id, body)
+    except managed_launch.ManagedLaunchError as exc:
+        raise _managed_launch_http_error(exc)
+
+
 @app.post("/managed-launch/v2/fence")
 async def install_managed_fence(
     body: ManagedV2FenceInstallRequest,
@@ -2254,20 +2326,84 @@ async def create_terminal_in_session(
 
 @app.get("/sessions/{session_name}/terminals")
 async def list_terminals_in_session(session_name: str) -> List[Dict]:
-    """List all terminals in a session."""
+    """List all terminals in a session, as the one shared projection.
+
+    The CLI and the dashboard read this same shape, which is the point:
+    they used to answer the question from different queries and disagree
+    about which terminals existed and what state they were in. Each row
+    carries its ``protocol_vintage`` and an observed ``lifecycle_state``,
+    so a card can say "superseded" instead of showing a deleted window as
+    a worker in an unknown state.
+    """
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.services import terminal_projection
 
-        return list_terminals_by_session(session_name)
+        # Off-loop: the projection enumerates tmux once, which is a
+        # blocking subprocess, and this endpoint is polled by both views.
+        return await asyncio.to_thread(terminal_projection.project_session, session_name)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list terminals: {str(e)}",
         )
+
+
+def _identity_for_verification(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """One identity shape, whichever store the row came from.
+
+    The v2 terminal store prefixes its newer identity columns ``v2_``
+    because the vintage receipt requires unique bare column names across
+    the two tables. Every checker below this point speaks the canonical
+    names, so the prefix is stripped here rather than teaching each of them
+    about the storage detail — a checker that silently found no
+    ``session_id`` on a v2 row would grade a complete identity as partial
+    and refuse a healthy worker.
+    """
+    normalized = dict(metadata)
+    for field in ("session_id", "pane_pid", "native_session_id"):
+        prefixed = f"v2_{field}"
+        if normalized.get(field) is None and prefixed in normalized:
+            normalized[field] = normalized[prefixed]
+    return normalized
+
+
+def _projected_terminal(terminal_id: str) -> Dict[str, Any]:
+    """One terminal, from the same projection both human views read.
+
+    Sourced here rather than from ``terminal_service.get_terminal`` because
+    this route is the per-terminal answer for almost everything — the
+    conductor's report, steer and control-input commands, supervisor
+    resolution, and the card ``cao session status`` prints after selecting
+    the conductor through the projection. While it returned the raw row,
+    a dead terminal read ``dead`` in the listing and ``unknown`` on its own
+    card: the phantom-unknown card, one endpoint over.
+
+    ``status`` keeps its provider meaning for a live pane, because machine
+    orchestration polls this route waiting on provider status and would
+    otherwise never see the value it waits for. Only a row whose identity
+    does not resolve reports its lifecycle there, which is exactly the case
+    where there is no provider state to report.
+
+    Falls back to the unprojected row when the projection has no answer, so
+    a terminal that exists but cannot be observed is still readable rather
+    than becoming a 404.
+    """
+    projected = terminal_projection.project_terminal(terminal_id)
+    if projected is None:
+        return terminal_service.get_terminal(terminal_id)
+    # ``id``/``name``/``session_name`` are the shape this response model has
+    # always used; the projection carries the canonical spellings alongside
+    # its back-compat keys, so map rather than rename either side.
+    return {
+        **projected,
+        "id": projected.get("terminal_id") or terminal_id,
+        "name": projected.get("tmux_window"),
+        "session_name": projected.get("tmux_session"),
+    }
 
 
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
@@ -2278,7 +2414,7 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
         # tmux (blocking subprocess). This endpoint is polled heavily by
         # wait_until_terminal_status, so run it off the loop to keep the
         # server responsive under concurrent orchestration.
-        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+        terminal = await asyncio.to_thread(_projected_terminal, terminal_id)
         return Terminal(**terminal)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -3595,13 +3731,68 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4003, reason="Invalid tmux target name")
         return
 
+    # Before a single byte is streamed, prove the registered pane is still
+    # the pane that was registered. A row whose window was deleted, or
+    # whose name a later window has taken, must fail closed with a reason
+    # that names what happened — not the generic "Failed to attach
+    # terminal", and never by falling back to resolving the name.
+    from cli_agent_orchestrator.services import terminal_projection
+
+    # Managed terminals are verified too, and they are the ones this
+    # matters most for. Skipping them left every v2 native worker attaching
+    # by mutable name on the *default* tmux server — discarding the pane,
+    # window and socket its own row records — so opening the card of a
+    # worker whose window had been deleted and its name reused gave an
+    # operator an interactive PTY into a stranger's live pane, which is
+    # worse than a one-shot key because they then type into it.
+    verified_pane: str | None = None
     try:
+        verified = await asyncio.to_thread(
+            terminal_service.verified_pane_target,
+            terminal_id,
+            _identity_for_verification(metadata),
+            operation="web-attach",
+        )
+    except terminal_service.TerminalIdentityMismatchError as exc:
+        projected = await asyncio.to_thread(terminal_projection.project_terminal, terminal_id)
+        state = (projected or {}).get("lifecycle_state") or "identity-mismatch"
+        successor = (projected or {}).get("superseded_by_terminal_id")
+        reason = f"terminal-{state}"
+        if successor:
+            reason = f"{reason}; replaced by {successor}"
+        logger.info("Refused web attach for terminal %s: %s", terminal_id, exc)
+        await websocket.close(code=4004, reason=reason[:120])
+        return
+    if verified is not None:
+        verified_pane = verified.pane_id
+        # The pane may have been relabelled since the row was written;
+        # the verification returns the names it answers to now.
+        session_name = verified.session_name
+        window_name = verified.window_name
+
+    try:
+        attach_command = await asyncio.to_thread(
+            partial(
+                get_backend().prepare_web_attach,
+                session_name,
+                window_name,
+                pane_id=verified_pane,
+                server_socket_path=metadata.get("server_socket_path"),
+            )
+        )
+    except TypeError:
+        # A backend that predates identity-addressed attach. It is handed
+        # the names only, which is exactly what it did before.
         attach_command = await asyncio.to_thread(
             get_backend().prepare_web_attach, session_name, window_name
         )
     except TerminalBackendError as e:
+        # Includes the backend's own refusal of an identity it cannot
+        # address safely. Reported as unbound rather than as a generic
+        # failure: nothing is wrong with the pane, the row does not say
+        # enough about it to be attached to.
         logger.error(f"Web attach failed for terminal {terminal_id}: {e}")
-        await websocket.close(code=4004, reason="Failed to attach terminal")
+        await websocket.close(code=4004, reason="terminal-unbound-identity")
         return
 
     # Create PTY pair for backend attach

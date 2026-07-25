@@ -47,6 +47,43 @@ class Terminal(BaseModel):
     )
     last_active: Optional[datetime] = Field(None, description="Last active timestamp")
 
+    # --- Projection fields ---
+    #
+    # Additive and all optional, so every existing consumer keeps working
+    # against the same response. They exist because this model is the
+    # boundary a projected terminal has to cross: without a declared field
+    # a projected dict is silently stripped here, which is how a per-terminal
+    # reader ends up unable to tell a superseded terminal from a live one
+    # even though the service below it knows.
+    #
+    # ``status`` stays provider-valued for a live pane — machine
+    # orchestration polls this route waiting on provider status — and
+    # carries the lifecycle only for a row whose identity does not resolve,
+    # where there is no provider state to report and "unknown" would read
+    # as "alive, not yet detected".
+    generation: Optional[str] = Field(None, description="Non-reusable incarnation identifier")
+    protocol_vintage: Optional[str] = Field(None, description="Which store holds this row (v1/v2)")
+    lifecycle_state: Optional[str] = Field(
+        None, description="Observed liveness: live/superseded/dead/unknown-liveness"
+    )
+    lifecycle_reason: Optional[str] = Field(
+        None, description="Why the lifecycle state was recorded"
+    )
+    superseded_by_terminal_id: Optional[str] = Field(
+        None, description="The terminal that now holds this row's pane"
+    )
+    superseded_by_generation: Optional[str] = Field(
+        None, description="The generation of the superseding terminal"
+    )
+    server_socket_path: Optional[str] = Field(
+        None, description="The tmux server that owns this row's pane and window ids"
+    )
+    session_id: Optional[str] = Field(None, description="Immutable tmux session identity ($N)")
+    pane_pid: Optional[int] = Field(None, description="The pane's primary process id")
+    native_session_id: Optional[str] = Field(
+        None, description="The provider-native session running in this pane"
+    )
+
 
 class AgentStepResult(BaseModel):
     """Transient result of one agent step (issue #312, C3b). Not persisted.

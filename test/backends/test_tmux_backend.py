@@ -75,6 +75,11 @@ class TestTmuxBackendDelegation:
         mock_client.list_sessions.assert_called_once()
 
     def test_prepare_web_attach_returns_window_target(self, backend):
+        """A row with no recorded identity keeps the name-resolved form.
+
+        Rows predating identity persistence are the documented edge of the
+        identity-addressed attach, not a case it silently upgrades.
+        """
         assert backend.prepare_web_attach("cao-test", "developer-abcd") == [
             "tmux",
             "-u",
@@ -82,6 +87,46 @@ class TestTmuxBackendDelegation:
             "-t",
             "cao-test:developer-abcd",
         ]
+
+    def test_prepare_web_attach_targets_the_registered_pane_on_its_server(self, backend):
+        """Verified against tmux 3.7b: a pane-id target selects its window.
+
+        A bare session-id target does not — it lands on whichever window
+        the session last had current — so the pane id is the only target
+        that means "open this worker's terminal". The names are passed but
+        must not appear anywhere in the argv.
+        """
+        argv = backend.prepare_web_attach(
+            "cao-test",
+            "developer-abcd",
+            pane_id="%263",
+            server_socket_path="/private/tmp/cao.sock",
+        )
+        assert argv == [
+            "tmux",
+            "-S",
+            "/private/tmp/cao.sock",
+            "-u",
+            "attach-session",
+            "-t",
+            "%263",
+        ]
+        assert "cao-test:developer-abcd" not in argv
+        assert "developer-abcd" not in argv
+
+    def test_prepare_web_attach_refuses_a_pane_id_with_no_recorded_server(self, backend):
+        """A pane id with no server is not a weaker identity — it is unsafe.
+
+        Not hypothetical: a restarted tmux server hands out ``%0``/``%1``
+        again, so the ids a row recorded before the restart resolve to
+        different live panes afterwards. Attaching such an id against
+        whichever server this process happens to reach is how a card opens
+        somebody else's terminal. It must fail closed rather than infer
+        the default server, and it must not quietly fall back to the name
+        form either — that is the same misdelivery by another route.
+        """
+        with pytest.raises(TerminalBackendError, match="unpinned id"):
+            backend.prepare_web_attach("cao-test", "developer-abcd", pane_id="%263")
 
     def test_kill_session_delegates(self, backend, mock_client):
         mock_client.kill_session.return_value = True
@@ -126,11 +171,36 @@ class TestTmuxBackendDelegation:
             enter_count=2,
             force_bracketed_paste=False,
             submit_delay=0.3,
+            pane_id=None,
         )
+
+    def test_send_keys_passes_a_verified_pane_id_through(self, backend, mock_client):
+        """A caller that supplies an exact pane must reach the client with it.
+
+        Dropping it here would be silent: the delegation would still
+        succeed and the write would still land — by name, at whatever
+        currently answers to it, which is what the caller declined.
+        """
+        backend.send_keys("cao-test", "window-0", "hello", pane_id="%263")
+        assert mock_client.send_keys.call_args.kwargs["pane_id"] == "%263"
 
     def test_send_special_key_delegates(self, backend, mock_client):
         backend.send_special_key("cao-test", "window-0", "C-c")
-        mock_client.send_special_key.assert_called_once_with("cao-test", "window-0", "C-c")
+        mock_client.send_special_key.assert_called_once_with(
+            "cao-test", "window-0", "C-c", pane_id=None
+        )
+
+    def test_send_special_key_passes_a_verified_pane_through(self, backend, mock_client):
+        """A control key is delivered to the proven pane, not to a name.
+
+        ``Enter`` submits whatever a composer is holding and ``C-c``
+        interrupts whatever is running, so a name-resolved target that has
+        since been reused acts on a stranger's session immediately.
+        """
+        backend.send_special_key("cao-test", "window-0", "C-c", pane_id="%9")
+        mock_client.send_special_key.assert_called_once_with(
+            "cao-test", "window-0", "C-c", pane_id="%9"
+        )
 
     def test_get_history_delegates(self, backend, mock_client):
         mock_client.get_history.return_value = "output text"

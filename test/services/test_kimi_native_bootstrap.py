@@ -501,7 +501,7 @@ def test_a_receipt_that_denies_its_own_assertions_cannot_license_an_attachment(p
 # --------------------------------------------------------------------------
 
 
-def test_a_non_canonical_working_directory_is_refused_before_any_provider_io(
+def test_a_non_canonical_working_directory_is_refused_with_no_turn_and_one_teardown(
     pinned_binary, tmp_path
 ):
     """Kimi buckets a session by the directory *string* it is handed.
@@ -509,8 +509,11 @@ def test_a_non_canonical_working_directory_is_refused_before_any_provider_io(
     Mint under one name for a directory and resume in another and the
     resume is refused with "created under a different directory" -- the
     two names index different buckets even though they are one place on
-    disk.  The refusal must come before the transport is touched, so a
-    bad path costs no provider process and mints no orphan session.
+    disk.  The refusal sends no ACP request (``calls == []``), but the
+    minting process the caller already spawned must still be torn down
+    exactly once: the transport exists before this function runs, so a
+    validation refusal that returned without terminating it would leak a
+    live provider behind a ``preflight_blocked`` reservation.
     """
     real = tmp_path / "real"
     real.mkdir()
@@ -522,7 +525,7 @@ def test_a_non_canonical_working_directory_is_refused_before_any_provider_io(
 
     assert str(real) in str(refusal.value)
     assert transport.calls == []
-    assert transport.terminated == 0
+    assert transport.terminated == 1
 
 
 def test_the_mint_refuses_a_bad_directory_rather_than_correcting_it(pinned_binary, tmp_path):
@@ -553,3 +556,66 @@ def test_a_working_directory_that_does_not_exist_is_refused(pinned_binary, tmp_p
     with pytest.raises(boot.KimiBootstrapInvalid, match="existing directory"):
         _mint(pinned_binary, transport, working_directory=str(tmp_path / "absent"))
     assert transport.calls == []
+
+
+# --------------------------------------------------------------------------
+# No refusal leaves the already-spawned minter running
+#
+# The caller spawns the transport (`StdioAcpBootstrap.__init__` runs the
+# process) BEFORE mint_session is entered, so "refused before any provider
+# IO" never meant "no process to clean up" -- the process is already
+# running.  Every refusal, including the ones that send no ACP request at
+# all, must tear that process down exactly once, or a `preflight_blocked`
+# reservation is left shadowing a live provider nobody owns.
+# --------------------------------------------------------------------------
+
+
+def _digest_mismatch(pinned, tmp_path):
+    return {"binary_sha256": "0" * 64}
+
+
+def _version_drift(pinned, tmp_path):
+    return {"version_output": "kimi 0.28.0"}
+
+
+def _absent_cwd(pinned, tmp_path):
+    return {"working_directory": str(tmp_path / "absent")}
+
+
+def _empty_model(pinned, tmp_path):
+    return {"model": ""}
+
+
+def _empty_effort(pinned, tmp_path):
+    return {"effort": ""}
+
+
+@pytest.mark.parametrize(
+    "make_overrides",
+    [_digest_mismatch, _version_drift, _absent_cwd, _empty_model, _empty_effort],
+    ids=["digest-mismatch", "version-drift", "absent-cwd", "empty-model", "empty-effort"],
+)
+def test_every_pre_exchange_refusal_tears_down_exactly_once_with_no_turn(
+    pinned_binary, tmp_path, make_overrides
+):
+    transport = FakeAcp()
+
+    with pytest.raises(boot.KimiBootstrapError):
+        _mint(pinned_binary, transport, **make_overrides(pinned_binary, tmp_path))
+
+    # Zero provider requests of any kind (so certainly zero task turns) ...
+    assert transport.calls == []
+    # ... and the already-running minter was reaped exactly once.
+    assert transport.terminated == 1
+
+
+def test_a_post_exchange_refusal_also_terminates_once_and_never_prompts(pinned_binary):
+    # A protocol failure after session/new still submits no turn and still
+    # tears the minter down exactly once.
+    transport = FakeAcp(session_result={"sessionId": ""})
+
+    with pytest.raises(boot.KimiBootstrapProtocol):
+        _mint(pinned_binary, transport)
+
+    assert transport.terminated == 1
+    assert not any("prompt" in method for method, _ in transport.calls)

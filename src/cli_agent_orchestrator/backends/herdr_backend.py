@@ -409,6 +409,7 @@ class HerdrBackend(TerminalBackend):
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        pane_id: Optional[str] = None,
     ) -> None:
         """Send text to a pane via herdr pane send-text + send-keys Enter.
 
@@ -420,7 +421,18 @@ class HerdrBackend(TerminalBackend):
         ``submit_delay`` is accepted for parity with the backend interface; herdr
         governs its own post-paste timing below (the generous 2s bracketed wait
         already covers Claude Code's Ink renderer), so the value is not used here.
+
+        ``pane_id`` names a tmux pane, which this backend does not address —
+        its panes are herdr's, resolved from the terminal id below. A caller
+        supplying one is asking for a guarantee this backend cannot give, so
+        it is refused rather than dropped: quietly ignoring it would deliver
+        by name to a caller who had specifically declined name resolution.
         """
+        if pane_id is not None:
+            raise TerminalBackendError(
+                "herdr backend cannot target a tmux pane id; "
+                "refusing to fall back to name resolution"
+            )
         # Resolve pane_id from terminal_id stored in DB metadata
         # The window_name is used as a lookup key in CAO's DB → terminal_id mapping
         # For herdr, we need the terminal_id. The service layer passes session:window
@@ -450,8 +462,26 @@ class HerdrBackend(TerminalBackend):
         for _ in range(enter_count):
             self._run_herdr(["pane", "send-keys", pane_id, "Enter"])
 
-    def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
-        """Send a special key to a pane."""
+    def send_special_key(
+        self,
+        session_name: str,
+        window_name: str,
+        key: str,
+        pane_id: Optional[str] = None,
+    ) -> None:
+        """Send a special key to a pane.
+
+        A supplied ``pane_id`` names a tmux pane, which this backend does
+        not address, and is refused for the same reason ``send_keys``
+        refuses one: a caller passing a verified id has specifically
+        declined name resolution, so silently delivering by name would give
+        it the opposite of what it asked for.
+        """
+        if pane_id is not None:
+            raise TerminalBackendError(
+                "herdr backend cannot target a tmux pane id; "
+                "refusing to fall back to name resolution"
+            )
         pane_id = self._resolve_pane_id_from_window(session_name, window_name)
 
         # Map key names
@@ -551,8 +581,23 @@ class HerdrBackend(TerminalBackend):
         # Equivalent to `tmux attach-session -t <session>`.
         os.execvp("herdr", ["herdr", "--session", self._herdr_session])
 
-    def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
-        """Focus the requested Herdr tab and return the browser PTY attach command."""
+    def prepare_web_attach(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        pane_id: Optional[str] = None,
+        server_socket_path: Optional[str] = None,
+    ) -> List[str]:
+        """Focus the requested Herdr tab and return the browser PTY attach command.
+
+        The tmux identity arguments are accepted for interface parity and
+        are not usable here: herdr owns its own panes and addresses them by
+        its own tab ids, which is already identity-based rather than
+        name-based. They are ignored rather than partially honoured — a
+        tmux pane id has no meaning on this backend, and pretending it did
+        would be worse than admitting it does not.
+        """
         workspace_id = self._resolve_workspace_id(session_name)
         tab_id = self._resolve_tab_id(session_name, workspace_id, window_name)
         self._run_herdr(["tab", "focus", tab_id])

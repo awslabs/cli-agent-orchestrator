@@ -36,6 +36,12 @@ _PANE_CONTROL_FORMAT = "\t".join(
     (
         "#{pane_id}",
         "#{window_id}",
+        # The session's immutable id, alongside the window and pane ids.
+        # Session *names* are as mutable and as reusable as window names:
+        # a session can be renamed, killed, and its name taken by an
+        # unrelated later session, so a recorded session name is not an
+        # identity a reattach may bind to.
+        "#{session_id}",
         "#{pane_pid}",
         "#{bracket_paste_flag}",
         "#{pane_dead}",
@@ -47,7 +53,7 @@ _PANE_CONTROL_FORMAT = "\t".join(
         "#{window_name}",
     )
 )
-_PANE_CONTROL_FIELDS = 8
+_PANE_CONTROL_FIELDS = 9
 
 # Just the server identity, for the check the write primitive makes
 # immediately before its first byte.  Kept separate from the full record
@@ -82,6 +88,7 @@ class PaneControlIdentity:
 
     pane_id: str
     window_id: str
+    session_id: str
     pane_pid: int
     session_name: str
     window_name: str
@@ -157,6 +164,7 @@ def _parse_pane_control_record(line: str) -> Optional[PaneControlIdentity]:
     (
         pane_id,
         window_id,
+        session_id,
         pane_pid,
         bracket_flag,
         dead_flag,
@@ -165,6 +173,8 @@ def _parse_pane_control_record(line: str) -> Optional[PaneControlIdentity]:
         window_name,
     ) = fields
     if not is_valid_pane_id(pane_id) or not window_id.startswith("@"):
+        return None
+    if not session_id.startswith("$"):
         return None
     try:
         pid = int(pane_pid)
@@ -175,6 +185,7 @@ def _parse_pane_control_record(line: str) -> Optional[PaneControlIdentity]:
     return PaneControlIdentity(
         pane_id=pane_id,
         window_id=window_id,
+        session_id=session_id,
         pane_pid=pid,
         session_name=session_name,
         window_name=window_name,
@@ -473,6 +484,7 @@ class TmuxClient:
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        pane_id: Optional[str] = None,
     ) -> None:
         """Send keys to window using tmux paste-buffer for instant delivery.
 
@@ -495,6 +507,15 @@ class TmuxClient:
                 Do NOT use for shell commands sent to bash during
                 initialization: those rely on each newline becoming an Enter
                 that runs the line.
+            pane_id: Immutable tmux pane id (``%N``). When supplied it *is*
+                the target and the two names are used only for logging.
+                Prefer it for every write to a registered terminal: a
+                ``session:window`` target is resolved by tmux at write time
+                against names that any later, unrelated window may reuse,
+                so the two names identify a location rather than a pane.
+                Callers that have verified a recorded identity pass the id
+                so that the pane they proved is the pane they write to,
+                with no window in between for a name to be reused in.
         """
         # Defence-in-depth: re-validate at the sink even though callers
         # validate at the API/MCP boundary. Both halves flow into a
@@ -504,7 +525,16 @@ class TmuxClient:
         # also clears the CodeQL py/command-line-injection data flow.
         validated_session = validate_tmux_name(session_name, "session_name")
         validated_window = validate_tmux_name(window_name, "window_name")
-        target = f"{validated_session}:{validated_window}"
+        if pane_id is not None:
+            # A malformed id is refused rather than quietly downgraded to
+            # the name target: the caller asked for an exact pane, and
+            # silently writing somewhere else is the failure this whole
+            # parameter exists to prevent.
+            if not is_valid_pane_id(pane_id):
+                raise ValueError(f"Invalid pane_id: {pane_id!r}")
+            target = pane_id
+        else:
+            target = f"{validated_session}:{validated_window}"
         buf_name = f"cao_{uuid.uuid4().hex[:8]}"
         try:
             # Log metadata only at INFO: the payload is the full launch
@@ -629,7 +659,13 @@ class TmuxClient:
             logger.error(f"Failed to send text via paste to {session_name}:{window_name}: {e}")
             raise
 
-    def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
+    def send_special_key(
+        self,
+        session_name: str,
+        window_name: str,
+        key: str,
+        pane_id: Optional[str] = None,
+    ) -> None:
         """Send a tmux special key sequence (e.g., C-d, C-c) to a window.
 
         Unlike send_keys(), this sends the key as a tmux key name (not literal text)
@@ -639,9 +675,25 @@ class TmuxClient:
             session_name: Name of tmux session
             window_name: Name of window in session
             key: Tmux key name (e.g., "C-d", "C-c", "Escape")
+            pane_id: Immutable tmux pane id (``%N``). When supplied it *is*
+                the target and the names are used only for logging. A
+                control key is delivered the instant it arrives, so a
+                name-resolved target that has been reused acts on a
+                stranger's pane with no opportunity to notice first.
         """
         try:
             logger.info(f"send_special_key: {session_name}:{window_name} - key: {key}")
+
+            if pane_id is not None:
+                # Refused rather than downgraded to the name target, for
+                # the same reason ``send_keys`` refuses: the caller asked
+                # for an exact pane, and writing somewhere else instead is
+                # the failure this parameter exists to prevent.
+                if not is_valid_pane_id(pane_id):
+                    raise ValueError(f"Invalid pane_id: {pane_id!r}")
+                subprocess.run(["tmux", "send-keys", "-t", pane_id, key], check=True)
+                logger.debug(f"Sent special key to pane {pane_id}")
+                return
 
             session = self.server.sessions.get(session_name=session_name)
             if not session:
@@ -790,6 +842,19 @@ class TmuxClient:
         is absent rather than null when unreadable, so a caller storing
         ``.get("server_socket_path")`` records an absence, never a value
         that a later check could pass against.
+
+        ``session_id`` (``$N``) and ``pane_pid`` follow the same rule and
+        exist for the same reason the window id does. A session *name* is
+        as mutable and as reusable as a window name — rename the session,
+        or kill it and let a later unrelated session take the name, and a
+        recorded name resolves somewhere else — so a reattach that means
+        "this exact session" has to say ``$N``. ``pane_pid`` identifies one
+        incarnation of the pane's root process, which is what distinguishes
+        "the pane I registered" from "a pane that reused its id after the
+        server restarted". It is a component of the tuple and never a check
+        on its own: a survival test that consulted only the pid (or only
+        the window) is precisely what let a write land in an unrelated live
+        composer.
         """
         try:
             session = self.server.sessions.get(session_name=session_name)
@@ -807,10 +872,15 @@ class TmuxClient:
             # Observed through the same query the write primitive uses, so
             # what gets recorded here is exactly what will be compared
             # there — a binding recorded by one reading and checked by a
-            # different one would be comparing two unrelated facts.
-            observed_server = self.observe_pane_server_identity(str(pane_id))
-            if observed_server is not None:
-                identity["server_socket_path"] = observed_server
+            # different one would be comparing two unrelated facts.  One
+            # observation supplies all three optional fields, so they can
+            # never disagree about the instant they describe.
+            observed = self.pane_control_identity(pane_id=str(pane_id))
+            if observed is not None:
+                if observed.server_socket_path is not None:
+                    identity["server_socket_path"] = observed.server_socket_path
+                identity["session_id"] = observed.session_id
+                identity["pane_pid"] = str(observed.pane_pid)
             return identity
         except Exception as e:
             logger.error(f"Failed to resolve window identity for {session_name}:{window_name}: {e}")

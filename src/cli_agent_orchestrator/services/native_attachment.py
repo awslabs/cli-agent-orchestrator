@@ -69,7 +69,16 @@ ATTACHMENT_STATES = frozenset(LIVE_STATES | {DETACHED, AMBIGUOUS})
 #: carries different obligations that ``declare`` validates.
 ACQUISITION_ACP_BOOTSTRAP = "zero_prompt_acp_bootstrap"
 ACQUISITION_RESUME = "pinned_resume"
-ACQUISITION_METHODS = frozenset({ACQUISITION_ACP_BOOTSTRAP, ACQUISITION_RESUME})
+#: The id was *chosen* by this system and handed to the provider at launch
+#: rather than obtained from it.  Distinct from the other two because both
+#: of those describe acquiring an id the provider already had: a bootstrap
+#: reads one back out of a transport, and a resume names one that exists.
+#: Recording either of those for a freshly chosen id would make the
+#: journaled receipt say the session pre-dated the launch when it did not.
+ACQUISITION_CHOSEN_SESSION_ID = "chosen_session_id"
+ACQUISITION_METHODS = frozenset(
+    {ACQUISITION_ACP_BOOTSTRAP, ACQUISITION_RESUME, ACQUISITION_CHOSEN_SESSION_ID}
+)
 
 INTENT_SCHEMA = "cao-native-attachment-intent-v1"
 NO_SURVIVOR_PROOF_SCHEMA = "cao-native-attachment-no-survivor-v1"
