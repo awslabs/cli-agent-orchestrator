@@ -758,6 +758,25 @@ def _build_preflight_failure(row: Any, *, reason: str, detail: str) -> dict[str,
 def _mark_preflight_blocked(
     reservation_id: str, detail: str, *, reason: str = PREFLIGHT_REASON_GENERIC
 ) -> dict[str, Any]:
+    # The one gate every emission passes through, checked before the row is
+    # read so a rejected reason cannot leave a half-written state behind.
+    #
+    # Refusing is the fail-closed answer even though it costs a 503, because
+    # the two failures are not symmetrical. This record is immutable and
+    # terminal: an unknown code written here is a code a recovering
+    # conductor must branch on forever, with no branch to take and no way
+    # to correct it after the fact. A refusal leaves the row in a state a
+    # redrive can still resolve correctly once the bug is fixed.
+    #
+    # Safe to make loud because it can only ever fire on a defect in this
+    # module: the reason is never caller-supplied — this is a private
+    # function and every call site passes one of the module constants — so
+    # no request can reach it.
+    if reason not in PREFLIGHT_REASONS:
+        raise ManagedLaunchUnavailable(
+            f"refusing to record {reason!r} as a preflight cause: it is not one of "
+            f"{sorted(PREFLIGHT_REASONS)}, and this evidence is immutable once written"
+        )
     try:
         with database.SessionLocal() as db:
             row = _query(db, reservation_id)

@@ -1178,6 +1178,17 @@ def attest_route(request: ManagedLaunchRouteAttestRequest) -> dict[str, Any]:
         "agent_profile": request.agent_profile,
         "working_directory": worktree,
         "trusted_project_root": request.trusted_project_root,
+        # These two echo the request verbatim. They name the *failure
+        # domain* being attested — "the route that failed, and is now being
+        # checked, was this model at this effort" — and are never a claim
+        # that a provider resolved to them. The distinction matters because
+        # the two providers answer it differently: Kimi's nested receipt
+        # reports a genuinely observed model/effort, while Claude has no
+        # pre-turn resolution surface at all and states its own as
+        # requested-only with observed values explicitly null. A reader that
+        # took these outer keys as resolution would therefore read a Claude
+        # attestation as proving something no probe looked at. Provider-
+        # observed facts live in ``provider_route_receipt`` and nowhere else.
         "model": request.expected_model,
         "effort": request.expected_effort,
         "no_task_admitted": True,

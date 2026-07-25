@@ -260,6 +260,67 @@ class TestPreflightReasonsAreTheClosedContractSet:
         v2._mark_preflight_blocked(record["reservation_id"], "cause", reason=reason)
         assert v2.get(record["reservation_id"])["preflight_failure"]["reason"] == reason
 
+    def test_an_out_of_contract_reason_is_refused_at_the_write(
+        self, isolated_memory_db, worktree, tmp_path
+    ):
+        """The enum is enforced where it is written, not only where it is read.
+
+        The static enumeration above proves today's call sites are lawful,
+        but it can only see literals and module constants in this file. The
+        write itself is the last place an unlawful code can still be
+        stopped: past it the record is immutable and terminal, so a
+        recovering conductor inherits a value it has no branch for and no
+        way to correct.
+        """
+        record = _reserve(worktree, tmp_path)
+
+        with pytest.raises(ManagedLaunchUnavailable):
+            v2._mark_preflight_blocked(record["reservation_id"], "cause", reason="launch-request")
+
+        # Refused *before* anything moved: the generation is still
+        # reserved, so a redrive can reach the right answer once the caller
+        # is fixed. A guard that rejected the reason but left the row
+        # blocked-without-evidence would be the worse of both outcomes.
+        after = v2.get(record["reservation_id"])
+        assert after["state"] == "reserved"
+        assert after["preflight_failure"] is None
+
+    def test_the_refusal_names_the_offending_code_and_the_lawful_set(
+        self, isolated_memory_db, worktree, tmp_path
+    ):
+        """Whoever hits this is reading a traceback, not this test."""
+        record = _reserve(worktree, tmp_path)
+
+        with pytest.raises(ManagedLaunchUnavailable) as raised:
+            v2._mark_preflight_blocked(record["reservation_id"], "cause", reason="provider-launch")
+
+        message = str(raised.value)
+        assert "provider-launch" in message
+        assert "native-generic" in message
+
+    def test_a_replay_cannot_smuggle_an_unlawful_reason_past_the_early_return(
+        self, isolated_memory_db, worktree, tmp_path
+    ):
+        """The guard sits ahead of the already-blocked short circuit.
+
+        That path returns the stored row without building an envelope, so
+        a check placed at envelope construction would wave this through and
+        report success for a code the contract does not contain.
+        """
+        record = _reserve(worktree, tmp_path)
+        v2._mark_preflight_blocked(
+            record["reservation_id"], "first cause", reason=v2.PREFLIGHT_REASON_NATIVE_PREFLIGHT
+        )
+
+        with pytest.raises(ManagedLaunchUnavailable):
+            v2._mark_preflight_blocked(record["reservation_id"], "again", reason="launch-request")
+
+        # The first cause still stands, untouched.
+        assert (
+            v2.get(record["reservation_id"])["preflight_failure"]["reason"]
+            == v2.PREFLIGHT_REASON_NATIVE_PREFLIGHT
+        )
+
 
 class TestPreflightFailureEnvelope:
     def test_blocked_generation_records_identity_bound_zero_byte_evidence(
