@@ -53,6 +53,36 @@ class ManagedLaunchUnavailable(ManagedLaunchError):
     pass
 
 
+#: The closed vocabulary of transient bind refusals. Exactly one member,
+#: and adding a second is a paired change: a consumer treats these as
+#: "retry the same attempt", so a value it does not recognise must be
+#: refused permanently rather than retried on the strength of being new.
+REASON_BIND_BRIDGE_NOT_DURABLY_READY = "bind-bridge-not-durably-ready"
+
+
+class ManagedLaunchNotReady(ManagedLaunchError):
+    """The operation cannot succeed *yet*, and asking again may change it.
+
+    Deliberately **not** a subclass of :class:`ManagedLaunchConflict`. A
+    conflict is permanent and a consumer is right to fail closed on it;
+    this is the one refusal where retrying the same attempt is the correct
+    behaviour, and it must be separable on the wire or a consumer has to
+    infer transience from something else. Inferring it from the row state
+    is what produced the failure this exists to remove: every permanent
+    conflict that happened to leave the row ``launching`` — an identity
+    mismatch, a mode violation, a foreign single-writer holder — was read
+    as "not yet", polled, and reported with the breaker untripped.
+
+    ``reason`` carries a closed-vocabulary token so the distinction
+    survives to the consumer as data rather than as prose it would have to
+    pattern-match.
+    """
+
+    def __init__(self, message: str, *, reason: str):
+        super().__init__(message)
+        self.reason = reason
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 

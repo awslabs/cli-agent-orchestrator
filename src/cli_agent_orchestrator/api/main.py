@@ -1559,6 +1559,16 @@ async def delete_session(
 def _managed_launch_http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, managed_launch.ManagedLaunchNotFound):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    # Checked before the conflict branch, and 425 is used for nothing else
+    # on this surface. A consumer keys "retry the same attempt" on exactly
+    # this status plus a reason it recognises; sharing a code with any
+    # other outcome would reintroduce the ambiguity that made a permanent
+    # identity conflict look like a slow start.
+    if isinstance(exc, managed_launch.ManagedLaunchNotReady):
+        return HTTPException(
+            status_code=status.HTTP_425_TOO_EARLY,
+            detail={"reason": exc.reason, "message": str(exc)},
+        )
     if isinstance(exc, managed_launch.ManagedLaunchConflict):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))

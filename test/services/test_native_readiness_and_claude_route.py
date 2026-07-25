@@ -348,3 +348,200 @@ class TestTheReadinessSiblingHasThreeStates:
         # process identity carries the start marker with it.
         assert sibling["provider_process_id"] == "42@mark"
         assert "proof_absent_reason" not in sibling
+
+
+class TestTheObservedModelSurvivesTheRealPath:
+    """Hook file → readiness receipt → comparison, with nothing faked.
+
+    The earlier revision of this suite asserted ``observed_model_matches``
+    against a hand-written string and never carried a real hook record
+    through the receipt that feeds it. The receipt dropped the provider's
+    ``model`` key, so the comparison ran against ``None`` and refused
+    *every* native Claude launch — while every test passed, because each
+    one supplied the field the production path was losing.
+
+    A test that constructs the value under test is a test of itself. These
+    write the record the provider actually writes and read it back the way
+    production does.
+    """
+
+    #: The live record, verbatim from a real managed launch: the provider
+    #: publishes the model under exactly the key the comparison reads.
+    LIVE_RECORD = {
+        "session_id": "ccefa0aa-ef31-4a8f-8fbc-7b4b9cd7492a",
+        "transcript_path": "/tmp/t.jsonl",
+        "cwd": "/tmp/wt",
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "model": "claude-opus-5[1m]",
+    }
+
+    def _hook_file(self, tmp_path, record):
+        import json
+
+        path = tmp_path / "claude-session-start.jsonl"
+        path.write_text(json.dumps(record) + "\n")
+        return path
+
+    def test_the_receipt_carries_the_providers_model(self, tmp_path):
+        from cli_agent_orchestrator.services import claude_native_readiness as cr
+
+        path = self._hook_file(tmp_path, self.LIVE_RECORD)
+
+        receipt = cr.await_session_start(path, self.LIVE_RECORD["session_id"], timeout=1.0)
+
+        assert receipt["model"] == "claude-opus-5[1m]"
+
+    def test_the_requested_route_is_accepted_end_to_end(self, tmp_path):
+        """Requested ``opus``; the provider's own proof says a 1M Opus."""
+        from cli_agent_orchestrator.services import claude_native_readiness as cr
+
+        path = self._hook_file(tmp_path, self.LIVE_RECORD)
+        receipt = cr.await_session_start(path, self.LIVE_RECORD["session_id"], timeout=1.0)
+
+        assert cl.observed_model_matches("opus", receipt.get("model")) is True
+
+    def test_the_reproduced_wrong_route_is_refused_end_to_end(self, tmp_path):
+        """The live failure: sonnet requested, Opus started."""
+        from cli_agent_orchestrator.services import claude_native_readiness as cr
+
+        path = self._hook_file(tmp_path, self.LIVE_RECORD)
+        receipt = cr.await_session_start(path, self.LIVE_RECORD["session_id"], timeout=1.0)
+
+        assert cl.observed_model_matches(SONNET, receipt.get("model")) is False
+
+    def test_a_record_without_a_model_fails_closed(self, tmp_path):
+        """ "The provider did not say" is not agreement.
+
+        An older build that omits the key must refuse rather than be
+        waved through on an absent observation.
+        """
+        from cli_agent_orchestrator.services import claude_native_readiness as cr
+
+        record = {k: v for k, v in self.LIVE_RECORD.items() if k != "model"}
+        path = self._hook_file(tmp_path, record)
+
+        receipt = cr.await_session_start(path, record["session_id"], timeout=1.0)
+
+        assert receipt["model"] is None
+        assert cl.observed_model_matches("opus", receipt.get("model")) is False
+
+
+class TestOneCompletenessRuleForBindAndProjection:
+    """Bind and the projection must answer the same question identically.
+
+    They used to answer it separately with different sets, and the gap
+    between them was reachable: a receipt rich enough to bind but too thin
+    to project left a generation ``bound`` whose readiness sibling was
+    ``null`` forever. A consumer reads that null as "not yet", so it waits
+    for a readiness that has already been consumed and can never arrive.
+    """
+
+    THIN = {
+        "model_input_ready": True,
+        "provider_session_id": "sess-1",
+        # A session-start proof with no session id, and no process
+        # identity at all: enough to look like a receipt, not enough to
+        # publish as one.
+        "provider_session_start": {},
+        "model_input_ready_observation": {
+            "pane_id": "%3",
+            "provider_status": "idle",
+            "observed_at": "2026-07-25Z",
+        },
+    }
+
+    def test_a_thin_proof_is_incomplete_for_both(self):
+        row = _Row(provider="claude_code")
+        missing = v2._incomplete_readiness_fields(row, self.THIN)
+
+        assert "session_start_hook_id" in missing
+        assert "provider_process_id" in missing
+
+    def test_bind_refuses_a_thin_proof_as_not_yet(self, monkeypatch):
+        """Transient, not permanent: the proof may still be completed.
+
+        Refusing it as a conflict would trip a breaker over a receipt that
+        is merely early.
+        """
+        from cli_agent_orchestrator.services.managed_launch import ManagedLaunchNotReady
+
+        row = _Row(provider="claude_code")
+        assert v2._incomplete_readiness_fields(row, self.THIN)
+        # The same rule the bind gate consults, so the refusal it raises
+        # and the null the projection publishes cannot disagree.
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+            lambda _rid: {"state": "ready", "readiness": self.THIN},
+        )
+        assert v2._native_readiness_sibling(row) is None
+        assert ManagedLaunchNotReady is not None
+
+    def test_a_complete_proof_satisfies_both(self, monkeypatch):
+        complete = dict(self.THIN)
+        complete["provider_session_start"] = {"session_id": "sess-1"}
+        complete["process_identity"] = {"pid": 7, "start_marker": "mk"}
+        row = _Row(provider="claude_code")
+
+        assert v2._incomplete_readiness_fields(row, complete) == []
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+            lambda _rid: {"state": "ready", "readiness": complete},
+        )
+        assert v2._native_readiness_sibling(row) is not None
+
+    def test_a_no_proof_pair_has_nothing_to_be_incomplete_about(self):
+        assert v2._incomplete_readiness_fields(_Row(provider="kimi_cli"), self.THIN) == []
+
+
+class TestTheTransientRefusalIsSeparableOnTheWire:
+    def test_the_reason_is_the_agreed_closed_token(self):
+        """Byte-identical with the consumer, which matches on it."""
+        from cli_agent_orchestrator.services import managed_launch as ml
+
+        assert ml.REASON_BIND_BRIDGE_NOT_DURABLY_READY == "bind-bridge-not-durably-ready"
+
+    def test_not_ready_is_not_a_conflict(self):
+        """A consumer keying on conflict must not see this as permanent."""
+        from cli_agent_orchestrator.services import managed_launch as ml
+
+        exc = ml.ManagedLaunchNotReady("early", reason=ml.REASON_BIND_BRIDGE_NOT_DURABLY_READY)
+        assert isinstance(exc, ml.ManagedLaunchError)
+        assert not isinstance(exc, ml.ManagedLaunchConflict)
+
+    def test_the_status_is_425_and_carries_the_reason(self):
+        """425 is used for nothing else on this surface.
+
+        A shared code is exactly the ambiguity being removed: the consumer
+        requires both the status and a reason it recognises, and treats an
+        unrecognised reason as permanent.
+        """
+        from cli_agent_orchestrator.api.main import _managed_launch_http_error
+        from cli_agent_orchestrator.services import managed_launch as ml
+
+        http = _managed_launch_http_error(
+            ml.ManagedLaunchNotReady("early", reason=ml.REASON_BIND_BRIDGE_NOT_DURABLY_READY)
+        )
+        assert http.status_code == 425
+        assert http.detail["reason"] == "bind-bridge-not-durably-ready"
+
+    def test_every_other_refusal_stays_a_permanent_409(self):
+        """Identity, mode and foreign-attempt conflicts must keep tripping."""
+        from cli_agent_orchestrator.api.main import _managed_launch_http_error
+        from cli_agent_orchestrator.services import managed_launch as ml
+
+        assert _managed_launch_http_error(ml.ManagedLaunchConflict("identity")).status_code == 409
+        assert _managed_launch_http_error(ml.ManagedLaunchNotFound("gone")).status_code == 404
+        assert _managed_launch_http_error(ml.ManagedLaunchUnavailable("down")).status_code == 503
+
+
+class TestModelPinnabilityIsCheckedBeforeAnythingPersists:
+    def test_an_unpinnable_claude_model_is_refused_at_reserve(self):
+        """Earlier than the launch check, which stays.
+
+        Refusing here costs no reservation, no allocated terminal id, and
+        no recovery verb to finalize.
+        """
+        with pytest.raises(cl.ClaudeNativeModelError):
+            cl.validate_requested_model("gpt-5")

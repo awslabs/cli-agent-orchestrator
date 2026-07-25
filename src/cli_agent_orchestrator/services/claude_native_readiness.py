@@ -228,6 +228,17 @@ def await_session_start(
         "transcript_path": first.get("transcript_path"),
         "source": first.get("source"),
         "cwd": first.get("cwd"),
+        # The model the provider says this session is actually running,
+        # forwarded verbatim under the provider's own key. This is the
+        # only place the running route can be learned before a turn: the
+        # launch argv states what was *asked for*, and the two differ
+        # exactly when something went wrong, which is when it matters.
+        #
+        # Carried as an observation, not a route decision — nothing here
+        # interprets it. A record that omits the key yields ``None``, and
+        # the caller comparing against it must fail closed, because
+        # "the provider did not say" is not agreement.
+        "model": first.get("model"),
         # Every id this generation's hook file saw, so a receipt reader
         # can tell a clean start from one where Claude also opened
         # something else.

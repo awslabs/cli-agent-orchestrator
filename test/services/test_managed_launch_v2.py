@@ -21,6 +21,7 @@ from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services.managed_launch import (
     ManagedLaunchConflict,
     ManagedLaunchNotFound,
+    ManagedLaunchNotReady,
 )
 from cli_agent_orchestrator.services.managed_provider_bridge import BRIDGE_VERSION
 
@@ -253,8 +254,19 @@ def test_bind_refused_before_ready(isolated_memory_db, worktree, tmp_path, monke
         lambda rid: {"state": "starting"},
         raising=False,
     )
-    with pytest.raises(ManagedLaunchConflict, match="ready"):
+    # Deliberately no longer a conflict. This is the one bind refusal that
+    # retrying can resolve, and it must be separable on the wire from a
+    # permanent one: a consumer that could not tell them apart inferred
+    # transience from the row state instead, which read every permanent
+    # conflict leaving the row 'launching' — identity mismatch, mode
+    # violation, foreign single-writer holder — as a slow start, polled
+    # it, and reported it with the breaker untripped.
+    with pytest.raises(ManagedLaunchNotReady, match="ready") as raised:
         v2.bind_native(record["reservation_id"], _bind_request(record))
+    assert raised.value.reason == "bind-bridge-not-durably-ready"
+    # Still an error, and still not a conflict: a consumer keying on
+    # ManagedLaunchConflict must not treat this as permanent.
+    assert not isinstance(raised.value, ManagedLaunchConflict)
 
 
 def test_bind_receipt_version_drift_refused(isolated_memory_db, worktree, tmp_path, monkeypatch):

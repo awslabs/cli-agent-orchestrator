@@ -61,9 +61,11 @@ from cli_agent_orchestrator.services import (
 )
 from cli_agent_orchestrator.services.destructive_endpoint import write_binding_record
 from cli_agent_orchestrator.services.managed_launch import (
+    REASON_BIND_BRIDGE_NOT_DURABLY_READY,
     ManagedLaunchConflict,
     ManagedLaunchError,
     ManagedLaunchNotFound,
+    ManagedLaunchNotReady,
     ManagedLaunchUnavailable,
 )
 from cli_agent_orchestrator.services.provider_contracts import (
@@ -248,6 +250,68 @@ _NATIVE_READINESS_OBSERVED_FIELDS = (
 )
 
 
+def _incomplete_readiness_fields(row: Any, receipt: dict[str, Any]) -> list[str]:
+    """Which parts of a proof-bearing sibling this receipt cannot supply.
+
+    The single completeness rule, consulted by **both** the bind gate and
+    the projection. They used to answer this question separately, with
+    different sets, and the gap between them was reachable: a receipt rich
+    enough to bind but too thin to project left a generation ``bound``
+    whose readiness sibling was ``null`` forever — and a consumer reads
+    that null as "not yet", so it waits for a readiness that has already
+    been consumed and can never arrive again.
+
+    Empty for a (mode, provider) pair that authors no proof: there is
+    nothing to be incomplete about, and its no-proof object needs only the
+    pane observation.
+    """
+    mode = em.mode_of_record(_mode_record(row))
+    if _NATIVE_READINESS_SIBLING_SCHEMAS.get(mode, {}).get(row.provider) is None:
+        return []
+    built = _readiness_proof_fields(row, receipt, mode)
+    missing = [
+        field
+        for field in _NATIVE_READINESS_OBSERVED_FIELDS
+        if not isinstance(built.get(field), str) or not built[field]
+    ]
+    if not isinstance(built.get("native_session_id"), str) or not built["native_session_id"]:
+        missing.append("native_session_id")
+    if not built.get("input_ready"):
+        missing.append("input_ready")
+    return missing
+
+
+def _readiness_proof_fields(row: Any, receipt: dict[str, Any], mode: str) -> dict[str, Any]:
+    """The proof-bearing sibling's fields, assembled from row + observation.
+
+    Split out so the completeness rule above and the projection below are
+    literally the same computation rather than two that agree today.
+    """
+    observation = receipt.get("model_input_ready_observation") or {}
+    session_start = receipt.get("provider_session_start") or {}
+    return {
+        "schema": _NATIVE_READINESS_SIBLING_SCHEMAS.get(mode, {}).get(row.provider),
+        "provider": row.provider,
+        "terminal_id": row.terminal_id,
+        "generation": row.generation,
+        "execution_mode": mode,
+        # The session the provider actually adopted, rather than the id
+        # chosen for it — the two differ exactly when something went
+        # wrong, which is when this field matters.
+        "native_session_id": receipt.get("provider_session_id"),
+        # Provider-authored: the hook Claude itself wrote, naming the
+        # session it started.
+        "session_start_hook_id": session_start.get("session_id"),
+        # Observed: what the composer detector read off the pane, when,
+        # and where.
+        "composer_state": observation.get("provider_status"),
+        "pane_id": observation.get("pane_id"),
+        "provider_process_id": _published_process_id(receipt.get("process_identity")),
+        "observed_at": observation.get("observed_at"),
+        "input_ready": bool(receipt.get("model_input_ready")),
+    }
+
+
 def _published_process_id(process_identity: Any) -> Optional[str]:
     """One process, rendered as the string the readiness sibling carries.
 
@@ -345,43 +409,13 @@ def _native_readiness_sibling(row: Any) -> Optional[dict[str, Any]]:
             "input_ready": True,
             "input_ready_observation": observation,
         }
-    session_start = receipt.get("provider_session_start") or {}
-    sibling = {
-        # Identity, from the durable row. The bound mode decides the kind
-        # and is itself published, so a reader can check that the receipt
-        # it got is the one this mode calls for.
-        "schema": schema,
-        "provider": row.provider,
-        "terminal_id": row.terminal_id,
-        "generation": row.generation,
-        "execution_mode": em.mode_of_record(_mode_record(row)),
-        # The session the provider actually adopted, from the receipt's
-        # provider-session identity rather than from the id that was
-        # chosen for it — the two differ exactly when something went
-        # wrong, which is when this field matters.
-        "native_session_id": receipt.get("provider_session_id"),
-        # Provider-authored: the hook Claude itself wrote, naming the
-        # session it started.
-        "session_start_hook_id": session_start.get("session_id"),
-        # Observed: what the composer detector actually read off the pane,
-        # and when, and where.
-        "composer_state": observation.get("provider_status"),
-        "pane_id": observation.get("pane_id"),
-        "provider_process_id": _published_process_id(receipt.get("process_identity")),
-        "observed_at": observation.get("observed_at"),
-        "input_ready": bool(receipt.get("model_input_ready")),
-    }
-    # An incomplete proof is not a weaker proof; it is an absent one. A
-    # sibling published with holes would satisfy the "is it there?" half of
-    # a consumer's check while failing the half that matters, and the
-    # refusal would name a field rather than the real state, which is that
-    # readiness has not been established.
-    if not sibling["input_ready"] or not isinstance(sibling["native_session_id"], str):
+    # One completeness rule, shared with the bind gate. An incomplete
+    # proof is not a weaker proof; it is an absent one — and because bind
+    # asks the same question with the same function, a generation cannot
+    # bind on a receipt this would then refuse to publish.
+    if _incomplete_readiness_fields(row, receipt):
         return None
-    for field in _NATIVE_READINESS_OBSERVED_FIELDS:
-        if not isinstance(sibling.get(field), str) or not sibling[field]:
-            return None
-    return sibling
+    return _readiness_proof_fields(row, receipt, mode)
 
 
 def _row_dict(row: Any) -> dict[str, Any]:
@@ -584,6 +618,18 @@ def _validate_reserve_identity(request: ManagedLaunchV2ReserveRequest) -> dict[s
         provider_contracts.validate_route_effort(request.expected_model, request.expected_effort)
     except provider_contracts.ProviderContractError as exc:
         raise ManagedLaunchConflict(str(exc)) from exc
+    # The model half of the same pre-I/O question, asked beside the effort
+    # half. The launch checks this again before minting an identity, and
+    # that check stays: this one only moves the refusal earlier, so an
+    # unpinnable Claude route costs no reservation, no allocated terminal
+    # id, and no recovery verb to finalize.
+    if request.provider == "claude_code":
+        from cli_agent_orchestrator.services import claude_native_launch
+
+        try:
+            claude_native_launch.validate_requested_model(request.expected_model)
+        except claude_native_launch.ClaudeNativeLaunchError as exc:
+            raise ManagedLaunchConflict(str(exc)) from exc
     payload = request.model_dump(mode="json")
     # The raw nonce never persists; only its digest is stored.
     payload.pop("launch_nonce")
@@ -1478,9 +1524,29 @@ def bind_native(reservation_id: str, request: ManagedLaunchV2BindRequest) -> dic
                 state = read_state(reservation_id)
                 receipt = (state or {}).get("readiness")
                 if not isinstance(receipt, dict) or (state or {}).get("state") != "ready":
-                    raise ManagedLaunchConflict(
+                    # The one transient refusal on this surface. Typed, so
+                    # a consumer retries the same attempt instead of
+                    # inferring transience from the row state — an
+                    # inference that read every permanent conflict leaving
+                    # the row ``launching`` as a slow start.
+                    raise ManagedLaunchNotReady(
                         "native bind requires the bridge's durable ready state with a "
-                        "provider-native readiness receipt"
+                        "provider-native readiness receipt; none is published yet",
+                        reason=REASON_BIND_BRIDGE_NOT_DURABLY_READY,
+                    )
+                # The same completeness rule the projection applies, asked
+                # here and answered once. Binding on a receipt the sibling
+                # would reject produces a generation that is bound and
+                # projects ``null`` forever: the consumer then waits for a
+                # readiness that has already been consumed and can never
+                # arrive. Two rules for one question is how that gap
+                # opened, so there is now one.
+                missing = _incomplete_readiness_fields(row, receipt)
+                if missing:
+                    raise ManagedLaunchNotReady(
+                        "the durable readiness receipt is not yet complete enough to "
+                        f"publish as a binding proof; missing {sorted(missing)}",
+                        reason=REASON_BIND_BRIDGE_NOT_DURABLY_READY,
                     )
                 _validate_readiness_for_bind(row, receipt)
                 intent = _build_bind_intent(db, row, reservation_id, request, receipt, bound_mode)
