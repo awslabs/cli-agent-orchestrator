@@ -13,19 +13,29 @@ terminal and report success. The pane id is minted once per pane and is
 never reused while the server lives, so a write targeted at one either
 reaches that pane or fails.
 
-The writing side is deliberately split by effect. ``send_literal`` types
-and never submits; ``send_enter`` submits and types nothing;
-``send_soft_newline`` opens a new line inside the composer and submits
-nothing. A single ``send(text)`` would let a newline inside a payload do
-the submitting, which is how a half-composed message becomes a sent one.
-``tmux send-keys -l`` writes the argument as literal characters -- no
-key-name interpretation, and no paste buffer, so no bracketed-paste
-sentinel can be introduced by this path at all.
+The writing side is deliberately split by effect. ``send_literal`` writes
+payload text and never submits; ``send_enter`` submits and writes no
+payload; ``send_key`` sends one named control key. A single
+``send(text)`` would let a newline inside a payload do the submitting,
+which is how a half-composed message becomes a sent one.
 
-Multi-line content is therefore delivered as content, not as newlines:
-each line is typed literally and the line breaks between them are
-composer keystrokes. The bytes ``\\r`` and ``\\n`` never reach the pane
-from here in any mode.
+The guarantee this module makes is about *payload writes*, and only
+those: a literal write never contains CR, LF, or a bracketed-paste
+marker. ``tmux send-keys -l`` writes its argument as literal characters
+with no key-name interpretation and no paste buffer, so nothing in a
+message can be reinterpreted as a control action.
+
+``send_key`` carries no such guarantee, and must not be read as if it
+did. A tmux key name is *resolved to bytes by tmux*, and those bytes are
+then interpreted by the provider: ``C-j`` emits LF, and ``Enter`` submits
+by design. Whether a given key inserts a newline rather than sending is a
+fact about one provider build, so **the caller owns that meaning** by
+pinning the key to an exact version. This module only guarantees it sends
+the key it was given, to the pane it was given, or raises.
+
+Multi-line content is delivered on those terms: each line is typed as a
+literal payload write, and the breaks between lines are named keys chosen
+by the version-pinned caller.
 """
 
 from __future__ import annotations
@@ -42,13 +52,16 @@ _LITERAL_CHUNK_CHARS = 1024
 
 _DEFAULT_TIMEOUT_SECONDS = 10.0
 
-# Refused rather than stripped. Every one of these either terminates the
-# literal write early or submits it: ESC (7-bit and 8-bit CSI
-# introducers) starts an escape sequence the pane will interpret, and CR
-# or LF submits whatever is in the composer. A caller holding text with
-# any of them built it through a path this module exists to replace, and
-# silently editing the message a human asked to send would be worse than
-# refusing it.
+# Refused rather than stripped. Each of these stops being payload the
+# moment it arrives: ESC (7-bit and 8-bit CSI introducers) starts an
+# escape sequence the pane will interpret, and CR or LF is a control byte
+# the provider acts on -- submitting on some builds, breaking the line on
+# others. Which one hardly matters here: the point is that a byte inside
+# a message must never get to decide, and only the caller's pinned key
+# names may carry that meaning. A caller holding text with any of them
+# built it through a path this module exists to replace, and silently
+# editing the message a human asked to send would be worse than refusing
+# it.
 _ILLEGAL_LITERAL_CHARS = ("\x1b", "\x9b", "\r", "\n")
 
 
@@ -184,19 +197,25 @@ class TmuxPaneInput:
             )
 
     def send_key(self, keystroke: str) -> None:
-        """Send one named, non-submitting key -- never text.
+        """Send one named key -- a key event, never payload text.
 
-        Used for the keys that shape the composer rather than fill it:
-        the newline that breaks a line without sending, and any key a
-        provider pin needs before submitting. The argument is a tmux key
-        *name*, so this cannot emit a literal ``\\n`` -- which would
-        submit -- no matter what is passed.
+        Used for the keys that shape the composer rather than fill it,
+        such as the newline that breaks a line without sending.
 
-        Deliberately without a default. Which key inserts a newline
-        instead of sending is a per-provider, per-version fact that has
-        to be proven against the installed build; a default here would be
-        this module guessing on behalf of every provider, and the failure
-        mode of a wrong guess is a message submitted in pieces.
+        **This does not promise the key is harmless.** tmux resolves the
+        name to bytes and the provider interprets them: ``C-j`` emits LF,
+        and ``Enter`` submits. Passing a submitting key here submits.
+        What this guarantees is narrower and is the part payload text
+        depends on -- the argument is a key *name*, so message content
+        can never reach the pane through this method and be reinterpreted
+        as a control action.
+
+        Which key inserts a newline instead of sending is a per-provider,
+        per-version fact that has to be proven against the installed
+        build, so there is deliberately no default: the version-pinned
+        caller owns that meaning. A default here would be this module
+        guessing on behalf of every provider, and the failure mode of a
+        wrong guess is a message submitted in pieces.
         """
         if not isinstance(keystroke, str) or not keystroke.strip():
             raise NativePaneInputInvalid(

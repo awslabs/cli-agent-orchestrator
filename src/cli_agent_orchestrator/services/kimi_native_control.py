@@ -133,8 +133,11 @@ CONTROL_COMPACT = "/compact"
 #: ESC, so refusing the class covers them without this module keeping a
 #: second copy of a sentinel vocabulary that belongs to the
 #: cross-provider control-input contract.  CR and LF are refused with it
-#: because an embedded newline submits the composer early -- sending
-#: half a message and leaving the remainder as a stray line.
+#: because they are control bytes the provider acts on rather than
+#: characters it stores -- on some builds submitting the composer early,
+#: on others breaking the line.  Either way a byte inside a message would
+#: be deciding, which is exactly what the keystroke plan exists to take
+#: away from it.
 #:
 #: This governs one *literal write*.  Message text may legitimately
 #: contain newlines; they are delivered as composer keystrokes between
