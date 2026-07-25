@@ -498,7 +498,13 @@ def test_the_capabilities_advertise_the_typed_not_ready_contract(client):
     """
     capabilities = client.get("/managed-launch/capabilities").json()
 
-    assert capabilities["native_bind_not_ready_status"] == 425
+    published = capabilities["native_bind_not_ready_status"]
+    # A JSON *number*, not a quoted one. The consumer compares it to an
+    # integer status, so a string would satisfy a loose check on one side
+    # and fail the gate on the other — the same both-sides-green,
+    # fails-together shape as the nested-envelope divergence.
+    assert isinstance(published, int) and not isinstance(published, bool)
+    assert published == 425
     assert capabilities["native_bind_not_ready_reason"] == "bind-bridge-not-durably-ready"
 
 
