@@ -29,6 +29,7 @@ produce a form its own validator would reject.
 
 from __future__ import annotations
 
+import re
 import uuid as _uuid_module
 from typing import Iterable, List, Optional
 
@@ -77,6 +78,49 @@ FORBIDDEN_OPTIONS = (
     "--no-session-persistence",
     "--from-pr",
 )
+
+#: The flag that pins the route. From the installed build's own help:
+#:
+#:     --model <model>   Model for the current session. Provide an alias
+#:                       for the latest model (e.g. 'fable', 'opus', or
+#:                       'sonnet') or a model's full name (e.g.
+#:                       'claude-fable-5').
+#:
+#: A launch that omits it runs on whatever the provider would choose,
+#: which is how a session requested as sonnet came up as a 1M Opus route.
+#: The request is not a preference the launch may round: an unpinnable
+#: model is refused before any I/O rather than approximated.
+MODEL_OPTION = "--model"
+
+#: Accepted ``--model`` values, exactly. Two forms, because the provider
+#: documents two and they mean different things:
+#:
+#: * an **alias** names *the latest model in a family*. Pinning an alias
+#:   to one exact resolved id would encode a "latest" that the provider
+#:   changes without telling us, so an alias request is satisfied by any
+#:   observed id in that family — and by nothing outside it.
+#: * a **full name** names one model. It is satisfied by exactly itself.
+#:
+#: Anything else is refused rather than passed through: a value this side
+#: cannot check the observation against is a value it cannot honestly
+#: attest, and passing it would put the route back in the state where
+#: nobody could say what was running.
+MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
+
+#: The family tokens a full model name may name. Read off the ids this
+#: machine's provider has actually reported, never guessed:
+#: ``claude-opus-5[1m]`` from a live SessionStart, plus ``claude-opus-5``,
+#: ``claude-sonnet-5``, ``claude-sonnet-4-6``, ``claude-fable-5`` and
+#: ``claude-haiku-4-5-20251001`` from provider-authored transcripts.
+MODEL_FAMILIES = MODEL_ALIASES
+
+#: Observed ids carry a context-window suffix — the live proof read
+#: ``claude-opus-5[1m]`` — which names how much context the session was
+#: given, not which model is answering. It is stripped before comparison
+#: so a 1M session of the requested model is not reported as a different
+#: model, and it is stripped from the *observation* only: a request never
+#: carries one.
+_CONTEXT_SUFFIX = re.compile(r"\[[^\]]*\]\s*$")
 
 
 class ClaudeNativeLaunchError(ValueError):
@@ -216,3 +260,97 @@ def binds_exactly(argv: List[str], session_id: str) -> bool:
     to know and no reason to care about.
     """
     return launches_exactly(argv, session_id) or resumes_exactly(argv, session_id)
+
+
+class ClaudeNativeModelError(ClaudeNativeLaunchError):
+    """A requested model cannot be pinned, or the running one is not it."""
+
+
+def _family_of(value: str) -> Optional[str]:
+    """The model family a value names, or None if it names none.
+
+    Matched on a hyphen-delimited segment rather than a substring, so a
+    family token embedded in some longer word cannot be read as that
+    family.
+    """
+    segments = value.strip().lower().split("-")
+    for family in MODEL_FAMILIES:
+        if family in segments:
+            return family
+    return None
+
+
+def normalize_observed_model(observed: str) -> str:
+    """One observed model id, with its context-window suffix removed.
+
+    The suffix says how much context the session was given, not which
+    model is answering, so leaving it on would report a 1M session of the
+    requested model as a different model entirely.
+    """
+    return _CONTEXT_SUFFIX.sub("", str(observed).strip()).strip()
+
+
+def validate_requested_model(model: Optional[str]) -> str:
+    """The exact ``--model`` value for a request, or a typed refusal.
+
+    Refuses before any provider I/O, at the same boundary the rest of the
+    route is checked, because the alternative is a launch on whatever
+    default the provider picks — which is indistinguishable from success
+    until someone reads the running session's own report.
+    """
+    if not isinstance(model, str) or not model.strip():
+        raise ClaudeNativeModelError(
+            "a native Claude launch requires an explicit model; there is no default "
+            "this side may choose on the caller's behalf"
+        )
+    value = model.strip()
+    if value.lower() in MODEL_ALIASES:
+        return value.lower()
+    if value.lower().startswith("claude-") and _family_of(value) is not None:
+        return value.lower()
+    raise ClaudeNativeModelError(
+        f"model {model!r} is not a pinnable Claude route: expected one of the aliases "
+        f"{list(MODEL_ALIASES)} or a full name naming one of those families. A value "
+        "this side cannot check the running session against is one it cannot honestly "
+        "attest, so it is refused rather than passed through"
+    )
+
+
+def observed_model_matches(requested: str, observed: Optional[str]) -> bool:
+    """Whether the session the provider actually started is the one asked for.
+
+    An alias request means "the latest model in this family", so it is
+    satisfied by any observed id in that family — pinning it to one exact
+    id would encode a "latest" the provider changes without notice. A full
+    name means one model, and is satisfied by exactly itself.
+    """
+    if not isinstance(observed, str) or not observed.strip():
+        return False
+    seen = normalize_observed_model(observed).lower()
+    wanted = requested.strip().lower()
+    if wanted in MODEL_ALIASES:
+        return _family_of(seen) == wanted
+    return seen == wanted
+
+
+def build_launch_argv_with_model(
+    *,
+    session_id: str,
+    model: str,
+    claude_binary: str = "claude",
+    extra_args: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """``claude --session-id <uuid> --model <model> [extra]``.
+
+    The model rides on the launch itself rather than being applied
+    afterwards, because there is no "afterwards" that a managed pane can
+    reach: the session is already running by the time anything could send
+    a slash command, and the first turn would have gone to the wrong
+    route.
+    """
+    pinned = validate_requested_model(model)
+    return build_launch_argv(
+        session_id=session_id,
+        claude_binary=claude_binary,
+        extra_args=[MODEL_OPTION, pinned, *list(extra_args or [])],
+    )

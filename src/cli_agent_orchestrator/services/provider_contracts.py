@@ -35,6 +35,17 @@ PROVIDER_KIMI = "kimi"
 PROVIDER_CLAUDE = "claude"
 PROVIDERS = (PROVIDER_CODEX, PROVIDER_KIMI, PROVIDER_CLAUDE)
 
+#: The *canonical wire keys*, which are a different namespace from the
+#: three above. Those name the executable and key the version-pin tables;
+#: these are what a reservation, a launch surface and a capability
+#: response call the provider. The two are deliberately not merged: the
+#: recovery-capability surface is closed over the short names and the v2
+#: launch surface is closed over these, and a helper that accepted either
+#: would let a caller satisfy one contract with the other's vocabulary.
+PROVIDER_CODEX_WIRE = "codex"
+PROVIDER_KIMI_CLI = "kimi_cli"
+PROVIDER_CLAUDE_CODE = "claude_code"
+
 #: The single *current* pin per provider: the version a fresh mint/proof
 #: is expected to run, and the one a receipt records when it cannot read a
 #: more specific fact.  ``SUPPORTED_VERSIONS`` below is the acceptance
@@ -132,23 +143,94 @@ def validate_route_effort(model: Optional[str], effort: Optional[str]) -> None:
         )
 
 
-def effort_receipt_matches(expected: Optional[str], observed: Optional[str]) -> bool:
+#: How an effort can be learned for one ``(provider, model)`` pair. Three
+#: values, three different claims — and the difference between the last
+#: two is load-bearing, not a nicety.
+#:
+#: ``observable``          the provider resolves an effort and it can be
+#:                         read back before a turn, so a receipt states it
+#:                         and bind requires observed == requested.
+#: ``none``                the model exposes no effort surface at all. The
+#:                         route carries the provider-default sentinel and
+#:                         the observation is null.
+#: ``unobserved-pre-turn`` the model *has* an effort surface, but nothing
+#:                         can read it before the first turn. The route
+#:                         keeps its concrete requested effort; only the
+#:                         observation is null.
+#:
+#: A model with no effort surface and a model whose effort cannot yet be
+#: *seen* are different facts. The sentinel that truthfully describes the
+#: first would be a lie about the second, so a provider in the third class
+#: must never be routed through the sentinel to make the plumbing simpler:
+#: that would silently discard a real requested effort. Should an
+#: authoritative pre-turn proof appear later, the pair is redeclared
+#: ``observable`` and enters the existing equality with no new field and
+#: no new branch.
+EFFORT_OBSERVABLE = "observable"
+EFFORT_OBSERVABILITY_NONE = "none"
+EFFORT_UNOBSERVED_PRE_TURN = "unobserved-pre-turn"
+
+#: Pairs whose observability differs from the default ``observable``.
+#: Keyed by provider, then by model where the answer is model-specific.
+#: Claude is provider-wide: no Claude model exposes a pre-turn effort
+#: reading, which is the same fact the route attestor already records when
+#: it refuses to name an observed effort.
+_EFFORT_OBSERVABILITY: dict = {
+    PROVIDER_CLAUDE_CODE: {None: EFFORT_UNOBSERVED_PRE_TURN},
+    PROVIDER_KIMI_CLI: {model: EFFORT_OBSERVABILITY_NONE for model in EFFORTLESS_MODELS},
+}
+
+
+def effort_observability(provider: Optional[str], model: Optional[str]) -> str:
+    """The declared observability of one ``(provider, model)`` pair.
+
+    Defaults to ``observable``, which is what Codex and the K3 Kimi routes
+    already are: an undeclared pair keeps the strict equality it has
+    today, so adding a provider cannot silently weaken an existing check —
+    the weaker classes are opt-in and each one is written down.
+    """
+    by_model = _EFFORT_OBSERVABILITY.get(provider or "")
+    if not by_model:
+        return EFFORT_OBSERVABLE
+    if model in by_model:
+        return by_model[model]
+    # A provider-wide declaration, recorded under ``None``.
+    return by_model.get(None, EFFORT_OBSERVABLE)
+
+
+def effort_receipt_matches(
+    expected: Optional[str],
+    observed: Optional[str],
+    *,
+    observability: str = EFFORT_OBSERVABLE,
+) -> bool:
     """Whether a receipt's observed effort is the one this route asked for.
 
     The comparison lives here, with the rest of the effort vocabulary,
-    because the sentinel and the value a truthful receipt reports are two
-    different alphabets and only this module knows both. A raw string
-    equality between them refuses every provider-default launch: the route
-    says ``provider-default`` and an honest native receipt says ``None``,
+    because the route and a truthful receipt speak different alphabets and
+    only this module knows both. A raw string equality between them
+    refuses every provider-default launch: the route says
+    ``provider-default`` and an honest native receipt says ``None``,
     because that session was never told an effort and never checked one.
 
-    * A selecting route requires ``observed == expected``, unchanged.
-    * A provider-default route requires ``observed is None``. A non-null
-      observed value is a genuine mismatch, not a formality — it means the
-      session settled on an effort nobody selected, which is exactly the
-      drift the exact-route check exists to catch, and accepting it would
-      certify a route this side never chose.
+    By declared observability:
+
+    * ``observable`` — ``observed == expected``, unchanged. This is where
+      Codex and K3 live and nothing about them moves.
+    * ``none`` — ``observed`` must be null. A non-null value is a genuine
+      mismatch: it means the session settled on an effort nobody selected,
+      which is the drift the exact-route check exists to catch.
+    * ``unobserved-pre-turn`` — ``observed`` must be null too, but for the
+      opposite reason: an effort *was* requested and simply cannot be seen
+      yet. A non-null value here is a claim nothing could have produced,
+      so it is refused rather than accepted as a bonus.
+
+    Null is never universally acceptable. Treating it as always-matching
+    would unblock the unobservable pairs by making every route's effort
+    unverifiable, including the ones where an effort really is read back.
     """
+    if observability in (EFFORT_OBSERVABILITY_NONE, EFFORT_UNOBSERVED_PRE_TURN):
+        return observed is None
     if route_selects_effort(expected):
         return observed == expected
     return observed is None

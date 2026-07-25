@@ -69,6 +69,12 @@ def test_capability_handshake_is_exact_and_versioned(client):
         "bridge_environment_inventory": "names-only-sha256",
         "post_allocation_bridge_failure_finalization": True,
         "launch_failure_evidence_schema": "cao-managed-bridge-launch-failure-v1",
+        # The one transient bind refusal, advertised so a new consumer can
+        # negotiate it against an old peer rather than assume it. Additive:
+        # a consumer that ignores both keys behaves exactly as before,
+        # which is why this carries no protocol-version bump.
+        "native_bind_not_ready_status": 425,
+        "native_bind_not_ready_reason": "bind-bridge-not-durably-ready",
         "trusted_project_root_providers": ["codex"],
         "readiness_providers": ["codex", "kimi_cli"],
         "execution_mode_selection": True,

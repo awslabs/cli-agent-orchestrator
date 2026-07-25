@@ -427,3 +427,138 @@ def test_every_advertised_v2_mode_has_a_launch_branch(client):
     advertised = client.get("/managed-launch/capabilities").json()["v2_launchable_execution_modes"]
 
     assert advertised == list(v2.LAUNCHABLE_EXECUTION_MODES)
+
+
+def test_a_not_yet_ready_bind_is_425_with_the_exact_serialized_envelope(
+    client, isolated_memory_db, worktree, tmp_path, monkeypatch
+):
+    """The transient bind refusal, as it actually appears on the wire.
+
+    Both sides had been modelling this envelope independently — the
+    consumer's client and its own fake shared one assumption about where
+    ``reason`` sits, and would have passed together while failing against
+    this server. So the shape is asserted here, through the real ASGI
+    app, where FastAPI does the serializing: a test that built the body
+    itself would be asserting its own model of the framework.
+
+    ``reason`` is nested under ``detail`` because that is what an
+    ``HTTPException(detail={...})`` produces. It is the one refusal a
+    consumer may retry, which is why it needs its own status *and* a
+    closed-vocabulary token — everything else on this surface stays 409
+    and permanent.
+    """
+    payload = _reserve_payload(worktree, tmp_path)
+    assert client.post(V2_ROOT, json=payload).status_code == 201
+    reservation_id = payload["reservation_id"]
+    v2.claim_launch(reservation_id)
+    # The bridge has started but published no durable readiness yet: the
+    # ordinary early state, not a fault.
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+        lambda _rid: {"state": "starting"},
+        raising=False,
+    )
+
+    response = client.post(
+        f"{V2_ROOT}/{reservation_id}/bind",
+        json=_bind_payload(
+            {
+                "terminal_id": _terminal_of(reservation_id),
+                "generation": _generation_of(reservation_id),
+            }
+        ),
+    )
+
+    assert response.status_code == 425, response.text
+    body = response.json()
+    assert set(body) == {"detail"}
+    assert body["detail"]["reason"] == "bind-bridge-not-durably-ready"
+    assert isinstance(body["detail"]["message"], str) and body["detail"]["message"]
+    # Not root-level: a consumer that reads body["reason"] finds nothing,
+    # which is exactly the divergence this pins.
+    assert "reason" not in body
+
+
+def _terminal_of(reservation_id: str) -> str:
+    return v2.get(reservation_id)["terminal_id"]
+
+
+def _generation_of(reservation_id: str) -> str:
+    return v2.get(reservation_id)["generation"]
+
+
+def test_the_capabilities_advertise_the_typed_not_ready_contract(client):
+    """A new consumer can negotiate 425 instead of discovering it.
+
+    An old peer uses 425 for nothing and answers every not-yet-ready bind
+    with a permanent 409, so a consumer that assumed the typed contract
+    would never retry and the launch would fail on terms neither side
+    agreed to. These two keys let it fail closed before a reservation
+    exists; their absence is exactly the signal that the peer is old.
+    """
+    capabilities = client.get("/managed-launch/capabilities").json()
+
+    published = capabilities["native_bind_not_ready_status"]
+    # A JSON *number*, not a quoted one. The consumer compares it to an
+    # integer status, so a string would satisfy a loose check on one side
+    # and fail the gate on the other — the same both-sides-green,
+    # fails-together shape as the nested-envelope divergence.
+    assert isinstance(published, int) and not isinstance(published, bool)
+    assert published == 425
+    assert capabilities["native_bind_not_ready_reason"] == "bind-bridge-not-durably-ready"
+
+
+def test_the_advertisement_is_bound_to_the_behaviour_it_describes(client):
+    """Pinned against what the endpoint actually does, not a shared literal.
+
+    Two constants agreeing is not the property that matters — an
+    advertisement can drift from the behaviour it describes and still
+    match a literal a test copied from it. So the published values are
+    compared to the status and reason the error mapper really produces
+    for the typed refusal, which is the thing a consumer will meet.
+    """
+    from cli_agent_orchestrator.api.main import _managed_launch_http_error
+
+    raised = _managed_launch_http_error(
+        managed_launch.ManagedLaunchNotReady(
+            "early", reason=managed_launch.REASON_BIND_BRIDGE_NOT_DURABLY_READY
+        )
+    )
+    capabilities = client.get("/managed-launch/capabilities").json()
+
+    assert capabilities["native_bind_not_ready_status"] == raised.status_code
+    assert capabilities["native_bind_not_ready_reason"] == raised.detail["reason"]
+
+
+def test_the_advertisement_matches_the_live_wire_answer(
+    client, isolated_memory_db, worktree, tmp_path, monkeypatch
+):
+    """End to end: negotiate from the capabilities, then meet the refusal.
+
+    This is the sequence a consumer actually performs, so it is the one
+    worth asserting — a capability document that agreed with a helper but
+    not with the route would pass every test above.
+    """
+    capabilities = client.get("/managed-launch/capabilities").json()
+    payload = _reserve_payload(worktree, tmp_path)
+    assert client.post(V2_ROOT, json=payload).status_code == 201
+    reservation_id = payload["reservation_id"]
+    v2.claim_launch(reservation_id)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_provider_bridge.read_state",
+        lambda _rid: {"state": "starting"},
+        raising=False,
+    )
+
+    response = client.post(
+        f"{V2_ROOT}/{reservation_id}/bind",
+        json=_bind_payload(
+            {
+                "terminal_id": _terminal_of(reservation_id),
+                "generation": _generation_of(reservation_id),
+            }
+        ),
+    )
+
+    assert response.status_code == capabilities["native_bind_not_ready_status"]
+    assert response.json()["detail"]["reason"] == capabilities["native_bind_not_ready_reason"]
