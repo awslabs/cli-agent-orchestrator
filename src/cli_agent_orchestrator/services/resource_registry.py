@@ -912,15 +912,23 @@ _BRIDGE = "managed_provider_bridge._serve"
 # ``_mark_bridge_resource_created`` / ``_mark_bridge_journal_created``,
 # and deletes in ``_deregister_bridge_resources`` only after a real
 # absence probe.
-_TS_DECLARE = f"{_TS}:344"  # registry.declare in _register_v2_terminal_resources
-_TS_MARK = f"{_TS}:392"  # registry.register_created in _mark_v2_resource_created
-_TS_MONITOR = f"{_TS}:360"  # registry.monitor in _register_v2_terminal_resources
-_TS_DELETE = f"{_TS}:635"  # registry.delete in _deregister_v2_terminal_resources
+#
+# These are line numbers, so they drift whenever anything above the call
+# site grows.  That is not a flaw in the manifest — pinning the exact line
+# is what lets the acceptance test prove the verb really executes there
+# rather than trusting a function name — but it does mean an unrelated edit
+# to either file will fail that test until these are re-pinned.  The
+# trailing comment on each entry names the helper the line must sit in, so
+# re-pinning is a search for the verb inside that helper, never a guess.
+_TS_DECLARE = f"{_TS}:573"  # registry.declare in _register_v2_terminal_resources
+_TS_MARK = f"{_TS}:621"  # registry.register_created in _mark_v2_resource_created
+_TS_MONITOR = f"{_TS}:589"  # registry.monitor in _register_v2_terminal_resources
+_TS_DELETE = f"{_TS}:864"  # registry.delete in _deregister_v2_terminal_resources
 _CS_RESOLVE = f"{_CS}:112"  # registry.resolve_fs_path in cleanup_old_data
-_BR_DECLARE = f"{_BR}:2987"  # registry.declare in _declare_bridge_resources
-_BR_MARK = f"{_BR}:3031"  # registry.register_created in _mark_bridge_resource_created
-_BR_JOURNAL_MARK = f"{_BR}:3055"  # registry.register_created in _mark_bridge_journal_created
-_BR_DELETE = f"{_BR}:3208"  # registry.delete in _deregister_bridge_resources
+_BR_DECLARE = f"{_BR}:2992"  # registry.declare in _declare_bridge_resources
+_BR_MARK = f"{_BR}:3036"  # registry.register_created in _mark_bridge_resource_created
+_BR_JOURNAL_MARK = f"{_BR}:3060"  # registry.register_created in _mark_bridge_journal_created
+_BR_DELETE = f"{_BR}:3213"  # registry.delete in _deregister_bridge_resources
 
 _MANIFEST_SPEC: tuple[tuple[str, str, str, str], ...] = (
     # --- terminal log artifacts (constructor + generation deleter + retention)
