@@ -24,6 +24,15 @@ def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageSta
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_wake_store(monkeypatch, tmp_path):
+    """Wake-receipt sidecars are written by ``deliver_pending`` now; keep them
+    out of the host's state root during tests."""
+    from cli_agent_orchestrator.services import wake_receipts
+
+    monkeypatch.setattr(wake_receipts, "WAKE_RECEIPT_DIR", tmp_path / "wake-receipts")
+
+
 class TestDeliverPending:
     """Tests for InboxService.deliver_pending()."""
 

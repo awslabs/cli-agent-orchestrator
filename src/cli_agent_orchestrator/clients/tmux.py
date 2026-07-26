@@ -65,6 +65,22 @@ _PANE_SERVER_FORMAT = "\t".join(("#{pane_id}", "#{socket_path}"))
 # control cannot produce a single unbounded argv.
 _LITERAL_CHUNK_CHARS = 1024
 
+# Every blocking tmux subprocess in the control write path runs under this
+# per-call bound.  A hung adapter call otherwise holds the pane lease forever
+# (the API runs delivery in an uncancellable ``asyncio.to_thread``), so every
+# later control gets a truthful but perpetual zero-byte ``pane-busy`` cleared
+# only by a process restart.  Bounding each call is what lets the existing
+# ``finally`` lease release actually run, and what lets the service classify a
+# timeout truthfully.  An overall write deadline (in the service) sits below
+# the conductor's 30s client default on top of this per-call bound.
+TMUX_CALL_TIMEOUT_SECONDS = 10.0
+
+# The real ``subprocess.TimeoutExpired`` class, bound at import.  Tests mock
+# the ``subprocess`` module, which would turn ``subprocess.TimeoutExpired``
+# into a non-class and make an ``except`` on it raise TypeError; this alias
+# keeps the catch working under that mock.
+_SUBPROCESS_TIMEOUT = subprocess.TimeoutExpired
+
 # Bytes that must never appear in literal control text: ESC and its
 # single-byte C1 CSI equivalent U+009B would both let a payload
 # synthesise its own escape sequences (including the very paste sentinels
@@ -85,6 +101,17 @@ _ILLEGAL_LITERAL_CHARS = ("\x1b", "\x9b", "\r", "\n")
 # clears the paste-burst window that would otherwise swallow the Enter
 # after it.  A pin that proves a further keystroke adds it here.
 COMPOSER_CONTROL_KEYS = frozenset({"C-j", "End"})
+
+# A steer chord is a provider-pinned composer chord (e.g. ``C-s``) that
+# replaces Enter as the submit/steer effect for a v2 control-input.  It is a
+# distinct surface from :data:`COMPOSER_CONTROL_KEYS`: the newline pin
+# governs composer line breaks, whereas a steer chord is the submit effect
+# for an urgent steer, gated by its own provider/version allowlist at the
+# service layer.  The pattern is the sink's syntactic defence-in-depth, so a
+# chord parameter can never become an arbitrary ``send-keys`` key sequence:
+# exactly ``C-`` followed by one ASCII letter.  Membership is re-checked by
+# the service against the proven allowlist before any byte.
+STEER_CHORD_PATTERN = re.compile(r"^C-[A-Za-z]$")
 
 
 @dataclass(frozen=True)
@@ -1022,10 +1049,16 @@ class TmuxClient:
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=TMUX_CALL_TIMEOUT_SECONDS,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("Could not enumerate tmux panes: %s", exc)
             return None
+        # subprocess.TimeoutExpired is deliberately allowed to propagate: a
+        # call that exceeded its bound is a distinct signal from an unreadable
+        # server, and the service classifies it (write-deadline before any
+        # write, ambiguous on or after one) rather than collapsing it into
+        # "no panes", which a caller could read as a live pane having gone.
         if result.returncode != 0:
             logger.warning(
                 "tmux could not enumerate panes: %s",
@@ -1063,10 +1096,13 @@ class TmuxClient:
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=TMUX_CALL_TIMEOUT_SECONDS,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("Could not observe tmux server identity: %s", exc)
             return None
+        # subprocess.TimeoutExpired propagates for the same reason as the
+        # pane enumeration above: it is a bound, not an unreadable server.
         if result.returncode != 0:
             logger.warning(
                 "tmux could not report server identity: %s",
@@ -1334,11 +1370,93 @@ class TmuxClient:
             enter_attempted=False,
         )
 
+    def send_steer_chord(
+        self,
+        pane_id: str,
+        chord: str,
+        *,
+        expected_server_identity: Optional[str],
+    ) -> None:
+        """Send one provider-pinned steer chord to a pane on the bound server.
+
+        The v2 submit effect: where a v1 control submits with one explicit
+        Enter, a v2 chord control types the text and then presses a named
+        composer chord (``C-s`` for a Kimi steer) that the provider's
+        build is proven to read as a submit/steer.  This is the *only* way
+        a chord reaches a pane -- it is not added to
+        :data:`COMPOSER_CONTROL_KEYS`, because the newline pin and the
+        steer chord are different acts with different proofs, and folding
+        them together would let any key proven for a line break be sent as
+        a steer.
+
+        Membership in the steer-chord allowlist is decided by the service
+        against the proven provider/version table before this is reached;
+        the :data:`STEER_CHORD_PATTERN` check here is the sink's own
+        syntactic bound, so a chord parameter can never become an arbitrary
+        key sequence even if a future caller bypasses the service gate.
+
+        Same server-identity proof as the literal write, for the same
+        reason and at the same distance from the first byte: a chord aimed
+        at ``%3`` on the wrong tmux server lands in a stranger's composer
+        exactly as a literal write would.
+
+        Raises:
+            ValueError: The pane id or chord name is not permitted here.
+                Nothing is written.
+            TmuxServerIdentityError: The pane could not be proven to be on
+                the bound tmux server.  Nothing is written.
+            TmuxLiteralSendError: tmux rejected the chord.
+        """
+        if not is_valid_pane_id(pane_id):
+            raise ValueError(f"Invalid pane_id: {pane_id!r}")
+        if not isinstance(chord, str) or STEER_CHORD_PATTERN.fullmatch(chord) is None:
+            raise ValueError(
+                f"{chord!r} is not a permitted steer chord name; a steer chord is "
+                f"'C-' followed by one ASCII letter. Membership in the provider "
+                f"allowlist is checked at the service layer; this is the sink bound"
+            )
+
+        logger.info("send_steer_chord: %s - chord: %s", pane_id, chord)
+
+        observed_server = self.observe_pane_server_identity(pane_id)
+        refusal = server_identity_refusal(bound=expected_server_identity, observed=observed_server)
+        if refusal is not None:
+            reason_code, detail = refusal
+            raise TmuxServerIdentityError(
+                f"refusing a steer chord to pane {pane_id}: {detail}",
+                reason_code=reason_code,
+                bound=normalize_server_identity(expected_server_identity),
+                observed=observed_server,
+            )
+
+        self._run_literal_write(
+            [tmux_binary(), "send-keys", "-t", pane_id, chord],
+            chunks_sent=0,
+            enter_attempted=False,
+        )
+
     @staticmethod
     def _run_literal_write(argv: List[str], *, chunks_sent: int, enter_attempted: bool) -> None:
         """Run one control write, converting any failure into a bounded one."""
         try:
-            result = subprocess.run(argv, capture_output=True, text=True, check=False)
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=TMUX_CALL_TIMEOUT_SECONDS,
+            )
+        except _SUBPROCESS_TIMEOUT as exc:
+            # A timed-out write may or may not have reached the pane -- tmux
+            # does not report how far it got -- so it is the same class of
+            # uncertainty as a partial write and is carried as such.  The
+            # service maps a TmuxLiteralSendError after the write claim to
+            # ``ambiguous``, never to a zero-byte refusal.
+            raise TmuxLiteralSendError(
+                f"tmux literal control write exceeded the {TMUX_CALL_TIMEOUT_SECONDS:g}s bound",
+                chunks_sent=chunks_sent,
+                enter_attempted=enter_attempted,
+            ) from exc
         except (OSError, RuntimeError, ValueError) as exc:
             raise TmuxLiteralSendError(
                 f"tmux literal control write failed: {exc}",

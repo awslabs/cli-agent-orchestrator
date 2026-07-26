@@ -133,6 +133,16 @@ REASON_OWNER_LOST_MID_WRITE = "owner-lost-mid-write"
 REASON_SERVER_IDENTITY_UNBOUND = "server-identity-unbound"
 REASON_SERVER_IDENTITY_UNREADABLE = "server-identity-unreadable"
 REASON_SERVER_IDENTITY_MISMATCH = "server-identity-mismatch"
+# A v2 ``chord`` the server will not press for this provider/build.  Decided
+# against the pinned steer-chord table before any write, so it is proven
+# zero bytes and a caller may retry with an allowed chord (or none).
+REASON_UNSUPPORTED_CHORD = "unsupported-chord"
+# A blocking tmux call in the write path exceeded its bound, or the overall
+# write deadline elapsed, before any pane byte was written.  Reattemptable:
+# nothing reached the pane, and the next attempt may succeed on a healthy
+# server.  A timeout on or after a pane-write call is ``ambiguous`` (the
+# post-claim reason set), never this one.
+REASON_WRITE_DEADLINE = "write-deadline"
 
 # Every reason is bound to the one outcome it can honestly carry.
 #
@@ -164,6 +174,8 @@ REASON_OUTCOMES: "dict[str, str]" = {
     REASON_SERVER_IDENTITY_UNBOUND: REFUSED,
     REASON_SERVER_IDENTITY_UNREADABLE: REFUSED,
     REASON_SERVER_IDENTITY_MISMATCH: REFUSED,
+    REASON_UNSUPPORTED_CHORD: REFUSED,
+    REASON_WRITE_DEADLINE: REFUSED,
     REASON_CONTROL_ROUTE_ABSENT: UNSUPPORTED,
     REASON_PROTOCOL_MISMATCH: UNSUPPORTED,
     REASON_RESPONSE_LOST: AMBIGUOUS,
@@ -299,10 +311,17 @@ def server_identity_refusal(*, bound: object, observed: object) -> Optional["tup
 # domain separation cannot be satisfied by accident.
 CONTROL_INPUT_DIGEST_DOMAIN = "cao-control-input-request-v1"
 
+# Schema v2 adds exactly one field, ``chord``, and travels under its own
+# domain so a v2 request can never collide with a v1 one.  The domain is
+# the cross-repo contract: both sides pin it, and the golden vector in the
+# activation spec asserts the bytes (see the v2 test class).
+CONTROL_INPUT_DIGEST_DOMAIN_V2 = "cao-control-input-request-v2"
+
 # Schema of the wire request, versioned separately from the protocol
 # identifier because the digest's field set may need to move without the
 # protocol name moving.
 CONTROL_INPUT_REQUEST_SCHEMA_VERSION = 1
+CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2 = 2
 
 # The identity a request may be bound to, in the fixed order the digest
 # encodes.  Every field is named explicitly and an absent expectation is
@@ -329,6 +348,20 @@ REQUEST_DIGEST_FIELD_ORDER = (
     "control_id",
     "text",
     "enter",
+    "expected_identity",
+)
+
+# v2 splices ``chord`` between ``enter`` and ``expected_identity``.  Kept as
+# its own tuple so the v1 order above (and the v1 golden vector that pins
+# it) is untouched: a v2-capable server must not change what a v1 request
+# digests to.
+REQUEST_DIGEST_FIELD_ORDER_V2 = (
+    "domain",
+    "schema_version",
+    "control_id",
+    "text",
+    "enter",
+    "chord",
     "expected_identity",
 )
 
@@ -380,6 +413,37 @@ def normalize_expected_identity(identity: Optional[Mapping[str, Any]]) -> Dict[s
     return normalized
 
 
+def _validate_chord(chord: Any) -> Optional[str]:
+    """Normalise a v2 ``chord`` field to its canonical wire form.
+
+    A chord is optional: ``None`` means "this v2 request names no chord",
+    which is a valid v2 shape (a future caller may speak v2 for another
+    reason).  A present chord is a non-empty string naming one
+    provider-pinned composer chord.  The empty string is refused rather
+    than read as an absent chord, because "I sent an empty chord" and "I
+    sent no chord" must not produce the same digest -- a caller reading a
+    digest mismatch would otherwise be unable to tell an absent feature
+    from a malformed one.
+
+    Allowlist membership is *not* decided here.  This function pins the
+    wire type only; whether a given chord is licensed for a given provider
+    and build is a service-layer fact decided against the proven composer
+    evidence, so a digest can be computed for any syntactically valid v2
+    request (including one a server will then refuse) without inventing a
+    binding the two sides could disagree about.
+    """
+    if chord is None:
+        return None
+    if not isinstance(chord, str):
+        raise ValueError(f"chord must be a string or null, got {type(chord).__name__}")
+    if chord == "":
+        raise ValueError(
+            "chord is an empty string; use null to mean 'no chord', because an "
+            "empty chord and an absent chord must not digest alike"
+        )
+    return chord
+
+
 def control_input_request_digest(
     *,
     control_id: str,
@@ -418,6 +482,49 @@ def control_input_request_digest(
                 ("control_id", control_id),
                 ("text", text),
                 ("enter", enter),
+                ("expected_identity", normalize_expected_identity(expected_identity)),
+            ]
+        )
+    )
+
+
+def control_input_request_digest_v2(
+    *,
+    control_id: str,
+    text: str,
+    enter: bool,
+    chord: Optional[str],
+    expected_identity: Optional[Mapping[str, Any]],
+) -> str:
+    """The v2 digest: the same binding as v1, plus the ``chord`` field.
+
+    The preimage is :data:`REQUEST_DIGEST_FIELD_ORDER_V2` under the v2
+    domain.  ``chord`` participates so a request that names a chord is a
+    different request from one that names none (or a different chord), and a
+    caller that authorised a chord control is bound to exactly that chord
+    the way it is bound to exactly that text.
+
+    Byte-identical to the conductor's v2 ``request_digest`` by the same
+    reconciliation that governs v1: the field order, the domain, and the
+    canonical encoder are the contract, asserted by a cross-implementation
+    golden vector on each side.
+
+    Allowlist membership is *not* checked here -- a digest must be computable
+    for any syntactically valid v2 request, including one a server will then
+    refuse, so the two sides never disagree about which requests exist.
+    """
+    if not isinstance(enter, bool):
+        raise ValueError(f"enter must be a bool, got {type(enter).__name__}")
+    normalised_chord = _validate_chord(chord)
+    return canonical_sha256(
+        build_canonical(
+            [
+                ("domain", CONTROL_INPUT_DIGEST_DOMAIN_V2),
+                ("schema_version", CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2),
+                ("control_id", control_id),
+                ("text", text),
+                ("enter", enter),
+                ("chord", normalised_chord),
                 ("expected_identity", normalize_expected_identity(expected_identity)),
             ]
         )

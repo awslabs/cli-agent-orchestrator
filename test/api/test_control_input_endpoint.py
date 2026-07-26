@@ -276,6 +276,31 @@ class TestCapabilityAdvertisement:
         assert "outcome" not in body
 
 
+class TestV2ChordDiscovery:
+    """A conductor that needs v2 reads support before sending a chord, because
+    a v2 request against a v1 server would otherwise be silently delivered as
+    text without the chord (pydantic ignores unknown fields)."""
+
+    def test_the_capability_document_advertises_v2_and_the_chord_allowlist(self, client):
+        body = client.get("/control-input/capabilities").json()
+        # v1 stays the named default; v2 is advertised alongside it.
+        assert body["request_schema_version"] == CONTROL_INPUT_REQUEST_SCHEMA_VERSION
+        assert body["request_schema_versions"] == [1, 2]
+        assert body["digest_domain"] == CONTROL_INPUT_DIGEST_DOMAIN
+        # The steer-chord allowlist is truthful: only the pinned Kimi chord.
+        assert body["steer_chords"] == {"kimi_cli": ["C-s"]}
+
+    def test_the_identity_route_advertises_the_control_input_block(self, client, tmux):
+        body = client.get(f"/terminals/{TERMINAL}/control-identity").json()
+        block = body["control_input"]
+        assert block["schema_versions"] == [1, 2]
+        assert block["chords"] == {"kimi_cli": ["C-s"]}
+
+    def test_the_identity_route_block_is_absent_on_an_unknown_terminal(self, client, tmux):
+        # No body to inspect on a 404; the block is only on a resolved terminal.
+        assert client.get(f"/terminals/{UNKNOWN_TERMINAL}/control-identity").status_code == 404
+
+
 class TestSendingAControl:
     """The happy path, and what the wire says about it."""
 

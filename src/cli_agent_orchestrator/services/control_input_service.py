@@ -47,7 +47,9 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -61,6 +63,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     CONTROL_INPUT_PROTOCOL,
     CONTROL_INPUT_REASON_CODES,
     CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
+    CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
     IDENTITY_FIELDS,
     REASON_CONTROL_ROUTE_ABSENT,
     REASON_IDENTITY_MISMATCH,
@@ -76,10 +79,13 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_REQUEST_REBOUND,
     REASON_STALE_GENERATION,
     REASON_UNKNOWN_TERMINAL,
+    REASON_UNSUPPORTED_CHORD,
+    REASON_WRITE_DEADLINE,
     REASON_WRITE_INCOMPLETE,
     REFUSED,
     contains_bracketed_paste_sentinel,
     control_input_request_digest,
+    control_input_request_digest_v2,
     is_reattemptable,
     normalize_expected_identity,
     normalize_server_identity,
@@ -107,6 +113,21 @@ logger = logging.getLogger(__name__)
 # a limit the two sides disagree about is a request one of them believes
 # it sent.
 MAX_TEXT_BYTES = 512
+
+# The overall bound on one control's write work, safely under the conductor's
+# default 30s client timeout (``mcp_request_timeout``).  Checked before each
+# step of the delivery so a path that has stalled across several bounded tmux
+# calls still answers before the client gives up, and so a hung adapter can
+# never hold the pane lease past it.  Expiry maps truthfully: before the
+# write claim it is ``refused``/``write-deadline`` (zero bytes proven,
+# reattemptable); on or after the claim it is ``ambiguous`` (the journal has
+# no writing->refused edge, and bytes may have landed).
+WRITE_DEADLINE_SECONDS = 20.0
+
+
+class _WriteDeadlineExpired(RuntimeError):
+    """The overall write deadline elapsed before delivery completed."""
+
 
 # The caller-supplied control id, validated against a strict alphabet
 # before it is used as a durable key.  Identical to the conductor's
@@ -416,7 +437,15 @@ def resolve_control_identity(terminal_id: str) -> Optional[ResolvedControlIdenti
     observed_server: Optional[str] = None
     client = _tmux_client()
     if client is not None and recorded_pane_id is not None:
-        live = client.pane_control_identity(pane_id=recorded_pane_id)
+        try:
+            live = client.pane_control_identity(pane_id=recorded_pane_id)
+        except subprocess.TimeoutExpired:
+            # A pre-lease identity read that exceeded its bound leaves the
+            # live pane unresolved.  The terminal is then refused downstream
+            # (lineage-unproven / pane-dead) rather than bound on a stale
+            # reading; the in-lease re-verification is where a write-deadline
+            # refusal is recorded for the same condition under the lease.
+            live = None
         if live is not None:
             # Only a pane tmux confirms right now becomes the live
             # identity.  An unreadable server leaves it unresolved rather
@@ -505,7 +534,9 @@ def screen_control_text(text: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _require_shape(control_id: Any, text: Any, enter: Any, request_digest: Any) -> None:
+def _require_shape(
+    control_id: Any, text: Any, enter: Any, request_digest: Any, chord: Any = None
+) -> None:
     """Refuse a request no typed outcome could honestly describe."""
     if not isinstance(control_id, str) or not CONTROL_ID_PATTERN.match(control_id):
         raise ControlInputRequestInvalid(
@@ -521,6 +552,22 @@ def _require_shape(control_id: Any, text: Any, enter: Any, request_digest: Any) 
         )
     if not isinstance(enter, bool):
         raise ControlInputRequestInvalid("enter must be a boolean and must be stated explicitly")
+    if chord is not None:
+        # A chord replaces Enter as the submit/steer effect, so the two may
+        # not both be requested: a request that pressed Enter *and* a chord
+        # would submit twice or order them ambiguously, and which landed is
+        # then unknowable.  Stated as a shape error because no typed outcome
+        # could honestly describe it, and nothing is written.
+        if not isinstance(chord, str) or chord == "":
+            raise ControlInputRequestInvalid(
+                "chord must be a non-empty string when supplied; use its absence to mean "
+                "'no chord'"
+            )
+        if enter:
+            raise ControlInputRequestInvalid(
+                "a chord control must set enter=false; the chord replaces Enter as the "
+                "submit/steer effect, and pressing both would submit twice"
+            )
     if request_digest is not None and (
         not isinstance(request_digest, str) or not _DIGEST_PATTERN.match(request_digest)
     ):
@@ -704,6 +751,13 @@ class ControlInputResult:
     enter_sent: bool = False
     chunks_sent: Optional[int] = None
     enter_attempted: Optional[bool] = None
+    # v2 chord mirrors the enter fields: a chord control types text and
+    # then presses a provider-pinned steer chord (replacing Enter).  Both
+    # are reported so a caller replaying a lost response knows whether the
+    # steer effect landed, not just the text.
+    chord: Optional[str] = None
+    chord_attempted: Optional[bool] = None
+    chord_sent: Optional[bool] = None
     http_status: int = 200
 
     def __post_init__(self) -> None:
@@ -744,6 +798,9 @@ class ControlInputResult:
             "enter_sent": self.enter_sent,
             "chunks_sent": self.chunks_sent,
             "enter_attempted": self.enter_attempted,
+            "chord": self.chord,
+            "chord_attempted": self.chord_attempted,
+            "chord_sent": self.chord_sent,
         }
 
 
@@ -796,6 +853,13 @@ def _from_record(
         enter_sent=outcome == ACCEPTED and bool(record.enter_attempted),
         chunks_sent=record.chunks_sent,
         enter_attempted=record.enter_attempted,
+        chord=record.chord,
+        chord_attempted=record.chord_attempted,
+        chord_sent=(
+            (outcome == ACCEPTED and bool(record.chord_sent))
+            if record.chord_sent is not None
+            else record.chord_sent
+        ),
     )
 
 
@@ -839,6 +903,65 @@ def _record_refusal(
     )
 
 
+def _steer_chord_refusal(
+    resolved: ResolvedControlIdentity, chord: Optional[str]
+) -> Optional[Tuple[str, str]]:
+    """Reason/detail if ``chord`` is not licensed here, or None to proceed.
+
+    Decided against the provider's own steer-chord table, pinned to the
+    proven composer build, before any write -- so an unproven chord is the
+    zero-byte refusal it is rather than a keystroke sent at a composer on
+    the strength of a guess.  Resolved through the same provider->adapter
+    table the native preflight uses, so the chord a request names and the
+    composer it is aimed at cannot disagree about which provider's facts
+    govern it.
+    """
+    if not chord:
+        return None
+    try:
+        from cli_agent_orchestrator.services import managed_launch_v2
+
+        adapter = managed_launch_v2.native_control_adapter(resolved.provider)
+    except Exception:
+        return (
+            REASON_UNSUPPORTED_CHORD,
+            f"provider {resolved.provider!r} has no native control adapter, so the "
+            f"steer chord {chord!r} cannot be proven for it; refused with zero bytes",
+        )
+    allowed = getattr(adapter, "steer_chords", lambda _v: frozenset())(resolved.provider_version)
+    if chord not in allowed:
+        return (
+            REASON_UNSUPPORTED_CHORD,
+            f"chord {chord!r} is not a proven steer chord for {resolved.provider!r} "
+            f"version {resolved.provider_version!r}; refused with zero bytes rather than "
+            "pressing a chord whose behaviour this build has not been read to exhibit",
+        )
+    return None
+
+
+def _advertised_steer_chords() -> Dict[str, List[str]]:
+    """Per-provider steer chords this server advertises (union over builds).
+
+    The discovery block on the identity route: a conductor that needs v2
+    reads this before sending a chord, and a chord not advertised is the
+    one safe answer to a server whose allowlist it cannot observe.  Built
+    from each native adapter's own advertisement so the table of proven
+    chords lives with the provider it is about.
+    """
+    from cli_agent_orchestrator.services import managed_launch_v2
+
+    advertised: Dict[str, List[str]] = {}
+    for provider in ("kimi_cli", "claude_code"):
+        try:
+            adapter = managed_launch_v2.native_control_adapter(provider)
+        except Exception:
+            continue
+        fn = getattr(adapter, "advertised_steer_chords", None)
+        if fn:
+            advertised.update(fn())
+    return advertised
+
+
 def deliver_control_input(
     terminal_id: str,
     *,
@@ -848,6 +971,7 @@ def deliver_control_input(
     expected_identity: Optional[Mapping[str, Any]] = None,
     request_digest: Optional[str] = None,
     protocol: Optional[str] = None,
+    chord: Any = None,
     lease_timeout: float = 0.0,
     journal: Optional[ControlInputJournal] = None,
 ) -> ControlInputResult:
@@ -907,7 +1031,7 @@ def deliver_control_input(
             http_status=422,
         )
 
-    _require_shape(control_id, text, enter, request_digest)
+    _require_shape(control_id, text, enter, request_digest, chord)
     try:
         expected = normalize_expected_identity(expected_identity)
     except ValueError as exc:
@@ -917,9 +1041,21 @@ def deliver_control_input(
     if screened is not None:
         return _refusal(control_id, screened[0], screened[1], terminal_id=terminal_id)
 
-    digest = control_input_request_digest(
-        control_id=control_id, text=text, enter=enter, expected_identity=expected
-    )
+    # A chord request is a v2 request: it travels under the v2 digest domain
+    # and field order, so the chord is bound into the digest the way text is.
+    # A v1 request names no chord and keeps its byte-identical v1 digest.
+    if chord is not None:
+        digest = control_input_request_digest_v2(
+            control_id=control_id,
+            text=text,
+            enter=enter,
+            chord=chord,
+            expected_identity=expected,
+        )
+    else:
+        digest = control_input_request_digest(
+            control_id=control_id, text=text, enter=enter, expected_identity=expected
+        )
     if request_digest is not None and request_digest != digest:
         return _refusal(
             control_id,
@@ -980,6 +1116,22 @@ def deliver_control_input(
             control_id,
             unproven[0],
             unproven[1],
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+        )
+
+    # A chord is licensed per provider against the proven composer build,
+    # decided here -- before the journal, before the lease, before any byte --
+    # so an unproven chord is the zero-byte refusal it is.  See §3: any other
+    # provider, mode, chord, or unpinned version is typed ``refused``, never a
+    # fallback to text-without-chord.
+    chord_refusal = _steer_chord_refusal(resolved, chord)
+    if chord_refusal is not None:
+        return _refusal(
+            control_id,
+            chord_refusal[0],
+            chord_refusal[1],
             terminal_id=terminal_id,
             resolved=resolved,
             digest=digest,
@@ -1080,6 +1232,7 @@ def deliver_control_input(
                 binding,
                 text=text,
                 enter=enter,
+                chord=chord,
                 terminal_id=terminal_id,
                 resolved=resolved,
                 digest=digest,
@@ -1121,6 +1274,11 @@ class _NativeComposerTransport:
         self._server_identity = server_identity
         self.chunks_sent = 0
         self.enter_attempted = False
+        # Mirrors enter_attempted for the v2 chord: marked before the send so
+        # an exception on the way out of tmux does not prove the chord did not
+        # land, and the journal can record how far a text-then-chord write got.
+        self.chord_attempted = False
+        self.chord_sent = False
 
     def send_literal(self, text: str) -> None:
         self.chunks_sent += self._client.send_literal_line(
@@ -1148,6 +1306,22 @@ class _NativeComposerTransport:
             submit=True,
             expected_server_identity=self._server_identity,
         )
+
+    def send_chord(self, chord: str) -> None:
+        """Press one provider-pinned steer chord (the v2 submit effect).
+
+        Marked before the call for the same reason ``send_enter`` is: an
+        exception leaving tmux does not prove the chord did not reach the
+        composer, so ``chord_attempted`` is the honest boundary and
+        ``chord_sent`` is set only after tmux acknowledged the write.
+        """
+        self.chord_attempted = True
+        self._client.send_steer_chord(
+            self._pane_id,
+            chord,
+            expected_server_identity=self._server_identity,
+        )
+        self.chord_sent = True
 
 
 def _native_composer_preflight(
@@ -1292,6 +1466,7 @@ def _deliver_under_lease(
     *,
     text: str,
     enter: bool,
+    chord: Optional[str],
     terminal_id: str,
     resolved: ResolvedControlIdentity,
     digest: str,
@@ -1304,7 +1479,77 @@ def _deliver_under_lease(
     composer with every earlier check having passed honestly.
     """
     control_id = binding.request_id
-    live = client.pane_control_identity(pane_id=binding.pane_id)
+    deadline = time.monotonic() + WRITE_DEADLINE_SECONDS
+    write_claimed = False
+
+    def _deadline_breached() -> Optional[ControlInputResult]:
+        """The overall write deadline's typed outcome, or None to proceed.
+
+        Checked before each blocking step.  Before the claim it is a
+        zero-byte ``refused``/``write-deadline`` (reattemptable); on or after
+        the claim it is ``ambiguous`` (the journal has no writing->refused
+        edge, and bytes may have landed), mirroring the crash-window
+        pessimism the sweep already applies to a dead owner.
+        """
+        if time.monotonic() <= deadline:
+            return None
+        if write_claimed:
+            journal.mark_ambiguous(
+                control_id,
+                reason_code=REASON_WRITE_INCOMPLETE,
+                chunks_sent=0,
+                enter_attempted=False,
+                evidence_digest=digest,
+            )
+            return ControlInputResult(
+                control_id=control_id,
+                outcome=AMBIGUOUS,
+                reason_code=REASON_WRITE_INCOMPLETE,
+                detail=(
+                    f"the control write exceeded its overall "
+                    f"{WRITE_DEADLINE_SECONDS:g}s write deadline after the write was "
+                    "claimed; bytes may have reached the pane, so it is ambiguous and "
+                    "must not be sent again"
+                ),
+                state=STATE_AMBIGUOUS,
+                terminal_id=terminal_id,
+                request_digest=digest,
+                resolved_identity=resolved.as_dict(),
+                chunks_sent=0,
+                enter_attempted=False,
+            )
+        return _record_refusal(
+            journal,
+            control_id,
+            REASON_WRITE_DEADLINE,
+            f"the control write exceeded its overall {WRITE_DEADLINE_SECONDS:g}s write "
+            "deadline before any byte was written; nothing reached the pane and the "
+            "control may be sent again",
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+        )
+
+    breached = _deadline_breached()
+    if breached is not None:
+        return breached
+    try:
+        live = client.pane_control_identity(pane_id=binding.pane_id)
+    except subprocess.TimeoutExpired as exc:
+        # A pre-write read exceeded its bound before any pane byte: proven
+        # zero bytes, so it is the reattemptable refusal the conductor may
+        # follow with a fresh attempt.  Distinct from ``live is None``
+        # (pane gone) below, which is a different action.
+        return _record_refusal(
+            journal,
+            control_id,
+            REASON_WRITE_DEADLINE,
+            f"the pre-write identity read exceeded its bound before any byte: {exc}; "
+            "nothing was written and the control may be sent again",
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+        )
     if live is None or live.dead:
         return _record_refusal(
             journal,
@@ -1360,6 +1605,9 @@ def _deliver_under_lease(
     adapter: Optional[Any] = None
     plan: Optional[Any] = None
     if resolved.managed and resolved.execution_mode == EXECUTION_MODE_NATIVE_TUI:
+        breached = _deadline_breached()
+        if breached is not None:
+            return breached
         adapter, plan, native_refusal = _native_composer_preflight(resolved, binding, text=text)
         if native_refusal is not None:
             return _record_refusal(
@@ -1372,12 +1620,16 @@ def _deliver_under_lease(
                 digest=digest,
             )
 
+    breached = _deadline_breached()
+    if breached is not None:
+        return breached
     claim = journal.claim_write(control_id)
     if not claim.granted:
         # Exactly one caller ever writes for a control id.  A caller
         # holding a refused claim must not write even when the record
         # looks abandoned: that owner may be mid-write this instant.
         return _from_record(claim.record, resolved=resolved)
+    write_claimed = True
 
     if plan is not None and adapter is not None:
         return _send_through_native_adapter(
@@ -1387,6 +1639,7 @@ def _deliver_under_lease(
             adapter=adapter,
             plan=plan,
             enter=enter,
+            chord=chord,
             terminal_id=terminal_id,
             resolved=resolved,
             digest=digest,
@@ -1495,6 +1748,34 @@ def _deliver_under_lease(
             chunks_sent=0,
             enter_attempted=False,
         )
+    except subprocess.TimeoutExpired as exc:
+        # A read inside the write call (the server-identity observation) or
+        # the write itself exceeded its bound, after the claim.  Bytes may
+        # have landed, so this is the same ambiguity as a partial write and
+        # is never re-sent blindly.
+        logger.error("control-input write path timed out for %s: %s", control_id, exc)
+        journal.mark_ambiguous(
+            control_id,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            chunks_sent=0,
+            enter_attempted=False,
+            evidence_digest=digest,
+        )
+        return ControlInputResult(
+            control_id=control_id,
+            outcome=AMBIGUOUS,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            detail=(
+                f"a tmux call in the write path exceeded its bound after the claim: {exc}. "
+                "What reached the pane is not knowable, so this control must not be sent again"
+            ),
+            state=STATE_AMBIGUOUS,
+            terminal_id=terminal_id,
+            request_digest=digest,
+            resolved_identity=resolved.as_dict(),
+            chunks_sent=0,
+            enter_attempted=False,
+        )
 
     record = journal.mark_delivered(
         control_id, chunks_sent=chunks, enter_attempted=enter, evidence_digest=digest
@@ -1525,6 +1806,7 @@ def _send_through_native_adapter(
     adapter: Any,
     plan: Any,
     enter: bool,
+    chord: Optional[str],
     terminal_id: str,
     resolved: ResolvedControlIdentity,
     digest: str,
@@ -1601,20 +1883,67 @@ def _send_through_native_adapter(
             enter_attempted=transport.enter_attempted,
         )
 
+    # The chord is the v2 submit/steer effect and the last step of the write
+    # (§3): the text above is already in the composer, and the chord presses
+    # the provider-pinned key that submits or steers it.  A failure here is
+    # ambiguous -- the text landed, the chord may or may not have -- and is
+    # never auto-retried, mirroring the Enter ambiguity rule.
+    if chord:
+        try:
+            transport.send_chord(chord)
+        except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
+            logger.error("control-input steer chord %s raised for %s: %s", chord, control_id, exc)
+            journal.mark_ambiguous(
+                control_id,
+                reason_code=REASON_WRITE_INCOMPLETE,
+                chunks_sent=transport.chunks_sent,
+                enter_attempted=transport.enter_attempted,
+                chord=chord,
+                chord_attempted=True,
+                chord_sent=transport.chord_sent,
+                evidence_digest=digest,
+            )
+            return ControlInputResult(
+                control_id=control_id,
+                outcome=AMBIGUOUS,
+                reason_code=REASON_WRITE_INCOMPLETE,
+                detail=(
+                    f"the text reached the composer but the steer chord {chord!r} raised: "
+                    f"{exc}. The chord may or may not have landed, so this control must "
+                    "not be sent again"
+                ),
+                state=STATE_AMBIGUOUS,
+                terminal_id=terminal_id,
+                request_digest=digest,
+                resolved_identity=resolved.as_dict(),
+                chunks_sent=transport.chunks_sent,
+                enter_attempted=transport.enter_attempted,
+                chord=chord,
+                chord_attempted=True,
+                chord_sent=transport.chord_sent,
+            )
+
     record = journal.mark_delivered(
         control_id,
         # Both numbers read off the transport, as on the ambiguous exits.
         chunks_sent=transport.chunks_sent,
         enter_attempted=transport.enter_attempted,
+        chord=chord,
+        chord_attempted=transport.chord_attempted,
+        chord_sent=transport.chord_sent,
         evidence_digest=digest,
+    )
+    submit_clause = (
+        f" and pressed the {chord} steer chord"
+        if chord
+        else (" and submitted with one Enter" if enter else " without submitting")
     )
     return ControlInputResult(
         control_id=control_id,
         outcome=ACCEPTED,
         detail=(
             f"typed {transport.chunks_sent} literal write(s) into pane {binding.pane_id} "
-            f"through the {resolved.provider} native composer adapter"
-            + (" and submitted with one Enter" if enter else " without submitting")
+            f"through the {resolved.provider} native composer adapter{submit_clause}"
         ),
         state=record.state,
         terminal_id=terminal_id,
@@ -1624,6 +1953,9 @@ def _send_through_native_adapter(
         enter_sent=enter,
         chunks_sent=transport.chunks_sent,
         enter_attempted=enter,
+        chord=chord,
+        chord_attempted=transport.chord_attempted,
+        chord_sent=transport.chord_sent,
     )
 
 
@@ -1675,6 +2007,25 @@ def lookup_control_input(
 # --- Capability advertisement ---------------------------------------------
 
 
+def control_input_capability_block() -> Dict[str, Any]:
+    """The per-terminal discovery block advertised on the identity route.
+
+    A conductor that needs v2 reads this before sending a chord, because a
+    v2 request against a v1 server would otherwise be silently delivered as
+    text without the chord (pydantic ignores unknown fields).  A chord not
+    advertised is the one safe answer to a server whose allowlist a caller
+    cannot observe: it fails closed with the typed ``unsupported`` verdict
+    and zero bytes, never degrading to text-without-chord.
+    """
+    return {
+        "schema_versions": [
+            CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
+            CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
+        ],
+        "chords": _advertised_steer_chords(),
+    }
+
+
 def control_input_capabilities() -> Dict[str, Any]:
     """What this server implements, readable without sending a control.
 
@@ -1688,7 +2039,17 @@ def control_input_capabilities() -> Dict[str, Any]:
     return {
         "protocol": CONTROL_INPUT_PROTOCOL,
         "request_schema_version": CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
+        # The set of request schema versions this server speaks.  v2 adds the
+        # optional ``chord`` field; v1 is unchanged.  A conductor that needs
+        # v2 reads this (and the per-terminal block on the identity route)
+        # before sending a chord, and fails closed against a server that
+        # offers only v1.
+        "request_schema_versions": [
+            CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
+            CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
+        ],
         "digest_domain": CONTROL_INPUT_DIGEST_DOMAIN,
+        "steer_chords": _advertised_steer_chords(),
         "identity_fields": list(IDENTITY_FIELDS),
         "outcomes": sorted(CONTROL_INPUT_OUTCOMES),
         "reason_codes": sorted(CONTROL_INPUT_REASON_CODES),

@@ -18,6 +18,7 @@ from unittest.mock import call, patch
 import pytest
 
 from cli_agent_orchestrator.clients.tmux import (
+    TMUX_CALL_TIMEOUT_SECONDS,
     TmuxClient,
     TmuxLiteralSendError,
     TmuxServerIdentityError,
@@ -200,24 +201,29 @@ class TestSendLiteralLineArgv:
         assert mock_subprocess.run.call_args_list == [
             # The server probe comes first and is part of the contract:
             # the write is not permitted to be the invocation that finds
-            # out which server it reached.
+            # out which server it reached.  Every call is bounded by the
+            # shared tmux-call timeout so a hung call can never hold the
+            # pane lease forever.
             call(
                 [TMUX, "list-panes", "-a", "-F", SERVER_FORMAT],
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=TMUX_CALL_TIMEOUT_SECONDS,
             ),
             call(
                 [TMUX, "send-keys", "-t", "%263", "-l", "--", "/compact"],
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=TMUX_CALL_TIMEOUT_SECONDS,
             ),
             call(
                 [TMUX, "send-keys", "-t", "%263", "Enter"],
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=TMUX_CALL_TIMEOUT_SECONDS,
             ),
         ]
 
@@ -820,3 +826,43 @@ class TestPaneControlIdentityLookup:
             client.pane_control_identity(**kwargs)
 
         assert mock_subprocess.run.call_count == 0
+
+
+class TestSendSteerChord:
+    """The v2 steer-chord primitive: a named chord, distinct from the
+    composer control keys, proven against the bound server before it lands."""
+
+    def test_presses_the_named_chord_after_proving_the_server(self, client, mock_subprocess):
+        client.send_steer_chord("%263", "C-s", expected_server_identity=SOCKET)
+
+        argv = _write_argv(mock_subprocess)
+        assert argv == [[TMUX, "send-keys", "-t", "%263", "C-s"]]
+        # The server is proven before the chord, never trusted from the caller.
+        assert SERVER_FORMAT in " ".join(_all_argv(mock_subprocess)[0])
+
+    def test_a_non_chord_name_is_refused_with_no_write(self, client, mock_subprocess):
+        for bad in ["C-foo", "Cs", "Enter", "C-", "C-s ", "M-s", ""]:
+            with pytest.raises(ValueError):
+                client.send_steer_chord("%263", bad, expected_server_identity=SOCKET)
+            assert _write_argv(mock_subprocess) == []
+
+    def test_an_invalid_pane_id_is_refused_before_any_call(self, client, mock_subprocess):
+        with pytest.raises(ValueError):
+            client.send_steer_chord("263", "C-s", expected_server_identity=SOCKET)
+        assert mock_subprocess.run.call_count == 0
+
+    def test_an_unbound_caller_is_refused(self, client, mock_subprocess):
+        with pytest.raises(TmuxServerIdentityError):
+            client.send_steer_chord("%263", "C-s", expected_server_identity=None)
+        assert _write_argv(mock_subprocess) == []
+
+    def test_a_pane_on_another_server_is_refused(self, client, mock_subprocess, answers):
+        answers.probe = _ok(_server_line(socket=OTHER_SOCKET))
+        with pytest.raises(TmuxServerIdentityError):
+            client.send_steer_chord("%263", "C-s", expected_server_identity=SOCKET)
+        assert _write_argv(mock_subprocess) == []
+
+    def test_a_tmux_rejection_is_a_bounded_send_error(self, client, mock_subprocess, answers):
+        answers.writes = [_fail(stderr="can't find pane: %263")]
+        with pytest.raises(TmuxLiteralSendError):
+            client.send_steer_chord("%263", "C-s", expected_server_identity=SOCKET)
