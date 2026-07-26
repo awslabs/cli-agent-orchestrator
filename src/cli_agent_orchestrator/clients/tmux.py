@@ -835,11 +835,11 @@ class TmuxClient:
             return False
 
     def window_exists(self, session_name: str, window_name: str) -> bool:
-        """Check the exact tmux window without swallowing lookup failures."""
-        session = self.server.sessions.get(session_name=session_name)
-        if not session:
+        """Check the exact tmux window while preserving unreadable-server errors."""
+        session = self.server.sessions.get(session_name=session_name, default=None)
+        if session is None:
             return False
-        return session.windows.get(window_name=window_name) is not None
+        return session.windows.get(window_name=window_name, default=None) is not None
 
     def window_identity(self, session_name: str, window_name: str) -> Optional[Dict[str, str]]:
         """Server-owned immutable tmux identity of a window: its tmux-assigned

@@ -6,6 +6,7 @@ import subprocess
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from libtmux.exc import ObjectDoesNotExist
 
 
 @pytest.fixture
@@ -697,6 +698,37 @@ class TestKillWindow:
         result = tmux.kill_window("ses", "win")
 
         assert result is False
+
+
+# ── window_exists ────────────────────────────────────────────────────
+
+
+class TestWindowExists:
+    @staticmethod
+    def _missing_object(**kwargs):
+        if "default" in kwargs:
+            return kwargs["default"]
+        raise ObjectDoesNotExist("No objects found")
+
+    def test_a_missing_window_is_observed_as_absent(self, tmux):
+        mock_session = MagicMock()
+        mock_session.windows.get.side_effect = self._missing_object
+        tmux.server.sessions.get.return_value = mock_session
+
+        assert tmux.window_exists("ses", "gone") is False
+        mock_session.windows.get.assert_called_once_with(window_name="gone", default=None)
+
+    def test_a_missing_session_is_observed_as_absent(self, tmux):
+        tmux.server.sessions.get.side_effect = self._missing_object
+
+        assert tmux.window_exists("gone", "win") is False
+        tmux.server.sessions.get.assert_called_once_with(session_name="gone", default=None)
+
+    def test_an_unreadable_server_is_not_misreported_as_absence(self, tmux):
+        tmux.server.sessions.get.side_effect = RuntimeError("tmux server unreadable")
+
+        with pytest.raises(RuntimeError, match="server unreadable"):
+            tmux.window_exists("ses", "win")
 
 
 # ── session_exists ───────────────────────────────────────────────────

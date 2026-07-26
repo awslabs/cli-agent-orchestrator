@@ -108,6 +108,26 @@ def test_exact_generation_delete_retires_v2_row(v2_metadata, spies):
     assert deregister.calls != [], "exact retirement drains registry entries"
 
 
+def test_unreadable_window_state_preserves_v2_row(v2_metadata, spies):
+    terminal_id, generation, _ = v2_metadata
+    backend, db_delete, deregister = spies
+
+    def _unreadable(*_args, **_kwargs):
+        raise RuntimeError("tmux server unreadable")
+
+    backend.window_exists = _unreadable
+
+    with pytest.raises(RuntimeError, match="server unreadable"):
+        terminals.delete_terminal(
+            terminal_id,
+            expected_generation=generation,
+            expected_session="managed-session",
+        )
+
+    assert db_delete.calls == [], "an unreadable server is not proof that the window is gone"
+    assert deregister.calls == [], "registry entries must survive an ambiguous teardown"
+
+
 @pytest.mark.parametrize(
     ("generation", "session"),
     [
