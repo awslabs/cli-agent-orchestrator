@@ -39,6 +39,12 @@ export const STATUS_CONFIG: Record<string, StatusStyle> = {
     bgClass: "bg-cao-warning/10",
     textClass: "text-cao-warning",
   },
+  NOT_FIFO_MONITORED: {
+    label: "Managed Live",
+    dotClass: "bg-cao-info",
+    bgClass: "bg-cao-info/10",
+    textClass: "text-cao-info",
+  },
   ERROR: {
     label: "Error",
     dotClass: "bg-cao-danger",

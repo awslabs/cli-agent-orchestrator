@@ -31,6 +31,11 @@ describe('StatusBadge', () => {
     expect(screen.getByText('Awaiting Input')).toBeInTheDocument()
   })
 
+  it('renders a managed native terminal as live without claiming turn activity', () => {
+    render(<StatusBadge status="not_fifo_monitored" />)
+    expect(screen.getByText('Managed Live')).toBeInTheDocument()
+  })
+
   it('renders null status as unknown', () => {
     render(<StatusBadge status={null} />)
     expect(screen.getByText('Unknown')).toBeInTheDocument()
