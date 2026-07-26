@@ -40,6 +40,7 @@ from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services import native_attachment
 from cli_agent_orchestrator.services import native_pane_input as npi
 from cli_agent_orchestrator.services import native_tui_launch
+from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.managed_launch import ManagedLaunchConflict
 
 PINNED_VERSION_BANNER = "kimi 0.29.0"
@@ -525,6 +526,67 @@ async def test_a_pane_that_resumes_the_wrong_session_is_never_certified(
     assert result["state"] == "preflight_blocked"
     with pytest.raises(Exception):
         _published_receipt(record["reservation_id"])
+
+
+@pytest.mark.asyncio
+async def test_missing_glm_marker_tears_down_published_terminal_and_freezes_attachment(
+    isolated_memory_db, monkeypatch
+):
+    """A post-publication route refusal leaves no live pane to recover."""
+    record = {
+        "provider": "claude_code",
+        "terminal_id": "terminal-marker-missing",
+        "generation": "generation-marker-missing",
+        "session_name": "cao-marker-missing",
+    }
+    bootstrap = {"native_session_id": "native-marker-missing"}
+    native_attachment.declare(
+        provider=record["provider"],
+        native_session_id=bootstrap["native_session_id"],
+        terminal_id=record["terminal_id"],
+        generation=record["generation"],
+        execution_mode=em.NATIVE_TUI,
+        intent=native_attachment.acquire_intent(
+            acquisition_method=native_attachment.ACQUISITION_CHOSEN_SESSION_ID,
+            acquisition_receipt={"session_id": bootstrap["native_session_id"]},
+            admits_only_new_instructions=True,
+            replays_task_bytes=False,
+        ),
+    )
+    live_pane = {"present": True}
+    deletion = {}
+
+    def _delete_terminal(terminal_id, *, registry, expected_generation, expected_session):
+        deletion.update(
+            terminal_id=terminal_id,
+            registry=registry,
+            expected_generation=expected_generation,
+            expected_session=expected_session,
+        )
+        live_pane["present"] = False
+        return True
+
+    monkeypatch.setattr(terminal_service, "delete_terminal", _delete_terminal)
+    registry = object()
+
+    cleanup_error = await v2._teardown_published_native_terminal(
+        record=record,
+        bootstrap=bootstrap,
+        registry=registry,
+        reason="glm_route_consumed_marker_missing",
+    )
+
+    assert cleanup_error is None
+    assert live_pane["present"] is False
+    assert deletion == {
+        "terminal_id": record["terminal_id"],
+        "registry": registry,
+        "expected_generation": record["generation"],
+        "expected_session": record["session_name"],
+    }
+    attachment = native_attachment.get(record["provider"], bootstrap["native_session_id"])
+    assert attachment["state"] == native_attachment.AMBIGUOUS
+    assert attachment["ambiguity_reason"] == "glm_route_consumed_marker_missing"
 
 
 # --------------------------------------------------------------------

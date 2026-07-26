@@ -1084,10 +1084,19 @@ def _resolve_reserve_mode(request: ManagedLaunchV2ReserveRequest) -> em.Executio
     second, unrelated one.
     """
     try:
-        return em.resolve(
+        resolution = em.resolve(
             launch_input=request.execution_mode,
             worker_class=request.worker_class,
         )
+        # GLM is a closed native route.  In particular, an omitted mode must
+        # not inherit the hands-off/one-shot ACP default and reach a provider
+        # branch that cannot honor the route envelope.
+        if (
+            request.provider_route == glm_native_launch.PROVIDER_ROUTE_GLM
+            and resolution.mode != em.NATIVE_TUI
+        ):
+            raise ManagedLaunchConflict("provider_route='glm' requires execution_mode='native_tui'")
+        return resolution
     except em.ExecutionModeError as exc:
         raise ManagedLaunchConflict(str(exc)) from exc
 
@@ -3213,6 +3222,48 @@ class _V2NativePane:
         ).observe()
 
 
+async def _teardown_published_native_terminal(
+    *,
+    record: dict[str, Any],
+    bootstrap: dict[str, Any],
+    registry: Any,
+    reason: str,
+) -> Optional[str]:
+    """Remove a pane published before a native route proof failed.
+
+    The marker check runs after ``native_tui_launch.start`` has declared the
+    attachment and created the pane.  Teardown therefore uses both immutable
+    v2 identities, and the attachment is frozen even when terminal cleanup
+    itself fails, so a later launch cannot reuse an uncertain session.
+    """
+    import asyncio
+
+    from cli_agent_orchestrator.services import terminal_service
+
+    cleanup_errors: list[str] = []
+    try:
+        await asyncio.to_thread(
+            terminal_service.delete_terminal,
+            record["terminal_id"],
+            registry=registry,
+            expected_generation=record["generation"],
+            expected_session=record["session_name"],
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the blocked state
+        cleanup_errors.append(f"native terminal teardown failed: {exc}")
+
+    try:
+        native_attachment.mark_ambiguous(
+            provider=record["provider"],
+            native_session_id=bootstrap["native_session_id"],
+            reason=reason,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the blocked state
+        cleanup_errors.append(f"native attachment freeze failed: {exc}")
+
+    return "; ".join(cleanup_errors) or None
+
+
 async def _launch_native_tui(
     reservation_id: str,
     record: dict[str, Any],
@@ -3421,9 +3472,18 @@ async def _launch_native_tui(
         provider_route == glm_native_launch.PROVIDER_ROUTE_GLM
         and not glm_native_launch.consumed_marker_exists(route_envelope["consumed_marker_path"])
     ):
+        cleanup_error = await _teardown_published_native_terminal(
+            record=record,
+            bootstrap=bootstrap,
+            registry=registry,
+            reason="glm_route_consumed_marker_missing",
+        )
+        detail = "GLM wrapper did not leave its consumed marker; refusing an ambient-auth pane"
+        if cleanup_error:
+            detail = f"{detail}; {cleanup_error}"
         return _mark_preflight_blocked(
             reservation_id,
-            "GLM wrapper did not leave its consumed marker; refusing an ambient-auth pane",
+            detail,
             reason=PREFLIGHT_REASON_READINESS,
         )
 
