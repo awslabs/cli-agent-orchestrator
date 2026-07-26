@@ -3175,7 +3175,9 @@ async def _launch_native_tui(
                 (
                     "the running Claude session is not on the requested route: requested "
                     f"{bootstrap['requested_model']!r}, the provider's own session-start "
-                    f"proof observed {observed_model!r}. Refusing rather than admitting a "
+                    f"proof observed {observed_model!r} "
+                    f"({claude_native_launch.observed_model_mismatch_detail(bootstrap['requested_model'], observed_model)}). "
+                    "Refusing rather than admitting a "
                     "task to a model nobody asked for"
                 ),
                 reason=PREFLIGHT_REASON_READINESS,

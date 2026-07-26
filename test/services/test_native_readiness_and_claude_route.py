@@ -40,6 +40,7 @@ class TestTheLaunchPinsAModelItCanCheck:
     def test_an_alias_and_a_full_name_are_both_pinnable(self):
         assert cl.validate_requested_model("sonnet") == "sonnet"
         assert cl.validate_requested_model("claude-sonnet-5") == "claude-sonnet-5"
+        assert cl.validate_requested_model("claude-opus-5[1m]") == "claude-opus-5[1m]"
 
     def test_an_unpinnable_model_is_refused_before_any_launch(self):
         """A value this side cannot check the observation against.
@@ -94,6 +95,22 @@ class TestTheObservedModelIsCheckedAgainstTheRequest:
     def test_a_full_name_is_satisfied_by_exactly_itself(self):
         assert cl.observed_model_matches("claude-sonnet-5", "claude-sonnet-5") is True
         assert cl.observed_model_matches("claude-sonnet-5", "claude-sonnet-4-6") is False
+
+    def test_a_full_name_without_a_context_pin_accepts_the_observed_context(self):
+        assert cl.observed_model_matches("claude-opus-5", OBSERVED_OPUS_1M) is True
+
+    def test_an_explicit_context_pin_must_match_exactly(self):
+        assert cl.observed_model_matches("claude-opus-5[1m]", OBSERVED_OPUS_1M) is True
+        assert cl.observed_model_matches("claude-opus-5[1m]", "claude-opus-5[200k]") is False
+        assert cl.observed_model_matches("claude-opus-5[1m]", "claude-opus-5") is False
+        assert (
+            cl.observed_model_mismatch_detail("claude-opus-5[1m]", "claude-opus-5[200k]")
+            == "requested context window '[1m]', observed context window '[200k]'"
+        )
+        assert (
+            cl.observed_model_mismatch_detail("claude-opus-5[1m]", "claude-opus-5")
+            == "requested context window '[1m]', but the provider reported no context window"
+        )
 
     def test_a_missing_observation_is_not_a_match(self):
         """Fail closed: nothing observed is not evidence of agreement."""
@@ -239,6 +256,10 @@ class TestBindRefusesAWrongFamilyBeforeAdmission:
     def test_the_requested_family_binds(self):
         row = _Row(model=SONNET)
         v2._validate_readiness_for_bind(row, _receipt(row, model=OBSERVED_SONNET))
+
+    def test_the_explicit_1m_route_crosses_the_real_bind_gate(self):
+        row = _Row(model="claude-opus-5[1m]")
+        v2._validate_readiness_for_bind(row, _receipt(row, model=OBSERVED_OPUS_1M))
 
     def test_an_unobservable_effort_claim_is_refused_at_bind(self):
         """A receipt naming an effort Claude cannot expose pre-turn."""
@@ -434,6 +455,15 @@ class TestTheObservedModelSurvivesTheRealPath:
         receipt = cr.await_session_start(path, self.LIVE_RECORD["session_id"], timeout=1.0)
 
         assert cl.observed_model_matches("opus", receipt.get("model")) is True
+
+    def test_the_explicit_1m_route_is_accepted_end_to_end(self, tmp_path):
+        """The profile pins both Opus 5 and the 1M context window."""
+        from cli_agent_orchestrator.services import claude_native_readiness as cr
+
+        path = self._hook_file(tmp_path, self.LIVE_RECORD)
+        receipt = cr.await_session_start(path, self.LIVE_RECORD["session_id"], timeout=1.0)
+
+        assert cl.observed_model_matches("claude-opus-5[1m]", receipt.get("model")) is True
 
     def test_the_reproduced_wrong_route_is_refused_end_to_end(self, tmp_path):
         """The live failure: sonnet requested, Opus started."""

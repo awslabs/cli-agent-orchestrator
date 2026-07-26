@@ -114,12 +114,11 @@ MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
 #: ``claude-haiku-4-5-20251001`` from provider-authored transcripts.
 MODEL_FAMILIES = MODEL_ALIASES
 
-#: Observed ids carry a context-window suffix — the live proof read
-#: ``claude-opus-5[1m]`` — which names how much context the session was
-#: given, not which model is answering. It is stripped before comparison
-#: so a 1M session of the requested model is not reported as a different
-#: model, and it is stripped from the *observation* only: a request never
-#: carries one.
+#: Provider observations may carry a context-window suffix — the live proof
+#: read ``claude-opus-5[1m]``. A request without a suffix selects only the
+#: model, so the observed suffix is ignored. A request that explicitly carries
+#: a suffix selects both model and context window, so the observation must
+#: match it exactly.
 _CONTEXT_SUFFIX = re.compile(r"\[[^\]]*\]\s*$")
 
 
@@ -322,15 +321,51 @@ def observed_model_matches(requested: str, observed: Optional[str]) -> bool:
     An alias request means "the latest model in this family", so it is
     satisfied by any observed id in that family — pinning it to one exact
     id would encode a "latest" the provider changes without notice. A full
-    name means one model, and is satisfied by exactly itself.
+    name without a context suffix selects exactly that model at any reported
+    context size. A full name with a context suffix selects both and requires
+    an exact provider observation.
     """
     if not isinstance(observed, str) or not observed.strip():
         return False
-    seen = normalize_observed_model(observed).lower()
-    wanted = requested.strip().lower()
-    if wanted in MODEL_ALIASES:
-        return _family_of(seen) == wanted
-    return seen == wanted
+    wanted_model, wanted_context = _model_and_context(requested)
+    seen_model, seen_context = _model_and_context(observed)
+    return _models_match(wanted_model, seen_model) and (
+        wanted_context is None or wanted_context == seen_context
+    )
+
+
+def observed_model_mismatch_detail(requested: str, observed: Optional[str]) -> str:
+    """Name the model-route dimension that failed readiness."""
+    if not isinstance(observed, str) or not observed.strip():
+        return "the provider did not report a model"
+    wanted_model, wanted_context = _model_and_context(requested)
+    seen_model, seen_context = _model_and_context(observed)
+    if not _models_match(wanted_model, seen_model):
+        return f"requested model {wanted_model!r}, observed model {seen_model!r}"
+    if wanted_context is not None and wanted_context != seen_context:
+        if seen_context is None:
+            return (
+                f"requested context window {wanted_context!r}, "
+                "but the provider reported no context window"
+            )
+        return (
+            f"requested context window {wanted_context!r}, "
+            f"observed context window {seen_context!r}"
+        )
+    return "the provider-reported route did not satisfy the request"
+
+
+def _model_and_context(value: str) -> tuple[str, Optional[str]]:
+    normalized = value.strip().lower()
+    match = _CONTEXT_SUFFIX.search(normalized)
+    context = match.group(0).strip() if match else None
+    return normalize_observed_model(normalized).lower(), context
+
+
+def _models_match(wanted_model: str, seen_model: str) -> bool:
+    if wanted_model in MODEL_ALIASES:
+        return _family_of(seen_model) == wanted_model
+    return seen_model == wanted_model
 
 
 def build_launch_argv_with_model(
