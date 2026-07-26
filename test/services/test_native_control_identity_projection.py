@@ -462,6 +462,28 @@ class TestTheRefusalsThatMustSurvive:
         assert journal.find("c-unidentified") is None
 
     @pytest.mark.asyncio
+    async def test_an_unreadable_reservation_is_unproven_not_a_bridge_pane(
+        self, isolated_memory_db, worktree, tmp_path, native, wired, monkeypatch
+    ):
+        """A row that could not be read has no mode, and must not borrow one."""
+        tmux, journal = wired
+        _, bound = await _bound_native(worktree, tmp_path)
+
+        def _unreadable(_reservation_id):
+            raise managed_launch.ManagedLaunchUnavailable("corrupt binding_json")
+
+        monkeypatch.setattr(v2, "get", _unreadable)
+
+        resolved = cis.resolve_control_identity(bound["terminal_id"])
+        result = _deliver(bound["terminal_id"], tmux, journal, control_id="c-unreadable")
+
+        assert resolved.execution_mode == cis.EXECUTION_MODE_ACP
+        assert result.outcome == cis.REFUSED
+        assert result.reason_code == cis.REASON_LINEAGE_UNPROVEN
+        assert result.reason_code != cis.REASON_MANAGED_ACP_PANE
+        assert tmux.events == []
+
+    @pytest.mark.asyncio
     async def test_an_acp_generation_still_projects_acp(
         self, isolated_memory_db, worktree, tmp_path, native, monkeypatch
     ):

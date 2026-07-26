@@ -315,6 +315,35 @@ def _managed_execution_mode(managed: Optional[Dict[str, Any]]) -> str:
     return EXECUTION_MODE_ACP
 
 
+def _projected_identity_refusal(
+    resolved: ResolvedControlIdentity,
+) -> Optional[Tuple[str, str]]:
+    """The typed reason the projection already recorded, if it recorded one."""
+    from cli_agent_orchestrator.services import managed_launch
+
+    if not resolved.managed:
+        return None
+    refusal = resolved.native_identity_refusal
+    if not isinstance(refusal, Mapping):
+        return None
+    detail = str(refusal.get("detail") or "the native identity could not be resolved")
+    if refusal.get("kind") == managed_launch.NATIVE_IDENTITY_UNAVAILABLE:
+        # "We could not look" is not "it is gone". Both refuse with zero
+        # bytes, and both are re-attemptable, but a caller reading a
+        # mismatch would stop re-attempting a delivery that is still open,
+        # so the two keep separate reasons all the way out.
+        return (
+            REASON_LINEAGE_UNPROVEN,
+            f"this server could not read the authoritative native identity of this "
+            f"generation, so nothing was typed: {detail}",
+        )
+    return (
+        REASON_IDENTITY_MISMATCH,
+        f"the authoritative attachment evidence does not name this generation as the "
+        f"holder of its provider session: {detail}",
+    )
+
+
 def _native_identity_refusal(
     resolved: ResolvedControlIdentity,
 ) -> Optional[Tuple[str, str]]:
@@ -334,28 +363,11 @@ def _native_identity_refusal(
     published with some of its fields is a binding some later check will
     pass against.
     """
-    from cli_agent_orchestrator.services import managed_launch
-
     if not resolved.managed:
         return None
-    refusal = resolved.native_identity_refusal
-    if isinstance(refusal, Mapping):
-        detail = str(refusal.get("detail") or "the native identity could not be resolved")
-        if refusal.get("kind") == managed_launch.NATIVE_IDENTITY_UNAVAILABLE:
-            # "We could not look" is not "it is gone". Both refuse with
-            # zero bytes, and both are re-attemptable, but a caller reading
-            # a mismatch would stop re-attempting a delivery that is still
-            # open, so the two keep separate reasons all the way out.
-            return (
-                REASON_LINEAGE_UNPROVEN,
-                f"this server could not read the authoritative native identity of this "
-                f"generation, so nothing was typed: {detail}",
-            )
-        return (
-            REASON_IDENTITY_MISMATCH,
-            f"the authoritative attachment evidence does not name this generation as the "
-            f"holder of its provider session: {detail}",
-        )
+    projected = _projected_identity_refusal(resolved)
+    if projected is not None:
+        return projected
     missing = [
         name
         for name, value in (
@@ -533,6 +545,13 @@ def screen_expected_identity(
             f"the request is addressed to terminal {resolved.terminal_id!r} but expects "
             f"{declared_terminal!r}",
         )
+
+    # Before the allowlist: an unreadable projection carries no mode, and
+    # the fallback below reads a missing mode as ACP, so this only changes
+    # the reason for a refusal the allowlist would make anyway.
+    projected = _projected_identity_refusal(resolved)
+    if projected is not None:
+        return projected
 
     # A positive allowlist, not "is it ACP". Only a mode this side has
     # resolved to a real native TUI may be typed into; everything else --
