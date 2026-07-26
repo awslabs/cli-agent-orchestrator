@@ -836,6 +836,11 @@ class TmuxClient:
 
     def window_exists(self, session_name: str, window_name: str) -> bool:
         """Check the exact tmux window while preserving unreadable-server errors."""
+        # ``Server.sessions`` turns every ``list-sessions`` failure into an empty
+        # QueryList.  Prove the server is readable first so a permission or
+        # subprocess failure cannot masquerade as an absent session.
+        if not self.server.is_alive():
+            raise RuntimeError("tmux server is unavailable or unreadable")
         session = self.server.sessions.get(session_name=session_name, default=None)
         if session is None:
             return False
