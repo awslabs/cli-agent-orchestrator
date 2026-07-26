@@ -422,6 +422,77 @@ def test_session_env_rebind_is_idempotent_and_only_updates_future_panes(
     assert session_env.get_session_env("cao-rebind") == env_vars
 
 
+def test_session_env_rebind_returns_404_for_an_absent_session(client, monkeypatch):
+    backend = MagicMock()
+    backend.session_exists.return_value = False
+    monkeypatch.setattr("cli_agent_orchestrator.api.main.get_backend", lambda: backend)
+
+    response = client.put(
+        "/sessions/cao-missing/env",
+        json={"env_vars": {}, "fingerprint": "0" * 64},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "session not found"
+
+
+def test_session_env_rebind_returns_409_for_a_fingerprint_mismatch(client, monkeypatch):
+    backend = MagicMock()
+    backend.session_exists.return_value = True
+    monkeypatch.setattr("cli_agent_orchestrator.api.main.get_backend", lambda: backend)
+    env_vars = {"CAO_CONDUCTOR_MODEL": "glm-5.2"}
+
+    response = client.put(
+        "/sessions/cao-fingerprint/env",
+        json={"env_vars": env_vars, "fingerprint": "0" * 64},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "env fingerprint mismatch"
+
+
+def test_session_env_rebind_returns_400_for_an_invalid_session_name(client):
+    response = client.put(
+        "/sessions/bad%20name/env",
+        json={"env_vars": {}, "fingerprint": "0" * 64},
+    )
+
+    assert response.status_code == 400
+
+
+def test_session_env_rebind_returns_503_when_the_store_is_unavailable(client, monkeypatch):
+    backend = MagicMock()
+    backend.session_exists.return_value = True
+    monkeypatch.setattr("cli_agent_orchestrator.api.main.get_backend", lambda: backend)
+    monkeypatch.setattr(
+        session_env,
+        "set_session_env",
+        MagicMock(side_effect=session_env.SessionEnvStoreError("store unavailable")),
+    )
+
+    response = client.put(
+        "/sessions/cao-store-error/env",
+        json={"env_vars": {}, "fingerprint": hashlib.sha256(b"{}").hexdigest()},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "session environment could not be persisted"
+
+
+def test_session_env_rebind_returns_503_when_session_existence_is_unreadable(client, monkeypatch):
+    backend = MagicMock()
+    backend.session_exists.side_effect = RuntimeError("backend unreadable")
+    monkeypatch.setattr("cli_agent_orchestrator.api.main.get_backend", lambda: backend)
+
+    response = client.put(
+        "/sessions/cao-unreadable/env",
+        json={"env_vars": {}, "fingerprint": hashlib.sha256(b"{}").hexdigest()},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "could not determine whether the session exists"
+
+
 def test_the_v1_surface_refuses_native_with_nothing_persisted(
     client, isolated_memory_db, worktree, tmp_path
 ):

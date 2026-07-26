@@ -1857,7 +1857,19 @@ def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
     else:
         model_ok = receipt.get("model") == expected_model
     if not model_ok:
-        mismatches["model"] = {"expected": expected_model, "observed": receipt.get("model")}
+        model_mismatch = {"expected": expected_model, "observed": receipt.get("model")}
+        # Claude's Anthropic route has a provider-specific diagnostic that
+        # explains family and context-window mismatches. GLM stays on its
+        # closed-route validation path above and must not be described with
+        # Claude's model vocabulary.
+        if (
+            provider_route == glm_native_launch.PROVIDER_ROUTE_ANTHROPIC
+            and row.provider == "claude_code"
+        ):
+            model_mismatch["detail"] = claude_native_launch.observed_model_mismatch_detail(
+                str(expected_model or ""), receipt.get("model")
+            )
+        mismatches["model"] = model_mismatch
     # Effort is compared through the effort vocabulary rather than by
     # string equality, because the route and a truthful receipt speak
     # different alphabets here: a provider-default route says

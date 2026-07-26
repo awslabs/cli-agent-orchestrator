@@ -250,7 +250,11 @@ class TestBindRefusesAWrongFamilyBeforeAdmission:
 
         mismatches = _parse_mismatches(raised.value)
         assert "model" in mismatches, mismatches
-        assert mismatches["model"] == {"expected": SONNET, "observed": OBSERVED_OPUS_1M}
+        assert mismatches["model"] == {
+            "expected": SONNET,
+            "observed": OBSERVED_OPUS_1M,
+            "detail": "requested model 'sonnet', observed model 'claude-opus-5'",
+        }
         # And nothing else drifted: a refusal that also flagged unrelated
         # fields would pass the check above while pointing an operator at
         # the wrong cause.
