@@ -560,6 +560,8 @@ class TestManagedWebSocketInputGate:
             "\x1b[M !!",
             "\x1b[<64;76;16M\x1b[<64;76;16M",
             "\x1b[<64;bad;16M",
+            "\x1b[<٦٤;١;١M",
+            "\x1b[M٠xy",
             "",
         ],
     )

@@ -3725,7 +3725,7 @@ async def get_inbox_messages_endpoint(
         )
 
 
-_SGR_WHEEL_REPORT = re.compile(r"^\x1b\[<(\d+);\d+;\d+[Mm]$")
+_SGR_WHEEL_REPORT = re.compile(r"^\x1b\[<([0-9]+);[0-9]+;[0-9]+[Mm]$")
 
 
 def _is_wheel_mouse_report(data: str) -> bool:
@@ -3743,7 +3743,7 @@ def _is_wheel_mouse_report(data: str) -> bool:
 
     if len(data) == 6 and data.startswith("\x1b[M"):
         button = ord(data[3]) - 32
-        return button >= 0 and (button & 64) == 64
+        return 0 <= button <= 223 and (button & 64) == 64
     return False
 
 
