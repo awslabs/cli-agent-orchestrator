@@ -147,6 +147,18 @@ class TestTheProducerAndConsumerAgreeOnTheFieldName:
         assert json.loads(path.read_text())["session_id"] == NATIVE_SESSION_ID
         assert readiness.SESSION_START_ID_KEY != "session_id"
 
+    def test_the_key_is_pinned_to_the_durable_wire_spelling(self):
+        """The constant's VALUE is a wire contract, not an internal name.
+
+        Every other test here reads the constant on both sides, so renaming
+        it to a third spelling keeps them all green -- while receipts
+        already persisted on disk still carry ``native_session_id`` and
+        would go back to failing the completeness rule forever, which is
+        the exact 425 this fixes. Only a literal can catch that, so the
+        literal is written down once, here.
+        """
+        assert readiness.SESSION_START_ID_KEY == "native_session_id"
+
 
 class TestTheRefusalStillWorksWhenItShould:
     """The fix must not make the proof unfalsifiable.
