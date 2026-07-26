@@ -216,7 +216,7 @@ def iter_sse(
     if last_event_id:
         req.add_header("Last-Event-ID", last_event_id)
 
-    with urllib.request.urlopen(req) as resp:  # noqa: S310 — URL is operator-controlled
+    with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 — URL is operator-controlled
         yield from _parse_sse_stream(resp)
 
 
@@ -293,7 +293,7 @@ def fetch_json(url: str) -> Union[dict, list]:
     Returns:
         The parsed JSON body -- a dict or list depending on the endpoint.
     """
-    with urllib.request.urlopen(url) as resp:  # noqa: S310 — URL is operator-controlled
+    with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310 — URL is operator-controlled
         return json.loads(resp.read().decode("utf-8"))
 
 

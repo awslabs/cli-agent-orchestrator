@@ -442,14 +442,16 @@ class TestFetchJson:
     (``urllib.request.urlopen``), never a real socket."""
 
     def test_returns_parsed_dict_body(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(urllib.request, "urlopen", lambda url: _FakeHTTPResponse(b'{"a": 1}'))
+        monkeypatch.setattr(
+            urllib.request, "urlopen", lambda url, **kw: _FakeHTTPResponse(b'{"a": 1}')
+        )
         assert csm.fetch_json("http://localhost:9889/flows") == {"a": 1}
 
     def test_returns_parsed_list_body(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The real /flows and /workflows endpoints return a JSON array, not
         an object -- the other branch of the -> Union[dict, list] contract."""
         monkeypatch.setattr(
-            urllib.request, "urlopen", lambda url: _FakeHTTPResponse(b'[{"a": 1}, {"b": 2}]')
+            urllib.request, "urlopen", lambda url, **kw: _FakeHTTPResponse(b'[{"a": 1}, {"b": 2}]')
         )
         assert csm.fetch_json("http://localhost:9889/flows") == [{"a": 1}, {"b": 2}]
 
@@ -458,7 +460,7 @@ class TestFetchJson:
     ) -> None:
         captured: List[str] = []
 
-        def fake_urlopen(url: str) -> "_FakeHTTPResponse":
+        def fake_urlopen(url: str, **kw) -> "_FakeHTTPResponse":
             captured.append(url)
             return _FakeHTTPResponse(b"{}")
 
@@ -469,7 +471,7 @@ class TestFetchJson:
     def test_url_error_from_urlopen_propagates_unchanged(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def fake_urlopen(url: str) -> "_FakeHTTPResponse":
+        def fake_urlopen(url: str, **kw) -> "_FakeHTTPResponse":
             raise urllib.request.URLError("connection refused")
 
         monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
@@ -479,7 +481,7 @@ class TestFetchJson:
     def test_http_error_from_urlopen_propagates_unchanged(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def fake_urlopen(url: str) -> "_FakeHTTPResponse":
+        def fake_urlopen(url: str, **kw) -> "_FakeHTTPResponse":
             raise urllib.request.HTTPError(url, 500, "Internal Server Error", None, None)
 
         monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
@@ -489,7 +491,9 @@ class TestFetchJson:
     def test_malformed_json_body_raises_json_decode_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(urllib.request, "urlopen", lambda url: _FakeHTTPResponse(b"not json"))
+        monkeypatch.setattr(
+            urllib.request, "urlopen", lambda url, **kw: _FakeHTTPResponse(b"not json")
+        )
         with pytest.raises(json.JSONDecodeError):
             csm.fetch_json("http://localhost:9889/flows")
 
@@ -2190,3 +2194,87 @@ class TestRenderUnreachableBanner:
         tree = {"sessions": {}}
         out = csm.render(tree, [], [], agui_enabled=True, unreachable=False)
         assert "CAO unreachable" not in out
+
+
+# ---------------------------------------------------------------------------
+# FIX 3: CRLF line endings in SSE stream
+# ---------------------------------------------------------------------------
+
+
+class TestParseSseStreamCrlf:
+    """_parse_sse_stream handles \\r\\n line endings (common from HTTP servers)."""
+
+    @staticmethod
+    def _parse(raw: bytes) -> List[Tuple[str, str]]:
+        return [(ev, data) for ev, data, _id in csm._parse_sse_stream(io.BytesIO(raw))]
+
+    def test_crlf_line_endings_parse_correctly(self) -> None:
+        assert self._parse(b"event: X\r\ndata: y\r\n\r\n") == [("X", "y")]
+
+
+# ---------------------------------------------------------------------------
+# FIX 4: SSE id: persists across events when not updated
+# ---------------------------------------------------------------------------
+
+
+class TestSseIdPersistence:
+    """_parse_sse_stream: id: field persists to subsequent events per SSE spec."""
+
+    def test_id_persists_across_events_when_not_updated(self) -> None:
+        raw = b"id: 5\ndata: a\n\ndata: b\n\n"
+        results = list(csm._parse_sse_stream(io.BytesIO(raw)))
+        assert results == [("message", "a", "5"), ("message", "b", "5")]
+
+
+# ---------------------------------------------------------------------------
+# FIX 5: Partial REST fetch failure keeps both at last known
+# ---------------------------------------------------------------------------
+
+
+class TestRestPollerPartialFailure:
+    """_rest_poller: if one of the two fetch_json calls raises, BOTH flows and
+    workflows in state remain at their prior values (atomic-or-nothing)."""
+
+    def test_partial_fetch_failure_keeps_both_at_last_known(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        call_count = [0]
+
+        def fake_fetch_json(url: str):
+            call_count[0] += 1
+            if "/flows" in url:
+                return [
+                    {
+                        "name": "new-flow",
+                        "schedule": "* * * * *",
+                        "agent_profile": "dev",
+                        "provider": "mock_cli",
+                        "enabled": True,
+                        "last_run": None,
+                        "next_run": None,
+                    }
+                ]
+            # /workflows raises
+            raise ConnectionError("refused on workflows")
+
+        monkeypatch.setattr(csm, "fetch_json", fake_fetch_json)
+
+        state: dict = {
+            "flows": [{"name": "prior-flow"}],
+            "workflows": [{"name": "prior-wf"}],
+            "unreachable": False,
+        }
+        lock = threading.Lock()
+        stop = threading.Event()
+
+        def stop_on_wait(timeout: float = None) -> bool:
+            stop.set()
+            return True
+
+        monkeypatch.setattr(stop, "wait", stop_on_wait)
+        csm._rest_poller("http://localhost:9889", state, lock, stop)
+
+        # Both must remain at prior values — the /flows success must NOT
+        # partially update state when /workflows fails.
+        assert state["flows"] == [{"name": "prior-flow"}]
+        assert state["workflows"] == [{"name": "prior-wf"}]
