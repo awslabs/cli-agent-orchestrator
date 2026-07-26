@@ -35,6 +35,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from functools import partial
+from pathlib import Path
 from typing import Any, Optional
 
 from sqlalchemy.exc import IntegrityError
@@ -81,6 +82,163 @@ _READINESS_RECEIPT_KINDS = {
     "codex": "codex-thread-start",
     "kimi_cli": "kimi-acp-session-new",
 }
+
+
+def _write_native_profile_file(
+    *,
+    terminal_id: str,
+    generation: str,
+    filename: str,
+    content: str,
+) -> str:
+    """Materialize one generation-private provider configuration file."""
+    root = Path(COMPANION_DIR) / terminal_id / generation
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = root / filename
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o600)
+    return str(path)
+
+
+def _claude_profile_launch_args(
+    *,
+    record: dict[str, Any],
+    request: dict[str, Any],
+    profile_material: dict[str, Any],
+) -> list[str]:
+    """Build the profile-derived portion of an exact native Claude argv.
+
+    Native v2 starts Claude as the pane's primary process and therefore
+    bypasses ``ClaudeCodeProvider._build_claude_command``. Reproduce the
+    profile contract as argv and generation-private files: permissions,
+    requested effort, prompt, strict MCP set, and tool restrictions. The
+    model remains owned by the separately attested route argument.
+    """
+    profile = profile_material["profile"]
+    if profile.permissionMode:
+        args = ["--permission-mode", profile.permissionMode]
+    else:
+        yolo = bool(profile.allowedTools and "*" in profile.allowedTools)
+        is_root = getattr(os, "geteuid", lambda: -1)() == 0
+        args = [] if yolo and is_root else ["--dangerously-skip-permissions"]
+
+    effort = request.get("expected_effort")
+    if effort and effort != provider_contracts.EFFORT_PROVIDER_DEFAULT:
+        args.extend(["--effort", str(effort)])
+
+    system_prompt = profile_material.get("system_prompt") or ""
+    if system_prompt:
+        args.extend(
+            [
+                "--append-system-prompt-file",
+                _write_native_profile_file(
+                    terminal_id=record["terminal_id"],
+                    generation=record["generation"],
+                    filename="profile-system-prompt.md",
+                    content=system_prompt,
+                ),
+            ]
+        )
+
+    mcp_servers = profile_material.get("mcp_servers") or []
+    if mcp_servers:
+        mcp_config: dict[str, Any] = {}
+        for server in mcp_servers:
+            mcp_config[server["name"]] = {
+                "command": server["command"],
+                "args": list(server.get("args") or []),
+                "env": {item["name"]: item["value"] for item in server.get("env") or []},
+            }
+        args.extend(
+            [
+                "--mcp-config",
+                _write_native_profile_file(
+                    terminal_id=record["terminal_id"],
+                    generation=record["generation"],
+                    filename="profile-mcp.json",
+                    content=json.dumps({"mcpServers": mcp_config}, sort_keys=True),
+                ),
+                "--strict-mcp-config",
+            ]
+        )
+
+    allowed_tools = profile_material.get("allowed_tools") or []
+    if allowed_tools and "*" not in allowed_tools:
+        from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+
+        for tool in get_disallowed_tools("claude_code", allowed_tools):
+            args.extend(["--disallowedTools", tool])
+    return args
+
+
+def _kimi_profile_launch_args(profile_material: dict[str, Any]) -> list[str]:
+    """Translate the profile's permission floor to Kimi's native TUI."""
+    profile = profile_material["profile"]
+    permission_mode = profile.permissionMode
+    allowed_tools = profile_material.get("allowed_tools") or []
+    if permission_mode in {"auto", "bypassPermissions"} or (
+        not permission_mode and "*" in allowed_tools
+    ):
+        return ["--auto"]
+    if permission_mode == "acceptEdits":
+        return ["--yolo"]
+    return []
+
+
+def _kimi_profile_environment(
+    *,
+    record: dict[str, Any],
+    profile_material: dict[str, Any],
+    base_environment: dict[str, str],
+) -> dict[str, str]:
+    """Give a native Kimi generation an isolated, profile-owned MCP home.
+
+    Kimi has no interactive-TUI equivalent of Claude's ``--mcp-config``
+    and ``--strict-mcp-config``. Its supported user configuration lives
+    under ``KIMI_CODE_HOME``. Build a generation-private home that links
+    back to the real provider state (OAuth and resumable sessions) while
+    replacing only ``mcp.json`` with the sealed profile material.
+    """
+    configured_home = base_environment.get("KIMI_CODE_HOME")
+    provider_home = (
+        Path(configured_home).expanduser() if configured_home else Path.home() / ".kimi-code"
+    ).resolve()
+    private_home = Path(COMPANION_DIR) / record["terminal_id"] / record["generation"] / "kimi-home"
+    private_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    if provider_home.exists():
+        for source in provider_home.iterdir():
+            if source.name == "mcp.json":
+                continue
+            destination = private_home / source.name
+            if destination.exists() or destination.is_symlink():
+                if not destination.is_symlink() or destination.resolve() != source.resolve():
+                    raise ManagedLaunchConflict(
+                        f"generation-private Kimi home entry drifted: {destination}"
+                    )
+                continue
+            destination.symlink_to(source, target_is_directory=source.is_dir())
+
+    mcp_servers: dict[str, Any] = {}
+    for server in profile_material.get("mcp_servers") or []:
+        mcp_servers[server["name"]] = {
+            "command": server["command"],
+            "args": list(server.get("args") or []),
+            "env": {item["name"]: item["value"] for item in server.get("env") or []},
+            "enabled": True,
+        }
+    mcp_path = private_home / "mcp.json"
+    mcp_path.write_text(
+        json.dumps({"mcpServers": mcp_servers}, sort_keys=True),
+        encoding="utf-8",
+    )
+    mcp_path.chmod(0o600)
+
+    environment = dict(base_environment)
+    environment["KIMI_CODE_HOME"] = str(private_home)
+    return environment
+
+
 #: Readiness receipt kinds for native-TUI generations.
 #:
 #: The kind strings are disjoint from the ACP table above by design, so
@@ -2917,9 +3075,18 @@ class _V2NativePane:
     thread waiting on itself.
     """
 
-    def __init__(self, *, record: dict[str, Any], request: dict[str, Any], loop, registry) -> None:
+    def __init__(
+        self,
+        *,
+        record: dict[str, Any],
+        request: dict[str, Any],
+        environment: dict[str, str],
+        loop,
+        registry,
+    ) -> None:
         self._record = record
         self._request = request
+        self._environment = dict(environment)
         self._loop = loop
         self._registry = registry
         self._window = managed_window_name(record["terminal_id"], record["generation"])
@@ -2952,6 +3119,7 @@ class _V2NativePane:
             # shell, so there is no window in which a partially-typed
             # command line could be interrupted into something else.
             managed_native_command=argv,
+            env_vars=self._environment,
             protocol_vintage="v2",
             # The pane runs the provider's own full-screen TUI, so its
             # status comes from the native observer and the FIFO monitor
@@ -3000,6 +3168,7 @@ async def _launch_native_tui(
     )
     from cli_agent_orchestrator.services.managed_provider_bridge import (
         BRIDGE_VERSION,
+        _profile_material,
         native_child_environment,
         provider_version_banner,
         publish_native_ready_state,
@@ -3022,8 +3191,17 @@ async def _launch_native_tui(
     digest = bridge_request["provider_executable_sha256"]
 
     try:
+        profile_material = _profile_material(record["agent_profile"], record["terminal_id"])
+        if profile_material["profile_sha256"] != bridge_request["profile_sha256"]:
+            raise ManagedLaunchConflict("agent profile changed after the launch request was sealed")
         version_output = await asyncio.to_thread(provider_version_banner, bridge_request)
         environment = native_child_environment(bridge_request)
+        if provider == "kimi_cli":
+            environment = _kimi_profile_environment(
+                record=record,
+                profile_material=profile_material,
+                base_environment=environment,
+            )
     except Exception as exc:  # noqa: BLE001 - nothing was started
         return _mark_preflight_blocked(
             reservation_id,
@@ -3063,6 +3241,11 @@ async def _launch_native_tui(
                 bootstrap["requested_model"],
                 "--settings",
                 claude_native_readiness.settings_argument(readiness_hook["settings"]),
+                *_claude_profile_launch_args(
+                    record=record,
+                    request=request,
+                    profile_material=profile_material,
+                ),
             ]
         else:
             bootstrap = await asyncio.to_thread(
@@ -3076,6 +3259,7 @@ async def _launch_native_tui(
                 request=request,
             )
             launch_kind = native_tui_launch.LAUNCH_KIND_RESUME
+            launch_extra_args = _kimi_profile_launch_args(profile_material)
     except Exception as exc:  # noqa: BLE001 - no turn was ever submitted
         return _mark_preflight_blocked(
             reservation_id,
@@ -3094,6 +3278,7 @@ async def _launch_native_tui(
         transport = _V2NativePane(
             record=record,
             request=request,
+            environment=environment,
             loop=asyncio.get_running_loop(),
             registry=registry,
         )

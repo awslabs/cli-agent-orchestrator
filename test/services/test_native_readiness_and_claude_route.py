@@ -24,6 +24,9 @@ as requested with an explicitly null observation.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from cli_agent_orchestrator.services import claude_native_launch as cl
@@ -552,6 +555,7 @@ class TestTheObservedModelSurvivesTheRealPath:
             "observed_effort": None,
         }
         published = {}
+        launched = {}
 
         monkeypatch.setattr(bridge, "provider_version_banner", lambda _request: "2.1.220")
         monkeypatch.setattr(bridge, "native_child_environment", lambda _request: {})
@@ -566,14 +570,37 @@ class TestTheObservedModelSurvivesTheRealPath:
         monkeypatch.setattr(v2, "_claude_bootstrap_intent", lambda *_args, **_kwargs: {})
         monkeypatch.setattr(v2, "_V2NativePane", lambda **_kwargs: object())
         monkeypatch.setattr(
-            native_tui_launch,
-            "start",
-            lambda **_kwargs: {
+            bridge,
+            "_profile_material",
+            lambda *_args: {
+                "profile": type(
+                    "Profile",
+                    (),
+                    {
+                        "permissionMode": "bypassPermissions",
+                        "allowedTools": ["*"],
+                    },
+                )(),
+                "profile_sha256": "c" * 64,
+                "allowed_tools": ["*"],
+                "system_prompt": "",
+                "mcp_servers": [],
+            },
+        )
+
+        def _start(**kwargs):
+            launched.update(kwargs)
+            return {
                 "outcome": "started",
                 "launch_argv_sha256": "a" * 64,
                 "pane_handle": "%1",
                 "attachment": {"owner": {"pane_id": "%1"}},
-            },
+            }
+
+        monkeypatch.setattr(
+            native_tui_launch,
+            "start",
+            _start,
         )
         monkeypatch.setattr(
             claude_native_readiness,
@@ -599,12 +626,164 @@ class TestTheObservedModelSurvivesTheRealPath:
             {
                 "provider_executable": "/usr/local/bin/claude",
                 "provider_executable_sha256": "b" * 64,
+                "profile_sha256": "c" * 64,
             },
         )
 
         assert result["state"] == "launching"
         assert published["model"] == OBSERVED_OPUS_1M
         assert bootstrap["observed_model"] == OBSERVED_OPUS_1M
+        assert "--permission-mode" in launched["extra_args"]
+        assert (
+            launched["extra_args"][launched["extra_args"].index("--permission-mode") + 1]
+            == "bypassPermissions"
+        )
+        assert launched["extra_args"][-2:] == ["--effort", "xhigh"]
+
+    @staticmethod
+    def _profile_material(permission_mode, *, allowed_tools=None):
+        return {
+            "profile": type(
+                "Profile",
+                (),
+                {
+                    "permissionMode": permission_mode,
+                    "allowedTools": allowed_tools or [],
+                },
+            )(),
+            "allowed_tools": allowed_tools or [],
+            "system_prompt": "",
+            "mcp_servers": [],
+        }
+
+    def test_native_permission_args_preserve_a_non_bypass_profile(self):
+        args = v2._claude_profile_launch_args(
+            record={"terminal_id": "term", "generation": "gen"},
+            request={"expected_effort": "provider-default"},
+            profile_material=self._profile_material("acceptEdits"),
+        )
+
+        assert args == ["--permission-mode", "acceptEdits"]
+
+    def test_native_permission_args_disable_prompts_by_default(self):
+        args = v2._claude_profile_launch_args(
+            record={"terminal_id": "term", "generation": "gen"},
+            request={"expected_effort": "provider-default"},
+            profile_material=self._profile_material(None, allowed_tools=["@builtin"]),
+        )
+
+        assert args[0] == "--dangerously-skip-permissions"
+        assert "--disallowedTools" in args
+
+    def test_native_permission_args_omit_rejected_flag_for_root_yolo(self, monkeypatch):
+        monkeypatch.setattr(v2.os, "geteuid", lambda: 0)
+
+        args = v2._claude_profile_launch_args(
+            record={"terminal_id": "term", "generation": "gen"},
+            request={"expected_effort": "provider-default"},
+            profile_material=self._profile_material(None, allowed_tools=["*"]),
+        )
+
+        assert args == []
+
+    def test_native_profile_materializes_prompt_and_strict_mcp(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path)
+        material = self._profile_material("bypassPermissions", allowed_tools=["*"])
+        material["system_prompt"] = "retain the design track"
+        material["mcp_servers"] = [
+            {
+                "name": "agentmemory",
+                "command": "/opt/homebrew/bin/node",
+                "args": ["/tmp/bridge.mjs"],
+                "env": [
+                    {"name": "AGENTMEMORY_ACCESS", "value": "read-only"},
+                    {"name": "CAO_TERMINAL_ID", "value": "term"},
+                ],
+            }
+        ]
+
+        args = v2._claude_profile_launch_args(
+            record={"terminal_id": "term", "generation": "gen"},
+            request={"expected_effort": "high"},
+            profile_material=material,
+        )
+
+        prompt_path = args[args.index("--append-system-prompt-file") + 1]
+        mcp_path = args[args.index("--mcp-config") + 1]
+        assert Path(prompt_path).read_text() == "retain the design track"
+        assert (
+            json.loads(Path(mcp_path).read_text())["mcpServers"]["agentmemory"]["env"][
+                "CAO_TERMINAL_ID"
+            ]
+            == "term"
+        )
+        assert "--strict-mcp-config" in args
+        effort_index = args.index("--effort")
+        assert args[effort_index : effort_index + 2] == ["--effort", "high"]
+
+
+class TestKimiNativeProfileMaterial:
+    @staticmethod
+    def _material(permission_mode=None, *, allowed_tools=None, mcp_servers=None):
+        return {
+            "profile": type(
+                "Profile",
+                (),
+                {
+                    "permissionMode": permission_mode,
+                    "allowedTools": allowed_tools or [],
+                },
+            )(),
+            "allowed_tools": allowed_tools or [],
+            "system_prompt": "",
+            "mcp_servers": mcp_servers or [],
+        }
+
+    def test_unrestricted_profile_uses_fully_autonomous_mode(self):
+        assert v2._kimi_profile_launch_args(self._material(allowed_tools=["*"])) == ["--auto"]
+        assert v2._kimi_profile_launch_args(self._material("bypassPermissions")) == ["--auto"]
+        assert v2._kimi_profile_launch_args(self._material("acceptEdits")) == ["--yolo"]
+
+    def test_profile_mcp_replaces_the_ambient_user_mcp(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companions")
+        provider_home = tmp_path / "provider-home"
+        (provider_home / "sessions").mkdir(parents=True)
+        (provider_home / "oauth").mkdir()
+        (provider_home / "mcp.json").write_text(
+            '{"mcpServers":{"agentmemory":{"command":"ambient"}}}'
+        )
+        material = self._material(
+            allowed_tools=["*"],
+            mcp_servers=[
+                {
+                    "name": "agentmemory",
+                    "command": "/opt/homebrew/bin/node",
+                    "args": ["/project/strict-memory.mjs"],
+                    "env": [
+                        {
+                            "name": "AGENTMEMORY_PROJECT_NAME",
+                            "value": "chess-shakedown",
+                        }
+                    ],
+                }
+            ],
+        )
+
+        environment = v2._kimi_profile_environment(
+            record={"terminal_id": "term", "generation": "gen"},
+            profile_material=material,
+            base_environment={"KIMI_CODE_HOME": str(provider_home), "PATH": "/bin"},
+        )
+
+        private_home = Path(environment["KIMI_CODE_HOME"])
+        config = json.loads((private_home / "mcp.json").read_text())
+        assert config["mcpServers"]["agentmemory"]["command"] == "/opt/homebrew/bin/node"
+        assert (
+            config["mcpServers"]["agentmemory"]["env"]["AGENTMEMORY_PROJECT_NAME"]
+            == "chess-shakedown"
+        )
+        assert (private_home / "sessions").resolve() == (provider_home / "sessions").resolve()
+        assert environment["PATH"] == "/bin"
 
 
 class TestOneCompletenessRuleForBindAndProjection:

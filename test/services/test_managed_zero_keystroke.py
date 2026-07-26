@@ -147,6 +147,38 @@ async def test_managed_bridge_is_explicit_argv_with_zero_keystrokes(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_managed_native_window_receives_only_its_explicit_environment(
+    monkeypatch,
+):
+    backend = FakeBackend(event_inbox=False)
+    _patch_common(monkeypatch, backend)
+
+    await terminal_service.create_terminal(
+        provider="kimi_cli",
+        agent_profile="reviewer",
+        session_name=SESSION,
+        new_session=False,
+        working_directory="/tmp",
+        registry=None,
+        env_vars={
+            "PATH": "/usr/bin:/bin",
+            "KIMI_CODE_HOME": "/tmp/private-kimi-home",
+        },
+        reserved_terminal_id=TERMINAL_ID,
+        terminal_generation=GENERATION,
+        preserve_on_init_failure=True,
+        managed_native_command=["/opt/homebrew/bin/kimi", "--auto"],
+        native_status_source=True,
+    )
+
+    call = next(c for c in backend.calls if c[0] == "create_window_with_argv")
+    assert call[6] == {
+        "PATH": "/usr/bin:/bin",
+        "KIMI_CODE_HOME": "/tmp/private-kimi-home",
+    }
+
+
+@pytest.mark.asyncio
 async def test_shell_in_pane_fails_closed_and_kills_window(monkeypatch):
     backend = FakeBackend(pane_command="zsh")
     _patch_common(monkeypatch, backend)
