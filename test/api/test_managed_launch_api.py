@@ -78,6 +78,7 @@ def test_capability_handshake_is_exact_and_versioned(client):
         "trusted_project_root_providers": ["codex"],
         "readiness_providers": ["codex", "kimi_cli"],
         "execution_mode_selection": True,
+        "glm_route_envelope": True,
         # Only the modes this surface can actually run. Native TUI is
         # absent until a native launch branch exists, so a consumer that
         # gates a native claim on this list is fail-closed by default.
