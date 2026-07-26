@@ -102,6 +102,7 @@ AMBIGUOUS_START_CROSSED_NO_PANE = "start_crossed_with_no_observable_pane"
 AMBIGUOUS_ARGV_MISMATCH = "pane_argv_does_not_resume_bound_session"
 AMBIGUOUS_PANE_WORKDIR_MISMATCH = "pane_cwd_is_not_the_bound_working_directory"
 AMBIGUOUS_PUBLISH_FAILED = "attachment_publication_failed"
+AMBIGUOUS_PROCESS_IMAGE_MISMATCH = "pane_process_image_does_not_match_inner_binary"
 
 
 class NativeLaunchError(RuntimeError):
@@ -360,6 +361,7 @@ def _publish(
     generation: str,
     working_directory: str,
     observation: Mapping[str, Any],
+    expected_inner_executable: Optional[str] = None,
 ) -> dict[str, Any]:
     """Verify the pane runs the bound session, then publish the attachment.
 
@@ -383,6 +385,18 @@ def _publish(
                 "a different one"
             ),
         )
+    if expected_inner_executable is not None:
+        observed_executable = observation["argv"][0] if observation["argv"] else ""
+        if os.path.realpath(observed_executable) != expected_inner_executable:
+            _freeze(
+                provider=provider,
+                native_session_id=native_session_id,
+                reason=AMBIGUOUS_PROCESS_IMAGE_MISMATCH,
+                detail=(
+                    f"the pane process image {observed_executable!r} is not the declared "
+                    f"inner executable {expected_inner_executable!r}"
+                ),
+            )
     observed_cwd = os.path.realpath(observation["cwd"])
     if observed_cwd != working_directory:
         # Frozen rather than refused, because a process is running: it
@@ -543,6 +557,7 @@ def start(
     transport: NativePaneTransport,
     extra_args: Optional[Sequence[str]] = None,
     launch_kind: str = LAUNCH_KIND_RESUME,
+    expected_inner_executable: Optional[str] = None,
 ) -> dict[str, Any]:
     """Claim, launch, prove, and publish one native TUI attachment.
 
@@ -655,6 +670,7 @@ def start(
             generation=generation,
             working_directory=working_directory,
             observation=observation,
+            expected_inner_executable=expected_inner_executable,
         )
         return _result(
             outcome=OUTCOME_RECONCILED,
@@ -710,6 +726,7 @@ def start(
         generation=generation,
         working_directory=working_directory,
         observation=observation,
+        expected_inner_executable=expected_inner_executable,
     )
     return _result(
         outcome=OUTCOME_LAUNCHED,

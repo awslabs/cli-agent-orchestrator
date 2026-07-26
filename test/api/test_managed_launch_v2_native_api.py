@@ -22,6 +22,7 @@ import json
 import subprocess
 import uuid
 from typing import Any, Mapping, Optional
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -34,6 +35,7 @@ from cli_agent_orchestrator.services import managed_launch
 from cli_agent_orchestrator.services import managed_launch_v2 as v2
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services import native_pane_input as npi
+from cli_agent_orchestrator.services import session_env
 
 PINNED_VERSION_BANNER = "kimi 0.29.0"
 SESSION_ID = "session_9f2c41ab"
@@ -384,6 +386,42 @@ def test_the_capability_document_separates_the_two_surfaces(client):
     assert payload["protocol_version"] == "cao-managed-launch-v1"
 
 
+def test_the_capability_document_advertises_the_closed_glm_route(client):
+    assert client.get("/managed-launch/capabilities").json()["glm_route_envelope"] is True
+
+
+def test_session_env_rebind_is_idempotent_and_only_updates_future_panes(
+    client, isolated_memory_db, monkeypatch
+):
+    backend = MagicMock()
+    backend.session_exists.return_value = True
+    monkeypatch.setattr("cli_agent_orchestrator.api.main.get_backend", lambda: backend)
+    env_vars = {
+        "CAO_CONDUCTOR_ROUTES": "/private/tmp/routes.json",
+        "CAO_CONDUCTOR_SHIM_DIR": "/private/tmp/shims",
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(env_vars, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    response = client.put(
+        "/sessions/cao-rebind/env",
+        json={"env_vars": env_vars, "fingerprint": fingerprint},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"fingerprint": fingerprint}
+    assert session_env.get_session_env("cao-rebind") == env_vars
+    backend.create_window.assert_not_called()
+
+    replay = client.put(
+        "/sessions/cao-rebind/env",
+        json={"env_vars": env_vars, "fingerprint": fingerprint},
+    )
+    assert replay.status_code == 200
+    assert session_env.get_session_env("cao-rebind") == env_vars
+
+
 def test_the_v1_surface_refuses_native_with_nothing_persisted(
     client, isolated_memory_db, worktree, tmp_path
 ):
@@ -427,6 +465,15 @@ def test_every_advertised_v2_mode_has_a_launch_branch(client):
     advertised = client.get("/managed-launch/capabilities").json()["v2_launchable_execution_modes"]
 
     assert advertised == list(v2.LAUNCHABLE_EXECUTION_MODES)
+
+
+def test_v2_reservation_rejects_unknown_fields(client, worktree, tmp_path):
+    payload = _reserve_payload(worktree, tmp_path)
+    payload["unexpected_field"] = "refused"
+
+    response = client.post(V2_ROOT, json=payload)
+
+    assert response.status_code == 422
 
 
 def test_a_not_yet_ready_bind_is_425_with_the_exact_serialized_envelope(

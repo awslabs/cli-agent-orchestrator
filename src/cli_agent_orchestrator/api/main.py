@@ -2,6 +2,7 @@
 
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -121,6 +122,7 @@ from cli_agent_orchestrator.services import (
     managed_launch,
     managed_launch_v2,
     secret_gate,
+    session_env,
     session_service,
     terminal_projection,
     terminal_service,
@@ -344,6 +346,30 @@ class RunStepRequest(BaseModel):
                 "(env injection only applies to freshly created terminals)"
             )
         return self
+
+
+class SessionEnvRebindRequest(BaseModel):
+    """The non-secret, fingerprinted env map applied to future panes."""
+
+    env_vars: Dict[str, str]
+    fingerprint: str
+
+    @field_validator("fingerprint")
+    @classmethod
+    def _fingerprint_shape(cls, value: str) -> str:
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise ValueError("fingerprint must be a lowercase sha256 digest")
+        return value
+
+    @field_validator("env_vars")
+    @classmethod
+    def _env_shape(cls, value: Dict[str, str]) -> Dict[str, str]:
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or not isinstance(item, str):
+                raise ValueError("env_vars must be a map of non-empty names to strings")
+            if any(ord(char) < 0x20 or ord(char) == 0x7F for char in item):
+                raise ValueError(f"env var value for '{key}' contains control characters")
+        return value
 
 
 class RunStepResponse(BaseModel):
@@ -1497,6 +1523,45 @@ async def create_session(
         )
 
 
+@app.put("/sessions/{session_name}/env")
+async def rebind_session_env(
+    session_name: str,
+    body: SessionEnvRebindRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, str]:
+    """Replace env inherited by panes created after this point.
+
+    A tmux pane already owns the environment it was launched with.  This
+    endpoint therefore updates only the durable session map and cache; it
+    never rewrites, restarts, or re-environments an existing pane.
+    """
+    try:
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    try:
+        exists = await asyncio.to_thread(get_backend().session_exists, session_name)
+    except Exception as exc:  # noqa: BLE001 - an unreadable session is not absent
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="could not determine whether the session exists",
+        ) from exc
+    if not exists:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="session not found")
+    canonical = json.dumps(body.env_vars, sort_keys=True, separators=(",", ":"))
+    observed_fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if observed_fingerprint != body.fingerprint:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="env fingerprint mismatch")
+    try:
+        await asyncio.to_thread(session_env.set_session_env, session_name, body.env_vars)
+    except session_env.SessionEnvStoreError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="session environment could not be persisted",
+        ) from exc
+    return {"fingerprint": observed_fingerprint}
+
+
 @app.get("/sessions")
 async def list_sessions() -> List[Dict]:
     try:
@@ -1595,6 +1660,10 @@ async def managed_launch_capabilities(
         "pinned_provider_executable": True,
         "reservation_bound_delivery_id": True,
         "provider_bound_bridge_environment": True,
+        # Native GLM is a closed wrapper/inner route envelope.  A conductor
+        # must negotiate this exact capability before sending route fields;
+        # an older fork would otherwise ignore them and run Anthropic.
+        "glm_route_envelope": True,
         "bridge_environment_inventory": "names-only-sha256",
         "post_allocation_bridge_failure_finalization": True,
         "launch_failure_evidence_schema": "cao-managed-bridge-launch-failure-v1",

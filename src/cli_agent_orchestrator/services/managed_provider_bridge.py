@@ -244,12 +244,40 @@ def _provider_route_environment(request: dict[str, Any]) -> dict[str, str]:
     return {}
 
 
-def _provider_child_environment(request: dict[str, Any]) -> dict[str, str]:
+def _provider_child_environment(
+    request: dict[str, Any], *, session_env: Optional[dict[str, str]] = None
+) -> dict[str, str]:
     """Compose the exact environment passed to the provider child."""
+    if request.get("provider_route", "anthropic") == "glm":
+        from cli_agent_orchestrator.services import glm_native_launch
+
+        envelope = request.get("route_envelope") or {}
+        if session_env is None:
+            raise BridgeError("GLM native environment requires the stored session env")
+        try:
+            verified = glm_native_launch.validate_session_env(
+                session_env=session_env,
+                envelope=envelope,
+                expected_model=request["model"],
+            )
+        except glm_native_launch.GlmRouteError as exc:
+            raise BridgeError(str(exc)) from exc
+        # The native GLM child must see the conductor shim and only its
+        # non-secret routing names.  The wrapper claims the token inside the
+        # provider process; no credential value is copied into this map.
+        env = {name: verified[name] for name in _PROVIDER_ENV_ALLOWLIST if name in verified}
+        shim_dir = verified["CAO_CONDUCTOR_SHIM_DIR"]
+        env["PATH"] = f"{shim_dir}:{_MINIMAL_PATH}"
+        for name, value in verified.items():
+            if name.startswith("CAO_CONDUCTOR_") or name == "ZDOTDIR":
+                env[name] = value
+        return env
     return _provider_env(_provider_route_environment(request))
 
 
-def native_child_environment(request: dict[str, Any]) -> dict[str, str]:
+def native_child_environment(
+    request: dict[str, Any], *, session_env: Optional[dict[str, str]] = None
+) -> dict[str, str]:
     """The provider child environment for a native-TUI launch.
 
     Deliberately the *same* composition the ACP bridge gives its own
@@ -259,10 +287,12 @@ def native_child_environment(request: dict[str, Any]) -> dict[str, str]:
     only show up as inexplicably different behaviour between two modes
     that are supposed to be interchangeable.
     """
-    return _provider_child_environment(request)
+    return _provider_child_environment(request, session_env=session_env)
 
 
-def provider_version_banner(request: dict[str, Any], *, timeout: float = 5.0) -> str:
+def provider_version_banner(
+    request: dict[str, Any], *, timeout: float = 5.0, environment: Optional[dict[str, str]] = None
+) -> str:
     """Read the installed provider's ``--version`` in the child environment.
 
     Run in the child environment rather than the caller's, because the
@@ -278,7 +308,7 @@ def provider_version_banner(request: dict[str, Any], *, timeout: float = 5.0) ->
         capture_output=True,
         text=True,
         timeout=timeout,
-        env=_provider_child_environment(request),
+        env=environment or _provider_child_environment(request),
     )
     if proc.returncode != 0:
         raise BridgeError(f"provider --version exited {proc.returncode}")
