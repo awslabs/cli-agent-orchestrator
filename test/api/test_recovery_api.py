@@ -257,9 +257,8 @@ def test_v1_surface_unaffected_by_v2(client):
     assert response.json()["protocol_version"] == "cao-managed-launch-v1"
 
 
-def test_generic_delete_of_v2_row_is_refused_without_endpoint_intent(client, isolated_memory_db):
-    """The ordinary DELETE route can never tear down a v2 row: without an
-    endpoint-issued intent the service refuses with zero mutation (409)."""
+def test_bare_delete_of_v2_row_is_refused(client, isolated_memory_db):
+    """The ordinary DELETE route never tears down a v2 row by id alone."""
     from cli_agent_orchestrator.clients import database
 
     generation = str(uuid.uuid4())
@@ -272,13 +271,52 @@ def test_generic_delete_of_v2_row_is_refused_without_endpoint_intent(client, iso
     )
     bare = client.delete("/terminals/a1b2c3d4")
     assert bare.status_code == 409
-    assert "conditional destructive endpoint" in bare.json()["detail"]
-    conditional = client.delete(
+    assert "supply its exact generation and session" in bare.json()["detail"]
+    # Zero mutation: the v2 row survives the unqualified attempt.
+    assert database.get_terminal_metadata_v2("a1b2c3d4") is not None
+
+
+def test_exact_v2_identity_retires_through_the_http_route(
+    client, isolated_memory_db, monkeypatch, tmp_path
+):
+    """The production HTTP seam completes identity-bound v2 retirement."""
+    from unittest.mock import MagicMock
+
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import terminal_service as terminals
+
+    generation = str(uuid.uuid4())
+    window = terminals.managed_window_name("a1b2c3d4", generation)
+    database.create_terminal_v2(
+        "a1b2c3d4",
+        "cao-test",
+        window,
+        "codex",
+        generation=generation,
+    )
+    backend = MagicMock()
+    backend.get_history.return_value = ""
+    backend.get_pane_working_directory.return_value = str(tmp_path)
+    backend.window_exists.return_value = False
+    monkeypatch.setattr(terminals, "get_backend", lambda: backend)
+    monkeypatch.setattr(terminals, "get_herdr_inbox_service", lambda: None)
+    monkeypatch.setattr(terminals, "fifo_manager", MagicMock())
+    monkeypatch.setattr(terminals, "status_monitor", MagicMock())
+    monkeypatch.setattr(terminals, "provider_manager", MagicMock())
+    monkeypatch.setattr(terminals, "TERMINAL_LOG_DIR", tmp_path)
+    monkeypatch.setattr(terminals, "dispatch_plugin_event", lambda *args, **kwargs: None)
+    deregister = MagicMock()
+    monkeypatch.setattr(terminals, "_deregister_v2_terminal_resources", deregister)
+
+    response = client.delete(
         f"/terminals/a1b2c3d4?expected_generation={generation}&expected_session=cao-test"
     )
-    assert conditional.status_code == 409
-    # Zero mutation: the v2 row survives both attempts.
-    assert database.get_terminal_metadata_v2("a1b2c3d4") is not None
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+    backend.kill_window.assert_called_once_with("cao-test", window)
+    assert database.get_terminal_metadata_v2("a1b2c3d4") is None
+    deregister.assert_called_once()
 
 
 def _admitted_v2_reservation(tmp_path, monkeypatch):

@@ -1,11 +1,9 @@
-"""Production-wiring regressions: v2 rows are never destroyed by legacy DELETE.
+"""Production-wiring regressions for exact-generation v2 retirement.
 
-Every v2 destructive action — including the ordinary terminal DELETE path
-through ``terminal_service.delete_terminal`` — is lawful only as the effect
-of the conditional destructive endpoint. Legacy callers are refused with
-zero resource/window mutation; the endpoint's own effect closure (which
-passes ``via_destructive_endpoint=True`` after the heartbeat, identity /
-fence, dual-exit, and containment decisions) still tears down lawfully.
+Bare legacy deletion is refused with zero resource/window mutation.  The
+ordinary conductor retirement path may tear down a v2 row only when it supplies
+the exact generation and session; the endpoint's stronger effect closure
+remains supported.
 """
 
 from __future__ import annotations
@@ -78,18 +76,55 @@ def spies(monkeypatch, v2_metadata, tmp_path):
     return backend, db_delete, deregister
 
 
-def test_legacy_delete_of_v2_row_refused_with_zero_mutation(v2_metadata, spies):
+def test_bare_delete_of_v2_row_refused_with_zero_mutation(v2_metadata, spies):
     terminal_id, generation, _ = v2_metadata
     backend, db_delete, deregister = spies
 
-    # Both the bare legacy DELETE and the generation-conditional legacy
-    # form are refused before any subsystem is touched.
-    for kwargs in (
+    with pytest.raises(terminals.DestructiveEndpointRequiredError):
+        terminals.delete_terminal(terminal_id)
+
+    assert backend.calls == [], f"window/history mutation leaked: {backend.calls}"
+    assert db_delete.calls == [], "the v2 row must survive"
+    assert deregister.calls == [], "registry entries must survive"
+
+
+def test_exact_generation_delete_retires_v2_row(v2_metadata, spies):
+    terminal_id, generation, _ = v2_metadata
+    backend, db_delete, deregister = spies
+
+    deleted = terminals.delete_terminal(
+        terminal_id,
+        expected_generation=generation,
+        expected_session="managed-session",
+    )
+
+    assert deleted is True
+    assert (
+        "kill_window",
+        ("managed-session", terminals.managed_window_name(terminal_id, generation)),
         {},
-        {"expected_generation": generation, "expected_session": "managed-session"},
-    ):
-        with pytest.raises(terminals.DestructiveEndpointRequiredError):
-            terminals.delete_terminal(terminal_id, **kwargs)
+    ) in backend.calls
+    assert db_delete.calls != [], "exact retirement deletes the v2 row"
+    assert deregister.calls != [], "exact retirement drains registry entries"
+
+
+@pytest.mark.parametrize(
+    ("generation", "session"),
+    [
+        (str(uuid.uuid4()), "managed-session"),
+        (None, "wrong-session"),
+    ],
+)
+def test_wrong_v2_identity_refuses_with_zero_mutation(v2_metadata, spies, generation, session):
+    terminal_id, expected_generation, _ = v2_metadata
+    backend, db_delete, deregister = spies
+
+    with pytest.raises(terminals.TerminalGenerationMismatchError):
+        terminals.delete_terminal(
+            terminal_id,
+            expected_generation=generation or expected_generation,
+            expected_session=session,
+        )
 
     assert backend.calls == [], f"window/history mutation leaked: {backend.calls}"
     assert db_delete.calls == [], "the v2 row must survive"
@@ -149,9 +184,8 @@ def test_v1_managed_delete_is_not_gated(monkeypatch, tmp_path):
     assert deleted is True
 
 
-def test_v2_companion_binding_without_row_is_refused(monkeypatch, tmp_path):
-    """Row-absent v2 generations (companion binding state only) are still
-    endpoint-only: legacy cleanup may not take the row-absent kill path."""
+def test_v2_companion_binding_without_row_uses_exact_window(monkeypatch, tmp_path):
+    """Row-absent recovery remains bound to the generation-derived window."""
     terminal_id = "cccc7777"
     generation = str(uuid.uuid4())
     monkeypatch.setattr(terminals, "get_terminal_metadata", lambda tid: None)
@@ -159,17 +193,16 @@ def test_v2_companion_binding_without_row_is_refused(monkeypatch, tmp_path):
     backend = _Spy()
     monkeypatch.setattr(terminals, "get_backend", lambda: backend)
 
-    from cli_agent_orchestrator import constants
-    from cli_agent_orchestrator.services.destructive_endpoint import binding_record_path
+    monkeypatch.setattr(terminals, "provider_manager", _Spy())
+    monkeypatch.setattr(terminals, "db_delete_terminal_if_generation", lambda *a: False)
 
-    monkeypatch.setattr(constants, "COMPANION_DIR", tmp_path / "companion")
-    binding = binding_record_path(constants.COMPANION_DIR, terminal_id, generation)
-    binding.parent.mkdir(parents=True, exist_ok=True)
-    binding.write_text("{}", encoding="utf-8")
-    with pytest.raises(terminals.DestructiveEndpointRequiredError):
-        terminals.delete_terminal(
-            terminal_id,
-            expected_generation=generation,
-            expected_session="managed-session",
-        )
-    assert backend.calls == [], "the row-absent kill path must not run for v2"
+    assert terminals.delete_terminal(
+        terminal_id,
+        expected_generation=generation,
+        expected_session="managed-session",
+    )
+    assert (
+        "kill_window",
+        ("managed-session", terminals.managed_window_name(terminal_id, generation)),
+        {},
+    ) in backend.calls

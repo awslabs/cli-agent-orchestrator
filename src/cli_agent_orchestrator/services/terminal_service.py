@@ -625,11 +625,11 @@ class TerminalGenerationMismatchError(ValueError):
 class DestructiveEndpointRequiredError(TerminalGenerationMismatchError):
     """A v2 terminal row was targeted by a legacy destructive path.
 
-    Every v2 destructive action — including an ordinary terminal DELETE —
-    is lawful only as the effect of the conditional destructive endpoint
-    (exact heartbeat, identity/fence, dual-exit, and containment
-    decisions). A legacy caller carries no endpoint-issued intent, so the
-    teardown refuses with zero mutation. Mapped to HTTP 409 like every
+    A caller may retire one exact generation by supplying its generation
+    and session, or use the stronger conditional destructive endpoint when
+    heartbeat, fencing, dual-exit, and containment proofs are required.  A
+    bare legacy caller carries neither identity nor endpoint-issued intent,
+    so teardown refuses with zero mutation. Mapped to HTTP 409 like every
     other conditional-identity refusal."""
 
 
@@ -2635,14 +2635,12 @@ def delete_terminal(
 ) -> bool:
     """Delete terminal and kill its tmux window.
 
-    A v2 terminal row (or v2 companion binding state for the claimed
-    generation) is never torn down by a legacy caller: every v2
-    destructive action is lawful only as the effect of the conditional
-    destructive endpoint, which has already made the exact heartbeat,
-    identity/fence, dual-exit, and containment decisions and consumed its
-    single-use intent. The endpoint's effect closure passes
-    ``via_destructive_endpoint=True``; every other caller is refused with
-    zero mutation before any external subsystem is touched."""
+    A bare legacy delete can never tear down a v2 terminal row or a
+    generation with v2 companion binding state.  Ordinary conductor
+    retirement is allowed only when it supplies the exact generation and
+    session, preserving the existing compare-and-delete protection against a
+    reused terminal id.  The stronger destructive endpoint may also call this
+    function after performing its additional heartbeat/fence checks."""
     try:
         # P1-1 (final conformance §20.2f): expected_session without the exact
         # generation NEVER degrades to ID-only destruction — a session name is
@@ -2654,30 +2652,13 @@ def delete_terminal(
             )
         if not via_destructive_endpoint:
             v2_row = get_terminal_metadata_v2(terminal_id)
-            if v2_row is not None:
+            if v2_row is not None and (expected_generation is None or expected_session is None):
                 raise DestructiveEndpointRequiredError(
                     f"terminal {terminal_id} is a v2 managed row (generation "
-                    f"{v2_row.get('generation')!r}); legacy deletion is "
-                    "refused with zero mutation — v2 teardown is lawful only "
-                    "through the conditional destructive endpoint "
-                    "(POST /managed/destructive) with its endpoint-issued "
-                    "intent, exact heartbeat, identity/fence, dual-exit, and "
-                    "containment decisions"
+                    f"{v2_row.get('generation')!r}); bare deletion is refused "
+                    "with zero mutation — supply its exact generation and "
+                    "session for compare-and-delete retirement"
                 )
-            if expected_generation is not None:
-                from cli_agent_orchestrator.constants import COMPANION_DIR
-                from cli_agent_orchestrator.services.destructive_endpoint import (
-                    binding_record_path,
-                )
-
-                if binding_record_path(COMPANION_DIR, terminal_id, expected_generation).exists():
-                    raise DestructiveEndpointRequiredError(
-                        f"terminal {terminal_id} generation "
-                        f"{expected_generation!r} has v2 companion binding "
-                        "state; legacy deletion is refused with zero "
-                        "mutation — teardown is lawful only through the "
-                        "conditional destructive endpoint"
-                    )
         # Managed cleanup claims the exact DB incarnation before any external
         # destructive action. If the id now names a replacement generation,
         # preserve every resource and report the mismatch.  v2 managed

@@ -3182,7 +3182,12 @@ async def _launch_native_tui(
                 ),
                 reason=PREFLIGHT_REASON_READINESS,
             )
-        bootstrap["observed_model"] = claude_native_launch.normalize_observed_model(observed_model)
+        # Preserve the provider-authored route exactly.  In particular,
+        # ``[1m]`` is part of an explicitly pinned Claude route even though
+        # it is not part of the base model name.  Bind validates this receipt
+        # a second time, so stripping the suffix here would make a route that
+        # passed preflight fail permanently at bind.
+        bootstrap["observed_model"] = str(observed_model).strip()
 
     # The post-proof boundary, and the only correct one. Before this point
     # the session id is what the launcher *intended* to run — a chosen uuid

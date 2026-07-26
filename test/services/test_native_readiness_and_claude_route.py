@@ -261,6 +261,41 @@ class TestBindRefusesAWrongFamilyBeforeAdmission:
         row = _Row(model="claude-opus-5[1m]")
         v2._validate_readiness_for_bind(row, _receipt(row, model=OBSERVED_OPUS_1M))
 
+    def test_the_explicit_context_survives_receipt_construction_and_bind(self):
+        row = _Row(model="claude-opus-5[1m]")
+        request = {"expected_model": "claude-opus-5[1m]", "expected_effort": "max"}
+        receipt = v2._native_readiness_receipt(
+            record={
+                "reservation_id": row.reservation_id,
+                "terminal_id": row.terminal_id,
+                "generation": row.generation,
+                "provider": row.provider,
+                "agent_profile": row.agent_profile,
+                "working_directory": row.working_directory,
+            },
+            request=request,
+            bootstrap={
+                "native_session_id": "sess-1",
+                "observed_model": OBSERVED_OPUS_1M,
+                "observed_effort": None,
+                "model": request["expected_model"],
+                "effort": request["expected_effort"],
+            },
+            outcome={
+                "outcome": "started",
+                "launch_argv_sha256": "a" * 64,
+                "pane_handle": "%1",
+                "attachment": {"owner": {"pane_id": "%1"}},
+            },
+            version_output="2.1.220 (Claude Code)",
+            bridge_version="test",
+            readiness={"input_ready": True},
+            session_start={"session_id": "sess-1", "model": OBSERVED_OPUS_1M},
+        )
+
+        assert receipt["model"] == OBSERVED_OPUS_1M
+        v2._validate_readiness_for_bind(row, receipt)
+
     def test_an_unobservable_effort_claim_is_refused_at_bind(self):
         """A receipt naming an effort Claude cannot expose pre-turn."""
         row = _Row(model=SONNET, effort="max")
