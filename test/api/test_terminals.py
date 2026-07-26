@@ -528,6 +528,78 @@ class TestWebSocketLocalhostRestriction:
         assert "Invalid tmux target name" in kwargs.get("reason", "")
 
 
+class TestManagedWebSocketInputGate:
+    """Managed transcript panes admit wheel reports and no other input."""
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            "\x1b[<64;76;16M",
+            "\x1b[<65;76;16M",
+            "\x1b[<84;76;16M",
+            "\x1b[M`!!",
+        ],
+    )
+    def test_managed_terminal_admits_one_wheel_report(self, data):
+        from cli_agent_orchestrator.api.main import _web_terminal_input_bytes
+
+        assert (
+            _web_terminal_input_bytes(
+                {"type": "input", "data": data},
+                managed_terminal=True,
+            )
+            == data.encode()
+        )
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            "printable input",
+            "^[[200~pasted^[[201~",
+            "\x1b[<0;76;16M",
+            "\x1b[M !!",
+            "\x1b[<64;76;16M\x1b[<64;76;16M",
+            "\x1b[<64;bad;16M",
+            "\x1b[<٦٤;١;١M",
+            "\x1b[M٠xy",
+            "",
+        ],
+    )
+    def test_managed_terminal_rejects_every_non_wheel_shape(self, data):
+        from cli_agent_orchestrator.api.main import _web_terminal_input_bytes
+
+        assert (
+            _web_terminal_input_bytes(
+                {"type": "input", "data": data},
+                managed_terminal=True,
+            )
+            is None
+        )
+
+    def test_unmanaged_terminal_preserves_ordinary_input(self):
+        from cli_agent_orchestrator.api.main import _web_terminal_input_bytes
+
+        assert (
+            _web_terminal_input_bytes(
+                {"type": "input", "data": "ordinary input"},
+                managed_terminal=False,
+            )
+            == b"ordinary input"
+        )
+
+    @pytest.mark.parametrize("data", [None, 42, ["not", "text"]])
+    def test_non_text_input_is_never_written(self, data):
+        from cli_agent_orchestrator.api.main import _web_terminal_input_bytes
+
+        assert (
+            _web_terminal_input_bytes(
+                {"type": "input", "data": data},
+                managed_terminal=False,
+            )
+            is None
+        )
+
+
 class TestBuildPtyEnv:
     """Tests for the tmux PTY attach environment builder (issue #150).
 
