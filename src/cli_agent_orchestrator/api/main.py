@@ -3725,6 +3725,42 @@ async def get_inbox_messages_endpoint(
         )
 
 
+_SGR_WHEEL_REPORT = re.compile(r"^\x1b\[<(\d+);\d+;\d+[Mm]$")
+
+
+def _is_wheel_mouse_report(data: str) -> bool:
+    """Return whether *data* is one complete terminal wheel report.
+
+    Managed browser terminals are transcripts, not alternate provider input
+    channels.  The server therefore repeats the client's narrow wheel check
+    before any bytes reach the attached tmux client.  Printable input, paste,
+    malformed reports, and non-wheel mouse buttons remain blocked even if a
+    modified or stale dashboard tries to send them.
+    """
+    match = _SGR_WHEEL_REPORT.fullmatch(data)
+    if match is not None:
+        return (int(match.group(1)) & 64) == 64
+
+    if len(data) == 6 and data.startswith("\x1b[M"):
+        button = ord(data[3]) - 32
+        return button >= 0 and (button & 64) == 64
+    return False
+
+
+def _web_terminal_input_bytes(
+    payload: dict[str, Any],
+    *,
+    managed_terminal: bool,
+) -> bytes | None:
+    """Resolve one browser input frame to the only bytes it may write."""
+    data = payload.get("data")
+    if not isinstance(data, str):
+        return None
+    if managed_terminal and not _is_wheel_mouse_report(data):
+        return None
+    return data.encode()
+
+
 @app.websocket("/terminals/{terminal_id}/ws")
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
@@ -3913,9 +3949,12 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                 msg = await websocket.receive_text()
                 payload = json.loads(msg)
                 if payload.get("type") == "input":
-                    if managed_terminal:
+                    raw = _web_terminal_input_bytes(
+                        payload,
+                        managed_terminal=managed_terminal,
+                    )
+                    if raw is None:
                         continue
-                    raw = payload["data"].encode()
                     # Write in chunks to avoid overflowing the PTY buffer
                     chunk_size = 1024
                     for i in range(0, len(raw), chunk_size):
