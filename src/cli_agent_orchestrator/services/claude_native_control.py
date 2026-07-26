@@ -779,6 +779,7 @@ def execute_composer_plan(
     plan: Mapping[str, Any],
     transport: NativeControlTransport,
     submit: bool = True,
+    deadline_monotonic: Optional[float] = None,
 ) -> dict[str, Any]:
     """Type one already-planned payload into a composer, then submit it.
 
@@ -838,6 +839,20 @@ def execute_composer_plan(
     # no turn — the message simply sits in the prompt box unsent.
     settle = float(plan.get("submit_settle_seconds") or 0.0)
     if settle > 0:
+        remaining = None if deadline_monotonic is None else deadline_monotonic - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise ComposerWriteInterrupted(
+                "the payload was typed but the overall write deadline expired before "
+                "the submit settle; the composer may hold unsubmitted text",
+                enter_attempted=False,
+            )
+        if remaining is not None and settle > remaining:
+            time.sleep(remaining)
+            raise ComposerWriteInterrupted(
+                "the payload was typed but the overall write deadline expired during "
+                "the submit settle; the composer may hold unsubmitted text",
+                enter_attempted=False,
+            )
         time.sleep(settle)
 
     try:

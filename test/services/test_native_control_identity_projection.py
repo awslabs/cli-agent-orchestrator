@@ -591,7 +591,7 @@ class _FakeTmux:
         self.server_identities: list[Optional[str]] = []
         self.fail_key = False
 
-    def pane_control_identity(self, *, pane_id: str) -> Any:
+    def pane_control_identity(self, *, pane_id: str, deadline_monotonic=None) -> Any:
         from cli_agent_orchestrator.clients.tmux import PaneControlIdentity
 
         return PaneControlIdentity(
@@ -606,7 +606,15 @@ class _FakeTmux:
             server_socket_path=SERVER_SOCKET,
         )
 
-    def send_literal_line(self, pane_id, text, submit=True, *, expected_server_identity):
+    def send_literal_line(
+        self,
+        pane_id,
+        text,
+        submit=True,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
         self.server_identities.append(expected_server_identity)
         chunks = 0
         if text:
@@ -616,7 +624,7 @@ class _FakeTmux:
             self.events.append(("enter", ""))
         return chunks
 
-    def send_control_key(self, pane_id, key, *, expected_server_identity):
+    def send_control_key(self, pane_id, key, *, expected_server_identity, deadline_monotonic=None):
         from cli_agent_orchestrator.clients.tmux import COMPOSER_CONTROL_KEYS
 
         assert key in COMPOSER_CONTROL_KEYS

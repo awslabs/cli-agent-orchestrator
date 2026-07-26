@@ -420,6 +420,8 @@ def _env_shebang_interpreter(wrapper_executable: str) -> Optional[str]:
     tokens = payload.strip(" \t").split()
     if len(tokens) != 2 or os.path.realpath(tokens[0]) != ENV_EXECUTABLE:
         return None
+    if tokens[1].startswith("-"):
+        return None
     return tokens[1]
 
 

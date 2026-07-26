@@ -14,6 +14,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 
 import pytest
@@ -123,7 +124,14 @@ class FakeTmux:
         self.writes = []
         self.identity_reads = 0
 
-    def pane_control_identity(self, *, pane_id=None, session_name=None, window_name=None):
+    def pane_control_identity(
+        self,
+        *,
+        pane_id=None,
+        session_name=None,
+        window_name=None,
+        deadline_monotonic=None,
+    ):
         self.identity_reads += 1
         # Time out only after N successful reads, so a test can let the
         # pre-lease resolution succeed and time out the in-lease preflight.
@@ -137,7 +145,15 @@ class FakeTmux:
     # Keyword-only and undefaulted, exactly like the real primitive: a
     # fake that tolerated the argument being omitted would let the one
     # mistake §24.7 is about pass every test in this file.
-    def send_literal_line(self, pane_id, text, submit=True, *, expected_server_identity):
+    def send_literal_line(
+        self,
+        pane_id,
+        text,
+        submit=True,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
         if self._on_write is not None:
             self._on_write()
         if self._write_error is not None:
@@ -869,7 +885,7 @@ class _FakeChordAdapter:
     def __init__(self, *, raise_after_text=None):
         self._raise_after_text = raise_after_text
 
-    def execute_composer_plan(self, *, plan, transport, submit):
+    def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic=None):
         transport.send_literal("typed-text")
         if self._raise_after_text is not None:
             raise self._raise_after_text
@@ -882,16 +898,26 @@ class _FakeChordClient:
         self.sent = []
         self._chord_error = chord_error
 
-    def send_literal_line(self, pane_id, text, submit=True, *, expected_server_identity):
+    def send_literal_line(
+        self,
+        pane_id,
+        text,
+        submit=True,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
         self.sent.append(("literal", text, submit))
         return 1
 
-    def send_steer_chord(self, pane_id, chord, *, expected_server_identity):
+    def send_steer_chord(
+        self, pane_id, chord, *, expected_server_identity, deadline_monotonic=None
+    ):
         if self._chord_error is not None:
             raise self._chord_error
         self.sent.append(("chord", chord))
 
-    def send_control_key(self, pane_id, key, *, expected_server_identity):
+    def send_control_key(self, pane_id, key, *, expected_server_identity, deadline_monotonic=None):
         self.sent.append(("key", key))
 
 
@@ -975,6 +1001,7 @@ class TestChordExecution:
             terminal_id=TERMINAL,
             resolved=_chord_resolved(),
             digest=digest,
+            deadline_monotonic=time.monotonic() + service.WRITE_DEADLINE_SECONDS,
         )
 
     def test_text_is_written_then_chord_pressed_last(self, journal):
@@ -1041,6 +1068,54 @@ class TestBoundedWriteDeadline:
         kwargs = {"control_id": CONTROL, "text": TEXT, "enter": True}
         kwargs.update(overrides)
         return service.deliver_control_input(TERMINAL, journal=journal, **kwargs)
+
+    def test_a_post_claim_block_is_cut_off_by_the_absolute_deadline(self, monkeypatch, journal):
+        class DeadlineAwareBlockingTmux(FakeTmux):
+            def __init__(self):
+                super().__init__()
+                self.write_calls = 0
+
+            def send_literal_line(
+                self,
+                pane_id,
+                text,
+                submit=True,
+                *,
+                expected_server_identity,
+                deadline_monotonic=None,
+            ):
+                self.write_calls += 1
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining > 0:
+                    time.sleep(remaining)
+                raise subprocess.TimeoutExpired(cmd=["tmux", "send-keys"], timeout=remaining)
+
+        client = DeadlineAwareBlockingTmux()
+        monkeypatch.setattr(service, "WRITE_DEADLINE_SECONDS", 0.05)
+        started = time.monotonic()
+        result = self._deliver_with(monkeypatch, journal, client)
+        elapsed = time.monotonic() - started
+
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == REASON_WRITE_INCOMPLETE
+        assert elapsed < 0.15
+        assert journal.get(CONTROL).state == service.STATE_AMBIGUOUS
+        assert client.write_calls == 1
+
+        # The request returned only after the inline write stopped, so the
+        # lease is free and no detached worker can produce a late byte.
+        healthy = FakeTmux()
+        monkeypatch.setattr(service, "_tmux_client", lambda: healthy)
+        fresh = service.deliver_control_input(
+            TERMINAL,
+            journal=journal,
+            control_id="ctl-after-deadline-7d",
+            text=TEXT,
+            enter=True,
+        )
+        assert fresh.outcome == ACCEPTED
+        assert len(healthy.writes) == 1
+        assert client.writes == []
 
     def test_a_preflight_read_timeout_is_a_reattemptable_write_deadline(self, monkeypatch, journal):
         # The pre-lease resolution reads first and must succeed; the in-lease

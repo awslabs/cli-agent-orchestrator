@@ -1268,10 +1268,18 @@ class _NativeComposerTransport:
     changed.
     """
 
-    def __init__(self, client: Any, pane_id: str, server_identity: Optional[str]) -> None:
+    def __init__(
+        self,
+        client: Any,
+        pane_id: str,
+        server_identity: Optional[str],
+        *,
+        deadline_monotonic: float,
+    ) -> None:
         self._client = client
         self._pane_id = pane_id
         self._server_identity = server_identity
+        self._deadline_monotonic = deadline_monotonic
         self.chunks_sent = 0
         self.enter_attempted = False
         # Mirrors enter_attempted for the v2 chord: marked before the send so
@@ -1286,6 +1294,7 @@ class _NativeComposerTransport:
             text,
             submit=False,
             expected_server_identity=self._server_identity,
+            deadline_monotonic=self._deadline_monotonic,
         )
 
     def send_key(self, keystroke: str) -> None:
@@ -1293,6 +1302,7 @@ class _NativeComposerTransport:
             self._pane_id,
             keystroke,
             expected_server_identity=self._server_identity,
+            deadline_monotonic=self._deadline_monotonic,
         )
 
     def send_enter(self) -> None:
@@ -1305,6 +1315,7 @@ class _NativeComposerTransport:
             "",
             submit=True,
             expected_server_identity=self._server_identity,
+            deadline_monotonic=self._deadline_monotonic,
         )
 
     def send_chord(self, chord: str) -> None:
@@ -1320,6 +1331,7 @@ class _NativeComposerTransport:
             self._pane_id,
             chord,
             expected_server_identity=self._server_identity,
+            deadline_monotonic=self._deadline_monotonic,
         )
         self.chord_sent = True
 
@@ -1534,7 +1546,7 @@ def _deliver_under_lease(
     if breached is not None:
         return breached
     try:
-        live = client.pane_control_identity(pane_id=binding.pane_id)
+        live = client.pane_control_identity(pane_id=binding.pane_id, deadline_monotonic=deadline)
     except subprocess.TimeoutExpired as exc:
         # A pre-write read exceeded its bound before any pane byte: proven
         # zero bytes, so it is the reattemptable refusal the conductor may
@@ -1643,6 +1655,7 @@ def _deliver_under_lease(
             terminal_id=terminal_id,
             resolved=resolved,
             digest=digest,
+            deadline_monotonic=deadline,
         )
 
     try:
@@ -1651,6 +1664,7 @@ def _deliver_under_lease(
             text,
             submit=enter,
             expected_server_identity=binding.server_socket_path,
+            deadline_monotonic=deadline,
         )
     except TmuxServerIdentityError as exc:
         # Unreachable by construction: the same comparison ran above,
@@ -1777,6 +1791,31 @@ def _deliver_under_lease(
             enter_attempted=False,
         )
 
+    if time.monotonic() > deadline:
+        journal.mark_ambiguous(
+            control_id,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            chunks_sent=chunks,
+            enter_attempted=enter,
+            evidence_digest=digest,
+        )
+        return ControlInputResult(
+            control_id=control_id,
+            outcome=AMBIGUOUS,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            detail=(
+                f"the control write exceeded its overall "
+                f"{WRITE_DEADLINE_SECONDS:g}s deadline after the write was claimed; "
+                "it is durably ambiguous and must not be sent again"
+            ),
+            state=STATE_AMBIGUOUS,
+            terminal_id=terminal_id,
+            request_digest=digest,
+            resolved_identity=resolved.as_dict(),
+            chunks_sent=chunks,
+            enter_attempted=enter,
+        )
+
     record = journal.mark_delivered(
         control_id, chunks_sent=chunks, enter_attempted=enter, evidence_digest=digest
     )
@@ -1810,6 +1849,7 @@ def _send_through_native_adapter(
     terminal_id: str,
     resolved: ResolvedControlIdentity,
     digest: str,
+    deadline_monotonic: float,
 ) -> ControlInputResult:
     """Type an already-proven plan through the provider's own adapter.
 
@@ -1827,9 +1867,53 @@ def _send_through_native_adapter(
     disagree about whether it was sent.
     """
     control_id = binding.request_id
-    transport = _NativeComposerTransport(client, binding.pane_id, binding.server_socket_path)
+    transport = _NativeComposerTransport(
+        client,
+        binding.pane_id,
+        binding.server_socket_path,
+        deadline_monotonic=deadline_monotonic,
+    )
+
+    def deadline_ambiguity() -> Optional[ControlInputResult]:
+        if time.monotonic() <= deadline_monotonic:
+            return None
+        journal.mark_ambiguous(
+            control_id,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            chunks_sent=transport.chunks_sent,
+            enter_attempted=transport.enter_attempted,
+            chord=chord,
+            chord_attempted=transport.chord_attempted,
+            chord_sent=transport.chord_sent,
+            evidence_digest=digest,
+        )
+        return ControlInputResult(
+            control_id=control_id,
+            outcome=AMBIGUOUS,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            detail=(
+                f"the provider composer write exceeded its overall "
+                f"{WRITE_DEADLINE_SECONDS:g}s deadline after the write was claimed; "
+                "it is durably ambiguous and must not be sent again"
+            ),
+            state=STATE_AMBIGUOUS,
+            terminal_id=terminal_id,
+            request_digest=digest,
+            resolved_identity=resolved.as_dict(),
+            chunks_sent=transport.chunks_sent,
+            enter_attempted=transport.enter_attempted,
+            chord=chord,
+            chord_attempted=transport.chord_attempted,
+            chord_sent=transport.chord_sent,
+        )
+
     try:
-        adapter.execute_composer_plan(plan=plan, transport=transport, submit=enter)
+        adapter.execute_composer_plan(
+            plan=plan,
+            transport=transport,
+            submit=enter,
+            deadline_monotonic=deadline_monotonic,
+        )
     except adapter.ComposerWriteInterrupted as exc:
         journal.mark_ambiguous(
             control_id,
@@ -1883,6 +1967,10 @@ def _send_through_native_adapter(
             enter_attempted=transport.enter_attempted,
         )
 
+    expired = deadline_ambiguity()
+    if expired is not None:
+        return expired
+
     # The chord is the v2 submit/steer effect and the last step of the write
     # (§3): the text above is already in the composer, and the chord presses
     # the provider-pinned key that submits or steers it.  A failure here is
@@ -1922,6 +2010,10 @@ def _send_through_native_adapter(
                 chord_attempted=True,
                 chord_sent=transport.chord_sent,
             )
+
+    expired = deadline_ambiguity()
+    if expired is not None:
+        return expired
 
     record = journal.mark_delivered(
         control_id,

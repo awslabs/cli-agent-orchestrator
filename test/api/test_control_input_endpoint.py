@@ -111,13 +111,28 @@ class FakeTmux:
         self.writes = []
         self._guard = threading.Lock()
 
-    def pane_control_identity(self, *, pane_id=None, session_name=None, window_name=None):
+    def pane_control_identity(
+        self,
+        *,
+        pane_id=None,
+        session_name=None,
+        window_name=None,
+        deadline_monotonic=None,
+    ):
         if len(self._identities) > 1:
             return self._identities.pop(0)
         return self._identities[0]
 
     # Keyword-only and undefaulted, mirroring the real primitive.
-    def send_literal_line(self, pane_id, text, submit=True, *, expected_server_identity):
+    def send_literal_line(
+        self,
+        pane_id,
+        text,
+        submit=True,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
         if self.on_write is not None:
             self.on_write()
         with self._guard:

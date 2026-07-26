@@ -342,6 +342,11 @@ def test_env_shebang_transient_refuses_unpinned_interpreter_forms(
     _assert_frozen(native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH)
 
 
+def test_bare_env_dash_s_is_not_an_interpreter_token(tmp_path: Any) -> None:
+    wrapper, _ = _pinned_wrapper(tmp_path, b"#!/usr/bin/env -S\n")
+    assert native_tui_launch._env_shebang_interpreter(wrapper) is None
+
+
 @pytest.mark.parametrize(
     "observed_argv",
     [

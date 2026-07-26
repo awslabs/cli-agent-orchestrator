@@ -7,6 +7,7 @@ import asyncio
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from itertools import groupby
 from typing import Any, Optional
 
@@ -45,6 +46,17 @@ _PARKED_STATUSES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class _WakePreparation:
+    key: tuple[str, str]
+    terminal_id: str
+    message_id: str
+    topic: str
+    queue: asyncio.Queue
+    baseline_status: str
+    delivery_identity: dict[str, Any]
+
+
 class InboxService:
     """Delivers one pending message per terminal per IDLE cycle.
 
@@ -59,6 +71,7 @@ class InboxService:
         # restart loses nothing here and never re-acts.  Keyed by
         # ``(terminal_id, message_id)``; the value is the scheduling future.
         self._wake_confirmations: dict[tuple[str, str], Any] = {}
+        self._wake_preparations: dict[tuple[str, str], _WakePreparation] = {}
         self._wake_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -99,27 +112,103 @@ class InboxService:
         exists for the key — the at-most-one-watcher and at-most-one-nudge
         guarantees both fall out of that single check under the lock.
         """
+        status = status_monitor.get_status(terminal_id)
+        preparation = self._prepare_wake_confirmation(
+            terminal_id, message_id, baseline_status=status
+        )
+        if preparation is not None:
+            self._commit_wake_confirmation(preparation)
+
+    @staticmethod
+    def _status_value(status: Any) -> Any:
+        return status.value if isinstance(status, TerminalStatus) else status
+
+    @staticmethod
+    def _delivery_identity(terminal_id: str) -> Optional[dict[str, Any]]:
+        """The immutable-enough v1 pane identity a later nudge must still match."""
+        try:
+            terminal = terminal_service.get_terminal(terminal_id)
+        except Exception:  # noqa: BLE001 - absence means no safe nudge authority
+            return None
+        if not isinstance(terminal, dict):
+            return None
+        fields = ("id", "provider", "session_name", "pane_id", "window_id")
+        identity = {field: terminal.get(field) for field in fields}
+        if identity["id"] != terminal_id or not identity["session_name"]:
+            return None
+        return identity
+
+    def _prepare_wake_confirmation(
+        self,
+        terminal_id: str,
+        message_id: Any,
+        *,
+        baseline_status: Any,
+    ) -> Optional[_WakePreparation]:
+        """Subscribe before the pane effect without yet opening durable intent."""
+        baseline_value = self._status_value(baseline_status)
+        if baseline_value not in _PARKED_STATUSES:
+            return None
+        delivery_identity = self._delivery_identity(terminal_id)
+        if delivery_identity is None:
+            logger.warning(
+                "wake observation for %s/%s has no delivery-time terminal identity; "
+                "delivery may proceed but no later nudge is authorized",
+                terminal_id,
+                message_id,
+            )
+            return None
         key = (terminal_id, str(message_id))
         with self._wake_lock:
-            if key in self._wake_confirmations:
-                return
+            if key in self._wake_confirmations or key in self._wake_preparations:
+                return None
             if wake_receipts.get(terminal_id, str(message_id)) is not None:
-                # A record exists (watching, or already finalized).  Never
-                # re-arm: a confirmed record is terminal, and a watching one
-                # is either being observed or was left by a prior process and
-                # will be loaded by ``_load_wake_confirmations``.
+                return None
+            topic = f"terminal.{terminal_id}.status"
+            preparation = _WakePreparation(
+                key=key,
+                terminal_id=terminal_id,
+                message_id=str(message_id),
+                topic=topic,
+                queue=bus.subscribe(topic),
+                baseline_status=str(baseline_value),
+                delivery_identity=delivery_identity,
+            )
+            self._wake_preparations[key] = preparation
+            return preparation
+
+    def _commit_wake_confirmation(self, preparation: _WakePreparation) -> None:
+        """Open durable intent only after send success, retaining the pre-send queue."""
+        with self._wake_lock:
+            if self._wake_preparations.pop(preparation.key, None) is not preparation:
+                bus.unsubscribe(preparation.topic, preparation.queue)
                 return
             delivered_at = wake_receipts.utcnow()
             deadline_at = wake_receipts.deadline_iso(delivered_at, WAKE_CONFIRMATION_SECONDS)
-            native_session_id = self._native_session_id_for(terminal_id)
             wake_receipts.ensure_watching(
-                terminal_id,
-                str(message_id),
-                native_session_id=native_session_id,
+                preparation.terminal_id,
+                preparation.message_id,
+                native_session_id=self._native_session_id_for(preparation.terminal_id),
                 delivered_at=delivered_at,
                 deadline_at=deadline_at,
+                delivery_identity=preparation.delivery_identity,
+                baseline_status=preparation.baseline_status,
             )
-            self._arm_watcher_locked(key, terminal_id, str(message_id), deadline_at)
+            self._arm_watcher_locked(
+                preparation.key,
+                preparation.terminal_id,
+                preparation.message_id,
+                deadline_at,
+                queue=preparation.queue,
+                baseline_status=preparation.baseline_status,
+                delivery_identity=preparation.delivery_identity,
+            )
+
+    def _abort_wake_confirmation(self, preparation: _WakePreparation) -> None:
+        """Cancel a provisional subscriber when the pane send did not succeed."""
+        with self._wake_lock:
+            self._wake_preparations.pop(preparation.key, None)
+        bus.unsubscribe(preparation.topic, preparation.queue)
 
     def _arm_watcher_locked(
         self,
@@ -127,14 +216,30 @@ class InboxService:
         terminal_id: str,
         message_id: str,
         deadline_at: str,
+        *,
+        queue: Optional[asyncio.Queue] = None,
+        baseline_status: Optional[str] = None,
+        delivery_identity: Optional[dict[str, Any]] = None,
     ) -> None:
         loop = self._loop
         if loop is None or not loop.is_running():
             # No event loop (e.g. a sync call before run() started): the
             # ``watching`` sidecar is the truth and startup load will arm it.
+            if queue is not None:
+                bus.unsubscribe(f"terminal.{terminal_id}.status", queue)
             return
+        if queue is None:
+            queue = bus.subscribe(f"terminal.{terminal_id}.status")
         future = asyncio.run_coroutine_threadsafe(
-            self._watch_wake(terminal_id, message_id, deadline_at), loop
+            self._watch_wake(
+                terminal_id,
+                message_id,
+                deadline_at,
+                queue=queue,
+                baseline_status=baseline_status,
+                delivery_identity=delivery_identity,
+            ),
+            loop,
         )
         self._wake_confirmations[key] = future
 
@@ -175,20 +280,47 @@ class InboxService:
                     )
                     self._emit_wake_event(terminal_id, message_id, wake_receipts.WAKE_UNCONFIRMED)
                     continue
-                self._arm_watcher_locked(key, terminal_id, message_id, record.get("deadline_at"))
+                self._arm_watcher_locked(
+                    key,
+                    terminal_id,
+                    message_id,
+                    record.get("deadline_at"),
+                    baseline_status=record.get("baseline_status"),
+                    delivery_identity=record.get("delivery_identity"),
+                )
 
-    async def _watch_wake(self, terminal_id: str, message_id: str, deadline_at: str) -> None:
+    async def _watch_wake(
+        self,
+        terminal_id: str,
+        message_id: str,
+        deadline_at: str,
+        *,
+        queue: Optional[asyncio.Queue] = None,
+        baseline_status: Optional[str] = None,
+        delivery_identity: Optional[dict[str, Any]] = None,
+    ) -> None:
         """Watch one receiver for a wake transition, or nudge once and conclude."""
         key = (terminal_id, message_id)
         topic = f"terminal.{terminal_id}.status"
-        queue = bus.subscribe(topic)
+        queue = queue or bus.subscribe(topic)
         try:
-            transition = await self._await_wake_transition(queue, terminal_id, deadline_at)
+            transition = await self._await_wake_transition(
+                queue,
+                terminal_id,
+                deadline_at,
+                baseline_status=baseline_status,
+            )
             if transition is not None:
                 wake_receipts.record_wake_confirmed(terminal_id, message_id, observed=transition)
                 self._emit_wake_event(terminal_id, message_id, wake_receipts.WAKE_CONFIRMED)
                 return
-            await self._nudge_once(queue, terminal_id, message_id, deadline_at)
+            await self._nudge_once(
+                queue,
+                terminal_id,
+                message_id,
+                deadline_at,
+                delivery_identity=delivery_identity,
+            )
         except Exception:  # noqa: BLE001 - a watcher must not kill the loop
             logger.exception("wake watcher for %s/%s failed", terminal_id, message_id)
             try:
@@ -203,12 +335,26 @@ class InboxService:
             bus.unsubscribe(topic, queue)
 
     async def _await_wake_transition(
-        self, queue: asyncio.Queue, terminal_id: str, deadline_at: str
+        self,
+        queue: asyncio.Queue,
+        terminal_id: str,
+        deadline_at: str,
+        *,
+        baseline_status: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         """Return the first out-of-IDLE transition, or None at the deadline."""
         deadline_ts = wake_receipts.parse_iso_timestamp(deadline_at)
         last = status_monitor.get_status(terminal_id)
-        last_value = last.value if isinstance(last, TerminalStatus) else last
+        sampled_value = self._status_value(last)
+        last_value = baseline_status or sampled_value
+        if baseline_status in _PARKED_STATUSES and sampled_value not in _PARKED_STATUSES:
+            return {
+                "event": "status-transition",
+                "from_status": baseline_status,
+                "to_status": sampled_value,
+                "at": wake_receipts.utcnow(),
+                "observation": "arm-time-sample",
+            }
         while True:
             if deadline_ts is None:
                 return None
@@ -234,12 +380,18 @@ class InboxService:
             }
 
     async def _nudge_once(
-        self, queue: asyncio.Queue, terminal_id: str, message_id: str, deadline_at: str
+        self,
+        queue: asyncio.Queue,
+        terminal_id: str,
+        message_id: str,
+        deadline_at: str,
+        *,
+        delivery_identity: Optional[dict[str, Any]] = None,
     ) -> None:
         """Exactly one bare Enter, intent-before-effect, then a bounded re-watch."""
         # Re-resolve status: a transition in the gap is a real wake.
         status = status_monitor.get_status(terminal_id)
-        status_value = status.value if isinstance(status, TerminalStatus) else status
+        status_value = self._status_value(status)
         if status_value not in _PARKED_STATUSES:
             wake_receipts.record_wake_confirmed(
                 terminal_id,
@@ -252,6 +404,15 @@ class InboxService:
                 },
             )
             self._emit_wake_event(terminal_id, message_id, wake_receipts.WAKE_CONFIRMED)
+            return
+        if delivery_identity is None or self._delivery_identity(terminal_id) != delivery_identity:
+            wake_receipts.record_wake_unconfirmed(
+                terminal_id,
+                message_id,
+                note="the delivery-time terminal identity could not be revalidated; "
+                "no nudge was sent",
+            )
+            self._emit_wake_event(terminal_id, message_id, wake_receipts.WAKE_UNCONFIRMED)
             return
         existing = wake_receipts.get(terminal_id, message_id) or {}
         if existing.get("nudge_intent_at") is not None:
@@ -372,6 +533,7 @@ class InboxService:
             return
 
         status = status_monitor.get_status(terminal_id)
+        idle_bound_delivery = status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
             # that accept input mid-turn receive messages while PROCESSING or
@@ -405,6 +567,26 @@ class InboxService:
         for sender_id, group in groupby(messages, key=lambda m: m.sender_id):
             batch = list(group)
             combined = "\n".join(m.message for m in batch)
+            preparations: list[_WakePreparation] = []
+            if idle_bound_delivery:
+                # Re-prove the parked baseline immediately before this batch.
+                # The subscribers are provisional: they can buffer a transition
+                # emitted synchronously by send_input, but become durable only
+                # after that send returns successfully.
+                batch_status = status_monitor.get_status(terminal_id)
+                if batch_status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+                    preparations = [
+                        preparation
+                        for message in batch
+                        if (
+                            preparation := self._prepare_wake_confirmation(
+                                terminal_id,
+                                message.id,
+                                baseline_status=batch_status,
+                            )
+                        )
+                        is not None
+                    ]
             try:
                 if registry is None:
                     terminal_service.send_input(terminal_id, combined)
@@ -423,9 +605,11 @@ class InboxService:
                 # by this service's event loop) awaits a wake transition or
                 # nudges at most once.  Idempotent across the POST, event-loop,
                 # poller, and reconcile paths that all funnel through here.
-                for message in batch:
-                    self._ensure_wake_confirmation(terminal_id, message.id)
+                for preparation in preparations:
+                    self._commit_wake_confirmation(preparation)
             except TerminalNotFoundError as e:
+                for preparation in preparations:
+                    self._abort_wake_confirmation(preparation)
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
                 # for this window). Treat as transient: reset to PENDING so the
                 # reconcile sweep retries rather than marking FAILED. These were
@@ -437,6 +621,8 @@ class InboxService:
                     f"{len(batch)} message(s) pending for retry: {e}"
                 )
             except Exception as e:
+                for preparation in preparations:
+                    self._abort_wake_confirmation(preparation)
                 for message in batch:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
                     update_message_status(message.id, MessageStatus.FAILED)

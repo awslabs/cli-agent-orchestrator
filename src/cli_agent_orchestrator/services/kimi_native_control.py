@@ -1042,6 +1042,7 @@ def execute_composer_plan(
     plan: Mapping[str, Any],
     transport: NativeControlTransport,
     submit: bool = True,
+    deadline_monotonic: Optional[float] = None,
 ) -> dict[str, Any]:
     """Type one already-planned payload into a composer, then submit it.
 
@@ -1109,6 +1110,14 @@ def execute_composer_plan(
         if reset_key:
             transport.send_key(reset_key)
         if settle > 0:
+            remaining = (
+                None if deadline_monotonic is None else deadline_monotonic - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("overall write deadline expired before submit settle")
+            if remaining is not None and settle > remaining:
+                time.sleep(remaining)
+                raise TimeoutError("overall write deadline expired during submit settle")
             time.sleep(settle)
     except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
         raise ComposerWriteInterrupted(

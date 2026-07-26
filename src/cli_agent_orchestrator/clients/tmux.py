@@ -1030,7 +1030,9 @@ class TmuxClient:
             )
             return None
 
-    def list_pane_control_identities(self) -> Optional[List[PaneControlIdentity]]:
+    def list_pane_control_identities(
+        self, *, deadline_monotonic: Optional[float] = None
+    ) -> Optional[List[PaneControlIdentity]]:
         """Every pane on the server, with the facts a control call binds to.
 
         Enumerates with ``list-panes -a`` and selects in Python.  A ``-t``
@@ -1044,12 +1046,13 @@ class TmuxClient:
         caller conclude a live pane had gone away.
         """
         try:
+            argv = [tmux_binary(), "list-panes", "-a", "-F", _PANE_CONTROL_FORMAT]
             result = subprocess.run(
-                [tmux_binary(), "list-panes", "-a", "-F", _PANE_CONTROL_FORMAT],
+                argv,
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=TMUX_CALL_TIMEOUT_SECONDS,
+                timeout=self._control_call_timeout(deadline_monotonic, argv),
             )
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("Could not enumerate tmux panes: %s", exc)
@@ -1072,7 +1075,12 @@ class TmuxClient:
                 records.append(record)
         return records
 
-    def observe_pane_server_identity(self, pane_id: str) -> Optional[str]:
+    def observe_pane_server_identity(
+        self,
+        pane_id: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Optional[str]:
         """The canonical identity of the tmux server that owns ``pane_id``.
 
         The narrow observation the write primitive makes immediately before
@@ -1091,12 +1099,13 @@ class TmuxClient:
         if not is_valid_pane_id(pane_id):
             return None
         try:
+            argv = [tmux_binary(), "list-panes", "-a", "-F", _PANE_SERVER_FORMAT]
             result = subprocess.run(
-                [tmux_binary(), "list-panes", "-a", "-F", _PANE_SERVER_FORMAT],
+                argv,
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=TMUX_CALL_TIMEOUT_SECONDS,
+                timeout=self._control_call_timeout(deadline_monotonic, argv),
             )
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("Could not observe tmux server identity: %s", exc)
@@ -1121,6 +1130,7 @@ class TmuxClient:
         pane_id: Optional[str] = None,
         session_name: Optional[str] = None,
         window_name: Optional[str] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> Optional[PaneControlIdentity]:
         """Resolve exactly one pane's live identity, or None.
 
@@ -1148,7 +1158,7 @@ class TmuxClient:
         if by_name and (session_name is None or window_name is None):
             raise ValueError("session_name and window_name must be supplied together")
 
-        records = self.list_pane_control_identities()
+        records = self.list_pane_control_identities(deadline_monotonic=deadline_monotonic)
         if records is None:
             return None
         if by_pane:
@@ -1177,6 +1187,7 @@ class TmuxClient:
         submit: bool = True,
         *,
         expected_server_identity: Optional[str],
+        deadline_monotonic: Optional[float] = None,
     ) -> int:
         """Write ``text`` to ``pane_id`` as literal bytes, then one Enter.
 
@@ -1264,7 +1275,9 @@ class TmuxClient:
         # Observed exactly once: a second query could return a different
         # answer, and an error that reported a reading other than the one
         # it refused on would be evidence of nothing.
-        observed_server = self.observe_pane_server_identity(pane_id)
+        observed_server = self.observe_pane_server_identity(
+            pane_id, deadline_monotonic=deadline_monotonic
+        )
         refusal = server_identity_refusal(bound=expected_server_identity, observed=observed_server)
         if refusal is not None:
             reason_code, detail = refusal
@@ -1289,6 +1302,7 @@ class TmuxClient:
                 ],
                 chunks_sent=chunks_sent,
                 enter_attempted=False,
+                deadline_monotonic=deadline_monotonic,
             )
             chunks_sent += 1
         if submit:
@@ -1296,6 +1310,7 @@ class TmuxClient:
                 [tmux_binary(), "send-keys", "-t", pane_id, "Enter"],
                 chunks_sent=chunks_sent,
                 enter_attempted=True,
+                deadline_monotonic=deadline_monotonic,
             )
         return chunks_sent
 
@@ -1305,6 +1320,7 @@ class TmuxClient:
         key: str,
         *,
         expected_server_identity: Optional[str],
+        deadline_monotonic: Optional[float] = None,
     ) -> None:
         """Send one named composer key to a pane on the bound server.
 
@@ -1353,7 +1369,9 @@ class TmuxClient:
 
         logger.info("send_control_key: %s - key: %s", pane_id, key)
 
-        observed_server = self.observe_pane_server_identity(pane_id)
+        observed_server = self.observe_pane_server_identity(
+            pane_id, deadline_monotonic=deadline_monotonic
+        )
         refusal = server_identity_refusal(bound=expected_server_identity, observed=observed_server)
         if refusal is not None:
             reason_code, detail = refusal
@@ -1368,6 +1386,7 @@ class TmuxClient:
             [tmux_binary(), "send-keys", "-t", pane_id, key],
             chunks_sent=0,
             enter_attempted=False,
+            deadline_monotonic=deadline_monotonic,
         )
 
     def send_steer_chord(
@@ -1376,6 +1395,7 @@ class TmuxClient:
         chord: str,
         *,
         expected_server_identity: Optional[str],
+        deadline_monotonic: Optional[float] = None,
     ) -> None:
         """Send one provider-pinned steer chord to a pane on the bound server.
 
@@ -1418,7 +1438,9 @@ class TmuxClient:
 
         logger.info("send_steer_chord: %s - chord: %s", pane_id, chord)
 
-        observed_server = self.observe_pane_server_identity(pane_id)
+        observed_server = self.observe_pane_server_identity(
+            pane_id, deadline_monotonic=deadline_monotonic
+        )
         refusal = server_identity_refusal(bound=expected_server_identity, observed=observed_server)
         if refusal is not None:
             reason_code, detail = refusal
@@ -1433,10 +1455,30 @@ class TmuxClient:
             [tmux_binary(), "send-keys", "-t", pane_id, chord],
             chunks_sent=0,
             enter_attempted=False,
+            deadline_monotonic=deadline_monotonic,
         )
 
     @staticmethod
-    def _run_literal_write(argv: List[str], *, chunks_sent: int, enter_attempted: bool) -> None:
+    def _control_call_timeout(
+        deadline_monotonic: Optional[float],
+        argv: List[str],
+    ) -> float:
+        """Return this call's share of the control path's absolute deadline."""
+        if deadline_monotonic is None:
+            return TMUX_CALL_TIMEOUT_SECONDS
+        remaining = deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, 0)
+        return min(TMUX_CALL_TIMEOUT_SECONDS, remaining)
+
+    @staticmethod
+    def _run_literal_write(
+        argv: List[str],
+        *,
+        chunks_sent: int,
+        enter_attempted: bool,
+        deadline_monotonic: Optional[float] = None,
+    ) -> None:
         """Run one control write, converting any failure into a bounded one."""
         try:
             result = subprocess.run(
@@ -1444,7 +1486,7 @@ class TmuxClient:
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=TMUX_CALL_TIMEOUT_SECONDS,
+                timeout=TmuxClient._control_call_timeout(deadline_monotonic, argv),
             )
         except _SUBPROCESS_TIMEOUT as exc:
             # A timed-out write may or may not have reached the pane -- tmux

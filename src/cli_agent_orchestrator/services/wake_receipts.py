@@ -103,6 +103,8 @@ def _default_record() -> dict[str, Any]:
         "message_id": None,
         "terminal_id": None,
         "native_session_id": None,
+        "delivery_identity": None,
+        "baseline_status": None,
         "delivered_at": None,
         "state": WATCHING,
         "deadline_at": None,
@@ -171,6 +173,8 @@ def ensure_watching(
     native_session_id: Optional[str],
     delivered_at: str,
     deadline_at: str,
+    delivery_identity: Optional[dict[str, Any]] = None,
+    baseline_status: Optional[str] = None,
 ) -> dict[str, Any]:
     """Idempotently open a ``watching`` record for this message.
 
@@ -190,6 +194,8 @@ def ensure_watching(
         record.update(
             {
                 "native_session_id": native_session_id,
+                "delivery_identity": delivery_identity,
+                "baseline_status": baseline_status,
                 "delivered_at": delivered_at,
                 "state": WATCHING,
                 "deadline_at": deadline_at,

@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.services import inbox_service, wake_receipts
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.inbox_service import InboxService
@@ -26,6 +28,24 @@ from cli_agent_orchestrator.services.inbox_service import InboxService
 def store(monkeypatch, tmp_path):
     monkeypatch.setattr(wake_receipts, "WAKE_RECEIPT_DIR", tmp_path)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def terminal_identity(monkeypatch):
+    def identity(terminal_id):
+        return {
+            "id": terminal_id,
+            "provider": "codex",
+            "session_name": "cao-test",
+            "pane_id": "%1",
+            "window_id": "@1",
+        }
+
+    monkeypatch.setattr(inbox_service.terminal_service, "get_terminal", identity)
+    monkeypatch.setattr(
+        inbox_service.status_monitor, "get_status", lambda _tid: TerminalStatus.IDLE
+    )
+    return identity("term-1")
 
 
 @pytest_asyncio.fixture
@@ -104,7 +124,9 @@ class TestWakeConfirmed:
 
 class TestOneNudge:
     @pytest.mark.asyncio
-    async def test_no_transition_nudges_once_then_unconfirms(self, store, bus_on_loop, monkeypatch):
+    async def test_no_transition_nudges_once_then_unconfirms(
+        self, store, bus_on_loop, monkeypatch, terminal_identity
+    ):
         monkeypatch.setattr(
             inbox_service.status_monitor, "get_status", lambda tid: TerminalStatus.IDLE
         )
@@ -118,10 +140,21 @@ class TestOneNudge:
             native_session_id=None,
             delivered_at=wake_receipts.utcnow(),
             deadline_at=_past_deadline(),
+            delivery_identity=terminal_identity,
+            baseline_status=TerminalStatus.IDLE.value,
         )
         svc = InboxService()
         svc._loop = bus_on_loop
-        await asyncio.wait_for(svc._watch_wake("term-1", "1202", _past_deadline()), timeout=2.0)
+        await asyncio.wait_for(
+            svc._watch_wake(
+                "term-1",
+                "1202",
+                _past_deadline(),
+                baseline_status=TerminalStatus.IDLE.value,
+                delivery_identity=terminal_identity,
+            ),
+            timeout=2.0,
+        )
         record = wake_receipts.get("term-1", "1202")
         assert record["state"] == wake_receipts.WAKE_UNCONFIRMED
         # Exactly one bare Enter, never re-pasting text.
@@ -174,6 +207,111 @@ class TestEnsureIsIdempotent:
         t2.join()
         non_lock = [p for p in store.glob("*.json") if not p.name.endswith(".lock")]
         assert len(non_lock) == 1
+
+
+class TestDeliveryOrdering:
+    @pytest.mark.asyncio
+    async def test_transition_inside_send_is_observed_without_a_later_nudge(
+        self, store, bus_on_loop, monkeypatch
+    ):
+        terminal_id = "term-1"
+        message = InboxMessage(
+            id=9201,
+            sender_id="sender",
+            receiver_id=terminal_id,
+            message="callback",
+            status=MessageStatus.PENDING,
+            created_at=datetime.now(),
+        )
+        current = {"status": TerminalStatus.IDLE}
+        nudges = MagicMock()
+
+        monkeypatch.setattr(
+            inbox_service.status_monitor,
+            "get_status",
+            lambda _tid: current["status"],
+        )
+        monkeypatch.setattr(inbox_service, "get_pending_messages", lambda _tid, limit=1: [message])
+        monkeypatch.setattr(inbox_service, "update_message_status", lambda *_args: None)
+        monkeypatch.setattr(
+            inbox_service.managed_launch, "managed_control_identity", lambda _tid: None
+        )
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            lambda *_args, **_kwargs: False,
+        )
+
+        def send_input(_terminal_id, _text):
+            current["status"] = TerminalStatus.PROCESSING
+            bus.publish(
+                f"terminal.{terminal_id}.status",
+                {"status": TerminalStatus.PROCESSING.value},
+            )
+
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", send_input)
+        monkeypatch.setattr(inbox_service.terminal_service, "send_special_key", nudges)
+        monkeypatch.setattr(inbox_service, "WAKE_CONFIRMATION_SECONDS", 0.05)
+        monkeypatch.setattr(inbox_service, "WAKE_NUDGE_WINDOW_SECONDS", 0.0)
+
+        service = InboxService()
+        service._loop = bus_on_loop
+        await asyncio.to_thread(service.deliver_pending, terminal_id)
+        current["status"] = TerminalStatus.IDLE
+        bus.publish(
+            f"terminal.{terminal_id}.status",
+            {"status": TerminalStatus.IDLE.value},
+        )
+        await asyncio.sleep(0.08)
+
+        receipt = wake_receipts.get(terminal_id, "9201")
+        assert receipt["state"] == wake_receipts.WAKE_CONFIRMED
+        assert receipt["observed"]["to_status"] == TerminalStatus.PROCESSING.value
+        nudges.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_eager_processing_delivery_never_arms_or_nudges(
+        self, store, bus_on_loop, monkeypatch
+    ):
+        message = InboxMessage(
+            id=9202,
+            sender_id="sender",
+            receiver_id="term-1",
+            message="follow-up",
+            status=MessageStatus.PENDING,
+            created_at=datetime.now(),
+        )
+        monkeypatch.setattr(
+            inbox_service.status_monitor,
+            "get_status",
+            lambda _tid: TerminalStatus.PROCESSING,
+        )
+        monkeypatch.setattr(inbox_service, "get_pending_messages", lambda _tid, limit=1: [message])
+        monkeypatch.setattr(inbox_service, "update_message_status", lambda *_args: None)
+        monkeypatch.setattr(
+            inbox_service.managed_launch, "managed_control_identity", lambda _tid: None
+        )
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            lambda *_args, **_kwargs: False,
+        )
+        provider = MagicMock(accepts_input_while_processing=True)
+        monkeypatch.setattr(inbox_service.provider_manager, "get_provider", lambda _tid: provider)
+        monkeypatch.setattr(inbox_service, "EAGER_INBOX_DELIVERY", True)
+        send = MagicMock()
+        nudge = MagicMock()
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", send)
+        monkeypatch.setattr(inbox_service.terminal_service, "send_special_key", nudge)
+
+        service = InboxService()
+        service._loop = bus_on_loop
+        await asyncio.to_thread(service.deliver_pending, "term-1")
+        await asyncio.sleep(0.02)
+
+        send.assert_called_once()
+        nudge.assert_not_called()
+        assert wake_receipts.get("term-1", "9202") is None
 
 
 class TestRestartNeverReNudges:
