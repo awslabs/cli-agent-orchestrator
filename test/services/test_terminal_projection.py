@@ -245,6 +245,7 @@ class TestVintageBoundary:
             "tmux_window": "managed",
             "provider": "claude_code",
             "generation": "gen-v2",
+            "caller_id": "deadbeef",
             "pane_id": "%10",
             "window_id": "@10",
             "server_socket_path": SOCKET,
@@ -261,6 +262,7 @@ class TestVintageBoundary:
         out = projection.project_row(v2_row, fake.observe_pane_identities(), vintage="v2")
 
         assert out["protocol_vintage"] == "v2"
+        assert out["caller_id"] == "deadbeef"
         assert out["lifecycle_state"] == projection.LIFECYCLE_LIVE
         # The v2 store prefixes these columns so the vintage receipt can
         # require unique bare names. That prefix is storage detail and
