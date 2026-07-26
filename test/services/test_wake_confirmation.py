@@ -17,8 +17,8 @@ from unittest.mock import MagicMock
 import pytest
 import pytest_asyncio
 
-from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import inbox_service, wake_receipts
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.inbox_service import InboxService
