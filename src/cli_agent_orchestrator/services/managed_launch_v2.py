@@ -287,6 +287,10 @@ def _readiness_proof_fields(row: Any, receipt: dict[str, Any], mode: str) -> dic
     Split out so the completeness rule above and the projection below are
     literally the same computation rather than two that agree today.
     """
+    # Local, matching the other native-module imports in this file, which
+    # are deferred to keep the import graph acyclic.
+    from cli_agent_orchestrator.services import claude_native_readiness
+
     observation = receipt.get("model_input_ready_observation") or {}
     session_start = receipt.get("provider_session_start") or {}
     return {
@@ -301,7 +305,17 @@ def _readiness_proof_fields(row: Any, receipt: dict[str, Any], mode: str) -> dic
         "native_session_id": receipt.get("provider_session_id"),
         # Provider-authored: the hook Claude itself wrote, naming the
         # session it started.
-        "session_start_hook_id": session_start.get("session_id"),
+        #
+        # Read through the producer's own constant rather than a literal.
+        # These were two independent spellings of one contract and they
+        # drifted: the receipt published ``native_session_id`` while this
+        # asked for ``session_id``, so the field was always absent, the
+        # completeness rule always reported it missing, and every real
+        # Claude native launch was refused 425 forever against a complete
+        # provider-authored proof. Sharing the constant makes that class of
+        # drift a NameError at import rather than a permanent refusal
+        # discovered in production.
+        "session_start_hook_id": session_start.get(claude_native_readiness.SESSION_START_ID_KEY),
         # Observed: what the composer detector read off the pane, when,
         # and where.
         "composer_state": observation.get("provider_status"),
