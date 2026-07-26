@@ -525,6 +525,87 @@ class TestTheObservedModelSurvivesTheRealPath:
         assert receipt["model"] is None
         assert cl.observed_model_matches("opus", receipt.get("model")) is False
 
+    @pytest.mark.asyncio
+    async def test_the_launch_producer_preserves_the_explicit_context(self, monkeypatch):
+        """The real launch assignment feeds the receipt without normalising ``[1m]``."""
+        from cli_agent_orchestrator.services import managed_provider_bridge as bridge
+        from cli_agent_orchestrator.services import native_tui_launch
+
+        record = {
+            "reservation_id": "res-1",
+            "terminal_id": "abcd1234",
+            "generation": "gen-1",
+            "session_name": "cao-test",
+            "provider": "claude_code",
+            "agent_profile": "spec-writer",
+            "working_directory": "/tmp/wt",
+            "request": {
+                "expected_model": "claude-opus-5[1m]",
+                "expected_effort": "xhigh",
+            },
+        }
+        bootstrap = {
+            "native_session_id": self.LIVE_RECORD["session_id"],
+            "requested_model": record["request"]["expected_model"],
+            "requested_effort": record["request"]["expected_effort"],
+            "observed_model": None,
+            "observed_effort": None,
+        }
+        published = {}
+
+        monkeypatch.setattr(bridge, "provider_version_banner", lambda _request: "2.1.220")
+        monkeypatch.setattr(bridge, "native_child_environment", lambda _request: {})
+        monkeypatch.setattr(
+            v2,
+            "_mint_claude_native_session",
+            lambda **_kwargs: (
+                bootstrap,
+                {"settings": {}, "readiness_path": "/tmp/session-start.jsonl"},
+            ),
+        )
+        monkeypatch.setattr(v2, "_claude_bootstrap_intent", lambda *_args, **_kwargs: {})
+        monkeypatch.setattr(v2, "_V2NativePane", lambda **_kwargs: object())
+        monkeypatch.setattr(
+            native_tui_launch,
+            "start",
+            lambda **_kwargs: {
+                "outcome": "started",
+                "launch_argv_sha256": "a" * 64,
+                "pane_handle": "%1",
+                "attachment": {"owner": {"pane_id": "%1"}},
+            },
+        )
+        monkeypatch.setattr(
+            claude_native_readiness,
+            "await_session_start",
+            lambda *_args, **_kwargs: dict(self.LIVE_RECORD),
+        )
+        monkeypatch.setattr(v2.database, "set_terminal_v2_native_session_id", lambda *_args: True)
+        monkeypatch.setattr(
+            v2,
+            "_await_native_pane_input_ready",
+            lambda *_args: {"input_ready": True},
+        )
+
+        def _publish(_reservation_id, receipt):
+            published.update(receipt)
+
+        monkeypatch.setattr(bridge, "publish_native_ready_state", _publish)
+        monkeypatch.setattr(v2, "get", lambda _reservation_id: {"state": "launching"})
+
+        result = await v2._launch_native_tui(
+            record["reservation_id"],
+            record,
+            {
+                "provider_executable": "/usr/local/bin/claude",
+                "provider_executable_sha256": "b" * 64,
+            },
+        )
+
+        assert result["state"] == "launching"
+        assert published["model"] == OBSERVED_OPUS_1M
+        assert bootstrap["observed_model"] == OBSERVED_OPUS_1M
+
 
 class TestOneCompletenessRuleForBindAndProjection:
     """Bind and the projection must answer the same question identically.
