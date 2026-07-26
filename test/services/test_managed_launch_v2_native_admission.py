@@ -152,6 +152,7 @@ class _Keystrokes:
         self.panes: list[str] = []
         self.fail_literal = False
         self.fail_enter = False
+        self.fail_key = False
 
     def transport_for(self, pane_id: str, **_kwargs) -> Any:
         self.panes.append(pane_id)
@@ -166,6 +167,21 @@ class _Keystrokes:
         if self.fail_enter:
             raise npi.NativePaneInputUnavailable("staged enter failure")
         self.events.append(("enter", ""))
+
+    def send_key(self, key: str) -> None:
+        """A named composer keystroke, recorded like any other event.
+
+        Absent from this fake until the version normalization landed, and
+        its absence was invisible for the wrong reason: the banner
+        ``kimi 0.29.0`` missed the bare-keyed pin, so the pinned burst
+        reset was skipped and nothing ever called this. Once the lookup
+        normalized, the pin resolved, the reset became reachable, and the
+        missing method surfaced as an ambiguous admission -- a fake that
+        was incomplete for a path the code could not previously take.
+        """
+        if self.fail_key:
+            raise npi.NativePaneInputUnavailable("staged key failure")
+        self.events.append(("key", key))
 
     @property
     def typed(self) -> list[str]:
@@ -383,7 +399,15 @@ async def test_a_native_generation_reaches_admitted_without_any_bridge(
     # Typed as one literal line into the exact bound pane, with the
     # submitting key as its own separate event.
     assert harness.keystrokes.panes == [PANE_ID]
-    assert harness.keystrokes.events == [("literal", TASK_MESSAGE), ("enter", "")]
+    assert harness.keystrokes.events == [
+        ("literal", TASK_MESSAGE),
+        # The pinned burst reset, now reachable. It was absent from
+        # this expectation only because the banner missed the
+        # bare-keyed pin, so the pin resolved to nothing and the
+        # reset was skipped -- the expectation recorded the defect.
+        ("key", "End"),
+        ("enter", ""),
+    ]
 
 
 @pytest.mark.asyncio
@@ -541,7 +565,15 @@ async def test_the_same_delivery_is_admitted_exactly_once_after_the_pane_settles
     # The refusal was superseded, not appended to: nothing of it survives
     # on a record that now says the task was delivered.
     assert "refusal_reason" not in admitted["admission"]
-    assert harness.keystrokes.events == [("literal", TASK_MESSAGE), ("enter", "")]
+    assert harness.keystrokes.events == [
+        ("literal", TASK_MESSAGE),
+        # The pinned burst reset, now reachable. It was absent from
+        # this expectation only because the banner missed the
+        # bare-keyed pin, so the pin resolved to nothing and the
+        # reset was skipped -- the expectation recorded the defect.
+        ("key", "End"),
+        ("enter", ""),
+    ]
 
 
 @pytest.mark.asyncio
@@ -635,7 +667,15 @@ async def test_a_lost_admission_response_reconciles_without_retyping(
     assert first["state"] == replay["state"] == "admitted"
     assert replay["admission"]["native_submission"] == first["admission"]["native_submission"]
     # Exactly one delivery crossed the boundary, not two.
-    assert harness.keystrokes.events == [("literal", TASK_MESSAGE), ("enter", "")]
+    assert harness.keystrokes.events == [
+        ("literal", TASK_MESSAGE),
+        # The pinned burst reset, now reachable. It was absent from
+        # this expectation only because the banner missed the
+        # bare-keyed pin, so the pin resolved to nothing and the
+        # reset was skipped -- the expectation recorded the defect.
+        ("key", "End"),
+        ("enter", ""),
+    ]
     assert harness.bridge_calls == []
 
 
@@ -972,7 +1012,15 @@ async def test_a_lost_response_is_answered_from_the_reservation_in_both_directio
     # And the replay that a lost response provokes types nothing again.
     replay = await v2.admit_reserved(reservation_id, request)
     assert replay["admission"]["native_submission"] == reread["admission"]["native_submission"]
-    assert harness.keystrokes.events == [("literal", TASK_MESSAGE), ("enter", "")]
+    assert harness.keystrokes.events == [
+        ("literal", TASK_MESSAGE),
+        # The pinned burst reset, now reachable. It was absent from
+        # this expectation only because the banner missed the
+        # bare-keyed pin, so the pin resolved to nothing and the
+        # reset was skipped -- the expectation recorded the defect.
+        ("key", "End"),
+        ("enter", ""),
+    ]
 
 
 @pytest.mark.asyncio

@@ -320,13 +320,13 @@ def _readiness_proof_fields(row: Any, receipt: dict[str, Any], mode: str) -> dic
         # and where.
         "composer_state": observation.get("provider_status"),
         "pane_id": observation.get("pane_id"),
-        "provider_process_id": _published_process_id(receipt.get("process_identity")),
+        "provider_process_id": published_process_id(receipt.get("process_identity")),
         "observed_at": observation.get("observed_at"),
         "input_ready": bool(receipt.get("model_input_ready")),
     }
 
 
-def _published_process_id(process_identity: Any) -> Optional[str]:
+def published_process_id(process_identity: Any) -> Optional[str]:
     """One process, rendered as the string the readiness sibling carries.
 
     A bare pid is not identity — pids are recycled, so a stale one can
@@ -334,6 +334,11 @@ def _published_process_id(process_identity: Any) -> Optional[str]:
     and forge a *no*-survivor. The start marker travels with it for that
     reason; publishing the pid alone would hand a consumer exactly the
     forgeable half.
+
+    Public because the control-identity projection publishes the same
+    scalar under the same name. Two renderings of one process identity
+    would agree on the pid and disagree on the half that makes it
+    non-forgeable, which is the only half worth checking.
     """
     if not isinstance(process_identity, dict):
         return None
@@ -802,7 +807,7 @@ def native_tui_capabilities() -> dict[str, Any]:
     return {"schema_version": NATIVE_TUI_CAPABILITY_SCHEMA_VERSION, "providers": providers}
 
 
-def _control_adapter(provider: str) -> Any:
+def native_control_adapter(provider: str) -> Any:
     """The native control adapter for one provider, or a refusal.
 
     Resolved by canonical provider rather than passed in, and never
@@ -810,6 +815,11 @@ def _control_adapter(provider: str) -> Any:
     stores precisely so one provider's operation cannot answer for
     another's; picking the adapter from anything other than the binding's
     own provider would give that separation away at the last step.
+
+    Public because the control-input path selects the same adapter for
+    the same reason. A second provider->adapter table written next to
+    that path could disagree with this one, and the disagreement would
+    surface as one provider's keystroke plan typed at another's composer.
     """
     from cli_agent_orchestrator.services import claude_native_control, kimi_native_control
 
@@ -824,6 +834,11 @@ def _control_adapter(provider: str) -> Any:
             f"native providers are {sorted(adapters)}"
         )
     return adapter
+
+
+#: The pre-public spelling, kept so existing call sites and their tests
+#: keep naming the same one function rather than a second copy of it.
+_control_adapter = native_control_adapter
 
 
 def _observe_turn_state(provider: str, **kwargs: Any) -> Any:
@@ -3549,28 +3564,49 @@ def _native_readiness_receipt(
     }
 
 
-def _validate_native_admission_identity(record: dict[str, Any]) -> dict[str, Any]:
-    """Prove the bound native identity is still exactly what was bound.
+def resolve_native_identity_of_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Who durably holds this generation's provider session, or a refusal.
 
-    Runs before the admission is claimed and before a single byte is
-    written, so every refusal below leaves zero task admission and zero
-    provider I/O with the reservation row untouched.  That ordering is
-    the contract: a caller that receives a refusal here knows the task
-    was not delivered, rather than having to treat it as maybe-delivered.
+    The durable half of the native identity question, split out so the
+    two callers that must answer it — native task admission and the
+    identity-bound control-input path — ask one implementation rather
+    than two that can disagree.  A second implementation of this question
+    would not fail loudly; it would agree on every healthy generation and
+    diverge on exactly the unhealthy one that mattered.
 
-    The authority is the exclusive-attachment store, not the reservation
-    row.  The row records what was bound; the store records who holds the
-    session *now*.  Trusting the row would let an admission minted for a
-    generation that has since been replaced type into the pane that
-    replaced it — the exact crossing the ownership record exists to stop.
+    Every check here reads a durable store, so it is free of provider I/O
+    and safe on a read-only projection.
+    :func:`validate_native_identity_against_live_pane` adds the live-pane
+    comparison on top for callers that are about to write.
 
-    The live pane is then compared against what the store recorded at
-    attach: pane id, pid, and process start marker together.  A bare pid
-    is not identity, since pids recycle in both directions — a stale one
-    can match an unrelated live process and forge a survivor.
+    Three properties are the point of this function rather than
+    incidental to it:
+
+    - **The attachment store is the authority, not the reservation row.**
+      The row records what was *bound*; the store records who holds the
+      session *now*.  A control arrives arbitrarily later than the bind,
+      so a generation that has since been replaced must not be able to
+      reach the pane that replaced it.
+    - **An unresolved earlier ambiguity blocks.** An operation that may
+      or may not have landed makes the transcript order unreconstructable
+      if anything further is sent, so it is reconciled by exact id first.
+    - **Absence is refusal, never a weaker identity.** No attachment, not
+      attached, the wrong owner, no pane id, or a process identity
+      missing either half is each its own refusal: a task must never be
+      typed at an unidentified process, and a partial identity is one
+      some later check would pass against.
+
+    Returns:
+        The proven identity: provider, native session id, pane id, tmux
+        session and window names, and the recorded ``process_identity``
+        of the process holding the session (pid *with* its start marker,
+        never a bare pid — pids recycle, so a bare one can forge either a
+        survivor or a no-survivor).
+
+    Raises:
+        ManagedLaunchConflict: The identity is absent, partial, or held
+            by someone else.  Nothing was read from the pane.
     """
-    from cli_agent_orchestrator.services import native_tui_launch, terminal_service
-
     provider = record["provider"]
     if provider not in NATIVE_TUI_PROVIDERS:
         raise ManagedLaunchConflict(
@@ -3640,8 +3676,45 @@ def _validate_native_admission_identity(record: dict[str, Any]) -> dict[str, Any
             f"identity; a task must never be typed at an unidentified process"
         )
 
-    session_name = record["session_name"]
-    window_name = managed_window_name(record["terminal_id"], record["generation"])
+    return {
+        "provider": provider,
+        "native_session_id": native_session_id,
+        "pane_id": pane_id,
+        "session_name": record["session_name"],
+        "window_name": managed_window_name(record["terminal_id"], record["generation"]),
+        "process_identity": {"pid": recorded_pid, "start_marker": recorded_marker},
+    }
+
+
+def validate_native_identity_against_live_pane(record: dict[str, Any]) -> dict[str, Any]:
+    """Prove the bound native identity is still exactly what was bound.
+
+    Runs before anything is claimed and before a single byte is written,
+    so every refusal below leaves zero task admission and zero provider
+    I/O with the reservation row untouched.  That ordering is the
+    contract: a caller that receives a refusal here knows the task was
+    not delivered, rather than having to treat it as maybe-delivered.
+
+    The durable half is :func:`resolve_native_identity_of_record`.  What
+    this adds is the live comparison: the pane in front of us right now,
+    against what the store recorded at attach — pane id, pid, and process
+    start marker together.
+
+    Public because native admission and the identity-bound control-input
+    path both have to ask it immediately before writing.  A control
+    arrives arbitrarily later than the bind that authorised it, so the
+    projection it was resolved from is a statement about the past; only
+    re-proving here closes the gap between "checked" and "wrote".
+    """
+    from cli_agent_orchestrator.services import native_tui_launch, terminal_service
+
+    identity = resolve_native_identity_of_record(record)
+    native_session_id = identity["native_session_id"]
+    pane_id = identity["pane_id"]
+    recorded_pid = identity["process_identity"]["pid"]
+    recorded_marker = identity["process_identity"]["start_marker"]
+    session_name = identity["session_name"]
+    window_name = identity["window_name"]
     pane = native_tui_launch.TmuxNativePane(
         terminal_service.get_backend(),
         session_name=session_name,
@@ -3677,13 +3750,12 @@ def _validate_native_admission_identity(record: dict[str, Any]) -> dict[str, Any
             f"replaced and the task is refused with zero bytes sent"
         )
 
-    return {
-        "provider": provider,
-        "native_session_id": native_session_id,
-        "pane_id": pane_id,
-        "session_name": session_name,
-        "window_name": window_name,
-    }
+    return identity
+
+
+#: The pre-public spelling, kept so existing call sites keep naming the
+#: same one validator rather than a second copy of it.
+_validate_native_admission_identity = validate_native_identity_against_live_pane
 
 
 def _settle_native_admission(

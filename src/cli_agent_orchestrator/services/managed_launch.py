@@ -1294,6 +1294,135 @@ def deliver_inbox_via_bridge(
         return False
 
 
+#: The kinds of native-identity refusal a projection can carry, kept
+#: apart all the way to the caller.  "We looked and it is wrong" and "we
+#: could not look" license opposite handling: reporting the second as the
+#: first closes a delivery that is still open, and reporting the first as
+#: the second leaves a permanently-wrong binding looking retryable.
+NATIVE_IDENTITY_CONFLICT = "conflict"
+NATIVE_IDENTITY_UNAVAILABLE = "unavailable"
+
+
+def _v2_native_control_projection(reservation_id: str) -> dict[str, Any]:
+    """The control-relevant identity of one v2 generation, from evidence.
+
+    Every field here is read from an authoritative durable source rather
+    than restated from the reservation row: the mode through
+    ``em.mode_of_record`` so a legacy NULL projects as the ACP it is, and
+    the native session and provider process through the *same* validator
+    native admission uses, so the control path and the admission path can
+    never disagree about who holds a session.
+
+    Deliberately not sourced from the published readiness sibling.  Kimi's
+    sibling omits provider-authored identity keys by design — its
+    readiness is an observed attached pane rather than a claim the
+    provider makes about itself — so a projection reading it would find
+    nothing for every healthy Kimi generation and refuse them all.  The
+    binding and the attachment are the evidence; the sibling is a
+    published statement about proof class.
+
+    An identity that cannot be resolved is reported as absent *with the
+    reason*, never as a weaker binding: the caller refuses on it rather
+    than proceeding on the pane tuple alone.
+    """
+    from cli_agent_orchestrator.services import managed_launch_v2 as v2
+
+    projection: dict[str, Any] = {
+        "execution_mode": None,
+        "execution_mode_source": None,
+        "native_session_id": None,
+        "provider_process_id": None,
+        "provider_version": None,
+        "native_identity_refusal": None,
+    }
+    try:
+        record = v2.get(reservation_id)
+    except ManagedLaunchError as exc:
+        projection["native_identity_refusal"] = {
+            "kind": NATIVE_IDENTITY_UNAVAILABLE,
+            "detail": f"the v2 reservation could not be read: {exc}",
+        }
+        return projection
+
+    projection["execution_mode"] = record["execution_mode"]
+    projection["execution_mode_source"] = record["execution_mode_source"]
+    if record["execution_mode"] != em.NATIVE_TUI:
+        # An ACP generation has no native composer identity to publish,
+        # and inventing absences as a refusal would misreport a mode that
+        # is behaving exactly as it should.
+        return projection
+
+    # The version the generation was *bound* to, not one probed now: which
+    # keystroke a composer accepts is a fact about the build that is
+    # running, and the binding is the record of which build that is.
+    binding = record.get("binding") or {}
+    projection["provider_version"] = binding.get("provider_version")
+
+    try:
+        proven = v2.resolve_native_identity_of_record(record)
+    except ManagedLaunchConflict as exc:
+        projection["native_identity_refusal"] = {
+            "kind": NATIVE_IDENTITY_CONFLICT,
+            "detail": str(exc),
+        }
+        return projection
+    except Exception as exc:  # noqa: BLE001 - an unread store, not a verdict
+        projection["native_identity_refusal"] = {
+            "kind": NATIVE_IDENTITY_UNAVAILABLE,
+            "detail": f"the native identity of this generation could not be read: {exc}",
+        }
+        return projection
+
+    projection["native_session_id"] = proven["native_session_id"]
+    # Rendered through the producer the readiness sibling already uses, so
+    # the pid travels with its start marker. A bare pid is the forgeable
+    # half on its own: pids recycle, so a stale one can match an unrelated
+    # live process and forge a survivor, or match nothing and forge a
+    # no-survivor.
+    projection["provider_process_id"] = v2.published_process_id(proven["process_identity"])
+    if projection["provider_process_id"] is None:
+        projection["native_identity_refusal"] = {
+            "kind": NATIVE_IDENTITY_CONFLICT,
+            "detail": (
+                f"the attachment for session {proven['native_session_id']} carries a "
+                f"process identity that cannot be published as a non-recyclable scalar; "
+                f"a bare pid is refused rather than published as identity"
+            ),
+        }
+        projection["native_session_id"] = None
+    return projection
+
+
+def verify_managed_native_identity(reservation_id: str) -> dict[str, Any]:
+    """Re-prove, live, that this generation still holds its provider session.
+
+    The projection a control was resolved from is a statement about the
+    past: a control arrives arbitrarily later than the bind that
+    authorised it, and in between the pane can die and be replaced, or
+    the session can be taken over by a successor generation.  So the
+    writer re-asks the same question immediately before it claims the
+    write, through the same validator native admission uses.
+
+    Nothing here writes, and every refusal leaves the pane untouched.
+
+    Raises:
+        ManagedLaunchConflict: The generation does not hold this session,
+            or the process that held it has been replaced.
+        ManagedLaunchUnavailable: The pane could not be observed at all.
+            Distinct from a conflict on purpose — "the pane is gone" and
+            "we could not look" license opposite handling.
+    """
+    from cli_agent_orchestrator.services import managed_launch_v2 as v2
+
+    record = v2.get(reservation_id)
+    if record["execution_mode"] != em.NATIVE_TUI:
+        raise ManagedLaunchConflict(
+            f"reservation {reservation_id} runs in {record['execution_mode']!r}, not "
+            f"{em.NATIVE_TUI!r}; only a native generation has a composer to type into"
+        )
+    return v2.validate_native_identity_against_live_pane(record)
+
+
 def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:
     """Resolve an exact managed generation without pane-name inference."""
     with database.SessionLocal() as db:
@@ -1327,7 +1456,7 @@ def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:
                 "vintage": "v1",
             }
         if row_v2 is not None:
-            return {
+            identity = {
                 "reservation_id": str(row_v2.reservation_id),
                 "terminal_id": str(row_v2.terminal_id),
                 "generation": str(row_v2.generation),
@@ -1336,6 +1465,13 @@ def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:
                 "controllable": str(row_v2.state) == "admitted",
                 "vintage": "v2",
             }
+            # The three fields a control caller needs and this projection
+            # used to omit entirely. Without them every managed generation
+            # read as ACP with both identities null, so a managed native
+            # pane was refused by the generic control path and could not
+            # be reached at all -- not even once it was admitted.
+            identity.update(_v2_native_control_projection(identity["reservation_id"]))
+            return identity
     return None
 
 

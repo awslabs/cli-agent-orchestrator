@@ -42,7 +42,7 @@ from typing import Any, Optional, Protocol, cast
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services import execution_mode as em
-from cli_agent_orchestrator.services import native_attachment
+from cli_agent_orchestrator.services import native_attachment, provider_contracts
 from cli_agent_orchestrator.services.canonical_json import canonical_sha256
 
 #: The only provider this adapter speaks for.  Named rather than
@@ -338,7 +338,22 @@ def plan_composer_keystrokes(
                 f"keystrokes for the breaks between them"
             )
 
-    pin = _PROVEN_COMPOSER_NEWLINE.get((provider_version or "").strip())
+    # Normalized through the one normalizer the version pin already uses.
+    # The durable binding records the provider's banner verbatim --
+    # "2.1.220 (Claude Code)" -- because that is what the provider printed,
+    # while this table is keyed by the bare build. A raw strip therefore
+    # missed on an installed, pinned, proven build and refused it as
+    # unproven, with zero task bytes, even though check_pinned_version had
+    # already accepted the same string at bind time by normalizing it.
+    #
+    # Normalizing the lookup INPUT is not loosening the pin. The keys stay
+    # bare exact builds, so an unproven version still misses. Adding the
+    # banner form as a second key would have turned a table of proven
+    # builds into a table of spellings, and the next banner variant would
+    # be unproven again.
+    pin = _PROVEN_COMPOSER_NEWLINE.get(
+        provider_contracts.normalized_version(provider_version or "")
+    )
     undeliverable = None
     if len(lines) > 1 and pin is None:
         # Recorded on the plan rather than raised. The payload is well
@@ -378,6 +393,18 @@ def plan_composer_keystrokes(
         "soft_newline_keystroke": None if pin is None else pin["keystroke"],
         "burst_reset_keystroke": None if pin is None else pin.get("burst_reset_keystroke"),
         "submit_settle_seconds": 0.0 if pin is None else float(pin["submit_settle_seconds"]),
+        # What was actually read out of this build to justify the
+        # keystrokes above, carried on the plan and therefore journaled
+        # with it. Present here for the same reason as on the Claude plan:
+        # a receipt that names a keystroke without naming the evidence for
+        # it is a claim, and this adapter's whole contract is that its
+        # composer facts were read rather than assumed.
+        #
+        # It was absent until a consumer asked both adapters the same
+        # question and got a different answer for each -- which is the
+        # kind of asymmetry that reads as "unproven build" for exactly one
+        # provider and refuses every healthy generation it has.
+        "composer_evidence": None if pin is None else pin["evidence"],
         "final_enter": True,
         "deliverable": undeliverable is None,
         "undeliverable_reason": undeliverable,
@@ -950,25 +977,51 @@ def _assert_deliverable(plan: Mapping[str, Any]) -> None:
         )
 
 
-def _post(
+class ComposerWriteInterrupted(NativeControlError):
+    """A keystroke plan stopped part-way, so what landed is not known.
+
+    Carries the boundary it stopped at, because "typed but not
+    submitted" is a real recoverable state while "may have submitted" is
+    not, and a caller that cannot tell them apart has to assume the
+    worse one.
+    """
+
+    def __init__(self, detail: str, *, enter_attempted: bool) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.enter_attempted = enter_attempted
+
+
+def execute_composer_plan(
     *,
-    operation_id: str,
     plan: Mapping[str, Any],
     transport: NativeControlTransport,
+    submit: bool = True,
 ) -> dict[str, Any]:
-    """Execute the keystroke plan, then submit with one explicit Enter.
+    """Type one already-planned payload into a composer, then submit it.
 
-    Any transport failure -- at any boundary -- becomes ambiguous rather
-    than failed.  A raised exception does not prove the bytes did not
-    land, and treating it as proof of non-delivery is precisely what
-    would justify a retry and produce a duplicate.  The Enter boundary is
-    recorded separately, and the ambiguity says which side of it was
-    reached, because "typed but not submitted" is a real, recoverable
-    state while "may have submitted" is not.
+    The provider-specific half of every native write, and deliberately
+    free of any store: the caller journals the outcome in whatever record
+    is its own at-most-once authority.  Native task admission journals it
+    on the reservation's control operation; the identity-bound
+    control-input path journals it on the control request.  Two callers,
+    one keystroke sequence — because the sequence is where the proven
+    composer newline, the paste-burst reset and the submit settle live,
+    and a second copy of it would be a second set of composer facts to
+    keep true.
 
     Exactly one Enter is sent, ever, for exactly one provider turn.  The
     line breaks inside a multi-line payload are composer keystrokes, not
     submissions, so a message with ten newlines is still one turn.
+
+    ``submit=False`` types the payload and stops, without the pre-submit
+    reset: that keystroke exists to make an Enter land, so sending it
+    where no Enter follows would be a keystroke at a composer for no
+    reason.
+
+    Raises:
+        NativeControlInvalid: The plan is undeliverable.  Nothing typed.
+        ComposerWriteInterrupted: The transport raised part-way through.
     """
     if not plan.get("deliverable", True):
         # Belt and braces: reaching the transport with an undeliverable
@@ -979,6 +1032,7 @@ def _post(
         )
     lines = list(plan["lines"])
     newline_key = plan["soft_newline_keystroke"]
+    index = 0
 
     try:
         for index, line in enumerate(lines):
@@ -990,13 +1044,14 @@ def _post(
             if line:
                 transport.send_literal(line)
     except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
-        return mark_ambiguous(
-            operation_id=operation_id,
-            reason=(
-                f"transport raised while typing line {index + 1} of {len(lines)}: {exc}; "
-                f"no Enter was sent, so the composer may hold a partial message"
-            ),
-        )
+        raise ComposerWriteInterrupted(
+            f"transport raised while typing line {index + 1} of {len(lines)}: {exc}; "
+            f"no Enter was sent, so the composer may hold a partial message",
+            enter_attempted=False,
+        ) from exc
+
+    if not submit:
+        return {"lines_typed": len(lines), "enter_sent": False}
 
     # Clear the provider's paste-burst window before submitting. Without
     # this the final Enter can be swallowed and turned into yet another
@@ -1011,24 +1066,44 @@ def _post(
         if settle > 0:
             time.sleep(settle)
     except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
-        return mark_ambiguous(
-            operation_id=operation_id,
-            reason=(
-                f"the payload was typed but the pre-submit keystroke raised: {exc}; "
-                f"the composer may hold unsubmitted text"
-            ),
-        )
+        raise ComposerWriteInterrupted(
+            f"the payload was typed but the pre-submit keystroke raised: {exc}; "
+            f"the composer may hold unsubmitted text",
+            enter_attempted=False,
+        ) from exc
 
     try:
         transport.send_enter()
     except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
-        return mark_ambiguous(
-            operation_id=operation_id,
-            reason=(
-                f"payload was written but the submitting Enter raised: {exc}; "
-                f"the composer may hold unsubmitted text"
-            ),
-        )
+        raise ComposerWriteInterrupted(
+            f"payload was written but the submitting Enter raised: {exc}; "
+            f"the composer may hold unsubmitted text",
+            enter_attempted=True,
+        ) from exc
+
+    return {"lines_typed": len(lines), "enter_sent": True}
+
+
+def _post(
+    *,
+    operation_id: str,
+    plan: Mapping[str, Any],
+    transport: NativeControlTransport,
+) -> dict[str, Any]:
+    """Execute the keystroke plan, then record what this adapter did.
+
+    Any transport failure -- at any boundary -- becomes ambiguous rather
+    than failed.  A raised exception does not prove the bytes did not
+    land, and treating it as proof of non-delivery is precisely what
+    would justify a retry and produce a duplicate.  The ambiguity says
+    which side of the Enter boundary was reached, because "typed but not
+    submitted" is a real, recoverable state while "may have submitted" is
+    not.
+    """
+    try:
+        execute_composer_plan(plan=plan, transport=transport)
+    except ComposerWriteInterrupted as exc:
+        return mark_ambiguous(operation_id=operation_id, reason=exc.detail)
 
     return _update(
         operation_id=operation_id,

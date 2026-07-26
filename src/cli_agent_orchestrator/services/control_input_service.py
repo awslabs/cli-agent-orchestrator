@@ -72,6 +72,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_PANE_BUSY,
     REASON_PANE_DEAD,
     REASON_PROTOCOL_MISMATCH,
+    REASON_PROVIDER_UNSUPPORTED,
     REASON_REQUEST_REBOUND,
     REASON_STALE_GENERATION,
     REASON_UNKNOWN_TERMINAL,
@@ -166,7 +167,12 @@ class ResolvedControlIdentity:
     native_session_id: Optional[str]
     execution_mode: str
     session_name: Optional[str]
-    provider_process_id: Optional[int] = None
+    # The provider process as ``<pid>@<start marker>``, never a bare pid.
+    # Pids recycle, so a bare one can match an unrelated live process and
+    # forge a survivor, or match nothing and forge a no-survivor; the
+    # marker is the half that makes the scalar non-forgeable.  Rendered by
+    # the same producer the readiness sibling uses.
+    provider_process_id: Optional[str] = None
     pane_id: Optional[str] = None
     window_id: Optional[str] = None
     pane_pid: Optional[int] = None
@@ -187,6 +193,25 @@ class ResolvedControlIdentity:
     # disagree while every other field agrees perfectly.
     bound_server_socket_path: Optional[str] = None
     observed_server_socket_path: Optional[str] = None
+    # The provider build this generation was *bound* to, carried for the
+    # adapter's composer pin.  Which keystroke breaks a composer line
+    # without sending it is a fact about the build that is running, and
+    # the binding is the record of which build that is -- not a version
+    # probed now, which could have changed underneath the session.
+    #
+    # Deliberately absent from the wire view: it is a server-side input to
+    # the keystroke plan, not an identity a caller may declare.
+    provider_version: Optional[str] = None
+    # The managed reservation this terminal belongs to, so the writer can
+    # re-prove the identity live against the same durable record the
+    # projection came from.  Internal, like the two fields above.
+    managed_reservation_id: Optional[str] = None
+    # Why the authoritative sources could not name this generation's
+    # native identity, when they could not.  Kept as a typed pair rather
+    # than folded into the absences above, because "we looked and it is
+    # held by someone else" and "we could not look" license opposite
+    # handling and only one of them is worth re-attempting.
+    native_identity_refusal: Optional[Dict[str, Any]] = None
 
     def expected_identity_view(self) -> Dict[str, Any]:
         """The nine declarable fields, in the digest's fixed order.
@@ -272,6 +297,84 @@ def _tmux_client() -> Any:
     return tmux_client
 
 
+def _managed_execution_mode(managed: Optional[Dict[str, Any]]) -> str:
+    """The control mode of a resolved terminal, default-deny on the unknown.
+
+    An unmanaged pane is a native TUI: there is no bridge in front of it.
+    A managed generation reports the mode its reservation durably records.
+    A managed row whose mode this side cannot resolve is reported as ACP,
+    which is the refusing branch -- an unresolved mode must never route to
+    the composer path, because typing into a pane on an unproven mode is
+    exactly the misroute the refusal exists to prevent.
+    """
+    if managed is None:
+        return EXECUTION_MODE_NATIVE_TUI
+    mode = managed.get("execution_mode")
+    if mode == EXECUTION_MODE_NATIVE_TUI:
+        return EXECUTION_MODE_NATIVE_TUI
+    return EXECUTION_MODE_ACP
+
+
+def _native_identity_refusal(
+    resolved: ResolvedControlIdentity,
+) -> Optional[Tuple[str, str]]:
+    """Reason and detail for a managed native pane this path may not type into.
+
+    Only reached once the mode has positively resolved to ``native_tui``,
+    which is the point at which the gate stops protecting the pane and the
+    identity has to.  Before the truthful projection existed, every managed
+    generation was refused as ACP and this question never arose; now that a
+    managed native pane is reachable, an absent provider identity must be
+    the thing that stops it, or a control would be delivered on the pane
+    tuple alone — typing into a pane whose provider *session* was never
+    verified, which is the aliasing the six-field identity discipline
+    exists to prevent.
+
+    Partial identity is refused outright rather than used weakly: a binding
+    published with some of its fields is a binding some later check will
+    pass against.
+    """
+    from cli_agent_orchestrator.services import managed_launch
+
+    if not resolved.managed:
+        return None
+    refusal = resolved.native_identity_refusal
+    if isinstance(refusal, Mapping):
+        detail = str(refusal.get("detail") or "the native identity could not be resolved")
+        if refusal.get("kind") == managed_launch.NATIVE_IDENTITY_UNAVAILABLE:
+            # "We could not look" is not "it is gone". Both refuse with
+            # zero bytes, and both are re-attemptable, but a caller reading
+            # a mismatch would stop re-attempting a delivery that is still
+            # open, so the two keep separate reasons all the way out.
+            return (
+                REASON_LINEAGE_UNPROVEN,
+                f"this server could not read the authoritative native identity of this "
+                f"generation, so nothing was typed: {detail}",
+            )
+        return (
+            REASON_IDENTITY_MISMATCH,
+            f"the authoritative attachment evidence does not name this generation as the "
+            f"holder of its provider session: {detail}",
+        )
+    missing = [
+        name
+        for name, value in (
+            ("native_session_id", resolved.native_session_id),
+            ("provider_process_id", resolved.provider_process_id),
+        )
+        if not value
+    ]
+    if missing:
+        return (
+            REASON_LINEAGE_UNPROVEN,
+            f"this managed generation runs a provider TUI but its durable sources name "
+            f"no {' and no '.join(missing)}; a control is refused rather than delivered "
+            f"on the pane tuple alone, which would type into a pane whose provider "
+            f"session was never verified",
+        )
+    return None
+
+
 def resolve_control_identity(terminal_id: str) -> Optional[ResolvedControlIdentity]:
     """This server's own view of ``terminal_id``, or None if unknown.
 
@@ -320,16 +423,28 @@ def resolve_control_identity(terminal_id: str) -> Optional[ResolvedControlIdenti
         terminal_incarnation=None,
         terminal_generation=generation,
         provider=metadata.get("provider"),
-        # A native TUI pane has no provider-native session id this server
-        # observes; the managed surface has one, and managed panes are
-        # refused by this path rather than typed into.
-        native_session_id=None,
-        execution_mode=EXECUTION_MODE_ACP if managed is not None else EXECUTION_MODE_NATIVE_TUI,
+        # An unmanaged pane is a plain native TUI with no managed record
+        # behind it. A managed generation reports what its own reservation
+        # durably says -- the mode it was launched in, and the native
+        # session and provider process its readiness proof published.
+        #
+        # These used to be hardcoded: every managed reservation projected
+        # ACP with both identities null, so a managed native pane was
+        # refused by the generic path and unreachable by control input at
+        # all, even once it was admitted. The mode is the reservation's
+        # own, never inferred from argv or protocol vintage, because the
+        # ACP bridge is also a v2 argv-launched terminal.
+        native_session_id=managed.get("native_session_id") if managed else None,
+        execution_mode=_managed_execution_mode(managed),
         session_name=metadata.get("tmux_session"),
-        # Unprovable here: pane_pid is the pane's root process, the
-        # provider is a descendant of it, and a guess would be worse
-        # than an absence.
-        provider_process_id=None,
+        provider_version=managed.get("provider_version") if managed else None,
+        managed_reservation_id=managed.get("reservation_id") if managed else None,
+        native_identity_refusal=managed.get("native_identity_refusal") if managed else None,
+        # For an unmanaged pane this stays unprovable: pane_pid is the
+        # pane's root process, the provider is a descendant of it, and a
+        # guess would be worse than an absence. A managed generation does
+        # not have to guess -- its readiness proof recorded the process.
+        provider_process_id=managed.get("provider_process_id") if managed else None,
         pane_id=pane_id,
         window_id=window_id,
         pane_pid=pane_pid,
@@ -419,7 +534,17 @@ def screen_expected_identity(
             f"{declared_terminal!r}",
         )
 
-    if resolved.execution_mode == EXECUTION_MODE_ACP:
+    # A positive allowlist, not "is it ACP". Only a mode this side has
+    # resolved to a real native TUI may be typed into; everything else --
+    # ACP, a legacy row whose durable mode is NULL, a value from a newer
+    # writer this build does not know -- takes the refusing branch.
+    #
+    # A deny-list here would refuse only the literal spelling and let every
+    # other value fall through to the composer, which is the one outcome
+    # this gate exists to prevent: a managed bridge pane typed into as
+    # though it were a native composer. The unknown case is exactly where
+    # that costs the most, because nothing about it is legible.
+    if resolved.execution_mode != EXECUTION_MODE_NATIVE_TUI:
         return (
             REASON_MANAGED_ACP_PANE,
             "this terminal is driven through the managed provider bridge; its pane runs "
@@ -452,12 +577,25 @@ def screen_expected_identity(
             "this server exposes no terminal incarnation token distinct from the "
             "generation, so an incarnation expectation cannot be verified",
         )
-    if expected.get("provider_process_id") is not None:
-        return (
-            REASON_LINEAGE_UNPROVEN,
-            "this server cannot prove the provider's process id; the pane pid is the "
-            "pane's root process and the provider is a descendant of it",
-        )
+    declared_process = expected.get("provider_process_id")
+    if declared_process is not None:
+        if resolved.provider_process_id is None:
+            # Unprovable for an unmanaged pane, and it must stay a refusal
+            # there: pane_pid is the pane's root process and the provider
+            # runs as a descendant of it, so equating them would let a
+            # caller believe it had bound to an identity nobody checked.
+            return (
+                REASON_LINEAGE_UNPROVEN,
+                "this server cannot prove the provider's process id for this terminal; "
+                "the pane pid is the pane's root process and the provider is a "
+                "descendant of it",
+            )
+        if declared_process != resolved.provider_process_id:
+            return (
+                REASON_IDENTITY_MISMATCH,
+                "the provider process holding this session is not the expected one; the "
+                "process the caller meant has been replaced",
+            )
 
     declared_provider = expected.get("provider")
     if declared_provider is not None and declared_provider != resolved.provider:
@@ -470,8 +608,8 @@ def screen_expected_identity(
     if declared_native is not None and declared_native != resolved.native_session_id:
         return (
             REASON_IDENTITY_MISMATCH,
-            "this server observes no provider-native session id for a native TUI pane, "
-            "so the expected native session id cannot match",
+            f"the provider-native session this server can prove for this terminal is "
+            f"{resolved.native_session_id!r}, not the expected {declared_native!r}",
         )
     declared_session = expected.get("session_name")
     if declared_session is not None and declared_session != resolved.session_name:
@@ -812,6 +950,22 @@ def deliver_control_input(
             digest=digest,
         )
 
+    # Checked once the mode has positively resolved to a native TUI, which
+    # is where the ACP gate above stops protecting the pane and the
+    # provider identity has to. A managed generation whose native session
+    # or provider process cannot be named by the authoritative sources is
+    # refused here rather than delivered on the pane tuple alone.
+    unproven = _native_identity_refusal(resolved)
+    if unproven is not None:
+        return _refusal(
+            control_id,
+            unproven[0],
+            unproven[1],
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+        )
+
     if resolved.recorded_pane_id is None:
         return _refusal(
             control_id,
@@ -926,6 +1080,192 @@ def deliver_control_input(
         )
 
 
+class _NativeComposerTransport:
+    """The adapters' keystroke transport, bound to one proven tmux server.
+
+    The adapters describe *what* to type; this decides *where*, and it
+    routes every keystroke through the identity-bound write primitives
+    rather than a bare ``send-keys``.  A composer keystroke aimed at
+    ``%3`` on the wrong tmux server lands in a stranger's composer exactly
+    as a literal write would, so the soft newline and the burst reset are
+    proven against the bound socket on the same terms as the text.
+
+    Counts what it actually did.  The outer journal records those numbers
+    as its account of what reached the pane, and a count recomputed from
+    the payload would stop matching the moment the primitive's chunking
+    changed.
+    """
+
+    def __init__(self, client: Any, pane_id: str, server_identity: Optional[str]) -> None:
+        self._client = client
+        self._pane_id = pane_id
+        self._server_identity = server_identity
+        self.chunks_sent = 0
+        self.enter_attempted = False
+
+    def send_literal(self, text: str) -> None:
+        self.chunks_sent += self._client.send_literal_line(
+            self._pane_id,
+            text,
+            submit=False,
+            expected_server_identity=self._server_identity,
+        )
+
+    def send_key(self, keystroke: str) -> None:
+        self._client.send_control_key(
+            self._pane_id,
+            keystroke,
+            expected_server_identity=self._server_identity,
+        )
+
+    def send_enter(self) -> None:
+        # Marked before the call, not after: the question this answers is
+        # "may the Enter have landed", and an exception on the way out of
+        # tmux does not prove it did not.
+        self.enter_attempted = True
+        self._client.send_literal_line(
+            self._pane_id,
+            "",
+            submit=True,
+            expected_server_identity=self._server_identity,
+        )
+
+
+def _native_composer_preflight(
+    resolved: ResolvedControlIdentity,
+    binding: ControlInputBinding,
+    *,
+    text: str,
+) -> Tuple[Optional[Any], Optional[Any], Optional[Tuple[str, str]]]:
+    """Everything a native write must prove before the claim, or a refusal.
+
+    Returns ``(adapter, plan, refusal)`` with exactly one of the plan or
+    the refusal set.  Nothing here writes, which is the whole point of its
+    position: the journal has no ``(writing, refused)`` edge, so this is
+    the last place a zero-byte outcome can still be recorded as the
+    refusal it truthfully is.  After the claim the only honest encoding
+    left is ``ambiguous``, which would withhold the re-attempt this
+    refusal is entitled to grant.
+
+    Two proofs, in this order:
+
+    1. The identity, re-asked live rather than taken from the projection
+       the request was resolved against. That projection is a statement
+       about the past — a control arrives arbitrarily later than its bind.
+    2. The composer plan for the build this generation is *bound* to,
+       which is where the version pin and the proven newline keystroke are
+       decided. An unproven build is a permanent fact about this session,
+       so it is refused rather than typed at hopefully.
+    """
+    from cli_agent_orchestrator.services import managed_launch, managed_launch_v2
+
+    reservation_id = resolved.managed_reservation_id
+    if not reservation_id:
+        return (
+            None,
+            None,
+            (
+                REASON_LINEAGE_UNPROVEN,
+                "this managed terminal names no reservation, so its native identity "
+                "cannot be re-proven before the write",
+            ),
+        )
+
+    try:
+        proven = managed_launch.verify_managed_native_identity(reservation_id)
+    except managed_launch.ManagedLaunchUnavailable as exc:
+        # "We could not look" is not "it is gone", and reporting the
+        # second as the first would close a delivery that is still open.
+        return (
+            None,
+            None,
+            (
+                REASON_LINEAGE_UNPROVEN,
+                f"the bound native pane could not be observed, so nothing was typed: {exc}",
+            ),
+        )
+    except managed_launch.ManagedLaunchError as exc:
+        return (
+            None,
+            None,
+            (
+                REASON_IDENTITY_MISMATCH,
+                f"this generation no longer holds its provider session, so nothing was "
+                f"typed: {exc}",
+            ),
+        )
+
+    if proven["pane_id"] != binding.pane_id:
+        return (
+            None,
+            None,
+            (
+                REASON_IDENTITY_MISMATCH,
+                f"the attachment now names pane {proven['pane_id']!r} for this session, "
+                f"not the bound {binding.pane_id!r}; the control was bound to a pane this "
+                f"generation no longer holds",
+            ),
+        )
+    if managed_launch_v2.published_process_id(proven["process_identity"]) != (
+        resolved.provider_process_id
+    ):
+        return (
+            None,
+            None,
+            (
+                REASON_IDENTITY_MISMATCH,
+                "the provider process holding this session is not the one this control "
+                "was resolved against; the process was replaced between the request and "
+                "the write",
+            ),
+        )
+
+    try:
+        adapter = managed_launch_v2.native_control_adapter(proven["provider"])
+    except managed_launch.ManagedLaunchError as exc:
+        return (None, None, (REASON_PROVIDER_UNSUPPORTED, str(exc)))
+
+    try:
+        plan = adapter.plan_composer_keystrokes(
+            text, provider_version=resolved.provider_version, field="text"
+        )
+    except adapter.NativeControlInvalid as exc:
+        # Unreachable by construction: this service screens the text more
+        # strictly than the adapter does. Recorded rather than raised so a
+        # disagreement between the two screens is a typed zero-byte answer
+        # instead of a 500.
+        logger.error("control-input adapter screening disagreement: %s", exc)
+        return (None, None, (REASON_ILLEGAL_CONTROL_BYTES, str(exc)))
+
+    if not plan.get("deliverable", True):
+        return (None, None, (REASON_PROVIDER_UNSUPPORTED, str(plan["undeliverable_reason"])))
+    if plan.get("composer_evidence") is None:
+        # No pin for this build. The generic literal write would "succeed"
+        # here and the Enter would be swallowed by the composer's own
+        # paste-burst window — no error, no turn, and a caller told its
+        # control landed. Refused instead, with zero bytes.
+        #
+        # Keyed on the evidence rather than on a keystroke: what licenses
+        # typing at a composer is that this build's behaviour was read,
+        # and the evidence is that reading. Both adapters publish it for
+        # exactly this reason -- an asymmetry here reads as "unproven
+        # build" for one provider and refuses every healthy generation it
+        # has, which is a proof-class rule turned against a provider it
+        # was never about.
+        return (
+            None,
+            None,
+            (
+                REASON_PROVIDER_UNSUPPORTED,
+                f"no composer behaviour is proven for {proven['provider']} version "
+                f"{resolved.provider_version!r}, so the submit keystroke this build needs "
+                f"is unknown; refusing rather than typing at a composer on an unproven "
+                f"build",
+            ),
+        )
+    return (adapter, plan, None)
+
+
 def _deliver_under_lease(
     journal: ControlInputJournal,
     client: Any,
@@ -988,12 +1328,50 @@ def _deliver_under_lease(
             digest=digest,
         )
 
+    # A managed provider TUI is driven through its own adapter, never
+    # through the generic literal primitive. The adapter is where the
+    # proven composer newline, the paste-burst reset and the submit settle
+    # live, and a raw literal line into an Ink composer is the exact class
+    # of interaction this lane exists to repair — it would "succeed" while
+    # the Enter was swallowed and no turn ever started.
+    #
+    # Every gate it can fail runs here, before the claim below, so an
+    # unproven build or a replaced process is the truthful zero-byte
+    # refusal it is rather than an ambiguous write.
+    adapter: Optional[Any] = None
+    plan: Optional[Any] = None
+    if resolved.managed and resolved.execution_mode == EXECUTION_MODE_NATIVE_TUI:
+        adapter, plan, native_refusal = _native_composer_preflight(resolved, binding, text=text)
+        if native_refusal is not None:
+            return _record_refusal(
+                journal,
+                control_id,
+                native_refusal[0],
+                native_refusal[1],
+                terminal_id=terminal_id,
+                resolved=resolved,
+                digest=digest,
+            )
+
     claim = journal.claim_write(control_id)
     if not claim.granted:
         # Exactly one caller ever writes for a control id.  A caller
         # holding a refused claim must not write even when the record
         # looks abandoned: that owner may be mid-write this instant.
         return _from_record(claim.record, resolved=resolved)
+
+    if plan is not None and adapter is not None:
+        return _send_through_native_adapter(
+            journal,
+            client,
+            binding,
+            adapter=adapter,
+            plan=plan,
+            enter=enter,
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+        )
 
     try:
         chunks = client.send_literal_line(
@@ -1116,6 +1494,116 @@ def _deliver_under_lease(
         text_sent=True,
         enter_sent=enter,
         chunks_sent=chunks,
+        enter_attempted=enter,
+    )
+
+
+def _send_through_native_adapter(
+    journal: ControlInputJournal,
+    client: Any,
+    binding: ControlInputBinding,
+    *,
+    adapter: Any,
+    plan: Any,
+    enter: bool,
+    terminal_id: str,
+    resolved: ResolvedControlIdentity,
+    digest: str,
+) -> ControlInputResult:
+    """Type an already-proven plan through the provider's own adapter.
+
+    The only part of a native control that sits inside the write claim,
+    and deliberately the only part: everything that could still have been
+    refused was refused before the claim, so nothing here can produce a
+    zero-byte outcome that the journal would have to encode as a refusal
+    it has no edge for.
+
+    The at-most-once authority is the control journal this writes into,
+    not the adapter's own operation store. The adapter contributes the
+    keystroke sequence — the proven newline, the burst reset, the submit
+    settle — and this path contributes the durable record, so one control
+    has exactly one at-most-once record rather than two that could
+    disagree about whether it was sent.
+    """
+    control_id = binding.request_id
+    transport = _NativeComposerTransport(client, binding.pane_id, binding.server_socket_path)
+    try:
+        adapter.execute_composer_plan(plan=plan, transport=transport, submit=enter)
+    except adapter.ComposerWriteInterrupted as exc:
+        journal.mark_ambiguous(
+            control_id,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            chunks_sent=transport.chunks_sent,
+            enter_attempted=transport.enter_attempted,
+            evidence_digest=digest,
+        )
+        return ControlInputResult(
+            control_id=control_id,
+            outcome=AMBIGUOUS,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            detail=(
+                f"the composer write stopped part-way: {exc.detail}. What reached the "
+                "pane is bounded by chunks_sent and enter_attempted but is not knowable "
+                "exactly, so this control must not be sent again"
+            ),
+            state=STATE_AMBIGUOUS,
+            terminal_id=terminal_id,
+            request_digest=digest,
+            resolved_identity=resolved.as_dict(),
+            chunks_sent=transport.chunks_sent,
+            enter_attempted=transport.enter_attempted,
+        )
+    except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
+        # Includes the server-identity error the transport's primitives
+        # raise. Recorded as ambiguous despite that error proving zero
+        # bytes: the rule that nothing after a write claim may be called a
+        # refusal is a stronger invariant than any one error type's
+        # guarantee, and carving an exception for it would leave a
+        # (writing, refused) edge a later error without the same proof
+        # could travel.
+        logger.error("control-input native adapter raised for %s: %s", control_id, exc)
+        journal.mark_ambiguous(
+            control_id,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            chunks_sent=transport.chunks_sent,
+            enter_attempted=transport.enter_attempted,
+            evidence_digest=digest,
+        )
+        return ControlInputResult(
+            control_id=control_id,
+            outcome=AMBIGUOUS,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            detail=f"the provider composer adapter raised while writing: {exc}",
+            state=STATE_AMBIGUOUS,
+            terminal_id=terminal_id,
+            request_digest=digest,
+            resolved_identity=resolved.as_dict(),
+            chunks_sent=transport.chunks_sent,
+            enter_attempted=transport.enter_attempted,
+        )
+
+    record = journal.mark_delivered(
+        control_id,
+        # Both numbers read off the transport, as on the ambiguous exits.
+        chunks_sent=transport.chunks_sent,
+        enter_attempted=transport.enter_attempted,
+        evidence_digest=digest,
+    )
+    return ControlInputResult(
+        control_id=control_id,
+        outcome=ACCEPTED,
+        detail=(
+            f"typed {transport.chunks_sent} literal write(s) into pane {binding.pane_id} "
+            f"through the {resolved.provider} native composer adapter"
+            + (" and submitted with one Enter" if enter else " without submitting")
+        ),
+        state=record.state,
+        terminal_id=terminal_id,
+        request_digest=digest,
+        resolved_identity=resolved.as_dict(),
+        text_sent=True,
+        enter_sent=enter,
+        chunks_sent=transport.chunks_sent,
         enter_attempted=enter,
     )
 

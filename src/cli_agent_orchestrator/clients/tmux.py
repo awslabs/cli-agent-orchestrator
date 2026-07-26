@@ -74,6 +74,18 @@ _LITERAL_CHUNK_CHARS = 1024
 # a working way to write the identical bytes.
 _ILLEGAL_LITERAL_CHARS = ("\x1b", "\x9b", "\r", "\n")
 
+# The only named keys the control path may emit, listed rather than left
+# open.  `send-keys` without `-l` reads its argument as key names, so an
+# unrestricted key parameter would be a way to deliver arbitrary
+# keystrokes through a path whose whole contract is literal text plus one
+# explicit Enter.
+#
+# Both entries are here because a provider pin proved them for a real
+# build: `C-j` breaks a composer line without submitting it, and `End`
+# clears the paste-burst window that would otherwise swallow the Enter
+# after it.  A pin that proves a further keystroke adds it here.
+COMPOSER_CONTROL_KEYS = frozenset({"C-j", "End"})
+
 
 @dataclass(frozen=True)
 class PaneControlIdentity:
@@ -1245,6 +1257,77 @@ class TmuxClient:
                 enter_attempted=True,
             )
         return chunks_sent
+
+    def send_control_key(
+        self,
+        pane_id: str,
+        key: str,
+        *,
+        expected_server_identity: Optional[str],
+    ) -> None:
+        """Send one named composer key to a pane on the bound server.
+
+        The companion to :meth:`send_literal_line` for the keys that
+        *shape* a composer rather than fill it — a soft newline that
+        breaks a line without submitting it, or the key that clears a
+        provider's paste-burst window so the following Enter is not
+        swallowed.  Those are key events, not text: sending them as
+        literal bytes would type their names into the composer.
+
+        Same server-identity proof as the literal write, for the same
+        reason and at the same distance from the first byte.  A composer
+        keystroke aimed at ``%3`` on the wrong tmux server lands in a
+        stranger's composer exactly as a literal write would, and the
+        write primitive proving its target while the keystroke primitive
+        did not would be a hole in the shape of a missing check.
+
+        The key must be one this path has a reason to send.  ``send-keys``
+        without ``-l`` interprets its argument as a sequence of key names,
+        so an unrestricted parameter here is a way to deliver arbitrary
+        keystrokes through a path whose entire contract is that it types
+        literal text plus one explicit Enter.
+
+        Args:
+            pane_id: Immutable tmux pane id (``%N``).
+            key: A key name from :data:`COMPOSER_CONTROL_KEYS`.
+            expected_server_identity: The socket identity of the tmux
+                server the pane must be on. ``None`` refuses.
+
+        Raises:
+            ValueError: The pane id or key name is not permitted here.
+                Nothing is written.
+            TmuxServerIdentityError: The pane could not be proven to be on
+                the bound tmux server.  Nothing is written.
+            TmuxLiteralSendError: tmux rejected the keystroke.
+        """
+        if not is_valid_pane_id(pane_id):
+            raise ValueError(f"Invalid pane_id: {pane_id!r}")
+        if key not in COMPOSER_CONTROL_KEYS:
+            raise ValueError(
+                f"{key!r} is not a composer control key; permitted keys are "
+                f"{sorted(COMPOSER_CONTROL_KEYS)}. A provider pin that proves a new "
+                f"keystroke adds it here, so the set of keys this path can emit stays "
+                f"readable in one place rather than inferred from its callers"
+            )
+
+        logger.info("send_control_key: %s - key: %s", pane_id, key)
+
+        observed_server = self.observe_pane_server_identity(pane_id)
+        refusal = server_identity_refusal(bound=expected_server_identity, observed=observed_server)
+        if refusal is not None:
+            reason_code, detail = refusal
+            raise TmuxServerIdentityError(
+                f"refusing a composer keystroke to pane {pane_id}: {detail}",
+                reason_code=reason_code,
+                bound=normalize_server_identity(expected_server_identity),
+                observed=observed_server,
+            )
+
+        self._run_literal_write(
+            [tmux_binary(), "send-keys", "-t", pane_id, key],
+            chunks_sent=0,
+            enter_attempted=False,
+        )
 
     @staticmethod
     def _run_literal_write(argv: List[str], *, chunks_sent: int, enter_attempted: bool) -> None:
