@@ -645,13 +645,9 @@ class TestTheObservedModelSurvivesTheRealPath:
             )(),
         )
 
-        assert v2._claude_profile_permission_args("reviewer") == [
-            "--dangerously-skip-permissions"
-        ]
+        assert v2._claude_profile_permission_args("reviewer") == ["--dangerously-skip-permissions"]
 
-    def test_native_permission_args_omit_rejected_flag_for_root_yolo(
-        self, monkeypatch
-    ):
+    def test_native_permission_args_omit_rejected_flag_for_root_yolo(self, monkeypatch):
         monkeypatch.setattr(
             v2,
             "load_agent_profile",
