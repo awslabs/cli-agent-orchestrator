@@ -71,6 +71,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from typing import Any, Mapping, NoReturn, Optional, Protocol, Sequence
 
@@ -80,6 +81,8 @@ from cli_agent_orchestrator.services import kimi_native_launch, native_attachmen
 
 LAUNCH_SCHEMA = "cao-native-tui-launch-v1"
 OBSERVATION_SCHEMA = "cao-native-tui-pane-observation-v1"
+INNER_EXEC_CONVERGENCE_TIMEOUT_SECONDS = 2.0
+INNER_EXEC_CONVERGENCE_POLL_SECONDS = 0.05
 
 #: A fresh launch: this call declared the attachment, started the pane,
 #: and published the proven process identity.
@@ -353,6 +356,147 @@ def _observe(
         )
 
 
+def _verify_bound_session_and_cwd(
+    *,
+    provider: str,
+    native_session_id: str,
+    working_directory: str,
+    observation: Mapping[str, Any],
+) -> None:
+    """Freeze unless an observation still describes the claimed session."""
+    if not _binder(provider)["binds_exactly"](observation["argv"], native_session_id):
+        _freeze(
+            provider=provider,
+            native_session_id=native_session_id,
+            reason=AMBIGUOUS_ARGV_MISMATCH,
+            detail=(
+                f"the pane's primary process does not bind exactly {native_session_id!r}; "
+                "on both supported providers a resume that lost its id opens an "
+                "interactive picker rather than failing, so the running session may be "
+                "a different one"
+            ),
+        )
+    observed_cwd = os.path.realpath(observation["cwd"])
+    if observed_cwd != working_directory:
+        _freeze(
+            provider=provider,
+            native_session_id=native_session_id,
+            reason=AMBIGUOUS_PANE_WORKDIR_MISMATCH,
+            detail=(
+                f"the pane's primary process is in {observed_cwd!r}, but session "
+                f"{native_session_id!r} is bound to {working_directory!r}; the provider "
+                "resolves a resume against the directory the session was minted in, so this "
+                "pane cannot open the session it was started for"
+            ),
+        )
+
+
+def _await_inner_exec(
+    transport: NativePaneTransport,
+    *,
+    provider: str,
+    native_session_id: str,
+    working_directory: str,
+    observation: dict[str, Any],
+    wrapper_executable: str,
+    launch_argv: Sequence[str],
+    expected_inner_executable: Optional[str],
+    absent_reason: str,
+) -> dict[str, Any]:
+    """Observe a routed wrapper until its same process execs the admitted inner.
+
+    The route wrapper is the pane's first process and consumes the one-shot
+    credential before it execs the provider binary.  tmux can return from
+    window creation during that short interval.  Publication must wait for the
+    exec, but the wait is observation-only: the pane is never written to, and a
+    changed process identity, wrong session, wrong cwd, disappearance, or
+    unreadable observation still freezes the attachment.
+    """
+    if expected_inner_executable is None:
+        return observation
+
+    identity = (
+        observation["pane_id"],
+        observation["pid"],
+        observation["start_marker"],
+    )
+    deadline = time.monotonic() + INNER_EXEC_CONVERGENCE_TIMEOUT_SECONDS
+    while True:
+        _verify_bound_session_and_cwd(
+            provider=provider,
+            native_session_id=native_session_id,
+            working_directory=working_directory,
+            observation=observation,
+        )
+        observed_executable = observation["argv"][0] if observation["argv"] else ""
+        if os.path.realpath(observed_executable) == expected_inner_executable:
+            return observation
+
+        # A shebang wrapper is briefly visible as ``interpreter wrapper
+        # <original args>``.  That exact admitted wrapper phase is the only
+        # image permitted to precede the inner executable; a merely
+        # session-shaped foreign command must not earn a convergence window.
+        wrapper_index = next(
+            (
+                index
+                for index in range(min(2, len(observation["argv"])))
+                if os.path.realpath(observation["argv"][index]) == wrapper_executable
+            ),
+            None,
+        )
+        if wrapper_index is None or observation["argv"][wrapper_index + 1 :] != list(
+            launch_argv[1:]
+        ):
+            _freeze(
+                provider=provider,
+                native_session_id=native_session_id,
+                reason=AMBIGUOUS_PROCESS_IMAGE_MISMATCH,
+                detail=(
+                    f"the pane process image {observed_executable!r} is neither the "
+                    f"declared inner executable {expected_inner_executable!r} nor the "
+                    "exact admitted wrapper/interpreter argv"
+                ),
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _freeze(
+                provider=provider,
+                native_session_id=native_session_id,
+                reason=AMBIGUOUS_PROCESS_IMAGE_MISMATCH,
+                detail=(
+                    f"the pane process image did not converge from the admitted route "
+                    f"wrapper to the declared inner executable "
+                    f"{expected_inner_executable!r} within "
+                    f"{INNER_EXEC_CONVERGENCE_TIMEOUT_SECONDS:g} seconds; last observed "
+                    f"image was {observed_executable!r}"
+                ),
+            )
+        time.sleep(min(INNER_EXEC_CONVERGENCE_POLL_SECONDS, remaining))
+        next_observation = _observe(
+            transport,
+            provider=provider,
+            native_session_id=native_session_id,
+            absent_reason=absent_reason,
+        )
+        next_identity = (
+            next_observation["pane_id"],
+            next_observation["pid"],
+            next_observation["start_marker"],
+        )
+        if next_identity != identity:
+            _freeze(
+                provider=provider,
+                native_session_id=native_session_id,
+                reason=AMBIGUOUS_PROCESS_IMAGE_MISMATCH,
+                detail=(
+                    "the pane process identity changed while waiting for the admitted "
+                    f"inner executable: expected {identity!r}, observed {next_identity!r}"
+                ),
+            )
+        observation = next_observation
+
+
 def _publish(
     *,
     provider: str,
@@ -373,18 +517,12 @@ def _publish(
     the provider will refuse to open, and it fails after the launch has
     already reported success.
     """
-    if not _binder(provider)["binds_exactly"](observation["argv"], native_session_id):
-        _freeze(
-            provider=provider,
-            native_session_id=native_session_id,
-            reason=AMBIGUOUS_ARGV_MISMATCH,
-            detail=(
-                f"the pane's primary process does not bind exactly {native_session_id!r}; "
-                "on both supported providers a resume that lost its id opens an "
-                "interactive picker rather than failing, so the running session may be "
-                "a different one"
-            ),
-        )
+    _verify_bound_session_and_cwd(
+        provider=provider,
+        native_session_id=native_session_id,
+        working_directory=working_directory,
+        observation=observation,
+    )
     if expected_inner_executable is not None:
         observed_executable = observation["argv"][0] if observation["argv"] else ""
         if os.path.realpath(observed_executable) != expected_inner_executable:
@@ -397,26 +535,6 @@ def _publish(
                     f"inner executable {expected_inner_executable!r}"
                 ),
             )
-    observed_cwd = os.path.realpath(observation["cwd"])
-    if observed_cwd != working_directory:
-        # Frozen rather than refused, because a process is running: it
-        # holds the bound session in a directory the session was not
-        # filed under, so it will fail to open it and exit shortly.
-        # Freezing before publication means the generation never becomes
-        # bindable, no task byte is ever typed at it, and the session
-        # stays permanently blocked instead of appearing free to the next
-        # claimant while a doomed process is still winding down.
-        _freeze(
-            provider=provider,
-            native_session_id=native_session_id,
-            reason=AMBIGUOUS_PANE_WORKDIR_MISMATCH,
-            detail=(
-                f"the pane's primary process is in {observed_cwd!r}, but session "
-                f"{native_session_id!r} is bound to {working_directory!r}; the provider "
-                "resolves a resume against the directory the session was minted in, so this "
-                "pane cannot open the session it was started for"
-            ),
-        )
     try:
         return native_attachment.mark_attached(
             provider=provider,
@@ -663,6 +781,17 @@ def start(
             native_session_id=native_session_id,
             absent_reason=AMBIGUOUS_START_CROSSED_NO_PANE,
         )
+        observation = _await_inner_exec(
+            transport,
+            provider=provider,
+            native_session_id=native_session_id,
+            working_directory=working_directory,
+            observation=observation,
+            wrapper_executable=binary,
+            launch_argv=argv,
+            expected_inner_executable=expected_inner_executable,
+            absent_reason=AMBIGUOUS_START_CROSSED_NO_PANE,
+        )
         attachment = _publish(
             provider=provider,
             native_session_id=native_session_id,
@@ -717,6 +846,17 @@ def start(
         transport,
         provider=provider,
         native_session_id=native_session_id,
+        absent_reason=AMBIGUOUS_PANE_ABSENT_AFTER_CREATE,
+    )
+    observation = _await_inner_exec(
+        transport,
+        provider=provider,
+        native_session_id=native_session_id,
+        working_directory=working_directory,
+        observation=observation,
+        wrapper_executable=binary,
+        launch_argv=argv,
+        expected_inner_executable=expected_inner_executable,
         absent_reason=AMBIGUOUS_PANE_ABSENT_AFTER_CREATE,
     )
     attachment = _publish(

@@ -86,6 +86,19 @@ class FakePane:
         return self.observation
 
 
+class SequencedPane(FakePane):
+    """Return successive observations while preserving one created pane."""
+
+    def __init__(self, observations: Sequence[Mapping[str, Any]]) -> None:
+        super().__init__()
+        self.observations = list(observations)
+
+    def observe(self) -> Optional[Mapping[str, Any]]:
+        self.observe_calls += 1
+        index = min(self.observe_calls - 1, len(self.observations) - 1)
+        return self.observations[index]
+
+
 def _canonical_workdir() -> str:
     """A real, existing, canonical directory the launcher will accept.
 
@@ -216,6 +229,125 @@ def test_relaunching_an_attached_session_never_touches_the_pane(
     assert result["outcome"] == native_tui_launch.OUTCOME_ALREADY_ATTACHED
     assert second.created == []
     assert second.observe_calls == 0
+
+
+def test_launch_waits_for_the_same_wrapper_process_to_exec_the_inner_binary(
+    isolated_memory_db: Any,
+    pinned_binary: tuple[str, str],
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    wrapper, _ = pinned_binary
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"inner")
+    inner.chmod(0o755)
+    inner_path = os.path.realpath(str(inner))
+    pane = SequencedPane(
+        [
+            _observation(["/usr/bin/python3", wrapper, "--session", SESSION]),
+            _observation([inner_path, "--session", SESSION]),
+        ]
+    )
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+
+    result = _start(
+        pinned_binary,
+        pane,
+        expected_inner_executable=inner_path,
+    )
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert result["binary"] == wrapper
+    assert result["pane_observation"]["argv"][0] == inner_path
+    assert pane.observe_calls == 2
+    assert native_attachment.get(PROVIDER, SESSION)["state"] == native_attachment.ATTACHED
+
+
+def test_inner_exec_convergence_refuses_a_replaced_process_identity(
+    isolated_memory_db: Any,
+    pinned_binary: tuple[str, str],
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    wrapper, _ = pinned_binary
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"inner")
+    inner.chmod(0o755)
+    inner_path = os.path.realpath(str(inner))
+    pane = SequencedPane(
+        [
+            _observation(
+                ["/usr/bin/python3", wrapper, "--session", SESSION],
+                pid=4321,
+            ),
+            _observation([inner_path, "--session", SESSION], pid=4322),
+        ]
+    )
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(
+            pinned_binary,
+            pane,
+            expected_inner_executable=inner_path,
+        )
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH)
+
+
+def test_inner_exec_convergence_freezes_when_the_wrapper_never_execs(
+    isolated_memory_db: Any,
+    pinned_binary: tuple[str, str],
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    wrapper, _ = pinned_binary
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"inner")
+    inner.chmod(0o755)
+    inner_path = os.path.realpath(str(inner))
+    pane = FakePane(observation=_observation(["/usr/bin/python3", wrapper, "--session", SESSION]))
+    monkeypatch.setattr(native_tui_launch, "INNER_EXEC_CONVERGENCE_TIMEOUT_SECONDS", 0.0)
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(
+            pinned_binary,
+            pane,
+            expected_inner_executable=inner_path,
+        )
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH
+    assert "did not converge" in caught.value.detail
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH)
+
+
+def test_inner_exec_convergence_does_not_wait_for_a_foreign_process(
+    isolated_memory_db: Any,
+    pinned_binary: tuple[str, str],
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"inner")
+    inner.chmod(0o755)
+    inner_path = os.path.realpath(str(inner))
+    pane = FakePane(
+        observation=_observation(["/usr/bin/python3", "/tmp/not-the-wrapper", "--session", SESSION])
+    )
+    slept: list[float] = []
+    monkeypatch.setattr(native_tui_launch.time, "sleep", slept.append)
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(
+            pinned_binary,
+            pane,
+            expected_inner_executable=inner_path,
+        )
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH
+    assert slept == []
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH)
 
 
 # --------------------------------------------------------------------------
