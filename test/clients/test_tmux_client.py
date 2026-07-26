@@ -713,22 +713,36 @@ class TestWindowExists:
     def test_a_missing_window_is_observed_as_absent(self, tmux):
         mock_session = MagicMock()
         mock_session.windows.get.side_effect = self._missing_object
+        tmux.server.is_alive.return_value = True
         tmux.server.sessions.get.return_value = mock_session
 
         assert tmux.window_exists("ses", "gone") is False
         mock_session.windows.get.assert_called_once_with(window_name="gone", default=None)
 
     def test_a_missing_session_is_observed_as_absent(self, tmux):
+        tmux.server.is_alive.return_value = True
         tmux.server.sessions.get.side_effect = self._missing_object
 
         assert tmux.window_exists("gone", "win") is False
         tmux.server.sessions.get.assert_called_once_with(session_name="gone", default=None)
 
     def test_an_unreadable_server_is_not_misreported_as_absence(self, tmux):
+        tmux.server.is_alive.return_value = True
         tmux.server.sessions.get.side_effect = RuntimeError("tmux server unreadable")
 
         with pytest.raises(RuntimeError, match="server unreadable"):
             tmux.window_exists("ses", "win")
+
+    def test_a_failed_server_probe_is_not_misreported_as_absence(self, tmux):
+        tmux.server.is_alive.return_value = False
+        # This is how libtmux's Server.sessions property represents every
+        # list-sessions failure, including permission and subprocess errors.
+        tmux.server.sessions.get.return_value = None
+
+        with pytest.raises(RuntimeError, match="unavailable or unreadable"):
+            tmux.window_exists("ses", "win")
+
+        tmux.server.sessions.get.assert_not_called()
 
 
 # ── session_exists ───────────────────────────────────────────────────
