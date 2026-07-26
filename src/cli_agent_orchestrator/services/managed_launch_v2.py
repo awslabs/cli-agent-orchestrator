@@ -73,6 +73,7 @@ from cli_agent_orchestrator.services.provider_contracts import (
     check_pinned_version,
     normalized_version,
 )
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import generate_terminal_id, managed_window_name
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,29 @@ _READINESS_RECEIPT_KINDS = {
     "codex": "codex-thread-start",
     "kimi_cli": "kimi-acp-session-new",
 }
+
+
+def _claude_profile_permission_args(agent_profile: str) -> list[str]:
+    """Return Claude permission arguments using the ordinary launch policy.
+
+    Managed native launch constructs Claude's argv directly, so it must carry
+    the same permission decision as the ordinary provider path: an explicit
+    profile mode wins, root yolo sessions omit Claude's rejected bypass flag,
+    and every other profile disables interactive approval prompts.
+    An unreadable profile raises before provider I/O instead of silently
+    degrading to interactive approval prompts.
+    """
+    profile = load_agent_profile(agent_profile)
+    if profile.permissionMode:
+        return ["--permission-mode", profile.permissionMode]
+
+    yolo = bool(profile.allowedTools and "*" in profile.allowedTools)
+    is_root = getattr(os, "geteuid", lambda: -1)() == 0
+    if yolo and is_root:
+        return []
+    return ["--dangerously-skip-permissions"]
+
+
 #: Readiness receipt kinds for native-TUI generations.
 #:
 #: The kind strings are disjoint from the ACP table above by design, so
@@ -3063,6 +3087,7 @@ async def _launch_native_tui(
                 bootstrap["requested_model"],
                 "--settings",
                 claude_native_readiness.settings_argument(readiness_hook["settings"]),
+                *_claude_profile_permission_args(record["agent_profile"]),
             ]
         else:
             bootstrap = await asyncio.to_thread(

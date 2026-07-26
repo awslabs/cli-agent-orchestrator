@@ -552,6 +552,7 @@ class TestTheObservedModelSurvivesTheRealPath:
             "observed_effort": None,
         }
         published = {}
+        launched = {}
 
         monkeypatch.setattr(bridge, "provider_version_banner", lambda _request: "2.1.220")
         monkeypatch.setattr(bridge, "native_child_environment", lambda _request: {})
@@ -566,14 +567,24 @@ class TestTheObservedModelSurvivesTheRealPath:
         monkeypatch.setattr(v2, "_claude_bootstrap_intent", lambda *_args, **_kwargs: {})
         monkeypatch.setattr(v2, "_V2NativePane", lambda **_kwargs: object())
         monkeypatch.setattr(
-            native_tui_launch,
-            "start",
-            lambda **_kwargs: {
+            v2,
+            "load_agent_profile",
+            lambda _name: type("Profile", (), {"permissionMode": "bypassPermissions"})(),
+        )
+
+        def _start(**kwargs):
+            launched.update(kwargs)
+            return {
                 "outcome": "started",
                 "launch_argv_sha256": "a" * 64,
                 "pane_handle": "%1",
                 "attachment": {"owner": {"pane_id": "%1"}},
-            },
+            }
+
+        monkeypatch.setattr(
+            native_tui_launch,
+            "start",
+            _start,
         )
         monkeypatch.setattr(
             claude_native_readiness,
@@ -605,6 +616,54 @@ class TestTheObservedModelSurvivesTheRealPath:
         assert result["state"] == "launching"
         assert published["model"] == OBSERVED_OPUS_1M
         assert bootstrap["observed_model"] == OBSERVED_OPUS_1M
+        assert launched["extra_args"][-2:] == ["--permission-mode", "bypassPermissions"]
+
+    def test_native_permission_args_preserve_a_non_bypass_profile(self, monkeypatch):
+        monkeypatch.setattr(
+            v2,
+            "load_agent_profile",
+            lambda _name: type(
+                "Profile",
+                (),
+                {"permissionMode": "acceptEdits", "allowedTools": []},
+            )(),
+        )
+
+        assert v2._claude_profile_permission_args("reviewer") == [
+            "--permission-mode",
+            "acceptEdits",
+        ]
+
+    def test_native_permission_args_disable_prompts_by_default(self, monkeypatch):
+        monkeypatch.setattr(
+            v2,
+            "load_agent_profile",
+            lambda _name: type(
+                "Profile",
+                (),
+                {"permissionMode": None, "allowedTools": ["@builtin"]},
+            )(),
+        )
+
+        assert v2._claude_profile_permission_args("reviewer") == [
+            "--dangerously-skip-permissions"
+        ]
+
+    def test_native_permission_args_omit_rejected_flag_for_root_yolo(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            v2,
+            "load_agent_profile",
+            lambda _name: type(
+                "Profile",
+                (),
+                {"permissionMode": "", "allowedTools": ["*"]},
+            )(),
+        )
+        monkeypatch.setattr(v2.os, "geteuid", lambda: 0)
+
+        assert v2._claude_profile_permission_args("reviewer") == []
 
 
 class TestOneCompletenessRuleForBindAndProjection:
