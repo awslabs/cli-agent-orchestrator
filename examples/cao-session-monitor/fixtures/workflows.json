@@ -1,0 +1,18 @@
+[
+  {
+    "name": "nightly-report",
+    "source_path": "/tmp/cao-isolated-home/workflows/nightly-report.yaml",
+    "mode": "sequential",
+    "step_count": 1,
+    "description": "Summarize overnight activity and post a digest",
+    "indexed_at": "2026-07-24T21:16:11Z"
+  },
+  {
+    "name": "pr-review",
+    "source_path": "/tmp/cao-isolated-home/workflows/pr-review.yaml",
+    "mode": "sequential",
+    "step_count": 2,
+    "description": "Review an open pull request end to end",
+    "indexed_at": "2026-07-24T21:16:11Z"
+  }
+]

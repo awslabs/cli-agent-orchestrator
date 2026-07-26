@@ -1,0 +1,20 @@
+id = "cao.session-monitor"
+name = "CAO Session Monitor"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Read-only status pane for CAO sessions, flows, and workflows inside the herdr `cao` session"
+
+[[panes]]
+id = "cao-session"
+title = "CAO SESSION"
+placement = "split"
+command = ["python3", "cao_session_monitor.py"]
+
+[[actions]]
+id = "open"
+title = "CAO: open session monitor"
+contexts = ["global"]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "cao.session-monitor", "--entrypoint", "cao-session", "--placement", "split"]
+
+[[startup]]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "cao.session-monitor", "--entrypoint", "cao-session", "--placement", "split"]

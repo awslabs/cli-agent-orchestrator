@@ -1,0 +1,52 @@
+[
+  {
+    "op": "replace",
+    "path": "/counts/sessions",
+    "value": 2
+  },
+  {
+    "op": "replace",
+    "path": "/counts/terminals",
+    "value": 2
+  },
+  {
+    "op": "replace",
+    "path": "/sessions",
+    "value": [
+      {
+        "id": "cao-isolated-test",
+        "name": "cao-isolated-test",
+        "status": "detached"
+      },
+      {
+        "id": "cao-isolated-test-2",
+        "name": "cao-isolated-test-2",
+        "status": "detached"
+      }
+    ]
+  },
+  {
+    "op": "replace",
+    "path": "/terminals",
+    "value": [
+      {
+        "id": "e5e12b7d",
+        "session_name": "cao-isolated-test",
+        "provider": "mock_cli",
+        "agent_profile": "developer",
+        "window": "developer-987d",
+        "status": null,
+        "last_active": "2026-07-24T14:10:14.418176"
+      },
+      {
+        "id": "00abca43",
+        "session_name": "cao-isolated-test-2",
+        "provider": "mock_cli",
+        "agent_profile": "developer",
+        "window": "developer-f24b",
+        "status": null,
+        "last_active": "2026-07-24T14:10:38.153088"
+      }
+    ]
+  }
+]

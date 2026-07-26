@@ -1,0 +1,39 @@
+{
+  "sessions": [
+    {
+      "id": "cao-isolated-test",
+      "name": "cao-isolated-test",
+      "status": "detached"
+    },
+    {
+      "id": "cao-isolated-test-2",
+      "name": "cao-isolated-test-2",
+      "status": "detached"
+    }
+  ],
+  "terminals": [
+    {
+      "id": "e5e12b7d",
+      "session_name": "cao-isolated-test",
+      "provider": "mock_cli",
+      "agent_profile": "developer",
+      "window": "developer-987d",
+      "status": null,
+      "last_active": "2026-07-24T14:10:14.418176"
+    },
+    {
+      "id": "00abca43",
+      "session_name": "cao-isolated-test-2",
+      "provider": "mock_cli",
+      "agent_profile": "developer",
+      "window": "developer-f24b",
+      "status": null,
+      "last_active": "2026-07-24T14:10:38.153088"
+    }
+  ],
+  "counts": {
+    "sessions": 2,
+    "terminals": 2
+  },
+  "scopes": ["cao:read", "cao:write", "cao:admin"]
+}
