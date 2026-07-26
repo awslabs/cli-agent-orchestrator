@@ -83,6 +83,8 @@ LAUNCH_SCHEMA = "cao-native-tui-launch-v1"
 OBSERVATION_SCHEMA = "cao-native-tui-pane-observation-v1"
 INNER_EXEC_CONVERGENCE_TIMEOUT_SECONDS = 2.0
 INNER_EXEC_CONVERGENCE_POLL_SECONDS = 0.05
+ENV_EXECUTABLE = os.path.realpath("/usr/bin/env")
+MAX_SHEBANG_LINE_BYTES = 512
 
 #: A fresh launch: this call declared the attachment, started the pane,
 #: and published the proven process identity.
@@ -391,6 +393,36 @@ def _verify_bound_session_and_cwd(
         )
 
 
+def _env_shebang_interpreter(wrapper_executable: str) -> Optional[str]:
+    """Return the sole interpreter token from a pinned env shebang.
+
+    The wrapper path has already been digest-verified by the launch path.  Read
+    only a bounded first line and accept exactly ``#!/usr/bin/env <token>``.
+    Multi-token forms such as ``env -S`` intentionally receive no transient
+    allowance.
+    """
+    try:
+        with open(wrapper_executable, "rb") as wrapper:
+            first_line = wrapper.readline(MAX_SHEBANG_LINE_BYTES + 1)
+    except OSError:
+        return None
+    if not first_line or len(first_line) > MAX_SHEBANG_LINE_BYTES:
+        return None
+    try:
+        shebang = first_line.rstrip(b"\r\n").decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if not shebang.startswith("#!"):
+        return None
+    payload = shebang[2:]
+    if any(character.isspace() and character not in " \t" for character in payload):
+        return None
+    tokens = payload.strip(" \t").split()
+    if len(tokens) != 2 or os.path.realpath(tokens[0]) != ENV_EXECUTABLE:
+        return None
+    return tokens[1]
+
+
 def _await_inner_exec(
     transport: NativePaneTransport,
     *,
@@ -420,6 +452,7 @@ def _await_inner_exec(
         observation["pid"],
         observation["start_marker"],
     )
+    env_shebang_interpreter = _env_shebang_interpreter(wrapper_executable)
     deadline = time.monotonic() + INNER_EXEC_CONVERGENCE_TIMEOUT_SECONDS
     while True:
         _verify_bound_session_and_cwd(
@@ -444,9 +477,19 @@ def _await_inner_exec(
             ),
             None,
         )
-        if wrapper_index is None or observation["argv"][wrapper_index + 1 :] != list(
-            launch_argv[1:]
-        ):
+        wrapper_phase = wrapper_index is not None and observation["argv"][
+            wrapper_index + 1 :
+        ] == list(launch_argv[1:])
+        argv = observation["argv"]
+        env_wrapper_phase = (
+            env_shebang_interpreter is not None
+            and len(argv) >= 3
+            and os.path.realpath(argv[0]) == ENV_EXECUTABLE
+            and argv[1] == env_shebang_interpreter
+            and os.path.realpath(argv[2]) == wrapper_executable
+            and argv[3:] == list(launch_argv[1:])
+        )
+        if not wrapper_phase and not env_wrapper_phase:
             _freeze(
                 provider=provider,
                 native_session_id=native_session_id,
