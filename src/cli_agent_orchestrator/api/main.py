@@ -2153,13 +2153,25 @@ async def reconcile_managed_launch_v2(
 
 @app.post("/managed-launch/v2/reservations/{reservation_id}/cleanup")
 async def cleanup_managed_launch_v2(
+    request: Request,
     reservation_id: str,
     body: ManagedLaunchV2CleanupRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
-    """Release the fork-owned v2 terminal record for a finalized generation."""
+    """Tear down a finalized zero-byte v2 generation and record the cleanup proof.
+
+    Drives the generation/session-bound terminal teardown (pane, provider
+    process, fork-owned resources, v2 terminal row) before persisting the
+    absorbing ``cleaned`` proof, using the live plugin registry so teardown
+    events and resource cleanup stay coherent.
+    """
     try:
-        return await asyncio.to_thread(managed_launch_v2.cleanup, reservation_id, body)
+        return await asyncio.to_thread(
+            managed_launch_v2.cleanup,
+            reservation_id,
+            body,
+            registry=get_plugin_registry(request),
+        )
     except managed_launch.ManagedLaunchError as exc:
         raise _managed_launch_http_error(exc)
 

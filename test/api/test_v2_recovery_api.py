@@ -30,6 +30,27 @@ def _companion(tmp_path, monkeypatch):
     monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companion")
 
 
+@pytest.fixture(autouse=True)
+def _stub_native_teardown(monkeypatch):
+    """The cleanup route now drives the generation-bound terminal teardown.
+
+    This suite proves the wire contract (status codes, request validation),
+    not tmux teardown, so the exact teardown is stubbed to a confirming
+    no-op. The teardown contract itself is exercised in
+    ``test_v2_cleanup_teardown.py``.
+    """
+
+    def _delete_terminal(
+        terminal_id, *, registry=None, expected_generation=None, expected_session=None, **_
+    ):
+        return True
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal",
+        _delete_terminal,
+    )
+
+
 @pytest.fixture
 def worktree(tmp_path):
     repo = tmp_path / "repo"
@@ -185,3 +206,31 @@ def test_cleanup_before_finalization_is_409(client, isolated_memory_db, worktree
     record = _blocked_reservation(client, worktree, tmp_path)
     resp = client.post(f"{V2_ROOT}/{record['reservation_id']}/cleanup", json=_cleanup_body(record))
     assert resp.status_code == 409, resp.text
+
+
+def test_cleanup_route_forwards_the_live_plugin_registry(
+    client, isolated_memory_db, worktree, tmp_path, monkeypatch
+):
+    """The teardown must run with the endpoint's live registry, not None.
+
+    Normal terminal teardown dispatches plugin events (post_kill_terminal)
+    and resource cleanup through the registry; passing None would silently
+    skip them, so a cleaned generation would leave the same orphans the row
+    -only cleanup did.
+    """
+    from cli_agent_orchestrator.api.main import app
+
+    record = _blocked_reservation(client, worktree, tmp_path)
+    client.post(f"{V2_ROOT}/{record['reservation_id']}/negative", json=_negative_body(record))
+
+    seen = {}
+
+    def _record(terminal_id, *, registry=None, **_):
+        seen["registry"] = registry
+        return True
+
+    monkeypatch.setattr("cli_agent_orchestrator.services.terminal_service.delete_terminal", _record)
+
+    resp = client.post(f"{V2_ROOT}/{record['reservation_id']}/cleanup", json=_cleanup_body(record))
+    assert resp.status_code == 200, resp.text
+    assert seen["registry"] is app.state.plugin_registry

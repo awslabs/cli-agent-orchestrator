@@ -2824,6 +2824,20 @@ def delete_terminal(
         if expected_generation is not None:
             if terminal_record_absent:
                 deleted = True
+                # The row is gone (a crash after teardown removed it, or a
+                # prior cleanup) but the generation's resource-registry
+                # entries can outlive the row. Deregister the exact
+                # generation's entries with the reserved session too, so a
+                # cleaned row-absent generation leaves no live registry
+                # entries -- the same effect the v2-row branch applies after
+                # its delete. This runs after the absence/replacement
+                # rechecks, and enumeration is keyed by exact terminal +
+                # generation, so a replacement incarnation is untouched.
+                _deregister_v2_terminal_resources(
+                    terminal_id,
+                    expected_generation,
+                    session_name=expected_session,
+                )
             elif v2_record:
                 deleted = db_delete_terminal_v2_if_generation(terminal_id, expected_generation)
                 if not deleted:

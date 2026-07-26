@@ -226,3 +226,69 @@ def test_v2_companion_binding_without_row_uses_exact_window(monkeypatch, tmp_pat
         ("managed-session", terminals.managed_window_name(terminal_id, generation)),
         {},
     ) in backend.calls
+
+
+def test_row_absent_delete_deregisters_exact_generation_registry_entries(monkeypatch, tmp_path):
+    """A row-absent generation's live registry entries are drained on cleanup.
+
+    Recovery reruns teardown against the immutable generation window when the
+    terminal row is already gone (a crash after teardown, or a prior cleanup).
+    That path kills the window but used to skip the resource-registry
+    deregister, so a cleaned row-absent generation left live registry entries.
+    Deregistration is keyed by exact terminal + generation, so a replacement
+    incarnation's entries survive untouched (zero effect on a replacement).
+    """
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    terminal_id = "d0e1f2a3"
+    generation = str(uuid.uuid4())
+    replacement_generation = str(uuid.uuid4())
+
+    # A real registry with two declared managed-window entries: the target
+    # generation and a replacement incarnation reusing the terminal id.
+    registry = rr.ResourceRegistry(tmp_path / "registry.sqlite")
+    for gen in (generation, replacement_generation):
+        window = terminals.managed_window_name(terminal_id, gen)
+        registry.declare(
+            entry_id=window,
+            kind="tmux_window",
+            protocol_vintage="v2",
+            terminal_id=terminal_id,
+            generation=gen,
+            owner="fork",
+            ownership="owned",
+            constructor_id="terminal_service.create_terminal",
+            deleter_id="terminal_service.delete_terminal",
+            rollback_rule="generation-isolated",
+            actor_id="terminal_service.create_terminal",
+            desired_tmux_name=window,
+        )
+    monkeypatch.setattr(rr, "get_resource_registry", lambda *a, **k: registry)
+
+    # Row-absent: no terminal metadata rows, and the window is already gone
+    # (a bare spy reports window_exists as None -> absent).
+    monkeypatch.setattr(terminals, "get_terminal_metadata", lambda tid: None)
+    monkeypatch.setattr(terminals, "get_terminal_metadata_v2", lambda tid: None)
+    monkeypatch.setattr(terminals, "get_backend", lambda: _Spy())
+    monkeypatch.setattr(terminals, "fifo_manager", _Spy())
+    monkeypatch.setattr(terminals, "status_monitor", _Spy())
+    monkeypatch.setattr(terminals, "provider_manager", _Spy())
+    monkeypatch.setattr(terminals, "get_herdr_inbox_service", lambda: None)
+    monkeypatch.setattr(terminals, "TERMINAL_LOG_DIR", tmp_path)
+    monkeypatch.setattr(terminals, "dispatch_plugin_event", lambda *a, **k: None)
+
+    deleted = terminals.delete_terminal(
+        terminal_id,
+        expected_generation=generation,
+        expected_session="managed-session",
+    )
+
+    assert deleted is True
+    # The exact generation's entry was deregistered (declared -> aborted on
+    # verified window absence); the replacement incarnation is untouched.
+    target = registry.resolve(terminals.managed_window_name(terminal_id, generation))
+    replacement = registry.resolve(
+        terminals.managed_window_name(terminal_id, replacement_generation)
+    )
+    assert target["lifecycle_state"] == "aborted"
+    assert replacement["lifecycle_state"] == "declared"

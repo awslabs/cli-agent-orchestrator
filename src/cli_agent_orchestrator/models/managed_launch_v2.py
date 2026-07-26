@@ -242,12 +242,13 @@ class ManagedLaunchV2NegativeRequest(BaseModel):
 
 
 class ManagedLaunchV2CleanupRequest(BaseModel):
-    """Release the terminal record for a finalized zero-byte generation.
+    """Release a finalized zero-byte generation: tear it down, then prove it.
 
     Idempotent by ``cleanup_id``; the terminal/generation identity must
-    match the reservation row.  This releases only the fork-owned terminal
-    metadata record — it never tears down a pane or process, which remains
-    the destructive endpoint's job under its own containment gate.
+    match the reservation row.  The managed cleanup tears down the exact
+    generation's pane, provider process, and fork-owned resources through
+    the generation/session-bound terminal teardown, and removes the v2
+    terminal record, before it records the absorbing cleanup proof.
     """
 
     protocol_version: ProtocolVersionV2

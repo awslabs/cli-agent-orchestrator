@@ -1667,34 +1667,57 @@ def reconcile(reservation_id: str) -> dict[str, Any]:
     }
 
 
-def cleanup(reservation_id: str, request: ManagedLaunchV2CleanupRequest) -> dict[str, Any]:
-    """Release the fork-owned terminal record for a finalized zero-byte generation.
+def cleanup(
+    reservation_id: str,
+    request: ManagedLaunchV2CleanupRequest,
+    *,
+    registry: Any = None,
+) -> dict[str, Any]:
+    """Release a finalized zero-byte generation: tear it down, then prove it.
 
-    Writes a durable cleanup record, once, first-writer-wins by
-    ``cleanup_id``. That record — not the absence of the terminal row — is
-    what projects the response's top-level ``state`` as ``cleaned``. An
-    absent row is not proof a cleanup happened: it can be missing for
-    having never existed, or for having been removed by something else, and
-    projecting from it would report a cleanup nobody performed.
+    For a finalized ``negative`` generation, this performs the
+    generation/session-bound terminal teardown — reusing
+    :func:`terminal_service.delete_terminal`, not a second pane-kill — and
+    only then writes the durable cleanup record. ``cleaned`` means the
+    exact generation's pane, its provider process, its fork-owned
+    resources, and the v2 terminal row are all gone, verified by the
+    teardown before any proof is persisted. Releasing only the row left the
+    pane and process alive and invisible, so a cleaned generation that was
+    not in fact cleaned became the absorbing answer.
+
+    The durable record — not the absence of the terminal row — is what
+    projects the response's top-level ``state`` as ``cleaned``. An absent
+    row is not proof a cleanup happened: it can be missing for having never
+    existed, or for having been removed by something else, and projecting
+    from it would report a cleanup nobody performed.
 
     ``cleaned`` is absorbing and idempotent. A retry with the same
     ``cleanup_id`` replays the byte-identical stored proof — the same
     ``cleaned_at``, the same ``terminal_record_removed`` — and performs no
-    second delete. It is the *answer* that has to be idempotent, not just
-    the effect: the answer is what crosses the boundary, and a consumer
-    that persists a different proof on a retry has persisted a different
-    fact. Recomputing it meant a retry after the first success reported
-    ``terminal_record_removed: false`` and a fresh timestamp, so which
-    proof a consumer stored depended on when it happened to ask.
+    second teardown, because the replay returns before teardown is reached.
+    It is the *answer* that has to be idempotent, not just the effect: the
+    answer is what crosses the boundary, and a consumer that persists a
+    different proof on a retry has persisted a different fact. The teardown
+    itself is rerun safely only when the response (not the teardown) was
+    lost: the managed window name embeds the immutable generation, so a
+    crash after physical teardown but before the proof persisted can rerun
+    the same teardown against the same window identity and converge.
 
     A *different* ``cleanup_id`` against an already-cleaned generation is a
     conflict, not a second cleanup.
 
+    Teardown is addressed only from this reservation's fork-owned identity
+    — terminal id, generation, and session. A replacement generation or a
+    foreign session is refused with zero destructive effect (a typed
+    conflict), and a window that survives the kill or a teardown whose
+    result cannot be verified leaves the row recoverable in ``negative``
+    and writes no cleanup proof.
+
     Valid only once the generation is finalized (``negative``); refused
-    while it is still live. This releases only the v2 terminal *metadata*
-    row — it never tears down a pane or process, which stays the
-    destructive endpoint's job under its own containment gate.
+    while it is still live.
     """
+    from cli_agent_orchestrator.services import terminal_service
+
     try:
         with database.SessionLocal() as db:
             row = _query(db, reservation_id)
@@ -1706,17 +1729,57 @@ def cleanup(reservation_id: str, request: ManagedLaunchV2CleanupRequest) -> dict
             stored = _parse_json(getattr(row, "cleanup_json", None), None)
             if stored is not None:
                 _assert_same_cleanup(stored, request)
-                # Absorbing: the stored proof is replayed exactly, and no
-                # second delete is attempted.
+                # Absorbing: the stored proof is replayed exactly. The
+                # pane/process/terminal row were torn down by the call that
+                # first wrote this proof, and a replay returns before
+                # teardown, so no second teardown is attempted.
                 return _row_dict(row)
             if row.state != "negative":
                 raise ManagedLaunchConflict(
                     f"v2 cleanup requires the finalized state 'negative', not {row.state!r}"
                 )
+            # The session is the fork-owned reservation identity. The
+            # window identity is derived from the immutable generation
+            # inside the teardown, so a replacement incarnation cannot be
+            # reached from this identity.
+            session_name = row.session_name
+
+        # Physical teardown BEFORE the proof is persisted, addressed from
+        # the exact generation/session identity. The teardown kills the
+        # managed window (terminating the provider process), releases the
+        # fork-owned resources, and removes the v2 terminal row, raising if
+        # the window survives or the live row names a different incarnation
+        # — so a teardown that returns is the verified absence the proof
+        # records.
+        try:
+            torn_down = terminal_service.delete_terminal(
+                request.terminal_id,
+                registry=registry,
+                expected_generation=request.generation,
+                expected_session=session_name,
+            )
+        except terminal_service.TerminalGenerationMismatchError as exc:
+            # Zero destructive effect reached the replacement incarnation;
+            # the generation stays recoverable in ``negative``.
+            raise ManagedLaunchConflict(
+                f"v2 cleanup teardown refused for terminal {request.terminal_id}: {exc}"
+            ) from exc
+        if not torn_down:
+            raise ManagedLaunchUnavailable(
+                f"v2 cleanup teardown did not confirm removal of terminal "
+                f"{request.terminal_id}; refusing to report a cleanup it "
+                "could not verify"
+            )
+        terminal_record_removed = torn_down
 
         cleaned_at = _now()
 
-        def _build(terminal_record_removed: bool) -> str:
+        def _build(_observed_by_recorder: bool) -> str:
+            # The teardown above is the source of truth for removal, not
+            # the recorder's own delete: that delete now finds nothing,
+            # because the teardown already removed the row under the exact
+            # generation. Recording the verified outcome keeps the proof
+            # honest and lets it replay byte-identically on retry.
             return _canonical_json(
                 {
                     "schema": "cao-managed-launch-v2-cleanup-v1",
