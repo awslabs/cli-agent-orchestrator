@@ -3,7 +3,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { X, Terminal as TermIcon } from 'lucide-react'
-import { api } from '../api'
+import { api, type ApiError } from '../api'
 
 interface TerminalViewProps {
   terminalId: string
@@ -17,12 +17,31 @@ const TERMINAL_FONT_SIZE = 14
 // Fallback row height (px) used only when the container has not been laid out
 // yet, so a touch delta can still be turned into whole wheel notches.
 const DEFAULT_LINE_HEIGHT = Math.round(TERMINAL_FONT_SIZE * 1.2)
+const CONTROL_UNSUPPORTED_STATUSES = new Set([404, 405, 501])
+const CONTROL_AMBIGUOUS_STATUSES = new Set([408, 425, 500, 502, 503, 504])
+
+function isWheelMouseReport(data: string): boolean {
+  const sgr = /^\x1b\[<(\d+);\d+;\d+[Mm]$/.exec(data)
+  if (sgr) return (Number(sgr[1]) & 64) === 64
+
+  // Legacy X10 mouse reports encode the button and coordinates as three
+  // bytes after ESC [ M. Keep this narrow so printable input and paste stay
+  // blocked on managed transcript panes.
+  if (data.length === 6 && data.startsWith('\x1b[M')) {
+    const button = data.charCodeAt(3) - 32
+    return button >= 0 && (button & 64) === 64
+  }
+  return false
+}
 
 export function TerminalView({ terminalId, provider, agentProfile, onClose }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const managedRef = useRef<boolean | null>(null)
   const [managed, setManaged] = useState(false)
   const [generation, setGeneration] = useState<string | undefined>()
+  const [executionMode, setExecutionMode] = useState<string | undefined>()
+  const [nativeControlSupported, setNativeControlSupported] = useState(false)
+  const [nativeControlResolved, setNativeControlResolved] = useState(false)
   const [message, setMessage] = useState('')
   const [model, setModel] = useState('')
   const [effort, setEffort] = useState('')
@@ -36,6 +55,26 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         managedRef.current = result.managed
         setManaged(result.managed)
         setGeneration(result.generation)
+        setExecutionMode(result.execution_mode)
+        setNativeControlSupported(false)
+        setNativeControlResolved(result.execution_mode !== 'native_tui')
+        if (result.managed && result.execution_mode === 'native_tui') {
+          api.getControlInputCapabilities()
+            .then(capabilities => {
+              setNativeControlSupported(
+                capabilities.execution_modes.includes('native_tui')
+                && capabilities.literal_write === true
+                && capabilities.bracketed_paste === false
+                && capabilities.enter_required === true,
+              )
+              setNativeControlResolved(true)
+            })
+            .catch(() => {
+              setNativeControlSupported(false)
+              setNativeControlResolved(true)
+              setControlStatus('native control capability unavailable')
+            })
+        }
       })
       .catch(() => {
         // Unknown control identity is not proof this is an ordinary TUI.
@@ -44,6 +83,9 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         managedRef.current = null
         setManaged(false)
         setGeneration(undefined)
+        setExecutionMode(undefined)
+        setNativeControlSupported(false)
+        setNativeControlResolved(false)
         setControlStatus('terminal control identity unavailable')
       })
   }, [terminalId])
@@ -91,6 +133,75 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       } catch {
         setControlStatus(
           `${body.action}: response unavailable; operation ${operationId} retained for reconciliation`,
+        )
+      }
+    } finally {
+      setControlBusy(false)
+    }
+  }
+
+  const runNativeControl = async (text: string, label: string) => {
+    const controlId = crypto.randomUUID()
+    setControlBusy(true)
+    setControlStatus(`${label}: submitting… (${controlId})`)
+    try {
+      const identity = await api.getControlIdentity(terminalId)
+      const expectedIdentity = Object.fromEntries(
+        [
+          'terminal_id',
+          'terminal_incarnation',
+          'terminal_generation',
+          'pane_birth_id',
+          'provider_process_id',
+          'provider',
+          'native_session_id',
+          'execution_mode',
+          'session_name',
+        ].map(key => [key, identity[key] ?? null]),
+      )
+      const response = await api.sendControlInput(terminalId, {
+        control_id: controlId,
+        text,
+        enter: true,
+        expected_identity: expectedIdentity,
+      })
+      const outcome = String(response.outcome || 'unknown')
+      const reason = response.reason_code || response.reason_detail
+      setControlStatus(
+        `${label}: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}`,
+      )
+      if (label === 'send' && outcome === 'accepted') setMessage('')
+    } catch (error) {
+      const apiError = error as ApiError
+      if (apiError.status && CONTROL_UNSUPPORTED_STATUSES.has(apiError.status)) {
+        setControlStatus(
+          `${label}: unsupported (HTTP ${apiError.status})`
+          + (apiError.detail ? ` — ${apiError.detail}` : ''),
+        )
+        return
+      }
+      if (
+        apiError.status
+        && !CONTROL_AMBIGUOUS_STATUSES.has(apiError.status)
+        && apiError.status >= 400
+        && apiError.status < 500
+      ) {
+        setControlStatus(
+          `${label}: refused (HTTP ${apiError.status})`
+          + (apiError.detail ? ` — ${apiError.detail}` : ''),
+        )
+        return
+      }
+      try {
+        const response = await api.queryControlInput(controlId)
+        const outcome = String(response.outcome || 'unknown')
+        const reason = response.reason_code || response.reason_detail
+        setControlStatus(
+          `${label}: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}`,
+        )
+      } catch {
+        setControlStatus(
+          `${label}: response unavailable; control ${controlId} retained for reconciliation`,
         )
       }
     } finally {
@@ -260,7 +371,13 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       // Its stdin is deliberately not a provider input channel; controls use
       // the exact generation-bound API above.  Hold input while managed status
       // is unresolved so an early paste cannot leak into the wrong transport.
-      if (managedRef.current === false && ws.readyState === WebSocket.OPEN) {
+      if (
+        ws.readyState === WebSocket.OPEN
+        && (
+          managedRef.current === false
+          || (managedRef.current === true && isWheelMouseReport(data))
+        )
+      ) {
         ws.send(JSON.stringify({ type: 'input', data }))
       }
     })
@@ -298,6 +415,9 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     }
   }, [terminalId])
 
+  const nativeManaged = managed && executionMode === 'native_tui'
+  const acpManaged = managed && executionMode === 'acp'
+
   return (
     <div className="fixed inset-0 z-50 flex flex-col" style={{ background: '#0d1117' }}>
       {/* Header */}
@@ -307,7 +427,15 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
           <span className="text-sm font-mono text-gray-300">{terminalId}</span>
           {provider && <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">{provider}</span>}
           {agentProfile && <span className="text-xs text-emerald-400 bg-emerald-900/30 px-2 py-0.5 rounded">{agentProfile}</span>}
-          {managed && <span className="text-xs text-cyan-300 bg-cyan-900/30 px-2 py-0.5 rounded">Managed ACP · read-only transcript</span>}
+          {managed && (
+            <span className="text-xs text-cyan-300 bg-cyan-900/30 px-2 py-0.5 rounded">
+              {nativeManaged
+                ? 'Managed native TUI · identity-bound controls'
+                : acpManaged
+                  ? 'Managed ACP · read-only transcript'
+                  : 'Managed mode unknown · controls unavailable'}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-3">
           <span className="text-[10px] text-gray-600">Click X to close</span>
@@ -320,7 +448,48 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
           </button>
         </div>
       </div>
-      {managed && (
+      {nativeManaged && nativeControlSupported && (
+        <div className="shrink-0 border-b border-gray-700/50 bg-gray-950 px-4 py-2 space-y-2">
+          <div className="flex gap-2">
+            <input
+              value={message}
+              onChange={event => setMessage(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === 'Enter' && message.trim() && !controlBusy) {
+                  void runNativeControl(message.trim(), 'send')
+                }
+              }}
+              placeholder="Send literal text to the native composer…"
+              className="min-w-0 flex-1 rounded border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none"
+            />
+            <button
+              disabled={controlBusy || !message.trim()}
+              onClick={() => void runNativeControl(message.trim(), 'send')}
+              className="rounded bg-emerald-700 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+            >
+              Send
+            </button>
+            <button
+              disabled={controlBusy}
+              onClick={() => void runNativeControl('/compact', 'compact')}
+              className="rounded bg-indigo-700 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+            >
+              Compact
+            </button>
+          </div>
+          <div className="flex items-center gap-2 text-[11px] text-gray-500">
+            <span>Cancel, route, effort, and resume controls are unavailable for native TUI sessions.</span>
+            <span className="min-w-0 truncate">{controlStatus}</span>
+          </div>
+        </div>
+      )}
+      {nativeManaged && nativeControlResolved && !nativeControlSupported && (
+        <div className="shrink-0 border-b border-gray-700/50 bg-gray-950 px-4 py-2 text-[11px] text-amber-300">
+          Native control input is unsupported by this server; no dashboard actions are available.
+          <span className="ml-2 text-gray-500">{controlStatus}</span>
+        </div>
+      )}
+      {acpManaged && (
         <div className="shrink-0 border-b border-gray-700/50 bg-gray-950 px-4 py-2 space-y-2">
           <div className="flex gap-2">
             <input

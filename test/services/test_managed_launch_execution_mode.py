@@ -97,6 +97,16 @@ def test_reserve_without_mode_or_class_stays_acp(isolated_memory_db, tmp_path):
     assert record["is_legacy_execution_mode"] is False
 
 
+def test_v1_control_projection_names_its_only_supported_mode(isolated_memory_db, tmp_path):
+    record, _ = managed_launch.reserve(_reserve_request(tmp_path))
+
+    identity = managed_launch.managed_control_identity(record["terminal_id"])
+
+    assert identity is not None
+    assert identity["vintage"] == "v1"
+    assert identity["execution_mode"] == em.ACP
+
+
 def test_request_echo_is_faithful_rather_than_resolved(isolated_memory_db, tmp_path):
     """The echo mirrors the request; the resolved mode is separate.
 

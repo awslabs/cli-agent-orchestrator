@@ -207,7 +207,34 @@ export const api = {
   sendInput: (id: string, message: string) =>
     fetchJSON<{ success: boolean }>(`/terminals/${id}/input?message=${encodeURIComponent(message)}`, { method: 'POST' }),
   getManagedControl: (id: string) =>
-    fetchJSON<{ managed: boolean; generation?: string; provider?: string }>(`/terminals/${id}/managed-control`),
+    fetchJSON<{ managed: boolean; generation?: string; provider?: string; execution_mode?: string; vintage?: string }>(`/terminals/${id}/managed-control`),
+  getControlInputCapabilities: () =>
+    fetchJSON<{
+      protocol: string
+      execution_modes: string[]
+      literal_write: boolean
+      bracketed_paste: boolean
+      enter_required: boolean
+    }>('/control-input/capabilities'),
+  getControlIdentity: (id: string) =>
+    fetchJSON<Record<string, unknown>>(`/terminals/${id}/control-identity`),
+  sendControlInput: (
+    id: string,
+    body: {
+      control_id: string
+      text: string
+      enter: boolean
+      expected_identity: Record<string, unknown>
+    }
+  ) =>
+    fetchJSON<Record<string, unknown>>(`/terminals/${id}/control-input`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      timeoutMs: 15000,
+    }),
+  queryControlInput: (controlId: string) =>
+    fetchJSON<Record<string, unknown>>(`/control-input/${encodeURIComponent(controlId)}`),
   beginManagedOperation: (
     id: string,
     body: {
