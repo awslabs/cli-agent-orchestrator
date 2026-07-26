@@ -39,8 +39,7 @@ from cli_agent_orchestrator.services import managed_launch_v2 as v2
 from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services import native_attachment
 from cli_agent_orchestrator.services import native_pane_input as npi
-from cli_agent_orchestrator.services import native_tui_launch
-from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services import native_tui_launch, terminal_service
 from cli_agent_orchestrator.services.managed_launch import ManagedLaunchConflict
 
 PINNED_VERSION_BANNER = "kimi 0.29.0"

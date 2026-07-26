@@ -3303,6 +3303,7 @@ async def _launch_native_tui(
         claude_native_readiness,
         glm_native_launch,
         kimi_native_bootstrap,
+        session_env,
     )
     from cli_agent_orchestrator.services.managed_provider_bridge import (
         BRIDGE_VERSION,
@@ -3311,7 +3312,6 @@ async def _launch_native_tui(
         provider_version_banner,
         publish_native_ready_state,
     )
-    from cli_agent_orchestrator.services import session_env
 
     provider = record["provider"]
     if provider not in NATIVE_TUI_PROVIDERS:
