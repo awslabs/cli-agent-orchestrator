@@ -20,6 +20,20 @@ const DEFAULT_LINE_HEIGHT = Math.round(TERMINAL_FONT_SIZE * 1.2)
 const CONTROL_UNSUPPORTED_STATUSES = new Set([404, 405, 501])
 const CONTROL_AMBIGUOUS_STATUSES = new Set([408, 425, 500, 502, 503, 504])
 
+function isWheelMouseReport(data: string): boolean {
+  const sgr = /^\x1b\[<(\d+);\d+;\d+[Mm]$/.exec(data)
+  if (sgr) return (Number(sgr[1]) & 64) === 64
+
+  // Legacy X10 mouse reports encode the button and coordinates as three
+  // bytes after ESC [ M. Keep this narrow so printable input and paste stay
+  // blocked on managed transcript panes.
+  if (data.length === 6 && data.startsWith('\x1b[M')) {
+    const button = data.charCodeAt(3) - 32
+    return button >= 0 && (button & 64) === 64
+  }
+  return false
+}
+
 export function TerminalView({ terminalId, provider, agentProfile, onClose }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const managedRef = useRef<boolean | null>(null)
@@ -357,7 +371,13 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       // Its stdin is deliberately not a provider input channel; controls use
       // the exact generation-bound API above.  Hold input while managed status
       // is unresolved so an early paste cannot leak into the wrong transport.
-      if (managedRef.current === false && ws.readyState === WebSocket.OPEN) {
+      if (
+        ws.readyState === WebSocket.OPEN
+        && (
+          managedRef.current === false
+          || (managedRef.current === true && isWheelMouseReport(data))
+        )
+      ) {
         ws.send(JSON.stringify({ type: 'input', data }))
       }
     })

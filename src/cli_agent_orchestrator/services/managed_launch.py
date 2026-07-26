@@ -1451,6 +1451,7 @@ def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:
                 "terminal_id": str(row.terminal_id),
                 "generation": str(row.generation),
                 "provider": str(row.provider),
+                "execution_mode": em.ACP,
                 "state": str(row.state),
                 "controllable": str(row.state) == "admitted",
                 "vintage": "v1",

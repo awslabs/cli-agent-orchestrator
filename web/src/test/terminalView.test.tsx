@@ -14,6 +14,7 @@ const { wheelEvents, termRegistry, FakeTerminal } = vi.hoisted(() => {
     rows = 24
     cols = 80
     element: HTMLDivElement
+    dataHandler: ((data: string) => void) | null = null
 
     constructor(_opts: unknown) {
       this.element = document.createElement('div')
@@ -25,7 +26,12 @@ const { wheelEvents, termRegistry, FakeTerminal } = vi.hoisted(() => {
     open(parent: HTMLElement) {
       parent.appendChild(this.element)
     }
-    onData() {}
+    onData(handler: (data: string) => void) {
+      this.dataHandler = handler
+    }
+    emitData(data: string) {
+      this.dataHandler?.(data)
+    }
     onSelectionChange() {}
     attachCustomKeyEventHandler() {}
     getSelection() {
@@ -50,13 +56,19 @@ vi.mock('@xterm/addon-fit', () => ({
 // TerminalView opens a WebSocket and observes resizes; jsdom has neither.
 class FakeWebSocket {
   static OPEN = 1
+  static instances: FakeWebSocket[] = []
   readyState = FakeWebSocket.OPEN
   binaryType = ''
   onopen: (() => void) | null = null
   onmessage: (() => void) | null = null
   onclose: (() => void) | null = null
-  constructor(public url: string) {}
-  send() {}
+  sent: string[] = []
+  constructor(public url: string) {
+    FakeWebSocket.instances.push(this)
+  }
+  send(data: string) {
+    this.sent.push(data)
+  }
   close() {}
 }
 
@@ -92,6 +104,7 @@ describe('TerminalView touch scrolling', () => {
   beforeEach(() => {
     wheelEvents.length = 0
     termRegistry.current = null
+    FakeWebSocket.instances.length = 0
     ;(globalThis as unknown as { WebSocket: unknown }).WebSocket = FakeWebSocket
     ;(globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = FakeResizeObserver
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
@@ -294,6 +307,45 @@ describe('TerminalView touch scrolling', () => {
       expect(controls[1].body?.text).toBe('/compact')
       expect(controls[1].body?.enter).toBe(true)
     })
+  })
+
+  it('forwards only mouse-wheel reports from a managed transcript', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      const response = url.endsWith('/managed-control')
+        ? { managed: true, execution_mode: 'native_tui' }
+        : url.endsWith('/control-input/capabilities')
+          ? {
+              protocol: 'cao-control-input-v1',
+              execution_modes: ['native_tui'],
+              literal_write: true,
+              bracketed_paste: false,
+              enter_required: true,
+            }
+          : {}
+      return {
+        ok: true,
+        json: async () => response,
+      } as Response
+    }))
+
+    render(<TerminalView terminalId="t-native" onClose={() => {}} />)
+    await screen.findByText('Managed native TUI · identity-bound controls')
+
+    const terminal = termRegistry.current
+    const socket = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]
+    if (!terminal || !socket) throw new Error('terminal websocket not mounted')
+
+    terminal.emitData('x')
+    terminal.emitData('ordinary multi-character paste')
+    terminal.emitData('\x1b[<0;1;1M')
+    terminal.emitData('\x1b[<64;12;8M')
+    terminal.emitData('\x1b[M`!!')
+
+    expect(socket.sent.map(message => JSON.parse(message))).toEqual([
+      { type: 'input', data: '\x1b[<64;12;8M' },
+      { type: 'input', data: '\x1b[M`!!' },
+    ])
   })
 
   it('surfaces a typed native-control refusal without querying or retrying', async () => {
