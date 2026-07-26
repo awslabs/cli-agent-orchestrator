@@ -60,6 +60,28 @@ def _companion(tmp_path, monkeypatch):
     monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companion")
 
 
+@pytest.fixture(autouse=True)
+def _stub_native_teardown(monkeypatch):
+    """The managed cleanup now drives the generation-bound terminal teardown.
+
+    These contract tests assert the cleanup *record* — the proof,
+    idempotency, conflict, and projection — not tmux process teardown, so
+    the exact teardown is stubbed to a confirming no-op that records its
+    identity arguments. The teardown itself is exercised in
+    ``test_v2_cleanup_teardown.py``.
+    """
+
+    def _delete_terminal(
+        terminal_id, *, registry=None, expected_generation=None, expected_session=None, **_
+    ):
+        return True
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal",
+        _delete_terminal,
+    )
+
+
 @pytest.fixture
 def worktree(tmp_path):
     repo = (tmp_path / "repo").resolve()
