@@ -207,6 +207,17 @@ class CreateTerminalBody(BaseModel):
     initial_message_orchestration_type: Optional[str] = None
 
 
+class CreateSessionBody(CreateTerminalBody):
+    """Optional JSON body for POST /sessions.
+
+    Reuses the terminal-creation message payload and keeps operator-forwarded
+    environment variables in the request body, preserving the existing
+    ``{"env_vars": {...}}`` wire shape.
+    """
+
+    env_vars: Optional[Dict[str, str]] = None
+
+
 def _validate_model_id(value: str) -> None:
     """Validate a ``model`` override at the request boundary (PR #501 review).
 
@@ -1679,7 +1690,8 @@ async def create_session(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
     memory_manager: Optional[str] = None,
-    env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
+    model: Optional[str] = None,
+    body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
     """Create a new session with exactly one terminal.
@@ -1691,11 +1703,24 @@ async def create_session(
     the curator reaches IDLE; ``get_curated_memory_context`` falls back to
     Phase 1 in that window.
 
-    ``env_vars`` (request body, optional) is the operator-forwarded env map
+    ``body.env_vars`` is the optional operator-forwarded env map
     from ``cao launch --env``. It travels in the JSON body — not the query
     string — so values potentially containing secrets do not land in
     cao-server's HTTP access log. See issue #248.
+
+    When ``body.initial_message`` is present, session creation reuses the
+    existing deferred terminal-initialization path: the response is returned
+    after the session and terminal record are created, then provider
+    initialization and message delivery continue in the background. This
+    narrows the create-then-send window but is not a transactional operation;
+    deferred failures follow terminal_service's existing logging and best-
+    effort cleanup behavior.
+
+    ``model`` is an optional per-launch override. It uses the same validation
+    and provider handoff as the existing terminal-creation endpoint.
     """
+    initial_message = body.initial_message if body else None
+    initial_message_orchestration_type = None
     try:
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
@@ -1711,6 +1736,22 @@ async def create_session(
                 else f"{SESSION_PREFIX}{session_name}"
             )
             validate_tmux_name(effective, "session_name")
+        if model is not None:
+            _validate_model_id(model)
+        if initial_message == "":
+            raise ValueError("initial_message must not be empty")
+        if body and body.initial_message_orchestration_type:
+            if initial_message is None:
+                raise ValueError("initial_message_orchestration_type requires initial_message")
+            try:
+                initial_message_orchestration_type = OrchestrationType(
+                    body.initial_message_orchestration_type
+                )
+            except ValueError:
+                raise ValueError(
+                    "invalid initial_message_orchestration_type: "
+                    f"{body.initial_message_orchestration_type!r}"
+                )
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
@@ -1721,7 +1762,10 @@ async def create_session(
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
-            env_vars=env_vars,
+            env_vars=body.env_vars if body else None,
+            initial_message=initial_message,
+            initial_message_orchestration_type=initial_message_orchestration_type,
+            model=model,
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
