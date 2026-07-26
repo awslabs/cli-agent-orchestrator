@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 import uuid as _uuid_module
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -31,6 +31,8 @@ def _uuid_text(value: str) -> str:
 
 
 class ManagedLaunchV2ReserveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     protocol_version: ProtocolVersionV2
     reservation_id: str
     session_name: str
@@ -73,6 +75,13 @@ class ManagedLaunchV2ReserveRequest(BaseModel):
             "unspecified",
         ]
     ] = None
+    #: The provider route is explicit so a GLM wrapper can never be inferred
+    #: from a model string.  Validation of the closed vocabulary happens at
+    #: the service boundary so malformed values produce the managed-launch
+    #: 409 refusal used by older callers for route conflicts.
+    provider_route: str = "anthropic"
+    #: Only the native GLM route carries executable/map/marker evidence.
+    route_envelope: Optional[dict[str, Any]] = None
 
     @field_validator("project")
     @classmethod

@@ -53,6 +53,7 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import (
     generation_fence,
+    glm_native_launch,
     heartbeat_store,
     native_attachment,
     native_tui_launch,
@@ -820,12 +821,32 @@ def _validate_reserve_identity(request: ManagedLaunchV2ReserveRequest) -> dict[s
         provider_contracts.validate_route_effort(request.expected_model, request.expected_effort)
     except provider_contracts.ProviderContractError as exc:
         raise ManagedLaunchConflict(str(exc)) from exc
+    try:
+        route_envelope = glm_native_launch.validate_envelope(
+            provider=request.provider,
+            provider_route=request.provider_route,
+            expected_model=request.expected_model,
+            working_directory=request.working_directory,
+            provider_executable=request.provider_executable,
+            provider_executable_sha256=request.provider_executable_sha256,
+            envelope=request.route_envelope,
+        )
+    except glm_native_launch.GlmRouteError as exc:
+        raise ManagedLaunchConflict(str(exc)) from exc
+    if (
+        request.provider_route == glm_native_launch.PROVIDER_ROUTE_GLM
+        and request.execution_mode == em.ACP
+    ):
+        raise ManagedLaunchConflict("provider_route='glm' requires execution_mode='native_tui'")
     # The model half of the same pre-I/O question, asked beside the effort
     # half. The launch checks this again before minting an identity, and
     # that check stays: this one only moves the refusal earlier, so an
     # unpinnable Claude route costs no reservation, no allocated terminal
     # id, and no recovery verb to finalize.
-    if request.provider == "claude_code":
+    if (
+        request.provider == "claude_code"
+        and request.provider_route == glm_native_launch.PROVIDER_ROUTE_ANTHROPIC
+    ):
         from cli_agent_orchestrator.services import claude_native_launch
 
         try:
@@ -833,6 +854,8 @@ def _validate_reserve_identity(request: ManagedLaunchV2ReserveRequest) -> dict[s
         except claude_native_launch.ClaudeNativeLaunchError as exc:
             raise ManagedLaunchConflict(str(exc)) from exc
     payload = request.model_dump(mode="json")
+    payload["provider_route"] = request.provider_route
+    payload["route_envelope"] = route_envelope
     # The raw nonce never persists; only its digest is stored.
     payload.pop("launch_nonce")
     return payload
@@ -840,7 +863,12 @@ def _validate_reserve_identity(request: ManagedLaunchV2ReserveRequest) -> dict[s
 
 #: Request keys introduced after the v2 reservation surface shipped.  A
 #: reservation written before they existed simply has no such key.
-_ADDITIVE_REQUEST_KEYS = ("execution_mode", "worker_class")
+_ADDITIVE_REQUEST_KEYS = (
+    "execution_mode",
+    "worker_class",
+    "provider_route",
+    "route_envelope",
+)
 
 
 def _request_matches(stored_json: str, incoming: dict[str, Any]) -> bool:
@@ -863,8 +891,18 @@ def _request_matches(stored_json: str, incoming: dict[str, Any]) -> bool:
         return False
     normalized = dict(stored)
     for key in _ADDITIVE_REQUEST_KEYS:
-        if key not in normalized and incoming.get(key) is None:
-            normalized[key] = None
+        if key not in normalized:
+            if key in {"provider_route", "route_envelope"}:
+                # Rows created before route envelopes existed are the
+                # historical Anthropic/default form.  Preserve idempotent
+                # replay for that form while refusing every explicit GLM
+                # replay against an old row.
+                if key == "provider_route" and incoming.get(key) == "anthropic":
+                    normalized[key] = "anthropic"
+                elif key == "route_envelope" and incoming.get(key) is None:
+                    normalized[key] = None
+            elif incoming.get(key) is None:
+                normalized[key] = None
     return _canonical_json(normalized) == _canonical_json(incoming)
 
 
@@ -1046,10 +1084,19 @@ def _resolve_reserve_mode(request: ManagedLaunchV2ReserveRequest) -> em.Executio
     second, unrelated one.
     """
     try:
-        return em.resolve(
+        resolution = em.resolve(
             launch_input=request.execution_mode,
             worker_class=request.worker_class,
         )
+        # GLM is a closed native route.  In particular, an omitted mode must
+        # not inherit the hands-off/one-shot ACP default and reach a provider
+        # branch that cannot honor the route envelope.
+        if (
+            request.provider_route == glm_native_launch.PROVIDER_ROUTE_GLM
+            and resolution.mode != em.NATIVE_TUI
+        ):
+            raise ManagedLaunchConflict("provider_route='glm' requires execution_mode='native_tui'")
+        return resolution
     except em.ExecutionModeError as exc:
         raise ManagedLaunchConflict(str(exc)) from exc
 
@@ -1766,17 +1813,63 @@ def _validate_readiness_for_bind(row: Any, receipt: dict[str, Any]) -> None:
     # equality would refuse every correctly-routed Claude session. The
     # family comparison is not looser: it refuses a different family, and
     # a full-name request is still satisfied by exactly itself.
-    from cli_agent_orchestrator.services import claude_native_launch
+    from cli_agent_orchestrator.services import claude_native_launch, glm_native_launch
 
     expected_model = request.get("expected_model")
-    if row.provider == "claude_code":
+    provider_route = request.get("provider_route", "anthropic")
+    if provider_route == glm_native_launch.PROVIDER_ROUTE_GLM:
+        model_ok = glm_native_launch.observed_model_matches(
+            str(expected_model or ""), receipt.get("model")
+        )
+        if receipt.get("provider_route") != provider_route:
+            mismatches["provider_route"] = {
+                "expected": provider_route,
+                "observed": receipt.get("provider_route"),
+            }
+        envelope = request.get("route_envelope")
+        if receipt.get("route_envelope") != envelope:
+            mismatches["route_envelope"] = {
+                "expected": envelope,
+                "observed": receipt.get("route_envelope"),
+            }
+        try:
+            glm_native_launch.validate_envelope(
+                provider=row.provider,
+                provider_route=provider_route,
+                expected_model=str(expected_model or ""),
+                working_directory=row.working_directory,
+                provider_executable=request["provider_executable"],
+                provider_executable_sha256=request["provider_executable_sha256"],
+                envelope=envelope,
+            )
+            if not glm_native_launch.consumed_marker_exists(envelope["consumed_marker_path"]):
+                raise glm_native_launch.GlmRouteError("consumed marker is absent")
+            if receipt.get("observed_process_executable") != envelope["inner_executable"]:
+                raise glm_native_launch.GlmRouteError(
+                    "readiness receipt does not name the declared inner executable"
+                )
+        except (KeyError, TypeError, glm_native_launch.GlmRouteError) as exc:
+            mismatches["route_proof"] = {"expected": "verified", "observed": str(exc)}
+    elif row.provider == "claude_code":
         model_ok = claude_native_launch.observed_model_matches(
             str(expected_model or ""), receipt.get("model")
         )
     else:
         model_ok = receipt.get("model") == expected_model
     if not model_ok:
-        mismatches["model"] = {"expected": expected_model, "observed": receipt.get("model")}
+        model_mismatch = {"expected": expected_model, "observed": receipt.get("model")}
+        # Claude's Anthropic route has a provider-specific diagnostic that
+        # explains family and context-window mismatches. GLM stays on its
+        # closed-route validation path above and must not be described with
+        # Claude's model vocabulary.
+        if (
+            provider_route == glm_native_launch.PROVIDER_ROUTE_ANTHROPIC
+            and row.provider == "claude_code"
+        ):
+            model_mismatch["detail"] = claude_native_launch.observed_model_mismatch_detail(
+                str(expected_model or ""), receipt.get("model")
+            )
+        mismatches["model"] = model_mismatch
     # Effort is compared through the effort vocabulary rather than by
     # string equality, because the route and a truthful receipt speak
     # different alphabets here: a provider-default route says
@@ -2957,6 +3050,8 @@ async def launch_reserved(reservation_id: str, *, registry=None) -> dict[str, An
             "working_directory": record["working_directory"],
             "provider_executable": executable,
             "provider_executable_sha256": digest,
+            "provider_route": request.get("provider_route", "anthropic"),
+            "route_envelope": request.get("route_envelope"),
             # v2 identity fields: the bridge emits fenced heartbeats only
             # when these are present (v1 requests never carry them).  The
             # immutable project identity persists from the reservation; it
@@ -3139,6 +3234,48 @@ class _V2NativePane:
         ).observe()
 
 
+async def _teardown_published_native_terminal(
+    *,
+    record: dict[str, Any],
+    bootstrap: dict[str, Any],
+    registry: Any,
+    reason: str,
+) -> Optional[str]:
+    """Remove a pane published before a native route proof failed.
+
+    The marker check runs after ``native_tui_launch.start`` has declared the
+    attachment and created the pane.  Teardown therefore uses both immutable
+    v2 identities, and the attachment is frozen even when terminal cleanup
+    itself fails, so a later launch cannot reuse an uncertain session.
+    """
+    import asyncio
+
+    from cli_agent_orchestrator.services import terminal_service
+
+    cleanup_errors: list[str] = []
+    try:
+        await asyncio.to_thread(
+            terminal_service.delete_terminal,
+            record["terminal_id"],
+            registry=registry,
+            expected_generation=record["generation"],
+            expected_session=record["session_name"],
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the blocked state
+        cleanup_errors.append(f"native terminal teardown failed: {exc}")
+
+    try:
+        native_attachment.mark_ambiguous(
+            provider=record["provider"],
+            native_session_id=bootstrap["native_session_id"],
+            reason=reason,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the blocked state
+        cleanup_errors.append(f"native attachment freeze failed: {exc}")
+
+    return "; ".join(cleanup_errors) or None
+
+
 async def _launch_native_tui(
     reservation_id: str,
     record: dict[str, Any],
@@ -3164,7 +3301,9 @@ async def _launch_native_tui(
     from cli_agent_orchestrator.services import (
         claude_native_launch,
         claude_native_readiness,
+        glm_native_launch,
         kimi_native_bootstrap,
+        session_env,
     )
     from cli_agent_orchestrator.services.managed_provider_bridge import (
         BRIDGE_VERSION,
@@ -3189,13 +3328,42 @@ async def _launch_native_tui(
     request = record["request"]
     executable = bridge_request["provider_executable"]
     digest = bridge_request["provider_executable_sha256"]
+    provider_route = request.get("provider_route", "anthropic")
+    route_envelope = request.get("route_envelope")
 
     try:
+        if provider_route == glm_native_launch.PROVIDER_ROUTE_GLM:
+            route_envelope = glm_native_launch.validate_envelope(
+                provider=provider,
+                provider_route=provider_route,
+                expected_model=request["expected_model"],
+                working_directory=record["working_directory"],
+                provider_executable=executable,
+                provider_executable_sha256=digest,
+                envelope=route_envelope,
+            )
         profile_material = _profile_material(record["agent_profile"], record["terminal_id"])
         if profile_material["profile_sha256"] != bridge_request["profile_sha256"]:
             raise ManagedLaunchConflict("agent profile changed after the launch request was sealed")
-        version_output = await asyncio.to_thread(provider_version_banner, bridge_request)
-        environment = native_child_environment(bridge_request)
+        stored_session_env = None
+        if provider_route == glm_native_launch.PROVIDER_ROUTE_GLM:
+            # The wrapper's route authority is the session map that the
+            # reservation names, not the server process's ambient environment.
+            # Resolve and verify it before version probing or pane creation so
+            # a bounced server cannot launch a pane on an unbound route.
+            stored_session_env = await asyncio.to_thread(
+                session_env.get_session_env, record["session_name"]
+            )
+        if provider_route == glm_native_launch.PROVIDER_ROUTE_GLM:
+            environment = native_child_environment(bridge_request, session_env=stored_session_env)
+            # Version probing targets the inner binary. Probing the wrapper
+            # would consume the one-shot token before the launch that needs it.
+            version_output = await asyncio.to_thread(
+                provider_version_banner, bridge_request, environment=environment
+            )
+        else:
+            environment = native_child_environment(bridge_request)
+            version_output = await asyncio.to_thread(provider_version_banner, bridge_request)
         if provider == "kimi_cli":
             environment = _kimi_profile_environment(
                 record=record,
@@ -3282,6 +3450,13 @@ async def _launch_native_tui(
             loop=asyncio.get_running_loop(),
             registry=registry,
         )
+        launch_executable = executable
+        launch_digest = digest
+        expected_inner_executable = None
+        if provider_route == glm_native_launch.PROVIDER_ROUTE_GLM:
+            launch_executable = route_envelope["wrapper_executable"]
+            launch_digest = route_envelope["wrapper_executable_sha256"]
+            expected_inner_executable = route_envelope["inner_executable"]
         outcome = await asyncio.to_thread(
             native_tui_launch.start,
             provider=provider,
@@ -3290,18 +3465,38 @@ async def _launch_native_tui(
             generation=record["generation"],
             execution_mode=em.NATIVE_TUI,
             intent=intent,
-            binary=executable,
-            binary_sha256=digest,
+            binary=launch_executable,
+            binary_sha256=launch_digest,
             working_directory=record["working_directory"],
             transport=transport,
             extra_args=launch_extra_args,
             launch_kind=launch_kind,
+            expected_inner_executable=expected_inner_executable,
         )
     except Exception as exc:  # noqa: BLE001 - the attachment store holds the detail
         return _mark_preflight_blocked(
             reservation_id,
             f"native TUI launch refused: {exc}",
             reason=PREFLIGHT_REASON_TUI_LAUNCH_REFUSED,
+        )
+
+    if (
+        provider_route == glm_native_launch.PROVIDER_ROUTE_GLM
+        and not glm_native_launch.consumed_marker_exists(route_envelope["consumed_marker_path"])
+    ):
+        cleanup_error = await _teardown_published_native_terminal(
+            record=record,
+            bootstrap=bootstrap,
+            registry=registry,
+            reason="glm_route_consumed_marker_missing",
+        )
+        detail = "GLM wrapper did not leave its consumed marker; refusing an ambient-auth pane"
+        if cleanup_error:
+            detail = f"{detail}; {cleanup_error}"
+        return _mark_preflight_blocked(
+            reservation_id,
+            detail,
+            reason=PREFLIGHT_REASON_READINESS,
         )
 
     # Waited for here, at the only place that knows the pane just started,
@@ -3352,16 +3547,21 @@ async def _launch_native_tui(
         # refusal costs a finalizable reservation rather than work spent
         # on the wrong capability and quota pool.
         observed_model = (session_start or {}).get("model")
-        if not claude_native_launch.observed_model_matches(
-            bootstrap["requested_model"], observed_model
-        ):
+        model_matches = (
+            glm_native_launch.observed_model_matches(bootstrap["requested_model"], observed_model)
+            if provider_route == glm_native_launch.PROVIDER_ROUTE_GLM
+            else claude_native_launch.observed_model_matches(
+                bootstrap["requested_model"], observed_model
+            )
+        )
+        if not model_matches:
             return _mark_preflight_blocked(
                 reservation_id,
                 (
                     "the running Claude session is not on the requested route: requested "
                     f"{bootstrap['requested_model']!r}, the provider's own session-start "
                     f"proof observed {observed_model!r} "
-                    f"({claude_native_launch.observed_model_mismatch_detail(bootstrap['requested_model'], observed_model)}). "
+                    f"(observed model did not match the closed route). "
                     "Refusing rather than admitting a "
                     "task to a model nobody asked for"
                 ),
@@ -3464,7 +3664,11 @@ def _mint_claude_native_session(
     drifted build is a refusal, and refusing after minting would leave a
     recorded identity for a session that was never going to be started.
     """
-    from cli_agent_orchestrator.services import claude_native_launch, claude_native_readiness
+    from cli_agent_orchestrator.services import (
+        claude_native_launch,
+        claude_native_readiness,
+        glm_native_launch,
+    )
 
     check_pinned_version(_PINNED_PROVIDER["claude_code"], version_output)
 
@@ -3475,8 +3679,11 @@ def _mint_claude_native_session(
     # explicit model runs on whatever the provider prefers, which is how a
     # route requested as sonnet came up as a 1M Opus session.
     try:
-        pinned_model = claude_native_launch.validate_requested_model(request["expected_model"])
-    except claude_native_launch.ClaudeNativeLaunchError as exc:
+        if request.get("provider_route", "anthropic") == glm_native_launch.PROVIDER_ROUTE_GLM:
+            pinned_model = glm_native_launch.validate_requested_model(request["expected_model"])
+        else:
+            pinned_model = claude_native_launch.validate_requested_model(request["expected_model"])
+    except (claude_native_launch.ClaudeNativeLaunchError, glm_native_launch.GlmRouteError) as exc:
         raise ManagedLaunchConflict(str(exc)) from exc
 
     native_session_id = claude_native_launch.mint_session_id()
@@ -3688,6 +3895,8 @@ def _native_readiness_receipt(
         "generation": record["generation"],
         "provider": record["provider"],
         "agent_profile": record["agent_profile"],
+        "provider_route": request.get("provider_route", "anthropic"),
+        "route_envelope": request.get("route_envelope"),
         # Observed, or explicitly absent — never the request wearing an
         # observation's name. The Kimi bootstrap reads its route back off
         # the session it configured, so ``model``/``effort`` there are
@@ -3738,6 +3947,9 @@ def _native_readiness_receipt(
         "native_launch_outcome": outcome["outcome"],
         "launch_argv_sha256": outcome["launch_argv_sha256"],
         "pane_handle": outcome.get("pane_handle"),
+        "observed_process_executable": (
+            ((outcome.get("pane_observation") or {}).get("argv") or [None])[0]
+        ),
         # Read from the attachment's ``owner`` rather than restated from
         # the observation: the identity that matters is the one the
         # exclusive-ownership store actually recorded, because that is

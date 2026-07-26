@@ -207,6 +207,16 @@ def test_reserve_without_mode_or_class_stays_acp(isolated_memory_db, worktree, t
     assert record["is_legacy_execution_mode"] is False
 
 
+def test_glm_route_with_implicit_mode_is_refused_before_acp_resolution(worktree, tmp_path):
+    request = _reserve_request(worktree, tmp_path, provider_route="glm", worker_class="hands_off")
+
+    with pytest.raises(
+        ManagedLaunchConflict,
+        match="provider_route='glm' requires execution_mode='native_tui'",
+    ):
+        v2._resolve_reserve_mode(request)
+
+
 def test_reserve_explicit_native_mode_is_recorded_at_launch_precedence(
     isolated_memory_db, worktree, tmp_path
 ):
