@@ -25,6 +25,7 @@ export const STATUS: Record<string, StatusSemantics> = {
   "processing": { label: "Processing", semanticRole: "info", pulse: true },
   "completed": { label: "Completed", semanticRole: "accent", pulse: false },
   "waiting_user_answer": { label: "Awaiting Input", semanticRole: "warning", pulse: false },
+  "not_fifo_monitored": { label: "Managed Live", semanticRole: "info", pulse: false },
   "error": { label: "Error", semanticRole: "danger", pulse: false },
   "stopped": { label: "Stopped", semanticRole: "neutral", pulse: false },
   "unknown": { label: "Unknown", semanticRole: "neutral", pulse: false },
