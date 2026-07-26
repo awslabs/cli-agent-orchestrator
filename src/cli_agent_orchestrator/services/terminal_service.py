@@ -1369,7 +1369,7 @@ async def create_terminal(
                     terminal_id,
                     managed_native_command,
                     working_directory,
-                    extra_env={},
+                    extra_env=env_vars or {},
                 )
             else:
                 # Merge explicit per-step env_vars over the persisted session env

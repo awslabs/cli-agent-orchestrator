@@ -335,7 +335,7 @@ async def test_the_bootstrap_runs_the_pinned_binary_in_the_bridge_child_environm
 
     assert harness.bootstrap_kwargs["kimi_binary"] == record["request"]["provider_executable"]
     assert harness.bootstrap_kwargs["working_directory"] == record["working_directory"]
-    assert harness.bootstrap_kwargs["env"] == bridge.native_child_environment(
+    expected_environment = bridge.native_child_environment(
         {
             "provider": record["provider"],
             "model": MODEL,
@@ -344,6 +344,13 @@ async def test_the_bootstrap_runs_the_pinned_binary_in_the_bridge_child_environm
             "provider_executable": record["request"]["provider_executable"],
         }
     )
+    actual_environment = dict(harness.bootstrap_kwargs["env"])
+    private_home = actual_environment.pop("KIMI_CODE_HOME")
+    assert actual_environment == expected_environment
+    assert private_home.startswith(
+        str(v2.COMPANION_DIR / record["terminal_id"] / record["generation"])
+    )
+    assert harness.terminals[0]["env_vars"]["KIMI_CODE_HOME"] == private_home
 
 
 # --------------------------------------------------------------------
