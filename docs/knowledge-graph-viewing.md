@@ -417,25 +417,22 @@ flow.
 | Script against the graph data | `GET /graph/memory` via `curl` (the API) |
 | The graph rendered **inside my agent host** | The built-in **Sigma renderer** (option C) — needs a UI-capable host |
 
-## Future directions (roadmap — not yet built)
+## Issue #348 delivery and extension points
 
-> **Status: forward-looking.** None of this section is implemented today; it
-> sketches how the *shipped* `GraphView` contract is designed to extend. Unlike
-> the rest of this doc — which is verified how-to — everything below is
-> anticipated work tracked as **separate issues under the same epic (#348)**.
-> There are no run commands here and nothing to enable. Read "would" / "could"
-> as exactly that. Where the epic itself leaves a question open, it's flagged as
-> open, not settled.
+> **Status:** issue #348's implemented graph scope shipped across merged PRs
+> #402 (`84d79ff`, contract and registries), #416 (`98443e3`, providers), #424
+> (`67f8e4b`, API and three file sinks), and #442 (`d7c1cd0`, Sigma renderer,
+> web view, and cache). The ideas below are possible extensions; where issue
+> #348 still lists an unchecked follow-up, that status is called out explicitly.
 
 The thesis this doc opens with — **CAO emits a standard typed `GraphView`; it
 does not own the engine** — is what makes growth cheap. Memory is the *first*
 provider, not the only intended one. Any future provider that projects its
 subsystem into the same `{nodes, edges, meta}` shape inherits the renderer and
 **every** sink (Obsidian / OKF / GraphML, and any future sink) for free — no new
-engine work. The epic (Issue #348) names the follow-ups below; this appendix
-mirrors that roadmap rather than inventing one. The authoritative list lives in
-the epic's design record (`aidlc/.../260709-graph-layer/aidlc-state.md`, the
-*Follow-ups* and *Open questions* sections).
+engine work. Current behavior is authoritative in the source paths listed under
+[See also](#see-also). Any future provider or sink should be tracked in its own
+issue rather than inferred from this historical roadmap.
 
 ### 1. New CAO-subsystem providers
 
@@ -461,8 +458,8 @@ that out is future work, not a shipped guarantee.
 ### 2. A broader knowledge-base provider
 
 Beyond CAO's own subsystems, the same seam could project **non-memory knowledge**
-— team knowledge under `aidlc/knowledge/`, docs, decisions/ADRs, or an external
-KB — as just another provider emitting the same `GraphView` shape. What lets
+— project docs, decisions/ADRs, or an external KB — as just another provider
+emitting the same `GraphView` shape. What lets
 heterogeneous sources *converge* rather than each inventing its own semantics is
 the **typed `EdgeType` taxonomy** already baked into the contract (see
 [The `GraphView` contract](#the-graphview-contract)). This is deliberate: the
@@ -481,12 +478,12 @@ Today's sinks are **export-only** — they serialize a `GraphView` to a file or
 render it, and that's the end of the line. The epic sketches a **second sink
 tier**: a *query-capable* store that a graph could be loaded into and then
 **traversed** — the kind of cross-scope, multi-hop traversal and graph analytics
-that flat SQLite can't do. The epic explored **AWS Neptune** as the exemplar of
-this tier, but note the honest history: Neptune was ultimately **removed from
-the epic entirely (not merely deferred)**, because its one differentiating
-capability depends on an unsolved design problem. That problem is the epic's
-first **open question — cross-scope edges.** Memory edges never cross the
-`(scope, scope_id)` boundary today (see
+that flat SQLite can't do. Issue #348 names **AWS Neptune** as the exemplar of
+this tier in its architecture and sink comparison and still lists an unchecked
+**AWS Neptune sink (export + query; infra)** follow-up. It was not delivered by
+PRs #402, #416, #424, or #442. Its differentiating capability depends on the
+issue's first **open question — cross-scope edges.** Memory edges never cross
+the `(scope, scope_id)` boundary today (see
 [What the memory provider projects](#what-the-memory-provider-projects)), so a
 whole-knowledge-base view currently fragments per scope. A query-capable store
 is only *useful* once cross-scope edges exist — and that design isn't settled.
@@ -495,11 +492,9 @@ heaviest tier (infrastructure, IAM, bulk-load), gated behind an open question,
 and would ship — if ever — as an optional plugin, never as part of the base
 engine.
 
-> **Where to track this.** The epic's design record holds the live *Follow-ups*
-> list (Notion sink; orchestration / workflow DAG / audit-lineage providers) and
-> the *Open questions* (cross-scope edges, shared edge-type taxonomy, snapshot
-> vs. live, query-capable sinks). Treat that record — not this appendix — as the
-> source of truth for what's planned vs. merely mused.
+> **Tracking rule:** this section preserves possible extension directions. It is
+> not an authoritative backlog. Use source for current behavior and dedicated
+> issues for accepted future work.
 
 ## See also
 

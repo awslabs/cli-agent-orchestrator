@@ -216,11 +216,16 @@ class ClaudeCodeProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # Explicit per-call override for profile.model (see launch()'s own
+        # --model resolution below) -- e.g. a handoff/assign caller pinning a
+        # specific model for one worker without needing a dedicated profile.
+        self._model = model
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
@@ -331,7 +336,16 @@ class ClaudeCodeProvider(BaseProvider):
         native = getattr(profile, "native_agent", None) if profile else None
         if profile is not None and isinstance(native, str) and native:
             # Thin wrapper: CAO profile maps to a native Claude Code agent.
-            # Let Claude Code handle all config (MCP servers, hooks, tools, model).
+            # Let Claude Code handle all config (MCP servers, hooks, tools, model)
+            # -- self._model (whether sourced from an explicit per-call override
+            # or from this same profile's own model field, see
+            # terminal_service.create_terminal's own precedence resolution) is
+            # deliberately NOT applied here, same as it was never applied for
+            # profile.model alone before this parameter existed. Not warned on:
+            # by the time this runs, self._model can no longer be distinguished
+            # from "this profile's own model field, nothing to do with a caller
+            # override at all" -- warning here would misattribute ordinary
+            # profile config as an ignored explicit request.
             # CAO_TERMINAL_ID propagates via tmux pane env inheritance.
             command_parts.extend(["--agent", native])
         elif self._agent_profile is not None and profile is None:
@@ -339,10 +353,18 @@ class ClaudeCodeProvider(BaseProvider):
             # native agent store (~/.claude/agents/). Same thin-orchestrator
             # pattern as the Kiro CLI provider.
             command_parts.extend(["--agent", self._agent_profile])
+            if self._model:
+                command_parts.extend(["--model", self._model])
         elif profile is not None:
-            # Full CAO profile with config decomposition
-            if profile.model:
-                command_parts.extend(["--model", profile.model])
+            # Full CAO profile with config decomposition. self._model is an
+            # explicit per-call override (handoff/assign's own `model`
+            # parameter) and wins over the profile's own static model field
+            # when both are given -- a caller pinning a one-off model for a
+            # single worker shouldn't need a dedicated agent profile just to
+            # do it.
+            resolved_model = self._model or profile.model
+            if resolved_model:
+                command_parts.extend(["--model", resolved_model])
 
             # Add system prompt - escape newlines to prevent tmux chunking issues
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""

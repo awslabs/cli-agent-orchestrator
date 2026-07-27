@@ -8,12 +8,12 @@ ABC, no edits to memory_service/wiki_lint) and awaiting
 
 import asyncio
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from cli_agent_orchestrator.graph.cache import GraphViewCache, make_meta
 from cli_agent_orchestrator.graph.models import Edge, EdgeType, GraphView, Node
 from cli_agent_orchestrator.graph.providers.base import GraphProvider, register_provider
-from cli_agent_orchestrator.services import wiki_lint
+from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -41,8 +41,13 @@ class MemoryGraphProvider(GraphProvider):
     never cross the (scope, scope_id) boundary (FR-9).
     """
 
-    def __init__(self, memory_service: Optional[MemoryService] = None) -> None:
+    def __init__(
+        self,
+        memory_service: Optional[MemoryService] = None,
+        lint_enabled: Optional[Callable[[], bool]] = None,
+    ) -> None:
         self._svc = memory_service or MemoryService()
+        self._lint_enabled = lint_enabled or settings_service.is_memory_lint_enabled
 
     async def project(self, **filters: Any) -> GraphView:
         """Return this scope's GraphView, served from cache when fresh.
@@ -57,8 +62,12 @@ class MemoryGraphProvider(GraphProvider):
         raw_scope_id = filters.get("scope_id")
         scope_id: Optional[str] = None if raw_scope_id is None else str(raw_scope_id)
 
-        key = ("memory", scope, scope_id)
-        view, cached, as_of = await _CACHE.get_or_build(key, lambda: self._build(scope, scope_id))
+        lint_enabled = self._lint_enabled()
+        key = ("memory", scope, scope_id, lint_enabled)
+        view, cached, as_of = await _CACHE.get_or_build(
+            key,
+            lambda: self._build(scope, scope_id, lint_enabled),
+        )
         # Re-wrap with fresh cache provenance without mutating the cached
         # instance's own meta (the same GraphView object is served to every hit).
         return GraphView(
@@ -67,9 +76,23 @@ class MemoryGraphProvider(GraphProvider):
             meta=make_meta(view.meta, cached=cached, as_of=as_of),
         )
 
-    async def _build(self, scope: str, scope_id: Optional[str]) -> GraphView:
+    async def _build(self, scope: str, scope_id: Optional[str], lint_enabled: bool) -> GraphView:
         """Project the scope's wiki into a GraphView (the uncached, ~148s path)."""
         meta: dict[str, Any] = {"provider": "memory", "scope": scope, "scope_id": scope_id}
+        if not lint_enabled:
+            meta.update(
+                {
+                    "lint_enabled": False,
+                    "lint_enrichment": "disabled",
+                    "disabled_enrichments": [
+                        "orphan_page",
+                        "contradiction",
+                        "stale_claim",
+                        "poison_frequency",
+                        "graph_density",
+                    ],
+                }
+            )
 
         # Resolve + parse the scope's index. A scope with no wiki on disk
         # (or an unresolvable scope/scope_id) is an empty graph, not an error.
@@ -118,20 +141,21 @@ class MemoryGraphProvider(GraphProvider):
                     )
                 )
 
-        # Lint findings — awaited directly in-request (ADR-7); no SQL or LLM
-        # calls beyond what run_lint itself performs (FR-7, C-1). A lint
-        # failure degrades to a lint-free graph rather than a 500.
-        try:
-            # project_hash arg is only used for run_lint's audit log, not for
-            # lookup — `project()` has no cwd/terminal_context to resolve the
-            # real project id (resolve_project_id), so this is a placeholder.
-            issues = await wiki_lint.run_lint(scope_id or scope, scope=scope)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning("memory graph provider: run_lint failed: %r", e, exc_info=True)
-            meta["lint_error"] = type(e).__name__
-            issues = []
+        issues = []
+        if lint_enabled:
+            # Lint findings may run expensive detectors. A failure degrades to
+            # a lint-free graph rather than a 500.
+            try:
+                # project_hash arg is only used for run_lint's audit log, not
+                # lookup — `project()` has no cwd/terminal_context to resolve
+                # the real project id (resolve_project_id), so this is a
+                # placeholder.
+                issues = await wiki_lint.run_lint(scope_id or scope, scope=scope)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("memory graph provider: run_lint failed: %r", e, exc_info=True)
+                meta["lint_error"] = type(e).__name__
 
         for issue in issues:
             if issue.issue_type == "orphan_page":

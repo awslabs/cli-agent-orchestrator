@@ -68,6 +68,23 @@ DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
 # Higher values provide more context but increase memory usage
 TMUX_HISTORY_LINES = 200
 
+# Foreground commands to treat as bracketed-paste INCOMPATIBLE.
+# (\x1b[200~...\x1b[201~). send_keys(force_bracketed_paste=True) checks the
+# pane's live #{pane_current_command} against this set before wrapping, so a
+# terminal whose provider process has already exited back to a bare shell
+# (e.g. after a TUI's own `/exit`) doesn't get the escape bytes glued onto
+# the first token of the next command. Bash is included deliberately even
+# though it CAN understand bracketed paste: readline's support is
+# version/config-dependent (default-off before readline 8.1/bash 5.1,
+# default-on after, and always overridable via `set enable-bracketed-paste`
+# in .inputrc) and there's no reliable way to detect from here whether it's
+# active in a given pane -- so the safe default is to skip wrapping rather
+# than risk the pasted markers leaking into the command on a
+# bracketed-paste-off bash.
+BRACKETED_PASTE_INCOMPATIBLE_SHELLS = frozenset(
+    {"sh", "dash", "bash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash"}
+)
+
 # =============================================================================
 # Application Directory Structure
 # =============================================================================
@@ -582,6 +599,21 @@ WORKFLOW_ENV_ALLOWLIST = frozenset(
 # changes — do not simplify away as duplicate validation (the effective
 # accepted length is 64 via WORKFLOW_NAME_RE; this cap is the outer fence).
 WORKFLOW_ENV_VALUE_MAX_LEN = 256
+
+# Model-ID validation for the explicit per-call ``model`` override on
+# handoff/assign (issue reported via PR #501 review). The override reaches a
+# provider's own launch-command builder (e.g. Codex/Kimi's ``--model
+# <value>``) which is shlex-quoted before delivery, so classic word-splitting
+# injection is not reachable -- but a control character or newline surviving
+# quoting into the command string is still a delivery hazard (this codebase
+# already treats that class of input as one: claude_code.py escapes newlines
+# in system_prompt to prevent tmux paste-buffer chunking, and bash's own
+# bracketed-paste-safety is called out in tmux.py). No allowlist is needed
+# (unlike WORKFLOW_ENV_ALLOWLIST's fixed key set) since a model id is
+# free-form per-provider, but a conservative charset covers every real model
+# id across all nine providers, including OpenCode's "vendor/model" form.
+MODEL_ID_RE = r"^[A-Za-z0-9._:/-]+$"
+MODEL_ID_MAX_LEN = 128
 
 # Script-runner subprocess lifecycle (Bolt 3, U4/C1). Wall-clock bound + grace,
 # output ring-buffer cap, engine-owned scratch root for resume materialization.

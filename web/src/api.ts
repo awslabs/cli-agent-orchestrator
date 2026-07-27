@@ -10,6 +10,8 @@ const BASE = ''  // Vite proxy handles routing to backend
 export interface ApiError extends Error {
   status?: number
   detail?: string
+  kind?: string
+  detailMeta?: Record<string, unknown>
 }
 
 async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: number }): Promise<T> {
@@ -22,13 +24,22 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
       // `detail` without leaking a full response. A non-JSON body is fine —
       // detail just stays undefined.
       let detail: string | undefined
+      let kind: string | undefined
+      let detailMeta: Record<string, unknown> | undefined
       try {
         const body = await res.json()
         if (body && typeof body.detail === 'string') detail = body.detail
+        if (body && body.detail && typeof body.detail === 'object') {
+          detailMeta = body.detail as Record<string, unknown>
+          if (typeof detailMeta.message === 'string') detail = detailMeta.message
+          if (typeof detailMeta.kind === 'string') kind = detailMeta.kind
+        }
       } catch { /* non-JSON error body */ }
       const err: ApiError = new Error(`${res.status} ${res.statusText}`)
       err.status = res.status
       err.detail = detail
+      err.kind = kind
+      err.detailMeta = detailMeta
       throw err
     }
     return res.json()

@@ -257,6 +257,7 @@ async def run_agent_step(
     on_terminal_created: Optional[Callable[[str], None]] = None,
     cancel_event: Optional[asyncio.Event] = None,
     engine: Optional[KiroEngine | str] = None,
+    model: Optional[str] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -334,6 +335,12 @@ async def run_agent_step(
             handoff caller passes nothing) — behavior unchanged.
         engine: Explicit Kiro engine for this child step. This is never inferred
             from a parent terminal.
+        model: Explicit per-call model override for a freshly created
+            terminal (ignored when reusing a terminal), forwarded to
+            ``terminal_service.create_terminal``. Lets a handoff caller pin
+            a specific model for this one worker without a dedicated agent
+            profile. Default None = behavior unchanged (profile.model, if
+            any, still applies).
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -401,6 +408,7 @@ async def run_agent_step(
             caller_id=caller_id,
             env_vars=env_vars,
             engine=engine,
+            model=model,
         )
         terminal_id = terminal.id
 

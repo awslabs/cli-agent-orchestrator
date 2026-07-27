@@ -1030,7 +1030,7 @@ async def run_lint(
 
     # Detector: stale_claim.
     try:
-        issues.extend(_detect_stale_claims(rows, repo_root_resolved))
+        issues.extend(await asyncio.to_thread(_detect_stale_claims, rows, repo_root_resolved))
         completion["stale_claim"] = True
     except Exception as e:
         logger.warning(f"stale_claim detector failed: {e}")
