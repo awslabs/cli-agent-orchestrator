@@ -2272,6 +2272,20 @@ def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]
     return get_inbox_messages(receiver_id, limit=limit, status=MessageStatus.PENDING)
 
 
+def is_message_pending(message_id: int) -> bool:
+    """Return whether one exact inbox row is still eligible for delivery."""
+    with SessionLocal() as db:
+        return (
+            db.query(InboxModel.id)
+            .filter(
+                InboxModel.id == message_id,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .first()
+            is not None
+        )
+
+
 def get_inbox_messages(
     receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
 ) -> List[InboxMessage]:
@@ -2362,13 +2376,13 @@ def list_aliases_for_project(project_id: str) -> List[Dict[str, Any]]:
 
 
 def update_message_status(message_id: int, status: MessageStatus) -> bool:
-    """Update one inbox row, atomically claiming a pending delivery.
+    """Update one inbox row, conditionally terminalizing a pending delivery.
 
-    ``PENDING -> DELIVERED`` is the effect claim: concurrent delivery
-    callers may both have selected the same pending row, but only the caller
-    whose conditional update succeeds may touch the provider or pane.
-    Rollback/failure transitions remain unconditional because they are issued
-    only by that winning caller after its own effect attempt.
+    The unmanaged pane path uses ``PENDING -> DELIVERED`` as its effect claim.
+    The managed bridge path calls it only after provider acknowledgement, with
+    the condition retained as defense in depth. Rollback/failure transitions
+    remain unconditional because only the caller that owns the corresponding
+    delivery attempt issues them.
     """
     with SessionLocal() as db:
         if status == MessageStatus.DELIVERED:

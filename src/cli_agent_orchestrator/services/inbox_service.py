@@ -14,6 +14,7 @@ from typing import Any, Optional
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
+    is_message_pending,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
     update_message_status,
@@ -39,6 +40,15 @@ logger = logging.getLogger(__name__)
 # turn.  A second, shorter window applies after the one allowed nudge.
 WAKE_CONFIRMATION_SECONDS = 45.0
 WAKE_NUDGE_WINDOW_SECONDS = 15.0
+
+# Managed delivery already has a durable exact-message-id journal at the
+# provider bridge. These bounded in-process stripes prevent two ordinary
+# cao-server callers from entering that bridge concurrently without creating a
+# terminal inbox status before a provider effect exists. A process restart
+# drops the lock while the still-PENDING row is safely reconciled through the
+# bridge journal.
+MANAGED_DELIVERY_LOCK_TIMEOUT_SECONDS = 0.25
+_MANAGED_DELIVERY_LOCKS = tuple(threading.Lock() for _ in range(256))
 
 # Statuses that mean "still parked": a transition to anything else is a wake.
 _PARKED_STATUSES = frozenset(
@@ -74,6 +84,11 @@ class InboxService:
         self._wake_preparations: dict[tuple[str, str], _WakePreparation] = {}
         self._wake_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
+
+    @staticmethod
+    def _managed_delivery_lock(message_id: int) -> threading.Lock:
+        """One bounded process-local serialization stripe for one inbox id."""
+        return _MANAGED_DELIVERY_LOCKS[message_id % len(_MANAGED_DELIVERY_LOCKS)]
 
     async def run(self, registry: PluginRegistry | None = None) -> None:
         self._loop = asyncio.get_running_loop()
@@ -553,39 +568,58 @@ class InboxService:
             remaining = messages
         else:
             for message in messages:
-                # The conditional PENDING -> DELIVERED update is the effect
-                # claim. Another status-event/poller/reconcile caller may have
-                # selected this row concurrently, but only one of them may reach
-                # the provider bridge.
-                if update_message_status(message.id, MessageStatus.DELIVERED) is False:
+                lock = self._managed_delivery_lock(message.id)
+                if not lock.acquire(timeout=MANAGED_DELIVERY_LOCK_TIMEOUT_SECONDS):
+                    logger.info(
+                        "Managed inbox delivery for %s/%s is already in progress; "
+                        "leaving the row pending for a later cycle",
+                        terminal_id,
+                        message.id,
+                    )
+                    remaining.append(message)
                     continue
                 try:
+                    # Both callers may have selected the row before either
+                    # reached this process-wide lock. Re-read the exact row
+                    # under it; only the first still-PENDING caller may enter
+                    # the provider's durable message-id journal.
+                    if not is_message_pending(message.id):
+                        continue
                     bridged = managed_launch.deliver_inbox_via_bridge(
                         terminal_id,
                         message_id=message.id,
                         message=message.message,
                         sender_id=message.sender_id,
                     )
+                    if bridged:
+                        if update_message_status(message.id, MessageStatus.DELIVERED) is False:
+                            logger.warning(
+                                "Managed bridge accepted inbox message %s for %s, but its "
+                                "still-pending row could not be terminalized",
+                                message.id,
+                                terminal_id,
+                            )
+                        logger.info(
+                            f"Delivered message {message.id} to terminal {terminal_id} "
+                            "via the managed provider bridge (provider-native ack)"
+                        )
+                    else:
+                        # The row never left PENDING. A later cycle re-enters
+                        # the exact-message-id bridge journal, which adopts an
+                        # existing acknowledgement and refuses blind replay
+                        # after ambiguity.
+                        remaining.append(message)
                 except Exception as exc:  # noqa: BLE001 - no duplicate effect
-                    update_message_status(message.id, MessageStatus.FAILED)
                     logger.error(
                         "Failed to deliver message %s to managed terminal %s: %s",
                         message.id,
                         terminal_id,
                         exc,
                     )
-                    continue
-                if bridged:
-                    logger.info(
-                        f"Delivered message {message.id} to terminal {terminal_id} "
-                        "via the managed provider bridge (provider-native ack)"
-                    )
-                else:
-                    # The bridge declined before accepting a provider effect.
-                    # Release the optimistic claim so a later provider path may
-                    # claim it.
-                    update_message_status(message.id, MessageStatus.PENDING)
                     remaining.append(message)
+                    continue
+                finally:
+                    lock.release()
         messages = remaining
         if not messages:
             return
