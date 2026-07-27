@@ -2287,7 +2287,7 @@ function containsEquivalentRule(content: string, rule: string): boolean {
 function normalizeRule(rule: string): string {
   return rule
     .replace(/^\s*-\s*/, "")
-    .replace(/\s*<!--.*?-->\s*$/, "")
+    .replace(/\s*<!--[\s\S]*?-->\s*$/, "")
     .replace(/\s+\(learned \d{4}-\d{2}-\d{2}\)\s*$/, "")
     .replace(/\s+/g, " ")
     .trim()
