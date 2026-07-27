@@ -20,9 +20,12 @@ What it does (W-3):
   :class:`~cli_agent_orchestrator.tui.provider_preflight.ProviderPreflight`.
 
 Error handling (FR-9.1 / BR-5): a
-:class:`~cli_agent_orchestrator.tui.server_client.ServerUnavailable` during any
-read flips the browser into an *unavailable* view state — command building and
-copy still work; the shell never crashes. A
+:class:`~cli_agent_orchestrator.tui.server_client.ServerUnavailable` (server
+unreachable) OR a sibling
+:class:`~cli_agent_orchestrator.tui.server_client.ServerClientError` (a
+malformed/unexpected server payload — the two are siblings, neither a subclass
+of the other) during any read flips the browser into an *unavailable* view
+state — command building and copy still work; the shell never crashes. A
 :class:`~cli_agent_orchestrator.tui.server_client.ProfileNotFound` on a detail
 read is a renderable "profile not found" note, not a crash.
 
@@ -51,6 +54,7 @@ from cli_agent_orchestrator.tui.server_client import (
     ProfileNotFound,
     ProfileSummary,
     ServerClient,
+    ServerClientError,
     ServerUnavailable,
 )
 
@@ -197,7 +201,11 @@ class ProfilesBrowser:
 
         try:
             self._profiles = list(self._client.profiles())
-        except ServerUnavailable:
+        except (ServerUnavailable, ServerClientError):
+            # ServerUnavailable (unreachable) and ServerClientError (a malformed
+            # /agents/profiles payload) are SIBLING exceptions — catch both so a
+            # contract-drift payload degrades to the unavailable view state
+            # exactly like a server-down read, never propagating into the shell.
             self._profiles = []
             self._detail = None
             self._state = STATE_UNAVAILABLE
@@ -276,7 +284,10 @@ class ProfilesBrowser:
             self._not_found_name = name
             self._state = STATE_NOT_FOUND
             return None
-        except ServerUnavailable:
+        except (ServerUnavailable, ServerClientError):
+            # ServerClientError (a malformed profile payload) is a sibling of
+            # ServerUnavailable, not a subclass — catch both so a drifted detail
+            # response degrades to the unavailable state rather than crashing.
             self._detail = None
             self._state = STATE_UNAVAILABLE
             return None
@@ -337,7 +348,10 @@ class ProfilesBrowser:
             return "provider: (profile default — resolved by the cao CLI on launch)"
         try:
             rows: List[PreflightRow] = self._preflight.rows()
-        except ServerUnavailable:
+        except (ServerUnavailable, ServerClientError):
+            # A malformed /agents/providers payload raises ServerClientError,
+            # a sibling of ServerUnavailable — degrade both to the same text note
+            # (NFR-6) rather than letting a payload defect crash the surface.
             return f"provider '{provider}': readiness unavailable (cao-server not reachable)"
         for row in rows:
             if row.name == provider:

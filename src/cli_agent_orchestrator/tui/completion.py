@@ -62,10 +62,14 @@ class ArgCompleter(Completer):
     def _params(self) -> List[Param]:
         """Fetch the focused command's params; degrade to ``[]`` on catalog error."""
 
+        # Resolve the path ONCE: ``self._path`` may be a callable whose result
+        # changes between calls, so resolving again in the ``except`` could log a
+        # path that was never the one actually attempted (and repeats the work).
+        path = self._resolve_path()
         try:
-            return self._catalog.params(self._resolve_path())
+            return self._catalog.params(path)
         except CatalogError as exc:
-            logger.debug("completion: catalog unavailable for %r: %s", self._resolve_path(), exc)
+            logger.debug("completion: catalog unavailable for %r: %s", path, exc)
             return []
 
     # -- Completer API ------------------------------------------------------- #

@@ -32,6 +32,7 @@ from cli_agent_orchestrator.tui.server_client import (
     ProfileDetail,
     ProfileNotFound,
     ProfileSummary,
+    ServerClientError,
     ServerUnavailable,
 )
 
@@ -353,6 +354,98 @@ def test_profile_not_found_is_renderable_note_not_crash() -> None:
     assert browser.state == "not_found"
     assert browser.not_found_name == "ghost"
     assert "ghost" in browser.detail_text()
+
+
+# --------------------------------------------------------------------------- #
+# FR-9.1 / BR-5: a MALFORMED payload (ServerClientError) degrades identically.   #
+#                                                                                #
+# ServerClientError and ServerUnavailable both inherit Exception DIRECTLY — they #
+# are siblings, neither a subclass of the other (server_client.py L55 / L64). A  #
+# catch of ServerUnavailable alone therefore does NOT catch ServerClientError,   #
+# so a contract-drift payload would escape into the shell. These pin the three   #
+# `except (ServerUnavailable, ServerClientError)` sites (load / open_detail /     #
+# provider_readiness) to the malformed-payload branch specifically: they FAIL if  #
+# any site is reverted to `except ServerUnavailable:` (the mutation the reviewer  #
+# fix corrects), because the ServerClientError then propagates and the assertion  #
+# on the degraded state is never reached.                                        #
+# --------------------------------------------------------------------------- #
+
+
+def test_malformed_payload_on_load_degrades_to_unavailable_state() -> None:
+    """A malformed ``/agents/profiles`` payload (ServerClientError, NOT a server-down)
+    degrades ``load`` to the visible *unavailable* view state — never a crash.
+
+    Guards the L204 catch site. A ``ServerClientError`` is raised (a drifted list
+    payload the server *did* answer), distinct from ``ServerUnavailable``
+    (unreachability). We assert on the degraded state the code sets — the state
+    flag AND the copy the user sees — not merely that nothing escaped.
+    """
+
+    client = mock.MagicMock()
+    client.profiles.side_effect = ServerClientError(
+        "/agents/profiles: expected a JSON array, got dict"
+    )
+    browser = ProfilesBrowser(client=client, builder=mock.MagicMock(), preflight=mock.MagicMock())
+
+    result = browser.load()
+
+    assert result == []
+    assert browser.unavailable is True
+    assert browser.state == "unavailable"
+    # The user sees the unavailable copy in the list pane (visible degradation).
+    assert browser.list_text() == profiles_view.UNAVAILABLE_TEXT
+    assert "unavailable" in browser.list_text().lower()
+
+
+def test_malformed_payload_on_detail_degrades_to_unavailable_state() -> None:
+    """A malformed ``/agents/profiles/{name}`` payload (ServerClientError) degrades
+    ``open_detail`` to the visible *unavailable* state mid-browse — never a crash.
+
+    Guards the L287 catch site. The list loaded fine; the detail read then returns
+    a drifted payload (``ServerClientError``, not ``ServerUnavailable``). The
+    browser must flip to the unavailable state and render the unavailable copy.
+    """
+
+    client = mock.MagicMock()
+    client.profiles.return_value = PROFILE_SUMMARIES
+    client.profile.side_effect = ServerClientError(
+        "/agents/profiles/backend-dev: missing required key 'name'"
+    )
+    browser = ProfilesBrowser(client=client, builder=mock.MagicMock(), preflight=mock.MagicMock())
+
+    browser.load()
+    assert browser.state == "list"  # list succeeded; the drift is on the detail read
+
+    detail = browser.open_detail("backend-dev")
+
+    assert detail is None
+    assert browser.detail is None
+    assert browser.unavailable is True
+    assert browser.state == "unavailable"
+    # The user sees the unavailable copy in the detail pane (visible degradation).
+    assert browser.detail_text() == profiles_view.UNAVAILABLE_TEXT
+
+
+def test_malformed_provider_payload_degrades_to_text_note() -> None:
+    """A malformed ``/agents/providers`` payload (ServerClientError) degrades
+    ``provider_readiness`` to the visible text note (NFR-6) — never a crash.
+
+    Guards the L351 catch site. ``ProviderPreflight.rows()`` raises a
+    ``ServerClientError`` (a drifted providers payload, not unreachability); the
+    surface must return the readiness-unavailable text, plain (no colour codes).
+    """
+
+    preflight = mock.MagicMock()
+    preflight.rows.side_effect = ServerClientError(
+        "/agents/providers: expected a JSON array, got dict"
+    )
+    browser = _browser(preflight=preflight)
+
+    text = browser.provider_readiness("claude_code")
+
+    assert "claude_code" in text
+    assert "unavailable" in text.lower()
+    assert "\x1b[" not in text  # text only, never colour (NFR-6)
 
 
 # --------------------------------------------------------------------------- #

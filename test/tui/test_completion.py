@@ -10,6 +10,7 @@ command has no params, and graceful degradation when the catalog raises
 
 from __future__ import annotations
 
+import logging
 from typing import List, Sequence
 
 from prompt_toolkit.completion import CompleteEvent
@@ -35,6 +36,22 @@ class _RaisingCatalog:
     """Stub whose ``params`` always raises, to test graceful degradation."""
 
     def params(self, command_path: Sequence[str]) -> List[Param]:
+        raise CatalogError(["cao", *command_path, "--help"], message="boom")
+
+
+class _RecordingRaisingCatalog:
+    """Raising stub that records the path it was queried with.
+
+    Lets a test prove which path ``_params`` *actually attempted* (the one the
+    catalog was called with) versus which path it later *logged* — the two
+    diverge only under the pre-fix double-resolve.
+    """
+
+    def __init__(self) -> None:
+        self.attempted: List[List[str]] = []
+
+    def params(self, command_path: Sequence[str]) -> List[Param]:
+        self.attempted.append(list(command_path))
         raise CatalogError(["cao", *command_path, "--help"], message="boom")
 
 
@@ -121,6 +138,50 @@ def test_catalog_error_degrades_to_no_completions() -> None:
 
     completer = ArgCompleter(_RaisingCatalog(), path=["session", "send"])
     assert _complete(completer, "--") == []
+
+
+def test_catalog_error_logs_the_path_actually_attempted(caplog) -> None:
+    """On ``CatalogError`` the debug log must name the path the catalog was ACTUALLY
+    queried with — proving the path is resolved ONCE, not re-resolved in ``except``.
+
+    ``self._path`` is a callable whose result CHANGES between calls (it pops from
+    a list). The fix resolves the path once into a local and reuses it for both
+    the catalog call and the log. The pre-fix code called ``self._resolve_path()``
+    a second time inside the ``except`` to build the log message, so it would log
+    the SECOND (never-attempted) resolution while the catalog was queried with the
+    FIRST — the logged path and the attempted path diverge.
+
+    This test pins them equal, which is the whole point of the fix. A test that
+    only asserted ``_params()`` returns ``[]`` on ``CatalogError`` would pass
+    before the fix too (that is decoration); the one-resolve / two-resolve
+    distinction is what this asserts.
+    """
+
+    catalog = _RecordingRaisingCatalog()
+    # Each call to the path callable yields a DIFFERENT path (front-popped), so a
+    # second resolve in the ``except`` branch would observe a path the catalog was
+    # never queried with. Two entries encode the expectation: one resolve consumes
+    # the first; a stray second resolve would consume the second.
+    resolutions = [["session", "send"], ["memory", "show"]]
+    completer = ArgCompleter(catalog, path=lambda: resolutions.pop(0))
+
+    with caplog.at_level(logging.DEBUG, logger="cli_agent_orchestrator.tui.completion"):
+        assert _complete(completer, "--") == []  # still degrades to no completions
+
+    # The catalog was queried exactly once, with the FIRST resolution.
+    assert catalog.attempted == [["session", "send"]]
+
+    # Exactly one degradation record, and it names the path ACTUALLY attempted —
+    # not the second, never-attempted resolution. Under the pre-fix double-resolve
+    # this record would carry ["memory", "show"], so the equality below fails.
+    records = [r for r in caplog.records if "catalog unavailable" in r.getMessage()]
+    assert len(records) == 1
+    logged_path = records[0].args[0]
+    assert logged_path == ["session", "send"] == catalog.attempted[0]
+    assert logged_path != ["memory", "show"]
+    # The rendered message the reader sees carries the attempted path, not the other.
+    assert "['session', 'send']" in records[0].getMessage()
+    assert "['memory', 'show']" not in records[0].getMessage()
 
 
 def test_unrecognized_previous_option_falls_through_to_flag_completion() -> None:
