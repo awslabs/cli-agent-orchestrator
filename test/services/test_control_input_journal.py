@@ -838,3 +838,254 @@ class TestAStoredSocketStillBindsExactly:
         again = journal.open_intent(_binding(server_socket_path=SOCKET))
         assert (first.state, again.state) == (INTENT, INTENT)
         assert [e["to_state"] for e in journal.get(REQ).events] == [INTENT]
+
+
+# --- Schema v4: the provider-visible submission observation ------------------
+
+V4_COLUMNS = ("submission_observed", "submission_evidence_ref")
+
+
+def _v3_row(db_path, state, *, chunks_sent=None, enter_attempted=None):
+    """A journal written before the submission observation existed.
+
+    Built at the real v3 shape — chord columns present, both v4 columns
+    genuinely absent, and ``journal_meta`` stamped ``3`` — so opening it
+    exercises the additive v4 migration and its pre-migration snapshot
+    rather than a hand-made imitation of their result.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript("""
+            CREATE TABLE journal_meta (
+              k TEXT PRIMARY KEY, v TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE control_input_request (
+              request_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL,
+              pane_id TEXT NOT NULL, window_id TEXT NOT NULL,
+              pane_pid INTEGER NOT NULL, server_socket_path TEXT,
+              generation TEXT, request_sha256 TEXT NOT NULL,
+              state TEXT NOT NULL, reason_code TEXT,
+              chunks_sent INTEGER, enter_attempted INTEGER,
+              chord TEXT, chord_attempted INTEGER, chord_sent INTEGER,
+              owner_pid INTEGER NOT NULL, owner_token TEXT NOT NULL,
+              opened_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            ) WITHOUT ROWID;
+            INSERT INTO journal_meta(k,v) VALUES ('journal_schema_version', '3');
+            """)
+        conn.execute(
+            "INSERT INTO control_input_request VALUES "
+            "(?,?,?,?,?,?,?,?,?,NULL,?,?,NULL,NULL,NULL,?,?,?,?)",
+            (
+                REQ,
+                TERMINAL,
+                PANE,
+                WINDOW,
+                PANE_PID,
+                SOCKET,
+                "gen-1",
+                _sha(),
+                state,
+                chunks_sent,
+                enter_attempted,
+                os.getpid(),
+                "v3-owner",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert not (set(V4_COLUMNS) & _columns(db_path)), "the v3 fixture is not v3"
+    return ControlInputJournal(db_path)
+
+
+def _snapshot_path(db_path):
+    return db_path.with_name(db_path.name + journal_module.V4_MIGRATION_SNAPSHOT_SUFFIX)
+
+
+def _meta_value(db_path, key):
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT v FROM journal_meta WHERE k=?", (key,)).fetchone()
+        return None if row is None else row[0]
+    finally:
+        conn.close()
+
+
+class TestV4Migration:
+    """The v3 -> v4 upgrade: additive columns, snapshot first, idempotent."""
+
+    def test_a_fresh_journal_is_born_v4_and_takes_no_snapshot(self, db_path):
+        ControlInputJournal(db_path)
+        assert set(V4_COLUMNS) <= _columns(db_path)
+        assert _meta_value(db_path, "journal_schema_version") == str(
+            CONTROL_INPUT_JOURNAL_SCHEMA_VERSION
+        )
+        # Nothing migrated, so nothing was preserved: a snapshot of a
+        # journal that never had a pre-v4 shape would be evidence of a
+        # migration that never happened.
+        assert not _snapshot_path(db_path).exists()
+
+    def test_a_v3_journal_gains_the_columns_and_is_restamped(self, db_path):
+        _v3_row(db_path, DELIVERED, chunks_sent=1, enter_attempted=1)
+        assert set(V4_COLUMNS) <= _columns(db_path)
+        assert _meta_value(db_path, "journal_schema_version") == "4"
+
+    def test_the_migration_snapshots_the_pre_v4_journal_before_altering(self, db_path):
+        _v3_row(db_path, DELIVERED, chunks_sent=1, enter_attempted=1)
+        snapshot = _snapshot_path(db_path)
+        assert snapshot.exists()
+        # The snapshot is the journal as it was *before* the ALTERs: v3
+        # shape, v3 stamp, the sealed row intact.  Anything newer in it
+        # would make it useless as pre-migration evidence.
+        assert not (set(V4_COLUMNS) & _columns(snapshot))
+        assert _meta_value(snapshot, "journal_schema_version") == "3"
+        conn = sqlite3.connect(snapshot)
+        try:
+            row = conn.execute(
+                "SELECT state, chunks_sent, enter_attempted FROM control_input_request "
+                "WHERE request_id=?",
+                (REQ,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row == (DELIVERED, 1, 1)
+
+    def test_an_existing_snapshot_is_never_overwritten(self, db_path):
+        """The first copy is the evidence; a later open must not replace it."""
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        sentinel = _snapshot_path(db_path)
+        sentinel.write_bytes(b"operator-preserved pre-v4 snapshot")
+        journal = _v3_row(db_path, DELIVERED)
+        assert journal.get(REQ).state == DELIVERED
+        assert sentinel.read_bytes() == b"operator-preserved pre-v4 snapshot"
+
+    def test_reopening_a_migrated_journal_takes_no_second_snapshot(self, db_path):
+        _v3_row(db_path, DELIVERED)
+        snapshot = _snapshot_path(db_path)
+        before = snapshot.stat().st_mtime_ns
+        # Second and later opens see the v4 columns already present, so
+        # the migration path — and with it the snapshot — is not re-run.
+        ControlInputJournal(db_path)
+        ControlInputJournal(db_path)
+        assert snapshot.stat().st_mtime_ns == before
+
+    def test_a_delivered_pre_v4_row_replays_with_a_typed_null_observation(self, db_path):
+        """A sealed pre-v4 row never grows an observation it never recorded.
+
+        NULL is the honest projection — "observation not recorded" — and
+        is distinct from ``unknown``, which is a recorded observation that
+        could not be classified.  Backfilling either way would fabricate
+        evidence about a write nobody watched.
+        """
+        book = _v3_row(db_path, DELIVERED, chunks_sent=1, enter_attempted=1)
+        record = book.open_intent(_binding(server_socket_path=SOCKET))
+        assert record.state == DELIVERED
+        assert record.outcome == ACCEPTED
+        assert record.submission_observed is None
+        assert record.submission_evidence_ref is None
+        assert record.as_dict()["submission_observed"] is None
+        assert [e["to_state"] for e in record.events] == []
+
+    def test_an_ambiguous_pre_v4_row_replays_typed_null_and_never_re_arms(self, db_path):
+        book = _v3_row(db_path, STATE_AMBIGUOUS)
+        record = book.open_intent(_binding(server_socket_path=SOCKET))
+        assert record.state == STATE_AMBIGUOUS
+        assert record.outcome == AMBIGUOUS
+        assert record.submission_observed is None
+        # An ambiguous record is terminal: the identical retry changed
+        # nothing, so a second Enter can never be smuggled in as a replay.
+        assert book.get(REQ).state == STATE_AMBIGUOUS
+        assert [e["to_state"] for e in book.get(REQ).events] == []
+
+
+class TestSubmissionObservationStorage:
+    """The v4 columns store and replay the observation verbatim."""
+
+    def test_a_delivered_record_stores_the_observation_and_its_evidence(self, journal):
+        journal.open_intent(_binding())
+        journal.claim_write(REQ)
+        record = journal.mark_delivered(
+            REQ,
+            chunks_sent=1,
+            enter_attempted=True,
+            submission_observed="submitted",
+            submission_evidence_ref="capture:%17:2026-07-27T00:00:01Z:abc123",
+        )
+        assert record.submission_observed == "submitted"
+        assert record.submission_evidence_ref == "capture:%17:2026-07-27T00:00:01Z:abc123"
+        assert journal.get(REQ).submission_observed == "submitted"
+
+    def test_an_ambiguous_record_stores_an_unsubmitted_observation(self, journal):
+        journal.open_intent(_binding())
+        journal.claim_write(REQ)
+        record = journal.mark_ambiguous(
+            REQ,
+            reason_code="submission-unproven",
+            chunks_sent=1,
+            enter_attempted=True,
+            submission_observed="unsubmitted",
+            submission_evidence_ref="capture:%17:2026-07-27T00:00:02Z:def456",
+        )
+        assert record.outcome == AMBIGUOUS
+        assert record.submission_observed == "unsubmitted"
+
+    def test_a_value_outside_the_closed_vocabulary_is_refused(self, journal):
+        journal.open_intent(_binding())
+        journal.claim_write(REQ)
+        with pytest.raises(ControlInputJournalError, match="unknown submission observation"):
+            journal.mark_delivered(REQ, chunks_sent=1, submission_observed="completed")
+
+    def test_the_observation_survives_a_terminal_replay_verbatim(self, journal):
+        """A6a: a same-id retry returns the stored observation, with no new event."""
+        journal.open_intent(_binding())
+        journal.claim_write(REQ)
+        journal.mark_delivered(
+            REQ,
+            chunks_sent=1,
+            enter_attempted=True,
+            submission_observed="submitted",
+            submission_evidence_ref="capture:%17:2026-07-27T00:00:03Z:789",
+        )
+        replayed = journal.open_intent(_binding())
+        assert replayed.state == DELIVERED
+        assert replayed.submission_observed == "submitted"
+        assert replayed.submission_evidence_ref == "capture:%17:2026-07-27T00:00:03Z:789"
+        # Terminal replay appends nothing: the event log is exactly the
+        # first attempt's history.
+        assert [e["to_state"] for e in replayed.events] == [INTENT, WRITING, DELIVERED]
+
+    def test_a_refused_record_rearms_and_then_replays_its_new_observation(self, journal):
+        """A6b: refused -> intent reattempt, then terminal replay of the new state."""
+        journal.open_intent(_binding())
+        journal.mark_refused(REQ, reason_code=REASON_PANE_BUSY)
+        rearmed = journal.open_intent(_binding())
+        assert rearmed.state == INTENT
+        assert rearmed.submission_observed is None
+        journal.claim_write(REQ)
+        journal.mark_delivered(
+            REQ,
+            chunks_sent=1,
+            enter_attempted=True,
+            submission_observed="submitted",
+            submission_evidence_ref="capture:%17:2026-07-27T00:00:04Z:aaa",
+        )
+        replayed = journal.open_intent(_binding())
+        assert replayed.state == DELIVERED
+        assert replayed.submission_observed == "submitted"
+        assert [e["to_state"] for e in replayed.events] == [
+            INTENT,
+            STATE_REFUSED,
+            INTENT,
+            WRITING,
+            DELIVERED,
+        ]
+
+    def test_a_barrier_refusal_carries_no_observation(self, journal):
+        """A refusal is decided before any byte; there is nothing to observe."""
+        journal.open_intent(_binding())
+        record = journal.mark_refused(REQ, reason_code=REASON_PANE_BUSY)
+        assert record.submission_observed is None
+        assert record.submission_evidence_ref is None

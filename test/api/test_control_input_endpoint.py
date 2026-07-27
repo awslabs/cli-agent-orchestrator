@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -32,6 +33,7 @@ from fastapi.testclient import TestClient
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.security import auth
 from cli_agent_orchestrator.services import control_input_service as service
+from cli_agent_orchestrator.services import native_pane_input
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
     AMBIGUOUS,
@@ -63,6 +65,7 @@ from cli_agent_orchestrator.services.control_input_journal import (
     ControlInputBinding,
     ControlInputJournal,
 )
+from cli_agent_orchestrator.services.native_pane_input import SubmissionBarrier
 from cli_agent_orchestrator.services.pane_input_arbiter import (
     pane_input_lease,
     reset_pane_input_arbiter,
@@ -842,3 +845,130 @@ class TestProtocolCompatibility:
         assert response.status_code == 200
         assert response.json()["outcome"] == ACCEPTED
         assert tmux.writes[0]["submit"] is True
+
+
+# --- cond-0026: the submission observation on the wire -------------------------
+
+
+class _FakeCodexComposer:
+    """The composer the capture fake serves, defect included on demand."""
+
+    def __init__(self, *, swallow_enter=False):
+        self.composed = ""
+        self.transcript = [f"transcript row {index}" for index in range(10)]
+        self.swallow_enter = swallow_enter
+
+    def on_write(self, text, submit):
+        if submit:
+            if not self.swallow_enter:
+                self.transcript.append(f"› {self.composed}")
+                self.composed = ""
+        else:
+            self.composed += text
+
+    def rows(self):
+        return self.transcript + [
+            "╭──────────────────────────────────────────────────────╮",
+            f"│ > {self.composed}",
+            "╰──────────────────────────────────────────────────────╯",
+            "  gpt-5.6-terra · 99% context left · ? for shortcuts",
+        ]
+
+
+class _CodexFakeTmux(FakeTmux):
+    def __init__(self, composer):
+        super().__init__()
+        self._composer = composer
+
+    def send_literal_line(
+        self,
+        pane_id,
+        text,
+        submit=True,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
+        accepted = super().send_literal_line(
+            pane_id,
+            text,
+            submit=submit,
+            expected_server_identity=expected_server_identity,
+            deadline_monotonic=deadline_monotonic,
+        )
+        self._composer.on_write(text, submit)
+        return accepted
+
+
+@pytest.fixture
+def codex(monkeypatch):
+    """One Codex terminal behind the app, with a test-speed barrier."""
+    composer = _FakeCodexComposer()
+    tmux_client = _CodexFakeTmux(composer)
+    monkeypatch.setattr(service, "_tmux_client", lambda: tmux_client)
+    monkeypatch.setattr(
+        service,
+        "_terminal_metadata",
+        lambda terminal_id: _metadata(provider="codex") if terminal_id == TERMINAL else None,
+    )
+    monkeypatch.setattr(service, "_managed_identity", lambda terminal_id: None)
+    monkeypatch.setattr(
+        native_pane_input,
+        "capture_pane_screen",
+        lambda pane_id, timeout=10.0: composer.rows(),
+    )
+    monkeypatch.setitem(
+        native_pane_input._SUBMISSION_BARRIERS,
+        "codex",
+        SubmissionBarrier(
+            compose_settle_seconds=0.3,
+            post_enter_seconds=0.3,
+            poll_interval_seconds=0.01,
+            composer_tail_rows=4,
+        ),
+    )
+    return SimpleNamespace(client=tmux_client, composer=composer)
+
+
+class TestSubmissionObservationOnTheWire:
+    """The typed body carries the observation; the wire never has to guess."""
+
+    def test_a_codex_control_reports_submission_observed(self, client, codex):
+        response = _post(client)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["outcome"] == ACCEPTED
+        assert body["submission_observed"] == "submitted"
+        assert body["submission_evidence_ref"].startswith(f"capture-pane:{PANE}:")
+        # One text write and exactly one Enter, in that order.
+        assert [write["submit"] for write in codex.client.writes] == [False, True]
+
+    def test_the_lookup_route_reports_the_same_stored_observation(self, client, codex):
+        posted = _post(client).json()
+        assert posted["outcome"] == ACCEPTED
+
+        looked_up = client.get(f"/control-input/{CONTROL}")
+        assert looked_up.status_code == 200
+        body = looked_up.json()
+        assert body["outcome"] == ACCEPTED
+        assert body["submission_observed"] == "submitted"
+        assert body["submission_evidence_ref"] == posted["submission_evidence_ref"]
+
+    def test_an_unsubmitted_codex_control_is_ambiguous_on_the_wire(self, client, codex):
+        codex.composer.swallow_enter = True
+
+        body = _post(client).json()
+        assert body["outcome"] == AMBIGUOUS
+        assert body["reason_code"] == "submission-unproven"
+        assert body["submission_observed"] == "unsubmitted"
+        assert [write["submit"] for write in codex.client.writes] == [False, True]
+
+    def test_a_non_codex_control_projects_the_typed_null(self, client, tmux):
+        """Keys always present, values null: absence is never ambiguous."""
+        body = _post(client).json()
+        assert body["outcome"] == ACCEPTED
+        assert "submission_observed" in body
+        assert body["submission_observed"] is None
+        assert "submission_evidence_ref" in body
+        assert body["submission_evidence_ref"] is None

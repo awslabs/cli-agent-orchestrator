@@ -25,6 +25,7 @@ import pytest
 from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import control_input_service as service
+from cli_agent_orchestrator.services import native_pane_input
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
     AMBIGUOUS,
@@ -49,6 +50,9 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_UNKNOWN_TERMINAL,
     REASON_WRITE_INCOMPLETE,
     REFUSED,
+    SUBMISSION_SUBMITTED,
+    SUBMISSION_UNKNOWN,
+    SUBMISSION_UNSUBMITTED,
     UNSUPPORTED,
     contains_bracketed_paste_sentinel,
     control_input_request_digest,
@@ -59,6 +63,10 @@ from cli_agent_orchestrator.services.control_input_journal import (
     STATE_REFUSED,
     ControlInputBinding,
     ControlInputJournal,
+)
+from cli_agent_orchestrator.services.native_pane_input import (
+    NativePaneInputUnavailable,
+    SubmissionBarrier,
 )
 from cli_agent_orchestrator.services.pane_input_arbiter import (
     pane_input_lease,
@@ -1605,3 +1613,327 @@ class TestPublicControlShapeStaysStrict:
         )
         assert result.outcome == REFUSED
         assert result.reason_code == REASON_MULTILINE_REJECTED
+
+
+# --- Codex provider-visible submission (cond-0026) ----------------------------
+
+
+class FakeComposer:
+    """The Codex composer as a tiny state machine behind ``capture-pane``.
+
+    Models the one fact the barrier cares about: whether the composer is
+    visibly holding the control text.  ``swallow_enter`` reproduces the
+    cond-0026 defect — the Enter arrives inside the composer's input-burst
+    window and the text simply stays put, with tmux reporting success for
+    every write.
+    """
+
+    def __init__(self, *, swallow_enter=False):
+        self.composed = ""
+        self.transcript = [f"transcript row {index}" for index in range(10)]
+        self.swallow_enter = swallow_enter
+
+    def on_write(self, text, submit):
+        if submit:
+            if not self.swallow_enter:
+                self.transcript.append(f"› {self.composed}")
+                self.composed = ""
+        else:
+            self.composed += text
+
+    def rows(self):
+        return self.transcript + [
+            "╭──────────────────────────────────────────────────────╮",
+            f"│ > {self.composed}",
+            "╰──────────────────────────────────────────────────────╯",
+            "  gpt-5.6-terra · 99% context left · ? for shortcuts",
+        ]
+
+
+class CodexFakeTmux(FakeTmux):
+    """A FakeTmux that drives the fake composer as its writes land."""
+
+    def __init__(self, composer, **kwargs):
+        super().__init__(**kwargs)
+        self._composer = composer
+
+    def send_literal_line(
+        self,
+        pane_id,
+        text,
+        submit=True,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
+        accepted = super().send_literal_line(
+            pane_id,
+            text,
+            submit=submit,
+            expected_server_identity=expected_server_identity,
+            deadline_monotonic=deadline_monotonic,
+        )
+        self._composer.on_write(text, submit)
+        return accepted
+
+
+@pytest.fixture
+def codex(monkeypatch):
+    """A Codex terminal whose composer answers capture-pane, and a fast barrier.
+
+    The pinned production bounds (3 s settle, 5 s observation) are right
+    for a live composer and wrong for a test clock; the table entry is
+    replaced with a tight one, which exercises the same code paths at
+    test speed.
+    """
+    composer = FakeComposer()
+    client = CodexFakeTmux(composer)
+    monkeypatch.setattr(service, "_tmux_client", lambda: client)
+    monkeypatch.setattr(
+        service, "_terminal_metadata", lambda terminal_id: _metadata(provider="codex")
+    )
+    monkeypatch.setattr(service, "_managed_identity", lambda terminal_id: None)
+    monkeypatch.setattr(
+        native_pane_input,
+        "capture_pane_screen",
+        lambda pane_id, timeout=10.0: composer.rows(),
+    )
+    monkeypatch.setitem(
+        native_pane_input._SUBMISSION_BARRIERS,
+        "codex",
+        SubmissionBarrier(
+            compose_settle_seconds=0.3,
+            post_enter_seconds=0.3,
+            poll_interval_seconds=0.01,
+            composer_tail_rows=4,
+        ),
+    )
+    return SimpleNamespace(client=client, composer=composer)
+
+
+class TestCodexSubmissionBarrier:
+    """cond-0026: transport acceptance is not read as submission for Codex."""
+
+    def test_text_and_enter_are_serialized_through_the_composer(self, codex, journal):
+        """A1's mechanism: text, compose-visible settle, one Enter, observation."""
+        result = _deliver(journal)
+
+        assert result.outcome == ACCEPTED
+        assert result.submission_observed == SUBMISSION_SUBMITTED
+        assert result.submission_evidence_ref is not None
+        assert result.submission_evidence_ref.startswith(f"capture-pane:{PANE}:")
+        assert result.text_sent is True and result.enter_sent is True
+        # Exactly one text write and exactly one Enter, in that order, and
+        # never a fused text+Enter burst.
+        assert codex.client.writes == [
+            {
+                "pane_id": PANE,
+                "text": TEXT,
+                "submit": False,
+                "expected_server_identity": SOCKET,
+            },
+            {
+                "pane_id": PANE,
+                "text": "",
+                "submit": True,
+                "expected_server_identity": SOCKET,
+            },
+        ]
+        record = journal.get(CONTROL)
+        assert record.state == DELIVERED
+        assert record.submission_observed == SUBMISSION_SUBMITTED
+        assert record.submission_evidence_ref == result.submission_evidence_ref
+        # The response states plainly what was and was not proven.
+        assert "not provider completion" in result.detail
+
+    def test_a_swallowed_enter_is_ambiguous_and_never_re_sent(self, codex, journal):
+        """A3: the defect itself — submission unproven, no second Enter."""
+        codex.composer.swallow_enter = True
+        result = _deliver(journal)
+
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        assert result.submission_observed == SUBMISSION_UNSUBMITTED
+        assert result.submission_evidence_ref is not None
+        # One text write, one Enter, full stop.  The blind second Enter
+        # that would double-submit is exactly what must never happen.
+        assert [write["submit"] for write in codex.client.writes] == [False, True]
+        record = journal.get(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        assert record.enter_attempted is True
+        assert record.submission_observed == SUBMISSION_UNSUBMITTED
+
+    def test_text_that_never_composes_withholds_the_enter(self, codex, journal):
+        """A3: the barrier's Enter fires only at a proven-composed control."""
+        codex.composer.rows = lambda: ["nothing on screen"] * 14
+        result = _deliver(journal)
+
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        assert result.submission_observed == SUBMISSION_UNKNOWN
+        assert result.enter_attempted is False
+        # The text write landed; zero Enters were sent.
+        assert [write["submit"] for write in codex.client.writes] == [False]
+        record = journal.get(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        assert record.enter_attempted is False
+        assert record.submission_observed == SUBMISSION_UNKNOWN
+
+    def test_blindness_after_the_enter_is_unknown_never_submitted(
+        self, codex, journal, monkeypatch
+    ):
+        """A3: a post-Enter observation that cannot be made proves nothing."""
+        calls = {"count": 0}
+
+        def flaky_capture(pane_id, timeout=10.0):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return codex.composer.rows()
+            raise NativePaneInputUnavailable("pane unreadable")
+
+        # Settle succeeds against the real composer; every post-Enter
+        # capture then fails, so there is no observation to classify.
+        monkeypatch.setattr(native_pane_input, "capture_pane_screen", flaky_capture)
+
+        result = _deliver(journal)
+
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        assert result.submission_observed == SUBMISSION_UNKNOWN
+        assert result.submission_evidence_ref is None
+        assert [write["submit"] for write in codex.client.writes] == [False, True]
+
+    def test_an_ambiguous_retry_replays_the_stored_record_with_zero_new_io(self, codex, journal):
+        """A6a: an ambiguous record never gains new I/O on retry."""
+        codex.composer.swallow_enter = True
+        first = _deliver(journal)
+        assert first.outcome == AMBIGUOUS
+        writes_after_first = len(codex.client.writes)
+        events_after_first = len(journal.get(CONTROL).events)
+
+        replayed = _deliver(journal)
+
+        assert replayed.outcome == AMBIGUOUS
+        assert replayed.reason_code == "submission-unproven"
+        assert replayed.submission_observed == SUBMISSION_UNSUBMITTED
+        assert replayed.submission_evidence_ref == first.submission_evidence_ref
+        assert len(codex.client.writes) == writes_after_first
+        assert len(journal.get(CONTROL).events) == events_after_first
+
+    def test_a_delivered_retry_replays_the_stored_observation_verbatim(self, codex, journal):
+        """A6a: a delivered record replays outcome plus observation, no new I/O."""
+        first = _deliver(journal)
+        assert first.outcome == ACCEPTED
+        writes_after_first = len(codex.client.writes)
+
+        replayed = _deliver(journal)
+
+        assert replayed.outcome == ACCEPTED
+        assert replayed.submission_observed == SUBMISSION_SUBMITTED
+        assert replayed.submission_evidence_ref == first.submission_evidence_ref
+        assert len(codex.client.writes) == writes_after_first
+
+    def test_a_lost_response_is_answered_with_the_stored_observation(self, codex, journal):
+        """A6a: the exact-id lookup reports the observation, not a guess."""
+        first = _deliver(journal)
+        assert first.outcome == ACCEPTED
+        writes_after_first = len(codex.client.writes)
+
+        answer = service.lookup_control_input(CONTROL, journal=journal)
+
+        assert answer.outcome == ACCEPTED
+        assert answer.submission_observed == SUBMISSION_SUBMITTED
+        assert answer.submission_evidence_ref == first.submission_evidence_ref
+        assert len(codex.client.writes) == writes_after_first
+
+    def test_a_crash_mid_write_replays_ambiguous_with_a_typed_null_observation(
+        self, codex, journal, db_path
+    ):
+        """A6a: crash window — the sweep's ambiguous record invents nothing."""
+        dead = ControlInputJournal(db_path, owner_pid=_dead_pid(), owner_token="prev")
+        dead.open_intent(
+            ControlInputBinding(
+                request_id=CONTROL,
+                terminal_id=TERMINAL,
+                pane_id=PANE,
+                window_id=WINDOW,
+                pane_pid=PANE_PID,
+                request_sha256=control_input_request_digest(
+                    control_id=CONTROL, text=TEXT, enter=True, expected_identity=None
+                ),
+                generation=GENERATION,
+                server_socket_path=SOCKET,
+            )
+        )
+        dead.claim_write(CONTROL)
+
+        result = _deliver(journal)
+
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "owner-lost-mid-write"
+        assert result.submission_observed is None
+        assert result.submission_evidence_ref is None
+        # The replay drove no new I/O of any kind.
+        assert codex.client.writes == []
+        # And a further identical retry replays that terminal record.
+        again = _deliver(journal)
+        assert again.outcome == AMBIGUOUS
+        assert again.submission_observed is None
+        assert codex.client.writes == []
+
+    def test_a_refused_record_reattempts_and_then_replays_terminally(self, codex, journal):
+        """A6b: refused -> intent reattempt, then terminal stored-row replay."""
+        with _pane_held_elsewhere():
+            refused = _deliver(journal)
+        assert refused.outcome == REFUSED
+        assert refused.reason_code == "pane-busy"
+        assert refused.submission_observed is None
+        assert codex.client.writes == []
+
+        delivered = _deliver(journal)
+        assert delivered.outcome == ACCEPTED
+        assert delivered.submission_observed == SUBMISSION_SUBMITTED
+        writes_after_delivery = len(codex.client.writes)
+        assert writes_after_delivery == 2
+
+        replayed = _deliver(journal)
+        assert replayed.outcome == ACCEPTED
+        assert replayed.submission_observed == SUBMISSION_SUBMITTED
+        assert replayed.submission_evidence_ref == delivered.submission_evidence_ref
+        assert len(codex.client.writes) == writes_after_delivery
+        assert [event["to_state"] for event in journal.get(CONTROL).events] == [
+            "intent",
+            "refused",
+            "intent",
+            "writing",
+            "delivered",
+        ]
+
+    def test_a_stale_identity_is_refused_before_any_write(self, codex, journal):
+        """Stale identity: the barrier is never reached, zero bytes as ever."""
+        result = _deliver(journal, expected_identity={"terminal_generation": "gen-old"})
+
+        assert result.outcome == REFUSED
+        assert result.reason_code == "stale-generation"
+        assert result.submission_observed is None
+        assert codex.client.writes == []
+
+    def test_enter_false_needs_no_barrier_and_records_no_observation(self, codex, journal):
+        """No Enter is requested, so there is nothing to observe."""
+        result = _deliver(journal, enter=False)
+
+        assert result.outcome == ACCEPTED
+        assert result.submission_observed is None
+        assert result.submission_evidence_ref is None
+        assert [write["submit"] for write in codex.client.writes] == [False]
+
+    def test_a_non_codex_provider_keeps_the_fused_write(self, tmux, journal):
+        """A4: absent contrary evidence, Kimi/Claude keep current behaviour."""
+        result = _deliver(journal)
+
+        assert result.outcome == ACCEPTED
+        assert result.submission_observed is None
+        assert result.as_response()["submission_observed"] is None
+        assert result.as_response()["submission_evidence_ref"] is None
+        # One fused text+Enter write, exactly as before cond-0026.
+        assert [write["submit"] for write in tmux.writes] == [True]
