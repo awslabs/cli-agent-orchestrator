@@ -84,6 +84,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_OWNER_LOST_BEFORE_WRITE,
     REASON_OWNER_LOST_MID_WRITE,
     REFUSED,
+    SUBMISSION_OBSERVED_VALUES,
     is_reattemptable,
     is_valid_pane_id,
     outcome_for_reason,
@@ -96,7 +97,20 @@ from cli_agent_orchestrator.services.control_input_contract import (
 #: 3 adds ``chord``, ``chord_attempted``, ``chord_sent`` for schema-v2
 #: chord controls (the chord mirrors the enter fields so a replay of a
 #: lost response can report how far a text-then-chord write got).
-CONTROL_INPUT_JOURNAL_SCHEMA_VERSION = 3
+#: 4 adds ``submission_observed`` and ``submission_evidence_ref`` for the
+#: cond-0026 provider-visible submission boundary: what the composer was
+#: observed to do with the control, and where that observation's evidence
+#: lives.  Both stay NULL on rows sealed before v4 — an observation that
+#: was never recorded is projected as exactly that, never backfilled or
+#: inferred.  The v3 -> v4 migration snapshots the journal file before the
+#: first ALTER (see ``_snapshot_before_v4_migration``).
+CONTROL_INPUT_JOURNAL_SCHEMA_VERSION = 4
+
+#: Where the pre-migration copy of a v3 journal is written before the v4
+#: ALTERs run.  Sibling of the journal file, created at most once: an
+#: existing snapshot is the original pre-migration evidence and is never
+#: overwritten by a later open.
+V4_MIGRATION_SNAPSHOT_SUFFIX = ".pre-v4-migration.sqlite3"
 
 # --- Record states --------------------------------------------------------
 
@@ -151,6 +165,8 @@ CREATE TABLE IF NOT EXISTS control_input_request (
   chord TEXT,
   chord_attempted INTEGER,
   chord_sent INTEGER,
+  submission_observed TEXT,
+  submission_evidence_ref TEXT,
   owner_pid INTEGER NOT NULL,
   owner_token TEXT NOT NULL,
   opened_at TEXT NOT NULL,
@@ -184,7 +200,15 @@ _ADDITIVE_REQUEST_COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("chord", "TEXT"),
     ("chord_attempted", "INTEGER"),
     ("chord_sent", "INTEGER"),
+    ("submission_observed", "TEXT"),
+    ("submission_evidence_ref", "TEXT"),
 )
+
+#: Columns whose absence from an existing journal marks it as pre-v4, so
+#: their addition is the v4 migration the snapshot below protects.  Both
+#: are added by one ``ALTER`` pass; checking one would do, but naming both
+#: keeps the marker honest if a journal is ever found half-migrated.
+_V4_REQUEST_COLUMNS: Tuple[str, ...] = ("submission_observed", "submission_evidence_ref")
 
 
 class ControlInputJournalError(RuntimeError):
@@ -251,6 +275,57 @@ def _add_missing_request_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE control_input_request ADD COLUMN {column} {column_type}")
 
 
+def _journal_needs_v4_migration(db_path: Path) -> bool:
+    """Whether opening ``db_path`` will ALTER a pre-v4 journal.
+
+    False for a journal that does not exist yet (it is born at the current
+    shape and there is nothing to preserve), for one whose request table
+    was never created (same), and for one already carrying the v4 columns
+    (the migration has already run; re-snapshotting now would overwrite
+    the original pre-migration evidence with a post-migration copy).
+    """
+    if not db_path.exists():
+        return False
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        cursor = conn.execute("PRAGMA table_info(control_input_request)")
+        present = {row[1] for row in cursor.fetchall()}
+    finally:
+        conn.close()
+    if not present:
+        return False
+    return any(column not in present for column in _V4_REQUEST_COLUMNS)
+
+
+def _snapshot_before_v4_migration(db_path: Path) -> Optional[Path]:
+    """Copy a pre-v4 journal aside before its first v4 ALTER.
+
+    Uses the SQLite backup API rather than a file copy so the snapshot is
+    a consistent database even while the live journal is in WAL mode with
+    transactions in flight.  Written at most once: an existing snapshot is
+    left untouched, because the first copy is the pre-migration evidence
+    and a later one would describe a journal that had already migrated.
+
+    Returns the snapshot path when one was written, else None.
+    """
+    if not _journal_needs_v4_migration(db_path):
+        return None
+    snapshot_path = db_path.with_name(db_path.name + V4_MIGRATION_SNAPSHOT_SUFFIX)
+    if snapshot_path.exists():
+        return None
+    source = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        destination = sqlite3.connect(str(snapshot_path))
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
+    os.chmod(snapshot_path, 0o600)
+    return snapshot_path
+
+
 @dataclass(frozen=True)
 class ControlInputBinding:
     """Everything one request id is permanently bound to.
@@ -306,6 +381,14 @@ class ControlInputRecord:
     chord: Optional[str] = None
     chord_attempted: Optional[bool] = None
     chord_sent: Optional[bool] = None
+    # The provider-visible submission observation and where its evidence
+    # lives (v4).  ``None`` is a typed null meaning "no observation was
+    # recorded for this request" — pre-v4 rows, providers with no
+    # submission barrier, controls sent with ``enter=False``, and every
+    # refusal — and is projected as exactly that, never as "unknown",
+    # which is a recorded observation that could not be classified.
+    submission_observed: Optional[str] = None
+    submission_evidence_ref: Optional[str] = None
     owner_pid: int = 0
     owner_token: str = ""
     opened_at: str = ""
@@ -339,6 +422,8 @@ class ControlInputRecord:
             "chord": self.chord,
             "chord_attempted": self.chord_attempted,
             "chord_sent": self.chord_sent,
+            "submission_observed": self.submission_observed,
+            "submission_evidence_ref": self.submission_evidence_ref,
             "opened_at": self.opened_at,
             "updated_at": self.updated_at,
             "events": [dict(event) for event in self.events],
@@ -377,6 +462,11 @@ class ControlInputJournal:
         # mistakes a previous incarnation's stranded record for its own.
         self._owner_token = str(uuid.uuid4()) if owner_token is None else owner_token
         self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Before anything else: if this is a pre-v4 journal, preserve it.
+        # The snapshot must precede the creation transaction below, which
+        # is where the v4 ALTERs run, and it is taken at most once so the
+        # pre-migration evidence is never overwritten by a later open.
+        _snapshot_before_v4_migration(self._path)
         # Concurrent first-open constructors race on the create
         # transaction; creation is idempotent, so a locked loser retries.
         last_error: Optional[sqlite3.Error] = None
@@ -625,6 +715,8 @@ class ControlInputJournal:
         chord: Optional[str] = None,
         chord_attempted: Optional[bool] = None,
         chord_sent: Optional[bool] = None,
+        submission_observed: Optional[str] = None,
+        submission_evidence_ref: Optional[str] = None,
         evidence_digest: Optional[str] = None,
     ) -> ControlInputRecord:
         """tmux accepted every write, including any submitting Enter.
@@ -639,6 +731,12 @@ class ControlInputJournal:
         where the chord replaces Enter as the submit/steer effect: a
         delivered chord control recorded ``chord_sent`` so a replay knows
         the steer effect landed, not just the text.
+
+        ``submission_observed`` is the provider-visible half (v4): on a
+        provider with a submission barrier, ``delivered`` is only reached
+        when the composer was seen to take the control, and the stored
+        observation plus its evidence reference is what a replay reports
+        verbatim.  It is never inferred from transport acknowledgement.
         """
         return self._transition(
             request_id,
@@ -648,6 +746,8 @@ class ControlInputJournal:
             chord=chord,
             chord_attempted=chord_attempted,
             chord_sent=chord_sent,
+            submission_observed=submission_observed,
+            submission_evidence_ref=submission_evidence_ref,
             evidence_digest=evidence_digest,
         )
 
@@ -681,6 +781,8 @@ class ControlInputJournal:
         chord: Optional[str] = None,
         chord_attempted: Optional[bool] = None,
         chord_sent: Optional[bool] = None,
+        submission_observed: Optional[str] = None,
+        submission_evidence_ref: Optional[str] = None,
         evidence_digest: Optional[str] = None,
     ) -> ControlInputRecord:
         """Record that the pane's state is unknowable for this request.
@@ -688,6 +790,13 @@ class ControlInputJournal:
         Terminal for automation.  It is never re-driven and never
         upgraded to delivered by a later observation, because the pane
         cannot distinguish this control's bytes from any other's.
+
+        ``submission_observed`` records what the submission barrier saw
+        before the ambiguity was declared — including ``unsubmitted``,
+        the positive observation that the composer kept the control.  An
+        ``unsubmitted`` observation never downgrades the record to a
+        refusal: the text may have reached the pane, so no zero-byte
+        proof exists and no re-attempt licence is granted.
         """
         return self._transition(
             request_id,
@@ -698,6 +807,8 @@ class ControlInputJournal:
             chord=chord,
             chord_attempted=chord_attempted,
             chord_sent=chord_sent,
+            submission_observed=submission_observed,
+            submission_evidence_ref=submission_evidence_ref,
             evidence_digest=evidence_digest,
         )
 
@@ -712,6 +823,8 @@ class ControlInputJournal:
         chord: Optional[str] = None,
         chord_attempted: Optional[bool] = None,
         chord_sent: Optional[bool] = None,
+        submission_observed: Optional[str] = None,
+        submission_evidence_ref: Optional[str] = None,
         evidence_digest: Optional[str] = None,
     ) -> ControlInputRecord:
         # A reason is bound to exactly one outcome, so a reason that
@@ -736,6 +849,20 @@ class ControlInputJournal:
                     f"reason {reason_code!r} carries outcome {expected!r} and cannot be "
                     f"recorded as {to_state!r} (outcome {actual!r}); {hazard}"
                 )
+        # The observation vocabulary is closed for the same reason the
+        # outcome vocabulary is: a value outside it is not an observation
+        # but a claim nobody verified, and storing it would let a replay
+        # report it as fact.  None is always legal — it is the typed null
+        # for "no observation was recorded", never a shorthand for one of
+        # the three recorded values.
+        if submission_observed is not None and submission_observed not in (
+            SUBMISSION_OBSERVED_VALUES
+        ):
+            raise ControlInputJournalError(
+                f"unknown submission observation {submission_observed!r}; the recorded "
+                f"values are {sorted(SUBMISSION_OBSERVED_VALUES)} and None means no "
+                "observation was taken"
+            )
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -764,7 +891,10 @@ class ControlInputJournal:
                 "enter_attempted=COALESCE(?, enter_attempted), "
                 "chord=COALESCE(?, chord), "
                 "chord_attempted=COALESCE(?, chord_attempted), "
-                "chord_sent=COALESCE(?, chord_sent), updated_at=? "
+                "chord_sent=COALESCE(?, chord_sent), "
+                "submission_observed=COALESCE(?, submission_observed), "
+                "submission_evidence_ref=COALESCE(?, submission_evidence_ref), "
+                "updated_at=? "
                 "WHERE request_id=? AND state=?",
                 (
                     to_state,
@@ -774,6 +904,8 @@ class ControlInputJournal:
                     chord,
                     None if chord_attempted is None else int(chord_attempted),
                     None if chord_sent is None else int(chord_sent),
+                    submission_observed,
+                    submission_evidence_ref,
                     moment,
                     request_id,
                     from_state,
@@ -820,6 +952,7 @@ class ControlInputJournal:
                 "SELECT request_id, terminal_id, pane_id, window_id, pane_pid, "
                 "server_socket_path, generation, request_sha256, state, reason_code, "
                 "chunks_sent, enter_attempted, chord, chord_attempted, chord_sent, "
+                "submission_observed, submission_evidence_ref, "
                 "owner_pid, owner_token, opened_at, updated_at "
                 "FROM control_input_request WHERE request_id=?",
                 (request_id,),
@@ -857,10 +990,12 @@ class ControlInputJournal:
             chord=row[12],
             chord_attempted=None if row[13] is None else bool(row[13]),
             chord_sent=None if row[14] is None else bool(row[14]),
-            owner_pid=int(row[15]),
-            owner_token=row[16],
-            opened_at=row[17],
-            updated_at=row[18],
+            submission_observed=row[15],
+            submission_evidence_ref=row[16],
+            owner_pid=int(row[17]),
+            owner_token=row[18],
+            opened_at=row[19],
+            updated_at=row[20],
             events=events,
         )
 

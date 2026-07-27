@@ -40,10 +40,19 @@ by the version-pinned caller.
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
-from typing import Optional, Sequence
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Callable, Optional, Sequence, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services.control_input_contract import (
+    SUBMISSION_SUBMITTED,
+    SUBMISSION_UNKNOWN,
+    SUBMISSION_UNSUBMITTED,
+)
 
 # tmux takes the payload as a single argv element. Long task messages are
 # split so no one call approaches an argument-length limit, which would
@@ -336,3 +345,271 @@ def observe_claude_turn_state(
         window_name=window_name,
     )
     return provider.get_status_from_screen(rows)
+
+
+# --- Provider-pinned submission barrier (cond-0026) ---------------------------
+#
+# Transport acceptance is not submission.  A composer that is still catching
+# up with an input burst can swallow the Enter that follows it, leaving the
+# control text resting unsubmitted while every tmux write reported success.
+# The providers with a native control adapter (Kimi, Claude) already cross
+# this boundary inside their own proven composer plans.  For a provider
+# without one, the barrier below is the only thing standing between "tmux
+# acked the bytes" and "the provider visibly took the control".
+#
+# The strategy is compose-visible settle: the text write and its one Enter
+# are serialized through an observation of the composer itself.  The Enter
+# is sent only after the control text is seen resting in the composer, and
+# submission is claimed only when the composer is then seen to give the
+# text up.  Exactly one Enter is ever sent.  If the text never becomes
+# visible, no Enter is sent at all; if the composer never gives the text
+# up, the control is ambiguous and is never re-driven — a second, blind
+# Enter is how one requested submission becomes two.
+
+
+@dataclass(frozen=True)
+class SubmissionBarrier:
+    """How one provider's composer is walked across the submit boundary.
+
+    ``compose_settle_seconds`` bounds the wait for the typed text to become
+    compose-visible.  ``post_enter_seconds`` bounds the wait for the
+    composer to give the text up after the single Enter.  Both are bounded
+    polls, not fixed sleeps: a healthy composer answers in one or two
+    polls, and the full bound is only ever paid by a composer that is not
+    answering.  ``composer_tail_rows`` is the region, counted up from the
+    bottom of the screen, that holds the composer box and its status line
+    for this provider's pinned builds.
+    """
+
+    compose_settle_seconds: float
+    post_enter_seconds: float
+    poll_interval_seconds: float
+    composer_tail_rows: int
+
+
+# The observation matches on the *tail* of the control text, not the whole
+# string.  A long control wraps inside the composer box, and the box's top
+# rows can scroll above the observed region; the wrap's last line always
+# carries the text's own ending, so the ending is the one fragment that is
+# present exactly while the composer holds the control.  48 normalized
+# characters spans at most two composer rows on any sane pane width.
+_OBSERVATION_SUFFIX_CHARS = 48
+
+# One capture may not consume the whole write deadline while the composer
+# is being polled.  A capture that cannot answer inside this bound is a
+# failed observation, not a slow one.
+_OBSERVATION_CAPTURE_TIMEOUT_SECONDS = 2.0
+
+#: The provider-pinned barrier table, beside the adapters' steer-chord
+#: pins.  Only Codex has an entry: it is the provider whose composer was
+#: proven to swallow a back-to-back Enter (cond-0026), and it has no
+#: native control adapter to cross the boundary on its own.  Kimi and
+#: Claude deliberately have no entry — their adapter plans already carry
+#: the proven submit settle, and adding a second barrier there would
+#: change behaviour that has no contrary evidence.  A provider absent
+#: from the table gets today's behaviour: text and Enter back to back,
+#: with no observation claimed.
+_SUBMISSION_BARRIERS = {
+    # Codex (ratatui composer, pinned 0.145.x): the observed region is
+    # the bottom four rows — the status line, the composer box's bottom
+    # border, and its (possibly wrapped) input rows.  Four is the
+    # boundary that keeps the composer's own contents in and everything
+    # else out: a submitted control's transcript echo lands directly
+    # above the box, outside the region, while the match on the text's
+    # own ending keeps a wrapped long control visible through its last
+    # input row.  Both failure directions of a misread region land on
+    # ``ambiguous`` rather than on a wrong verdict: a region too small
+    # fails the settle, a region too large reads the echo as the
+    # composer, and neither sends a second Enter.  The settle bound is far
+    # beyond the measured paste-burst windows (~120 ms class) and well
+    # inside the 20 s control write deadline; the post-Enter bound covers
+    # a slow first repaint without ever approaching that deadline.
+    "codex": SubmissionBarrier(
+        compose_settle_seconds=3.0,
+        post_enter_seconds=5.0,
+        poll_interval_seconds=0.1,
+        composer_tail_rows=4,
+    ),
+}
+
+
+def submission_barrier_for(provider: Optional[str]) -> Optional[SubmissionBarrier]:
+    """The pinned submission barrier for ``provider``, or None.
+
+    None means "no barrier is proven for this provider" and the caller
+    keeps the current behaviour.  It never means "guess one": a barrier
+    run against a composer whose layout was never read would fabricate
+    the very observation this boundary exists to make honest.
+    """
+    if provider is None:
+        return None
+    return _SUBMISSION_BARRIERS.get(provider)
+
+
+# Composer chrome: the box-drawing verticals and prompt glyphs a composer
+# draws *around* the text it holds.  They sit between the fragments of a
+# wrapped line, so matching without dropping them would split every wrap
+# at its border.  They are stripped from the captured rows and from the
+# control text alike, so a text that genuinely contains one still matches
+# its own rendering.
+_COMPOSER_CHROME_CHARS = "│┃>›"
+
+
+def _normalised(text: str) -> str:
+    """``text`` with whitespace and composer chrome removed.
+
+    Whitespace is the one thing the composer may reflow (wrapping,
+    indentation, box padding) without changing what the operator typed,
+    and chrome is what it draws around the text rather than as part of
+    it, so the comparison is made on the characters that cannot move.
+    """
+    return "".join(
+        char for char in text if not char.isspace() and char not in _COMPOSER_CHROME_CHARS
+    )
+
+
+def composed_text_visible(
+    rows: Sequence[str],
+    text: str,
+    *,
+    composer_tail_rows: int,
+) -> bool:
+    """Whether the control text is visibly resting in the composer region.
+
+    The region is the bottom ``composer_tail_rows`` rows of the captured
+    screen.  The match is on the normalised tail of the text (see
+    :data:`_OBSERVATION_SUFFIX_CHARS`), so a wrapped composer line still
+    counts, and a transcript echo of an already-submitted copy — which
+    renders above the composer box — does not.
+    """
+    if not rows:
+        return False
+    needle = _normalised(text)[-_OBSERVATION_SUFFIX_CHARS:]
+    if not needle:
+        return False
+    haystack = _normalised("".join(rows[-composer_tail_rows:]))
+    return needle in haystack
+
+
+def submission_evidence_ref(pane_id: str, rows: Sequence[str]) -> str:
+    """A durable pointer to the capture a submission verdict rests on.
+
+    The reference names the pane, the moment, and the digest of the exact
+    rows that decided the observation, so a later reader can re-capture or
+    locate the same evidence in the pane's logs.  The screen itself is not
+    journaled: it can carry conversation the operator considers private,
+    and the digest is the proof that does not.
+    """
+    digest = hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()[:16]
+    moment = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return f"capture-pane:{pane_id}:{moment}:sha256:{digest}"
+
+
+def _capture_rows(
+    pane_id: str,
+    screen: Optional[Callable[[], Sequence[str]]],
+    *,
+    timeout: float,
+) -> Sequence[str]:
+    if screen is not None:
+        return screen()
+    return capture_pane_screen(pane_id, timeout=timeout)
+
+
+def await_compose_visible(
+    pane_id: str,
+    text: str,
+    *,
+    barrier: SubmissionBarrier,
+    deadline_monotonic: Optional[float] = None,
+    screen: Optional[Callable[[], Sequence[str]]] = None,
+) -> bool:
+    """Poll until the control text is compose-visible, or the settle expires.
+
+    Called after the text write and before the one Enter.  A False return
+    withholds the Enter: the barrier's whole guarantee is that the Enter
+    fires only at a composer proven to be holding this control's text.
+    Capture failures are retried within the bound rather than fatal — one
+    transient tmux hiccup must not strand a healthy write — but a settle
+    that expires without a positive sighting is a failed barrier, and the
+    caller records it as the ambiguity it is.
+    """
+    settle_end = time.monotonic() + barrier.compose_settle_seconds
+    if deadline_monotonic is not None:
+        settle_end = min(settle_end, deadline_monotonic)
+    while True:
+        try:
+            rows = _capture_rows(
+                pane_id,
+                screen,
+                timeout=min(
+                    _OBSERVATION_CAPTURE_TIMEOUT_SECONDS,
+                    max(0.2, settle_end - time.monotonic()),
+                ),
+            )
+        except NativePaneInputUnavailable:
+            rows = ()
+        if composed_text_visible(rows, text, composer_tail_rows=barrier.composer_tail_rows):
+            return True
+        remaining = settle_end - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(barrier.poll_interval_seconds, remaining))
+
+
+def observe_submission(
+    pane_id: str,
+    text: str,
+    *,
+    barrier: SubmissionBarrier,
+    deadline_monotonic: Optional[float] = None,
+    screen: Optional[Callable[[], Sequence[str]]] = None,
+) -> Tuple[str, Optional[str]]:
+    """Classify what the composer did with the control after the one Enter.
+
+    Returns ``(submission_observed, evidence_ref)``:
+
+    - ``submitted`` — the text that was compose-visible before the Enter
+      is gone from the composer region.  This is the provider-visible
+      submission evidence: the composer gave the control up.  It is not,
+      and never upgrades to, provider completion.
+    - ``unsubmitted`` — the text persisted in the composer region through
+      the whole post-Enter window: the positive observation that the
+      Enter did not take.
+    - ``unknown`` — no classification could be made: every capture failed,
+      or the overall write deadline cut the window short.  Never read as
+      "probably submitted".
+    """
+    observe_end = time.monotonic() + barrier.post_enter_seconds
+    if deadline_monotonic is not None:
+        observe_end = min(observe_end, deadline_monotonic)
+    last_rows: Optional[Sequence[str]] = None
+    while True:
+        try:
+            rows = _capture_rows(
+                pane_id,
+                screen,
+                timeout=min(
+                    _OBSERVATION_CAPTURE_TIMEOUT_SECONDS,
+                    max(0.2, observe_end - time.monotonic()),
+                ),
+            )
+        except NativePaneInputUnavailable:
+            rows = None
+        if rows is not None:
+            last_rows = rows
+            if not composed_text_visible(rows, text, composer_tail_rows=barrier.composer_tail_rows):
+                return (SUBMISSION_SUBMITTED, submission_evidence_ref(pane_id, rows))
+        remaining = observe_end - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(barrier.poll_interval_seconds, remaining))
+    # The window closed without the composer ever giving the text up.
+    # ``unsubmitted`` is a positive observation, so it requires two things:
+    # a successful final capture still holding the text, and a window that
+    # ran its full bound rather than being cut by the write deadline — a
+    # shortened window proves nothing about what the composer did next.
+    deadline_cut = deadline_monotonic is not None and time.monotonic() >= deadline_monotonic
+    if last_rows is not None and not deadline_cut:
+        return (SUBMISSION_UNSUBMITTED, submission_evidence_ref(pane_id, last_rows))
+    return (SUBMISSION_UNKNOWN, None)

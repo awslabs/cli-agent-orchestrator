@@ -97,6 +97,31 @@ CONTROL_INPUT_OUTCOMES = frozenset({ACCEPTED, REFUSED, AMBIGUOUS, UNSUPPORTED})
 # have, which is precisely why it may not be repeated.
 REATTEMPTABLE_OUTCOMES = frozenset({REFUSED})
 
+# --- Provider-visible submission observation (cond-0026) -------------------
+
+# What the provider visibly did with a submitted control, observed through
+# the pane rather than inferred from transport acknowledgement.  Distinct
+# from ``text_sent``/``enter_sent``: those prove tmux accepted bytes, while
+# this proves the composer took them (or could not be proven to).  A
+# control whose transport succeeded can still rest unsubmitted in the
+# composer — the cond-0026 defect — so transport acceptance is never read
+# as submission.
+SUBMISSION_SUBMITTED = "submitted"
+SUBMISSION_UNSUBMITTED = "unsubmitted"
+SUBMISSION_UNKNOWN = "unknown"
+
+SUBMISSION_OBSERVED_VALUES = frozenset(
+    {SUBMISSION_SUBMITTED, SUBMISSION_UNSUBMITTED, SUBMISSION_UNKNOWN}
+)
+
+# ``submitted`` is an observation of the composer boundary only: the
+# composer was seen to give up the control text.  It is not provider
+# completion — the provider may still refuse, error, or never answer, and
+# reconciling that remains an operator act exactly as before.  Nothing in
+# this vocabulary may ever be mapped onto a provider-completion claim.
+# ``unsubmitted`` and ``unknown`` never upgrade any verdict: a control
+# whose submission is unproven stays ``ambiguous`` and is never re-driven.
+
 # --- Refusal reasons ------------------------------------------------------
 
 REASON_UNKNOWN_TERMINAL = "unknown-terminal"
@@ -122,6 +147,14 @@ REASON_WRITE_INCOMPLETE = "write-incomplete"
 # remove.
 REASON_OWNER_LOST_BEFORE_WRITE = "owner-lost-before-write"
 REASON_OWNER_LOST_MID_WRITE = "owner-lost-mid-write"
+# The submitting Enter was acknowledged by tmux (or was deliberately
+# withheld when the text never became compose-visible) but provider-visible
+# submission could not be proven: the composer never showed the control as
+# taken.  Bytes may have reached the pane, so this is terminal for
+# automation -- a re-attempt could double-deliver -- and it is never
+# upgraded by a later observation.  Bound to ``ambiguous`` because no
+# zero-byte proof exists once the text write was acknowledged.
+REASON_SUBMISSION_UNPROVEN = "submission-unproven"
 # Canonical tmux server socket identity (§24.7).  Three reasons rather
 # than one because a caller acts differently on each: unbound is a
 # terminal that predates the binding and can never pass until it is
@@ -181,6 +214,7 @@ REASON_OUTCOMES: "dict[str, str]" = {
     REASON_RESPONSE_LOST: AMBIGUOUS,
     REASON_WRITE_INCOMPLETE: AMBIGUOUS,
     REASON_OWNER_LOST_MID_WRITE: AMBIGUOUS,
+    REASON_SUBMISSION_UNPROVEN: AMBIGUOUS,
 }
 
 CONTROL_INPUT_REASON_CODES = frozenset(REASON_OUTCOMES)

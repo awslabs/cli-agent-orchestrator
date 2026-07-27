@@ -57,6 +57,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services import native_pane_input
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
     AMBIGUOUS,
@@ -80,11 +81,16 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_PROVIDER_UNSUPPORTED,
     REASON_REQUEST_REBOUND,
     REASON_STALE_GENERATION,
+    REASON_SUBMISSION_UNPROVEN,
     REASON_UNKNOWN_TERMINAL,
     REASON_UNSUPPORTED_CHORD,
     REASON_WRITE_DEADLINE,
     REASON_WRITE_INCOMPLETE,
     REFUSED,
+    SUBMISSION_OBSERVED_VALUES,
+    SUBMISSION_SUBMITTED,
+    SUBMISSION_UNKNOWN,
+    SUBMISSION_UNSUBMITTED,
     contains_bracketed_paste_sentinel,
     control_input_request_digest,
     control_input_request_digest_v2,
@@ -814,6 +820,18 @@ class ControlInputResult:
     chord: Optional[str] = None
     chord_attempted: Optional[bool] = None
     chord_sent: Optional[bool] = None
+    # The provider-visible submission observation (cond-0026), distinct
+    # from the transport facts above: ``text_sent``/``enter_sent`` prove
+    # tmux accepted bytes, while this records what the composer was seen
+    # to do with them.  None is the typed null — "no observation was
+    # recorded" (a pre-v4 record, a provider with no submission barrier,
+    # a control sent with enter=False, any refusal) — and is never a
+    # shorthand for "unknown", which is a recorded observation that could
+    # not be classified.  Only "submitted" may accompany an accepted
+    # outcome, and it never upgrades to provider completion; reconciling
+    # what the provider did with the control remains an operator act.
+    submission_observed: Optional[str] = None
+    submission_evidence_ref: Optional[str] = None
     http_status: int = 200
 
     def __post_init__(self) -> None:
@@ -831,6 +849,9 @@ class ControlInputResult:
                     f"reason {self.reason_code!r} carries outcome {bound!r}, not "
                     f"{self.outcome!r}"
                 )
+        if self.submission_observed is not None:
+            if self.submission_observed not in SUBMISSION_OBSERVED_VALUES:
+                raise ValueError(f"unknown submission observation: {self.submission_observed!r}")
 
     def as_response(self) -> Dict[str, Any]:
         return {
@@ -857,6 +878,12 @@ class ControlInputResult:
             "chord": self.chord,
             "chord_attempted": self.chord_attempted,
             "chord_sent": self.chord_sent,
+            # Always present, null when unrecorded: an absent key would
+            # make "this server predates the field" indistinguishable from
+            # "no observation was taken", and a caller must not have to
+            # guess which it is looking at.
+            "submission_observed": self.submission_observed,
+            "submission_evidence_ref": self.submission_evidence_ref,
         }
 
 
@@ -916,6 +943,13 @@ def _from_record(
             if record.chord_sent is not None
             else record.chord_sent
         ),
+        # Replayed verbatim from the stored row: the recorded observation
+        # and its evidence, or the typed null for a record that never
+        # carried one.  Never inferred from the transport fields above —
+        # a replay that invented an observation would be the same lie as
+        # reading transport acceptance as submission.
+        submission_observed=record.submission_observed,
+        submission_evidence_ref=record.submission_evidence_ref,
     )
 
 
@@ -1735,6 +1769,31 @@ def _deliver_under_lease(
             deadline_monotonic=deadline,
         )
 
+    # cond-0026: a provider with a pinned submission barrier (Codex) never
+    # gets the back-to-back text+Enter below.  Its composer can swallow an
+    # Enter that arrives inside its input-burst window, leaving the control
+    # resting unsubmitted while every transport fact reads success.  The
+    # barrier serializes the same two writes through composer observation
+    # instead.  Providers without a pin keep today's behaviour: no barrier
+    # is ever guessed at a composer whose layout was never read.
+    barrier = (
+        native_pane_input.submission_barrier_for(resolved.provider)
+        if enter and chord is None
+        else None
+    )
+    if barrier is not None:
+        return _deliver_with_submission_barrier(
+            journal,
+            client,
+            binding,
+            text=text,
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+            deadline_monotonic=deadline,
+            barrier=barrier,
+        )
+
     try:
         chunks = client.send_literal_line(
             binding.pane_id,
@@ -1912,6 +1971,247 @@ def _deliver_under_lease(
         enter_sent=enter,
         chunks_sent=chunks,
         enter_attempted=enter,
+    )
+
+
+def _deliver_with_submission_barrier(
+    journal: ControlInputJournal,
+    client: Any,
+    binding: ControlInputBinding,
+    *,
+    text: str,
+    terminal_id: str,
+    resolved: ResolvedControlIdentity,
+    digest: str,
+    deadline_monotonic: float,
+    barrier: "native_pane_input.SubmissionBarrier",
+) -> ControlInputResult:
+    """Deliver one control across the provider-visible submit boundary.
+
+    The cond-0026 sequence for a provider whose composer can swallow a
+    back-to-back Enter: the text write and the single submitting Enter are
+    serialized through composer observation rather than fired as one
+    burst.  The Enter is sent only once the control text is seen resting
+    in the composer, and ``delivered`` is recorded only once the composer
+    is then seen to give the text up.  Exactly one Enter is ever sent.
+    When submission cannot be proven the outcome is ``ambiguous`` and
+    terminal — never a second, blind Enter, which is how one requested
+    submission becomes two.
+    """
+    control_id = binding.request_id
+    text_chunks = 0
+    enter_attempted = False
+
+    def _ambiguous_after_claim(
+        reason: str,
+        detail: str,
+        *,
+        chunks_sent: int,
+        enter: bool,
+        observed: Optional[str] = None,
+        evidence_ref: Optional[str] = None,
+    ) -> ControlInputResult:
+        journal.mark_ambiguous(
+            control_id,
+            reason_code=reason,
+            chunks_sent=chunks_sent,
+            enter_attempted=enter,
+            submission_observed=observed,
+            submission_evidence_ref=evidence_ref,
+            evidence_digest=digest,
+        )
+        return ControlInputResult(
+            control_id=control_id,
+            outcome=AMBIGUOUS,
+            reason_code=reason,
+            detail=detail,
+            state=STATE_AMBIGUOUS,
+            terminal_id=terminal_id,
+            request_digest=digest,
+            resolved_identity=resolved.as_dict(),
+            chunks_sent=chunks_sent,
+            enter_attempted=enter,
+            submission_observed=observed,
+            submission_evidence_ref=evidence_ref,
+        )
+
+    try:
+        text_chunks = client.send_literal_line(
+            binding.pane_id,
+            text,
+            submit=False,
+            expected_server_identity=binding.server_socket_path,
+            deadline_monotonic=deadline_monotonic,
+        )
+        if not native_pane_input.await_compose_visible(
+            binding.pane_id,
+            text,
+            barrier=barrier,
+            deadline_monotonic=deadline_monotonic,
+        ):
+            if time.monotonic() > deadline_monotonic:
+                return _ambiguous_after_claim(
+                    REASON_WRITE_INCOMPLETE,
+                    f"the control write exceeded its overall "
+                    f"{WRITE_DEADLINE_SECONDS:g}s write deadline while waiting for the "
+                    "composer to show the control text; the Enter was never sent, "
+                    "bytes may have reached the pane, so it is ambiguous and must not "
+                    "be sent again",
+                    chunks_sent=text_chunks,
+                    enter=False,
+                    observed=SUBMISSION_UNKNOWN,
+                )
+            # The settle expired without the text ever becoming
+            # compose-visible, so the barrier withholds the Enter: zero
+            # Enters were sent.  The text write was acked, so no zero-byte
+            # proof exists and this is the terminal ambiguity it is rather
+            # than a refusal.
+            return _ambiguous_after_claim(
+                REASON_SUBMISSION_UNPROVEN,
+                f"the control text never became visible in the composer of pane "
+                f"{binding.pane_id}, so the submitting Enter was withheld; the text "
+                "may be resting in the composer, no Enter was sent and none will be "
+                "sent, so this control is ambiguous and must not be sent again",
+                chunks_sent=text_chunks,
+                enter=False,
+                observed=SUBMISSION_UNKNOWN,
+            )
+        # Marked before the call, not after: an exception on the way out
+        # of tmux does not prove the Enter did not land, so "attempted" is
+        # the honest boundary from here on.
+        enter_attempted = True
+        client.send_literal_line(
+            binding.pane_id,
+            "",
+            submit=True,
+            expected_server_identity=binding.server_socket_path,
+            deadline_monotonic=deadline_monotonic,
+        )
+        observed, evidence_ref = native_pane_input.observe_submission(
+            binding.pane_id,
+            text,
+            barrier=barrier,
+            deadline_monotonic=deadline_monotonic,
+        )
+    except TmuxServerIdentityError as exc:
+        # Unreachable by construction (re-proven under this lease moments
+        # ago), and recorded as ambiguous on the same rule the generic
+        # path applies: a claimed write is never reported as a refusal.
+        logger.error(
+            "control-input server identity changed under the write lease for %s: "
+            "bound=%r observed=%r",
+            control_id,
+            exc.bound,
+            exc.observed,
+        )
+        return _ambiguous_after_claim(
+            REASON_WRITE_INCOMPLETE,
+            f"the pane's tmux server changed while the write lease was held: {exc}. "
+            "Nothing after the change can be proven, and a claimed write is never "
+            "reported as a refusal",
+            chunks_sent=text_chunks,
+            enter=enter_attempted,
+        )
+    except TmuxLiteralSendError as exc:
+        return _ambiguous_after_claim(
+            REASON_WRITE_INCOMPLETE,
+            f"the write failed part-way through: {exc}. What reached the pane is "
+            "bounded by chunks_sent and enter_attempted but is not knowable exactly, "
+            "so this control must not be sent again",
+            chunks_sent=text_chunks + exc.chunks_sent,
+            enter=enter_attempted,
+        )
+    except ValueError as exc:
+        # The two screens disagree, which is a bug in this file; recorded
+        # rather than raised so the claim never dangles.  See the generic
+        # branch for the full rationale.
+        logger.error("control-input screening disagreement for %s: %s", control_id, exc)
+        return _ambiguous_after_claim(
+            REASON_WRITE_INCOMPLETE,
+            f"the write primitive rejected an already-screened control: {exc}",
+            chunks_sent=text_chunks,
+            enter=enter_attempted,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logger.error("control-input barrier write path timed out for %s: %s", control_id, exc)
+        return _ambiguous_after_claim(
+            REASON_WRITE_INCOMPLETE,
+            f"a tmux call in the write path exceeded its bound after the claim: {exc}. "
+            "What reached the pane is not knowable, so this control must not be sent "
+            "again",
+            chunks_sent=text_chunks,
+            enter=enter_attempted,
+        )
+
+    if time.monotonic() > deadline_monotonic:
+        # The observation completed past the write deadline.  The stored
+        # observation travels with the ambiguous record either way: it is
+        # what the composer was seen to do, and downgrading the outcome
+        # for lateness must not erase it.
+        return _ambiguous_after_claim(
+            REASON_WRITE_INCOMPLETE,
+            f"the control write exceeded its overall {WRITE_DEADLINE_SECONDS:g}s "
+            "deadline after the write was claimed; it is durably ambiguous and must "
+            "not be sent again",
+            chunks_sent=text_chunks,
+            enter=True,
+            observed=observed,
+            evidence_ref=evidence_ref,
+        )
+
+    if observed == SUBMISSION_SUBMITTED:
+        record = journal.mark_delivered(
+            control_id,
+            chunks_sent=text_chunks,
+            enter_attempted=True,
+            submission_observed=observed,
+            submission_evidence_ref=evidence_ref,
+            evidence_digest=digest,
+        )
+        return ControlInputResult(
+            control_id=control_id,
+            outcome=ACCEPTED,
+            detail=(
+                f"typed {text_chunks} literal write(s) into pane {binding.pane_id} "
+                "and submitted with one Enter; the composer was observed to take the "
+                "control. This is transport acceptance plus a provider-visible "
+                "submission observation, not provider completion: what the provider "
+                "does with the control remains operator-reconciled"
+            ),
+            state=record.state,
+            terminal_id=terminal_id,
+            request_digest=digest,
+            resolved_identity=resolved.as_dict(),
+            text_sent=True,
+            enter_sent=True,
+            chunks_sent=text_chunks,
+            enter_attempted=True,
+            submission_observed=observed,
+            submission_evidence_ref=evidence_ref,
+        )
+
+    # ``unsubmitted`` or ``unknown``: the one Enter is spent, and no
+    # second one is ever sent at a composer whose state cannot be proven.
+    if observed == SUBMISSION_UNSUBMITTED:
+        detail = (
+            f"the composer of pane {binding.pane_id} was observed to still hold the "
+            "control text after the single Enter; no second Enter was sent and none "
+            "will be, so this control is ambiguous and must not be sent again — an "
+            "operator may reconcile the composer by hand"
+        )
+    else:
+        detail = (
+            f"the composer of pane {binding.pane_id} could not be observed after the "
+            "single Enter, so submission is unproven; no second Enter was sent and "
+            "none will be, so this control is ambiguous and must not be sent again"
+        )
+    return _ambiguous_after_claim(
+        REASON_SUBMISSION_UNPROVEN,
+        detail,
+        chunks_sent=text_chunks,
+        enter=True,
+        observed=observed,
+        evidence_ref=evidence_ref,
     )
 
 
