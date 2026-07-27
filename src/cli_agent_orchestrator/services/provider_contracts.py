@@ -52,17 +52,20 @@ PROVIDER_CLAUDE_CODE = "claude_code"
 #: authority; this map is the representative head of each accepted tuple.
 PINNED_VERSIONS = {
     PROVIDER_CODEX: "0.145.0",
-    PROVIDER_KIMI: "0.29.1",
+    PROVIDER_KIMI: "0.29.2",
     PROVIDER_CLAUDE: "2.1.220",
 }
 
 #: Every exact version accepted for a provider, current first.  A tuple of
 #: exact strings, never a range: which builds are proven is a fact about
 #: each specific build, and a range would silently assert something about
-#: builds nobody has read.  Kimi retains ``0.29.0`` so a session minted
-#: under it still validates after the binary is stage-verified up to
-#: ``0.29.1`` (installed bundle ``main.mjs`` sha256
-#: cba31835395ff75fa6b5bc9b81a7907c7d933e7e6a7d8ba53afac23dd0f5ab04).
+#: builds nobody has read.  Kimi retains ``0.29.1`` and ``0.29.0`` so
+#: sessions minted under them still validate after the binary is
+#: stage-verified up to ``0.29.2`` (installed bundle ``main.mjs`` sha256
+#: 2ee6e2f15d68bffdce532d1c8e50f8d40e0230090b3a0dd1dbcdb7c29bf532db,
+#: matching the npm-published digest; the three-way 0.29.0/0.29.1/0.29.2
+#: bundle comparison proved the composer, paste-burst, and steer-chord
+#: facts byte-identical).
 #:
 #: Claude accepts only ``2.1.220``, the stage-verified installed build
 #: (``versions/2.1.220`` sha256
@@ -73,7 +76,7 @@ PINNED_VERSIONS = {
 #: the composer behaviour of is acceptable.
 SUPPORTED_VERSIONS: dict[str, tuple[str, ...]] = {
     PROVIDER_CODEX: ("0.145.0",),
-    PROVIDER_KIMI: ("0.29.1", "0.29.0"),
+    PROVIDER_KIMI: ("0.29.2", "0.29.1", "0.29.0"),
     PROVIDER_CLAUDE: ("2.1.220",),
 }
 # The current pin must always be an accepted version — asserted here so the
@@ -107,10 +110,12 @@ EFFORT_PROVIDER_DEFAULT = "provider-default"
 #: Read from the installed Kimi 0.29.1: ``kimi-code/kimi-for-coding`` (the
 #: K2.7 route) advertises no ``support_efforts``, and both ``max`` and
 #: ``high`` come back ``Invalid params`` — from the ACP probe and from a
-#: real managed launch alike. An exact set rather than a capability probe,
-#: for the same reason the version pins are exact: this is a fact about
-#: specific builds that were read, and guessing at others would assert
-#: something nobody verified.
+#: real managed launch alike. Confirmed again on the installed 0.29.2:
+#: the zero-prompt ACP ``initialize`` + ``session/new`` selected
+#: ``kimi-code/kimi-for-coding`` with no selectable effort. An exact set
+#: rather than a capability probe, for the same reason the version pins
+#: are exact: this is a fact about specific builds that were read, and
+#: guessing at others would assert something nobody verified.
 EFFORTLESS_MODELS = frozenset({"kimi-code/kimi-for-coding"})
 
 
@@ -329,9 +334,10 @@ def check_pinned_version(provider: str, installed_version: str) -> None:
     """Fail closed unless the installed version is an accepted exact pin.
 
     Acceptance is exact-set membership, never a range: a provider may
-    accept more than one build (Kimi retains ``0.29.0`` alongside the
-    current ``0.29.1``), but every accepted version is a build that has
-    been read and proven, not a bound guessing at ones that have not.
+    accept more than one build (Kimi retains ``0.29.1`` and ``0.29.0``
+    alongside the current ``0.29.2``), but every accepted version is a
+    build that has been read and proven, not a bound guessing at ones
+    that have not.
     """
     accepted = SUPPORTED_VERSIONS.get(provider)
     if accepted is None:
@@ -364,7 +370,7 @@ def validate_resume_argv(provider: str, argv: list[str]) -> ResumeForm:
 
     Accepted, and only accepted:
       codex:  ``codex resume <id>`` · ``codex exec resume <id>``
-      kimi:   ``--session <id>`` · ``-r <id>``
+      kimi:   ``--session <id>`` · ``-S <id>`` · ``-r <id>``
       claude: ``--resume <uuid>``
     Forbidden forms refuse with zero provider I/O.
     """
@@ -398,9 +404,15 @@ def validate_resume_argv(provider: str, argv: list[str]) -> ResumeForm:
             "codex resume accepts exactly `codex resume <id>` or " "`codex exec resume <id>`"
         )
     if provider == PROVIDER_KIMI:
-        if len(args) == 2 and args[0] in ("--session", "-r") and args[1]:
+        # ``--session`` is the golden launch form; ``-S`` is its documented
+        # short form; ``-r`` is the bundle-verified hidden compatibility
+        # alias (registered with hideHelp() in 0.29.1 and 0.29.2 — absence
+        # from human-facing --help is not evidence of invalidity).
+        if len(args) == 2 and args[0] in ("--session", "-S", "-r") and args[1]:
             return ResumeForm(provider, tuple(args), args[1])
-        raise ResumeFormRefused("kimi resume accepts exactly `--session <id>` or `-r <id>`")
+        raise ResumeFormRefused(
+            "kimi resume accepts exactly `--session <id>`, `-S <id>`, or `-r <id>`"
+        )
     # claude
     if len(args) == 2 and args[0] == "--resume" and args[1] and not args[1].startswith("-"):
         native_id = args[1]

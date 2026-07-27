@@ -240,7 +240,7 @@ class TestDatabaseFunctionCompatibility:
 
 
 class TestCreateInboxMessageCrossVintage:
-    """cond-0163: POST /terminals/{id}/inbox/messages accepts a live managed-v2
+    """POST /terminals/{id}/inbox/messages accepts a live managed-v2
     receiver (previously 404 before any row existed) and keeps refusing absent,
     superseded, and cross-vintage ambiguous ids with zero rows written."""
 

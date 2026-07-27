@@ -941,7 +941,7 @@ class TestManagedBridgeDelivery:
 
 
 class TestManagedV2InboxDelivery:
-    """cond-0163: ordinary inbox delivery to managed-v2 native workers.
+    """Ordinary inbox delivery to managed-v2 native workers.
 
     A live managed-v2 receiver can now persist an ordinary inbox row; delivery
     still resolves the cross-vintage managed identity and routes through the

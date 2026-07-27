@@ -1166,7 +1166,7 @@ def _seed_v2_terminal(
 
 
 class TestCrossVintageInboxEligibility:
-    """cond-0163: create_inbox_message admits exactly one current, live,
+    """create_inbox_message admits exactly one current, live,
     non-superseded managed-v2 identity and refuses everything else, while
     legacy-v1 behavior stays byte-for-byte unchanged."""
 
@@ -1301,7 +1301,7 @@ class TestCrossVintageInboxEligibility:
 
 
 class TestListPendingReceiverIdsOlderThanCrossVintage:
-    """cond-0163: the reconciliation sweep enumerates stale PENDING rows for
+    """The reconciliation sweep enumerates stale PENDING rows for
     live managed-v2 receivers (server bounce cannot strand them) while dead
     receivers of either vintage stay dropped."""
 

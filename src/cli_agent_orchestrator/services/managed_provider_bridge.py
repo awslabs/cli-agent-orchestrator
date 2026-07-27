@@ -1849,8 +1849,8 @@ class _ProviderSession:
         )
         actual = proc.stdout.strip()
         # Exact-set membership, never a range: a provider may accept more
-        # than one proven build (Kimi retains 0.29.0 alongside 0.29.1), and
-        # the receipt records the actual installed one.
+        # than one proven build (Kimi retains 0.29.1 and 0.29.0 alongside
+        # 0.29.2), and the receipt records the actual installed one.
         if proc.returncode != 0 or actual not in accepted:
             raise BridgeError(
                 f"unsupported provider version {actual!r}; expected one of {list(accepted)!r}"
