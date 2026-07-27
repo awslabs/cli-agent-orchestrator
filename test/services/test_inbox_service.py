@@ -1023,6 +1023,64 @@ class TestManagedV2InboxDelivery:
         # the managed bridge speaks the provider-native protocol instead.
         send_input.assert_not_called()
 
+    def test_delivery_refuses_identity_that_becomes_cross_vintage_ambiguous(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "dualrace"
+        generation = "gen-dual-race"
+        database.create_terminal(terminal_id, "cao-v1", "worker", "kimi_cli")
+        message = database.create_inbox_message("supervisor-1", terminal_id, "legacy target")
+
+        now = datetime.now().isoformat()
+        with database.SessionLocal() as db:
+            db.add(
+                database.ManagedLaunchV2ReservationModel(
+                    reservation_id="rsv-dual-race",
+                    terminal_id=terminal_id,
+                    generation=generation,
+                    protocol_vintage="v2",
+                    session_name="cao-v2",
+                    provider="kimi_cli",
+                    agent_profile="reviewer",
+                    caller_id="supervisor-1",
+                    working_directory="/tmp",
+                    trusted_project_root=None,
+                    obligation_generation="obligation-dual-race",
+                    task_id="dual-race",
+                    run_id="run-dual-race",
+                    launch_nonce_digest="0" * 64,
+                    state="admitted",
+                    request_json="{}",
+                    binding_json="{}",
+                    execution_mode="acp",
+                    execution_mode_source="launch",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.add(
+                database.ManagedLaunchV2TerminalModel(
+                    id=terminal_id,
+                    tmux_session="cao-v2",
+                    tmux_window="worker",
+                    provider="kimi_cli",
+                    generation=generation,
+                    protocol_vintage="v2",
+                    v2_lifecycle_state="live",
+                )
+            )
+            db.commit()
+
+        bridge = MagicMock()
+        monkeypatch.setattr(inbox_service.managed_launch, "deliver_inbox_via_bridge", bridge)
+
+        with pytest.raises(ManagedLaunchConflict, match="ambiguous"):
+            InboxService().deliver_pending(terminal_id)
+
+        bridge.assert_not_called()
+        stored = database.get_inbox_messages(terminal_id, limit=1)[0]
+        assert (stored.id, stored.status) == (message.id, MessageStatus.PENDING)
+
     def test_live_v2_claude_receiver_delivers_via_native_bridge(
         self, isolated_memory_db, monkeypatch
     ):
