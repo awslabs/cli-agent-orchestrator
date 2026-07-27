@@ -1428,3 +1428,68 @@ def test_loss_at_the_enter_boundary_stays_ambiguous_and_is_never_resent():
     replay = _queue(transport, text="body\n", provider_version=PINNED)
     assert replay["state"] == knc.AMBIGUOUS
     assert transport.calls.count("enter") == 1
+
+
+class TestMultiKbMultilineComposerExecution:
+    """A multi-KB multiline inbox payload on a proven build types as one
+    sequence: literal lines in byte order, proven soft-newline keystrokes
+    between them, exactly one burst reset and one Enter at the end, and no
+    framing bytes anywhere."""
+
+    class _RecordingTransport:
+        def __init__(self):
+            self.events = []
+
+        def send_literal(self, text):
+            self.events.append(("literal", text))
+
+        def send_key(self, keystroke):
+            self.events.append(("key", keystroke))
+
+        def send_enter(self):
+            self.events.append(("enter", None))
+
+    def test_multi_kb_multiline_payload_types_in_order_with_one_submit(self):
+        paragraph = "ordinary agent report line with detail and numbers 0123456789\n"
+        payload = paragraph * 70  # ~4.9 KB, 70 embedded newlines
+        assert len(payload.encode("utf-8")) >= 4096
+
+        plan = knc.plan_composer_keystrokes(payload, provider_version="0.29.2")
+        assert plan["deliverable"] is True
+        assert plan["encoding"] == knc.ENCODING_SOFT_NEWLINE
+
+        transport = self._RecordingTransport()
+        knc.execute_composer_plan(plan=plan, transport=transport, submit=True)
+
+        keys = [event for event in transport.events if event[0] == "key"]
+        enters = [event for event in transport.events if event[0] == "enter"]
+        literals = [event[1] for event in transport.events if event[0] == "literal"]
+
+        # Byte order preserved: one soft-newline keystroke between each pair
+        # of plan lines (a trailing payload newline is the plan's trailing
+        # terminator, not an extra line), and the literal stream
+        # reconstructs the payload's text content exactly.
+        assert sum(1 for key in keys if key[1] == "C-j") == len(plan["lines"]) - 1
+        assert len(plan["lines"]) == payload.count("\n")
+        assert [key[1] for key in keys if key[1] != "C-j"] == ["End"]
+        assert len(enters) == 1
+        assert transport.events[-1] == ("enter", None)
+        # The submit sequence (End burst reset, then Enter) happens exactly
+        # once, after the final literal — never per line.
+        end_index = next(i for i, event in enumerate(transport.events) if event == ("key", "End"))
+        assert all(
+            i < end_index for i, event in enumerate(transport.events) if event[0] == "literal"
+        )
+        assert "".join(literals) == payload.replace("\n", "")
+        # No framing bytes are introduced anywhere in the stream.
+        for event in transport.events:
+            if event[1] is not None:
+                assert "\x1b" not in event[1]
+
+    def test_undeliverable_build_is_refused_before_any_keystroke(self):
+        plan = knc.plan_composer_keystrokes("line one\nline two", provider_version="0.29.3")
+        assert plan["deliverable"] is False
+        transport = self._RecordingTransport()
+        with pytest.raises(knc.NativeControlInvalid):
+            knc.execute_composer_plan(plan=plan, transport=transport, submit=True)
+        assert transport.events == []

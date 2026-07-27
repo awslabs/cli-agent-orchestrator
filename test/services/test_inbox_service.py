@@ -4,6 +4,7 @@ import asyncio
 import os
 import threading
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -14,6 +15,12 @@ from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import inbox_service
+from cli_agent_orchestrator.services.control_input_contract import (
+    ACCEPTED,
+    AMBIGUOUS,
+    REFUSED,
+    contains_bracketed_paste_sentinel,
+)
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.managed_launch import ManagedLaunchConflict
 
@@ -1294,3 +1301,418 @@ class TestManagedV2InboxDelivery:
         assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
             MessageStatus.PENDING
         )
+
+
+class TestNativeManagedV2InboxDelivery:
+    """Ordinary inbox delivery to a native-TUI managed v2 receiver.
+
+    A native-TUI generation has no ACP bridge process, so the managed branch
+    dispatches on the reservation's execution mode: ACP generations keep the
+    bridge path, native generations fall through to the ordinary idle-gated
+    machinery with the pane send performed by the generation-bound native
+    text delivery (one exact control per message id, literal bytes only).
+    """
+
+    def _seed_live_v2_terminal(self, terminal_id, provider, generation):
+        with database.SessionLocal() as db:
+            db.add(
+                database.ManagedLaunchV2TerminalModel(
+                    id=terminal_id,
+                    tmux_session="cao-v2",
+                    tmux_window="worker",
+                    provider=provider,
+                    generation=generation,
+                    protocol_vintage="v2",
+                    v2_lifecycle_state="live",
+                )
+            )
+            db.commit()
+
+    @staticmethod
+    def _native_identity(terminal_id, provider, generation):
+        return {
+            "reservation_id": f"rsv-{terminal_id}",
+            "terminal_id": terminal_id,
+            "generation": generation,
+            "provider": provider,
+            "state": "admitted",
+            "controllable": True,
+            "vintage": "v2",
+            "execution_mode": "native_tui",
+        }
+
+    def _install_fakes(self, monkeypatch, identity, control, *, status=TerminalStatus.IDLE):
+        monkeypatch.setattr(
+            inbox_service.managed_launch, "managed_control_identity", lambda tid: identity
+        )
+        bridge = MagicMock(return_value=True)
+        monkeypatch.setattr(inbox_service.managed_launch, "deliver_inbox_via_bridge", bridge)
+        send_input = MagicMock()
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", send_input)
+        monkeypatch.setattr(
+            inbox_service.control_input_service, "deliver_native_inbox_payload", control
+        )
+        monkeypatch.setattr(inbox_service.status_monitor, "get_status", lambda tid: status)
+        return bridge, send_input
+
+    @staticmethod
+    def _result(outcome, reason="ok"):
+        return SimpleNamespace(outcome=outcome, reason_code=reason)
+
+    def test_idle_native_receiver_delivers_once_via_native_text_path(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "ntv00001"
+        generation = "gen-native-1"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        message = database.create_inbox_message("supervisor-1", terminal_id, "ordinary ping")
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            return self._result(ACCEPTED)
+
+        bridge, send_input = self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+
+        InboxService().deliver_pending(terminal_id)
+
+        assert control_calls == [
+            (
+                terminal_id,
+                {
+                    "text": "ordinary ping",
+                    "expected_identity": {
+                        "terminal_id": terminal_id,
+                        "terminal_generation": generation,
+                    },
+                },
+            )
+        ]
+        bridge.assert_not_called()
+        send_input.assert_not_called()
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.DELIVERED
+        )
+
+    def test_busy_native_receiver_stays_queued_then_delivers_once_at_idle(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "ntv00002"
+        generation = "gen-native-2"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        database.create_inbox_message("supervisor-1", terminal_id, "queued follow-up")
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            return self._result(ACCEPTED)
+
+        identity = self._native_identity(terminal_id, "kimi_cli", generation)
+        monkeypatch.setattr(
+            inbox_service.managed_launch, "managed_control_identity", lambda tid: identity
+        )
+        bridge = MagicMock(return_value=True)
+        monkeypatch.setattr(inbox_service.managed_launch, "deliver_inbox_via_bridge", bridge)
+        send_input = MagicMock()
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", send_input)
+        monkeypatch.setattr(
+            inbox_service.control_input_service, "deliver_native_inbox_payload", control
+        )
+        # Busy: the ordinary idle gate parks the row — nothing typed mid-turn.
+        monkeypatch.setattr(
+            inbox_service.status_monitor,
+            "get_status",
+            lambda tid: TerminalStatus.PROCESSING,
+        )
+
+        InboxService().deliver_pending(terminal_id)
+
+        assert control_calls == []
+        bridge.assert_not_called()
+        send_input.assert_not_called()
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.PENDING
+        )
+
+        # Idle: exactly one native send, still no paste and no bridge.
+        monkeypatch.setattr(
+            inbox_service.status_monitor, "get_status", lambda tid: TerminalStatus.IDLE
+        )
+        InboxService().deliver_pending(terminal_id)
+
+        assert len(control_calls) == 1
+        bridge.assert_not_called()
+        send_input.assert_not_called()
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.DELIVERED
+        )
+
+    def test_bounce_never_redelivers_a_terminalized_row(self, isolated_memory_db, monkeypatch):
+        terminal_id = "ntv00003"
+        generation = "gen-native-3"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        message = database.create_inbox_message("supervisor-1", terminal_id, "exactly once")
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            return self._result(ACCEPTED)
+
+        self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+
+        InboxService().deliver_pending(terminal_id)
+        assert len(control_calls) == 1
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.DELIVERED
+        )
+
+        # Server bounce: fresh service instances over the same durable rows.
+        bounced = InboxService()
+        bounced.deliver_pending(terminal_id)
+        bounced.reconcile_orphaned_messages()
+        InboxService().deliver_pending(terminal_id)
+
+        assert len(control_calls) == 1
+        stored = database.get_inbox_messages(terminal_id, limit=10)
+        assert [(row.id, row.status) for row in stored] == [(message.id, MessageStatus.DELIVERED)]
+
+    def test_pre_claim_crash_yields_exactly_one_later_delivery(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "ntv00004"
+        generation = "gen-native-4"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        database.create_inbox_message("supervisor-1", terminal_id, "adopt me once")
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            return self._result(ACCEPTED)
+
+        self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+
+        # The row was never claimed (the first server died before any delivery
+        # pass). A fresh incarnation adopts it and delivers exactly once.
+        bounced = InboxService()
+        bounced.deliver_pending(terminal_id)
+        assert len(control_calls) == 1
+        bounced.deliver_pending(terminal_id)
+        bounced.reconcile_orphaned_messages()
+        assert len(control_calls) == 1
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.DELIVERED
+        )
+
+    def test_native_send_refused_resets_pending_and_retries_without_duplicate(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "ntv00005"
+        generation = "gen-native-5"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        message = database.create_inbox_message("supervisor-1", terminal_id, "retry me")
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            if len(control_calls) == 1:
+                return self._result(REFUSED, "pane-busy")
+            return self._result(ACCEPTED)
+
+        bridge, send_input = self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+
+        # First pass: the typed refusal proves zero bytes, so the row resets
+        # to PENDING (never FAILED, never duplicated).
+        InboxService().deliver_pending(terminal_id)
+        assert len(control_calls) == 1
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.PENDING
+        )
+        bridge.assert_not_called()
+        send_input.assert_not_called()
+
+        # Second pass: the exact control id is retried and accepted once.
+        InboxService().deliver_pending(terminal_id)
+        assert len(control_calls) == 2
+        assert control_calls[1][1]["text"] == "retry me"
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.DELIVERED
+        )
+
+        # Terminalized: no third pass has any effect.
+        InboxService().deliver_pending(terminal_id)
+        assert len(control_calls) == 2
+
+    def test_native_send_ambiguous_terminalizes_failed_without_replay(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "ntv00006"
+        generation = "gen-native-6"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        database.create_inbox_message("supervisor-1", terminal_id, "do not replay")
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            return self._result(AMBIGUOUS, "response-lost")
+
+        self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+
+        InboxService().deliver_pending(terminal_id)
+        assert len(control_calls) == 1
+        # Ambiguous is not a zero-byte proof: the row terminalizes under the
+        # existing hard-failure semantics and is never retyped blindly.
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (MessageStatus.FAILED)
+
+        InboxService().deliver_pending(terminal_id)
+        InboxService().reconcile_orphaned_messages()
+        assert len(control_calls) == 1
+
+    def test_acp_execution_mode_still_uses_the_bridge(self, isolated_memory_db, monkeypatch):
+        terminal_id = "ntv00007"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", "gen-acp-1")
+        identity = self._native_identity(terminal_id, "kimi_cli", "gen-acp-1")
+        identity["execution_mode"] = "acp"
+        message = database.create_inbox_message("supervisor-1", terminal_id, "bridge me")
+        bridge_calls = []
+
+        def bridge(tid, **kwargs):
+            bridge_calls.append((tid, kwargs))
+            return True
+
+        control = MagicMock(return_value=self._result(ACCEPTED))
+        monkeypatch.setattr(
+            inbox_service.managed_launch, "managed_control_identity", lambda tid: identity
+        )
+        monkeypatch.setattr(inbox_service.managed_launch, "deliver_inbox_via_bridge", bridge)
+        monkeypatch.setattr(
+            inbox_service.control_input_service, "deliver_native_inbox_payload", control
+        )
+        send_input = MagicMock()
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", send_input)
+
+        InboxService().deliver_pending(terminal_id)
+
+        assert bridge_calls == [
+            (
+                terminal_id,
+                {
+                    "message_id": message.id,
+                    "message": "bridge me",
+                    "sender_id": "supervisor-1",
+                },
+            )
+        ]
+        control.assert_not_called()
+        send_input.assert_not_called()
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.DELIVERED
+        )
+
+    def test_legacy_null_execution_mode_keeps_bridge_and_preserve_guard(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "ntv00008"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", "gen-legacy-1")
+        identity = self._native_identity(terminal_id, "kimi_cli", "gen-legacy-1")
+        # A reservation row written before the mode contract carries NULL,
+        # which must read as legacy ACP — the projection then carries no mode.
+        identity["execution_mode"] = None
+        database.create_inbox_message("supervisor-1", terminal_id, "preserve me")
+        bridge = MagicMock(return_value=False)
+        monkeypatch.setattr(
+            inbox_service.managed_launch, "managed_control_identity", lambda tid: identity
+        )
+        monkeypatch.setattr(inbox_service.managed_launch, "deliver_inbox_via_bridge", bridge)
+        control = MagicMock(return_value=self._result(ACCEPTED))
+        monkeypatch.setattr(
+            inbox_service.control_input_service, "deliver_native_inbox_payload", control
+        )
+        send_input = MagicMock()
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", send_input)
+
+        InboxService().deliver_pending(terminal_id)
+
+        # Bridge attempted and unavailable: the preserve guard parks the row;
+        # neither the native text path nor the unmanaged paste runs.
+        bridge.assert_called_once()
+        control.assert_not_called()
+        send_input.assert_not_called()
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.PENDING
+        )
+
+    def test_native_send_carries_no_bracketed_paste_sentinels(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "ntv00009"
+        generation = "gen-native-9"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        database.create_inbox_message(
+            "supervisor-1", terminal_id, "line one\nline two, bracket free"
+        )
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            return self._result(ACCEPTED)
+
+        _, send_input = self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+
+        InboxService().deliver_pending(terminal_id)
+
+        assert len(control_calls) == 1
+        # Multiline is a proven composer encoding: the payload reaches the
+        # native path verbatim, with no framing bytes introduced anywhere.
+        sent_text = control_calls[0][1]["text"]
+        assert sent_text == "line one\nline two, bracket free"
+        assert contains_bracketed_paste_sentinel(sent_text) is False
+        assert "\x1b[" not in sent_text
+        # The bracket-framing paste path is never used for a managed receiver.
+        send_input.assert_not_called()
+
+    def test_multi_kb_multiline_payload_delivered_once_verbatim(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "ntv00010"
+        generation = "gen-native-10"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        # ≥4 KB of ordinary multiline agent prose — the common case the
+        # public single-line control shape would refuse.
+        paragraph = "ordinary agent report line with detail and numbers 0123456789\n"
+        payload = paragraph * 70  # ~4.9 KB, 70 embedded newlines
+        assert len(payload.encode("utf-8")) >= 4096
+        database.create_inbox_message("supervisor-1", terminal_id, payload)
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            return self._result(ACCEPTED)
+
+        _, send_input = self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+
+        InboxService().deliver_pending(terminal_id)
+
+        assert len(control_calls) == 1
+        assert control_calls[0][1]["text"] == payload
+        send_input.assert_not_called()
+        stored = database.get_inbox_messages(terminal_id, limit=1)
+        assert stored[0].status == MessageStatus.DELIVERED
+
+        # Terminalized once: a second pass and the reconcile sweep re-type nothing.
+        InboxService().deliver_pending(terminal_id)
+        InboxService().reconcile_orphaned_messages()
+        assert len(control_calls) == 1
