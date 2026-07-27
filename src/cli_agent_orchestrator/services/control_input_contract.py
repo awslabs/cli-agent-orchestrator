@@ -187,6 +187,14 @@ REASON_UNSUPPORTED_KEY = "unsupported-key"
 # something it is not).  Decided before any write, so it is proven zero
 # bytes.
 REASON_UNREPRESENTABLE_EVENT = "unrepresentable-event"
+# The bound pane's tmux copy-mode state could not be proven safe for a
+# payload write: the pane was proven in copy mode and the exit control was
+# not accepted or not confirmed, or the mode state could not be observed at
+# all.  Decided before any payload byte — the copy-mode-exit control is the
+# only keystroke that may have been sent, and it is payload to nobody — so
+# this carries the zero-bytes proof and is reattemptable under the refused
+# rule.  It never means delivery, transport success, or provider submission.
+REASON_COPY_MODE_ACTIVE = "copy-mode-active"
 
 # Every reason is bound to the one outcome it can honestly carry.
 #
@@ -221,6 +229,7 @@ REASON_OUTCOMES: "dict[str, str]" = {
     REASON_UNSUPPORTED_CHORD: REFUSED,
     REASON_UNSUPPORTED_KEY: REFUSED,
     REASON_UNREPRESENTABLE_EVENT: REFUSED,
+    REASON_COPY_MODE_ACTIVE: REFUSED,
     REASON_WRITE_DEADLINE: REFUSED,
     REASON_CONTROL_ROUTE_ABSENT: UNSUPPORTED,
     REASON_PROTOCOL_MISMATCH: UNSUPPORTED,

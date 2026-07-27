@@ -149,6 +149,34 @@ class FakeTmux:
             )
         return 1
 
+    # The cond-0178 copy-mode guard primitives; default "not in copy mode"
+    # so no exit control is recorded for a test that does not ask for one.
+    def pane_in_copy_mode(
+        self,
+        pane_id,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
+        return False
+
+    def send_copy_mode_cancel(
+        self,
+        pane_id,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
+        with self._guard:
+            self.writes.append(
+                {
+                    "pane_id": pane_id,
+                    "copy_mode_cancel": True,
+                    "expected_server_identity": expected_server_identity,
+                }
+            )
+        return True
+
 
 def _metadata(**overrides):
     fields = {

@@ -76,6 +76,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     MAX_SEQUENCE_EVENTS,
     MAX_SEQUENCE_TEXT_BYTES,
     REASON_CONTROL_ROUTE_ABSENT,
+    REASON_COPY_MODE_ACTIVE,
     REASON_IDENTITY_MISMATCH,
     REASON_ILLEGAL_CONTROL_BYTES,
     REASON_LINEAGE_UNPROVEN,
@@ -2001,6 +2002,183 @@ def _native_sequence_preflight(
     return (adapter, plans, None)
 
 
+# --- Copy-mode-safe managed delivery ------------------------------------------
+#
+# The supported dashboard wheel-scroll path can leave a managed tmux pane
+# in copy mode (``pane_in_mode=1``).  A payload written into that mode
+# still reaches the pane, but the Enter that submits it is consumed by the
+# mode — the text rests unsubmitted while every transport fact reads
+# success, which is a provider-submission claim nobody can prove.  The
+# guard below is the write boundary's answer: inside the pane lease, after
+# the identity re-proof and before any payload byte, prove the exact pane's
+# mode; exit a proven copy mode with the one non-payload keystroke this
+# path may ever send; re-prove the exit; only then deliver.  Detection
+# that cannot be proven is a zero-byte ``copy-mode-active`` refusal, never
+# a speculative cancel and never a delivery claim.
+
+
+def _copy_mode_identity_refusal(
+    live: Optional[Any],
+    binding: ControlInputBinding,
+) -> Optional[Tuple[str, str]]:
+    """The identity half of the copy-mode guard's re-proof, or None.
+
+    The same checks the write path's own under-lease re-verification
+    makes, repeated here because the guard's whole value is that its
+    reading is *current*: a pane that died or was replaced between the
+    path's first re-verification and the payload is the existing
+    ``pane-dead`` / ``identity-mismatch`` / server-identity refusal, and
+    no copy-mode-exit control is ever aimed at a pane whose identity did
+    not re-prove — a reincarnated generation gets nothing.
+    """
+    if live is None or live.dead:
+        return (
+            REASON_PANE_DEAD,
+            f"pane {binding.pane_id} is gone or dead as of the copy-mode guard; "
+            "no payload was typed",
+        )
+    if live.window_id != binding.window_id or live.pane_pid != binding.pane_pid:
+        return (
+            REASON_IDENTITY_MISMATCH,
+            f"pane {binding.pane_id} now reports window {live.window_id!r} and root pid "
+            f"{live.pane_pid}, not the bound {binding.window_id!r} / {binding.pane_pid}; "
+            "no copy-mode exit and no payload was aimed at the pane in front of it now",
+        )
+    return server_identity_refusal(
+        bound=binding.server_socket_path, observed=live.server_socket_path
+    )
+
+
+def _copy_mode_guard_refusal(
+    client: Any,
+    binding: ControlInputBinding,
+    *,
+    deadline_monotonic: float,
+) -> Optional[Tuple[str, str]]:
+    """Prove the exact bound pane is out of copy mode, exiting it if proven in it.
+
+    Run under the pane lease, after the identity re-proof every managed
+    write already performs and before the write claim, so a guard refusal
+    is the zero-byte refusal it truthfully is (the journal has no
+    writing-to-refused edge) and so no other managed writer can interleave
+    between the detection, the exit, and the payload.
+
+    Returns None when the exact bound pane is proven not in copy mode and
+    payload input may proceed — in which case no exit control was sent,
+    because the exit is never sent speculatively ("maybe in copy mode" is
+    the honest-failure branch, not a reason to cancel).  Otherwise returns
+    the typed ``(reason_code, detail)`` refusal for the caller to record
+    through its own refusal path, with zero payload bytes written:
+
+    - identity failures keep the existing identity reason codes (no exit
+      control reaches a pane whose identity did not re-prove);
+    - a mode state that cannot be observed, an exit control tmux did not
+      accept, or an exit the re-proof cannot confirm is
+      ``copy-mode-active`` — proven zero payload bytes, reattemptable
+      under the existing refused rule.
+
+    ``send-keys -X cancel`` is the only non-payload keystroke ever sent
+    here: only to the exact pane just proven in copy mode, never treated
+    as provider input, and recorded as part of the same delivery/control
+    outcome the caller journals.  When the exit is confirmed, the caller
+    proceeds to claim and deliver the original payload exactly once within
+    the same lease and durable operation.
+    """
+    try:
+        live = client.pane_control_identity(
+            pane_id=binding.pane_id, deadline_monotonic=deadline_monotonic
+        )
+    except subprocess.TimeoutExpired as exc:
+        return (
+            REASON_COPY_MODE_ACTIVE,
+            f"the copy-mode detection read exceeded its bound before any payload "
+            f"byte: {exc}; nothing was typed and the write may be sent again",
+        )
+    refusal = _copy_mode_identity_refusal(live, binding)
+    if refusal is not None:
+        return refusal
+
+    try:
+        in_mode = client.pane_in_copy_mode(
+            binding.pane_id,
+            expected_server_identity=binding.server_socket_path,
+            deadline_monotonic=deadline_monotonic,
+        )
+    except TmuxServerIdentityError as exc:
+        return (exc.reason_code, str(exc))
+    except subprocess.TimeoutExpired as exc:
+        return (
+            REASON_COPY_MODE_ACTIVE,
+            f"the copy-mode state query exceeded its bound before any payload "
+            f"byte: {exc}; nothing was typed and the write may be sent again",
+        )
+    if in_mode is None:
+        return (
+            REASON_COPY_MODE_ACTIVE,
+            f"the copy-mode state of pane {binding.pane_id} could not be observed, "
+            "so no payload was typed; 'could not look' is never read as 'not in "
+            "copy mode', and the write may be sent again",
+        )
+    if not in_mode:
+        return None
+
+    # The exact pane is proven in copy mode: the exit control is licensed,
+    # to this pane only — the sole non-payload keystroke this path sends.
+    try:
+        cancelled = client.send_copy_mode_cancel(
+            binding.pane_id,
+            expected_server_identity=binding.server_socket_path,
+            deadline_monotonic=deadline_monotonic,
+        )
+    except TmuxServerIdentityError as exc:
+        return (exc.reason_code, str(exc))
+    if not cancelled:
+        return (
+            REASON_COPY_MODE_ACTIVE,
+            f"tmux did not accept the copy-mode exit for pane {binding.pane_id}; "
+            "no payload was typed and the write may be sent again",
+        )
+
+    # tmux's ack is not the proof of the exit: re-prove the identity (so
+    # the cancel is the only keystroke a replaced pane could ever have
+    # received) and re-prove pane_in_mode=0 before any payload byte.
+    try:
+        live = client.pane_control_identity(
+            pane_id=binding.pane_id, deadline_monotonic=deadline_monotonic
+        )
+    except subprocess.TimeoutExpired as exc:
+        return (
+            REASON_COPY_MODE_ACTIVE,
+            f"the post-exit identity re-proof exceeded its bound: {exc}; no "
+            "payload was typed and the write may be sent again",
+        )
+    refusal = _copy_mode_identity_refusal(live, binding)
+    if refusal is not None:
+        return refusal
+    try:
+        in_mode = client.pane_in_copy_mode(
+            binding.pane_id,
+            expected_server_identity=binding.server_socket_path,
+            deadline_monotonic=deadline_monotonic,
+        )
+    except TmuxServerIdentityError as exc:
+        return (exc.reason_code, str(exc))
+    except subprocess.TimeoutExpired as exc:
+        return (
+            REASON_COPY_MODE_ACTIVE,
+            f"the post-exit copy-mode re-proof exceeded its bound: {exc}; no "
+            "payload was typed and the write may be sent again",
+        )
+    if in_mode is not False:
+        return (
+            REASON_COPY_MODE_ACTIVE,
+            f"the copy-mode exit for pane {binding.pane_id} could not be confirmed "
+            "(pane_in_mode did not read 0 on the re-proof); no payload was typed "
+            "and the write may be sent again",
+        )
+    return None
+
+
 def _deliver_under_lease(
     journal: ControlInputJournal,
     client: Any,
@@ -2129,6 +2307,24 @@ def _deliver_under_lease(
             control_id,
             server_refusal[0],
             server_refusal[1],
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+        )
+
+    # The copy-mode guard runs here — under this lease, after
+    # the identity re-proof above, and before the claim below, so a pane
+    # the dashboard wheel path left in copy mode is exited exactly once on
+    # the exact pane and the payload then delivered exactly once, or the
+    # control is the zero-byte ``copy-mode-active`` refusal it truthfully
+    # is — never a delivery claim over an Enter the mode may have consumed.
+    copy_mode_refusal = _copy_mode_guard_refusal(client, binding, deadline_monotonic=deadline)
+    if copy_mode_refusal is not None:
+        return _record_refusal(
+            journal,
+            control_id,
+            copy_mode_refusal[0],
+            copy_mode_refusal[1],
             terminal_id=terminal_id,
             resolved=resolved,
             digest=digest,
@@ -2957,6 +3153,16 @@ def _deliver_sequence_under_lease(
     )
     if server_refusal is not None:
         return _refuse_pre_claim(server_refusal[0], server_refusal[1])
+
+    # The copy-mode guard runs before the readiness gates below
+    # as well as before the claim — a frozen copy-mode frame reads as a
+    # stale idle prompt to the turn observation, and a payload Enter aimed
+    # into the mode is consumed by it.  Same lease, same exact-pane rule:
+    # a proven copy mode is exited once and the sequence delivered exactly
+    # once, or the refusal is zero bytes and reattemptable.
+    copy_mode_refusal = _copy_mode_guard_refusal(client, binding, deadline_monotonic=deadline)
+    if copy_mode_refusal is not None:
+        return _refuse_pre_claim(copy_mode_refusal[0], copy_mode_refusal[1])
 
     adapter: Optional[Any] = None
     plans: Optional[Dict[int, Any]] = None
@@ -3806,6 +4012,17 @@ def deliver_native_inbox_payload(
                     f"root pid {live.pane_pid}, not the bound {binding.window_id!r} / "
                     f"{binding.pane_pid}; nothing was typed",
                 )
+            # The copy-mode guard runs before the readiness
+            # observations below — a frozen copy-mode frame reads as a stale
+            # idle prompt to the turn observation, and a payload Enter aimed
+            # into the mode is consumed by it.  A guard refusal is zero
+            # payload bytes, so the caller resets the batch to PENDING under
+            # the existing honest queue rule and a later cycle re-attempts.
+            copy_mode_refusal = _copy_mode_guard_refusal(
+                client, binding, deadline_monotonic=deadline
+            )
+            if copy_mode_refusal is not None:
+                return NativePayloadResult(REFUSED, copy_mode_refusal[0], copy_mode_refusal[1])
             dispatch_key = (
                 _native_kimi_dispatch_key(resolved, binding)
                 if resolved.provider == "kimi_cli"

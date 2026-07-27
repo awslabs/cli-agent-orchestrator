@@ -221,6 +221,34 @@ class FakeTmux:
             }
         )
 
+    # The cond-0178 copy-mode guard primitives.  Default: the pane is
+    # provably not in copy mode, so no exit control is ever recorded for a
+    # test that does not ask for one — the guard is never speculative.
+    def pane_in_copy_mode(
+        self,
+        pane_id,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
+        return False
+
+    def send_copy_mode_cancel(
+        self,
+        pane_id,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
+        self.writes.append(
+            {
+                "pane_id": pane_id,
+                "copy_mode_cancel": True,
+                "expected_server_identity": expected_server_identity,
+            }
+        )
+        return True
+
 
 def _metadata(**overrides):
     fields = {
@@ -1338,8 +1366,19 @@ class TestNativeInboxPayload:
         with service._native_kimi_dispatch_guard_lock:
             service._native_kimi_dispatch_times.clear()
         monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
-        live = SimpleNamespace(dead=False, window_id=resolved.window_id, pane_pid=resolved.pane_pid)
-        client = SimpleNamespace(pane_control_identity=lambda *, pane_id, deadline_monotonic: live)
+        live = SimpleNamespace(
+            dead=False,
+            window_id=resolved.window_id,
+            pane_pid=resolved.pane_pid,
+            server_socket_path=resolved.bound_server_socket_path,
+        )
+        # The guard primitives default to "provably not in copy mode": a test
+        # that does not model the wheel path sees no exit control, ever.
+        client = SimpleNamespace(
+            pane_control_identity=lambda *, pane_id, deadline_monotonic: live,
+            pane_in_copy_mode=lambda pane_id, **kwargs: False,
+            send_copy_mode_cancel=lambda pane_id, **kwargs: True,
+        )
         monkeypatch.setattr(service, "_tmux_client", lambda: client)
         monkeypatch.setattr(
             service,
