@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI-DLC Portfolio"
+  short_description: "Coordinate parallel AI-DLC portfolio work"
+  default_prompt: "Use $aidlc-portfolio to initialize and coordinate a multi-project AI-DLC portfolio."

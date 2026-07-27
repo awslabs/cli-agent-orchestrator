@@ -1,0 +1,10 @@
+schemaVersion: 1
+project: example-project
+intent: example-intent
+changedComponents: []
+changedCapabilities: []
+contracts: []
+dependencyAssumptions: []
+verification:
+  - Replace with the child workflow verification summary.
+submittedAt: "2026-01-01T00:00:00.000Z"
