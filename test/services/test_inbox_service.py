@@ -1407,6 +1407,10 @@ class TestNativeManagedV2InboxDelivery:
 
         def control(tid, **kwargs):
             control_calls.append((tid, kwargs))
+            # First pass observes a mid-turn receiver (zero-byte refusal);
+            # the later pass observes IDLE.
+            if len(control_calls) == 1:
+                return self._result(REFUSED, "pane-busy")
             return self._result(ACCEPTED)
 
         identity = self._native_identity(terminal_id, "kimi_cli", generation)
@@ -1420,7 +1424,10 @@ class TestNativeManagedV2InboxDelivery:
         monkeypatch.setattr(
             inbox_service.control_input_service, "deliver_native_inbox_payload", control
         )
-        # Busy: the ordinary idle gate parks the row — nothing typed mid-turn.
+        # Busy: the provider-native observation reports a mid-turn receiver,
+        # which the payload path refuses with zero bytes — the row stays
+        # queued and nothing is typed mid-turn.  (The FIFO status below is
+        # irrelevant on the native path; the observation is the gate.)
         monkeypatch.setattr(
             inbox_service.status_monitor,
             "get_status",
@@ -1429,20 +1436,18 @@ class TestNativeManagedV2InboxDelivery:
 
         InboxService().deliver_pending(terminal_id)
 
-        assert control_calls == []
+        assert len(control_calls) == 1
         bridge.assert_not_called()
         send_input.assert_not_called()
         assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
             MessageStatus.PENDING
         )
 
-        # Idle: exactly one native send, still no paste and no bridge.
-        monkeypatch.setattr(
-            inbox_service.status_monitor, "get_status", lambda tid: TerminalStatus.IDLE
-        )
+        # Idle (a later pass observes IDLE): exactly one accepted delivery,
+        # still no paste and no bridge.
         InboxService().deliver_pending(terminal_id)
 
-        assert len(control_calls) == 1
+        assert len(control_calls) == 2
         bridge.assert_not_called()
         send_input.assert_not_called()
         assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
@@ -1756,3 +1761,33 @@ class TestNativeManagedV2InboxDelivery:
         InboxService().deliver_pending(terminal_id)
         InboxService().reconcile_orphaned_messages()
         assert len(control_calls) == 1
+
+    def test_native_path_never_consults_fifo_status(self, isolated_memory_db, monkeypatch):
+        terminal_id = "ntv00012"
+        generation = "gen-native-12"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        database.create_inbox_message("supervisor-1", terminal_id, "fifo-free delivery")
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            return self._result(ACCEPTED)
+
+        bridge, send_input = self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+        # A native pane is never FIFO-classified, so the native path must not
+        # ask the FIFO monitor at all: the idle proof is the provider-native
+        # observation under the payload write's own lease (faked above).
+        get_status = MagicMock(side_effect=AssertionError("FIFO consulted on native path"))
+        monkeypatch.setattr(inbox_service.status_monitor, "get_status", get_status)
+
+        InboxService().deliver_pending(terminal_id)
+
+        assert len(control_calls) == 1
+        get_status.assert_not_called()
+        bridge.assert_not_called()
+        send_input.assert_not_called()
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.DELIVERED
+        )
