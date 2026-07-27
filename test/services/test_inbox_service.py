@@ -3,7 +3,7 @@
 import asyncio
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -15,6 +15,7 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import inbox_service
 from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.managed_launch import ManagedLaunchConflict
 
 
 def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageStatus.PENDING):
@@ -936,4 +937,302 @@ class TestManagedBridgeDelivery:
         bridge.assert_called_once()
         assert database.get_inbox_messages("term-managed-busy", limit=1)[0].status == (
             MessageStatus.DELIVERED
+        )
+
+
+class TestManagedV2InboxDelivery:
+    """cond-0163: ordinary inbox delivery to managed-v2 native workers.
+
+    A live managed-v2 receiver can now persist an ordinary inbox row; delivery
+    still resolves the cross-vintage managed identity and routes through the
+    provider-native bridge — never the pane (no paste, no Ctrl-S/bracketed-paste
+    sentinel). Unavailable delivery stays PENDING and reconciles exactly once;
+    a server bounce cannot duplicate a delivered message.
+    """
+
+    def _seed_live_v2_terminal(self, terminal_id, provider, generation):
+        with database.SessionLocal() as db:
+            db.add(
+                database.ManagedLaunchV2TerminalModel(
+                    id=terminal_id,
+                    tmux_session="cao-v2",
+                    tmux_window="worker",
+                    provider=provider,
+                    generation=generation,
+                    protocol_vintage="v2",
+                    v2_lifecycle_state="live",
+                )
+            )
+            db.commit()
+
+    @staticmethod
+    def _managed_identity(terminal_id, provider, generation):
+        return {
+            "reservation_id": f"rsv-{terminal_id}",
+            "terminal_id": terminal_id,
+            "generation": generation,
+            "provider": provider,
+            "state": "admitted",
+            "controllable": True,
+            "vintage": "v2",
+        }
+
+    def _install_bridge_fakes(self, monkeypatch, terminal_id, provider, generation, bridge):
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "managed_control_identity",
+            lambda tid: self._managed_identity(tid, provider, generation),
+        )
+        monkeypatch.setattr(inbox_service.managed_launch, "deliver_inbox_via_bridge", bridge)
+        send_input = MagicMock()
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", send_input)
+        return send_input
+
+    def test_live_v2_kimi_receiver_delivers_via_native_bridge(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "v2kimi01"
+        generation = "gen-kimi-1"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        message = database.create_inbox_message("supervisor-1", terminal_id, "ordinary ping")
+        bridge_calls = []
+
+        def bridge(*args, **kwargs):
+            bridge_calls.append((args, kwargs))
+            return True
+
+        send_input = self._install_bridge_fakes(
+            monkeypatch, terminal_id, "kimi_cli", generation, bridge
+        )
+
+        InboxService().deliver_pending(terminal_id)
+
+        assert bridge_calls == [
+            (
+                (terminal_id,),
+                {
+                    "message_id": message.id,
+                    "message": "ordinary ping",
+                    "sender_id": "supervisor-1",
+                },
+            )
+        ]
+        stored = database.get_inbox_messages(terminal_id, limit=10)
+        assert [(row.id, row.status) for row in stored] == [(message.id, MessageStatus.DELIVERED)]
+        # No paste and no Ctrl-S/bracketed-paste sentinel ever touches the pane:
+        # the managed bridge speaks the provider-native protocol instead.
+        send_input.assert_not_called()
+
+    def test_live_v2_claude_receiver_delivers_via_native_bridge(
+        self, isolated_memory_db, monkeypatch
+    ):
+        """Provider-neutral: the same path serves managed-v2 Claude identity
+        metadata — nothing in create/route branches on the provider string."""
+        terminal_id = "v2claude"
+        generation = "gen-claude-1"
+        self._seed_live_v2_terminal(terminal_id, "claude_code", generation)
+        message = database.create_inbox_message("supervisor-1", terminal_id, "ordinary ping")
+        bridge_calls = []
+
+        def bridge(*args, **kwargs):
+            bridge_calls.append((args, kwargs))
+            return True
+
+        send_input = self._install_bridge_fakes(
+            monkeypatch, terminal_id, "claude_code", generation, bridge
+        )
+
+        InboxService().deliver_pending(terminal_id)
+
+        assert bridge_calls == [
+            (
+                (terminal_id,),
+                {
+                    "message_id": message.id,
+                    "message": "ordinary ping",
+                    "sender_id": "supervisor-1",
+                },
+            )
+        ]
+        stored = database.get_inbox_messages(terminal_id, limit=10)
+        assert [(row.id, row.status) for row in stored] == [(message.id, MessageStatus.DELIVERED)]
+        send_input.assert_not_called()
+
+    def test_bridge_unavailable_stays_pending_then_reconcile_delivers_once(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "v2busy01"
+        generation = "gen-busy-1"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        message = database.create_inbox_message("supervisor-1", terminal_id, "queued follow-up")
+        bridge_calls = []
+
+        def refusing_bridge(*args, **kwargs):
+            bridge_calls.append((args, kwargs))
+            return False
+
+        send_input = self._install_bridge_fakes(
+            monkeypatch, terminal_id, "kimi_cli", generation, refusing_bridge
+        )
+
+        # Busy/unavailable: the row stays PENDING and the pane is never touched.
+        InboxService().deliver_pending(terminal_id)
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.PENDING
+        )
+        send_input.assert_not_called()
+
+        # Age the row past the reconcile grace window so the sweep adopts it.
+        with database.SessionLocal() as db:
+            db.query(database.InboxModel).filter(database.InboxModel.id == message.id).update(
+                {
+                    database.InboxModel.created_at: datetime.now()
+                    - timedelta(seconds=INBOX_RECONCILE_GRACE_SECONDS + 60)
+                }
+            )
+            db.commit()
+
+        bridge_calls.clear()
+
+        def accepting_bridge(*args, **kwargs):
+            bridge_calls.append((args, kwargs))
+            return True
+
+        monkeypatch.setattr(
+            inbox_service.managed_launch, "deliver_inbox_via_bridge", accepting_bridge
+        )
+
+        InboxService().reconcile_orphaned_messages()
+        assert len(bridge_calls) == 1
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.DELIVERED
+        )
+
+        # A second sweep over the terminalized row is a no-op.
+        InboxService().reconcile_orphaned_messages()
+        assert len(bridge_calls) == 1
+        send_input.assert_not_called()
+
+    def test_server_bounce_retry_cannot_duplicate_delivered_message(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "v2bounce"
+        generation = "gen-bounce-1"
+        self._seed_live_v2_terminal(terminal_id, "claude_code", generation)
+        message = database.create_inbox_message("supervisor-1", terminal_id, "exactly once")
+        bridge_calls = []
+
+        def bridge(*args, **kwargs):
+            bridge_calls.append((args, kwargs))
+            return True
+
+        send_input = self._install_bridge_fakes(
+            monkeypatch, terminal_id, "claude_code", generation, bridge
+        )
+
+        # First server incarnation delivers.
+        InboxService().deliver_pending(terminal_id)
+        assert len(bridge_calls) == 1
+
+        # Server bounce: fresh service instances over the same durable rows.
+        # Neither a retried deliver pass nor the reconcile sweep may re-enter
+        # the bridge for the already-terminalized exact message id.
+        bounced = InboxService()
+        bounced.deliver_pending(terminal_id)
+        bounced.reconcile_orphaned_messages()
+        InboxService().deliver_pending(terminal_id)
+
+        assert len(bridge_calls) == 1
+        stored = database.get_inbox_messages(terminal_id, limit=10)
+        assert [(row.id, row.status) for row in stored] == [(message.id, MessageStatus.DELIVERED)]
+        send_input.assert_not_called()
+
+    def test_cross_vintage_ambiguous_identity_produces_zero_effects(
+        self, isolated_memory_db, monkeypatch
+    ):
+        """Reservation rows in BOTH vintages for one id: the delivery-time
+        identity resolver refuses (ManagedLaunchConflict) before any effect."""
+        terminal_id = "v2ambg01"
+        database.create_terminal(terminal_id, "cao-amb", "worker", "codex")
+        message = database.create_inbox_message("supervisor-1", terminal_id, "hello")
+        now = datetime.now().isoformat()
+        with database.SessionLocal() as db:
+            db.add(
+                database.ManagedLaunchReservationModel(
+                    reservation_id="rsv-v1-amb",
+                    terminal_id=terminal_id,
+                    generation="gen-v1-amb",
+                    session_name="cao-amb",
+                    provider="codex",
+                    agent_profile="worker",
+                    caller_id="test",
+                    working_directory="/tmp",
+                    state="admitted",
+                    request_json="{}",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.add(
+                database.ManagedLaunchV2ReservationModel(
+                    reservation_id="rsv-v2-amb",
+                    terminal_id=terminal_id,
+                    generation="gen-v2-amb",
+                    session_name="cao-amb",
+                    provider="codex",
+                    agent_profile="worker",
+                    caller_id="test",
+                    working_directory="/tmp",
+                    obligation_generation="og-1",
+                    run_id="run-1",
+                    launch_nonce_digest="digest-1",
+                    state="admitted",
+                    request_json="{}",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.commit()
+
+        bridge = MagicMock(return_value=True)
+        monkeypatch.setattr(inbox_service.managed_launch, "deliver_inbox_via_bridge", bridge)
+        send_input = MagicMock()
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", send_input)
+
+        with pytest.raises(ManagedLaunchConflict, match="ambiguous"):
+            InboxService().deliver_pending(terminal_id)
+
+        bridge.assert_not_called()
+        send_input.assert_not_called()
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.PENDING
+        )
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].id == message.id
+
+    def test_stale_generation_conflict_produces_zero_effects(self, isolated_memory_db, monkeypatch):
+        """A wrong/current-generation mismatch surfaces as a conflict at
+        identity resolution; delivery refuses before any provider effect."""
+        terminal_id = "v2genmis"
+        generation = "gen-current-1"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        database.create_inbox_message("supervisor-1", terminal_id, "hello")
+
+        def stale_identity(tid):
+            raise ManagedLaunchConflict("stale managed terminal generation")
+
+        monkeypatch.setattr(
+            inbox_service.managed_launch, "managed_control_identity", stale_identity
+        )
+        bridge = MagicMock(return_value=True)
+        monkeypatch.setattr(inbox_service.managed_launch, "deliver_inbox_via_bridge", bridge)
+        send_input = MagicMock()
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", send_input)
+
+        with pytest.raises(ManagedLaunchConflict, match="stale managed terminal generation"):
+            InboxService().deliver_pending(terminal_id)
+
+        bridge.assert_not_called()
+        send_input.assert_not_called()
+        assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
+            MessageStatus.PENDING
         )

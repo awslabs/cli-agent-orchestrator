@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 
 
@@ -236,3 +237,81 @@ class TestDatabaseFunctionCompatibility:
         # This should work without errors
         result = get_pending_messages("test_terminal", limit=5)
         assert isinstance(result, list)
+
+
+class TestCreateInboxMessageCrossVintage:
+    """cond-0163: POST /terminals/{id}/inbox/messages accepts a live managed-v2
+    receiver (previously 404 before any row existed) and keeps refusing absent,
+    superseded, and cross-vintage ambiguous ids with zero rows written."""
+
+    def _seed_v2_terminal(self, terminal_id, provider="kimi_cli", generation="gen-v2-1", **kw):
+        with database.SessionLocal() as db:
+            db.add(
+                database.ManagedLaunchV2TerminalModel(
+                    id=terminal_id,
+                    tmux_session="cao-v2",
+                    tmux_window="worker",
+                    provider=provider,
+                    generation=generation,
+                    protocol_vintage="v2",
+                    v2_lifecycle_state=kw.get("v2_lifecycle_state", "live"),
+                    v2_superseded_by_terminal_id=kw.get("v2_superseded_by_terminal_id"),
+                    v2_superseded_by_generation=kw.get("v2_superseded_by_generation"),
+                )
+            )
+            db.commit()
+
+    def _inbox_row_count(self):
+        with database.SessionLocal() as db:
+            return db.query(database.InboxModel).count()
+
+    def test_post_to_live_managed_v2_receiver_returns_200(self, client, isolated_memory_db):
+        self._seed_v2_terminal("3ce1a684")
+
+        response = client.post(
+            "/terminals/3ce1a684/inbox/messages",
+            params={"sender_id": "supervisor-1", "message": "ordinary follow-up"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["receiver_id"] == "3ce1a684"
+        stored = database.get_inbox_messages("3ce1a684", limit=10)
+        assert [row.status for row in stored] == [MessageStatus.PENDING]
+        # The v2 identity is never copied into legacy ownership.
+        with database.SessionLocal() as db:
+            assert db.query(database.TerminalModel).count() == 0
+
+    def test_post_to_unknown_receiver_404_zero_rows(self, client, isolated_memory_db):
+        response = client.post(
+            "/terminals/deadbeef/inbox/messages",
+            params={"sender_id": "supervisor-1", "message": "hello"},
+        )
+
+        assert response.status_code == 404
+        assert self._inbox_row_count() == 0
+
+    def test_post_to_superseded_v2_receiver_404_zero_rows(self, client, isolated_memory_db):
+        self._seed_v2_terminal("badcaf01", v2_superseded_by_terminal_id="badcaf99")
+
+        response = client.post(
+            "/terminals/badcaf01/inbox/messages",
+            params={"sender_id": "supervisor-1", "message": "hello"},
+        )
+
+        assert response.status_code == 404
+        assert self._inbox_row_count() == 0
+
+    def test_post_to_ambiguous_receiver_404_zero_rows(self, client, isolated_memory_db):
+        database.create_terminal("a0b1c2d3", "cao-amb", "worker", "codex")
+        self._seed_v2_terminal("a0b1c2d3", provider="codex")
+
+        response = client.post(
+            "/terminals/a0b1c2d3/inbox/messages",
+            params={"sender_id": "supervisor-1", "message": "hello"},
+        )
+
+        assert response.status_code == 404
+        assert "ambiguous" in response.json()["detail"]
+        assert self._inbox_row_count() == 0

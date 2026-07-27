@@ -2176,6 +2176,52 @@ def list_pending_receiver_ids_by_provider(provider: str) -> List[str]:
         return [row[0] for row in rows]
 
 
+def _live_managed_v2_terminal_clauses():
+    """The one shared current/live/non-superseded managed-v2 receiver predicate.
+
+    Mirrors the registration writer (``register_terminal_incarnation_outcome_v2``
+    sets ``live`` and clears both supersession pointers), the supersede path
+    (which sets the pointers), and collection (which deletes the row). Used by
+    both cross-vintage inbox query sites so they can never drift apart.
+    """
+    return (
+        ManagedLaunchV2TerminalModel.v2_lifecycle_state == "live",
+        ManagedLaunchV2TerminalModel.v2_superseded_by_terminal_id.is_(None),
+        ManagedLaunchV2TerminalModel.v2_superseded_by_generation.is_(None),
+    )
+
+
+def _inbox_receiver_eligible(db, receiver_id: str) -> bool:
+    """Cross-vintage inbox receiver eligibility for ordinary inbox creation.
+
+    v1: a ``terminals`` row with the exact id is eligible (unchanged).
+    v2: a ``managed_launch_v2_terminals`` row is eligible only while it is the
+    current live incarnation — ``_live_managed_v2_terminal_clauses``. An id
+    present in BOTH vintages refuses as ambiguous, mirroring
+    ``managed_control_identity``'s ``ManagedLaunchConflict``. A pre-v2 schema
+    has no v2 table: the ``OperationalError`` guard treats the v2 surface as
+    absent, keeping v1 behavior bit-identical. A v2 identity is NEVER copied
+    into ``terminals``.
+    """
+    v1_exists = db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first() is not None
+    try:
+        v2_query = db.query(ManagedLaunchV2TerminalModel).filter(
+            ManagedLaunchV2TerminalModel.id == receiver_id
+        )
+        v2_present = v2_query.first() is not None
+        v2_live = v2_query.filter(*_live_managed_v2_terminal_clauses()).first() is not None
+    except OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        v2_present = False
+        v2_live = False
+    if v1_exists and v2_present:
+        raise ValueError(
+            f"ambiguous managed terminal identity across protocol vintages: {receiver_id}"
+        )
+    return v1_exists or v2_live
+
+
 def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
     """List receiver terminal IDs whose messages have been PENDING too long.
 
@@ -2186,6 +2232,11 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
 
     The join on ``terminals`` drops messages whose receiver terminal no longer
     exists, so the sweep does not keep retrying deliveries to deleted agents.
+    Managed-v2 receivers never appear in ``terminals``; the v2 branch adopts
+    their stale PENDING rows under the same live/non-superseded predicate inbox
+    creation enforces, so collected, superseded, or non-live v2 receivers stay
+    excluded and a server bounce cannot strand a live v2 receiver's row. The
+    result is the distinct union of both branches.
 
     ``created_at`` is stored local-naive (``InboxModel.created_at`` defaults to
     ``datetime.now``), so the cutoff uses ``datetime.now()`` to match — the same
@@ -2203,7 +2254,29 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
             .distinct()
             .all()
         )
-        return [row[0] for row in rows]
+        receiver_ids = [row[0] for row in rows]
+        try:
+            v2_rows = (
+                db.query(InboxModel.receiver_id)
+                .join(
+                    ManagedLaunchV2TerminalModel,
+                    ManagedLaunchV2TerminalModel.id == InboxModel.receiver_id,
+                )
+                .filter(
+                    InboxModel.status == MessageStatus.PENDING.value,
+                    InboxModel.created_at < cutoff,
+                    *_live_managed_v2_terminal_clauses(),
+                )
+                .distinct()
+                .all()
+            )
+        except OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            v2_rows = []
+        seen = set(receiver_ids)
+        receiver_ids.extend(row[0] for row in v2_rows if row[0] not in seen)
+        return receiver_ids
 
 
 def delete_terminal(terminal_id: str) -> bool:
@@ -2242,11 +2315,17 @@ def delete_terminals_by_session(tmux_session: str) -> int:
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING.
 
+    The receiver is validated cross-vintage: a legacy ``terminals`` row, or
+    exactly one current, live, non-superseded managed-v2 identity
+    (``_inbox_receiver_eligible``). The inbox row itself stays
+    vintage-agnostic (``receiver_id`` string only).
+
     Raises:
-        ValueError: If the receiver terminal does not exist.
+        ValueError: If the receiver terminal does not exist, is not a live
+            managed-v2 identity, or is ambiguous across protocol vintages.
     """
     with SessionLocal() as db:
-        if not db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
+        if not _inbox_receiver_eligible(db, receiver_id):
             raise ValueError(f"Terminal '{receiver_id}' not found")
         inbox_msg = InboxModel(
             sender_id=sender_id,
