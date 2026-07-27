@@ -28,6 +28,17 @@ from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 
 logger = logging.getLogger(__name__)
 
+# Wire key names whose tmux ``send-keys`` name differs from the contract's
+# normalized name, translated at the argv and nowhere else.  The wire name
+# is the contract (it matches ``KeyboardEvent.key`` in the browser and is
+# what the digest binds), so it is never renamed upstream of this sink.
+# The translation exists because ``send-keys`` without ``-l`` does not
+# error on a name it does not know: it falls back to sending the argument
+# as literal bytes, so the wire's ``Backspace`` would type the nine
+# characters "Backspace" into the composer.  tmux's name for the erase
+# key is ``BSpace``; names absent from this table are already tmux's.
+_TMUX_SEQUENCE_KEY_NAMES = {"Backspace": "BSpace"}
+
 _TMUX_BINARY: Optional[str] = None
 
 # Immutable pane facts, tab-separated.  The two variable-content fields
@@ -1445,10 +1456,16 @@ class TmuxClient:
         ``C-c``, ``C-s``, ``Enter``, ``Backspace``).  The set is the sink's
         own bound: ``send-keys`` without ``-l`` interprets its argument as
         key names, so an unrestricted parameter here would let a caller
-        deliver arbitrary keystrokes through the structured path.  What a
-        key *means* to one provider build is the caller's fact, pinned at
-        the service layer; this primitive guarantees only that the named
-        key reaches the named pane on the named server, or raises.
+        deliver arbitrary keystrokes through the structured path.  The
+        names are the wire contract's, not tmux's: where the two differ
+        (:data:`_TMUX_SEQUENCE_KEY_NAMES` — the wire's ``Backspace`` is
+        tmux's ``BSpace``) the tmux name is substituted into the argv,
+        because ``send-keys`` never errors on an unrecognized name — it
+        sends the argument as literal bytes, which would type the name
+        itself into the composer.  What a key *means* to one provider
+        build is the caller's fact, pinned at the service layer; this
+        primitive guarantees only that the named key reaches the named
+        pane on the named server, or raises.
 
         Same server-identity proof as the literal write, for the same
         reason and at the same distance from the first byte: a sequence
@@ -1488,7 +1505,7 @@ class TmuxClient:
             )
 
         self._run_literal_write(
-            [tmux_binary(), "send-keys", "-t", pane_id, key],
+            [tmux_binary(), "send-keys", "-t", pane_id, _TMUX_SEQUENCE_KEY_NAMES.get(key, key)],
             chunks_sent=0,
             enter_attempted=False,
             deadline_monotonic=deadline_monotonic,

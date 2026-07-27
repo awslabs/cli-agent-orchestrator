@@ -903,3 +903,65 @@ class TestSendSteerChord:
         answers.writes = [_fail(stderr="can't find pane: %263")]
         with pytest.raises(TmuxLiteralSendError):
             client.send_steer_chord("%263", "C-s", expected_server_identity=SOCKET)
+
+
+class TestSendSequenceKey:
+    """The v3 sequence-key primitive: a wire key name, translated to tmux's
+    own name at the argv, proven against the bound server before it lands.
+
+    The translation is load-bearing, not cosmetic: ``send-keys`` without
+    ``-l`` never errors on a name it does not know — it sends the argument
+    as literal bytes, so the wire's ``Backspace`` would type the nine
+    characters "Backspace" into the composer.  tmux's name for the erase
+    key is ``BSpace``.
+    """
+
+    def test_backspace_reaches_tmux_as_bspace(self, client, mock_subprocess):
+        client.send_sequence_key("%263", "Backspace", expected_server_identity=SOCKET)
+
+        argv = _write_argv(mock_subprocess)
+        assert argv == [[TMUX, "send-keys", "-t", "%263", "BSpace"]]
+        # The wire name itself is never an argv element: it is the
+        # contract's name, not tmux's, and tmux would type it literally.
+        assert all("Backspace" not in invocation for invocation in argv)
+        # The server is proven before the keystroke, never trusted from the caller.
+        assert SERVER_FORMAT in " ".join(_all_argv(mock_subprocess)[0])
+
+    def test_exact_wire_names_pass_through_unchanged(self, client, mock_subprocess):
+        names = ["Escape", "C-c", "C-s", "Enter"]
+        for name in names:
+            client.send_sequence_key("%263", name, expected_server_identity=SOCKET)
+        assert _write_argv(mock_subprocess) == [
+            [TMUX, "send-keys", "-t", "%263", name] for name in names
+        ]
+
+    def test_a_name_outside_the_set_is_refused_with_no_write(self, client, mock_subprocess):
+        # "BSpace" is tmux's name, not the wire's — the sink takes wire
+        # names only and translation is its own internal step.  Any name
+        # outside the pinned set is refused before a subprocess exists,
+        # because tmux would type an unrecognized name as literal bytes.
+        for bad in ["BSpace", "backspace", "Tab", "C-foo", "Backspace ", ""]:
+            with pytest.raises(ValueError):
+                client.send_sequence_key("%263", bad, expected_server_identity=SOCKET)
+            assert _write_argv(mock_subprocess) == []
+
+    def test_an_invalid_pane_id_is_refused_before_any_call(self, client, mock_subprocess):
+        with pytest.raises(ValueError):
+            client.send_sequence_key("263", "Backspace", expected_server_identity=SOCKET)
+        assert mock_subprocess.run.call_count == 0
+
+    def test_an_unbound_caller_is_refused(self, client, mock_subprocess):
+        with pytest.raises(TmuxServerIdentityError):
+            client.send_sequence_key("%263", "Backspace", expected_server_identity=None)
+        assert _write_argv(mock_subprocess) == []
+
+    def test_a_pane_on_another_server_is_refused(self, client, mock_subprocess, answers):
+        answers.probe = _ok(_server_line(socket=OTHER_SOCKET))
+        with pytest.raises(TmuxServerIdentityError):
+            client.send_sequence_key("%263", "Backspace", expected_server_identity=SOCKET)
+        assert _write_argv(mock_subprocess) == []
+
+    def test_a_tmux_rejection_is_a_bounded_send_error(self, client, mock_subprocess, answers):
+        answers.writes = [_fail(stderr="can't find pane: %263")]
+        with pytest.raises(TmuxLiteralSendError):
+            client.send_sequence_key("%263", "Backspace", expected_server_identity=SOCKET)
