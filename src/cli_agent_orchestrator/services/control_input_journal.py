@@ -364,9 +364,7 @@ def _journal_needs_v5_migration(db_path: Path) -> bool:
     try:
         tables = {
             row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
     finally:
         conn.close()
@@ -1156,11 +1154,11 @@ class ControlInputJournal:
                         **(
                             {"text": seq_row[2]}
                             if seq_row[1] == "text"
-                            else {"key": seq_row[3]}
-                            if seq_row[1] == "key"
-                            else {"chord": seq_row[4]}
-                            if seq_row[1] == "chord"
-                            else {}
+                            else (
+                                {"key": seq_row[3]}
+                                if seq_row[1] == "key"
+                                else {"chord": seq_row[4]} if seq_row[1] == "chord" else {}
+                            )
                         ),
                         "outcome": seq_row[5],
                     }

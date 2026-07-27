@@ -661,9 +661,7 @@ def _validate_sequence_event(event: Any) -> Dict[str, Any]:
     schema does not define and guessing one would fork the digest.
     """
     if not isinstance(event, Mapping):
-        raise ValueError(
-            f"a sequence event must be an object, got {type(event).__name__}"
-        )
+        raise ValueError(f"a sequence event must be an object, got {type(event).__name__}")
     event_type = event.get("type")
     if not isinstance(event_type, str) or event_type == "":
         raise ValueError("a sequence event requires a non-empty string 'type'")

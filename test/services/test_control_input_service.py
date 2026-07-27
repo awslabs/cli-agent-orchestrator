@@ -1980,6 +1980,8 @@ class TestCodexSubmissionBarrier:
         assert result.as_response()["submission_evidence_ref"] is None
         # One fused text+Enter write, exactly as before cond-0026.
         assert [write["submit"] for write in tmux.writes] == [True]
+
+
 # --- Schema v3: ordered structured event sequences ---------------------------
 
 from cli_agent_orchestrator.services.control_input_contract import (  # noqa: E402
@@ -2056,7 +2058,9 @@ class TestSequenceShape:
             _deliver_sequence(journal, events=[{"type": "macro", "name": "x"}])
 
     def test_v1_omitted_enter_keeps_the_wire_default(self, tmux, journal):
-        result = service.deliver_control_input(TERMINAL, control_id=CONTROL, text=TEXT, journal=journal)
+        result = service.deliver_control_input(
+            TERMINAL, control_id=CONTROL, text=TEXT, journal=journal
+        )
         assert result.outcome == ACCEPTED
         assert tmux.writes[-1]["submit"] is True
 
@@ -2070,8 +2074,12 @@ class TestSequenceDeliveryUnmanaged:
         assert result.request_schema_version == 3
         # The text+Enter pair is the exact v1 write: one call, one Enter.
         assert tmux.writes == [
-            {"pane_id": PANE, "text": "make it so, + \\", "submit": True,
-             "expected_server_identity": SOCKET}
+            {
+                "pane_id": PANE,
+                "text": "make it so, + \\",
+                "submit": True,
+                "expected_server_identity": SOCKET,
+            }
         ]
         assert result.text_sent is True
         assert result.enter_sent is True
@@ -2395,9 +2403,15 @@ class TestSequenceReadinessGate:
         with service._native_kimi_dispatch_guard_lock:
             service._native_kimi_dispatch_times.clear()
         monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
-        client = FakeTmux(identities=[FakePaneIdentity(
-            pane_id=resolved.pane_id, window_id=resolved.window_id, pane_pid=resolved.pane_pid,
-        )])
+        client = FakeTmux(
+            identities=[
+                FakePaneIdentity(
+                    pane_id=resolved.pane_id,
+                    window_id=resolved.window_id,
+                    pane_pid=resolved.pane_pid,
+                )
+            ]
+        )
         monkeypatch.setattr(service, "_tmux_client", lambda: client)
         monkeypatch.setattr(
             service,
@@ -2416,7 +2430,10 @@ class TestSequenceReadinessGate:
     def test_composer_sequence_is_idle_gated(self, monkeypatch, journal):
         resolved = _seq_resolved()
         client = self._wire(
-            monkeypatch, resolved, _FakeSequenceAdapter(), {0: {"lines": ["hello"]}},
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["hello"]}},
             turn_status=TerminalStatus.PROCESSING,
         )
         result = _deliver_sequence(journal, events=[{"type": "text", "text": "hello"}])
@@ -2428,7 +2445,10 @@ class TestSequenceReadinessGate:
     def test_interrupt_sequence_is_deliverable_during_an_active_turn(self, monkeypatch, journal):
         resolved = _seq_resolved()
         client = self._wire(
-            monkeypatch, resolved, _FakeSequenceAdapter(), {},
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {},
             turn_status=TerminalStatus.PROCESSING,
         )
         events = [{"type": "key", "key": "Escape"}, {"type": "key", "key": "C-c"}]
@@ -2439,17 +2459,25 @@ class TestSequenceReadinessGate:
     def test_chord_sequence_is_deliverable_during_an_active_turn(self, monkeypatch, journal):
         resolved = _seq_resolved()
         client = self._wire(
-            monkeypatch, resolved, _FakeSequenceAdapter(), {},
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {},
             turn_status=TerminalStatus.PROCESSING,
         )
         result = _deliver_sequence(journal, events=[{"type": "chord", "chord": "C-s"}])
         assert result.outcome == ACCEPTED
-        assert client.writes == [{"pane_id": PANE, "chord": "C-s", "expected_server_identity": SOCKET}]
+        assert client.writes == [
+            {"pane_id": PANE, "chord": "C-s", "expected_server_identity": SOCKET}
+        ]
 
     def test_a_mixed_sequence_is_gated_as_a_whole(self, monkeypatch, journal):
         resolved = _seq_resolved()
         client = self._wire(
-            monkeypatch, resolved, _FakeSequenceAdapter(), {1: {"lines": ["hello"]}},
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {1: {"lines": ["hello"]}},
             turn_status=TerminalStatus.PROCESSING,
         )
         events = [{"type": "key", "key": "Escape"}, {"type": "text", "text": "hello"}]
@@ -2461,7 +2489,10 @@ class TestSequenceReadinessGate:
     def test_idle_composer_sequence_delivers(self, monkeypatch, journal):
         resolved = _seq_resolved()
         client = self._wire(
-            monkeypatch, resolved, _FakeSequenceAdapter(), {0: {"lines": ["hello"]}},
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["hello"]}},
             turn_status=TerminalStatus.IDLE,
         )
         result = _deliver_sequence(journal, events=[{"type": "text", "text": "hello"}])
@@ -2471,7 +2502,10 @@ class TestSequenceReadinessGate:
     def test_unobservable_turn_state_is_a_zero_byte_refusal(self, monkeypatch, journal):
         resolved = _seq_resolved()
         client = self._wire(
-            monkeypatch, resolved, _FakeSequenceAdapter(), {0: {"lines": ["hello"]}},
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["hello"]}},
             turn_status=RuntimeError("pane unreadable"),
         )
         result = _deliver_sequence(journal, events=[{"type": "text", "text": "hello"}])
@@ -2494,7 +2528,10 @@ class TestSequenceReadinessGate:
         # Marked after wiring: the harness clears the grace table to model a
         # fresh server, so a dispatch marked before it never happened.
         client = self._wire(
-            monkeypatch, resolved, _FakeSequenceAdapter(), {0: {"lines": ["hello"]}},
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["hello"]}},
             turn_status=TerminalStatus.IDLE,
         )
         service._mark_native_kimi_dispatch(service._native_kimi_dispatch_key(resolved, binding))
@@ -2528,7 +2565,10 @@ class TestSequenceJournalReplay:
         assert len(tmux.writes) == writes_after  # zero new writes
         assert [event["outcome"] for event in replay.events] == ["sent"] * 3
         assert replay.events[2] == {
-            "ordinal": 2, "type": "key", "key": "Escape", "outcome": "sent",
+            "ordinal": 2,
+            "type": "key",
+            "key": "Escape",
+            "outcome": "sent",
         }
         # The exact-id lookup answers the same stored row.
         looked = service.lookup_control_input(CONTROL, journal=journal)
@@ -2565,7 +2605,9 @@ class TestSequenceJournalReplay:
         assert replay.outcome == AMBIGUOUS
         assert len(client.writes) == writes_after  # never auto-replayed
         assert [event["outcome"] for event in replay.events] == [
-            "sent", "attempted", "skipped",
+            "sent",
+            "attempted",
+            "skipped",
         ]
 
     def test_refused_sequence_stores_and_rearms_event_outcomes(self, journal):
@@ -2600,7 +2642,9 @@ class TestSequenceSubmissionBarrier:
     def test_text_then_enter_crosses_the_barrier_once(self, monkeypatch, journal):
         from cli_agent_orchestrator.services import native_pane_input
 
-        monkeypatch.setattr(service, "_terminal_metadata", lambda terminal_id: self._codex_metadata())
+        monkeypatch.setattr(
+            service, "_terminal_metadata", lambda terminal_id: self._codex_metadata()
+        )
         monkeypatch.setattr(service, "_managed_identity", lambda terminal_id: None)
         client = FakeTmux()
         monkeypatch.setattr(service, "_tmux_client", lambda: client)
@@ -2608,7 +2652,10 @@ class TestSequenceSubmissionBarrier:
         monkeypatch.setattr(
             native_pane_input,
             "await_compose_visible",
-            lambda pane_id, text, *, barrier, deadline_monotonic: observations.append(("compose", text)) or True,
+            lambda pane_id, text, *, barrier, deadline_monotonic: observations.append(
+                ("compose", text)
+            )
+            or True,
         )
         monkeypatch.setattr(
             native_pane_input,
@@ -2621,9 +2668,10 @@ class TestSequenceSubmissionBarrier:
         assert result.submission_observed == "submitted"
         assert result.submission_evidence_ref == "evidence://ref-1"
         # The barrier's two writes: text unsubmitted, then exactly one Enter.
-        assert [
-            (write.get("text"), write.get("submit")) for write in client.writes
-        ] == [("codex task", False), ("", True)]
+        assert [(write.get("text"), write.get("submit")) for write in client.writes] == [
+            ("codex task", False),
+            ("", True),
+        ]
         assert observations == [("compose", "codex task")]
         assert [event["outcome"] for event in result.events] == ["sent", "sent"]
         # The observation is journaled with the delivered record.
@@ -2634,12 +2682,15 @@ class TestSequenceSubmissionBarrier:
     def test_the_barrier_withholds_the_enter_when_text_never_settles(self, monkeypatch, journal):
         from cli_agent_orchestrator.services import native_pane_input
 
-        monkeypatch.setattr(service, "_terminal_metadata", lambda terminal_id: self._codex_metadata())
+        monkeypatch.setattr(
+            service, "_terminal_metadata", lambda terminal_id: self._codex_metadata()
+        )
         monkeypatch.setattr(service, "_managed_identity", lambda terminal_id: None)
         client = FakeTmux()
         monkeypatch.setattr(service, "_tmux_client", lambda: client)
         monkeypatch.setattr(
-            native_pane_input, "await_compose_visible",
+            native_pane_input,
+            "await_compose_visible",
             lambda pane_id, text, *, barrier, deadline_monotonic: False,
         )
         events = [{"type": "text", "text": "resting"}, {"type": "key", "key": "Enter"}]
@@ -2658,17 +2709,24 @@ class TestSequenceSubmissionBarrier:
     def test_an_unsubmitted_observation_never_sends_a_second_enter(self, monkeypatch, journal):
         from cli_agent_orchestrator.services import native_pane_input
 
-        monkeypatch.setattr(service, "_terminal_metadata", lambda terminal_id: self._codex_metadata())
+        monkeypatch.setattr(
+            service, "_terminal_metadata", lambda terminal_id: self._codex_metadata()
+        )
         monkeypatch.setattr(service, "_managed_identity", lambda terminal_id: None)
         client = FakeTmux()
         monkeypatch.setattr(service, "_tmux_client", lambda: client)
         monkeypatch.setattr(
-            native_pane_input, "await_compose_visible",
+            native_pane_input,
+            "await_compose_visible",
             lambda pane_id, text, *, barrier, deadline_monotonic: True,
         )
         monkeypatch.setattr(
-            native_pane_input, "observe_submission",
-            lambda pane_id, text, *, barrier, deadline_monotonic: ("unsubmitted", "evidence://ref-2"),
+            native_pane_input,
+            "observe_submission",
+            lambda pane_id, text, *, barrier, deadline_monotonic: (
+                "unsubmitted",
+                "evidence://ref-2",
+            ),
         )
         events = [
             {"type": "text", "text": "swallowed"},

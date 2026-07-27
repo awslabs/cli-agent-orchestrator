@@ -370,9 +370,9 @@ class TestV3SequenceDigest:
         )
 
     def test_matches_the_recorded_preimage_byte_for_byte(self):
-        assert hashlib.sha256(self.PREIMAGE.encode("utf-8")).hexdigest() == self.DIGEST, (
-            "the recorded v3 preimage does not hash to the recorded digest"
-        )
+        assert (
+            hashlib.sha256(self.PREIMAGE.encode("utf-8")).hexdigest() == self.DIGEST
+        ), "the recorded v3 preimage does not hash to the recorded digest"
         encoded = canonical_json.encode_canonical(
             {
                 "domain": contract.CONTROL_INPUT_DIGEST_DOMAIN_V3,
@@ -424,25 +424,34 @@ class TestV3SequenceDigest:
             control_id="req-1", text="/model opus", enter=True, expected_identity=None
         )
         v2 = contract.control_input_request_digest_v2(
-            control_id="req-1", text="/model opus", enter=False, chord="C-s",
+            control_id="req-1",
+            text="/model opus",
+            enter=False,
+            chord="C-s",
             expected_identity=None,
         )
-        assert v1 == hashlib.sha256(
-            b'{"domain":"cao-control-input-request-v1","schema_version":1,'
-            b'"control_id":"req-1","text":"/model opus","enter":true,'
-            b'"expected_identity":{"terminal_id":null,"terminal_incarnation":null,'
-            b'"terminal_generation":null,"pane_birth_id":null,"provider_process_id":null,'
-            b'"provider":null,"native_session_id":null,"execution_mode":null,'
-            b'"session_name":null}}\n'
-        ).hexdigest()
-        assert v2 == hashlib.sha256(
-            b'{"domain":"cao-control-input-request-v2","schema_version":2,'
-            b'"control_id":"req-1","text":"/model opus","enter":false,"chord":"C-s",'
-            b'"expected_identity":{"terminal_id":null,"terminal_incarnation":null,'
-            b'"terminal_generation":null,"pane_birth_id":null,"provider_process_id":null,'
-            b'"provider":null,"native_session_id":null,"execution_mode":null,'
-            b'"session_name":null}}\n'
-        ).hexdigest()
+        assert (
+            v1
+            == hashlib.sha256(
+                b'{"domain":"cao-control-input-request-v1","schema_version":1,'
+                b'"control_id":"req-1","text":"/model opus","enter":true,'
+                b'"expected_identity":{"terminal_id":null,"terminal_incarnation":null,'
+                b'"terminal_generation":null,"pane_birth_id":null,"provider_process_id":null,'
+                b'"provider":null,"native_session_id":null,"execution_mode":null,'
+                b'"session_name":null}}\n'
+            ).hexdigest()
+        )
+        assert (
+            v2
+            == hashlib.sha256(
+                b'{"domain":"cao-control-input-request-v2","schema_version":2,'
+                b'"control_id":"req-1","text":"/model opus","enter":false,"chord":"C-s",'
+                b'"expected_identity":{"terminal_id":null,"terminal_incarnation":null,'
+                b'"terminal_generation":null,"pane_birth_id":null,"provider_process_id":null,'
+                b'"provider":null,"native_session_id":null,"execution_mode":null,'
+                b'"session_name":null}}\n'
+            ).hexdigest()
+        )
 
     def test_caps_are_pinned(self):
         assert contract.MAX_SEQUENCE_EVENTS == 32
@@ -457,8 +466,7 @@ class TestV3SequenceDigest:
         assert contract.REASON_UNREPRESENTABLE_EVENT == "unrepresentable-event"
         assert contract.outcome_for_reason(contract.REASON_UNSUPPORTED_KEY) == contract.REFUSED
         assert (
-            contract.outcome_for_reason(contract.REASON_UNREPRESENTABLE_EVENT)
-            == contract.REFUSED
+            contract.outcome_for_reason(contract.REASON_UNREPRESENTABLE_EVENT) == contract.REFUSED
         )
         assert contract.REASON_UNSUPPORTED_KEY in contract.CONTROL_INPUT_REASON_CODES
         assert contract.REASON_UNREPRESENTABLE_EVENT in contract.CONTROL_INPUT_REASON_CODES
@@ -477,9 +485,7 @@ class TestV3SequenceDigest:
         ]
         assert len(contract.normalize_sequence_events(events)) == 2
         with pytest.raises(ValueError):
-            contract.normalize_sequence_events(
-                [events[0], {"type": "text", "text": "b" * 257}]
-            )
+            contract.normalize_sequence_events([events[0], {"type": "text", "text": "b" * 257}])
 
     def test_multibyte_text_is_measured_in_utf8_bytes(self):
         with pytest.raises(ValueError):

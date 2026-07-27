@@ -1093,7 +1093,6 @@ class TestSubmissionObservationStorage:
         assert record.submission_evidence_ref is None
 
 
-
 # --- Schema v5: structured sequence events and per-event outcomes -------------
 
 SEQUENCE = [
@@ -1107,10 +1106,7 @@ SEQUENCE = [
 def _tables(db_path):
     conn = sqlite3.connect(db_path)
     try:
-        return {
-            row[0]
-            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
+        return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     finally:
         conn.close()
 
@@ -1301,7 +1297,10 @@ class TestSequenceEventStorage:
             dict(e) for e in record.sequence_events
         ]
         assert replayed.as_dict()["sequence_events"][1] == {
-            "ordinal": 1, "type": "key", "key": "Enter", "outcome": "sent",
+            "ordinal": 1,
+            "type": "key",
+            "key": "Enter",
+            "outcome": "sent",
         }
 
     def test_ambiguity_records_the_event_boundary(self, journal):
@@ -1314,12 +1313,18 @@ class TestSequenceEventStorage:
             sequence_event_outcomes=[(0, "sent"), (1, "attempted"), (2, "skipped"), (3, "skipped")],
         )
         assert [e["outcome"] for e in record.sequence_events] == [
-            "sent", "attempted", "skipped", "skipped",
+            "sent",
+            "attempted",
+            "skipped",
+            "skipped",
         ]
         # An ambiguous record never gains new outcomes on a re-arrival.
         again = journal.open_intent(_binding(), sequence_events=SEQUENCE)
         assert [e["outcome"] for e in again.sequence_events] == [
-            "sent", "attempted", "skipped", "skipped",
+            "sent",
+            "attempted",
+            "skipped",
+            "skipped",
         ]
 
     def test_refusal_marks_every_event_refused_and_rearm_clears_them(self, journal):
@@ -1371,9 +1376,7 @@ class TestSequenceEventStorage:
         journal.open_intent(_binding(), sequence_events=SEQUENCE)
         journal.claim_write(REQ)
         # A different owner instance sweeps with every owner provably dead.
-        resolved = ControlInputJournal(db_path).sweep_stranded(
-            owner_alive=lambda pid: False
-        )
+        resolved = ControlInputJournal(db_path).sweep_stranded(owner_alive=lambda pid: False)
         assert [record.state for record in resolved] == [STATE_AMBIGUOUS]
         record = journal.get(REQ)
         assert record.state == STATE_AMBIGUOUS

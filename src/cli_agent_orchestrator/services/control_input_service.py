@@ -760,9 +760,7 @@ def _sequence_events_with_outcome(
     events: List[Dict[str, Any]], outcome: str
 ) -> List[Dict[str, Any]]:
     """The ordered events each stamped with one per-event outcome."""
-    return [
-        {"ordinal": index, **event, "outcome": outcome} for index, event in enumerate(events)
-    ]
+    return [{"ordinal": index, **event, "outcome": outcome} for index, event in enumerate(events)]
 
 
 class _SequenceRun:
@@ -1235,9 +1233,7 @@ def _record_sequence_refusal(
         terminal_id=terminal_id,
         resolved=resolved,
         digest=digest,
-        sequence_event_outcomes=[
-            (index, EVENT_OUTCOME_REFUSED) for index in range(len(events))
-        ],
+        sequence_event_outcomes=[(index, EVENT_OUTCOME_REFUSED) for index in range(len(events))],
     )
     if result.reason_code != reason:
         # The transition was refused because another writer resolved the
@@ -2991,9 +2987,7 @@ def _deliver_sequence_under_lease(
                     pane_id=binding.pane_id,
                     terminal_id=terminal_id,
                     session_name=resolved.session_name,
-                    window_name=managed_window_name(
-                        terminal_id, resolved.terminal_generation
-                    ),
+                    window_name=managed_window_name(terminal_id, resolved.terminal_generation),
                 )
             except Exception as exc:  # noqa: BLE001 - "could not look" is not "idle"
                 return _refuse_pre_claim(
@@ -3147,9 +3141,7 @@ def _send_sequence_through_native_adapter(
             chord=last_chord,
             chord_attempted=transport.chord_attempted,
             chord_sent=transport.chord_sent,
-            sequence_event_outcomes=[
-                (event["ordinal"], event["outcome"]) for event in run.events
-            ],
+            sequence_event_outcomes=[(event["ordinal"], event["outcome"]) for event in run.events],
             evidence_digest=digest,
         )
         return ControlInputResult(
@@ -3213,9 +3205,7 @@ def _send_sequence_through_native_adapter(
                         run.mark_attempted(ordinal + 1)
                 return _ambiguous(f"the composer write stopped part-way: {exc.detail}.")
             except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
-                logger.error(
-                    "control-input sequence adapter raised for %s: %s", control_id, exc
-                )
+                logger.error("control-input sequence adapter raised for %s: %s", control_id, exc)
                 if transport.enter_attempted:
                     run.mark_sent(ordinal)
                     if submits:
@@ -3283,9 +3273,7 @@ def _send_sequence_through_native_adapter(
         chord=last_chord,
         chord_attempted=transport.chord_attempted,
         chord_sent=transport.chord_sent,
-        sequence_event_outcomes=[
-            (event["ordinal"], event["outcome"]) for event in run.events
-        ],
+        sequence_event_outcomes=[(event["ordinal"], event["outcome"]) for event in run.events],
         evidence_digest=digest,
     )
     return _sequence_accepted(
@@ -3362,9 +3350,7 @@ def _send_sequence_through_literal_sink(
             chord_sent=chord_sent,
             submission_observed=observed,
             submission_evidence_ref=evidence_ref,
-            sequence_event_outcomes=[
-                (event["ordinal"], event["outcome"]) for event in run.events
-            ],
+            sequence_event_outcomes=[(event["ordinal"], event["outcome"]) for event in run.events],
             evidence_digest=digest,
         )
         return ControlInputResult(
@@ -3609,9 +3595,7 @@ def _send_sequence_through_literal_sink(
         chord_sent=chord_sent,
         submission_observed=submission_observed,
         submission_evidence_ref=submission_evidence_ref,
-        sequence_event_outcomes=[
-            (event["ordinal"], event["outcome"]) for event in run.events
-        ],
+        sequence_event_outcomes=[(event["ordinal"], event["outcome"]) for event in run.events],
         evidence_digest=digest,
     )
     return _sequence_accepted(
