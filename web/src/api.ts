@@ -93,6 +93,152 @@ export interface AgentProfileInfo {
   // Other enabled directories that also define this profile name (the winner
   // above is what loads). Empty/absent when the name is unique. (GH #280)
   duplicated_in?: string[]
+  // Discovery metadata surfaced by list_agent_profiles(); all optional/additive
+  // so existing callers are unaffected. `loadable === false` marks a profile the
+  // load path would reject — the Profiles list badges it View-only (#510).
+  loadable?: boolean
+  capabilities?: string[]
+  tags?: string[]
+  role?: string
+}
+
+/**
+ * One ranked search hit — mirrors the server `search_profiles` result shape
+ * verbatim (GET /agents/profiles/search, #510). The list order is
+ * server-provided (coverage → BM25Plus → name); the client MUST NOT re-sort or
+ * recompute `score` (which is relative to the matched set, not a percentage).
+ */
+export interface ProfileSearchResult {
+  name: string
+  description: string
+  capabilities: string[]
+  tags: string[]
+  role: string | null
+  source: AgentProfileSource
+  coverage: number
+  score: number
+}
+
+/**
+ * Validation outcome from POST /agents/profiles/validate (#510). `valid` is
+ * true iff there are zero `[error]` messages; `[warn]` messages never block
+ * save, mirroring the CLI's "exit 1 only on [error]".
+ */
+export interface ValidateProfileResult {
+  valid: boolean
+  errors: string[]
+  warnings: string[]
+}
+
+/** Request body for POST /agents/profiles/validate — supply exactly one input. */
+export interface ValidateProfilePayload {
+  content?: string
+  metadata?: Record<string, unknown>
+}
+
+/**
+ * Full parsed profile from GET /agents/profiles/{name} — the server serializes
+ * its AgentProfile with None fields excluded, so most fields are optional. The
+ * open index signature carries provider-specific keys without repeated widening.
+ */
+export interface AgentProfileDetail {
+  name: string
+  description?: string
+  role?: string
+  provider?: string
+  model?: string
+  system_prompt?: string
+  capabilities?: string[]
+  tags?: string[]
+  allowedTools?: string[]
+  mcpServers?: Record<string, unknown>
+  [key: string]: unknown
+}
+
+/** One scaffolding template descriptor — mirrors list_templates() (#510). */
+export interface TemplateInfo {
+  name: string
+  description: string
+  path: string
+}
+
+/**
+ * A template's JSON-Schema (Draft 2020-12) from
+ * GET /agents/profiles/templates/{name}/schema. Left as an open object — the
+ * create form reads `properties`/`required` to build fields.
+ */
+export interface TemplateSchema {
+  type?: string
+  title?: string
+  description?: string
+  properties?: Record<string, JsonSchemaProperty>
+  required?: string[]
+  additionalProperties?: boolean
+  [key: string]: unknown
+}
+
+/** One property node within a template schema, as far as the form widget reads it. */
+export interface JsonSchemaProperty {
+  type?: string
+  description?: string
+  enum?: string[]
+  pattern?: string
+  default?: unknown
+  minimum?: number
+  maximum?: number
+  [key: string]: unknown
+}
+
+/**
+ * Request body for POST /agents/profiles (create) and POST
+ * /agents/profiles/preview. `provider` and `model` are REQUIRED explicit inputs
+ * (ADR-006/F-1) — set as frontmatter on the rendered output server-side, never
+ * merged into `config`.
+ */
+export interface CreateProfileRequest {
+  template_name: string
+  config: Record<string, unknown>
+  provider: string
+  model: string
+}
+
+/** Response for a create/edit write — the persisted local profile (#510). */
+export interface ProfileWriteResult {
+  name: string
+  source: string
+  path: string
+}
+
+/**
+ * Render-only preview from POST /agents/profiles/preview (#510). Carries the
+ * rendered profile `text` (frontmatter already patched with provider/model,
+ * server-side) plus the validation split. NON-MUTATING — nothing is written.
+ */
+export interface PreviewProfileResult {
+  text: string
+  valid: boolean
+  errors: string[]
+  warnings: string[]
+}
+
+/** Request body for PUT /agents/profiles/{name} (edit — #510 U4). */
+export interface UpdateProfileRequest {
+  content: string
+  provider: string
+  model: string
+}
+
+/**
+ * Request body for POST /agents/profiles/from-content (clone — #510 U4). Writes
+ * a NEW local profile from raw `content` under a new `name`; the server refuses
+ * to overwrite an existing name. `provider`/`model` arrive inside `content` and
+ * are re-asserted on the body (ADR-006).
+ */
+export interface CreateFromContentRequest {
+  name: string
+  content: string
+  provider: string
+  model: string
 }
 
 export interface AgentDirsSettings {
@@ -193,6 +339,61 @@ export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
   listProviders: () => fetchJSON<ProviderInfo[]>('/agents/providers'),
+
+  // Profile management (#510 U2). Search + validate are open-read; the server
+  // owns all ranking/validation logic — these wrappers only carry data. Search
+  // results come back in server order and MUST NOT be re-sorted client-side
+  // (coverage → BM25Plus → name is U1's pinned contract). U3 appends its own
+  // template/create methods to this block when it runs.
+  searchProfiles: (q: string, limit?: number) =>
+    fetchJSON<ProfileSearchResult[]>(
+      `/agents/profiles/search?q=${encodeURIComponent(q)}${limit !== undefined ? `&limit=${limit}` : ''}`,
+    ),
+  getProfile: (name: string) =>
+    fetchJSON<AgentProfileDetail>(`/agents/profiles/${encodeURIComponent(name)}`),
+  validateProfile: (payload: ValidateProfilePayload) =>
+    fetchJSON<ValidateProfileResult>('/agents/profiles/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+
+  // Create-from-template flow (#510 U3). Templates + schema are open-read; the
+  // preview is a server-side render (writes nothing); create writes to the local
+  // store via the scope-gated endpoint. No scaffolding/validation logic here.
+  listTemplates: () => fetchJSON<TemplateInfo[]>('/agents/profiles/templates'),
+  getTemplateSchema: (name: string) =>
+    // `name` is category/name (e.g. aws/stepfunction); the server route captures
+    // it with a :path convertor, so the '/' is intentionally NOT encoded.
+    fetchJSON<TemplateSchema>(`/agents/profiles/templates/${name}/schema`),
+  previewProfile: (req: CreateProfileRequest) =>
+    fetchJSON<PreviewProfileResult>('/agents/profiles/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    }),
+  createProfile: (req: CreateProfileRequest) =>
+    fetchJSON<ProfileWriteResult>('/agents/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    }),
+
+  // Edit + clone (#510 U4). Edit updates a local profile in place via PUT;
+  // clone writes a NEW local profile from a built-in's (edited) content via
+  // from-content (the built-in is never mutated). Both server-validated + guarded.
+  updateProfile: (name: string, req: UpdateProfileRequest) =>
+    fetchJSON<ProfileWriteResult>(`/agents/profiles/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    }),
+  createProfileFromContent: (req: CreateFromContentRequest) =>
+    fetchJSON<ProfileWriteResult>('/agents/profiles/from-content', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    }),
 
   // Settings
   getAgentDirs: () => fetchJSON<AgentDirsSettings>('/settings/agent-dirs'),

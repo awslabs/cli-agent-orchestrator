@@ -14,7 +14,9 @@ type TabKey = 'home' | 'agents' | 'flows' | 'settings' | 'memory'
 // Memory appended last so Alt+N numbering of existing tabs never shifts
 const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
   { key: 'home', label: 'Home', icon: <Home size={16} /> },
-  { key: 'agents', label: 'Agents', icon: <Bot size={16} /> },
+  // #510: user-facing label only — the route key stays 'agents' (no rename of
+  // the store key, API path, or component wiring).
+  { key: 'agents', label: 'Profiles', icon: <Bot size={16} /> },
   { key: 'flows', label: 'Flows', icon: <Clock size={16} /> },
   { key: 'settings', label: 'Settings', icon: <Settings size={16} /> },
   { key: 'memory', label: 'Memory', icon: <Brain size={16} /> },

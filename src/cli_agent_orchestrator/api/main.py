@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Optional, Tuple, cast
 
+import frontmatter
 from fastapi import (
     BackgroundTasks,
     Body,
@@ -40,6 +41,7 @@ from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFou
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
+from cli_agent_orchestrator.cli.commands.profile import _validate_frontmatter
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
@@ -54,6 +56,7 @@ from cli_agent_orchestrator.constants import (
     DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
+    LOCAL_AGENT_STORE_DIR,
     MODEL_ID_MAX_LEN,
     MODEL_ID_RE,
     OTEL_SERVICE_NAME,
@@ -101,6 +104,11 @@ from cli_agent_orchestrator.services import (
     session_service,
     terminal_service,
 )
+from cli_agent_orchestrator.services.agent_scaffold import (
+    get_template_schema,
+    list_templates,
+    render_template,
+)
 from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
 from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
@@ -116,11 +124,17 @@ from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxServic
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
+from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT, search_profiles
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import (
+    _safe_join,
+    _validate_agent_name,
+    load_agent_profile,
+    resolve_provider,
+)
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -460,6 +474,137 @@ class InstallAgentProfileRequest(BaseModel):
     source: str
     provider: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
+
+
+# --- U1 profile-management DTOs (#510) -----------------------------------
+#
+# HTTP request/response models for the additive ``/agents/profiles/*`` routes
+# (search, templates, template schema, validate, create, edit). These are pure
+# serialization shapes over existing profile/template data — no new persistent
+# entity is introduced. See the U1 functional-design (business-logic-model
+# R1-R6, domain-entities). All ranking/validation/containment logic lives in the
+# reused services; these models only carry data across the HTTP boundary.
+
+
+class ProfileSearchResult(BaseModel):
+    """One search hit — mirrors the ``search_profiles`` result shape verbatim.
+
+    Serialization only; the list order is service-provided (coverage DESC →
+    BM25Plus DESC → name ASC) and MUST NOT be re-sorted by the route.
+    """
+
+    name: str
+    description: str
+    capabilities: List[str]
+    tags: List[str]
+    role: Optional[str] = None
+    source: str
+    coverage: int
+    score: float
+
+
+class TemplateInfo(BaseModel):
+    """One scaffolding template descriptor — mirrors ``list_templates()``."""
+
+    name: str
+    description: str
+    path: str
+
+
+class ValidateProfileRequest(BaseModel):
+    """Request to validate a profile.
+
+    Accepts either raw ``content`` (markdown + YAML frontmatter) or a parsed
+    ``metadata`` frontmatter dict. Exactly one is required; ``content`` takes
+    precedence when both are supplied. Validation is identical either way
+    (parse-then-``_validate_frontmatter``).
+    """
+
+    content: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def _require_one_input(self) -> "ValidateProfileRequest":
+        if self.content is None and self.metadata is None:
+            raise ValueError("Provide either 'content' or 'metadata'.")
+        return self
+
+
+class ValidateProfileResponse(BaseModel):
+    """Validation outcome. ``valid`` is true iff there are zero ``[error]``s;
+    ``[warn]`` messages never make a profile invalid (mirrors the CLI)."""
+
+    valid: bool
+    errors: List[str]
+    warnings: List[str]
+
+
+class CreateProfileRequest(BaseModel):
+    """Request to create a profile from a template (R5).
+
+    ``provider`` and ``model`` are REQUIRED explicit inputs (ADR-006); they are
+    set as top-level frontmatter fields on the RENDERED profile, never merged
+    into the template ``config`` (the template schemas are
+    ``additionalProperties:false``, so a config merge would fail validation).
+    """
+
+    template_name: str
+    config: Dict[str, Any] = Field(default_factory=dict)
+    provider: str
+    model: str
+
+
+class UpdateProfileRequest(BaseModel):
+    """Request to edit an existing local-store profile (R6).
+
+    The client submits the full edited profile ``content`` (frontmatter +
+    body). ``provider`` and ``model`` are REQUIRED explicit inputs (ADR-006);
+    they are already embedded in the submitted frontmatter, and the server
+    re-asserts their presence on the request body.
+    """
+
+    content: str
+    provider: str
+    model: str
+
+
+class ProfileWriteResult(BaseModel):
+    """Response for a create/edit write — the persisted local profile."""
+
+    name: str
+    source: str = "local"
+    path: str
+
+
+class PreviewProfileResponse(BaseModel):
+    """Response for the render-only preview (R5-preview).
+
+    Carries the rendered profile ``text`` (frontmatter patched with
+    provider/model, exactly as create would write it) plus the C-BE-3 validation
+    split. NON-MUTATING: nothing is written. ``valid``/``errors``/``warnings``
+    mirror ``ValidateProfileResponse`` so the wizard can block Save on any
+    ``[error]`` before the create call (BR-8/BR-9)."""
+
+    text: str
+    valid: bool
+    errors: List[str]
+    warnings: List[str]
+
+
+class CreateFromContentRequest(BaseModel):
+    """Request to create a NEW local profile from raw ``content`` (R6-clone).
+
+    This is the content-mode create used by clone-to-customize: the client
+    submits a built-in's (edited) content under a NEW local ``name``. Unlike the
+    template create, there is no ``render_template`` step — the ``content`` is
+    the finished profile. ``provider`` and ``model`` are REQUIRED explicit inputs
+    (ADR-006); F-1 does NOT apply here because they arrive INSIDE ``content``'s
+    frontmatter (no post-render patch), exactly as the edit (PUT) path works."""
+
+    name: str
+    content: str
+    provider: str
+    model: str
 
 
 class MemorySummary(BaseModel):
@@ -1477,6 +1622,390 @@ async def list_agent_profiles_endpoint() -> List[Dict]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list agent profiles: {str(e)}",
         )
+
+
+# --- U1 profile-management helpers (#510) --------------------------------
+#
+# Thin glue over the reused services. No ranking, scaffolding, schema, or
+# containment logic is reimplemented here (ADR-003): the helpers parse input,
+# call an existing service, and shape the result. See the U1 functional-design
+# (business-logic-model R1-R6, business-rules BR-1..BR-18).
+
+
+def _parse_profile_metadata(
+    content: Optional[str], metadata: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Resolve the frontmatter dict to validate from raw ``content`` or a parsed
+    ``metadata`` dict. ``content`` wins when both are supplied.
+
+    Raises ``ValueError`` if raw ``content`` cannot be parsed as frontmatter, so
+    the caller can map it to a 400 (bad input) rather than a silent pass.
+    """
+    if content is not None:
+        try:
+            post = frontmatter.loads(content)
+        except Exception as e:
+            raise ValueError(f"Could not parse profile content: {e}")
+        return dict(post.metadata)
+    return dict(metadata or {})
+
+
+def validate_profile(
+    content: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None
+) -> ValidateProfileResponse:
+    """Validate a profile's frontmatter and split messages into errors/warnings.
+
+    Reuses the CLI's ``_validate_frontmatter`` (schema + CAO conventions) — no
+    validation rule is reimplemented (C-BE-3, ADR-003). ``valid`` is true iff
+    there are zero ``[error]`` messages; ``[warn]`` messages never make a profile
+    invalid, mirroring the CLI's "exit 1 only on ``[error]``" (BR-8). Schema
+    errors are already emitted sorted by path by ``_validate_frontmatter`` (BR-6).
+    """
+    meta = _parse_profile_metadata(content, metadata)
+    messages = _validate_frontmatter(meta)
+    errors = [m for m in messages if m.startswith("[error]")]
+    warnings = [m for m in messages if m.startswith("[warn]")]
+    return ValidateProfileResponse(valid=(len(errors) == 0), errors=errors, warnings=warnings)
+
+
+def set_frontmatter_fields(rendered: str, provider: str, model: str) -> str:
+    """Patch the RENDERED profile's YAML frontmatter with explicit top-level
+    ``provider`` and ``model`` fields, then re-serialize.
+
+    ``provider`` and ``model`` are declared properties of
+    ``agent_profile.schema.json``, so patching them onto the rendered output
+    keeps it schema-valid. This is U1's only new glue (business-logic-model R5,
+    F-1 fix): the fields are set on the RENDERED profile, NEVER merged into the
+    template ``config`` (the template schemas are ``additionalProperties:false``,
+    so a config merge would fail ``validate_config`` inside ``render_template``).
+    """
+    post = frontmatter.loads(rendered)
+    post["provider"] = provider
+    post["model"] = model
+    return cast("str", frontmatter.dumps(post))
+
+
+def write_local_profile(name: str, text: str) -> Path:
+    """Write ``text`` to ``<local-store>/<name>.md`` and return the resolved path.
+
+    Reuses the existing containment guards (``_validate_agent_name`` +
+    ``_safe_join``): a name containing ``/``, ``\\`` or ``..`` raises
+    ``ValueError``, and any path that would escape ``LOCAL_AGENT_STORE_DIR``
+    (absolute component, symlink escape) is refused. Writes ONLY under the local
+    store, so a built-in/packaged profile is never mutated in place
+    (ADR-005, BR-12/13).
+    """
+    _validate_agent_name(name)
+    target = _safe_join(LOCAL_AGENT_STORE_DIR, f"{name}.md")
+    if target is None:
+        raise ValueError(f"Invalid profile name '{name}': resolved path escapes the local store.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    return target
+
+
+# --- U1 profile-management routes (#510) ---------------------------------
+#
+# GET sub-paths (search, templates, template schema) are declared BEFORE the
+# existing GET ``/agents/profiles/{name}`` so a request to e.g.
+# ``/agents/profiles/search`` resolves to the search handler, not ``{name}``
+# with ``name="search"`` (ADR-001, BR-16). POST/PUT sub-paths are method-distinct
+# from GET ``{name}`` and carry no shadowing risk. All new routes precede the
+# StaticFiles mount.
+
+
+@app.get("/agents/profiles/search")
+async def search_agent_profiles_endpoint(
+    q: str = Query(..., description="Free-text keywords (e.g. 'monitor sqs')."),
+    limit: int = Query(DEFAULT_LIMIT, description="Maximum number of results."),
+) -> List[ProfileSearchResult]:
+    """Search agent profiles by keyword (R1).
+
+    Pure pass-through to ``search_profiles``: the service owns tokenization, the
+    coverage → BM25Plus → name-ascending ordering, the score formula, the
+    unloadable filter, and the empty/``limit<=0`` → ``[]`` guard. The route MUST
+    NOT sort, slice, re-score, or re-filter — it surfaces the service order
+    verbatim (BR-1..BR-5, ADR-004).
+    """
+    try:
+        results = search_profiles(q, limit=limit)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Profile search failed: {str(e)}",
+        )
+    return [ProfileSearchResult(**r) for r in results]
+
+
+@app.get("/agents/profiles/templates")
+async def list_profile_templates_endpoint() -> List[TemplateInfo]:
+    """List available scaffolding templates (R2) — wraps ``list_templates()``,
+    which never raises and returns ``[]`` when the templates root is absent."""
+    try:
+        return [TemplateInfo(**t) for t in list_templates()]
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list templates: {str(e)}",
+        )
+
+
+@app.get("/agents/profiles/templates/{template_name:path}/schema")
+async def get_profile_template_schema_endpoint(template_name: str) -> Dict:
+    """Return a template's JSON-Schema (R3) — wraps ``get_template_schema``.
+
+    The ``:path`` convertor captures the ``category/name`` template id (e.g.
+    ``aws/stepfunction``). A missing schema (``None``) or a containment escape
+    (``FileNotFoundError``) both map to 404.
+    """
+    try:
+        schema = get_template_schema(template_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load template schema: {str(e)}",
+        )
+    if schema is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No schema found for template '{template_name}'",
+        )
+    return schema
+
+
+@app.post("/agents/profiles/validate")
+async def validate_agent_profile_endpoint(
+    request: ValidateProfileRequest,
+) -> ValidateProfileResponse:
+    """Validate a profile's frontmatter (R4). Non-mutating: a schema-invalid
+    profile is a normal 200 body with ``valid:false`` (not an exception); only
+    unparseable ``content`` is a 400 (BR-8, BR-18)."""
+    try:
+        return validate_profile(content=request.content, metadata=request.metadata)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Validation failed: {str(e)}",
+        )
+
+
+@app.post("/agents/profiles/preview")
+async def preview_agent_profile_endpoint(
+    request: CreateProfileRequest,
+) -> PreviewProfileResponse:
+    """Render-only preview of a create (R5-preview, FR4/AC4.2). NON-MUTATING.
+
+    Runs the SAME render pipeline as create — ``render_template(config)`` →
+    ``set_frontmatter_fields`` (provider/model patched onto the RENDERED output,
+    NEVER merged into ``config`` — F-1/BR-10) → ``validate_profile`` — but calls
+    NO ``write_local_profile`` on any path (including errors): nothing is ever
+    written. Returns the rendered ``text`` plus the validation split so the
+    create wizard can show the preview and block Save on any ``[error]`` before
+    the actual create call.
+
+    Open-read (non-mutating), like ``/validate``: no scope dependency. Invalid
+    config surfaces ``validate_config``'s messages as 400 (via
+    ``render_template`` → ``ValueError``); a template-path escape is 404 (BR-18).
+    A schema-invalid RENDERED profile is a normal 200 body with ``valid:false``
+    (the wizard blocks Save on it) — not an exception, matching ``/validate``.
+    """
+    if not request.provider or not request.model:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Both 'provider' and 'model' are required.",
+        )
+    try:
+        rendered = render_template(request.template_name, request.config)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    text = set_frontmatter_fields(rendered, provider=request.provider, model=request.model)
+    result = validate_profile(content=text)
+    # No write on any path — this route only renders + validates.
+    return PreviewProfileResponse(
+        text=text,
+        valid=result.valid,
+        errors=result.errors,
+        warnings=result.warnings,
+    )
+
+
+@app.post("/agents/profiles", status_code=status.HTTP_201_CREATED)
+async def create_agent_profile_endpoint(
+    request: CreateProfileRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> ProfileWriteResult:
+    """Create a profile from a template (R5).
+
+    Flow: require provider+model → ``render_template(config)`` (which runs
+    ``validate_config`` against the template schema and containment-checks the
+    template path) → ``set_frontmatter_fields`` patches provider/model onto the
+    RENDERED profile → ``validate_profile`` (pre-write, blocks on any ``[error]``,
+    BR-9/F-2) → ``write_local_profile`` (containment-guarded local write) → 201.
+
+    ``provider``/``model`` are NEVER merged into ``config`` — the template
+    schemas are ``additionalProperties:false`` (BR-10/F-1).
+    """
+    if not request.provider or not request.model:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Both 'provider' and 'model' are required.",
+        )
+    try:
+        rendered = render_template(request.template_name, request.config)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    text = set_frontmatter_fields(rendered, provider=request.provider, model=request.model)
+
+    result = validate_profile(content=text)
+    if result.errors:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"message": "Profile validation failed", "errors": result.errors},
+        )
+
+    # Derive the local-store name from the rendered profile's own validated
+    # identity (its `name` frontmatter field is schema-guaranteed present and
+    # filesystem-safe post-validation). For the shipped templates this equals
+    # the CLI's `<basename>-agent`; falling back to that if `name` is absent.
+    post = frontmatter.loads(text)
+    name = str(post.metadata.get("name") or f"{request.template_name.split('/')[-1]}-agent")
+    try:
+        path = write_local_profile(name, text)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return ProfileWriteResult(name=name, source="local", path=str(path))
+
+
+@app.post("/agents/profiles/from-content", status_code=status.HTTP_201_CREATED)
+async def create_profile_from_content_endpoint(
+    request: CreateFromContentRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> ProfileWriteResult:
+    """Create a NEW local profile from raw ``content`` (R6-clone).
+
+    The content-mode create that clone-to-customize needs: the built-ins are not
+    template-derived (5 built-ins, 7 unrelated AWS templates — zero overlap), so
+    clone cannot go through the template ``create`` path, and ``PUT`` refuses a
+    non-existent target. This route writes a NEW local-store profile from the
+    submitted (edited) content under a NEW ``name``.
+
+    Flow: require provider+model → refuse-overwrite (a ``name`` that already
+    exists in the local store → 400, no clobber) → ``validate_profile(content)``
+    (any ``[error]`` → 400, nothing written; same F-2 shape as create) →
+    ``write_local_profile`` (containment-guarded via ``_validate_agent_name`` +
+    ``_safe_join``; a ``../evil`` name is refused). Scope-gated WRITE|ADMIN — this
+    genuinely writes, so it is NOT in the read-only ``_EXEMPT`` set.
+
+    F-1 does NOT apply: ``provider``/``model`` arrive INSIDE ``content``'s
+    frontmatter (the client embeds them, as the edit/PUT path does), not via a
+    post-render patch — there is no ``render_template`` step to keep them out of.
+    The server re-asserts their presence on the request body (ADR-006).
+    """
+    if not request.provider or not request.model:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Both 'provider' and 'model' are required.",
+        )
+    try:
+        _validate_agent_name(request.name)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    target = _safe_join(LOCAL_AGENT_STORE_DIR, f"{request.name}.md")
+    if target is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid profile name '{request.name}'.",
+        )
+    # Refuse overwrite: a clone must never silently clobber an existing local
+    # profile. The caller picks a different new name (or edits the existing one
+    # via PUT).
+    if target.exists():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"A local profile named '{request.name}' already exists. "
+                f"Choose a different name (clone must not overwrite)."
+            ),
+        )
+
+    result = validate_profile(content=request.content)
+    if result.errors:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"message": "Profile validation failed", "errors": result.errors},
+        )
+    try:
+        path = write_local_profile(request.name, request.content)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return ProfileWriteResult(name=request.name, source="local", path=str(path))
+
+
+@app.put("/agents/profiles/{name}")
+async def update_agent_profile_endpoint(
+    name: str,
+    request: UpdateProfileRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> ProfileWriteResult:
+    """Edit an existing local-store profile (R6).
+
+    The target MUST be a local-store profile: a built-in/packaged-only name has
+    no local file and is refused with 400 (built-ins are read-only — clone them
+    to a new local profile via create instead; FR6, BR-12/13). The submitted
+    ``content`` already carries provider/model in its frontmatter (no post-render
+    patch — the R5/R6 asymmetry); the server re-asserts them on the request body
+    (ADR-006) and re-validates before writing (BR-9).
+    """
+    if not request.provider or not request.model:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Both 'provider' and 'model' are required.",
+        )
+    try:
+        _validate_agent_name(name)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    target = _safe_join(LOCAL_AGENT_STORE_DIR, f"{name}.md")
+    if target is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid profile name '{name}'.",
+        )
+    if not target.exists():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Profile '{name}' is not a local-store profile. Built-in/packaged "
+                f"profiles are read-only; clone to a new local profile instead."
+            ),
+        )
+
+    result = validate_profile(content=request.content)
+    if result.errors:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"message": "Profile validation failed", "errors": result.errors},
+        )
+    try:
+        path = write_local_profile(name, request.content)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return ProfileWriteResult(name=name, source="local", path=str(path))
 
 
 @app.get("/agents/profiles/{name}")

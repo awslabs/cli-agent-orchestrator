@@ -9,6 +9,7 @@ import { CustomSelect, SelectOption } from './CustomSelect'
 import { TerminalMeta } from '../api'
 import { StatusBadge } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
+import { ProfilesBrowser } from './ProfilesBrowser'
 
 export const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli']
 
@@ -198,6 +199,10 @@ export function AgentPanel() {
 
   return (
     <div className="space-y-6">
+      {/* Profiles browser (#510): search + grouped list + validate. All ranking
+          and validation logic lives server-side; this only renders results. */}
+      <ProfilesBrowser />
+
       {/* Sessions List */}
       <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5">
         <div className="flex items-center justify-between mb-1">

@@ -15,9 +15,14 @@ interface CustomSelectProps {
   options: SelectOption[]
   placeholder?: string
   className?: string
+  // Optional a11y hooks for the trigger button — used where the select stands in
+  // for a labelled form field (e.g. the required Provider field, #510 U3).
+  ariaLabel?: string
+  ariaRequired?: boolean
+  ariaInvalid?: boolean
 }
 
-export function CustomSelect({ value, onChange, options, placeholder = 'Select...', className = '' }: CustomSelectProps) {
+export function CustomSelect({ value, onChange, options, placeholder = 'Select...', className = '', ariaLabel, ariaRequired, ariaInvalid }: CustomSelectProps) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
 
@@ -57,6 +62,11 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
       <button
         type="button"
         onClick={() => setOpen(!open)}
+        aria-label={ariaLabel}
+        aria-required={ariaRequired}
+        aria-invalid={ariaInvalid}
+        aria-haspopup="listbox"
+        aria-expanded={open}
         className="w-full flex items-center justify-between bg-gray-900 border border-gray-700 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-none transition-colors hover:border-gray-600"
       >
         <span className={selected ? 'text-gray-200' : 'text-gray-500'}>
