@@ -485,8 +485,10 @@ class ControlInputRequest(BaseModel):
     text: Optional[str] = None
     # Stated, never inferred from the text.  Submitting is the
     # irreversible half of a control, and a default that guessed would
-    # make the caller's intent unreadable from the request.  ``None``
-    # keeps the v1 wire default (submit) for v1/v2 requests.
+    # make the caller's intent unreadable from the request.  An omitted
+    # field keeps the v1 wire default (submit) for v1/v2 requests; an
+    # explicit JSON null is a stated non-boolean and fails validation
+    # (see ``_stated_enter``), as it did at F1.
     enter: Optional[bool] = None
     expected_identity: Optional[Dict[str, Any]] = None
     request_digest: Optional[str] = None
@@ -2847,6 +2849,25 @@ async def get_terminal_control_identity(
     return body
 
 
+def _stated_enter(body: ControlInputRequest) -> Any:
+    """The ``enter`` argument for the service, with one JSON distinction restored.
+
+    Pydantic parses an omitted ``enter`` and an explicit ``"enter": null``
+    to the same ``None``, but they are different requests on the v1/v2
+    wire: the omission carries the v1 default (submit), while the explicit
+    null failed validation at F1 (``enter`` was a non-Optional bool) and
+    must keep failing rather than silently becoming ``enter=true``.  Raw
+    field presence is the only place the two can still be told apart, so
+    the edge translates the stated-null case to a marker the service
+    refuses as a shape error.  Beside ``events`` a stated ``enter`` — null
+    included — is handed through the same marker, so the v3 either/or rule
+    refuses it as the ambiguous intent it is.
+    """
+    if body.enter is None and "enter" in body.model_fields_set:
+        return control_input_service.ENTER_EXPLICIT_NULL
+    return body.enter
+
+
 @app.post("/terminals/{terminal_id}/control-input")
 async def send_terminal_control_input(
     terminal_id: TerminalId,
@@ -2868,7 +2889,7 @@ async def send_terminal_control_input(
                 terminal_id,
                 control_id=body.control_id,
                 text=body.text,
-                enter=body.enter,
+                enter=_stated_enter(body),
                 expected_identity=body.expected_identity,
                 request_digest=body.request_digest,
                 protocol=body.protocol,

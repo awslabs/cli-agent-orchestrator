@@ -2064,6 +2064,21 @@ class TestSequenceShape:
         assert result.outcome == ACCEPTED
         assert tmux.writes[-1]["submit"] is True
 
+    def test_an_explicit_null_enter_is_not_the_omission(self, tmux, journal):
+        """The API edge marks a stated JSON ``"enter": null`` with
+        :data:`ENTER_EXPLICIT_NULL`: it failed validation at F1 (a
+        non-Optional bool) and must not silently become the v1 default."""
+        with pytest.raises(service.ControlInputRequestInvalid):
+            _deliver(journal, enter=service.ENTER_EXPLICIT_NULL)
+        assert tmux.writes == []
+
+    def test_a_stated_null_enter_beside_events_is_never_both(self, journal):
+        """The v3 either/or rule stays strict on stated fields: a nulled
+        ``enter`` beside ``events`` is a stated v1/v2 field, refused as
+        ambiguous intent rather than resolved by precedence."""
+        with pytest.raises(service.ControlInputRequestInvalid):
+            _deliver_sequence(journal, enter=service.ENTER_EXPLICIT_NULL)
+
 
 class TestSequenceDeliveryUnmanaged:
     """The generic literal sink: ordering, coalescing, and honest outcomes."""

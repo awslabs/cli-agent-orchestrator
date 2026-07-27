@@ -612,6 +612,18 @@ def screen_control_text(text: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+# Marker for an explicit JSON ``"enter": null``, passed by the API layer.
+# Pydantic parses an omitted ``enter`` and an explicitly nulled one to the
+# same ``None``, but they are different requests on the v1/v2 wire: the
+# omission carries the v1 default (submit), while the explicit null failed
+# validation at F1 (``enter`` was a non-Optional bool) and must keep
+# failing rather than silently becoming ``enter=true``.  The service
+# cannot see raw field presence, so the edge passes this marker; beside
+# ``events`` any stated ``enter`` — including this one — trips the v3
+# either/or rule below, which stays strict.
+ENTER_EXPLICIT_NULL: Any = object()
+
+
 def _require_shape(
     control_id: Any, text: Any, enter: Any, request_digest: Any, chord: Any = None
 ) -> None:
@@ -1399,6 +1411,11 @@ def deliver_control_input(
             )
         normalized_events = _require_sequence_shape(control_id, events, request_digest)
     else:
+        if enter is ENTER_EXPLICIT_NULL:
+            raise ControlInputRequestInvalid(
+                "enter must be a boolean when stated; an explicit JSON null is not the "
+                "v1 omission — omit the field for the default, or state true or false"
+            )
         if enter is None:
             # The v1 wire default, preserved: a client that omits ``enter``
             # asks for the submitting Enter.

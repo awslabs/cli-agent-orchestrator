@@ -394,6 +394,45 @@ class TestSendingAControl:
         assert tmux.writes == []
 
 
+class TestEnterStatedAsNull:
+    """An explicit ``"enter": null`` is not the omitted field.
+
+    Pydantic parses an omission and an explicit null to the same ``None``,
+    but they are different requests on the v1/v2 wire: the omission carries
+    the v1 default (submit), while the explicit null failed validation at
+    F1 — ``enter`` was a non-Optional bool — and keeps failing rather than
+    silently becoming ``enter=true``.  Raw field presence, consulted at
+    the edge, is what still tells the two apart.
+    """
+
+    def test_an_explicit_null_enter_is_a_validation_error(self, client, tmux):
+        response = _post(client, enter=None)
+        assert response.status_code == 422
+        assert "enter" in response.json()["detail"]
+        assert tmux.writes == []
+
+    def test_an_omitted_enter_keeps_the_v1_default(self, client, tmux):
+        body = _post(client).json()
+        assert body["outcome"] == ACCEPTED
+        assert body["enter_sent"] is True
+        assert tmux.writes[0]["submit"] is True
+
+    def test_a_stated_null_enter_beside_events_is_refused(self, client, tmux):
+        # The v3 either/or rule stays strict on stated fields: a nulled
+        # ``enter`` beside ``events`` is a stated v1/v2 field, refused as
+        # ambiguous intent rather than resolved by precedence.
+        response = client.post(
+            f"/terminals/{TERMINAL}/control-input",
+            json={
+                "control_id": CONTROL,
+                "events": [{"type": "key", "key": "Escape"}],
+                "enter": None,
+            },
+        )
+        assert response.status_code == 422
+        assert tmux.writes == []
+
+
 class TestStatusDiscipline:
     """Which failures are typed 200s and which are transport-level errors."""
 
