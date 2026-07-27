@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
     AMBIGUOUS,
@@ -2251,6 +2252,36 @@ def deliver_native_inbox_payload(
                     f"pane {binding.pane_id} now reports window {live.window_id!r} and "
                     f"root pid {live.pane_pid}, not the bound {binding.window_id!r} / "
                     f"{binding.pane_pid}; nothing was typed",
+                )
+            # The idle gate for an ordinary payload: the provider's own live
+            # turn state, observed under this same lease so the idle proof
+            # and the write are atomic against a turn starting between them.
+            # Only an exact IDLE admits the send; every other status — and
+            # any observation failure — is a zero-byte refusal, so the busy
+            # queue is unchanged and a later pass re-observes.
+            from cli_agent_orchestrator.services import managed_launch_v2
+            from cli_agent_orchestrator.utils.terminal import managed_window_name
+
+            try:
+                turn_status = managed_launch_v2._observe_turn_state(
+                    resolved.provider,
+                    pane_id=binding.pane_id,
+                    terminal_id=terminal_id,
+                    session_name=resolved.session_name,
+                    window_name=managed_window_name(terminal_id, resolved.terminal_generation),
+                )
+            except Exception as exc:  # noqa: BLE001 - "could not look" is not "idle"
+                return NativePayloadResult(
+                    REFUSED,
+                    REASON_PANE_BUSY,
+                    f"the receiver's turn state could not be observed, so nothing "
+                    f"was typed: {exc}",
+                )
+            if turn_status is not TerminalStatus.IDLE:
+                return NativePayloadResult(
+                    REFUSED,
+                    REASON_PANE_BUSY,
+                    f"the receiver is {turn_status.value}, not idle; nothing was typed",
                 )
             adapter, plan, refusal = _native_composer_preflight(
                 resolved, binding, text=text, deadline_monotonic=deadline

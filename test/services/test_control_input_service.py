@@ -17,10 +17,12 @@ import threading
 import time
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import control_input_service as service
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
@@ -1256,11 +1258,11 @@ class TestNativeInboxPayload:
     REFUSED — proves zero bytes reached the pane.
     """
 
-    def _resolved(self, terminal_id="ntvpay01"):
+    def _resolved(self, terminal_id="a1b2c3d4"):
         return service.ResolvedControlIdentity(
             terminal_id=terminal_id,
             terminal_incarnation=None,
-            terminal_generation="gen-payload-1",
+            terminal_generation="11111111-2222-3333-4444-555555555555",
             provider="kimi_cli",
             native_session_id="ns-1",
             execution_mode="native_tui",
@@ -1276,7 +1278,9 @@ class TestNativeInboxPayload:
             observed_server_socket_path="/tmp/payload-sock",
         )
 
-    def _wire(self, monkeypatch, resolved, adapter, plan):
+    def _wire(self, monkeypatch, resolved, adapter, plan, turn_status=TerminalStatus.IDLE):
+        from cli_agent_orchestrator.services import managed_launch_v2
+
         monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
         live = SimpleNamespace(dead=False, window_id=resolved.window_id, pane_pid=resolved.pane_pid)
         client = SimpleNamespace(pane_control_identity=lambda *, pane_id, deadline_monotonic: live)
@@ -1286,6 +1290,16 @@ class TestNativeInboxPayload:
             "_native_composer_preflight",
             lambda *a, **k: (adapter, plan, None) if adapter is not None else (None, None, plan),
         )
+        observations = []
+
+        def _observe(provider, **kwargs):
+            observations.append((provider, kwargs))
+            if isinstance(turn_status, BaseException):
+                raise turn_status
+            return turn_status
+
+        monkeypatch.setattr(managed_launch_v2, "_observe_turn_state", _observe)
+        return observations
 
     def test_happy_path_types_the_plan_once(self, monkeypatch):
         resolved = self._resolved()
@@ -1302,7 +1316,7 @@ class TestNativeInboxPayload:
         plan = {"deliverable": True, "lines": ["a", "b"]}
         self._wire(monkeypatch, resolved, adapter, plan)
 
-        result = service.deliver_native_inbox_payload("ntvpay01", text="a\nb")
+        result = service.deliver_native_inbox_payload("a1b2c3d4", text="a\nb")
 
         assert result.outcome == ACCEPTED
         assert result.enter_sent is True
@@ -1318,7 +1332,7 @@ class TestNativeInboxPayload:
             ("provider-unsupported", "no composer behaviour is proven for this build"),
         )
 
-        result = service.deliver_native_inbox_payload("ntvpay01", text="hello")
+        result = service.deliver_native_inbox_payload("a1b2c3d4", text="hello")
 
         assert result.outcome == REFUSED
         assert result.reason_code == "provider-unsupported"
@@ -1341,7 +1355,7 @@ class TestNativeInboxPayload:
 
         self._wire(monkeypatch, resolved, _Adapter(), {"deliverable": True})
 
-        result = service.deliver_native_inbox_payload("ntvpay01", text="a\nb\nc")
+        result = service.deliver_native_inbox_payload("a1b2c3d4", text="a\nb\nc")
 
         assert result.outcome == AMBIGUOUS
         assert result.chunks_sent == 2
@@ -1357,11 +1371,99 @@ class TestNativeInboxPayload:
 
         monkeypatch.setattr(service, "pane_input_lease", _busy_lease)
 
-        result = service.deliver_native_inbox_payload("ntvpay01", text="hello")
+        result = service.deliver_native_inbox_payload("a1b2c3d4", text="hello")
 
         assert result.outcome == REFUSED
         assert result.reason_code == REASON_PANE_BUSY
         assert result.chunks_sent == 0
+
+    def test_idle_observation_admits_the_write_under_the_lease(self, monkeypatch):
+        resolved = self._resolved()
+        executed = []
+
+        class _Adapter:
+            def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic):
+                executed.append(plan)
+                transport.chunks_sent = 1
+                transport.enter_attempted = True
+                return {"lines_typed": 1, "enter_sent": True}
+
+        observations = self._wire(
+            monkeypatch, resolved, _Adapter(), {"deliverable": True}, TerminalStatus.IDLE
+        )
+
+        result = service.deliver_native_inbox_payload("a1b2c3d4", text="hello")
+
+        assert result.outcome == ACCEPTED
+        assert len(executed) == 1
+        assert observations == [
+            (
+                "kimi_cli",
+                {
+                    "pane_id": resolved.pane_id,
+                    "terminal_id": "a1b2c3d4",
+                    "session_name": resolved.session_name,
+                    "window_name": "managed-a1b2c3d4-111111112222",
+                },
+            )
+        ]
+
+    def test_non_idle_observation_refuses_with_zero_bytes(self, monkeypatch):
+        resolved = self._resolved()
+        adapter = MagicMock()
+        self._wire(monkeypatch, resolved, adapter, {"deliverable": True}, TerminalStatus.PROCESSING)
+
+        result = service.deliver_native_inbox_payload("a1b2c3d4", text="hello")
+
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PANE_BUSY
+        assert result.chunks_sent == 0
+        adapter.execute_composer_plan.assert_not_called()
+
+    def test_observer_exception_refuses_with_zero_bytes(self, monkeypatch):
+        resolved = self._resolved()
+        adapter = MagicMock()
+        self._wire(
+            monkeypatch,
+            resolved,
+            adapter,
+            {"deliverable": True},
+            RuntimeError("the pane could not be read"),
+        )
+
+        result = service.deliver_native_inbox_payload("a1b2c3d4", text="hello")
+
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PANE_BUSY
+        assert result.chunks_sent == 0
+        adapter.execute_composer_plan.assert_not_called()
+
+    def test_two_runs_reobserve_busy_then_idle_delivers_once(self, monkeypatch):
+        from cli_agent_orchestrator.services import managed_launch_v2
+
+        resolved = self._resolved()
+        executed = []
+
+        class _Adapter:
+            def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic):
+                executed.append(plan)
+                transport.chunks_sent = 1
+                transport.enter_attempted = True
+                return {"lines_typed": 1, "enter_sent": True}
+
+        self._wire(monkeypatch, resolved, _Adapter(), {"deliverable": True})
+        statuses = iter([TerminalStatus.PROCESSING, TerminalStatus.IDLE])
+        monkeypatch.setattr(
+            managed_launch_v2, "_observe_turn_state", lambda provider, **kw: next(statuses)
+        )
+
+        busy = service.deliver_native_inbox_payload("a1b2c3d4", text="hello")
+        assert busy.outcome == REFUSED
+        assert executed == []
+
+        idle = service.deliver_native_inbox_payload("a1b2c3d4", text="hello")
+        assert idle.outcome == ACCEPTED
+        assert len(executed) == 1
 
 
 class TestInboxPayloadScreen:
@@ -1378,7 +1480,7 @@ class TestInboxPayloadScreen:
 
         monkeypatch.setattr(service, "resolve_control_identity", _boom)
 
-        result = service.deliver_native_inbox_payload("ntvpay01", text=bad)
+        result = service.deliver_native_inbox_payload("a1b2c3d4", text=bad)
 
         assert result.outcome == REFUSED
         assert result.reason_code == REASON_ILLEGAL_CONTROL_BYTES
@@ -1390,7 +1492,7 @@ class TestInboxPayloadScreen:
 
         monkeypatch.setattr(service, "resolve_control_identity", _boom)
 
-        result = service.deliver_native_inbox_payload("ntvpay01", text="")
+        result = service.deliver_native_inbox_payload("a1b2c3d4", text="")
 
         assert result.outcome == REFUSED
 

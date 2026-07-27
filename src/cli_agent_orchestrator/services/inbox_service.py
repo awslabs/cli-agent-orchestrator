@@ -675,23 +675,35 @@ class InboxService:
             )
             return
 
-        status = status_monitor.get_status(terminal_id)
-        idle_bound_delivery = status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
-        if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
-            # Not ready on the normal path. Eager delivery (#251) lets providers
-            # that accept input mid-turn receive messages while PROCESSING or
-            # WAITING_USER_ANSWER; only in that case do we need the provider.
-            eager_eligible = False
-            if EAGER_INBOX_DELIVERY and status in (
-                TerminalStatus.PROCESSING,
-                TerminalStatus.WAITING_USER_ANSWER,
-            ):
-                provider = provider_manager.get_provider(terminal_id)
-                eager_eligible = provider is not None and getattr(
-                    provider, "accepts_input_while_processing", False
-                )
-            if not eager_eligible:
-                return
+        if native_managed:
+            # A native pane is never FIFO-classified (its projection reports
+            # not_fifo_monitored by design), so the legacy status gate below
+            # would park its rows forever.  Delivery eligibility for a native
+            # receiver is instead the provider-native live turn state,
+            # observed per sender run under the payload write's own pane
+            # lease; only an exact IDLE admits the send, anything else leaves
+            # the rows PENDING, and DELIVERED still follows only the typed
+            # ACCEPTED.  Wake receipts stay best-effort evidence and never
+            # gate the row, so the wake-preparation path stays off here.
+            idle_bound_delivery = False
+        else:
+            status = status_monitor.get_status(terminal_id)
+            idle_bound_delivery = status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+            if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+                # Not ready on the normal path. Eager delivery (#251) lets providers
+                # that accept input mid-turn receive messages while PROCESSING or
+                # WAITING_USER_ANSWER; only in that case do we need the provider.
+                eager_eligible = False
+                if EAGER_INBOX_DELIVERY and status in (
+                    TerminalStatus.PROCESSING,
+                    TerminalStatus.WAITING_USER_ANSWER,
+                ):
+                    provider = provider_manager.get_provider(terminal_id)
+                    eager_eligible = provider is not None and getattr(
+                        provider, "accepts_input_while_processing", False
+                    )
+                if not eager_eligible:
+                    return
 
         # Claim each row before sending (#164). send_input() types into the tmux
         # pane; that output can re-enter deliver_pending, while independent
