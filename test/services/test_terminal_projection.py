@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional
 import pytest
 
 from cli_agent_orchestrator.clients import database
+from cli_agent_orchestrator.models.terminal import TerminalLifecycleState
 from cli_agent_orchestrator.services import terminal_projection as projection
 
 SOCKET = "/private/tmp/cao-projection.sock"
@@ -399,3 +400,20 @@ class TestSingleTerminalLookup:
 
         assert out["lifecycle_state"] == projection.LIFECYCLE_DEAD
         assert out["status"] == projection.LIFECYCLE_DEAD
+
+
+class TestLifecycleVocabularyDrift:
+    def test_the_projection_vocabulary_is_exactly_the_response_models(self):
+        """A lifecycle the projection emits but the model cannot admit.
+
+        ``Terminal.status`` declares exactly ``TerminalLifecycleState``'s
+        values at the response boundary; a projection-only addition would
+        fail response validation there, and an existing legacy terminal row
+        would read as a 404 again — the cond-0173 failure this guards.
+        """
+        assert {
+            projection.LIFECYCLE_LIVE,
+            projection.LIFECYCLE_SUPERSEDED,
+            projection.LIFECYCLE_DEAD,
+            projection.LIFECYCLE_UNKNOWN_LIVENESS,
+        } == {state.value for state in TerminalLifecycleState}
