@@ -1445,6 +1445,27 @@ def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:
             if "no such table" not in str(exc).lower():
                 raise
             row_v2 = None
+        legacy_terminal_present = (
+            db.query(database.TerminalModel.id)
+            .filter(database.TerminalModel.id == terminal_id)
+            .first()
+            is not None
+        )
+        try:
+            v2_terminal_present = (
+                db.query(database.ManagedLaunchV2TerminalModel.id)
+                .filter(database.ManagedLaunchV2TerminalModel.id == terminal_id)
+                .first()
+                is not None
+            )
+        except OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            v2_terminal_present = False
+        if legacy_terminal_present and v2_terminal_present:
+            raise ManagedLaunchConflict(
+                f"ambiguous managed terminal identity across protocol vintages: {terminal_id}"
+            )
         if row is not None and row_v2 is not None:
             raise ManagedLaunchConflict(
                 f"ambiguous managed terminal identity across protocol vintages: {terminal_id}"

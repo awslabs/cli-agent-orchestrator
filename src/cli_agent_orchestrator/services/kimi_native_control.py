@@ -155,11 +155,16 @@ KEYSTROKE_PLAN_SCHEMA = "cao-kimi-native-keystroke-plan-v1"
 
 #: What the pinned provider does to the composer image when it submits.
 #:
-#: Named and recorded rather than assumed away.  Kimi 0.29.0's
-#: ``submitValue()`` computes ``lines.join("\n").trim()`` *before* the
-#: model sees anything, so the composer image and the model's input are
-#: two different strings whenever the content has leading or trailing
-#: whitespace.  Both are recorded; neither is presented as the other.
+#: Named and recorded rather than assumed away.  The Kimi composer's
+#: ``submitValue()`` computes ``expandPasteMarkers(lines.join("\n")).trim()``
+#: *before* the model sees anything (verified identical in the 0.29.0,
+#: 0.29.1, and 0.29.2 bundles).  ``expandPasteMarkers`` only rewrites
+#: TUI-internal paste markers, and CAO's literal keystroke path creates
+#: none, so on CAO-typed content the expansion is the identity and the
+#: model-visible normalization is still join-LF-then-trim: the composer
+#: image and the model's input are two different strings whenever the
+#: content has leading or trailing whitespace.  Both are recorded;
+#: neither is presented as the other.
 #:
 #: Defeating this with sentinel or framing bytes is forbidden: it would
 #: put artifact bytes into model input to win an argument about
@@ -218,7 +223,9 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
         "evidence": (
             "dist/main.mjs declares tui.input.newLine defaultKeys "
             "['shift+enter', 'ctrl+j'] with tui.input.submit 'enter'; "
-            "submitValue() computes lines.join('\\n').trim(); "
+            "submitValue() computes expandPasteMarkers(lines.join('\\n')).trim() "
+            "(the paste-marker expansion is the identity on CAO's "
+            "marker-free keystroke input); "
             "PASTE_ENTER_SUPPRESS_WINDOW_MS = 120 and reset() clears it"
         ),
     },
@@ -240,8 +247,34 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
             "c9b81a7907c7d933e7e6a7d8ba53afac23dd0f5ab04) declares "
             "tui.input.newLine defaultKeys ['shift+enter', 'ctrl+j'] with "
             "tui.input.submit 'enter'; submitValue() computes "
-            "lines.join('\\n').trim(); PASTE_ENTER_SUPPRESS_WINDOW_MS = 120 "
+            "expandPasteMarkers(lines.join('\\n')).trim(); "
+            "PASTE_ENTER_SUPPRESS_WINDOW_MS = 120 "
             "— byte-identical to the 0.29.0 composer facts"
+        ),
+    },
+    # 0.29.2 is likewise a *separate* proven entry: read from the
+    # installed 0.29.2 bundle (main.mjs sha256
+    # 2ee6e2f15d68bffdce532d1c8e50f8d40e0230090b3a0dd1dbcdb7c29bf532db,
+    # matching the npm-published digest) and confirmed by the three-way
+    # 0.29.0/0.29.1/0.29.2 bundle comparison — the composer keybinds, the
+    # expandPasteMarkers(lines.join("\n")).trim() submit computation, the
+    # 120 ms paste-burst window, and the content-neutral reset are
+    # byte-identical across all three builds.  Same proven behaviour, so
+    # the same normalization identifier; no behavioral drift is claimed.
+    "0.29.2": {
+        "keystroke": "C-j",
+        "burst_reset_keystroke": "End",
+        "submit_settle_seconds": 0.25,
+        "normalization": NORMALIZATION_JOIN_LF_THEN_TRIM,
+        "evidence": (
+            "installed 0.29.2 dist/main.mjs (sha256 2ee6e2f15d68bffdce532"
+            "d1c8e50f8d40e0230090b3a0dd1dbcdb7c29bf532db, matches the "
+            "npm-published digest) declares tui.input.newLine defaultKeys "
+            "['shift+enter', 'ctrl+j'] with tui.input.submit 'enter'; "
+            "submitValue() computes expandPasteMarkers(lines.join('\\n')).trim(); "
+            "PASTE_ENTER_SUPPRESS_WINDOW_MS = 120 with content-neutral "
+            "reset — byte-identical to the 0.29.0/0.29.1 composer facts "
+            "(three-way bundle comparison)"
         ),
     },
 }
@@ -257,6 +290,9 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
 _PROVEN_STEER_CHORDS: dict[str, frozenset[str]] = {
     "0.29.0": frozenset({"C-s"}),
     "0.29.1": frozenset({"C-s"}),
+    # Key.ctrl("s") exists in the 0.29.2 bundle exactly as in 0.29.0/0.29.1
+    # (three-way comparison; sha256 keyed in _PROVEN_COMPOSER_NEWLINE).
+    "0.29.2": frozenset({"C-s"}),
 }
 
 

@@ -345,7 +345,8 @@ def mint_session(
         "provider": PROVIDER_KIMI,
         "native_session_id": session_id,
         "id_source": native_id_source(PROVIDER_KIMI),
-        # The exact version the pinned binary reports (0.29.0 or 0.29.1),
+        # The exact version the pinned binary reports (0.29.0, 0.29.1, or
+        # 0.29.2),
         # validated by _validate_binary above — not a pin constant that
         # could name the wrong one of several accepted builds.
         "provider_version": normalized_version(version_output),

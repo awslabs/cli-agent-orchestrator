@@ -1,9 +1,9 @@
 """The exact pinned argv for resuming a Kimi session into a native TUI.
 
-The installed Kimi Code resume option (0.29.0 and 0.29.1, verified
-byte-identical) is ``-S, --session [id]`` with an **optional** argument:
-given an id it resumes that session, and given *no* id it opens an
-interactive picker instead.
+The installed Kimi Code resume option (0.29.0, 0.29.1, and 0.29.2,
+verified byte-identical) is ``-S, --session [id]`` with an **optional**
+argument: given an id it resumes that session, and given *no* id it
+opens an interactive picker instead.
 
 That optionality is the hazard this module exists to remove.  A resume
 that loses its session id does not fail — it launches a picker, and

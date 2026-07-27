@@ -13,6 +13,7 @@ from cli_agent_orchestrator.clients.database import (
     Base,
     FlowModel,
     InboxModel,
+    ManagedLaunchV2TerminalModel,
     TerminalModel,
     backfill_terminal_identity_if_missing,
     create_flow,
@@ -688,8 +689,15 @@ class TestFlowOperations:
         mock_session.__exit__ = MagicMock(return_value=False)
         mock_session_class.return_value = mock_session
 
-        # Receiver terminal exists
-        mock_session.query.return_value.filter.return_value.first.return_value = MagicMock()
+        # Receiver terminal exists in the legacy table; the managed-v2
+        # surface has no row for this id, so this is a plain v1 admission.
+        v1_query = MagicMock()
+        v1_query.filter.return_value.first.return_value = MagicMock()
+        v2_query = MagicMock()
+        v2_query.filter.return_value.first.return_value = None
+        mock_session.query.side_effect = lambda model: (
+            v1_query if model is TerminalModel else v2_query
+        )
 
         # Setup mock to update message attributes on refresh
         def mock_refresh(msg):
@@ -718,8 +726,12 @@ class TestFlowOperations:
         mock_session.__exit__ = MagicMock(return_value=False)
         mock_session_class.return_value = mock_session
 
-        # Receiver terminal does not exist
-        mock_session.query.return_value.filter.return_value.first.return_value = None
+        # Receiver terminal exists in neither vintage surface (the second
+        # filter level is the live/non-superseded managed-v2 predicate).
+        missing_query = MagicMock()
+        missing_query.filter.return_value.first.return_value = None
+        missing_query.filter.return_value.filter.return_value.first.return_value = None
+        mock_session.query.side_effect = lambda model: missing_query
 
         with pytest.raises(ValueError, match="not found"):
             create_inbox_message("sender-123", "dead-terminal", "Hello")
@@ -1125,3 +1137,260 @@ class TestSessionEnvMigration:
         with sqlite3.connect(str(db_file)) as conn:
             rows = conn.execute("SELECT session_name, env_vars FROM session_env").fetchall()
         assert rows == [("cao-x", '{"A": "1"}')]
+
+
+def _seed_v2_terminal(
+    seed,
+    terminal_id,
+    *,
+    lifecycle_state="live",
+    superseded_by_terminal_id=None,
+    superseded_by_generation=None,
+    provider="kimi_cli",
+    generation="gen-v2-1",
+):
+    """Seed one managed-v2 terminal row in the exact lifecycle state under test."""
+    seed.add(
+        ManagedLaunchV2TerminalModel(
+            id=terminal_id,
+            tmux_session="cao-v2",
+            tmux_window="worker",
+            provider=provider,
+            generation=generation,
+            protocol_vintage="v2",
+            v2_lifecycle_state=lifecycle_state,
+            v2_superseded_by_terminal_id=superseded_by_terminal_id,
+            v2_superseded_by_generation=superseded_by_generation,
+        )
+    )
+
+
+class TestCrossVintageInboxEligibility:
+    """create_inbox_message admits exactly one current, live,
+    non-superseded managed-v2 identity and refuses everything else, while
+    legacy-v1 behavior stays byte-for-byte unchanged."""
+
+    def test_live_managed_v2_receiver_accepted_creates_pending_row(self, test_db):
+        with test_db() as seed:
+            _seed_v2_terminal(seed, "v2live01")
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = create_inbox_message("supervisor-1", "v2live01", "ordinary follow-up")
+
+            assert result.receiver_id == "v2live01"
+            assert result.status == MessageStatus.PENDING
+            # The v2 identity is NEVER copied into legacy ownership.
+            with test_db() as db:
+                assert db.query(TerminalModel).count() == 0
+
+    def test_legacy_v1_receiver_accepted_unchanged(self, test_db):
+        with test_db() as seed:
+            seed.add(
+                TerminalModel(
+                    id="term-v1", tmux_session="cao-s", tmux_window="w", provider="kiro_cli"
+                )
+            )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = create_inbox_message("sender-1", "term-v1", "hello")
+            assert result.status == MessageStatus.PENDING
+
+    def test_unknown_receiver_refused_zero_rows(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            with pytest.raises(ValueError, match="not found"):
+                create_inbox_message("sender-1", "no-such-terminal", "hello")
+            with test_db() as db:
+                assert db.query(InboxModel).count() == 0
+
+    def test_superseded_by_terminal_pointer_refused(self, test_db):
+        with test_db() as seed:
+            _seed_v2_terminal(seed, "v2sup01", superseded_by_terminal_id="v2new01")
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            with pytest.raises(ValueError, match="not found"):
+                create_inbox_message("sender-1", "v2sup01", "hello")
+            with test_db() as db:
+                assert db.query(InboxModel).count() == 0
+
+    def test_superseded_by_generation_pointer_refused(self, test_db):
+        with test_db() as seed:
+            _seed_v2_terminal(seed, "v2sup02", superseded_by_generation="gen-v2-2")
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            with pytest.raises(ValueError, match="not found"):
+                create_inbox_message("sender-1", "v2sup02", "hello")
+            with test_db() as db:
+                assert db.query(InboxModel).count() == 0
+
+    def test_null_lifecycle_state_refused(self, test_db):
+        """A registered-but-never-activated v2 row (state NULL) is not live."""
+        with test_db() as seed:
+            _seed_v2_terminal(seed, "v2null1", lifecycle_state=None)
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            with pytest.raises(ValueError, match="not found"):
+                create_inbox_message("sender-1", "v2null1", "hello")
+            with test_db() as db:
+                assert db.query(InboxModel).count() == 0
+
+    def test_non_live_lifecycle_state_refused(self, test_db):
+        with test_db() as seed:
+            _seed_v2_terminal(seed, "v2stale", lifecycle_state="stale")
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            with pytest.raises(ValueError, match="not found"):
+                create_inbox_message("sender-1", "v2stale", "hello")
+            with test_db() as db:
+                assert db.query(InboxModel).count() == 0
+
+    def test_collected_receiver_refused(self, test_db):
+        """Collection deletes the v2 row; a previously live receiver goes absent."""
+        with test_db() as seed:
+            _seed_v2_terminal(seed, "v2gone1")
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            first = create_inbox_message("sender-1", "v2gone1", "before collect")
+            assert first.status == MessageStatus.PENDING
+            with test_db() as db:
+                db.query(ManagedLaunchV2TerminalModel).filter(
+                    ManagedLaunchV2TerminalModel.id == "v2gone1"
+                ).delete()
+                db.commit()
+            with pytest.raises(ValueError, match="not found"):
+                create_inbox_message("sender-1", "v2gone1", "after collect")
+
+    def test_cross_vintage_ambiguous_refused(self, test_db):
+        """An id present in BOTH vintage tables refuses as ambiguous (mirrors
+        managed_control_identity's ManagedLaunchConflict), with zero rows."""
+        with test_db() as seed:
+            seed.add(
+                TerminalModel(id="dualid1", tmux_session="cao-s", tmux_window="w", provider="codex")
+            )
+            _seed_v2_terminal(seed, "dualid1", provider="codex")
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            with pytest.raises(ValueError, match="ambiguous"):
+                create_inbox_message("sender-1", "dualid1", "hello")
+            with test_db() as db:
+                assert db.query(InboxModel).count() == 0
+
+    def test_ambiguous_even_when_v2_row_not_live(self, test_db):
+        """Presence in both vintages is ambiguous regardless of v2 liveness."""
+        with test_db() as seed:
+            seed.add(
+                TerminalModel(id="dualid2", tmux_session="cao-s", tmux_window="w", provider="codex")
+            )
+            _seed_v2_terminal(
+                seed, "dualid2", provider="codex", superseded_by_terminal_id="dualid3"
+            )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            with pytest.raises(ValueError, match="ambiguous"):
+                create_inbox_message("sender-1", "dualid2", "hello")
+            with test_db() as db:
+                assert db.query(InboxModel).count() == 0
+
+
+class TestListPendingReceiverIdsOlderThanCrossVintage:
+    """The reconciliation sweep enumerates stale PENDING rows for
+    live managed-v2 receivers (server bounce cannot strand them) while dead
+    receivers of either vintage stay dropped."""
+
+    def _seed_pending(self, seed, receiver_id, *, age_seconds=120):
+        seed.add(
+            InboxModel(
+                sender_id="a",
+                receiver_id=receiver_id,
+                message="m",
+                status=MessageStatus.PENDING.value,
+                created_at=datetime.now() - timedelta(seconds=age_seconds),
+            )
+        )
+
+    def test_live_v2_receiver_enumerated(self, test_db):
+        with test_db() as seed:
+            _seed_v2_terminal(seed, "v2rcv01")
+            self._seed_pending(seed, "v2rcv01")
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            assert list_pending_receiver_ids_older_than(30) == ["v2rcv01"]
+
+    def test_superseded_v2_receiver_excluded(self, test_db):
+        with test_db() as seed:
+            _seed_v2_terminal(seed, "v2rcv02", superseded_by_terminal_id="v2rcv99")
+            self._seed_pending(seed, "v2rcv02")
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            assert list_pending_receiver_ids_older_than(30) == []
+
+    def test_non_live_v2_receiver_excluded(self, test_db):
+        with test_db() as seed:
+            _seed_v2_terminal(seed, "v2rcv03", lifecycle_state="stale")
+            self._seed_pending(seed, "v2rcv03")
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            assert list_pending_receiver_ids_older_than(30) == []
+
+    def test_distinct_union_of_v1_and_v2_branches(self, test_db):
+        with test_db() as seed:
+            seed.add(
+                TerminalModel(
+                    id="term-old", tmux_session="cao-s", tmux_window="w", provider="kiro_cli"
+                )
+            )
+            self._seed_pending(seed, "term-old")
+            self._seed_pending(seed, "term-old")
+            _seed_v2_terminal(seed, "v2rcv04")
+            self._seed_pending(seed, "v2rcv04")
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_pending_receiver_ids_older_than(30)
+
+        assert sorted(result) == ["term-old", "v2rcv04"]
+        assert len(result) == len(set(result))
+
+    def test_pre_v2_schema_v1_behavior_bit_identical(self):
+        """A schema with no v2 tables at all: the v2 surface reads as absent
+        (OperationalError guard) at BOTH query sites; v1 behavior is unchanged."""
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(
+            bind=engine, tables=[TerminalModel.__table__, InboxModel.__table__]
+        )
+        pre_v2_db = sessionmaker(bind=engine)
+        old = datetime.now() - timedelta(seconds=120)
+        with pre_v2_db() as seed:
+            seed.add(
+                TerminalModel(
+                    id="term-v1", tmux_session="cao-s", tmux_window="w", provider="kiro_cli"
+                )
+            )
+            seed.add(
+                InboxModel(
+                    sender_id="a",
+                    receiver_id="term-v1",
+                    message="m",
+                    status=MessageStatus.PENDING.value,
+                    created_at=old,
+                )
+            )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", pre_v2_db):
+            assert list_pending_receiver_ids_older_than(30) == ["term-v1"]
+            result = create_inbox_message("sender-1", "term-v1", "hello")
+            assert result.status == MessageStatus.PENDING
+            with pytest.raises(ValueError, match="not found"):
+                create_inbox_message("sender-1", "no-such-terminal", "hello")
