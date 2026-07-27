@@ -931,7 +931,9 @@ class TestV4Migration:
     def test_a_v3_journal_gains_the_columns_and_is_restamped(self, db_path):
         _v3_row(db_path, DELIVERED, chunks_sent=1, enter_attempted=1)
         assert set(V4_COLUMNS) <= _columns(db_path)
-        assert _meta_value(db_path, "journal_schema_version") == "4"
+        assert _meta_value(db_path, "journal_schema_version") == str(
+            CONTROL_INPUT_JOURNAL_SCHEMA_VERSION
+        )
 
     def test_the_migration_snapshots_the_pre_v4_journal_before_altering(self, db_path):
         _v3_row(db_path, DELIVERED, chunks_sent=1, enter_attempted=1)
@@ -1089,3 +1091,293 @@ class TestSubmissionObservationStorage:
         record = journal.mark_refused(REQ, reason_code=REASON_PANE_BUSY)
         assert record.submission_observed is None
         assert record.submission_evidence_ref is None
+
+
+# --- Schema v5: structured sequence events and per-event outcomes -------------
+
+SEQUENCE = [
+    {"type": "text", "text": "make it so, + \\"},
+    {"type": "key", "key": "Enter"},
+    {"type": "key", "key": "Escape"},
+    {"type": "chord", "chord": "C-s"},
+]
+
+
+def _tables(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+
+def _v5_snapshot_path(db_path):
+    return db_path.with_name(db_path.name + journal_module.V5_MIGRATION_SNAPSHOT_SUFFIX)
+
+
+def _v4_row(db_path, state, *, chunks_sent=None, enter_attempted=None):
+    """A journal written at the v4 shape — observation columns present, the
+    sequence table genuinely absent, and ``journal_meta`` stamped ``4`` —
+    so opening it exercises the v5 migration and its snapshot for real.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript("""
+            CREATE TABLE journal_meta (
+              k TEXT PRIMARY KEY, v TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE control_input_request (
+              request_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL,
+              pane_id TEXT NOT NULL, window_id TEXT NOT NULL,
+              pane_pid INTEGER NOT NULL, server_socket_path TEXT,
+              generation TEXT, request_sha256 TEXT NOT NULL,
+              state TEXT NOT NULL, reason_code TEXT,
+              chunks_sent INTEGER, enter_attempted INTEGER,
+              chord TEXT, chord_attempted INTEGER, chord_sent INTEGER,
+              submission_observed TEXT, submission_evidence_ref TEXT,
+              owner_pid INTEGER NOT NULL, owner_token TEXT NOT NULL,
+              opened_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE control_input_event (
+              event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+              request_id TEXT NOT NULL, from_state TEXT, to_state TEXT NOT NULL,
+              reason_code TEXT, evidence_digest TEXT, at TEXT NOT NULL
+            );
+            INSERT INTO journal_meta(k,v) VALUES ('journal_schema_version', '4');
+            """)
+        conn.execute(
+            "INSERT INTO control_input_request VALUES "
+            "(?,?,?,?,?,?,?,?,?,NULL,?,?,NULL,NULL,NULL,NULL,NULL,?,?,?,?)",
+            (
+                REQ,
+                TERMINAL,
+                PANE,
+                WINDOW,
+                PANE_PID,
+                SOCKET,
+                "gen-1",
+                _sha(),
+                state,
+                chunks_sent,
+                enter_attempted,
+                os.getpid(),
+                "v4-owner",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert "control_input_sequence_event" not in _tables(db_path), "the v4 fixture is not v4"
+    return ControlInputJournal(db_path)
+
+
+class TestV5Migration:
+    """The v4 -> v5 upgrade: a new structured table, snapshot first, idempotent."""
+
+    def test_a_fresh_journal_is_born_v5_and_takes_no_snapshot(self, db_path):
+        ControlInputJournal(db_path)
+        assert "control_input_sequence_event" in _tables(db_path)
+        assert _meta_value(db_path, "journal_schema_version") == "5"
+        assert not _v5_snapshot_path(db_path).exists()
+        assert not _snapshot_path(db_path).exists()
+
+    def test_a_v4_journal_gains_the_table_and_is_restamped(self, db_path):
+        _v4_row(db_path, DELIVERED, chunks_sent=1, enter_attempted=1)
+        assert "control_input_sequence_event" in _tables(db_path)
+        assert _meta_value(db_path, "journal_schema_version") == "5"
+
+    def test_the_migration_snapshots_the_pre_v5_journal_before_creating(self, db_path):
+        _v4_row(db_path, DELIVERED, chunks_sent=1, enter_attempted=1)
+        snapshot = _v5_snapshot_path(db_path)
+        assert snapshot.exists()
+        # The snapshot is the journal as it was before the table existed:
+        # v4 shape, v4 stamp, the sealed row intact.
+        assert "control_input_sequence_event" not in _tables(snapshot)
+        assert _meta_value(snapshot, "journal_schema_version") == "4"
+        conn = sqlite3.connect(snapshot)
+        try:
+            row = conn.execute(
+                "SELECT state, chunks_sent, enter_attempted FROM control_input_request "
+                "WHERE request_id=?",
+                (REQ,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row == (DELIVERED, 1, 1)
+
+    def test_an_existing_v5_snapshot_is_never_overwritten(self, db_path):
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        sentinel = _v5_snapshot_path(db_path)
+        sentinel.write_bytes(b"operator-preserved pre-v5 snapshot")
+        journal = _v4_row(db_path, DELIVERED)
+        assert journal.get(REQ).state == DELIVERED
+        assert sentinel.read_bytes() == b"operator-preserved pre-v5 snapshot"
+
+    def test_reopening_a_migrated_journal_takes_no_second_v5_snapshot(self, db_path):
+        _v4_row(db_path, DELIVERED)
+        snapshot = _v5_snapshot_path(db_path)
+        before = snapshot.stat().st_mtime_ns
+        ControlInputJournal(db_path)
+        ControlInputJournal(db_path)
+        assert snapshot.stat().st_mtime_ns == before
+
+    def test_a_v3_journal_migrates_through_both_steps(self, db_path):
+        _v3_row(db_path, DELIVERED, chunks_sent=1, enter_attempted=1)
+        assert set(V4_COLUMNS) <= _columns(db_path)
+        assert "control_input_sequence_event" in _tables(db_path)
+        assert _meta_value(db_path, "journal_schema_version") == "5"
+        assert _snapshot_path(db_path).exists()
+        assert _v5_snapshot_path(db_path).exists()
+
+    def test_a_pre_v5_row_carries_no_events(self, db_path):
+        """Sealed v1/v2 requests have no events, and none are invented."""
+        book = _v4_row(db_path, DELIVERED, chunks_sent=1, enter_attempted=1)
+        record = book.open_intent(_binding(server_socket_path=SOCKET))
+        assert record.state == DELIVERED
+        assert record.sequence_events is None
+        assert record.as_dict()["sequence_events"] is None
+
+
+class TestSequenceEventStorage:
+    """One sequence is one request row; its events are stored structured."""
+
+    def test_intent_stores_the_ordered_events_as_typed_rows(self, journal):
+        record = journal.open_intent(_binding(), sequence_events=SEQUENCE)
+        assert record.sequence_events is not None
+        assert [(e["ordinal"], e["type"], e["outcome"]) for e in record.sequence_events] == [
+            (0, "text", None),
+            (1, "key", None),
+            (2, "key", None),
+            (3, "chord", None),
+        ]
+        # Structured columns, never an escaped string: the payloads are
+        # queryable per event, byte for byte as requested.
+        assert record.sequence_events[0]["text"] == "make it so, + \\"
+        assert record.sequence_events[1]["key"] == "Enter"
+        assert record.sequence_events[2]["key"] == "Escape"
+        assert record.sequence_events[3]["chord"] == "C-s"
+        conn = sqlite3.connect(journal._path)
+        try:
+            rows = conn.execute(
+                "SELECT ordinal, type, text, key, chord, outcome "
+                "FROM control_input_sequence_event WHERE request_id=? ORDER BY ordinal",
+                (REQ,),
+            ).fetchall()
+        finally:
+            conn.close()
+        assert rows == [
+            (0, "text", "make it so, + \\", None, None, None),
+            (1, "key", None, "Enter", None, None),
+            (2, "key", None, "Escape", None, None),
+            (3, "chord", None, None, "C-s", None),
+        ]
+
+    def test_an_identical_re_arrival_never_duplicates_the_events(self, journal):
+        journal.open_intent(_binding(), sequence_events=SEQUENCE)
+        again = journal.open_intent(_binding(), sequence_events=SEQUENCE)
+        assert again.sequence_events is not None
+        assert len(again.sequence_events) == len(SEQUENCE)
+        assert [e["to_state"] for e in again.events] == [INTENT]
+
+    def test_delivery_records_every_event_sent_and_replays_verbatim(self, journal):
+        journal.open_intent(_binding(), sequence_events=SEQUENCE)
+        journal.claim_write(REQ)
+        outcomes = [(index, "sent") for index in range(len(SEQUENCE))]
+        record = journal.mark_delivered(
+            REQ, chunks_sent=1, enter_attempted=True, sequence_event_outcomes=outcomes
+        )
+        assert [e["outcome"] for e in record.sequence_events] == ["sent"] * 4
+        # The terminal stored-row replay: a fresh read returns the stored
+        # per-event results exactly, with nothing recomputed.
+        replayed = journal.get(REQ)
+        assert [dict(e) for e in replayed.sequence_events] == [
+            dict(e) for e in record.sequence_events
+        ]
+        assert replayed.as_dict()["sequence_events"][1] == {
+            "ordinal": 1,
+            "type": "key",
+            "key": "Enter",
+            "outcome": "sent",
+        }
+
+    def test_ambiguity_records_the_event_boundary(self, journal):
+        journal.open_intent(_binding(), sequence_events=SEQUENCE)
+        journal.claim_write(REQ)
+        record = journal.mark_ambiguous(
+            REQ,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            chunks_sent=1,
+            sequence_event_outcomes=[(0, "sent"), (1, "attempted"), (2, "skipped"), (3, "skipped")],
+        )
+        assert [e["outcome"] for e in record.sequence_events] == [
+            "sent",
+            "attempted",
+            "skipped",
+            "skipped",
+        ]
+        # An ambiguous record never gains new outcomes on a re-arrival.
+        again = journal.open_intent(_binding(), sequence_events=SEQUENCE)
+        assert [e["outcome"] for e in again.sequence_events] == [
+            "sent",
+            "attempted",
+            "skipped",
+            "skipped",
+        ]
+
+    def test_refusal_marks_every_event_refused_and_rearm_clears_them(self, journal):
+        journal.open_intent(_binding(), sequence_events=SEQUENCE)
+        record = journal.mark_refused(
+            REQ,
+            reason_code=REASON_PANE_BUSY,
+            sequence_event_outcomes=[(index, "refused") for index in range(len(SEQUENCE))],
+        )
+        assert [e["outcome"] for e in record.sequence_events] == ["refused"] * 4
+        # The refused -> intent re-arm clears the old attempt's evidence:
+        # NULL is "no outcome recorded yet", not a carried-forward refusal.
+        rearmed = journal.open_intent(_binding(), sequence_events=SEQUENCE)
+        assert rearmed.state == INTENT
+        assert [e["outcome"] for e in rearmed.sequence_events] == [None] * 4
+        # The re-attempt then delivers and replays its new outcomes.
+        journal.claim_write(REQ)
+        delivered = journal.mark_delivered(
+            REQ,
+            chunks_sent=1,
+            enter_attempted=True,
+            sequence_event_outcomes=[(index, "sent") for index in range(len(SEQUENCE))],
+        )
+        assert [e["outcome"] for e in delivered.sequence_events] == ["sent"] * 4
+
+    def test_an_unknown_event_outcome_is_refused_with_zero_mutation(self, journal):
+        journal.open_intent(_binding(), sequence_events=SEQUENCE)
+        journal.claim_write(REQ)
+        with pytest.raises(ControlInputJournalError):
+            journal.mark_delivered(REQ, sequence_event_outcomes=[(0, "maybe")])
+        record = journal.get(REQ)
+        assert record.state == WRITING
+        assert [e["outcome"] for e in record.sequence_events] == [None] * 4
+
+    def test_malformed_sequence_events_are_refused_at_intent(self, journal):
+        with pytest.raises(ValueError):
+            journal.open_intent(_binding(), sequence_events=[{"type": "text", "text": ""}])
+        assert journal.find(REQ) is None
+
+    def test_v1_and_v2_requests_have_no_sequence_events(self, journal):
+        journal.open_intent(_binding())
+        journal.claim_write(REQ)
+        record = journal.mark_delivered(REQ, chunks_sent=1, enter_attempted=True)
+        assert record.sequence_events is None
+
+    def test_a_swept_record_keeps_unrecorded_outcomes_null(self, journal, db_path):
+        """The crash window: a claimed sequence whose owner died records no
+        per-event outcomes, and the sweep never invents a boundary."""
+        journal.open_intent(_binding(), sequence_events=SEQUENCE)
+        journal.claim_write(REQ)
+        # A different owner instance sweeps with every owner provably dead.
+        resolved = ControlInputJournal(db_path).sweep_stranded(owner_alive=lambda pid: False)
+        assert [record.state for record in resolved] == [STATE_AMBIGUOUS]
+        record = journal.get(REQ)
+        assert record.state == STATE_AMBIGUOUS
+        assert [e["outcome"] for e in record.sequence_events] == [None] * 4

@@ -4,6 +4,14 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { X, Terminal as TermIcon } from 'lucide-react'
 import { api, type ApiError } from '../api'
+import {
+  applyKeyToRecording,
+  previewToken,
+  sequenceTextBytes,
+  MAX_SEQUENCE_EVENTS,
+  MAX_SEQUENCE_TEXT_BYTES,
+  type SequenceEvent,
+} from '../lib/sequenceRecorder'
 
 interface TerminalViewProps {
   terminalId: string
@@ -47,6 +55,10 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   const [effort, setEffort] = useState('')
   const [controlBusy, setControlBusy] = useState(false)
   const [controlStatus, setControlStatus] = useState('')
+  const [sequenceSupported, setSequenceSupported] = useState(false)
+  const [recording, setRecording] = useState(false)
+  const [recordedEvents, setRecordedEvents] = useState<SequenceEvent[]>([])
+  const [recordNotice, setRecordNotice] = useState('')
 
   useEffect(() => {
     managedRef.current = null
@@ -66,6 +78,12 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
                 && capabilities.literal_write === true
                 && capabilities.bracketed_paste === false
                 && capabilities.enter_required === true,
+              )
+              // The structured-sequence recorder is v3-only: a server that
+              // does not advertise it gets the literal bar alone, and the
+              // recorder's absence is stated rather than silently missing.
+              setSequenceSupported(
+                (capabilities.request_schema_versions ?? []).includes(3),
               )
               setNativeControlResolved(true)
             })
@@ -202,6 +220,132 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       } catch {
         setControlStatus(
           `${label}: response unavailable; control ${controlId} retained for reconciliation`,
+        )
+      }
+    } finally {
+      setControlBusy(false)
+    }
+  }
+
+  // --- Structured key-sequence recorder (cond-0175) ------------------------
+  //
+  // Record captures the ordered, representable events; the preview renders
+  // them readably; send submits the exact structured events through the
+  // arbiter with terminal/pane/process/generation re-proof (the same
+  // expected-identity re-fetch the literal send uses) and a fresh request
+  // id; cancel before send writes nothing — no request is ever sent on a
+  // discard.
+
+  const startRecording = () => {
+    setRecordedEvents([])
+    setRecordNotice('')
+    setRecording(true)
+  }
+
+  const stopRecording = () => {
+    setRecording(false)
+    setRecordNotice('')
+  }
+
+  const cancelRecording = () => {
+    // Discard is purely local: no request id is minted and nothing is
+    // sent, so a cancelled sequence provably wrote nothing.
+    setRecording(false)
+    setRecordedEvents([])
+    setRecordNotice('')
+    setControlStatus('sequence: cancelled — nothing was sent')
+  }
+
+  const onRecorderKeyDown = (event: React.KeyboardEvent) => {
+    // While recording, every key is the payload: none of them may reach
+    // the terminal, the page, or the browser's own bindings.
+    event.preventDefault()
+    event.stopPropagation()
+    const result = applyKeyToRecording(recordedEvents, {
+      key: event.key,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      altKey: event.altKey,
+    })
+    if (result.refused) {
+      setRecordNotice(result.refused)
+      return
+    }
+    setRecordNotice('')
+    setRecordedEvents(result.events)
+  }
+
+  const runNativeSequence = async (events: SequenceEvent[]) => {
+    const controlId = crypto.randomUUID()
+    setControlBusy(true)
+    setControlStatus(`sequence: submitting… (${controlId})`)
+    try {
+      const identity = await api.getControlIdentity(terminalId)
+      const expectedIdentity = Object.fromEntries(
+        [
+          'terminal_id',
+          'terminal_incarnation',
+          'terminal_generation',
+          'pane_birth_id',
+          'provider_process_id',
+          'provider',
+          'native_session_id',
+          'execution_mode',
+          'session_name',
+        ].map(key => [key, identity[key] ?? null]),
+      )
+      const response = await api.sendControlInput(terminalId, {
+        control_id: controlId,
+        events,
+        expected_identity: expectedIdentity,
+      })
+      const outcome = String(response.outcome || 'unknown')
+      const reason = response.reason_code || response.reason_detail
+      const perEvent = Array.isArray(response.events)
+        ? ` [${(response.events as Array<Record<string, unknown>>)
+            .map(entry => String(entry.outcome ?? '—'))
+            .join(', ')}]`
+        : ''
+      setControlStatus(
+        `sequence: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}${perEvent}`,
+      )
+      if (outcome === 'accepted') {
+        setRecording(false)
+        setRecordedEvents([])
+      }
+    } catch (error) {
+      const apiError = error as ApiError
+      if (apiError.status && CONTROL_UNSUPPORTED_STATUSES.has(apiError.status)) {
+        setControlStatus(
+          `sequence: unsupported (HTTP ${apiError.status})`
+          + (apiError.detail ? ` — ${apiError.detail}` : ''),
+        )
+        return
+      }
+      if (
+        apiError.status
+        && !CONTROL_AMBIGUOUS_STATUSES.has(apiError.status)
+        && apiError.status >= 400
+        && apiError.status < 500
+      ) {
+        setControlStatus(
+          `sequence: refused (HTTP ${apiError.status})`
+          + (apiError.detail ? ` — ${apiError.detail}` : ''),
+        )
+        return
+      }
+      // The response may have crossed the pane boundary before it was
+      // lost. Resolve by the exact control id; never re-send the events.
+      try {
+        const response = await api.queryControlInput(controlId)
+        const outcome = String(response.outcome || 'unknown')
+        const reason = response.reason_code || response.reason_detail
+        setControlStatus(
+          `sequence: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}`,
+        )
+      } catch {
+        setControlStatus(
+          `sequence: response unavailable; control ${controlId} retained for reconciliation`,
         )
       }
     } finally {
@@ -481,6 +625,79 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
             <span>Cancel, route, effort, and resume controls are unavailable for native TUI sessions.</span>
             <span className="min-w-0 truncate">{controlStatus}</span>
           </div>
+          {sequenceSupported && (
+            <div className="space-y-1 border-t border-gray-800 pt-2">
+              <div className="flex items-center gap-2">
+                {!recording ? (
+                  <button
+                    disabled={controlBusy}
+                    onClick={startRecording}
+                    className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
+                  >
+                    Record
+                  </button>
+                ) : (
+                  <button
+                    disabled={controlBusy}
+                    onClick={stopRecording}
+                    className="rounded bg-amber-700 px-3 py-1 text-xs text-white disabled:opacity-40"
+                  >
+                    Stop
+                  </button>
+                )}
+                {recording && (
+                  <div
+                    tabIndex={0}
+                    onKeyDown={onRecorderKeyDown}
+                    ref={element => element?.focus()}
+                    className="min-w-0 flex-1 rounded border border-amber-600/60 bg-gray-900 px-3 py-1 text-xs text-amber-200 focus:outline-none"
+                  >
+                    Recording — press keys now ({recordedEvents.length}/{MAX_SEQUENCE_EVENTS}{' '}
+                    events, {sequenceTextBytes(recordedEvents)}/{MAX_SEQUENCE_TEXT_BYTES} B)
+                  </div>
+                )}
+                {!recording && recordedEvents.length > 0 && (
+                  <div className="min-w-0 flex-1 truncate rounded border border-gray-700 bg-gray-900 px-3 py-1 font-mono text-xs text-gray-200">
+                    {recordedEvents.map((event, index) => (
+                      <span key={index} className="mr-2">
+                        {previewToken(event)}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <button
+                  disabled={controlBusy || recording || recordedEvents.length === 0}
+                  onClick={() => void runNativeSequence(recordedEvents)}
+                  className="rounded bg-emerald-700 px-3 py-1 text-xs text-white disabled:opacity-40"
+                >
+                  Send sequence
+                </button>
+                <button
+                  disabled={controlBusy || (!recording && recordedEvents.length === 0)}
+                  onClick={cancelRecording}
+                  className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
+                >
+                  Cancel
+                </button>
+              </div>
+              {recordNotice && (
+                <div className="text-[11px] text-amber-300">{recordNotice}</div>
+              )}
+              <div className="text-[10px] text-gray-600">
+                Records exact representable events only: Escape, Ctrl+C, Ctrl+S (steer chord),
+                Enter, Backspace, and printable text. Comma, plus, and backslash are ordinary
+                text. Terminal protocols cannot express arbitrary simultaneous physical-key
+                combinations; a combination this surface cannot represent is refused with a
+                message, never approximated. Cancel before send writes nothing.
+              </div>
+            </div>
+          )}
+          {nativeControlResolved && !sequenceSupported && (
+            <div className="text-[10px] text-gray-600">
+              Sequence recording needs control-input schema v3; this server offers the literal
+              control only.
+            </div>
+          )}
         </div>
       )}
       {nativeManaged && nativeControlResolved && !nativeControlSupported && (

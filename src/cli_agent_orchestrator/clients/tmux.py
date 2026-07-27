@@ -14,6 +14,7 @@ import libtmux
 
 from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
 from cli_agent_orchestrator.services.control_input_contract import (
+    SEQUENCE_KEY_NAMES,
     contains_bracketed_paste_sentinel,
     is_valid_pane_id,
     normalize_server_identity,
@@ -26,6 +27,17 @@ from cli_agent_orchestrator.utils.path_validation import (
 from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 
 logger = logging.getLogger(__name__)
+
+# Wire key names whose tmux ``send-keys`` name differs from the contract's
+# normalized name, translated at the argv and nowhere else.  The wire name
+# is the contract (it matches ``KeyboardEvent.key`` in the browser and is
+# what the digest binds), so it is never renamed upstream of this sink.
+# The translation exists because ``send-keys`` without ``-l`` does not
+# error on a name it does not know: it falls back to sending the argument
+# as literal bytes, so the wire's ``Backspace`` would type the nine
+# characters "Backspace" into the composer.  tmux's name for the erase
+# key is ``BSpace``; names absent from this table are already tmux's.
+_TMUX_SEQUENCE_KEY_NAMES = {"Backspace": "BSpace"}
 
 _TMUX_BINARY: Optional[str] = None
 
@@ -1423,6 +1435,77 @@ class TmuxClient:
 
         self._run_literal_write(
             [tmux_binary(), "send-keys", "-t", pane_id, key],
+            chunks_sent=0,
+            enter_attempted=False,
+            deadline_monotonic=deadline_monotonic,
+        )
+
+    def send_sequence_key(
+        self,
+        pane_id: str,
+        key: str,
+        *,
+        expected_server_identity: Optional[str],
+        deadline_monotonic: Optional[float] = None,
+    ) -> None:
+        """Send one named v3 sequence key to a pane on the bound server.
+
+        The keystroke primitive for schema-v3 structured sequences
+        (cond-0175): one event, one named key, from the contract's
+        normalized name set (:data:`SEQUENCE_KEY_NAMES` — ``Escape``,
+        ``C-c``, ``C-s``, ``Enter``, ``Backspace``).  The set is the sink's
+        own bound: ``send-keys`` without ``-l`` interprets its argument as
+        key names, so an unrestricted parameter here would let a caller
+        deliver arbitrary keystrokes through the structured path.  The
+        names are the wire contract's, not tmux's: where the two differ
+        (:data:`_TMUX_SEQUENCE_KEY_NAMES` — the wire's ``Backspace`` is
+        tmux's ``BSpace``) the tmux name is substituted into the argv,
+        because ``send-keys`` never errors on an unrecognized name — it
+        sends the argument as literal bytes, which would type the name
+        itself into the composer.  What a key *means* to one provider
+        build is the caller's fact, pinned at the service layer; this
+        primitive guarantees only that the named key reaches the named
+        pane on the named server, or raises.
+
+        Same server-identity proof as the literal write, for the same
+        reason and at the same distance from the first byte: a sequence
+        keystroke aimed at ``%3`` on the wrong tmux server lands in a
+        stranger's composer exactly as a literal write would.
+
+        Raises:
+            ValueError: The pane id or key name is not permitted here.
+                Nothing is written.
+            TmuxServerIdentityError: The pane could not be proven to be on
+                the bound tmux server.  Nothing is written.
+            TmuxLiteralSendError: tmux rejected the keystroke.
+        """
+        if not is_valid_pane_id(pane_id):
+            raise ValueError(f"Invalid pane_id: {pane_id!r}")
+        if key not in SEQUENCE_KEY_NAMES:
+            raise ValueError(
+                f"{key!r} is not a sequence key; permitted keys are "
+                f"{sorted(SEQUENCE_KEY_NAMES)}. The normalized set is the wire contract, "
+                "so an unnamed key or modifier combination is refused here rather than "
+                "approximated into keystrokes nobody asked for"
+            )
+
+        logger.info("send_sequence_key: %s - key: %s", pane_id, key)
+
+        observed_server = self.observe_pane_server_identity(
+            pane_id, deadline_monotonic=deadline_monotonic
+        )
+        refusal = server_identity_refusal(bound=expected_server_identity, observed=observed_server)
+        if refusal is not None:
+            reason_code, detail = refusal
+            raise TmuxServerIdentityError(
+                f"refusing a sequence keystroke to pane {pane_id}: {detail}",
+                reason_code=reason_code,
+                bound=normalize_server_identity(expected_server_identity),
+                observed=observed_server,
+            )
+
+        self._run_literal_write(
+            [tmux_binary(), "send-keys", "-t", pane_id, _TMUX_SEQUENCE_KEY_NAMES.get(key, key)],
             chunks_sent=0,
             enter_attempted=False,
             deadline_monotonic=deadline_monotonic,

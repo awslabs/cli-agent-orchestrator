@@ -215,6 +215,13 @@ export const api = {
       literal_write: boolean
       bracketed_paste: boolean
       enter_required: boolean
+      request_schema_versions?: number[]
+      sequence?: {
+        event_types: string[]
+        keys: string[]
+        max_events: number
+        max_text_bytes: number
+      }
     }>('/control-input/capabilities'),
   getControlIdentity: (id: string) =>
     fetchJSON<Record<string, unknown>>(`/terminals/${id}/control-identity`),
@@ -222,8 +229,11 @@ export const api = {
     id: string,
     body: {
       control_id: string
-      text: string
-      enter: boolean
+      text?: string
+      enter?: boolean
+      // v3 structured sequences: the request carries events OR the v1/v2
+      // fields, never both.
+      events?: Array<{ type: string; text?: string; key?: string; chord?: string }>
       expected_identity: Record<string, unknown>
     }
   ) =>

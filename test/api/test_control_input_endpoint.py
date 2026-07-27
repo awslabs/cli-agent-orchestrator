@@ -301,18 +301,24 @@ class TestV2ChordDiscovery:
 
     def test_the_capability_document_advertises_v2_and_the_chord_allowlist(self, client):
         body = client.get("/control-input/capabilities").json()
-        # v1 stays the named default; v2 is advertised alongside it.
+        # v1 stays the named default; v2 and v3 are advertised alongside it.
         assert body["request_schema_version"] == CONTROL_INPUT_REQUEST_SCHEMA_VERSION
-        assert body["request_schema_versions"] == [1, 2]
+        assert body["request_schema_versions"] == [1, 2, 3]
         assert body["digest_domain"] == CONTROL_INPUT_DIGEST_DOMAIN
         # The steer-chord allowlist is truthful: only the pinned Kimi chord.
         assert body["steer_chords"] == {"kimi_cli": ["C-s"]}
+        # The v3 sequence surface states its exact representable forms.
+        assert body["sequence"]["event_types"] == ["chord", "key", "text"]
+        assert body["sequence"]["keys"] == ["Backspace", "C-c", "C-s", "Enter", "Escape"]
+        assert body["sequence"]["max_events"] == 32
+        assert body["sequence"]["max_text_bytes"] == 512
 
     def test_the_identity_route_advertises_the_control_input_block(self, client, tmux):
         body = client.get(f"/terminals/{TERMINAL}/control-identity").json()
         block = body["control_input"]
-        assert block["schema_versions"] == [1, 2]
+        assert block["schema_versions"] == [1, 2, 3]
         assert block["chords"] == {"kimi_cli": ["C-s"]}
+        assert block["sequence"]["keys"] == ["Backspace", "C-c", "C-s", "Enter", "Escape"]
 
     def test_the_identity_route_block_is_absent_on_an_unknown_terminal(self, client, tmux):
         # No body to inspect on a 404; the block is only on a resolved terminal.
@@ -385,6 +391,45 @@ class TestSendingAControl:
         body = _post(client, text=f"{BRACKETED_PASTE_START}/compact").json()
         assert body["outcome"] == REFUSED
         assert body["reason_code"] == REASON_ILLEGAL_CONTROL_BYTES
+        assert tmux.writes == []
+
+
+class TestEnterStatedAsNull:
+    """An explicit ``"enter": null`` is not the omitted field.
+
+    Pydantic parses an omission and an explicit null to the same ``None``,
+    but they are different requests on the v1/v2 wire: the omission carries
+    the v1 default (submit), while the explicit null failed validation at
+    F1 — ``enter`` was a non-Optional bool — and keeps failing rather than
+    silently becoming ``enter=true``.  Raw field presence, consulted at
+    the edge, is what still tells the two apart.
+    """
+
+    def test_an_explicit_null_enter_is_a_validation_error(self, client, tmux):
+        response = _post(client, enter=None)
+        assert response.status_code == 422
+        assert "enter" in response.json()["detail"]
+        assert tmux.writes == []
+
+    def test_an_omitted_enter_keeps_the_v1_default(self, client, tmux):
+        body = _post(client).json()
+        assert body["outcome"] == ACCEPTED
+        assert body["enter_sent"] is True
+        assert tmux.writes[0]["submit"] is True
+
+    def test_a_stated_null_enter_beside_events_is_refused(self, client, tmux):
+        # The v3 either/or rule stays strict on stated fields: a nulled
+        # ``enter`` beside ``events`` is a stated v1/v2 field, refused as
+        # ambiguous intent rather than resolved by precedence.
+        response = client.post(
+            f"/terminals/{TERMINAL}/control-input",
+            json={
+                "control_id": CONTROL,
+                "events": [{"type": "key", "key": "Escape"}],
+                "enter": None,
+            },
+        )
+        assert response.status_code == 422
         assert tmux.writes == []
 
 

@@ -478,11 +478,18 @@ class ControlInputRequest(BaseModel):
     """
 
     control_id: str
-    text: str
+    # v1/v2 payload fields.  Optional at parse time because a v3 request
+    # carries ``events`` instead; the service enforces the either/or rule
+    # and the non-empty-text requirement for v1/v2, so a missing field is
+    # a typed answer rather than an untyped pydantic failure.
+    text: Optional[str] = None
     # Stated, never inferred from the text.  Submitting is the
     # irreversible half of a control, and a default that guessed would
-    # make the caller's intent unreadable from the request.
-    enter: bool = True
+    # make the caller's intent unreadable from the request.  An omitted
+    # field keeps the v1 wire default (submit) for v1/v2 requests; an
+    # explicit JSON null is a stated non-boolean and fails validation
+    # (see ``_stated_enter``), as it did at F1.
+    enter: Optional[bool] = None
     expected_identity: Optional[Dict[str, Any]] = None
     request_digest: Optional[str] = None
     protocol: Optional[str] = None
@@ -492,6 +499,13 @@ class ControlInputRequest(BaseModel):
     # otherwise drop it and a v2 request would silently deliver as v1
     # text-without-chord.  ``None`` is v1; a non-empty string is v2.
     chord: Optional[str] = None
+    # v3 only: an ordered array of structured events
+    # (``{"type":"text","text":...}``, ``{"type":"key","key":...}``,
+    # ``{"type":"chord","chord":...}``) delivered as one at-most-once
+    # control.  Declared for the same reason ``chord`` is: an old server's
+    # parser must never silently drop a v3 payload and deliver the request
+    # as something else.  Never combined with the v1/v2 fields.
+    events: Optional[List[Dict[str, Any]]] = None
     # Bounded on purpose.  An unbounded wait converts a truthful
     # "the pane is busy, nothing was written, try again" into a request
     # that may never answer.
@@ -2835,6 +2849,25 @@ async def get_terminal_control_identity(
     return body
 
 
+def _stated_enter(body: ControlInputRequest) -> Any:
+    """The ``enter`` argument for the service, with one JSON distinction restored.
+
+    Pydantic parses an omitted ``enter`` and an explicit ``"enter": null``
+    to the same ``None``, but they are different requests on the v1/v2
+    wire: the omission carries the v1 default (submit), while the explicit
+    null failed validation at F1 (``enter`` was a non-Optional bool) and
+    must keep failing rather than silently becoming ``enter=true``.  Raw
+    field presence is the only place the two can still be told apart, so
+    the edge translates the stated-null case to a marker the service
+    refuses as a shape error.  Beside ``events`` a stated ``enter`` — null
+    included — is handed through the same marker, so the v3 either/or rule
+    refuses it as the ambiguous intent it is.
+    """
+    if body.enter is None and "enter" in body.model_fields_set:
+        return control_input_service.ENTER_EXPLICIT_NULL
+    return body.enter
+
+
 @app.post("/terminals/{terminal_id}/control-input")
 async def send_terminal_control_input(
     terminal_id: TerminalId,
@@ -2856,11 +2889,12 @@ async def send_terminal_control_input(
                 terminal_id,
                 control_id=body.control_id,
                 text=body.text,
-                enter=body.enter,
+                enter=_stated_enter(body),
                 expected_identity=body.expected_identity,
                 request_digest=body.request_digest,
                 protocol=body.protocol,
                 chord=body.chord,
+                events=body.events,
                 lease_timeout=body.lease_timeout,
             )
         )
