@@ -910,6 +910,100 @@ def _mark_v2_resource_created(
     )
 
 
+def _retire_reused_tmux_observation(
+    entry_id: str,
+    identity: dict[str, Any],
+) -> None:
+    """Free a tmux id whose previous registered window is provably absent.
+
+    Tmux assigns ``@N`` ids only within one server lifetime.  After the
+    server restarts it can reuse an id while the durable resource registry
+    still remembers the old generation.  The uniqueness index must remain
+    authoritative, so reuse is accepted only after one readable pane
+    inventory proves both sides of the handoff: the newly created window
+    owns the observed id and every previous registered owner name is absent.
+    """
+    from cli_agent_orchestrator.services import resource_registry as rr
+
+    observed_id = identity.get("window_id")
+    pane_id = identity.get("pane_id")
+    if not observed_id or not pane_id:
+        return
+
+    registry = rr.get_resource_registry()
+    conflicts = [
+        resource
+        for resource in registry.enumerate(
+            lifecycle_states=("created", "active", "draining", "closed")
+        )
+        if resource["kind"] == "tmux_window"
+        and resource.get("observed_tmux_id") == observed_id
+        and resource["entry_id"] != entry_id
+    ]
+    if not conflicts:
+        return
+
+    panes = get_backend().observe_pane_identities()
+    if panes is None:
+        raise rr.RegistryConflict(
+            f"tmux id {observed_id} is already registered and the live server "
+            "inventory is unreadable"
+        )
+    current = panes.get(str(pane_id))
+    expected_fields = {
+        "pane_id": str(pane_id),
+        "window_id": str(observed_id),
+        "window_name": entry_id,
+    }
+    for field in ("session_id", "server_socket_path", "pane_pid"):
+        if identity.get(field) is not None:
+            expected_fields[field] = str(identity[field])
+    if current is None or any(
+        str(current.get(field)) != value for field, value in expected_fields.items()
+    ):
+        raise rr.RegistryConflict(
+            f"tmux id {observed_id} is already registered and does not resolve "
+            "to the newly created exact window identity"
+        )
+
+    live_names = {
+        str(record.get("window_name"))
+        for record in panes.values()
+        if record.get("window_name") is not None
+    }
+    stale_names = {str(resource["desired_tmux_name"]) for resource in conflicts}
+    still_live = sorted(stale_names & live_names)
+    if still_live:
+        raise rr.RegistryConflict(
+            "tmux id reuse cannot retire registered windows still present in "
+            f"the readable server inventory: {', '.join(still_live)}"
+        )
+
+    absence = rr.receipt_digest(
+        {
+            "domain": "tmux-observed-id-reuse-v1",
+            "observed_tmux_id": observed_id,
+            "new_entry_id": entry_id,
+            "new_identity": expected_fields,
+            "absent_entry_ids": sorted(resource["entry_id"] for resource in conflicts),
+            "inventory_pane_ids": sorted(panes),
+        }
+    )
+    actor = "terminal_service.create_terminal.reconcile_tmux_id_reuse"
+    for resource in conflicts:
+        state = resource["lifecycle_state"]
+        if state in ("created", "active"):
+            registry.drain(resource["entry_id"], actor_id=actor)
+            state = "draining"
+        if state == "draining":
+            registry.close(resource["entry_id"], actor_id=actor)
+        registry.delete(
+            resource["entry_id"],
+            actor_id=actor,
+            verified_absence_digest=absence,
+        )
+
+
 def _mark_existing_v2_fs_artifacts(terminal_id: str) -> None:
     """Mark fs-backed v2 entries created iff the artifact is really present."""
     actor = "terminal_service.create_terminal"
@@ -1436,6 +1530,7 @@ async def create_terminal(
                 raise ValueError("v2 terminal persistence requires the exact generation")
             # The window now physically exists: record the OBSERVED creation
             # (never before, never for an absent identity).
+            _retire_reused_tmux_observation(window_name, identity)
             _mark_v2_resource_created(
                 window_name,
                 actor_id="terminal_service.create_terminal",
