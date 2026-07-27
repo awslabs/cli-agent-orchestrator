@@ -111,13 +111,28 @@ class FakeTmux:
         self.writes = []
         self._guard = threading.Lock()
 
-    def pane_control_identity(self, *, pane_id=None, session_name=None, window_name=None):
+    def pane_control_identity(
+        self,
+        *,
+        pane_id=None,
+        session_name=None,
+        window_name=None,
+        deadline_monotonic=None,
+    ):
         if len(self._identities) > 1:
             return self._identities.pop(0)
         return self._identities[0]
 
     # Keyword-only and undefaulted, mirroring the real primitive.
-    def send_literal_line(self, pane_id, text, submit=True, *, expected_server_identity):
+    def send_literal_line(
+        self,
+        pane_id,
+        text,
+        submit=True,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
         if self.on_write is not None:
             self.on_write()
         with self._guard:
@@ -274,6 +289,31 @@ class TestCapabilityAdvertisement:
         body = client.get("/control-input/capabilities").json()
         assert "max_text_bytes" in body
         assert "outcome" not in body
+
+
+class TestV2ChordDiscovery:
+    """A conductor that needs v2 reads support before sending a chord, because
+    a v2 request against a v1 server would otherwise be silently delivered as
+    text without the chord (pydantic ignores unknown fields)."""
+
+    def test_the_capability_document_advertises_v2_and_the_chord_allowlist(self, client):
+        body = client.get("/control-input/capabilities").json()
+        # v1 stays the named default; v2 is advertised alongside it.
+        assert body["request_schema_version"] == CONTROL_INPUT_REQUEST_SCHEMA_VERSION
+        assert body["request_schema_versions"] == [1, 2]
+        assert body["digest_domain"] == CONTROL_INPUT_DIGEST_DOMAIN
+        # The steer-chord allowlist is truthful: only the pinned Kimi chord.
+        assert body["steer_chords"] == {"kimi_cli": ["C-s"]}
+
+    def test_the_identity_route_advertises_the_control_input_block(self, client, tmux):
+        body = client.get(f"/terminals/{TERMINAL}/control-identity").json()
+        block = body["control_input"]
+        assert block["schema_versions"] == [1, 2]
+        assert block["chords"] == {"kimi_cli": ["C-s"]}
+
+    def test_the_identity_route_block_is_absent_on_an_unknown_terminal(self, client, tmux):
+        # No body to inspect on a 404; the block is only on a resolved terminal.
+        assert client.get(f"/terminals/{UNKNOWN_TERMINAL}/control-identity").status_code == 404
 
 
 class TestSendingAControl:

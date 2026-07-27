@@ -137,11 +137,28 @@ class TerminalBackend(ABC):
         ...
 
     @abstractmethod
-    def window_exists(self, session_name: str, window_name: str) -> bool:
-        """Return whether the exact window exists, raising on lookup failure."""
+    def window_exists(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        """Return whether the exact window exists, raising on lookup failure.
+
+        ``deadline_monotonic`` is optional so ordinary lifecycle callers keep
+        their existing behavior.  Identity-bound control paths supply it and
+        implementations must not outlive that absolute deadline.
+        """
         ...
 
-    def window_identity(self, session_name: str, window_name: str) -> Optional[Dict[str, str]]:
+    def window_identity(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Optional[Dict[str, str]]:
         """Server-owned immutable tmux identity (pane_id/window_id) of a
         window, or None when the backend cannot resolve one."""
         return None

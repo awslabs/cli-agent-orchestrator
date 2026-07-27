@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import time
 from typing import Any, Mapping, Optional, Sequence
 
 import pytest
@@ -124,6 +125,14 @@ def _observation(
 
 def _expected_argv(path: str) -> list[str]:
     return [path, native_tui_launch.kimi_native_launch.RESUME_OPTION, SESSION]
+
+
+def _pinned_wrapper(tmp_path: Any, shebang: bytes) -> tuple[str, str]:
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_bytes(shebang + b"exit 0\n")
+    wrapper.chmod(0o755)
+    path = os.path.realpath(str(wrapper))
+    return path, hashlib.sha256(wrapper.read_bytes()).hexdigest()
 
 
 def _start(pinned: tuple[str, str], transport: Any, **overrides: Any) -> dict[str, Any]:
@@ -261,6 +270,153 @@ def test_launch_waits_for_the_same_wrapper_process_to_exec_the_inner_binary(
     assert result["pane_observation"]["argv"][0] == inner_path
     assert pane.observe_calls == 2
     assert native_attachment.get(PROVIDER, SESSION)["state"] == native_attachment.ATTACHED
+
+
+def test_launch_waits_for_an_env_shebang_wrapper_to_exec_the_inner_binary(
+    isolated_memory_db: Any,
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    pinned = _pinned_wrapper(tmp_path, b"#!/usr/bin/env python3\n")
+    wrapper, _ = pinned
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"inner")
+    inner.chmod(0o755)
+    inner_path = os.path.realpath(str(inner))
+    pane = SequencedPane(
+        [
+            _observation(
+                [
+                    native_tui_launch.ENV_EXECUTABLE,
+                    "python3",
+                    wrapper,
+                    "--session",
+                    SESSION,
+                ]
+            ),
+            _observation([inner_path, "--session", SESSION]),
+        ]
+    )
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+
+    result = _start(pinned, pane, expected_inner_executable=inner_path)
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert result["pane_observation"]["argv"][0] == inner_path
+    assert pane.observe_calls == 2
+
+
+@pytest.mark.parametrize(
+    ("shebang", "observed_prefix"),
+    [
+        (b"#!/usr/bin/env python3\n", [native_tui_launch.ENV_EXECUTABLE, "python3.13"]),
+        (b"#!/usr/bin/env -S python3\n", [native_tui_launch.ENV_EXECUTABLE, "python3"]),
+        (b"#!/usr/bin/env python3 -u\n", [native_tui_launch.ENV_EXECUTABLE, "python3"]),
+        (b"not-a-shebang\n", [native_tui_launch.ENV_EXECUTABLE, "python3"]),
+        (
+            b"#!" + b"x" * (native_tui_launch.MAX_SHEBANG_LINE_BYTES + 1),
+            [native_tui_launch.ENV_EXECUTABLE, "python3"],
+        ),
+    ],
+)
+def test_env_shebang_transient_refuses_unpinned_interpreter_forms(
+    isolated_memory_db: Any,
+    tmp_path: Any,
+    shebang: bytes,
+    observed_prefix: list[str],
+) -> None:
+    pinned = _pinned_wrapper(tmp_path, shebang)
+    wrapper, _ = pinned
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"inner")
+    inner.chmod(0o755)
+    pane = FakePane(observation=_observation([*observed_prefix, wrapper, "--session", SESSION]))
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(
+            pinned,
+            pane,
+            expected_inner_executable=os.path.realpath(str(inner)),
+        )
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH)
+
+
+def test_bare_env_dash_s_is_not_an_interpreter_token(tmp_path: Any) -> None:
+    wrapper, _ = _pinned_wrapper(tmp_path, b"#!/usr/bin/env -S\n")
+    assert native_tui_launch._env_shebang_interpreter(wrapper) is None
+
+
+@pytest.mark.parametrize(
+    "observed_argv",
+    [
+        [native_tui_launch.ENV_EXECUTABLE, "python3", "/tmp/not-the-wrapper", "--session", SESSION],
+        [
+            native_tui_launch.ENV_EXECUTABLE,
+            "python3",
+            "{wrapper}",
+            "--session",
+            SESSION,
+            "--wrong-tail",
+        ],
+    ],
+)
+def test_env_shebang_transient_refuses_wrong_wrapper_or_tail(
+    isolated_memory_db: Any,
+    tmp_path: Any,
+    observed_argv: list[str],
+) -> None:
+    pinned = _pinned_wrapper(tmp_path, b"#!/usr/bin/env python3\n")
+    wrapper, _ = pinned
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"inner")
+    inner.chmod(0o755)
+    argv = [wrapper if value == "{wrapper}" else value for value in observed_argv]
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(
+            pinned,
+            FakePane(observation=_observation(argv)),
+            expected_inner_executable=os.path.realpath(str(inner)),
+        )
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH)
+
+
+def test_env_shebang_transient_requires_the_canonical_env_binary(
+    isolated_memory_db: Any,
+    tmp_path: Any,
+) -> None:
+    pinned = _pinned_wrapper(tmp_path, b"#!/usr/bin/env python3\n")
+    wrapper, _ = pinned
+    fake_env = tmp_path / "env"
+    fake_env.write_bytes(b"env")
+    fake_env.chmod(0o755)
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"inner")
+    inner.chmod(0o755)
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(
+            pinned,
+            FakePane(
+                observation=_observation(
+                    [
+                        os.path.realpath(str(fake_env)),
+                        "python3",
+                        wrapper,
+                        "--session",
+                        SESSION,
+                    ]
+                )
+            ),
+            expected_inner_executable=os.path.realpath(str(inner)),
+        )
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH)
 
 
 def test_inner_exec_convergence_refuses_a_replaced_process_identity(
@@ -713,10 +869,24 @@ class FakeBackend:
         self.calls.append((session_name, window_name, terminal_id, tuple(argv)))
         return window_name
 
-    def window_identity(self, session_name: str, window_name: str) -> Any:
+    def window_identity(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Any:
+        self.identity_deadline = deadline_monotonic
         return self.identity
 
-    def window_exists(self, session_name: str, window_name: str) -> bool:
+    def window_exists(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        self.exists_deadline = deadline_monotonic
         return self.exists
 
 
@@ -778,6 +948,38 @@ def test_tmux_transport_splits_the_observed_command_line(
         "argv": ["/bin/kimi", "--session", SESSION],
         "cwd": "/private/tmp/w",
     }
+
+
+def test_tmux_transport_threads_one_deadline_through_the_whole_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeBackend(identity={"pane_id": "%3"}, exists=True)
+    pane = _pane(backend)
+    deadline = time.monotonic() + 1.0
+    observed_deadlines: list[float] = []
+
+    def _pane_pid(*, deadline_monotonic: float) -> int:
+        observed_deadlines.append(deadline_monotonic)
+        return 777
+
+    def _process_field(pid: int, field: str, *, deadline_monotonic: float) -> str:
+        observed_deadlines.append(deadline_monotonic)
+        if field == "lstart=":
+            return "Thu Jul 24 10:00:00 2026"
+        return f"/bin/kimi --session {SESSION}"
+
+    def _process_cwd(pid: int, *, deadline_monotonic: float) -> str:
+        observed_deadlines.append(deadline_monotonic)
+        return "/private/tmp/w"
+
+    monkeypatch.setattr(pane, "_pane_pid", _pane_pid)
+    monkeypatch.setattr(native_tui_launch, "_process_field", _process_field)
+    monkeypatch.setattr(native_tui_launch, "_process_cwd", _process_cwd)
+
+    pane.observe(deadline_monotonic=deadline)
+
+    assert backend.identity_deadline == deadline
+    assert observed_deadlines == [deadline, deadline, deadline, deadline]
 
 
 def test_tmux_transport_raises_when_the_pane_cwd_is_unreadable(

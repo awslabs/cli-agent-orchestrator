@@ -162,6 +162,15 @@ FIFO_DIR.mkdir(parents=True, exist_ok=True)
 COMPANION_DIR = CAO_HOME_DIR / "companion"
 COMPANION_DIR.mkdir(parents=True, exist_ok=True)
 
+# Durable unmanaged wake-receipt sidecars (cao-unmanaged-wake-receipt-v1):
+# one JSON record per (terminal_id, message_id), the truthful wake evidence
+# for an unmanaged idle receiver whose paste may not have started a turn.
+# Distinct from COMPANION_DIR: companion receipts are provider-native and
+# generation-bound; wake receipts are status-transition evidence keyed by
+# message id, recorded by the InboxService wake watcher.
+WAKE_RECEIPT_DIR = CAO_HOME_DIR / "wake-receipts"
+WAKE_RECEIPT_DIR.mkdir(parents=True, exist_ok=True)
+
 # =============================================================================
 # Event-Driven State Detection Configuration
 # =============================================================================

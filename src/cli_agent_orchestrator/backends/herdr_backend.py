@@ -391,8 +391,18 @@ class HerdrBackend(TerminalBackend):
             return True
         return False
 
-    def window_exists(self, session_name: str, window_name: str) -> bool:
+    def window_exists(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
         """Check the exact live tab/pane identity, preserving lookup errors."""
+        if deadline_monotonic is not None:
+            raise TerminalBackendError(
+                "deadline-bound window observation is unavailable for the herdr backend"
+            )
         try:
             self._resolve_pane_id_from_window(session_name, window_name)
             return True

@@ -126,6 +126,7 @@ from cli_agent_orchestrator.services import (
     session_service,
     terminal_projection,
     terminal_service,
+    wake_receipts,
 )
 from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
 from cli_agent_orchestrator.services.cleanup_service import (
@@ -485,6 +486,12 @@ class ControlInputRequest(BaseModel):
     expected_identity: Optional[Dict[str, Any]] = None
     request_digest: Optional[str] = None
     protocol: Optional[str] = None
+    # v2 only: a provider-pinned steer chord that replaces Enter as the
+    # submit/steer effect (``enter`` must be false).  Declared so the field
+    # survives parsing -- pydantic's default ``extra='ignore'`` would
+    # otherwise drop it and a v2 request would silently deliver as v1
+    # text-without-chord.  ``None`` is v1; a non-empty string is v2.
+    chord: Optional[str] = None
     # Bounded on purpose.  An unbounded wait converts a truthful
     # "the pane is busy, nothing was written, try again" into a request
     # that may never answer.
@@ -2606,13 +2613,26 @@ async def get_inbox_message_turn_receipt(terminal_id: TerminalId, message_id: st
     one exact inbox message, bound to message id, the receiver's exact live
     generation, and the provider session/turn — or 204 when no provider-native
     submission has been recorded (an ordinary inbox ``delivered``/terminal
-    paste is never an acknowledgement)."""
+    paste is never an acknowledgement).
+
+    For an unmanaged receiver with no provider-native ack, the durable wake
+    receipt (``source: status-transition``) is served once terminal — a wake
+    receipt, not a model-consumption proof.  The managed companion ack is
+    checked first and preferred; a still-``watching`` wake receipt answers 204
+    until it finalizes, so an open obligation stays observable rather than
+    falsely closed."""
     ack = companion_receipts.get_message_ack(
         terminal_id, _live_terminal_generation(terminal_id), message_id
     )
-    if ack is None:
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
-    return ack
+    if ack is not None:
+        return ack
+    wake = wake_receipts.get(terminal_id, message_id)
+    if wake is not None and wake.get("state") in (
+        wake_receipts.WAKE_CONFIRMED,
+        wake_receipts.WAKE_UNCONFIRMED,
+    ):
+        return wake
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get("/terminals/{terminal_id}/memory-context")
@@ -2806,7 +2826,13 @@ async def get_terminal_control_identity(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"no terminal {terminal_id!r} is known to this server",
         )
-    return resolved.as_dict()
+    body = resolved.as_dict()
+    # The discovery block (§3): a conductor that needs v2 reads this before
+    # sending a chord, so a v2 request against a v1-only server fails closed
+    # with typed ``unsupported`` and zero bytes rather than silently
+    # delivering text without the chord.
+    body["control_input"] = control_input_service.control_input_capability_block()
+    return body
 
 
 @app.post("/terminals/{terminal_id}/control-input")
@@ -2834,6 +2860,7 @@ async def send_terminal_control_input(
                 expected_identity=body.expected_identity,
                 request_digest=body.request_digest,
                 protocol=body.protocol,
+                chord=body.chord,
                 lease_timeout=body.lease_timeout,
             )
         )

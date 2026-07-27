@@ -14,11 +14,12 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 
 import pytest
 
-from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError
+from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
 from cli_agent_orchestrator.services import control_input_service as service
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
@@ -39,6 +40,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_PANE_DEAD,
     REASON_PROTOCOL_MISMATCH,
     REASON_REQUEST_REBOUND,
+    REASON_SERVER_IDENTITY_UNREADABLE,
     REASON_STALE_GENERATION,
     REASON_UNKNOWN_TERMINAL,
     REASON_WRITE_INCOMPLETE,
@@ -103,17 +105,40 @@ class FakeTmux:
     an AttributeError rather than silently exercising the fallback.
     """
 
-    def __init__(self, identities=None, *, write_error=None, on_write=None):
+    def __init__(
+        self,
+        identities=None,
+        *,
+        write_error=None,
+        on_write=None,
+        read_error=None,
+        read_error_after=0,
+    ):
         if identities is None:
             identities = [FakePaneIdentity()]
         self._identities = list(identities)
         self._write_error = write_error
         self._on_write = on_write
+        self._read_error = read_error
+        self._read_error_after = read_error_after
+        self._successful_reads = 0
         self.writes = []
         self.identity_reads = 0
 
-    def pane_control_identity(self, *, pane_id=None, session_name=None, window_name=None):
+    def pane_control_identity(
+        self,
+        *,
+        pane_id=None,
+        session_name=None,
+        window_name=None,
+        deadline_monotonic=None,
+    ):
         self.identity_reads += 1
+        # Time out only after N successful reads, so a test can let the
+        # pre-lease resolution succeed and time out the in-lease preflight.
+        if self._read_error is not None and self._successful_reads >= self._read_error_after:
+            raise self._read_error
+        self._successful_reads += 1
         if len(self._identities) > 1:
             return self._identities.pop(0)
         return self._identities[0]
@@ -121,7 +146,15 @@ class FakeTmux:
     # Keyword-only and undefaulted, exactly like the real primitive: a
     # fake that tolerated the argument being omitted would let the one
     # mistake §24.7 is about pass every test in this file.
-    def send_literal_line(self, pane_id, text, submit=True, *, expected_server_identity):
+    def send_literal_line(
+        self,
+        pane_id,
+        text,
+        submit=True,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
         if self._on_write is not None:
             self._on_write()
         if self._write_error is not None:
@@ -787,3 +820,424 @@ class TestResultInvariants:
         ]:
             payload = service.ControlInputResult(control_id=CONTROL, outcome=outcome).as_response()
             assert payload["reattemptable"] is reattemptable
+
+
+# ---------------------------------------------------------------------------
+# v2 chord (schema v2 steer chord)
+# ---------------------------------------------------------------------------
+
+from cli_agent_orchestrator.services.control_input_contract import (  # noqa: E402
+    REASON_UNSUPPORTED_CHORD,
+    control_input_request_digest_v2,
+)
+
+
+def _chord_digest(chord="C-s"):
+    return control_input_request_digest_v2(
+        control_id=CONTROL,
+        text=TEXT,
+        enter=False,
+        chord=chord,
+        expected_identity={"terminal_id": TERMINAL, "terminal_generation": GENERATION},
+    )
+
+
+def _chord_binding(digest):
+    return ControlInputBinding(
+        request_id=CONTROL,
+        terminal_id=TERMINAL,
+        pane_id=PANE,
+        window_id=WINDOW,
+        pane_pid=PANE_PID,
+        request_sha256=digest,
+        generation=GENERATION,
+        server_socket_path=SOCKET,
+    )
+
+
+def _chord_resolved(provider="kimi_cli", version="0.29.0"):
+    return service.ResolvedControlIdentity(
+        terminal_id=TERMINAL,
+        terminal_incarnation=None,
+        terminal_generation=GENERATION,
+        provider=provider,
+        native_session_id="sess-1",
+        execution_mode=service.EXECUTION_MODE_NATIVE_TUI,
+        session_name="cao",
+        provider_process_id="4242@boot-1",
+        provider_version=version,
+        pane_id=PANE,
+        window_id=WINDOW,
+        pane_pid=PANE_PID,
+        bound_server_socket_path=SOCKET,
+        observed_server_socket_path=SOCKET,
+    )
+
+
+class _FakeChordAdapter:
+    """A native adapter that types the text and (unlike the real one) no more."""
+
+    class ComposerWriteInterrupted(Exception):
+        def __init__(self, detail, *, enter_attempted=False):
+            super().__init__(detail)
+            self.detail = detail
+            self.enter_attempted = enter_attempted
+
+    def __init__(self, *, raise_after_text=None):
+        self._raise_after_text = raise_after_text
+
+    def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic=None):
+        transport.send_literal("typed-text")
+        if self._raise_after_text is not None:
+            raise self._raise_after_text
+
+
+class _FakeChordClient:
+    """Records literal writes and steer-chord presses, nothing else."""
+
+    def __init__(self, *, literal_error=None, chord_error=None):
+        self.sent = []
+        self._literal_error = literal_error
+        self._chord_error = chord_error
+
+    def send_literal_line(
+        self,
+        pane_id,
+        text,
+        submit=True,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
+        if self._literal_error is not None:
+            raise self._literal_error
+        self.sent.append(("literal", text, submit))
+        return 1
+
+    def send_steer_chord(
+        self, pane_id, chord, *, expected_server_identity, deadline_monotonic=None
+    ):
+        if self._chord_error is not None:
+            raise self._chord_error
+        self.sent.append(("chord", chord))
+
+    def send_control_key(self, pane_id, key, *, expected_server_identity, deadline_monotonic=None):
+        self.sent.append(("key", key))
+
+
+class TestChordShapeValidation:
+    def test_chord_requires_enter_false(self):
+        with pytest.raises(service.ControlInputRequestInvalid):
+            service._require_shape(CONTROL, TEXT, True, None, chord="C-s")
+
+    def test_empty_chord_rejected(self):
+        with pytest.raises(service.ControlInputRequestInvalid):
+            service._require_shape(CONTROL, TEXT, False, None, chord="")
+
+    def test_non_string_chord_rejected(self):
+        with pytest.raises(service.ControlInputRequestInvalid):
+            service._require_shape(CONTROL, TEXT, False, None, chord=123)
+
+    def test_no_chord_allows_enter_true(self):
+        service._require_shape(CONTROL, TEXT, True, None, chord=None)
+
+    def test_chord_with_enter_false_is_well_formed(self):
+        service._require_shape(CONTROL, TEXT, False, None, chord="C-s")
+
+
+class TestSteerChordAllowlist:
+    def test_allowed_chord_proceeds(self):
+        assert service._steer_chord_refusal(_chord_resolved(version="0.29.0"), "C-s") is None
+        assert service._steer_chord_refusal(_chord_resolved(version="0.29.1"), "C-s") is None
+
+    def test_wrong_chord_refused_with_zero_bytes(self):
+        reason = service._steer_chord_refusal(_chord_resolved(version="0.29.0"), "C-x")
+        assert reason is not None
+        assert reason[0] == REASON_UNSUPPORTED_CHORD
+
+    def test_unpinned_version_refused(self):
+        reason = service._steer_chord_refusal(_chord_resolved(version="0.40.0"), "C-s")
+        assert reason is not None and reason[0] == REASON_UNSUPPORTED_CHORD
+
+    def test_absent_version_refused(self):
+        reason = service._steer_chord_refusal(_chord_resolved(version=None), "C-s")
+        assert reason is not None and reason[0] == REASON_UNSUPPORTED_CHORD
+
+    def test_wrong_provider_refused(self):
+        reason = service._steer_chord_refusal(
+            _chord_resolved(provider="claude_code", version="0.29.0"), "C-s"
+        )
+        assert reason is not None and reason[0] == REASON_UNSUPPORTED_CHORD
+
+    def test_absent_chord_is_not_a_refusal(self):
+        assert service._steer_chord_refusal(_chord_resolved(version="0.29.0"), None) is None
+
+
+class TestChordExecution:
+    """text-then-chord under one lease; chord failure after text is ambiguous."""
+
+    def _send(self, journal, client, *, chord, chord_error=None, enter=False):
+        client._chord_error = chord_error
+        adapter = _FakeChordAdapter()
+        digest = (
+            _chord_digest(chord)
+            if chord
+            else control_input_request_digest(
+                control_id=CONTROL,
+                text=TEXT,
+                enter=enter,
+                expected_identity={"terminal_id": TERMINAL, "terminal_generation": GENERATION},
+            )
+        )
+        binding = _chord_binding(digest)
+        # The real caller opens intent and claims the write before this runs;
+        # _send_through_native_adapter assumes a WRITING record.
+        journal.open_intent(binding)
+        journal.claim_write(CONTROL)
+        return service._send_through_native_adapter(
+            journal,
+            client,
+            binding,
+            adapter=adapter,
+            plan={"lines": [TEXT]},
+            enter=enter,
+            chord=chord,
+            terminal_id=TERMINAL,
+            resolved=_chord_resolved(),
+            digest=digest,
+            deadline_monotonic=time.monotonic() + service.WRITE_DEADLINE_SECONDS,
+        )
+
+    def test_text_is_written_then_chord_pressed_last(self, journal):
+        client = _FakeChordClient()
+        result = self._send(journal, client, chord="C-s")
+        assert result.outcome == ACCEPTED
+        assert result.chord == "C-s"
+        assert result.chord_attempted is True
+        assert result.chord_sent is True
+        # Ordering: the literal write precedes the chord press.
+        kinds = [entry[0] for entry in client.sent]
+        assert kinds.index("literal") < kinds.index("chord")
+        assert client.sent[-1] == ("chord", "C-s")
+
+    def test_chord_failure_after_text_is_ambiguous(self, journal):
+        client = _FakeChordClient()
+        result = self._send(journal, client, chord="C-s", chord_error=RuntimeError("boom"))
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == REASON_WRITE_INCOMPLETE
+        assert result.chord == "C-s"
+        assert result.chord_attempted is True
+        # The text reached the pane (literal recorded) but the chord did not land.
+        assert result.chord_sent is False
+        assert any(entry[0] == "literal" for entry in client.sent)
+        assert not any(entry[0] == "chord" for entry in client.sent)
+        # The durable record agrees: ambiguous, chord attempted, not sent.
+        record = journal.find(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        assert record.chord == "C-s"
+        assert record.chord_attempted is True
+        assert record.chord_sent is False
+
+    def test_text_write_failure_preserves_requested_chord_facts(self, journal):
+        client = _FakeChordClient(literal_error=RuntimeError("literal write failed"))
+
+        result = self._send(journal, client, chord="C-s")
+
+        assert result.outcome == AMBIGUOUS
+        assert result.chord == "C-s"
+        assert result.chord_attempted is False
+        assert result.chord_sent is False
+        record = journal.find(CONTROL)
+        assert record.chord == "C-s"
+        assert record.chord_attempted is False
+        assert record.chord_sent is False
+
+    def test_no_chord_skips_the_chord_press(self, journal):
+        client = _FakeChordClient()
+        result = self._send(journal, client, chord=None, enter=False)
+        assert result.outcome == ACCEPTED
+        assert result.chord is None
+        assert not any(entry[0] == "chord" for entry in client.sent)
+
+    def test_replay_returns_the_journaled_record_with_no_new_io(self, journal):
+        client = _FakeChordClient()
+        first = self._send(journal, client, chord="C-s")
+        assert first.outcome == ACCEPTED
+        assert len(client.sent) >= 2  # text + chord were written
+        # A lost-response replay queries by control id (the conductor's
+        # GET /control-input/{control_id}); the journaled record answers with
+        # zero new I/O and the same chord outcome.
+        again = service.lookup_control_input(CONTROL, journal=journal)
+        assert again.outcome == ACCEPTED
+        assert again.chord == "C-s"
+        assert again.chord_sent is True
+        # No additional writes occurred: the fake recorded only the first send.
+        assert len(client.sent) == 2
+
+
+class TestBoundedWriteDeadline:
+    """A hung tmux call is bounded, classified truthfully, and releases the
+    lease so a fresh control succeeds exactly once with no late bytes."""
+
+    def _deliver_with(self, monkeypatch, journal, client, **overrides):
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        monkeypatch.setattr(service, "_terminal_metadata", lambda terminal_id: _metadata())
+        monkeypatch.setattr(service, "_managed_identity", lambda terminal_id: None)
+        kwargs = {"control_id": CONTROL, "text": TEXT, "enter": True}
+        kwargs.update(overrides)
+        return service.deliver_control_input(TERMINAL, journal=journal, **kwargs)
+
+    def test_a_post_claim_block_is_cut_off_by_the_absolute_deadline(self, monkeypatch, journal):
+        class DeadlineAwareBlockingTmux(FakeTmux):
+            def __init__(self):
+                super().__init__()
+                self.write_calls = 0
+
+            def send_literal_line(
+                self,
+                pane_id,
+                text,
+                submit=True,
+                *,
+                expected_server_identity,
+                deadline_monotonic=None,
+            ):
+                self.write_calls += 1
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining > 0:
+                    time.sleep(remaining)
+                raise subprocess.TimeoutExpired(cmd=["tmux", "send-keys"], timeout=remaining)
+
+        client = DeadlineAwareBlockingTmux()
+        monkeypatch.setattr(service, "WRITE_DEADLINE_SECONDS", 0.05)
+        started = time.monotonic()
+        result = self._deliver_with(monkeypatch, journal, client)
+        elapsed = time.monotonic() - started
+
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == REASON_WRITE_INCOMPLETE
+        assert elapsed < 0.15
+        assert journal.get(CONTROL).state == service.STATE_AMBIGUOUS
+        assert client.write_calls == 1
+
+        # The request returned only after the inline write stopped, so the
+        # lease is free and no detached worker can produce a late byte.
+        healthy = FakeTmux()
+        monkeypatch.setattr(service, "_tmux_client", lambda: healthy)
+        fresh = service.deliver_control_input(
+            TERMINAL,
+            journal=journal,
+            control_id="ctl-after-deadline-7d",
+            text=TEXT,
+            enter=True,
+        )
+        assert fresh.outcome == ACCEPTED
+        assert len(healthy.writes) == 1
+        assert client.writes == []
+
+    def test_a_preflight_read_timeout_is_a_reattemptable_write_deadline(self, monkeypatch, journal):
+        # The pre-lease resolution reads first and must succeed; the in-lease
+        # re-verification preflight is the read that times out.
+        client = FakeTmux(
+            read_error=subprocess.TimeoutExpired(cmd=["tmux"], timeout=10),
+            read_error_after=1,
+        )
+        result = self._deliver_with(monkeypatch, journal, client)
+        assert result.outcome == REFUSED
+        assert result.reason_code == service.REASON_WRITE_DEADLINE
+        assert result.as_response()["reattemptable"] is True
+        # Nothing was written: the timeout was a pre-write read.
+        assert client.writes == []
+
+    def test_a_write_call_timeout_is_ambiguous(self, monkeypatch, journal):
+        client = FakeTmux(write_error=subprocess.TimeoutExpired(cmd=["tmux"], timeout=10))
+        result = self._deliver_with(monkeypatch, journal, client)
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == REASON_WRITE_INCOMPLETE
+        # A write timeout is never a reattempt licence.
+        assert result.as_response()["reattemptable"] is False
+
+    def test_a_post_claim_server_identity_error_is_durably_ambiguous(self, monkeypatch, journal):
+        client = FakeTmux(
+            write_error=TmuxServerIdentityError(
+                "tmux server identity became unreadable",
+                reason_code=REASON_SERVER_IDENTITY_UNREADABLE,
+                bound=SOCKET,
+                observed=None,
+            )
+        )
+
+        result = self._deliver_with(monkeypatch, journal, client)
+
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == REASON_WRITE_INCOMPLETE
+        assert REASON_SERVER_IDENTITY_UNREADABLE in result.detail
+        record = journal.get(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        assert record.reason_code == REASON_WRITE_INCOMPLETE
+        assert service.lookup_control_input(CONTROL, journal=journal).outcome == AMBIGUOUS
+
+    def test_a_hung_write_releases_the_lease_for_a_fresh_control(self, monkeypatch, journal):
+        hung = FakeTmux(write_error=subprocess.TimeoutExpired(cmd=["tmux"], timeout=10))
+        first = self._deliver_with(monkeypatch, journal, hung)
+        assert first.outcome == AMBIGUOUS
+        # The lease was released by the bounded timeout: a fresh control id
+        # on the same pane delivers exactly once, with no late bytes.
+        healthy = FakeTmux()
+        monkeypatch.setattr(service, "_tmux_client", lambda: healthy)
+        again = service.deliver_control_input(
+            TERMINAL, journal=journal, control_id="ctl-fresh-9a", text=TEXT, enter=True
+        )
+        assert again.outcome == ACCEPTED
+        assert len(healthy.writes) == 1
+        assert hung.writes == []
+
+    def test_a_write_deadline_refusal_lets_a_clean_retry_succeed(self, monkeypatch, journal):
+        stalling = FakeTmux(
+            read_error=subprocess.TimeoutExpired(cmd=["tmux"], timeout=10),
+            read_error_after=1,
+        )
+        first = self._deliver_with(monkeypatch, journal, stalling)
+        assert first.outcome == REFUSED
+        assert first.reason_code == service.REASON_WRITE_DEADLINE
+        healthy = FakeTmux()
+        monkeypatch.setattr(service, "_tmux_client", lambda: healthy)
+        again = service.deliver_control_input(
+            TERMINAL, journal=journal, control_id="ctl-retry-7b", text=TEXT, enter=True
+        )
+        assert again.outcome == ACCEPTED
+
+    def test_the_overall_deadline_is_under_the_conductor_client_default(self):
+        from cli_agent_orchestrator.clients.tmux import TMUX_CALL_TIMEOUT_SECONDS
+
+        # The conductor's default client timeout is 30s (mcp_request_timeout);
+        # the overall write deadline sits below it, and each call below that.
+        assert service.WRITE_DEADLINE_SECONDS < 30
+        assert TMUX_CALL_TIMEOUT_SECONDS <= service.WRITE_DEADLINE_SECONDS
+
+
+class TestChordJournalReplay:
+    def test_delivered_chord_round_trips_through_the_record(self, journal):
+        digest = _chord_digest()
+        journal.open_intent(_chord_binding(digest))
+        journal.claim_write(CONTROL)
+        journal.mark_delivered(
+            CONTROL,
+            chunks_sent=1,
+            enter_attempted=False,
+            chord="C-s",
+            chord_attempted=True,
+            chord_sent=True,
+            evidence_digest=digest,
+        )
+        record = journal.find(CONTROL)
+        assert record.chord == "C-s"
+        assert record.chord_attempted is True
+        assert record.chord_sent is True
+        result = service._from_record(record)
+        assert result.chord == "C-s"
+        assert result.chord_sent is True
+        wire = result.as_response()
+        assert wire["chord"] == "C-s"
+        assert wire["chord_sent"] is True
+        assert wire["chord_attempted"] is True

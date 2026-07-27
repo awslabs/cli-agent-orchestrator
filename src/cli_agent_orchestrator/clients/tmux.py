@@ -65,6 +65,22 @@ _PANE_SERVER_FORMAT = "\t".join(("#{pane_id}", "#{socket_path}"))
 # control cannot produce a single unbounded argv.
 _LITERAL_CHUNK_CHARS = 1024
 
+# Every blocking tmux subprocess in the control write path runs under this
+# per-call bound.  A hung adapter call otherwise holds the pane lease forever
+# (the API runs delivery in an uncancellable ``asyncio.to_thread``), so every
+# later control gets a truthful but perpetual zero-byte ``pane-busy`` cleared
+# only by a process restart.  Bounding each call is what lets the existing
+# ``finally`` lease release actually run, and what lets the service classify a
+# timeout truthfully.  An overall write deadline (in the service) sits below
+# the conductor's 30s client default on top of this per-call bound.
+TMUX_CALL_TIMEOUT_SECONDS = 10.0
+
+# The real ``subprocess.TimeoutExpired`` class, bound at import.  Tests mock
+# the ``subprocess`` module, which would turn ``subprocess.TimeoutExpired``
+# into a non-class and make an ``except`` on it raise TypeError; this alias
+# keeps the catch working under that mock.
+_SUBPROCESS_TIMEOUT = subprocess.TimeoutExpired
+
 # Bytes that must never appear in literal control text: ESC and its
 # single-byte C1 CSI equivalent U+009B would both let a payload
 # synthesise its own escape sequences (including the very paste sentinels
@@ -85,6 +101,17 @@ _ILLEGAL_LITERAL_CHARS = ("\x1b", "\x9b", "\r", "\n")
 # clears the paste-burst window that would otherwise swallow the Enter
 # after it.  A pin that proves a further keystroke adds it here.
 COMPOSER_CONTROL_KEYS = frozenset({"C-j", "End"})
+
+# A steer chord is a provider-pinned composer chord (e.g. ``C-s``) that
+# replaces Enter as the submit/steer effect for a v2 control-input.  It is a
+# distinct surface from :data:`COMPOSER_CONTROL_KEYS`: the newline pin
+# governs composer line breaks, whereas a steer chord is the submit effect
+# for an urgent steer, gated by its own provider/version allowlist at the
+# service layer.  The pattern is the sink's syntactic defence-in-depth, so a
+# chord parameter can never become an arbitrary ``send-keys`` key sequence:
+# exactly ``C-`` followed by one ASCII letter.  Membership is re-checked by
+# the service against the proven allowlist before any byte.
+STEER_CHORD_PATTERN = re.compile(r"^C-[A-Za-z]$")
 
 
 @dataclass(frozen=True)
@@ -834,8 +861,23 @@ class TmuxClient:
             logger.error(f"Failed to kill window {session_name}:{window_name}: {e}")
             return False
 
-    def window_exists(self, session_name: str, window_name: str) -> bool:
+    def window_exists(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
         """Check the exact tmux window while preserving unreadable-server errors."""
+        if deadline_monotonic is not None:
+            records = self.list_pane_control_identities(deadline_monotonic=deadline_monotonic)
+            if records is None:
+                raise RuntimeError("tmux server is unavailable or unreadable")
+            return any(
+                record.session_name == session_name and record.window_name == window_name
+                for record in records
+            )
+
         # ``Server.sessions`` turns every ``list-sessions`` failure into an empty
         # QueryList.  Prove the server is readable first so a permission or
         # subprocess failure cannot masquerade as an absent session.
@@ -846,7 +888,13 @@ class TmuxClient:
             return False
         return session.windows.get(window_name=window_name, default=None) is not None
 
-    def window_identity(self, session_name: str, window_name: str) -> Optional[Dict[str, str]]:
+    def window_identity(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Optional[Dict[str, str]]:
         """Server-owned immutable tmux identity of a window: its tmux-assigned
         ``window_id`` (``@N``) and active ``pane_id`` (``%N``). Unlike window
         names these are immutable for the resource's life — the only tmux
@@ -873,6 +921,24 @@ class TmuxClient:
         the window) is precisely what let a write land in an unrelated live
         composer.
         """
+        if deadline_monotonic is not None:
+            observed = self.pane_control_identity(
+                session_name=session_name,
+                window_name=window_name,
+                deadline_monotonic=deadline_monotonic,
+            )
+            if observed is None:
+                return None
+            identity = {
+                "pane_id": observed.pane_id,
+                "window_id": observed.window_id,
+                "session_id": observed.session_id,
+                "pane_pid": str(observed.pane_pid),
+            }
+            if observed.server_socket_path is not None:
+                identity["server_socket_path"] = observed.server_socket_path
+            return identity
+
         try:
             session = self.server.sessions.get(session_name=session_name)
             if not session:
@@ -1003,7 +1069,9 @@ class TmuxClient:
             )
             return None
 
-    def list_pane_control_identities(self) -> Optional[List[PaneControlIdentity]]:
+    def list_pane_control_identities(
+        self, *, deadline_monotonic: Optional[float] = None
+    ) -> Optional[List[PaneControlIdentity]]:
         """Every pane on the server, with the facts a control call binds to.
 
         Enumerates with ``list-panes -a`` and selects in Python.  A ``-t``
@@ -1017,15 +1085,22 @@ class TmuxClient:
         caller conclude a live pane had gone away.
         """
         try:
+            argv = [tmux_binary(), "list-panes", "-a", "-F", _PANE_CONTROL_FORMAT]
             result = subprocess.run(
-                [tmux_binary(), "list-panes", "-a", "-F", _PANE_CONTROL_FORMAT],
+                argv,
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=self._control_call_timeout(deadline_monotonic, argv),
             )
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("Could not enumerate tmux panes: %s", exc)
             return None
+        # subprocess.TimeoutExpired is deliberately allowed to propagate: a
+        # call that exceeded its bound is a distinct signal from an unreadable
+        # server, and the service classifies it (write-deadline before any
+        # write, ambiguous on or after one) rather than collapsing it into
+        # "no panes", which a caller could read as a live pane having gone.
         if result.returncode != 0:
             logger.warning(
                 "tmux could not enumerate panes: %s",
@@ -1039,7 +1114,12 @@ class TmuxClient:
                 records.append(record)
         return records
 
-    def observe_pane_server_identity(self, pane_id: str) -> Optional[str]:
+    def observe_pane_server_identity(
+        self,
+        pane_id: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Optional[str]:
         """The canonical identity of the tmux server that owns ``pane_id``.
 
         The narrow observation the write primitive makes immediately before
@@ -1058,15 +1138,19 @@ class TmuxClient:
         if not is_valid_pane_id(pane_id):
             return None
         try:
+            argv = [tmux_binary(), "list-panes", "-a", "-F", _PANE_SERVER_FORMAT]
             result = subprocess.run(
-                [tmux_binary(), "list-panes", "-a", "-F", _PANE_SERVER_FORMAT],
+                argv,
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=self._control_call_timeout(deadline_monotonic, argv),
             )
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning("Could not observe tmux server identity: %s", exc)
             return None
+        # subprocess.TimeoutExpired propagates for the same reason as the
+        # pane enumeration above: it is a bound, not an unreadable server.
         if result.returncode != 0:
             logger.warning(
                 "tmux could not report server identity: %s",
@@ -1085,6 +1169,7 @@ class TmuxClient:
         pane_id: Optional[str] = None,
         session_name: Optional[str] = None,
         window_name: Optional[str] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> Optional[PaneControlIdentity]:
         """Resolve exactly one pane's live identity, or None.
 
@@ -1112,7 +1197,7 @@ class TmuxClient:
         if by_name and (session_name is None or window_name is None):
             raise ValueError("session_name and window_name must be supplied together")
 
-        records = self.list_pane_control_identities()
+        records = self.list_pane_control_identities(deadline_monotonic=deadline_monotonic)
         if records is None:
             return None
         if by_pane:
@@ -1141,6 +1226,7 @@ class TmuxClient:
         submit: bool = True,
         *,
         expected_server_identity: Optional[str],
+        deadline_monotonic: Optional[float] = None,
     ) -> int:
         """Write ``text`` to ``pane_id`` as literal bytes, then one Enter.
 
@@ -1228,7 +1314,9 @@ class TmuxClient:
         # Observed exactly once: a second query could return a different
         # answer, and an error that reported a reading other than the one
         # it refused on would be evidence of nothing.
-        observed_server = self.observe_pane_server_identity(pane_id)
+        observed_server = self.observe_pane_server_identity(
+            pane_id, deadline_monotonic=deadline_monotonic
+        )
         refusal = server_identity_refusal(bound=expected_server_identity, observed=observed_server)
         if refusal is not None:
             reason_code, detail = refusal
@@ -1253,6 +1341,7 @@ class TmuxClient:
                 ],
                 chunks_sent=chunks_sent,
                 enter_attempted=False,
+                deadline_monotonic=deadline_monotonic,
             )
             chunks_sent += 1
         if submit:
@@ -1260,6 +1349,7 @@ class TmuxClient:
                 [tmux_binary(), "send-keys", "-t", pane_id, "Enter"],
                 chunks_sent=chunks_sent,
                 enter_attempted=True,
+                deadline_monotonic=deadline_monotonic,
             )
         return chunks_sent
 
@@ -1269,6 +1359,7 @@ class TmuxClient:
         key: str,
         *,
         expected_server_identity: Optional[str],
+        deadline_monotonic: Optional[float] = None,
     ) -> None:
         """Send one named composer key to a pane on the bound server.
 
@@ -1317,7 +1408,9 @@ class TmuxClient:
 
         logger.info("send_control_key: %s - key: %s", pane_id, key)
 
-        observed_server = self.observe_pane_server_identity(pane_id)
+        observed_server = self.observe_pane_server_identity(
+            pane_id, deadline_monotonic=deadline_monotonic
+        )
         refusal = server_identity_refusal(bound=expected_server_identity, observed=observed_server)
         if refusal is not None:
             reason_code, detail = refusal
@@ -1332,13 +1425,119 @@ class TmuxClient:
             [tmux_binary(), "send-keys", "-t", pane_id, key],
             chunks_sent=0,
             enter_attempted=False,
+            deadline_monotonic=deadline_monotonic,
+        )
+
+    def send_steer_chord(
+        self,
+        pane_id: str,
+        chord: str,
+        *,
+        expected_server_identity: Optional[str],
+        deadline_monotonic: Optional[float] = None,
+    ) -> None:
+        """Send one provider-pinned steer chord to a pane on the bound server.
+
+        The v2 submit effect: where a v1 control submits with one explicit
+        Enter, a v2 chord control types the text and then presses a named
+        composer chord (``C-s`` for a Kimi steer) that the provider's
+        build is proven to read as a submit/steer.  This is the *only* way
+        a chord reaches a pane -- it is not added to
+        :data:`COMPOSER_CONTROL_KEYS`, because the newline pin and the
+        steer chord are different acts with different proofs, and folding
+        them together would let any key proven for a line break be sent as
+        a steer.
+
+        Membership in the steer-chord allowlist is decided by the service
+        against the proven provider/version table before this is reached;
+        the :data:`STEER_CHORD_PATTERN` check here is the sink's own
+        syntactic bound, so a chord parameter can never become an arbitrary
+        key sequence even if a future caller bypasses the service gate.
+
+        Same server-identity proof as the literal write, for the same
+        reason and at the same distance from the first byte: a chord aimed
+        at ``%3`` on the wrong tmux server lands in a stranger's composer
+        exactly as a literal write would.
+
+        Raises:
+            ValueError: The pane id or chord name is not permitted here.
+                Nothing is written.
+            TmuxServerIdentityError: The pane could not be proven to be on
+                the bound tmux server.  Nothing is written.
+            TmuxLiteralSendError: tmux rejected the chord.
+        """
+        if not is_valid_pane_id(pane_id):
+            raise ValueError(f"Invalid pane_id: {pane_id!r}")
+        if not isinstance(chord, str) or STEER_CHORD_PATTERN.fullmatch(chord) is None:
+            raise ValueError(
+                f"{chord!r} is not a permitted steer chord name; a steer chord is "
+                f"'C-' followed by one ASCII letter. Membership in the provider "
+                f"allowlist is checked at the service layer; this is the sink bound"
+            )
+
+        logger.info("send_steer_chord: %s - chord: %s", pane_id, chord)
+
+        observed_server = self.observe_pane_server_identity(
+            pane_id, deadline_monotonic=deadline_monotonic
+        )
+        refusal = server_identity_refusal(bound=expected_server_identity, observed=observed_server)
+        if refusal is not None:
+            reason_code, detail = refusal
+            raise TmuxServerIdentityError(
+                f"refusing a steer chord to pane {pane_id}: {detail}",
+                reason_code=reason_code,
+                bound=normalize_server_identity(expected_server_identity),
+                observed=observed_server,
+            )
+
+        self._run_literal_write(
+            [tmux_binary(), "send-keys", "-t", pane_id, chord],
+            chunks_sent=0,
+            enter_attempted=False,
+            deadline_monotonic=deadline_monotonic,
         )
 
     @staticmethod
-    def _run_literal_write(argv: List[str], *, chunks_sent: int, enter_attempted: bool) -> None:
+    def _control_call_timeout(
+        deadline_monotonic: Optional[float],
+        argv: List[str],
+    ) -> float:
+        """Return this call's share of the control path's absolute deadline."""
+        if deadline_monotonic is None:
+            return TMUX_CALL_TIMEOUT_SECONDS
+        remaining = deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, 0)
+        return min(TMUX_CALL_TIMEOUT_SECONDS, remaining)
+
+    @staticmethod
+    def _run_literal_write(
+        argv: List[str],
+        *,
+        chunks_sent: int,
+        enter_attempted: bool,
+        deadline_monotonic: Optional[float] = None,
+    ) -> None:
         """Run one control write, converting any failure into a bounded one."""
         try:
-            result = subprocess.run(argv, capture_output=True, text=True, check=False)
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=TmuxClient._control_call_timeout(deadline_monotonic, argv),
+            )
+        except _SUBPROCESS_TIMEOUT as exc:
+            # A timed-out write may or may not have reached the pane -- tmux
+            # does not report how far it got -- so it is the same class of
+            # uncertainty as a partial write and is carried as such.  The
+            # service maps a TmuxLiteralSendError after the write claim to
+            # ``ambiguous``, never to a zero-byte refusal.
+            raise TmuxLiteralSendError(
+                f"tmux literal control write exceeded the {TMUX_CALL_TIMEOUT_SECONDS:g}s bound",
+                chunks_sent=chunks_sent,
+                enter_attempted=enter_attempted,
+            ) from exc
         except (OSError, RuntimeError, ValueError) as exc:
             raise TmuxLiteralSendError(
                 f"tmux literal control write failed: {exc}",

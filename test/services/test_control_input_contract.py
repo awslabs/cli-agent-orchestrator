@@ -153,6 +153,152 @@ class TestRequestDigest:
         assert contract.REASON_OWNER_LOST_MID_WRITE in contract.CONTROL_INPUT_REASON_CODES
 
 
+class TestV2ChordDigest:
+    """Schema v2 adds exactly one field, ``chord``, between ``enter`` and
+    ``expected_identity`` in the digest preimage, with its own domain.
+
+    The preimage field order and domain string are the cross-repo contract:
+    both sides reproduce the golden vector byte for byte, so a one-sided
+    edit to either implementation fails this test rather than diverging in
+    production.  v1 stays byte-identical (its domain, version, and field
+    order are untouched) -- a v2-capable server must not change what a v1
+    request digests to.
+    """
+
+    # The exact golden vector from the activation spec §3.  control_id,
+    # text, identity, and provider_process_id typing are all part of it.
+    VECTOR = {
+        "control_id": "ex-1",
+        "text": "[conduct-steer ex-1] URGENT amendment for task demo: apply the reviewed fix",
+        "enter": False,
+        "chord": "C-s",
+        "expected_identity": {
+            "terminal_id": "term-1",
+            "terminal_generation": "gen-3",
+            "provider_process_id": 4242,
+            "provider": "kimi_cli",
+            "session_name": "cao-demo",
+        },
+    }
+    PREIMAGE = (
+        '{"domain":"cao-control-input-request-v2","schema_version":2,'
+        '"control_id":"ex-1",'
+        '"text":"[conduct-steer ex-1] URGENT amendment for task demo: apply the reviewed fix",'
+        '"enter":false,"chord":"C-s","expected_identity":{"terminal_id":"term-1",'
+        '"terminal_incarnation":null,"terminal_generation":"gen-3","pane_birth_id":null,'
+        '"provider_process_id":4242,"provider":"kimi_cli","native_session_id":null,'
+        '"execution_mode":null,"session_name":"cao-demo"}}\n'
+    )
+    DIGEST = "6b1086b25fbe2b0eeb8b8d884440e0a2ab5f07b714d59ceea25fbe126948806c"
+
+    def test_v2_domain_is_separate_from_v1(self):
+        assert contract.CONTROL_INPUT_DIGEST_DOMAIN_V2 == "cao-control-input-request-v2"
+        assert contract.CONTROL_INPUT_DIGEST_DOMAIN_V2 != contract.CONTROL_INPUT_DIGEST_DOMAIN
+        assert contract.CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2 == 2
+
+    def test_v2_field_order_inserts_chord_before_identity(self):
+        order = contract.REQUEST_DIGEST_FIELD_ORDER_V2
+        assert order == (
+            "domain",
+            "schema_version",
+            "control_id",
+            "text",
+            "enter",
+            "chord",
+            "expected_identity",
+        )
+        # The insertion point is contract, not a property of any dict.
+        assert order != tuple(sorted(order))
+
+    def test_matches_the_recorded_digest(self):
+        assert (
+            contract.control_input_request_digest_v2(
+                control_id=self.VECTOR["control_id"],
+                text=self.VECTOR["text"],
+                enter=self.VECTOR["enter"],
+                chord=self.VECTOR["chord"],
+                expected_identity=self.VECTOR["expected_identity"],
+            )
+            == self.DIGEST
+        )
+
+    def test_matches_the_recorded_preimage_byte_for_byte(self):
+        assert (
+            hashlib.sha256(self.PREIMAGE.encode("utf-8")).hexdigest() == self.DIGEST
+        ), "the recorded v2 preimage does not hash to the recorded digest"
+        encoded = canonical_json.encode_canonical(
+            {
+                "domain": contract.CONTROL_INPUT_DIGEST_DOMAIN_V2,
+                "schema_version": contract.CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
+                "control_id": self.VECTOR["control_id"],
+                "text": self.VECTOR["text"],
+                "enter": self.VECTOR["enter"],
+                "chord": self.VECTOR["chord"],
+                "expected_identity": contract.normalize_expected_identity(
+                    self.VECTOR["expected_identity"]
+                ),
+            }
+        )
+        assert encoded.decode("utf-8") == self.PREIMAGE
+
+    def test_chord_is_bound_into_the_digest(self):
+        base = dict(self.VECTOR)
+        different = contract.control_input_request_digest_v2(
+            control_id=base["control_id"],
+            text=base["text"],
+            enter=base["enter"],
+            chord="C-c",
+            expected_identity=base["expected_identity"],
+        )
+        assert different != self.DIGEST
+        # A null chord is a different request from a named one.
+        none_chord = contract.control_input_request_digest_v2(
+            control_id=base["control_id"],
+            text=base["text"],
+            enter=base["enter"],
+            chord=None,
+            expected_identity=base["expected_identity"],
+        )
+        assert none_chord != self.DIGEST
+
+    def test_v1_digest_is_unchanged_when_chord_exists(self):
+        """v1 must keep digesting exactly as before v2 existed."""
+        v1 = contract.control_input_request_digest(
+            control_id="ex-1",
+            text="[conduct-steer ex-1] URGENT amendment for task demo: apply the reviewed fix",
+            enter=False,
+            expected_identity=self.VECTOR["expected_identity"],
+        )
+        assert (
+            v1
+            == hashlib.sha256(
+                (
+                    '{"domain":"cao-control-input-request-v1","schema_version":1,'
+                    '"control_id":"ex-1",'
+                    '"text":"[conduct-steer ex-1] URGENT amendment for task demo: apply the '
+                    'reviewed fix","enter":false,"expected_identity":{"terminal_id":"term-1",'
+                    '"terminal_incarnation":null,"terminal_generation":"gen-3",'
+                    '"pane_birth_id":null,"provider_process_id":4242,"provider":"kimi_cli",'
+                    '"native_session_id":null,"execution_mode":null,"session_name":"cao-demo"}}\n'
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+
+    @pytest.mark.parametrize("enter", [1, 0, None, "false"])
+    def test_a_non_boolean_enter_is_refused(self, enter):
+        with pytest.raises(ValueError):
+            contract.control_input_request_digest_v2(
+                control_id="ex-1", text="x", enter=enter, chord="C-s", expected_identity=None
+            )
+
+    @pytest.mark.parametrize("chord", ["", 1, True, []])
+    def test_a_non_optional_chord_is_refused(self, chord):
+        with pytest.raises(ValueError):
+            contract.control_input_request_digest_v2(
+                control_id="ex-1", text="x", enter=False, chord=chord, expected_identity=None
+            )
+
+
 class TestCrossImplementationDigest:
     """The fork and the conductor must produce the same 64 hex characters.
 

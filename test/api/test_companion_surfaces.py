@@ -136,6 +136,59 @@ def test_message_turn_receipt_surface_and_redaction(client, companion):
     assert client.get("/terminals/deadbeef/inbox/messages/msg-2/turn-receipt").status_code == 204
 
 
+def test_turn_receipt_serves_a_terminal_wake_receipt_when_no_managed_ack(
+    client, companion, tmp_path, monkeypatch
+):
+    from cli_agent_orchestrator.services import wake_receipts
+
+    monkeypatch.setattr(wake_receipts, "WAKE_RECEIPT_DIR", tmp_path / "wake")
+    url = "/terminals/deadbeef/inbox/messages/msg-w/turn-receipt"
+    # No record yet: 204 (no false close).
+    assert client.get(url).status_code == 204
+    # watching: still 204 — an open obligation stays observable, not terminal.
+    wake_receipts.ensure_watching(
+        "deadbeef",
+        "msg-w",
+        native_session_id=None,
+        delivered_at="2026-07-26T12:00:00+00:00",
+        deadline_at="2026-07-26T12:00:45+00:00",
+    )
+    assert client.get(url).status_code == 204
+    # terminal wake_confirmed: served, with status-transition provenance and
+    # never a provider-native claim.
+    wake_receipts.record_wake_confirmed("deadbeef", "msg-w", observed={"to_status": "processing"})
+    body = client.get(url).json()
+    assert body["message_id"] == "msg-w"
+    assert body["state"] == "wake_confirmed"
+    assert body["source"] == "status-transition"
+
+
+def test_managed_ack_is_preferred_over_the_wake_sidecar(client, companion, tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services import wake_receipts
+
+    monkeypatch.setattr(wake_receipts, "WAKE_RECEIPT_DIR", tmp_path / "wake")
+    # Both a wake sidecar and a managed provider-native ack exist for msg-1.
+    wake_receipts.ensure_watching(
+        "deadbeef",
+        "msg-1",
+        native_session_id=None,
+        delivered_at="2026-07-26T12:00:00+00:00",
+        deadline_at="2026-07-26T12:00:45+00:00",
+    )
+    wake_receipts.record_wake_confirmed("deadbeef", "msg-1", observed={"to_status": "processing"})
+    companion_receipts.record_message_ack(
+        "deadbeef",
+        GEN,
+        message_id="msg-1",
+        ack={"kind": "submitted", "message_id": "msg-1", "provider_turn_id": "turn-1"},
+    )
+    body = client.get("/terminals/deadbeef/inbox/messages/msg-1/turn-receipt").json()
+    # The managed provider-native acknowledgement outranks the wake sidecar.
+    assert body.get("kind") == "submitted"
+    assert body.get("provider_turn_id") == "turn-1"
+    assert body.get("state") is None  # the wake record's field is absent
+
+
 def test_corrupt_record_is_response_loss_fail_closed(client, companion):
     companion_receipts.record_route_receipt(
         "deadbeef",

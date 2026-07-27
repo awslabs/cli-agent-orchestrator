@@ -246,6 +246,51 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
     },
 }
 
+#: The steer chords proven for each pinned Kimi build.  Distinct from
+#: :data:`_PROVEN_COMPOSER_NEWLINE` on purpose: a steer chord replaces
+#: Enter as the submit/steer effect for a v2 ``conduct steer`` control,
+#: whereas the newline pin governs multi-line composer *breaks*.  Reusing
+#: the newline pin would let any key proven for a line break be sent as a
+#: steer effect, which is a different act with a different proof.  A build
+#: appears here only when its chord behaviour was read, on the same terms
+#: as the newline pin.
+_PROVEN_STEER_CHORDS: dict[str, frozenset[str]] = {
+    "0.29.0": frozenset({"C-s"}),
+    "0.29.1": frozenset({"C-s"}),
+}
+
+
+def steer_chords(provider_version: Optional[str]) -> frozenset[str]:
+    """The steer chords proven for this Kimi build, or an empty set.
+
+    Looked up by the same normalized version the newline pin uses, so the
+    two tables agree about which build a request names.  An empty result is
+    the honest answer for an unproven build: a chord the server has not
+    read evidence for is refused with zero bytes rather than sent at a
+    composer on the strength of a guess.
+    """
+    if not provider_version:
+        return frozenset()
+    return _PROVEN_STEER_CHORDS.get(
+        provider_contracts.normalized_version(provider_version), frozenset()
+    )
+
+
+def advertised_steer_chords() -> dict[str, list[str]]:
+    """The steer chords this adapter advertises for discovery (per provider).
+
+    The union over proven builds: the discovery block on the identity route
+    tells a conductor which chords exist at all, before it has named a
+    version, so it can fail closed against a server that offers none.  A
+    conductor that names a version still gets the per-build answer from
+    :func:`steer_chords`; this is the looser, earlier question.
+    """
+    union: set[str] = set()
+    for build_chords in _PROVEN_STEER_CHORDS.values():
+        union.update(build_chords)
+    return {PROVIDER: sorted(union)} if union else {}
+
+
 #: Characters ECMAScript ``String.prototype.trim`` removes: its
 #: WhiteSpace production plus its LineTerminator production.  Listed
 #: explicitly rather than reusing Python's ``str.strip``, whose set is
@@ -997,6 +1042,7 @@ def execute_composer_plan(
     plan: Mapping[str, Any],
     transport: NativeControlTransport,
     submit: bool = True,
+    deadline_monotonic: Optional[float] = None,
 ) -> dict[str, Any]:
     """Type one already-planned payload into a composer, then submit it.
 
@@ -1064,6 +1110,14 @@ def execute_composer_plan(
         if reset_key:
             transport.send_key(reset_key)
         if settle > 0:
+            remaining = (
+                None if deadline_monotonic is None else deadline_monotonic - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("overall write deadline expired before submit settle")
+            if remaining is not None and settle > remaining:
+                time.sleep(remaining)
+                raise TimeoutError("overall write deadline expired during submit settle")
             time.sleep(settle)
     except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
         raise ComposerWriteInterrupted(

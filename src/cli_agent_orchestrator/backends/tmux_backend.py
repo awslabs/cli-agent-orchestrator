@@ -79,11 +79,31 @@ class TmuxBackend(TerminalBackend):
     def kill_window(self, session_name: str, window_name: str) -> bool:
         return self._client.kill_window(session_name, window_name)
 
-    def window_exists(self, session_name: str, window_name: str) -> bool:
-        return self._client.window_exists(session_name, window_name)
+    def window_exists(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        return self._client.window_exists(
+            session_name,
+            window_name,
+            deadline_monotonic=deadline_monotonic,
+        )
 
-    def window_identity(self, session_name: str, window_name: str) -> Optional[Dict[str, str]]:
-        return self._client.window_identity(session_name, window_name)
+    def window_identity(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Optional[Dict[str, str]]:
+        return self._client.window_identity(
+            session_name,
+            window_name,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     def terminal_bound_window_identity(
         self, terminal_id: str, session_name: str, window_name: str

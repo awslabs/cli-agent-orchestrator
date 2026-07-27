@@ -1,15 +1,19 @@
 """Tests for the event-driven InboxService."""
 
 import asyncio
+import os
+import threading
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services import inbox_service
 from cli_agent_orchestrator.services.inbox_service import InboxService
 
 
@@ -22,6 +26,15 @@ def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageSta
         status=status,
         created_at=datetime.now(),
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_wake_store(monkeypatch, tmp_path):
+    """Wake-receipt sidecars are written by ``deliver_pending`` now; keep them
+    out of the host's state root during tests."""
+    from cli_agent_orchestrator.services import wake_receipts
+
+    monkeypatch.setattr(wake_receipts, "WAKE_RECEIPT_DIR", tmp_path / "wake-receipts")
 
 
 class TestDeliverPending:
@@ -209,6 +222,70 @@ class TestDeliverPending:
         # Final status is PENDING (reset after the optimistic DELIVERED), never FAILED.
         assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
         assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
+
+    def test_two_concurrent_callers_send_one_pending_message_once(
+        self, isolated_memory_db, monkeypatch
+    ):
+        database.create_terminal(
+            "term-race",
+            "cao-race",
+            "worker",
+            "codex",
+        )
+        message = database.create_inbox_message("sender-1", "term-race", "callback-once")
+        real_get_pending = database.get_pending_messages
+        both_selected = threading.Barrier(2)
+
+        def synchronized_get(terminal_id, limit=1):
+            selected = real_get_pending(terminal_id, limit=limit)
+            both_selected.wait(timeout=5)
+            return selected
+
+        sends = []
+        send_lock = threading.Lock()
+
+        def record_send(terminal_id, text):
+            with send_lock:
+                sends.append((terminal_id, text))
+
+        monkeypatch.setattr(inbox_service, "get_pending_messages", synchronized_get)
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "managed_control_identity",
+            lambda _terminal_id: None,
+        )
+        monkeypatch.setattr(
+            inbox_service.status_monitor,
+            "get_status",
+            lambda _terminal_id: TerminalStatus.IDLE,
+        )
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", record_send)
+        monkeypatch.setattr(
+            InboxService,
+            "_prepare_wake_confirmation",
+            lambda *args, **kwargs: None,
+        )
+
+        service = InboxService()
+        errors = []
+
+        def deliver():
+            try:
+                service.deliver_pending("term-race")
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        callers = [threading.Thread(target=deliver) for _ in range(2)]
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join(timeout=5)
+
+        assert not errors
+        assert all(not caller.is_alive() for caller in callers)
+        assert sends == [("term-race", "callback-once")]
+        stored = database.get_inbox_messages("term-race", limit=10)
+        assert [(row.id, row.status) for row in stored] == [(message.id, MessageStatus.DELIVERED)]
 
 
 class TestEagerInboxDelivery:
@@ -587,13 +664,14 @@ class TestManagedBridgeDelivery:
     acknowledgement); anything else uses the ordinary path with NO ack
     inferred from paste."""
 
+    @patch("cli_agent_orchestrator.services.inbox_service.is_message_pending", return_value=True)
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.managed_launch")
     def test_managed_receiver_delivers_via_bridge_never_paste(
-        self, mock_managed, mock_get, mock_monitor, mock_term_svc, mock_update
+        self, mock_managed, mock_get, mock_monitor, mock_term_svc, mock_update, mock_pending
     ):
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
@@ -602,6 +680,7 @@ class TestManagedBridgeDelivery:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
+        mock_pending.assert_called_once_with(1)
         mock_managed.deliver_inbox_via_bridge.assert_called_once_with(
             "term-1", message_id=1, message="hello", sender_id="sender-1"
         )
@@ -627,13 +706,14 @@ class TestManagedBridgeDelivery:
         mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
         mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
 
+    @patch("cli_agent_orchestrator.services.inbox_service.is_message_pending", return_value=True)
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.managed_launch")
     def test_managed_bridge_unavailable_preserves_pending_never_pastes(
-        self, mock_managed, mock_get, mock_monitor, mock_term_svc, mock_update
+        self, mock_managed, mock_get, mock_monitor, mock_term_svc, mock_update, mock_pending
     ):
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
@@ -648,5 +728,212 @@ class TestManagedBridgeDelivery:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
+        mock_pending.assert_called_once_with(1)
         mock_term_svc.send_input.assert_not_called()
         mock_update.assert_not_called()
+
+    def test_two_service_instances_enter_the_managed_bridge_once(
+        self, isolated_memory_db, monkeypatch
+    ):
+        database.create_terminal("term-managed-race", "cao-race", "worker", "codex")
+        message = database.create_inbox_message(
+            "sender-1",
+            "term-managed-race",
+            "managed-callback-once",
+        )
+        real_get_pending = database.get_pending_messages
+        both_selected = threading.Barrier(2)
+
+        def synchronized_get(terminal_id, limit=1):
+            selected = real_get_pending(terminal_id, limit=limit)
+            both_selected.wait(timeout=5)
+            return selected
+
+        bridge_calls = []
+        bridge_lock = threading.Lock()
+
+        def bridge(*args, **kwargs):
+            with bridge_lock:
+                bridge_calls.append((args, kwargs))
+            return True
+
+        monkeypatch.setattr(inbox_service, "get_pending_messages", synchronized_get)
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "managed_control_identity",
+            lambda _terminal_id: {"state": "admitted"},
+        )
+        monkeypatch.setattr(inbox_service.managed_launch, "deliver_inbox_via_bridge", bridge)
+
+        services = [InboxService(), InboxService()]
+        errors = []
+
+        def deliver(service):
+            try:
+                service.deliver_pending("term-managed-race")
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        callers = [threading.Thread(target=deliver, args=(service,)) for service in services]
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join(timeout=5)
+
+        assert not errors
+        assert all(not caller.is_alive() for caller in callers)
+        assert len(bridge_calls) == 1
+        stored = database.get_inbox_messages("term-managed-race", limit=10)
+        assert [(row.id, row.status) for row in stored] == [(message.id, MessageStatus.DELIVERED)]
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX process semantics")
+    @pytest.mark.parametrize("crash_after_ack", [False, True])
+    def test_managed_process_death_reconciles_one_provider_effect(
+        self, isolated_memory_db, monkeypatch, tmp_path, crash_after_ack
+    ):
+        database.create_terminal("term-managed-crash", "cao-crash", "worker", "codex")
+        message = database.create_inbox_message(
+            "sender-1",
+            "term-managed-crash",
+            "survive-process-death",
+        )
+        ack_path = tmp_path / "provider-ack"
+        effects_path = tmp_path / "provider-effects"
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "managed_control_identity",
+            lambda _terminal_id: {"state": "admitted"},
+        )
+
+        def crashing_bridge(*args, **kwargs):
+            if crash_after_ack:
+                effects_path.write_text("effect\n", encoding="utf-8")
+                ack_path.write_text("ack\n", encoding="utf-8")
+            os._exit(77)
+
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            crashing_bridge,
+        )
+        child = os.fork()
+        if child == 0:
+            InboxService().deliver_pending("term-managed-crash")
+            os._exit(78)
+        _, wait_status = os.waitpid(child, 0)
+        assert os.waitstatus_to_exitcode(wait_status) == 77
+        assert database.get_inbox_messages("term-managed-crash", limit=1)[0].status == (
+            MessageStatus.PENDING
+        )
+
+        def reconciling_bridge(*args, **kwargs):
+            if not ack_path.exists():
+                effects_path.write_text("effect\n", encoding="utf-8")
+                ack_path.write_text("ack\n", encoding="utf-8")
+            return True
+
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            reconciling_bridge,
+        )
+        InboxService().deliver_pending("term-managed-crash")
+
+        assert effects_path.read_text(encoding="utf-8").splitlines() == ["effect"]
+        assert database.get_inbox_messages("term-managed-crash", limit=1)[0].status == (
+            MessageStatus.DELIVERED
+        )
+        assert message.id > 0
+
+    def test_managed_refusal_and_exception_stay_pending_until_retry(
+        self, isolated_memory_db, monkeypatch
+    ):
+        database.create_terminal("term-managed-retry", "cao-retry", "worker", "codex")
+        first = database.create_inbox_message("sender-1", "term-managed-retry", "refused")
+        second = database.create_inbox_message("sender-1", "term-managed-retry", "exception")
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "managed_control_identity",
+            lambda _terminal_id: {"state": "admitted"},
+        )
+
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            lambda *args, **kwargs: False,
+        )
+        InboxService().deliver_pending("term-managed-retry")
+        assert database.get_inbox_messages("term-managed-retry", limit=2)[0].status == (
+            MessageStatus.PENDING
+        )
+
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            lambda *args, **kwargs: True,
+        )
+        InboxService().deliver_pending("term-managed-retry")
+        stored = database.get_inbox_messages("term-managed-retry", limit=2)
+        assert [(row.id, row.status) for row in stored] == [
+            (first.id, MessageStatus.DELIVERED),
+            (second.id, MessageStatus.PENDING),
+        ]
+
+        def bridge_error(*args, **kwargs):
+            raise RuntimeError("bridge failed before a usable result")
+
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            bridge_error,
+        )
+        InboxService().deliver_pending("term-managed-retry")
+        assert database.get_inbox_messages("term-managed-retry", limit=2)[1].status == (
+            MessageStatus.PENDING
+        )
+
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            lambda *args, **kwargs: True,
+        )
+        InboxService().deliver_pending("term-managed-retry")
+        assert database.get_inbox_messages("term-managed-retry", limit=2)[1].status == (
+            MessageStatus.DELIVERED
+        )
+
+    def test_managed_lock_timeout_leaves_pending_for_a_later_cycle(
+        self, isolated_memory_db, monkeypatch
+    ):
+        database.create_terminal("term-managed-busy", "cao-busy", "worker", "codex")
+        message = database.create_inbox_message("sender-1", "term-managed-busy", "later")
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "managed_control_identity",
+            lambda _terminal_id: {"state": "admitted"},
+        )
+        bridge = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            bridge,
+        )
+        monkeypatch.setattr(inbox_service, "MANAGED_DELIVERY_LOCK_TIMEOUT_SECONDS", 0.02)
+
+        lock = InboxService._managed_delivery_lock(message.id)
+        lock.acquire()
+        try:
+            InboxService().deliver_pending("term-managed-busy")
+        finally:
+            lock.release()
+
+        bridge.assert_not_called()
+        assert database.get_inbox_messages("term-managed-busy", limit=1)[0].status == (
+            MessageStatus.PENDING
+        )
+
+        InboxService().deliver_pending("term-managed-busy")
+        bridge.assert_called_once()
+        assert database.get_inbox_messages("term-managed-busy", limit=1)[0].status == (
+            MessageStatus.DELIVERED
+        )

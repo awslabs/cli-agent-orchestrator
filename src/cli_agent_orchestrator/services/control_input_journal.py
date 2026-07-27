@@ -93,7 +93,10 @@ from cli_agent_orchestrator.services.control_input_contract import (
 #: rather than left at 1 because the recorded version is re-stamped by the
 #: additive migration below, so it describes the shape a journal actually
 #: has now — not the shape it was born with.
-CONTROL_INPUT_JOURNAL_SCHEMA_VERSION = 2
+#: 3 adds ``chord``, ``chord_attempted``, ``chord_sent`` for schema-v2
+#: chord controls (the chord mirrors the enter fields so a replay of a
+#: lost response can report how far a text-then-chord write got).
+CONTROL_INPUT_JOURNAL_SCHEMA_VERSION = 3
 
 # --- Record states --------------------------------------------------------
 
@@ -145,6 +148,9 @@ CREATE TABLE IF NOT EXISTS control_input_request (
   reason_code TEXT,
   chunks_sent INTEGER,
   enter_attempted INTEGER,
+  chord TEXT,
+  chord_attempted INTEGER,
+  chord_sent INTEGER,
   owner_pid INTEGER NOT NULL,
   owner_token TEXT NOT NULL,
   opened_at TEXT NOT NULL,
@@ -173,7 +179,12 @@ CREATE TRIGGER IF NOT EXISTS cie_no_delete BEFORE DELETE ON control_input_event
 #: Each is nullable — an existing row records a request that was bound
 #: before this identity existed, and inventing a value for it would
 #: manufacture a binding nobody ever observed.
-_ADDITIVE_REQUEST_COLUMNS: Tuple[Tuple[str, str], ...] = (("server_socket_path", "TEXT"),)
+_ADDITIVE_REQUEST_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("server_socket_path", "TEXT"),
+    ("chord", "TEXT"),
+    ("chord_attempted", "INTEGER"),
+    ("chord_sent", "INTEGER"),
+)
 
 
 class ControlInputJournalError(RuntimeError):
@@ -292,10 +303,13 @@ class ControlInputRecord:
     reason_code: Optional[str]
     chunks_sent: Optional[int]
     enter_attempted: Optional[bool]
-    owner_pid: int
-    owner_token: str
-    opened_at: str
-    updated_at: str
+    chord: Optional[str] = None
+    chord_attempted: Optional[bool] = None
+    chord_sent: Optional[bool] = None
+    owner_pid: int = 0
+    owner_token: str = ""
+    opened_at: str = ""
+    updated_at: str = ""
     events: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
 
     @property
@@ -322,6 +336,9 @@ class ControlInputRecord:
             "reason_code": self.reason_code,
             "chunks_sent": self.chunks_sent,
             "enter_attempted": self.enter_attempted,
+            "chord": self.chord,
+            "chord_attempted": self.chord_attempted,
+            "chord_sent": self.chord_sent,
             "opened_at": self.opened_at,
             "updated_at": self.updated_at,
             "events": [dict(event) for event in self.events],
@@ -605,6 +622,9 @@ class ControlInputJournal:
         *,
         chunks_sent: Optional[int] = None,
         enter_attempted: Optional[bool] = None,
+        chord: Optional[str] = None,
+        chord_attempted: Optional[bool] = None,
+        chord_sent: Optional[bool] = None,
         evidence_digest: Optional[str] = None,
     ) -> ControlInputRecord:
         """tmux accepted every write, including any submitting Enter.
@@ -614,12 +634,20 @@ class ControlInputJournal:
         submitted.  A record that omitted it could not answer the only
         question a caller replaying a lost response actually has: whether
         the provider has already started acting on the control.
+
+        The ``chord`` fields mirror the enter ones for v2 chord controls,
+        where the chord replaces Enter as the submit/steer effect: a
+        delivered chord control recorded ``chord_sent`` so a replay knows
+        the steer effect landed, not just the text.
         """
         return self._transition(
             request_id,
             to_state=DELIVERED,
             chunks_sent=chunks_sent,
             enter_attempted=enter_attempted,
+            chord=chord,
+            chord_attempted=chord_attempted,
+            chord_sent=chord_sent,
             evidence_digest=evidence_digest,
         )
 
@@ -650,6 +678,9 @@ class ControlInputJournal:
         reason_code: str,
         chunks_sent: Optional[int] = None,
         enter_attempted: Optional[bool] = None,
+        chord: Optional[str] = None,
+        chord_attempted: Optional[bool] = None,
+        chord_sent: Optional[bool] = None,
         evidence_digest: Optional[str] = None,
     ) -> ControlInputRecord:
         """Record that the pane's state is unknowable for this request.
@@ -664,6 +695,9 @@ class ControlInputJournal:
             reason_code=reason_code,
             chunks_sent=chunks_sent,
             enter_attempted=enter_attempted,
+            chord=chord,
+            chord_attempted=chord_attempted,
+            chord_sent=chord_sent,
             evidence_digest=evidence_digest,
         )
 
@@ -675,6 +709,9 @@ class ControlInputJournal:
         reason_code: Optional[str] = None,
         chunks_sent: Optional[int] = None,
         enter_attempted: Optional[bool] = None,
+        chord: Optional[str] = None,
+        chord_attempted: Optional[bool] = None,
+        chord_sent: Optional[bool] = None,
         evidence_digest: Optional[str] = None,
     ) -> ControlInputRecord:
         # A reason is bound to exactly one outcome, so a reason that
@@ -724,13 +761,19 @@ class ControlInputJournal:
             conn.execute(
                 "UPDATE control_input_request SET state=?, reason_code=?, "
                 "chunks_sent=COALESCE(?, chunks_sent), "
-                "enter_attempted=COALESCE(?, enter_attempted), updated_at=? "
+                "enter_attempted=COALESCE(?, enter_attempted), "
+                "chord=COALESCE(?, chord), "
+                "chord_attempted=COALESCE(?, chord_attempted), "
+                "chord_sent=COALESCE(?, chord_sent), updated_at=? "
                 "WHERE request_id=? AND state=?",
                 (
                     to_state,
                     reason_code,
                     chunks_sent,
                     None if enter_attempted is None else int(enter_attempted),
+                    chord,
+                    None if chord_attempted is None else int(chord_attempted),
+                    None if chord_sent is None else int(chord_sent),
                     moment,
                     request_id,
                     from_state,
@@ -776,8 +819,9 @@ class ControlInputJournal:
             row = conn.execute(
                 "SELECT request_id, terminal_id, pane_id, window_id, pane_pid, "
                 "server_socket_path, generation, request_sha256, state, reason_code, "
-                "chunks_sent, enter_attempted, owner_pid, owner_token, opened_at, "
-                "updated_at FROM control_input_request WHERE request_id=?",
+                "chunks_sent, enter_attempted, chord, chord_attempted, chord_sent, "
+                "owner_pid, owner_token, opened_at, updated_at "
+                "FROM control_input_request WHERE request_id=?",
                 (request_id,),
             ).fetchone()
             if row is None:
@@ -810,10 +854,13 @@ class ControlInputJournal:
             reason_code=row[9],
             chunks_sent=row[10],
             enter_attempted=None if row[11] is None else bool(row[11]),
-            owner_pid=int(row[12]),
-            owner_token=row[13],
-            opened_at=row[14],
-            updated_at=row[15],
+            chord=row[12],
+            chord_attempted=None if row[13] is None else bool(row[13]),
+            chord_sent=None if row[14] is None else bool(row[14]),
+            owner_pid=int(row[15]),
+            owner_token=row[16],
+            opened_at=row[17],
+            updated_at=row[18],
             events=events,
         )
 
