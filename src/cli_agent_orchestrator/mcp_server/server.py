@@ -187,9 +187,10 @@ def _create_terminal(
             runs as a background task on cao-server. The tool-call round-trip
             drops from tens of seconds to <2s, keeping it well under
             kiro-cli 2.11's ~60s per-tool client timeout.
-        initial_message: If ``defer_init=True``, this message is delivered
-            to the newly created worker once its provider finishes
-            initializing. Ignored otherwise.
+        initial_message: This message is delivered to the newly created worker
+            once its provider finishes initializing. For a new session, the
+            message selects deferred initialization automatically; for an
+            existing session, ``defer_init=True`` is required.
         initial_message_orchestration_type: Passed through to send_input for
             plugin event emission (assign/handoff).
         model: Explicit per-call model override for the new terminal, applied
@@ -303,8 +304,7 @@ def _create_terminal(
             params["model"] = model
 
         json_body = None
-        if defer_init:
-            assert initial_message is not None  # guarded above for new sessions
+        if initial_message is not None:
             json_body = {"initial_message": initial_message}
             if initial_message_orchestration_type is not None:
                 json_body["initial_message_orchestration_type"] = (

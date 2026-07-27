@@ -62,6 +62,8 @@ async def create_session(
     existing deferred-init path so provider initialization and delivery can
     continue after the session response. Omitting it preserves the synchronous
     initialization behavior used by existing callers.
+    On the deferred path, the ``post_create_session`` plugin event is dispatched
+    before provider initialization and message delivery finish.
     """
     if initial_message == "":
         raise ValueError("initial_message must not be empty")

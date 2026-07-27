@@ -193,6 +193,43 @@ class TestCreateTerminalProviderResolution:
             timeout=_mcp_timeout(),
         )
 
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.generate_session_name",
+        return_value="cao-new-session",
+    )
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.resolve_provider",
+        return_value="codex",
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_new_session_initial_message_is_forwarded_without_defer_flag(
+        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+    ):
+        """An initial message cannot be dropped when defer_init keeps its default."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "codex"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            _create_terminal(
+                "reviewer",
+                initial_message="Review the current change",
+            )
+
+        mock_requests.post.assert_called_once_with(
+            f"{API_BASE_URL}/sessions",
+            params={
+                "provider": "codex",
+                "agent_profile": "reviewer",
+                "session_name": "cao-new-session",
+            },
+            json={"initial_message": "Review the current change"},
+            timeout=_mcp_timeout(),
+        )
+
     @patch("cli_agent_orchestrator.mcp_server.server.requests")
     def test_defer_init_without_message_on_new_session_raises(self, mock_requests):
         """A bare defer flag still fails rather than changing semantics silently."""
