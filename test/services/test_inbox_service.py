@@ -1682,6 +1682,46 @@ class TestNativeManagedV2InboxDelivery:
         # The bracket-framing paste path is never used for a managed receiver.
         send_input.assert_not_called()
 
+    def test_two_same_sender_messages_submit_as_one_payload(self, isolated_memory_db, monkeypatch):
+        terminal_id = "ntv00011"
+        generation = "gen-native-11"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        first = database.create_inbox_message("supervisor-1", terminal_id, "first half")
+        second = database.create_inbox_message("supervisor-1", terminal_id, "second half")
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            return self._result(ACCEPTED)
+
+        _, send_input = self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+
+        # num_messages=0 drains all pending: the same-sender run must be
+        # LF-joined and submitted ONCE — a second message is never typed
+        # after the first turn has already started.
+        InboxService().deliver_pending(terminal_id, num_messages=0)
+
+        assert control_calls == [
+            (
+                terminal_id,
+                {
+                    "text": "first half\nsecond half",
+                    "expected_identity": {
+                        "terminal_id": terminal_id,
+                        "terminal_generation": generation,
+                    },
+                },
+            )
+        ]
+        send_input.assert_not_called()
+        stored = database.get_inbox_messages(terminal_id, limit=10)
+        assert [(row.id, row.status) for row in stored] == [
+            (first.id, MessageStatus.DELIVERED),
+            (second.id, MessageStatus.DELIVERED),
+        ]
+
     def test_multi_kb_multiline_payload_delivered_once_verbatim(
         self, isolated_memory_db, monkeypatch
     ):

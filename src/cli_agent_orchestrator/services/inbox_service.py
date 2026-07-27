@@ -735,7 +735,7 @@ class InboxService:
                             if preparation is not None:
                                 preparations.append(preparation)
                 if native_managed:
-                    self._send_native_managed_batch(terminal_id, batch, managed_identity)
+                    self._send_native_managed_text(terminal_id, combined, managed_identity)
                 elif registry is None:
                     terminal_service.send_input(terminal_id, combined)
                 else:
@@ -763,9 +763,10 @@ class InboxService:
             except _NativeManagedSendRefused as e:
                 for preparation in preparations:
                     self._abort_wake_confirmation(preparation)
-                # The typed refusal proves zero bytes reached the pane, so the
-                # same transient semantics apply: reset the exact rows for a
-                # later cycle; the durable control journal dedupes the retry.
+                # The typed refusal proves zero bytes reached the pane, so
+                # resetting the exact rows cannot duplicate a provider effect:
+                # the inbox row's atomic claim remains the at-most-once
+                # anchor, and a later cycle re-attempts the same payload.
                 for message in batch:
                     update_message_status(message.id, MessageStatus.PENDING)
                 logger.info(
@@ -795,47 +796,46 @@ class InboxService:
                         )
 
     @staticmethod
-    def _send_native_managed_batch(terminal_id: str, batch: list, managed_identity: dict) -> None:
-        """Send one claimed inbox run to a native-TUI managed receiver.
+    def _send_native_managed_text(terminal_id: str, text: str, managed_identity: dict) -> None:
+        """Send one claimed sender run to a native-TUI managed receiver.
 
-        One payload send per exact message through the generation-bound
-        native payload path: the composer plan inside is read from the bound
+        The run's messages are LF-joined into ONE payload, exactly like the
+        unmanaged path's combined send: one composer submission per sender
+        run, so a second message is never typed after the first turn has
+        already started.  The composer plan inside is read from the bound
         generation's recorded provider_version (no live probe) and types
         literal bytes only — multiline included, no bracketed-paste framing.
-        The inbox row's atomic claim is the at-most-once anchor: a claimed
-        row is never re-typed, and an already DELIVERED row survives any
-        bounce exactly as on the ordinary path.  ``send_input``'s managed
-        guard stays untouched: this path never passes through it, and no
+        The inbox rows' atomic claim is the at-most-once anchor: claimed
+        rows are never re-typed, and terminalized rows survive any bounce
+        exactly as on the ordinary path.  ``send_input``'s managed guard
+        stays untouched: this path never passes through it, and no
         acknowledgement is inferred beyond the typed ACCEPTED outcome.
 
         Raises:
-            _NativeManagedSendRefused: a message was refused with zero bytes
+            _NativeManagedSendRefused: the send was refused with zero bytes
                 proven; the caller resets the batch to PENDING.
-            _NativeManagedSendUndeliverable: a message ended neither accepted
+            _NativeManagedSendUndeliverable: the send ended neither accepted
                 nor refused; the caller terminalizes the batch under the
                 existing hard-failure semantics (no blind replay).
         """
-        generation = managed_identity.get("generation")
-        for message in batch:
-            result = control_input_service.deliver_native_inbox_payload(
-                terminal_id,
-                text=message.message,
-                expected_identity={
-                    "terminal_id": terminal_id,
-                    "terminal_generation": generation,
-                },
+        result = control_input_service.deliver_native_inbox_payload(
+            terminal_id,
+            text=text,
+            expected_identity={
+                "terminal_id": terminal_id,
+                "terminal_generation": managed_identity.get("generation"),
+            },
+        )
+        if result.outcome == ACCEPTED:
+            return
+        if result.outcome == REFUSED:
+            raise _NativeManagedSendRefused(
+                f"sender run refused ({result.reason_code}); zero bytes reached the pane"
             )
-            if result.outcome == ACCEPTED:
-                continue
-            if result.outcome == REFUSED:
-                raise _NativeManagedSendRefused(
-                    f"message {message.id} refused ({result.reason_code}); "
-                    "zero bytes reached the pane"
-                )
-            raise _NativeManagedSendUndeliverable(
-                f"message {message.id} ended {result.outcome!r} "
-                f"({result.reason_code}); not reattempted blindly"
-            )
+        raise _NativeManagedSendUndeliverable(
+            f"sender run ended {result.outcome!r} "
+            f"({result.reason_code}); not reattempted blindly"
+        )
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.
