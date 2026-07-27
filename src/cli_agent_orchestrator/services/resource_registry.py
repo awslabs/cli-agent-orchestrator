@@ -923,7 +923,8 @@ _BRIDGE = "managed_provider_bridge._serve"
 _TS_DECLARE = f"{_TS}:855"  # registry.declare in _register_v2_terminal_resources
 _TS_MARK = f"{_TS}:903"  # registry.register_created in _mark_v2_resource_created
 _TS_MONITOR = f"{_TS}:871"  # registry.monitor in _register_v2_terminal_resources
-_TS_DELETE = f"{_TS}:1146"  # registry.delete in _deregister_v2_terminal_resources
+_TS_REUSE_DELETE = f"{_TS}:1000"  # registry.delete in _retire_reused_tmux_observation
+_TS_DELETE = f"{_TS}:1240"  # registry.delete in _deregister_v2_terminal_resources
 _CS_RESOLVE = f"{_CS}:112"  # registry.resolve_fs_path in cleanup_old_data
 _BR_DECLARE = f"{_BR}:3042"  # registry.declare in _declare_bridge_resources
 _BR_MARK = f"{_BR}:3086"  # registry.register_created in _mark_bridge_resource_created
@@ -951,6 +952,7 @@ _MANIFEST_SPEC: tuple[tuple[str, str, str, str], ...] = (
     (_TS_MARK, "register_created", "watchdog", _CREATE),
     # --- tmux + provider + DB row set
     (_TS_DECLARE, "declare", "tmux_window", _CREATE),
+    (_TS_REUSE_DELETE, "delete", "tmux_window", _CREATE),
     (_TS_DELETE, "delete", "tmux_window", _DELETE),
     (_TS_DECLARE, "declare", "provider_instance", _CREATE),
     (_TS_DELETE, "delete", "provider_instance", _DELETE),
