@@ -2507,3 +2507,179 @@ class TestSequenceReadinessGate:
         )
         assert delivered.outcome == ACCEPTED
         assert [write["key"] for write in client.writes] == ["Escape"]
+
+
+class TestSequenceJournalReplay:
+    """The v5 stored-row replay: stored per-event results, zero new I/O."""
+
+    def test_delivered_sequence_replays_stored_event_outcomes(self, tmux, journal):
+        events = [
+            {"type": "text", "text": "first"},
+            {"type": "key", "key": "Enter"},
+            {"type": "key", "key": "Escape"},
+        ]
+        first = _deliver_sequence(journal, events=events)
+        assert first.outcome == ACCEPTED
+        writes_after = len(tmux.writes)
+
+        replay = _deliver_sequence(journal, events=events)
+        assert replay.outcome == ACCEPTED
+        assert replay.request_schema_version == 3
+        assert len(tmux.writes) == writes_after  # zero new writes
+        assert [event["outcome"] for event in replay.events] == ["sent"] * 3
+        assert replay.events[2] == {
+            "ordinal": 2, "type": "key", "key": "Escape", "outcome": "sent",
+        }
+        # The exact-id lookup answers the same stored row.
+        looked = service.lookup_control_input(CONTROL, journal=journal)
+        assert looked.request_schema_version == 3
+        assert [event["outcome"] for event in looked.events] == ["sent"] * 3
+
+    def test_ambiguous_sequence_replays_the_stored_boundary(self, journal):
+        calls = {"count": 0}
+
+        def fail_on_second():
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise TmuxLiteralSendError("tmux went away", chunks_sent=0, enter_attempted=False)
+
+        client = FakeTmux(on_write=fail_on_second)
+        events = [
+            {"type": "text", "text": "typed first"},
+            {"type": "key", "key": "Escape"},
+            {"type": "key", "key": "C-c"},
+        ]
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(service, "_tmux_client", lambda: client)
+            mp.setattr(service, "_terminal_metadata", lambda terminal_id: _metadata())
+            mp.setattr(service, "_managed_identity", lambda terminal_id: None)
+            first = _deliver_sequence(journal, events=events)
+        assert first.outcome == AMBIGUOUS
+        writes_after = len(client.writes)
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(service, "_tmux_client", lambda: client)
+            mp.setattr(service, "_terminal_metadata", lambda terminal_id: _metadata())
+            mp.setattr(service, "_managed_identity", lambda terminal_id: None)
+            replay = _deliver_sequence(journal, events=events)
+        assert replay.outcome == AMBIGUOUS
+        assert len(client.writes) == writes_after  # never auto-replayed
+        assert [event["outcome"] for event in replay.events] == [
+            "sent", "attempted", "skipped",
+        ]
+
+    def test_refused_sequence_stores_and_rearms_event_outcomes(self, journal):
+        client = FakeTmux()
+        events = [{"type": "text", "text": "busy test"}, {"type": "key", "key": "Escape"}]
+        with _pane_held_elsewhere():
+            with pytest.MonkeyPatch().context() as mp:
+                mp.setattr(service, "_tmux_client", lambda: client)
+                mp.setattr(service, "_terminal_metadata", lambda terminal_id: _metadata())
+                mp.setattr(service, "_managed_identity", lambda terminal_id: None)
+                refused = _deliver_sequence(journal, events=events)
+        assert refused.outcome == REFUSED
+        record = journal.get(CONTROL)
+        assert [e["outcome"] for e in record.sequence_events] == ["refused", "refused"]
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(service, "_tmux_client", lambda: client)
+            mp.setattr(service, "_terminal_metadata", lambda terminal_id: _metadata())
+            mp.setattr(service, "_managed_identity", lambda terminal_id: None)
+            delivered = _deliver_sequence(journal, events=events)
+        assert delivered.outcome == ACCEPTED
+        record = journal.get(CONTROL)
+        assert [e["outcome"] for e in record.sequence_events] == ["sent", "sent"]
+
+
+class TestSequenceSubmissionBarrier:
+    """A sequence's text+Enter pair reuses the cond-0026 barrier (Codex)."""
+
+    def _codex_metadata(self):
+        return _metadata(provider="codex")
+
+    def test_text_then_enter_crosses_the_barrier_once(self, monkeypatch, journal):
+        from cli_agent_orchestrator.services import native_pane_input
+
+        monkeypatch.setattr(service, "_terminal_metadata", lambda terminal_id: self._codex_metadata())
+        monkeypatch.setattr(service, "_managed_identity", lambda terminal_id: None)
+        client = FakeTmux()
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        observations = []
+        monkeypatch.setattr(
+            native_pane_input,
+            "await_compose_visible",
+            lambda pane_id, text, *, barrier, deadline_monotonic: observations.append(("compose", text)) or True,
+        )
+        monkeypatch.setattr(
+            native_pane_input,
+            "observe_submission",
+            lambda pane_id, text, *, barrier, deadline_monotonic: ("submitted", "evidence://ref-1"),
+        )
+        events = [{"type": "text", "text": "codex task"}, {"type": "key", "key": "Enter"}]
+        result = _deliver_sequence(journal, events=events)
+        assert result.outcome == ACCEPTED
+        assert result.submission_observed == "submitted"
+        assert result.submission_evidence_ref == "evidence://ref-1"
+        # The barrier's two writes: text unsubmitted, then exactly one Enter.
+        assert [
+            (write.get("text"), write.get("submit")) for write in client.writes
+        ] == [("codex task", False), ("", True)]
+        assert observations == [("compose", "codex task")]
+        assert [event["outcome"] for event in result.events] == ["sent", "sent"]
+        # The observation is journaled with the delivered record.
+        record = journal.get(CONTROL)
+        assert record.submission_observed == "submitted"
+        assert record.submission_evidence_ref == "evidence://ref-1"
+
+    def test_the_barrier_withholds_the_enter_when_text_never_settles(self, monkeypatch, journal):
+        from cli_agent_orchestrator.services import native_pane_input
+
+        monkeypatch.setattr(service, "_terminal_metadata", lambda terminal_id: self._codex_metadata())
+        monkeypatch.setattr(service, "_managed_identity", lambda terminal_id: None)
+        client = FakeTmux()
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        monkeypatch.setattr(
+            native_pane_input, "await_compose_visible",
+            lambda pane_id, text, *, barrier, deadline_monotonic: False,
+        )
+        events = [{"type": "text", "text": "resting"}, {"type": "key", "key": "Enter"}]
+        result = _deliver_sequence(journal, events=events)
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        # Zero Enters: the Enter event is provably skipped, the text is
+        # provably sent, and the sequence is terminal — never auto-replayed.
+        assert [event["outcome"] for event in result.events] == ["sent", "skipped"]
+        assert all(not write.get("submit") for write in client.writes)
+        record = journal.get(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        assert record.enter_attempted is False
+        assert [e["outcome"] for e in record.sequence_events] == ["sent", "skipped"]
+
+    def test_an_unsubmitted_observation_never_sends_a_second_enter(self, monkeypatch, journal):
+        from cli_agent_orchestrator.services import native_pane_input
+
+        monkeypatch.setattr(service, "_terminal_metadata", lambda terminal_id: self._codex_metadata())
+        monkeypatch.setattr(service, "_managed_identity", lambda terminal_id: None)
+        client = FakeTmux()
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        monkeypatch.setattr(
+            native_pane_input, "await_compose_visible",
+            lambda pane_id, text, *, barrier, deadline_monotonic: True,
+        )
+        monkeypatch.setattr(
+            native_pane_input, "observe_submission",
+            lambda pane_id, text, *, barrier, deadline_monotonic: ("unsubmitted", "evidence://ref-2"),
+        )
+        events = [
+            {"type": "text", "text": "swallowed"},
+            {"type": "key", "key": "Enter"},
+            {"type": "key", "key": "Escape"},
+        ]
+        result = _deliver_sequence(journal, events=events)
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        assert result.submission_observed == "unsubmitted"
+        # Exactly one Enter ever; the tail never ran.
+        enters = [write for write in client.writes if write.get("submit")]
+        assert len(enters) == 1
+        assert [event["outcome"] for event in result.events] == ["sent", "sent", "skipped"]

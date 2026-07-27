@@ -84,9 +84,11 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_OWNER_LOST_BEFORE_WRITE,
     REASON_OWNER_LOST_MID_WRITE,
     REFUSED,
+    SEQUENCE_EVENT_OUTCOMES,
     SUBMISSION_OBSERVED_VALUES,
     is_reattemptable,
     is_valid_pane_id,
+    normalize_sequence_events,
     outcome_for_reason,
 )
 
@@ -104,13 +106,24 @@ from cli_agent_orchestrator.services.control_input_contract import (
 #: was never recorded is projected as exactly that, never backfilled or
 #: inferred.  The v3 -> v4 migration snapshots the journal file before the
 #: first ALTER (see ``_snapshot_before_v4_migration``).
-CONTROL_INPUT_JOURNAL_SCHEMA_VERSION = 4
+#: 5 adds ``control_input_sequence_event``: the ordered structured events
+#: of a schema-v3 sequence control (cond-0175) and their per-event
+#: outcomes, stored as typed columns — never flattened into an escaped
+#: string.  One sequence is one request row and one at-most-once
+#: operation; the child rows carry the ordered detail.  The v4 -> v5
+#: migration creates the table and snapshots the journal file first (see
+#: ``_snapshot_before_v5_migration``).
+CONTROL_INPUT_JOURNAL_SCHEMA_VERSION = 5
 
 #: Where the pre-migration copy of a v3 journal is written before the v4
 #: ALTERs run.  Sibling of the journal file, created at most once: an
 #: existing snapshot is the original pre-migration evidence and is never
 #: overwritten by a later open.
 V4_MIGRATION_SNAPSHOT_SUFFIX = ".pre-v4-migration.sqlite3"
+
+#: Same rule for the v4 -> v5 migration: the pre-migration copy is taken
+#: before the sequence-event table is created, at most once.
+V5_MIGRATION_SNAPSHOT_SUFFIX = ".pre-v5-migration.sqlite3"
 
 # --- Record states --------------------------------------------------------
 
@@ -181,6 +194,16 @@ CREATE TABLE IF NOT EXISTS control_input_event (
   evidence_digest TEXT,
   at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS control_input_sequence_event (
+  request_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  text TEXT,
+  key TEXT,
+  chord TEXT,
+  outcome TEXT,
+  PRIMARY KEY (request_id, ordinal)
+) WITHOUT ROWID;
 CREATE TRIGGER IF NOT EXISTS cie_no_update BEFORE UPDATE ON control_input_event
   BEGIN SELECT RAISE(ABORT,'control_input_event is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS cie_no_delete BEFORE DELETE ON control_input_event
@@ -326,6 +349,57 @@ def _snapshot_before_v4_migration(db_path: Path) -> Optional[Path]:
     return snapshot_path
 
 
+def _journal_needs_v5_migration(db_path: Path) -> bool:
+    """Whether opening ``db_path`` will create the v5 sequence table.
+
+    Same rules as the v4 check: False for a journal that does not exist
+    yet (it is born at the current shape), for one whose request table was
+    never created, and for one already carrying the sequence-event table
+    (the migration has already run, and re-snapshotting would overwrite
+    the original pre-migration evidence).
+    """
+    if not db_path.exists():
+        return False
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    if "control_input_request" not in tables:
+        return False
+    return "control_input_sequence_event" not in tables
+
+
+def _snapshot_before_v5_migration(db_path: Path) -> Optional[Path]:
+    """Copy a pre-v5 journal aside before its sequence table is created.
+
+    Same discipline as the v4 snapshot: a consistent backup API copy,
+    written at most once, before the first DDL that changes the shape.
+    Returns the snapshot path when one was written, else None.
+    """
+    if not _journal_needs_v5_migration(db_path):
+        return None
+    snapshot_path = db_path.with_name(db_path.name + V5_MIGRATION_SNAPSHOT_SUFFIX)
+    if snapshot_path.exists():
+        return None
+    source = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        destination = sqlite3.connect(str(snapshot_path))
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
+    os.chmod(snapshot_path, 0o600)
+    return snapshot_path
+
+
 @dataclass(frozen=True)
 class ControlInputBinding:
     """Everything one request id is permanently bound to.
@@ -389,6 +463,13 @@ class ControlInputRecord:
     # which is a recorded observation that could not be classified.
     submission_observed: Optional[str] = None
     submission_evidence_ref: Optional[str] = None
+    # The ordered events of a schema-v3 sequence control (v5), each with
+    # its per-event outcome — ``None`` for v1/v2 records, which have no
+    # events.  A NULL outcome on a stored event is the typed null: the
+    # record was sealed (or swept) before an outcome was recorded for
+    # that event, and it is projected as exactly that, never replaced by
+    # an invented one.
+    sequence_events: Optional[Tuple[Dict[str, Any], ...]] = None
     owner_pid: int = 0
     owner_token: str = ""
     opened_at: str = ""
@@ -424,6 +505,11 @@ class ControlInputRecord:
             "chord_sent": self.chord_sent,
             "submission_observed": self.submission_observed,
             "submission_evidence_ref": self.submission_evidence_ref,
+            "sequence_events": (
+                None
+                if self.sequence_events is None
+                else [dict(event) for event in self.sequence_events]
+            ),
             "opened_at": self.opened_at,
             "updated_at": self.updated_at,
             "events": [dict(event) for event in self.events],
@@ -467,6 +553,9 @@ class ControlInputJournal:
         # is where the v4 ALTERs run, and it is taken at most once so the
         # pre-migration evidence is never overwritten by a later open.
         _snapshot_before_v4_migration(self._path)
+        # Same discipline for the v5 sequence table: snapshot before the
+        # DDL that creates it.
+        _snapshot_before_v5_migration(self._path)
         # Concurrent first-open constructors race on the create
         # transaction; creation is idempotent, so a locked loser retries.
         last_error: Optional[sqlite3.Error] = None
@@ -526,7 +615,11 @@ class ControlInputJournal:
 
     # --- Intent -----------------------------------------------------------
 
-    def open_intent(self, binding: ControlInputBinding) -> ControlInputRecord:
+    def open_intent(
+        self,
+        binding: ControlInputBinding,
+        sequence_events: Optional[List[Dict[str, Any]]] = None,
+    ) -> ControlInputRecord:
         """Commit the request's identity before any pane I/O.
 
         Idempotent for an identical re-arrival: a client that retried the
@@ -537,9 +630,23 @@ class ControlInputJournal:
         module docstring for why that is safe and why no other state
         gets the same treatment.
 
+        ``sequence_events`` is the ordered payload of a schema-v3
+        sequence control (v5): the events are stored structured, one row
+        per event, inside the same transaction as the intent — a sequence
+        whose events were only half-stored must never exist.  They are
+        stored with a NULL outcome ("no outcome recorded yet"); outcomes
+        are written by the terminal transitions.  v1/v2 requests pass
+        nothing and get no rows.  The request digest already binds the
+        exact events, so an identical re-arrival needs no event
+        re-comparison: same digest, same events.
+
         Raises:
             ControlInputRebound: The id is bound to a different control.
+            ValueError: The events are not a well-formed v3 sequence.
         """
+        normalised_events = (
+            None if sequence_events is None else normalize_sequence_events(sequence_events)
+        )
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -623,6 +730,15 @@ class ControlInputJournal:
                             STATE_REFUSED,
                         ),
                     )
+                    # The per-event refusal outcomes clear with the live
+                    # row for the same reason: they belong to the attempt
+                    # that is over, and the re-armed request must not look
+                    # pre-failed.  NULL is "no outcome recorded yet".
+                    conn.execute(
+                        "UPDATE control_input_sequence_event SET outcome=NULL "
+                        "WHERE request_id=?",
+                        (binding.request_id,),
+                    )
                     self._append_event(
                         conn, binding.request_id, STATE_REFUSED, INTENT, None, moment
                     )
@@ -651,6 +767,20 @@ class ControlInputJournal:
                     moment,
                 ),
             )
+            if normalised_events is not None:
+                for ordinal, event in enumerate(normalised_events):
+                    conn.execute(
+                        "INSERT INTO control_input_sequence_event(request_id, ordinal, "
+                        "type, text, key, chord, outcome) VALUES (?,?,?,?,?,?,NULL)",
+                        (
+                            binding.request_id,
+                            ordinal,
+                            event["type"],
+                            event.get("text"),
+                            event.get("key"),
+                            event.get("chord"),
+                        ),
+                    )
             self._append_event(conn, binding.request_id, None, INTENT, None, moment)
             conn.commit()
         except ControlInputJournalError:
@@ -717,6 +847,7 @@ class ControlInputJournal:
         chord_sent: Optional[bool] = None,
         submission_observed: Optional[str] = None,
         submission_evidence_ref: Optional[str] = None,
+        sequence_event_outcomes: Optional[List[Tuple[int, str]]] = None,
         evidence_digest: Optional[str] = None,
     ) -> ControlInputRecord:
         """tmux accepted every write, including any submitting Enter.
@@ -748,6 +879,7 @@ class ControlInputJournal:
             chord_sent=chord_sent,
             submission_observed=submission_observed,
             submission_evidence_ref=submission_evidence_ref,
+            sequence_event_outcomes=sequence_event_outcomes,
             evidence_digest=evidence_digest,
         )
 
@@ -756,6 +888,7 @@ class ControlInputJournal:
         request_id: str,
         *,
         reason_code: str,
+        sequence_event_outcomes: Optional[List[Tuple[int, str]]] = None,
         evidence_digest: Optional[str] = None,
     ) -> ControlInputRecord:
         """Record a refusal decided before any byte was written.
@@ -763,11 +896,17 @@ class ControlInputJournal:
         Legal only from ``intent``.  Calling it after the write is
         claimed is refused rather than recorded, because by then no
         evidence can support the claim that nothing was written.
+
+        For a sequence control the caller passes every event's
+        ``refused`` outcome explicitly: the refusal was decided before
+        any write, so zero bytes are proven per event, and the stored
+        rows say so individually rather than by implication.
         """
         return self._transition(
             request_id,
             to_state=STATE_REFUSED,
             reason_code=reason_code,
+            sequence_event_outcomes=sequence_event_outcomes,
             evidence_digest=evidence_digest,
         )
 
@@ -783,6 +922,7 @@ class ControlInputJournal:
         chord_sent: Optional[bool] = None,
         submission_observed: Optional[str] = None,
         submission_evidence_ref: Optional[str] = None,
+        sequence_event_outcomes: Optional[List[Tuple[int, str]]] = None,
         evidence_digest: Optional[str] = None,
     ) -> ControlInputRecord:
         """Record that the pane's state is unknowable for this request.
@@ -809,6 +949,7 @@ class ControlInputJournal:
             chord_sent=chord_sent,
             submission_observed=submission_observed,
             submission_evidence_ref=submission_evidence_ref,
+            sequence_event_outcomes=sequence_event_outcomes,
             evidence_digest=evidence_digest,
         )
 
@@ -825,6 +966,7 @@ class ControlInputJournal:
         chord_sent: Optional[bool] = None,
         submission_observed: Optional[str] = None,
         submission_evidence_ref: Optional[str] = None,
+        sequence_event_outcomes: Optional[List[Tuple[int, str]]] = None,
         evidence_digest: Optional[str] = None,
     ) -> ControlInputRecord:
         # A reason is bound to exactly one outcome, so a reason that
@@ -863,6 +1005,18 @@ class ControlInputJournal:
                 f"values are {sorted(SUBMISSION_OBSERVED_VALUES)} and None means no "
                 "observation was taken"
             )
+        # The per-event outcome vocabulary is closed under the same rule:
+        # validated before the transaction so a bad value fails with zero
+        # mutation.  An outcome not passed is not written — the stored row
+        # keeps what it has, which for a swept record is the honest NULL.
+        if sequence_event_outcomes is not None:
+            for ordinal, outcome in sequence_event_outcomes:
+                if outcome not in SEQUENCE_EVENT_OUTCOMES:
+                    raise ControlInputJournalError(
+                        f"unknown per-event outcome {outcome!r} at ordinal {ordinal}; "
+                        f"the recorded values are {sorted(SEQUENCE_EVENT_OUTCOMES)} and "
+                        "an unrecorded outcome stays NULL"
+                    )
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -911,6 +1065,16 @@ class ControlInputJournal:
                     from_state,
                 ),
             )
+            if sequence_event_outcomes is not None:
+                # Same transaction as the state transition: the per-event
+                # outcomes and the request's terminal state are one durable
+                # fact, never two writes that a crash could split.
+                for ordinal, outcome in sequence_event_outcomes:
+                    conn.execute(
+                        "UPDATE control_input_sequence_event SET outcome=? "
+                        "WHERE request_id=? AND ordinal=?",
+                        (outcome, request_id, ordinal),
+                    )
             self._append_event(conn, request_id, from_state, to_state, reason_code, moment)
             conn.commit()
         except ControlInputJournalError:
@@ -972,6 +1136,37 @@ class ControlInputJournal:
                     (request_id,),
                 )
             )
+            sequence_rows = conn.execute(
+                "SELECT ordinal, type, text, key, chord, outcome "
+                "FROM control_input_sequence_event WHERE request_id=? ORDER BY ordinal",
+                (request_id,),
+            ).fetchall()
+            # None — not an empty tuple — marks a v1/v2 record: it has no
+            # events at all, which is a different fact from a sequence
+            # whose events are all present.  A NULL outcome stays None:
+            # the typed null for "no outcome was recorded for this event",
+            # never replaced by an invented one.
+            sequence_events = (
+                None
+                if not sequence_rows
+                else tuple(
+                    {
+                        "ordinal": seq_row[0],
+                        "type": seq_row[1],
+                        **(
+                            {"text": seq_row[2]}
+                            if seq_row[1] == "text"
+                            else {"key": seq_row[3]}
+                            if seq_row[1] == "key"
+                            else {"chord": seq_row[4]}
+                            if seq_row[1] == "chord"
+                            else {}
+                        ),
+                        "outcome": seq_row[5],
+                    }
+                    for seq_row in sequence_rows
+                )
+            )
         finally:
             conn.close()
         return ControlInputRecord(
@@ -992,6 +1187,7 @@ class ControlInputJournal:
             chord_sent=None if row[14] is None else bool(row[14]),
             submission_observed=row[15],
             submission_evidence_ref=row[16],
+            sequence_events=sequence_events,
             owner_pid=int(row[17]),
             owner_token=row[18],
             opened_at=row[19],

@@ -51,7 +51,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -1083,6 +1083,7 @@ def _from_record(
 ) -> ControlInputResult:
     """The answer a durable record already licenses, with nothing added."""
     outcome = outcome_for_state(record.state)
+    is_sequence = record.sequence_events is not None
     return ControlInputResult(
         control_id=record.request_id,
         outcome=outcome,
@@ -1116,6 +1117,20 @@ def _from_record(
         # reading transport acceptance as submission.
         submission_observed=record.submission_observed,
         submission_evidence_ref=record.submission_evidence_ref,
+        # The v5 stored per-event results, replayed exactly: a sequence
+        # record in any state returns its stored events and stored
+        # outcomes (NULL stays the typed null) with zero new I/O and
+        # nothing invented from the re-arriving request.
+        events=(
+            None
+            if record.sequence_events is None
+            else [dict(event) for event in record.sequence_events]
+        ),
+        request_schema_version=(
+            CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
+            if is_sequence
+            else CONTROL_INPUT_REQUEST_SCHEMA_VERSION
+        ),
     )
 
 
@@ -1131,6 +1146,7 @@ def _record_refusal(
     terminal_id: str,
     resolved: ResolvedControlIdentity,
     digest: str,
+    sequence_event_outcomes: Optional[List[Tuple[int, str]]] = None,
 ) -> ControlInputResult:
     """Record a refusal decided after the intent, and answer with it.
 
@@ -1139,7 +1155,12 @@ def _record_refusal(
     if the refusal was durable before the answer was sent.
     """
     try:
-        record = journal.mark_refused(control_id, reason_code=reason, evidence_digest=digest)
+        record = journal.mark_refused(
+            control_id,
+            reason_code=reason,
+            sequence_event_outcomes=sequence_event_outcomes,
+            evidence_digest=digest,
+        )
     except ControlInputTransitionRefused:
         # Another writer resolved this record first.  Its answer is the
         # durable one and stands; overwriting it with this one would tell
@@ -1214,12 +1235,15 @@ def _record_sequence_refusal(
         terminal_id=terminal_id,
         resolved=resolved,
         digest=digest,
+        sequence_event_outcomes=[
+            (index, EVENT_OUTCOME_REFUSED) for index in range(len(events))
+        ],
     )
     if result.reason_code != reason:
         # The transition was refused because another writer resolved the
         # record first; that record's answer (already returned) stands and
         # is not re-stamped with this refusal's events.
-        return replace(result, request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3)
+        return result
     return _sequence_refusal(
         control_id,
         reason,
@@ -1586,7 +1610,7 @@ def deliver_control_input(
         server_socket_path=resolved.bound_server_socket_path,
     )
     try:
-        record = book.open_intent(binding)
+        record = book.open_intent(binding, sequence_events=normalized_events)
     except ControlInputRebound as exc:
         return _refuse(REASON_REQUEST_REBOUND, str(exc), resolved=resolved)
 
@@ -1601,15 +1625,9 @@ def deliver_control_input(
     if record.is_terminal:
         # The at-most-once replay.  A retried request after a lost
         # response is answered from the record rather than re-executed.
-        result = _from_record(record, resolved=resolved)
-        if normalized_events is not None:
-            # A v3 request is answered in v3 terms.  The stored per-event
-            # outcomes attach here once the journal records them (v5);
-            # none are invented from the re-arriving request.
-            result = replace(
-                result, request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
-            )
-        return result
+        # For a sequence record the stored per-event results travel with
+        # it — the terminal stored-row replay, with zero new writes.
+        return _from_record(record, resolved=resolved)
 
     holder = f"control-input:{control_id}"
     try:
@@ -2998,8 +3016,7 @@ def _deliver_sequence_under_lease(
         # Exactly one caller ever writes for a control id.  A caller
         # holding a refused claim must not write even when the record
         # looks abandoned: that owner may be mid-write this instant.
-        result = _from_record(claim.record, resolved=resolved)
-        return replace(result, request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3)
+        return _from_record(claim.record, resolved=resolved)
     write_claimed = True
 
     if adapter is not None and plans is not None:
@@ -3043,6 +3060,8 @@ def _sequence_accepted(
     chord: Optional[str],
     chord_attempted: Optional[bool],
     chord_sent: Optional[bool],
+    submission_observed: Optional[str] = None,
+    submission_evidence_ref: Optional[str] = None,
 ) -> ControlInputResult:
     """The accepted v3 answer: every event sent, in order, once."""
     return ControlInputResult(
@@ -3071,6 +3090,8 @@ def _sequence_accepted(
         chord=chord,
         chord_attempted=chord_attempted,
         chord_sent=chord_sent,
+        submission_observed=submission_observed,
+        submission_evidence_ref=submission_evidence_ref,
         events=run.events,
         request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
     )
@@ -3126,6 +3147,9 @@ def _send_sequence_through_native_adapter(
             chord=last_chord,
             chord_attempted=transport.chord_attempted,
             chord_sent=transport.chord_sent,
+            sequence_event_outcomes=[
+                (event["ordinal"], event["outcome"]) for event in run.events
+            ],
             evidence_digest=digest,
         )
         return ControlInputResult(
@@ -3259,6 +3283,9 @@ def _send_sequence_through_native_adapter(
         chord=last_chord,
         chord_attempted=transport.chord_attempted,
         chord_sent=transport.chord_sent,
+        sequence_event_outcomes=[
+            (event["ordinal"], event["outcome"]) for event in run.events
+        ],
         evidence_digest=digest,
     )
     return _sequence_accepted(
@@ -3292,12 +3319,14 @@ def _send_sequence_through_literal_sink(
     """Write one claimed v3 sequence through the generic literal primitive.
 
     For a native pane without a managed adapter, a text event is the v1
-    literal write, a text event immediately followed by an Enter is the
-    exact v1 text-plus-Enter write (one call, one Enter — the cond-0026
-    provider-pinned submission barrier covers this pair where it pins one,
-    exactly as it does the v1 path), and a bare Enter is the submitting
-    Enter on its own.  The error mapping is the v1 unmanaged path's: every
-    failure after the claim is ``ambiguous``, including the server-identity
+    literal write, a bare Enter is the submitting Enter on its own, and a
+    text event immediately followed by an Enter is submitted exactly as the
+    v1 text-plus-Enter control is: through the cond-0026 provider-pinned
+    submission barrier where one is pinned for this provider (the text
+    write and the single Enter serialized through composer observation, no
+    second Enter ever), and as the one fused literal write everywhere
+    else.  The error mapping is the v1 unmanaged path's: every failure
+    after the claim is ``ambiguous``, including the server-identity
     anomaly that proves zero bytes — the journal has no (writing, refused)
     edge, and no error type carves one out.
     """
@@ -3308,22 +3337,40 @@ def _send_sequence_through_literal_sink(
     chord_attempted = False
     chord_sent = False
     last_chord: Optional[str] = None
+    # cond-0026's provider-pinned submission barrier, reused for a
+    # sequence's text+Enter pair exactly as for the v1 control.  Providers
+    # without a pin keep the fused literal write; no barrier is ever
+    # guessed at a composer whose layout was never read.
+    barrier = native_pane_input.submission_barrier_for(resolved.provider)
+    submission_observed: Optional[str] = None
+    submission_evidence_ref: Optional[str] = None
 
-    def _ambiguous(detail: str) -> ControlInputResult:
+    def _ambiguous(
+        detail: str,
+        *,
+        reason: str = REASON_WRITE_INCOMPLETE,
+        observed: Optional[str] = None,
+        evidence_ref: Optional[str] = None,
+    ) -> ControlInputResult:
         journal.mark_ambiguous(
             control_id,
-            reason_code=REASON_WRITE_INCOMPLETE,
+            reason_code=reason,
             chunks_sent=chunks,
             enter_attempted=enter_attempted,
             chord=last_chord,
             chord_attempted=chord_attempted,
             chord_sent=chord_sent,
+            submission_observed=observed,
+            submission_evidence_ref=evidence_ref,
+            sequence_event_outcomes=[
+                (event["ordinal"], event["outcome"]) for event in run.events
+            ],
             evidence_digest=digest,
         )
         return ControlInputResult(
             control_id=control_id,
             outcome=AMBIGUOUS,
-            reason_code=REASON_WRITE_INCOMPLETE,
+            reason_code=reason,
             detail=detail
             + " What reached the pane is bounded by the per-event outcomes but is not "
             "knowable exactly, so this sequence must not be sent again",
@@ -3336,6 +3383,8 @@ def _send_sequence_through_literal_sink(
             chord=last_chord,
             chord_attempted=chord_attempted,
             chord_sent=chord_sent,
+            submission_observed=observed,
+            submission_evidence_ref=evidence_ref,
             events=run.events,
             request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
         )
@@ -3346,7 +3395,9 @@ def _send_sequence_through_literal_sink(
         if time.monotonic() > deadline_monotonic:
             return _ambiguous(
                 f"the sequence write exceeded its overall {WRITE_DEADLINE_SECONDS:g}s "
-                "deadline after the write was claimed."
+                "deadline after the write was claimed.",
+                observed=submission_observed,
+                evidence_ref=submission_evidence_ref,
             )
         event = events[ordinal]
         event_type = event["type"]
@@ -3358,6 +3409,87 @@ def _send_sequence_through_literal_sink(
                     and events[ordinal + 1]["key"] == "Enter"
                 )
                 run.mark_attempted(ordinal)
+                if submits and barrier is not None:
+                    # The barrier pair: text first, then the single
+                    # submitting Enter only once the text is seen resting
+                    # in the composer, and delivery only once the composer
+                    # is seen to give it up.
+                    chunks += client.send_literal_line(
+                        binding.pane_id,
+                        event["text"],
+                        submit=False,
+                        expected_server_identity=binding.server_socket_path,
+                        deadline_monotonic=deadline_monotonic,
+                    )
+                    run.mark_sent(ordinal)
+                    if not native_pane_input.await_compose_visible(
+                        binding.pane_id,
+                        event["text"],
+                        barrier=barrier,
+                        deadline_monotonic=deadline_monotonic,
+                    ):
+                        if time.monotonic() > deadline_monotonic:
+                            return _ambiguous(
+                                f"the sequence write exceeded its overall "
+                                f"{WRITE_DEADLINE_SECONDS:g}s write deadline while "
+                                "waiting for the composer to show the control text; "
+                                "the Enter was never sent.",
+                                observed=SUBMISSION_UNKNOWN,
+                            )
+                        # The Enter is withheld: zero Enters were sent, so
+                        # the Enter event is provably skipped — and the
+                        # text may be resting, so the sequence is the
+                        # terminal ambiguity it is, never a re-attempt.
+                        return _ambiguous(
+                            f"the control text never became visible in the composer of "
+                            f"pane {binding.pane_id}, so the submitting Enter was "
+                            "withheld; no Enter was sent and none will be.",
+                            reason=REASON_SUBMISSION_UNPROVEN,
+                            observed=SUBMISSION_UNKNOWN,
+                        )
+                    # Marked before the call, not after: an exception on
+                    # the way out of tmux does not prove the Enter did not
+                    # land.  Exactly one Enter is ever sent.
+                    enter_attempted = True
+                    run.mark_attempted(ordinal + 1)
+                    client.send_literal_line(
+                        binding.pane_id,
+                        "",
+                        submit=True,
+                        expected_server_identity=binding.server_socket_path,
+                        deadline_monotonic=deadline_monotonic,
+                    )
+                    run.mark_sent(ordinal + 1)
+                    submission_observed, submission_evidence_ref = (
+                        native_pane_input.observe_submission(
+                            binding.pane_id,
+                            event["text"],
+                            barrier=barrier,
+                            deadline_monotonic=deadline_monotonic,
+                        )
+                    )
+                    if submission_observed != SUBMISSION_SUBMITTED:
+                        if submission_observed == SUBMISSION_UNSUBMITTED:
+                            detail = (
+                                f"the composer of pane {binding.pane_id} was observed to "
+                                "still hold the control text after the single Enter; no "
+                                "second Enter was sent and none will be — an operator "
+                                "may reconcile the composer by hand."
+                            )
+                        else:
+                            detail = (
+                                f"the composer of pane {binding.pane_id} could not be "
+                                "observed after the single Enter, so submission is "
+                                "unproven; no second Enter was sent and none will be."
+                            )
+                        return _ambiguous(
+                            detail,
+                            reason=REASON_SUBMISSION_UNPROVEN,
+                            observed=submission_observed,
+                            evidence_ref=submission_evidence_ref,
+                        )
+                    ordinal += 2
+                    continue
                 written = client.send_literal_line(
                     binding.pane_id,
                     event["text"],
@@ -3426,7 +3558,9 @@ def _send_sequence_through_literal_sink(
                 f"the pane's tmux server changed while the write lease was held: {exc}. "
                 f"The underlying identity diagnostic was {exc.reason_code!r}. "
                 "Nothing was written, but the write had already been claimed, and a "
-                "claimed write is never reported as a refusal"
+                "claimed write is never reported as a refusal",
+                observed=submission_observed,
+                evidence_ref=submission_evidence_ref,
             )
         except TmuxLiteralSendError as exc:
             chunks += exc.chunks_sent
@@ -3437,22 +3571,34 @@ def _send_sequence_through_literal_sink(
                 if event["type"] == SEQUENCE_EVENT_TYPE_TEXT:
                     run.mark_sent(ordinal)
                     run.mark_attempted(ordinal + 1)
-            return _ambiguous(f"the write failed part-way through: {exc}.")
+            return _ambiguous(
+                f"the write failed part-way through: {exc}.",
+                observed=submission_observed,
+                evidence_ref=submission_evidence_ref,
+            )
         except ValueError as exc:
             # A screening disagreement between this service and the sink:
             # recorded, never raised, for the same reason as on v1.
             logger.error("control-input screening disagreement for %s: %s", control_id, exc)
-            return _ambiguous(f"the write primitive rejected an already-screened event: {exc}")
+            return _ambiguous(
+                f"the write primitive rejected an already-screened event: {exc}",
+                observed=submission_observed,
+                evidence_ref=submission_evidence_ref,
+            )
         except subprocess.TimeoutExpired as exc:
             logger.error("control-input sequence write timed out for %s: %s", control_id, exc)
             return _ambiguous(
-                f"a tmux call in the write path exceeded its bound after the claim: {exc}."
+                f"a tmux call in the write path exceeded its bound after the claim: {exc}.",
+                observed=submission_observed,
+                evidence_ref=submission_evidence_ref,
             )
 
     if time.monotonic() > deadline_monotonic:
         return _ambiguous(
             f"the sequence write exceeded its overall {WRITE_DEADLINE_SECONDS:g}s "
-            "deadline after the write was claimed."
+            "deadline after the write was claimed.",
+            observed=submission_observed,
+            evidence_ref=submission_evidence_ref,
         )
     record = journal.mark_delivered(
         control_id,
@@ -3461,6 +3607,11 @@ def _send_sequence_through_literal_sink(
         chord=last_chord,
         chord_attempted=chord_attempted,
         chord_sent=chord_sent,
+        submission_observed=submission_observed,
+        submission_evidence_ref=submission_evidence_ref,
+        sequence_event_outcomes=[
+            (event["ordinal"], event["outcome"]) for event in run.events
+        ],
         evidence_digest=digest,
     )
     return _sequence_accepted(
@@ -3477,6 +3628,8 @@ def _send_sequence_through_literal_sink(
         chord=last_chord,
         chord_attempted=chord_attempted,
         chord_sent=chord_sent,
+        submission_observed=submission_observed,
+        submission_evidence_ref=submission_evidence_ref,
     )
 
 

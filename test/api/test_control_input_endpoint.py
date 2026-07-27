@@ -301,18 +301,24 @@ class TestV2ChordDiscovery:
 
     def test_the_capability_document_advertises_v2_and_the_chord_allowlist(self, client):
         body = client.get("/control-input/capabilities").json()
-        # v1 stays the named default; v2 is advertised alongside it.
+        # v1 stays the named default; v2 and v3 are advertised alongside it.
         assert body["request_schema_version"] == CONTROL_INPUT_REQUEST_SCHEMA_VERSION
-        assert body["request_schema_versions"] == [1, 2]
+        assert body["request_schema_versions"] == [1, 2, 3]
         assert body["digest_domain"] == CONTROL_INPUT_DIGEST_DOMAIN
         # The steer-chord allowlist is truthful: only the pinned Kimi chord.
         assert body["steer_chords"] == {"kimi_cli": ["C-s"]}
+        # The v3 sequence surface states its exact representable forms.
+        assert body["sequence"]["event_types"] == ["chord", "key", "text"]
+        assert body["sequence"]["keys"] == ["Backspace", "C-c", "C-s", "Enter", "Escape"]
+        assert body["sequence"]["max_events"] == 32
+        assert body["sequence"]["max_text_bytes"] == 512
 
     def test_the_identity_route_advertises_the_control_input_block(self, client, tmux):
         body = client.get(f"/terminals/{TERMINAL}/control-identity").json()
         block = body["control_input"]
-        assert block["schema_versions"] == [1, 2]
+        assert block["schema_versions"] == [1, 2, 3]
         assert block["chords"] == {"kimi_cli": ["C-s"]}
+        assert block["sequence"]["keys"] == ["Backspace", "C-c", "C-s", "Enter", "Escape"]
 
     def test_the_identity_route_block_is_absent_on_an_unknown_terminal(self, client, tmux):
         # No body to inspect on a 404; the block is only on a resolved terminal.
