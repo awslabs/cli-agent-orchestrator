@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
@@ -29,6 +29,25 @@ class TerminalStatus(str, Enum):
     NOT_FIFO_MONITORED = "not_fifo_monitored"
 
 
+class TerminalLifecycleState(str, Enum):
+    """The observed-lifecycle vocabulary a projected row reports.
+
+    Mirrors the durable lifecycle vocabulary stored on terminal rows (the
+    ``lifecycle_state`` column documented in ``clients/database.py``). A row
+    whose recorded identity no longer resolves — or could not be observed at
+    all — has no provider state to report, so the projection reports its
+    lifecycle in ``status`` instead. This boundary must admit those values:
+    while it did not, every non-live row failed response validation on
+    ``GET /terminals/{id}``, and a legacy ``unknown-liveness`` row read as
+    a 404 — absent — instead of as the historical record it is (cond-0173).
+    """
+
+    LIVE = "live"
+    SUPERSEDED = "superseded"
+    DEAD = "dead"
+    UNKNOWN_LIVENESS = "unknown-liveness"
+
+
 class Terminal(BaseModel):
     """Terminal model - represents a tmux window."""
 
@@ -50,8 +69,12 @@ class Terminal(BaseModel):
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"
     )
-    status: Optional[TerminalStatus] = Field(
-        None, description="Current terminal status (live only)"
+    status: Optional[Union[TerminalStatus, TerminalLifecycleState]] = Field(
+        None,
+        description=(
+            "Provider status for a live pane; the observed lifecycle state "
+            "for a row whose identity does not resolve"
+        ),
     )
     last_active: Optional[datetime] = Field(None, description="Last active timestamp")
 
