@@ -1580,6 +1580,164 @@ class TmuxClient:
             deadline_monotonic=deadline_monotonic,
         )
 
+    def pane_in_copy_mode(
+        self,
+        pane_id: str,
+        *,
+        expected_server_identity: Optional[str],
+        deadline_monotonic: Optional[float] = None,
+    ) -> Optional[bool]:
+        """Whether this exact pane is proven to be in a tmux mode (copy mode).
+
+        The copy-mode guard's detection read (cond-0178).  The reading
+        comes from ``display-message -p -t <pane> '#{pane_in_mode}'``: an
+        immutable pane-id target either resolves to that exact pane or
+        fails, so the answer is never about a stranger's pane.  The same
+        server-identity proof as the write primitives runs first, for the
+        same reason — ``%3`` is a target on whichever server answers, and
+        the mode that matters is the one on the bound server.
+
+        Returns True only on a proven ``1`` reading, False only on a
+        proven ``0``, and None when the state could not be observed.
+        "Could not look" is never read as "not in copy mode": typing a
+        payload Enter into a copy-mode pane is the exact silent wedge this
+        read exists to prevent, so an unproven state must fail closed.
+
+        Raises:
+            ValueError: The pane id is invalid.
+            TmuxServerIdentityError: The pane could not be proven to be on
+                the bound tmux server.
+            subprocess.TimeoutExpired: The read exceeded its bound.
+        """
+        if not is_valid_pane_id(pane_id):
+            raise ValueError(f"Invalid pane_id: {pane_id!r}")
+
+        observed_server = self.observe_pane_server_identity(
+            pane_id, deadline_monotonic=deadline_monotonic
+        )
+        refusal = server_identity_refusal(bound=expected_server_identity, observed=observed_server)
+        if refusal is not None:
+            reason_code, detail = refusal
+            raise TmuxServerIdentityError(
+                f"refusing a copy-mode read of pane {pane_id}: {detail}",
+                reason_code=reason_code,
+                bound=normalize_server_identity(expected_server_identity),
+                observed=observed_server,
+            )
+
+        argv = [tmux_binary(), "display-message", "-p", "-t", pane_id, "#{pane_in_mode}"]
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=self._control_call_timeout(deadline_monotonic, argv),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("copy-mode read of pane %s failed: %s", pane_id, exc)
+            return None
+        # subprocess.TimeoutExpired propagates for the same reason as the
+        # pane enumeration above: an exceeded bound is a distinct signal
+        # from an unreadable answer, and the caller classifies it.
+        if result.returncode != 0:
+            logger.warning(
+                "tmux could not report the pane mode for %s: %s",
+                pane_id,
+                (result.stderr or "").strip(),
+            )
+            return None
+        answer = (result.stdout or "").strip()
+        if answer == "1":
+            return True
+        if answer == "0":
+            return False
+        # Any other expansion is not a reading: a tmux that does not know
+        # the format expands it to nothing, and nothing must never become
+        # "proven not in copy mode".
+        logger.warning("tmux reported an unreadable pane mode for %s: %r", pane_id, answer)
+        return None
+
+    def send_copy_mode_cancel(
+        self,
+        pane_id: str,
+        *,
+        expected_server_identity: Optional[str],
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        """Send the copy-mode-exit control to this exact pane; True iff tmux acked.
+
+        The ONLY non-payload keystroke the managed write boundary may ever
+        send (cond-0178): ``send-keys -X cancel`` exits the copy mode the
+        dashboard wheel path (cond-0131) can leave a pane in, so the
+        payload Enter that follows is read by the provider rather than
+        consumed by the mode.  It is licensed only by a just-proven
+        ``pane_in_mode=1`` reading on this exact pane and is never sent
+        speculatively — the caller proves the mode before asking for the
+        exit, and tmux itself rejects ``-X`` commands for a pane in no
+        mode.
+
+        Same server-identity proof as the write primitives, at the same
+        distance from the keystroke: a cancel aimed at ``%3`` on the wrong
+        tmux server exits a mode on a stranger's pane.
+
+        Returns True when tmux acknowledged the exit control, False when
+        it did not (rejection, an unreadable server, or an exceeded
+        bound).  A False is "the exit is not proven", never "the pane was
+        not in copy mode", and even a True is not the confirmation — the
+        caller re-proves ``pane_in_mode=0`` on the exact pane before any
+        payload byte.
+
+        Raises:
+            ValueError: The pane id is invalid.
+            TmuxServerIdentityError: The pane could not be proven to be on
+                the bound tmux server.  Nothing was sent.
+        """
+        if not is_valid_pane_id(pane_id):
+            raise ValueError(f"Invalid pane_id: {pane_id!r}")
+
+        logger.info("send_copy_mode_cancel: %s", pane_id)
+
+        observed_server = self.observe_pane_server_identity(
+            pane_id, deadline_monotonic=deadline_monotonic
+        )
+        refusal = server_identity_refusal(bound=expected_server_identity, observed=observed_server)
+        if refusal is not None:
+            reason_code, detail = refusal
+            raise TmuxServerIdentityError(
+                f"refusing the copy-mode exit for pane {pane_id}: {detail}",
+                reason_code=reason_code,
+                bound=normalize_server_identity(expected_server_identity),
+                observed=observed_server,
+            )
+
+        argv = [tmux_binary(), "send-keys", "-t", pane_id, "-X", "cancel"]
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=self._control_call_timeout(deadline_monotonic, argv),
+            )
+        except _SUBPROCESS_TIMEOUT:
+            # A timed-out exit may or may not have reached the pane, so it
+            # is "not proven" — the caller's re-proof of pane_in_mode=0 is
+            # what decides, and it answers False here either way.
+            logger.warning("the copy-mode exit for pane %s exceeded its bound", pane_id)
+            return False
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("the copy-mode exit for pane %s failed: %s", pane_id, exc)
+            return False
+        if result.returncode != 0:
+            logger.warning(
+                "tmux rejected the copy-mode exit for pane %s: %s",
+                pane_id,
+                (result.stderr or "").strip(),
+            )
+            return False
+        return True
+
     @staticmethod
     def _control_call_timeout(
         deadline_monotonic: Optional[float],
