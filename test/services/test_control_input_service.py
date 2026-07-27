@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -1281,6 +1282,10 @@ class TestNativeInboxPayload:
     def _wire(self, monkeypatch, resolved, adapter, plan, turn_status=TerminalStatus.IDLE):
         from cli_agent_orchestrator.services import managed_launch_v2
 
+        # Each test models a fresh server lifetime unless it deliberately
+        # performs multiple deliveries itself.
+        with service._native_kimi_dispatch_guard_lock:
+            service._native_kimi_dispatch_times.clear()
         monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
         live = SimpleNamespace(dead=False, window_id=resolved.window_id, pane_pid=resolved.pane_pid)
         client = SimpleNamespace(pane_control_identity=lambda *, pane_id, deadline_monotonic: live)
@@ -1407,6 +1412,88 @@ class TestNativeInboxPayload:
                 },
             )
         ]
+
+    def test_completed_observation_admits_the_write_under_the_lease(self, monkeypatch):
+        """A completed turn is parked at the same input-ready composer as IDLE."""
+        resolved = self._resolved()
+        executed = []
+
+        class _Adapter:
+            def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic):
+                executed.append(plan)
+                transport.chunks_sent = 1
+                transport.enter_attempted = True
+
+        self._wire(
+            monkeypatch,
+            resolved,
+            _Adapter(),
+            {"deliverable": True},
+            TerminalStatus.COMPLETED,
+        )
+
+        result = service.deliver_native_inbox_payload("a1b2c3d4", text="follow up")
+
+        assert result.outcome == ACCEPTED
+        assert result.enter_sent is True
+        assert executed == [{"deliverable": True}]
+
+    def test_back_to_back_completed_frame_refuses_second_sender_run(self, monkeypatch):
+        """The prior ready frame must not admit another payload after Enter."""
+        resolved = self._resolved()
+        executed = []
+
+        class _Adapter:
+            def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic):
+                executed.append(plan)
+                transport.chunks_sent = 1
+                transport.enter_attempted = True
+
+        self._wire(
+            monkeypatch,
+            resolved,
+            _Adapter(),
+            {"deliverable": True},
+            TerminalStatus.COMPLETED,
+        )
+
+        first = service.deliver_native_inbox_payload("a1b2c3d4", text="first sender")
+        second = service.deliver_native_inbox_payload("a1b2c3d4", text="second sender")
+
+        assert first.outcome == ACCEPTED
+        assert second.outcome == REFUSED
+        assert second.reason_code == REASON_PANE_BUSY
+        assert second.chunks_sent == 0
+        assert executed == [{"deliverable": True}]
+
+    def test_dispatch_guard_is_generation_bound_and_expires(self):
+        original = self._resolved()
+        replacement = self._resolved()
+        replacement = replace(
+            replacement,
+            terminal_generation="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )
+        original_binding = ControlInputBinding(
+            request_id="inbox-payload",
+            terminal_id=original.terminal_id,
+            pane_id=original.pane_id,
+            window_id=original.window_id,
+            pane_pid=original.pane_pid,
+            request_sha256="0" * 64,
+            generation=original.terminal_generation,
+            server_socket_path=original.bound_server_socket_path,
+        )
+        replacement_binding = replace(
+            original_binding,
+            generation=replacement.terminal_generation,
+        )
+        original_key = service._native_kimi_dispatch_key(original, original_binding)
+        replacement_key = service._native_kimi_dispatch_key(replacement, replacement_binding)
+        service._mark_native_kimi_dispatch(original_key, now=100.0)
+
+        assert service._native_kimi_dispatch_is_guarded(original_key, now=104.9)
+        assert not service._native_kimi_dispatch_is_guarded(replacement_key, now=104.9)
+        assert not service._native_kimi_dispatch_is_guarded(original_key, now=105.0)
 
     def test_non_idle_observation_refuses_with_zero_bytes(self, monkeypatch):
         resolved = self._resolved()

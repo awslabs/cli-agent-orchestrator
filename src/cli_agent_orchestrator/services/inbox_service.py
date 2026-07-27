@@ -681,10 +681,11 @@ class InboxService:
             # would park its rows forever.  Delivery eligibility for a native
             # receiver is instead the provider-native live turn state,
             # observed per sender run under the payload write's own pane
-            # lease; only an exact IDLE admits the send, anything else leaves
-            # the rows PENDING, and DELIVERED still follows only the typed
-            # ACCEPTED.  Wake receipts stay best-effort evidence and never
-            # gate the row, so the wake-preparation path stays off here.
+            # lease; IDLE or COMPLETED admits the send because both are parked
+            # at an input-ready composer, while an active/unknown state leaves
+            # the rows PENDING. DELIVERED still follows only the typed ACCEPTED.
+            # Wake receipts stay best-effort evidence and never gate the row,
+            # so the wake-preparation path stays off here.
             idle_bound_delivery = False
         else:
             status = status_monitor.get_status(terminal_id)

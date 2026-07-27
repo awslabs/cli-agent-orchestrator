@@ -1555,6 +1555,36 @@ class TestNativeManagedV2InboxDelivery:
         InboxService().deliver_pending(terminal_id)
         assert len(control_calls) == 2
 
+    def test_back_to_back_sender_runs_leave_the_guarded_run_pending(
+        self, isolated_memory_db, monkeypatch
+    ):
+        terminal_id = "ntv00010"
+        generation = "gen-native-10"
+        self._seed_live_v2_terminal(terminal_id, "kimi_cli", generation)
+        first = database.create_inbox_message("sender-a", terminal_id, "first turn")
+        second = database.create_inbox_message("sender-b", terminal_id, "guard this turn")
+        control_calls = []
+
+        def control(tid, **kwargs):
+            control_calls.append((tid, kwargs))
+            if len(control_calls) == 1:
+                return self._result(ACCEPTED)
+            return self._result(REFUSED, "pane-busy")
+
+        self._install_fakes(
+            monkeypatch, self._native_identity(terminal_id, "kimi_cli", generation), control
+        )
+
+        InboxService().deliver_pending(terminal_id, num_messages=0)
+
+        stored = {row.id: row.status for row in database.get_inbox_messages(terminal_id, limit=10)}
+        assert stored[first.id] == MessageStatus.DELIVERED
+        assert stored[second.id] == MessageStatus.PENDING
+        assert [call[1]["text"] for call in control_calls] == [
+            "first turn",
+            "guard this turn",
+        ]
+
     def test_native_send_ambiguous_terminalizes_failed_without_replay(
         self, isolated_memory_db, monkeypatch
     ):

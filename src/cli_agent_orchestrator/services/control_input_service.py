@@ -126,6 +126,17 @@ MAX_TEXT_BYTES = 512
 # no writing->refused edge, and bytes may have landed).
 WRITE_DEADLINE_SECONDS = 20.0
 
+# Kimi briefly leaves the prior ready frame visible after Enter, before the
+# new turn's first spinner repaint.  A fresh native observer is intentionally
+# stateless, so that frame can still classify as IDLE/COMPLETED.  Keep the
+# dispatch proof beside the shared pane lease and bind it to the complete
+# physical/provider incarnation; a replacement pane or generation never
+# inherits the delay.  Five seconds matches KimiCliProvider's own dispatch
+# grace and is long enough to bridge the measured ~100 ms repaint gap.
+NATIVE_KIMI_DISPATCH_GRACE_SECONDS = 5.0
+_native_kimi_dispatch_guard_lock = threading.Lock()
+_native_kimi_dispatch_times: Dict[Tuple[str, Optional[str], str, int], float] = {}
+
 
 class _WriteDeadlineExpired(RuntimeError):
     """The overall write deadline elapsed before delivery completed."""
@@ -146,6 +157,49 @@ _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 # whose control surface is the generation-bound managed operations API.
 EXECUTION_MODE_NATIVE_TUI = "native_tui"
 EXECUTION_MODE_ACP = "acp"
+
+
+def _native_kimi_dispatch_key(
+    resolved: "ResolvedControlIdentity",
+    binding: ControlInputBinding,
+) -> Tuple[str, Optional[str], str, int]:
+    """The exact Kimi pane incarnation whose ready frame may be stale."""
+    return (
+        resolved.terminal_id,
+        resolved.terminal_generation,
+        binding.pane_id,
+        binding.pane_pid,
+    )
+
+
+def _native_kimi_dispatch_is_guarded(
+    key: Tuple[str, Optional[str], str, int],
+    *,
+    now: Optional[float] = None,
+) -> bool:
+    """Whether a preceding Enter is still inside Kimi's repaint gap."""
+    observed_at = time.monotonic() if now is None else now
+    cutoff = observed_at - NATIVE_KIMI_DISPATCH_GRACE_SECONDS
+    with _native_kimi_dispatch_guard_lock:
+        expired = [
+            existing
+            for existing, dispatched_at in _native_kimi_dispatch_times.items()
+            if dispatched_at <= cutoff
+        ]
+        for existing in expired:
+            _native_kimi_dispatch_times.pop(existing, None)
+        dispatched_at = _native_kimi_dispatch_times.get(key)
+    return dispatched_at is not None and dispatched_at > cutoff
+
+
+def _mark_native_kimi_dispatch(
+    key: Tuple[str, Optional[str], str, int],
+    *,
+    now: Optional[float] = None,
+) -> None:
+    """Record a Kimi Enter before releasing the pane-input lease."""
+    with _native_kimi_dispatch_guard_lock:
+        _native_kimi_dispatch_times[key] = time.monotonic() if now is None else now
 
 
 class ControlInputRequestInvalid(ValueError):
@@ -2253,12 +2307,27 @@ def deliver_native_inbox_payload(
                     f"root pid {live.pane_pid}, not the bound {binding.window_id!r} / "
                     f"{binding.pane_pid}; nothing was typed",
                 )
+            dispatch_key = (
+                _native_kimi_dispatch_key(resolved, binding)
+                if resolved.provider == "kimi_cli"
+                else None
+            )
+            if dispatch_key is not None and _native_kimi_dispatch_is_guarded(dispatch_key):
+                return NativePayloadResult(
+                    REFUSED,
+                    REASON_PANE_BUSY,
+                    "a preceding Enter was sent to this exact Kimi pane generation "
+                    "inside its dispatch grace; the ready-looking frame may be stale, "
+                    "so nothing was typed",
+                )
             # The idle gate for an ordinary payload: the provider's own live
             # turn state, observed under this same lease so the idle proof
             # and the write are atomic against a turn starting between them.
-            # Only an exact IDLE admits the send; every other status — and
-            # any observation failure — is a zero-byte refusal, so the busy
-            # queue is unchanged and a later pass re-observes.
+            # IDLE and COMPLETED both mean the rendered provider is parked at
+            # an input-ready composer; COMPLETED additionally records that a
+            # prior turn produced a response. Every active/unknown status —
+            # and any observation failure — is a zero-byte refusal, so the
+            # busy queue is unchanged and a later pass re-observes.
             from cli_agent_orchestrator.services import managed_launch_v2
             from cli_agent_orchestrator.utils.terminal import managed_window_name
 
@@ -2277,7 +2346,7 @@ def deliver_native_inbox_payload(
                     f"the receiver's turn state could not be observed, so nothing "
                     f"was typed: {exc}",
                 )
-            if turn_status is not TerminalStatus.IDLE:
+            if turn_status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
                 return NativePayloadResult(
                     REFUSED,
                     REASON_PANE_BUSY,
@@ -2302,6 +2371,8 @@ def deliver_native_inbox_payload(
                     deadline_monotonic=deadline,
                 )
             except adapter.ComposerWriteInterrupted as exc:
+                if dispatch_key is not None and transport.enter_attempted:
+                    _mark_native_kimi_dispatch(dispatch_key)
                 return NativePayloadResult(
                     AMBIGUOUS,
                     REASON_WRITE_INCOMPLETE,
@@ -2312,6 +2383,8 @@ def deliver_native_inbox_payload(
                     enter_sent=transport.enter_attempted,
                 )
             except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
+                if dispatch_key is not None and transport.enter_attempted:
+                    _mark_native_kimi_dispatch(dispatch_key)
                 logger.error("native inbox payload adapter raised for %s: %s", terminal_id, exc)
                 return NativePayloadResult(
                     AMBIGUOUS,
@@ -2322,6 +2395,8 @@ def deliver_native_inbox_payload(
                     chunks_sent=transport.chunks_sent,
                     enter_sent=transport.enter_attempted,
                 )
+            if dispatch_key is not None:
+                _mark_native_kimi_dispatch(dispatch_key)
             return NativePayloadResult(
                 ACCEPTED,
                 "delivered",
