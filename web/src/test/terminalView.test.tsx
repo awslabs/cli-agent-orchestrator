@@ -510,3 +510,177 @@ describe('TerminalView touch scrolling', () => {
     expect(screen.queryByRole('button', { name: 'Cancel turn' })).toBeNull()
   })
 })
+
+
+describe('TerminalView structured key-sequence recorder', () => {
+  beforeEach(() => {
+    wheelEvents.length = 0
+    termRegistry.current = null
+    FakeWebSocket.instances.length = 0
+    ;(globalThis as unknown as { WebSocket: unknown }).WebSocket = FakeWebSocket
+    ;(globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = FakeResizeObserver
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
+
+  function stubNativeControlFetch(
+    requests: Array<{ url: string; body?: Record<string, unknown> }>,
+    { schemaVersions = [1, 2, 3] }: { schemaVersions?: number[] } = {},
+  ) {
+    let controlNumber = 0
+    vi.stubGlobal('crypto', { randomUUID: () => `control-${++controlNumber}` })
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined
+      requests.push({ url, body })
+      let response: Record<string, unknown>
+      if (url.endsWith('/managed-control')) {
+        response = { managed: true, generation: 'generation-1', execution_mode: 'native_tui' }
+      } else if (url.endsWith('/control-input/capabilities')) {
+        response = {
+          protocol: 'cao-control-input-v1',
+          execution_modes: ['native_tui'],
+          literal_write: true,
+          bracketed_paste: false,
+          enter_required: true,
+          request_schema_versions: schemaVersions,
+          sequence: {
+            event_types: ['chord', 'key', 'text'],
+            keys: ['Backspace', 'C-c', 'C-s', 'Enter', 'Escape'],
+            max_events: 32,
+            max_text_bytes: 512,
+          },
+        }
+      } else if (url.endsWith('/control-identity')) {
+        response = {
+          terminal_id: 't-native',
+          terminal_generation: 'generation-1',
+          pane_birth_id: '%7',
+          provider: 'kimi_cli',
+          execution_mode: 'native_tui',
+          session_name: 'cao-test',
+        }
+      } else {
+        response = { control_id: body?.control_id, outcome: 'accepted', events: body?.events }
+      }
+      return { ok: true, json: async () => response } as Response
+    }))
+  }
+
+  function recorderInput(): HTMLElement {
+    const el = document.activeElement as HTMLElement | null
+    if (!el || !el.textContent?.startsWith('Recording')) {
+      throw new Error('the recorder capture element is not focused')
+    }
+    return el
+  }
+
+  it('records, previews, and sends the exact structured events', async () => {
+    const requests: Array<{ url: string; body?: Record<string, unknown> }> = []
+    stubNativeControlFetch(requests)
+    render(<TerminalView terminalId="t-native" onClose={() => {}} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Record' }))
+    const capture = recorderInput()
+    fireEvent.keyDown(capture, { key: 'Escape' })
+    fireEvent.keyDown(capture, { key: 'c', ctrlKey: true })
+    fireEvent.keyDown(capture, { key: 's', ctrlKey: true })
+    fireEvent.keyDown(capture, { key: ',' })
+    fireEvent.keyDown(capture, { key: '+' })
+    fireEvent.keyDown(capture, { key: '\\' })
+    fireEvent.keyDown(capture, { key: 'Backspace' })
+    fireEvent.keyDown(capture, { key: 'Enter' })
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+
+    // The readable preview renders the recorded tokens in order.
+    expect(screen.getByText('[Escape]')).toBeTruthy()
+    expect(screen.getByText('[Ctrl+C]')).toBeTruthy()
+    expect(screen.getByText('[Ctrl+S]')).toBeTruthy()
+    expect(screen.getByText('",+\\"')).toBeTruthy()
+    expect(screen.getByText('[Backspace]')).toBeTruthy()
+    expect(screen.getByText('[Enter]')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send sequence' }))
+    await waitFor(() => {
+      const control = requests.find(request => request.url.endsWith('/control-input'))
+      expect(control?.body?.control_id).toBe('control-1')
+      expect(control?.body?.events).toEqual([
+        { type: 'key', key: 'Escape' },
+        { type: 'key', key: 'C-c' },
+        { type: 'chord', chord: 'C-s' },
+        { type: 'text', text: ',+\\' },
+        { type: 'key', key: 'Backspace' },
+        { type: 'key', key: 'Enter' },
+      ])
+      // No v1/v2 fields travel beside the events — never both.
+      expect(control?.body?.text).toBeUndefined()
+      expect(control?.body?.enter).toBeUndefined()
+      expect(control?.body?.expected_identity).toMatchObject({
+        terminal_id: 't-native',
+        terminal_generation: 'generation-1',
+        pane_birth_id: '%7',
+      })
+    })
+    // An accepted send clears the recording.
+    await waitFor(() => {
+      expect(screen.queryByText('[Escape]')).toBeNull()
+    })
+  })
+
+  it('cancel before send writes nothing', async () => {
+    const requests: Array<{ url: string; body?: Record<string, unknown> }> = []
+    stubNativeControlFetch(requests)
+    render(<TerminalView terminalId="t-native" onClose={() => {}} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Record' }))
+    const capture = recorderInput()
+    fireEvent.keyDown(capture, { key: 'Escape' })
+    fireEvent.keyDown(capture, { key: 'x' })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    expect(screen.queryByText('[Escape]')).toBeNull()
+    expect(requests.find(request => request.url.endsWith('/control-input'))).toBeUndefined()
+  })
+
+  it('refuses an unrepresentable combination with a message and records nothing for it', async () => {
+    const requests: Array<{ url: string; body?: Record<string, unknown> }> = []
+    stubNativeControlFetch(requests)
+    render(<TerminalView terminalId="t-native" onClose={() => {}} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Record' }))
+    const capture = recorderInput()
+    fireEvent.keyDown(capture, { key: 'x', ctrlKey: true, altKey: true })
+
+    expect(
+      await screen.findByText(/cannot be represented: terminal protocols cannot express/),
+    ).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    expect(screen.getByRole('button', { name: 'Send sequence' })).toHaveProperty('disabled', true)
+  })
+
+  it('keeps the managed onData guard: recording never leaks into the websocket', async () => {
+    const requests: Array<{ url: string; body?: Record<string, unknown> }> = []
+    stubNativeControlFetch(requests)
+    render(<TerminalView terminalId="t-native" onClose={() => {}} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Record' }))
+    const capture = recorderInput()
+    fireEvent.keyDown(capture, { key: 'x' })
+    const ws = FakeWebSocket.instances[0]
+    expect(ws.sent.filter(frame => frame.includes('"input"'))).toHaveLength(0)
+  })
+
+  it('hides the recorder on a server that does not advertise v3', async () => {
+    const requests: Array<{ url: string; body?: Record<string, unknown> }> = []
+    stubNativeControlFetch(requests, { schemaVersions: [1, 2] })
+    render(<TerminalView terminalId="t-native" onClose={() => {}} />)
+
+    expect(
+      await screen.findByText(/Sequence recording needs control-input schema v3/),
+    ).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Record' })).toBeNull()
+  })
+})
