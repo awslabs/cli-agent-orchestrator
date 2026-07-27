@@ -7,6 +7,7 @@ Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/340
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +16,22 @@ from jsonschema import Draft202012Validator
 
 # Templates live under src/cli_agent_orchestrator/templates/
 _TEMPLATES_ROOT = Path(__file__).resolve().parent.parent / "templates"
+
+# A template name is ``category/name`` — each ``/``-separated segment must be a
+# strict lowercase slug: it starts with an alphanumeric and thereafter admits
+# only ``[a-z0-9._-]``. Matched with ``fullmatch`` against the WHOLE name, this
+# allowlist rejects ``.``, ``..``, empty segments, leading/trailing/repeated
+# ``/`` (so absolute and trailing-slash paths fail), backslashes, and any other
+# separator or control character — an untrusted ``template_name`` that passes
+# cannot walk outside _TEMPLATES_ROOT once joined into a path.
+#
+# The ``fullmatch`` check is duplicated INLINE at every filesystem use site
+# (``get_template_schema`` / ``render_template``) rather than factored into a
+# helper, because CodeQL's ``py/path-injection`` dataflow only recognises a
+# barrier that guards — in the same function as the sink — the very variable
+# that reaches it: the same static-analysis-legibility constraint that forced
+# ``select_autoescape`` inline in #462.
+_TEMPLATE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*")
 
 # Extensions that enable Jinja2 autoescape. CAO scaffold templates are named
 # ``template.<ext>.j2`` (e.g. ``template.md.j2``), and ``select_autoescape``
@@ -79,6 +96,15 @@ def get_template_schema(template_name: str) -> Optional[dict]:
     template_name: category/name format (e.g., 'aws/stepfunction').
     Returns the schema dict, or None if not found.
     """
+    # Break path-injection taint INLINE, before the untrusted template_name is
+    # joined into a filesystem path: it must match the strict-slug allowlist
+    # (see _TEMPLATE_NAME_RE), which rejects ``.``/``..``/empty/absolute
+    # components. Inlined and guarding template_name directly so CodeQL's
+    # py/path-injection dataflow sees the sanitizer in the same function as the
+    # sink (cf. the inline select_autoescape in #462). _check_containment below
+    # remains as defence in depth.
+    if not _TEMPLATE_NAME_RE.fullmatch(template_name):
+        raise FileNotFoundError(f"Invalid template name: {template_name!r}")
     schema_path = (_TEMPLATES_ROOT / template_name / "schema.json").resolve()
     _check_containment(schema_path, _TEMPLATES_ROOT)
     if not schema_path.exists():
@@ -114,6 +140,15 @@ def render_template(template_name: str, config: dict) -> str:
     Raises FileNotFoundError if template doesn't exist or escapes root.
     Raises ValueError if config fails validation.
     """
+    # Break path-injection taint INLINE, before the untrusted template_name is
+    # joined into a filesystem path: it must match the strict-slug allowlist
+    # (see _TEMPLATE_NAME_RE), which rejects ``.``/``..``/empty/absolute
+    # components. Inlined and guarding template_name directly so CodeQL's
+    # py/path-injection dataflow sees the sanitizer in the same function as the
+    # sink (cf. the inline select_autoescape in #462). _check_containment below
+    # remains as defence in depth.
+    if not _TEMPLATE_NAME_RE.fullmatch(template_name):
+        raise FileNotFoundError(f"Invalid template name: {template_name!r}")
     template_dir = (_TEMPLATES_ROOT / template_name).resolve()
     _check_containment(template_dir, _TEMPLATES_ROOT)
     template_file = template_dir / "template.md.j2"

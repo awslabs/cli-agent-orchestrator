@@ -197,6 +197,57 @@ class TestRenderTemplate:
             render_template("aws/stepfunction", {"profile": "x"})
 
 
+class TestTemplateNameValidation:
+    """The template-name allowlist (py/path-injection fix, #518 follow-up).
+
+    ``template_name`` reaches these functions from HTTP request data (the #510
+    profile endpoints), so a traversal attempt must be refused before the name
+    is joined into a filesystem path. The strict-slug regex is checked INLINE at
+    each use site — guarding the same variable that reaches the path sink — so
+    the barrier is legible to CodeQL, exactly as the inline ``select_autoescape``
+    was made legible to bandit B701 in #462. ``_check_containment`` remains as a
+    second, defence-in-depth layer; these tests assert the boundary rejection
+    fires (still a ``FileNotFoundError`` → HTTP 404, so behaviour is unchanged).
+    """
+
+    # Each rejects at the allowlist: parent-dir walk, absolute path, empty
+    # segment, backslash separator, and uppercase (not a lowercase slug).
+    _TRAVERSAL_NAMES = [
+        "aws/../../../etc/passwd",
+        "../evil",
+        "/etc/passwd",
+        "aws/",
+        "aws//stepfunction",
+        "aws/\\..\\evil",
+        "aws/Stepfunction",
+    ]
+
+    @pytest.mark.parametrize("name", _TRAVERSAL_NAMES)
+    def test_get_template_schema_refuses_traversal(self, name):
+        with pytest.raises(FileNotFoundError):
+            get_template_schema(name)
+
+    @pytest.mark.parametrize("name", _TRAVERSAL_NAMES)
+    def test_render_template_refuses_traversal(self, name):
+        with pytest.raises(FileNotFoundError):
+            render_template(name, {"profile": "x"})
+
+    def test_dotdot_does_not_reach_real_file(self):
+        """A crafted name that would resolve to a real on-disk schema outside
+        the templates root is still refused (the allowlist fires before any
+        path join, so the file is never read)."""
+        # aws/../aws/stepfunction resolves to the real stepfunction schema, but
+        # the ``..`` segment must never be honoured.
+        with pytest.raises(FileNotFoundError):
+            get_template_schema("aws/../aws/stepfunction")
+
+    def test_valid_names_still_pass(self):
+        # A well-formed slug is untouched by the allowlist: schema loads, and a
+        # valid-but-absent template still returns None (not a rejection).
+        assert get_template_schema("aws/stepfunction") is not None
+        assert get_template_schema("aws/nonexistent") is None
+
+
 class TestAutoescapeBehavior:
     """Locks in the Jinja2 autoescape configuration (PR #429 follow-up).
 
