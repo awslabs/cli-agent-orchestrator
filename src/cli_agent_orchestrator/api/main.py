@@ -116,6 +116,9 @@ from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxServic
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
+from cli_agent_orchestrator.services.profile_search import (
+    DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
@@ -471,6 +474,43 @@ class InstallAgentProfileRequest(BaseModel):
     source: str
     provider: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
+
+
+# Scaffold templates are identified as ``category/name`` (e.g.
+# ``aws/stepfunction``). Constraining that identifier with an allowlist pattern
+# at the API boundary rejects traversal attempts before they reach the scaffold
+# service — which independently re-checks containment via ``_check_containment``.
+# Allowlist rather than denylist is deliberate: a denylist of dot sequences is
+# always incomplete.
+TEMPLATE_NAME_PATTERN = r"^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$"
+
+
+class TemplateConfigRequest(BaseModel):
+    """Request body for the non-mutating template validate and preview routes."""
+
+    template: str = Field(
+        pattern=TEMPLATE_NAME_PATTERN,
+        max_length=128,
+        description="Template identifier in 'category/name' form, e.g. 'aws/stepfunction'",
+    )
+    config: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Flat config values matching the template's JSON-Schema",
+    )
+
+
+class ValidateTemplateConfigResponse(BaseModel):
+    """Outcome of validating a config against a template's JSON-Schema."""
+
+    valid: bool
+    errors: List[str] = Field(default_factory=list)
+
+
+class PreviewTemplateResponse(BaseModel):
+    """A rendered profile. Returned to the caller and never written to disk."""
+
+    template: str
+    content: str
 
 
 class MemorySummary(BaseModel):
@@ -1488,6 +1528,123 @@ async def list_agent_profiles_endpoint() -> List[Dict]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list agent profiles: {str(e)}",
         )
+
+
+# The static sub-paths below (`/search`, `/templates`, and the template schema
+# route) MUST stay declared ABOVE `/agents/profiles/{name}`. FastAPI resolves in
+# declaration order, so moving them below would let the `{name}` route capture
+# "search" and "templates" as profile names. test_api_profile_surface.py pins
+# this ordering.
+@app.get("/agents/profiles/search")
+async def search_agent_profiles_endpoint(
+    q: str = Query(description="Free-text capability keywords, e.g. 'monitor sqs'"),
+    limit: int = Query(default=PROFILE_SEARCH_DEFAULT_LIMIT, ge=1, le=100),
+) -> List[Dict]:
+    """Rank installed agent profiles against ``q``.
+
+    Delegates to ``services.profile_search.search_profiles`` so HTTP, the CLI
+    (``cao profile find``) and the ``find_profiles`` MCP tool return identical
+    ordering and scores — no ranking logic lives here. The service excludes
+    profiles that ``load_agent_profile()`` would reject, and results are
+    metadata-only: the profile prompt body is never returned.
+    """
+    from cli_agent_orchestrator.services.profile_search import search_profiles
+
+    try:
+        return search_profiles(q, limit=limit)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to search agent profiles: {str(e)}",
+        )
+
+
+@app.get("/agents/profiles/templates")
+async def list_profile_templates_endpoint() -> List[Dict]:
+    """List the scaffold templates available for profile creation."""
+    from cli_agent_orchestrator.services.agent_scaffold import list_templates
+
+    try:
+        return list_templates()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list profile templates: {str(e)}",
+        )
+
+
+@app.get("/agents/profiles/templates/{category}/{name}/schema")
+async def get_profile_template_schema_endpoint(category: str, name: str) -> Dict:
+    """Return the JSON-Schema for one scaffold template.
+
+    ``category`` and ``name`` are two path segments rather than one so the
+    ``category/name`` template identifier survives routing without a
+    percent-encoded slash. The pair is allowlist-validated here and the scaffold
+    service re-checks containment independently.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import get_template_schema
+
+    template = f"{category}/{name}"
+    if not re.fullmatch(TEMPLATE_NAME_PATTERN, template):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid template name: {template}",
+        )
+
+    try:
+        schema = get_template_schema(template)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    if schema is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No schema found for template '{template}'",
+        )
+    return schema
+
+
+@app.post("/agents/profiles/validate")
+async def validate_profile_template_config_endpoint(
+    request: TemplateConfigRequest,
+) -> ValidateTemplateConfigResponse:
+    """Validate a config against a template's JSON-Schema. Writes nothing.
+
+    Deliberately NOT guarded by ``SCOPE_WRITE``. This is a POST only because the
+    config travels in a JSON body rather than a query string; it mutates no
+    state. The write-scope guard belongs on the create/edit routes that persist
+    a profile, not on validation.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import validate_config
+
+    try:
+        errors = validate_config(request.template, request.config)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return ValidateTemplateConfigResponse(valid=not errors, errors=errors)
+
+
+@app.post("/agents/profiles/preview")
+async def preview_profile_template_endpoint(
+    request: TemplateConfigRequest,
+) -> PreviewTemplateResponse:
+    """Render a template to markdown and return it. Writes nothing.
+
+    Same non-mutating rationale as ``/validate``: rendering is a pure function of
+    the template and the supplied config. ``render_template`` validates the
+    config first, so an invalid config returns 400 rather than partial output.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import render_template
+
+    try:
+        content = render_template(request.template, request.config)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return PreviewTemplateResponse(template=request.template, content=content)
 
 
 @app.get("/agents/profiles/{name}")
