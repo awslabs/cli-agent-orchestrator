@@ -181,6 +181,46 @@ class FakeTmux:
         )
         return 1
 
+    def send_sequence_key(
+        self,
+        pane_id,
+        key,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
+        if self._on_write is not None:
+            self._on_write()
+        if self._write_error is not None:
+            raise self._write_error
+        self.writes.append(
+            {
+                "pane_id": pane_id,
+                "key": key,
+                "expected_server_identity": expected_server_identity,
+            }
+        )
+
+    def send_steer_chord(
+        self,
+        pane_id,
+        chord,
+        *,
+        expected_server_identity,
+        deadline_monotonic=None,
+    ):
+        if self._on_write is not None:
+            self._on_write()
+        if self._write_error is not None:
+            raise self._write_error
+        self.writes.append(
+            {
+                "pane_id": pane_id,
+                "chord": chord,
+                "expected_server_identity": expected_server_identity,
+            }
+        )
+
 
 def _metadata(**overrides):
     fields = {
@@ -934,6 +974,9 @@ class _FakeChordClient:
         self.sent.append(("chord", chord))
 
     def send_control_key(self, pane_id, key, *, expected_server_identity, deadline_monotonic=None):
+        self.sent.append(("key", key))
+
+    def send_sequence_key(self, pane_id, key, *, expected_server_identity, deadline_monotonic=None):
         self.sent.append(("key", key))
 
 
@@ -1937,3 +1980,530 @@ class TestCodexSubmissionBarrier:
         assert result.as_response()["submission_evidence_ref"] is None
         # One fused text+Enter write, exactly as before cond-0026.
         assert [write["submit"] for write in tmux.writes] == [True]
+# --- Schema v3: ordered structured event sequences ---------------------------
+
+from cli_agent_orchestrator.services.control_input_contract import (  # noqa: E402
+    REASON_UNREPRESENTABLE_EVENT,
+    REASON_UNSUPPORTED_CHORD,
+    REASON_UNSUPPORTED_KEY,
+    control_input_request_digest_v3,
+)
+
+SEQ_EVENTS = [
+    {"type": "text", "text": "make it so, + \\"},
+    {"type": "key", "key": "Enter"},
+]
+
+
+def _deliver_sequence(journal, events=SEQ_EVENTS, **overrides):
+    kwargs = {"control_id": CONTROL, "events": events}
+    kwargs.update(overrides)
+    return service.deliver_control_input(TERMINAL, journal=journal, **kwargs)
+
+
+def _seq_resolved(**overrides):
+    fields = {
+        "terminal_id": TERMINAL,
+        "terminal_incarnation": None,
+        "terminal_generation": "11111111-2222-3333-4444-555555555555",
+        "provider": "kimi_cli",
+        "native_session_id": "sess-1",
+        "execution_mode": service.EXECUTION_MODE_NATIVE_TUI,
+        "session_name": "cao",
+        "provider_process_id": "4242@boot-1",
+        "provider_version": "0.29.0",
+        "pane_id": PANE,
+        "window_id": WINDOW,
+        "pane_pid": PANE_PID,
+        "pane_dead": False,
+        "managed": True,
+        "recorded_pane_id": PANE,
+        "bound_server_socket_path": SOCKET,
+        "observed_server_socket_path": SOCKET,
+    }
+    fields.update(overrides)
+    return service.ResolvedControlIdentity(**fields)
+
+
+class TestSequenceShape:
+    def test_events_and_text_is_never_both(self, journal):
+        with pytest.raises(service.ControlInputRequestInvalid):
+            _deliver_sequence(journal, text="hello")
+
+    def test_events_and_enter_is_never_both(self, journal):
+        with pytest.raises(service.ControlInputRequestInvalid):
+            _deliver_sequence(journal, enter=True)
+
+    def test_events_and_chord_is_never_both(self, journal):
+        with pytest.raises(service.ControlInputRequestInvalid):
+            _deliver_sequence(journal, chord="C-s")
+
+    def test_empty_sequence_is_no_control(self, journal):
+        with pytest.raises(service.ControlInputRequestInvalid):
+            _deliver_sequence(journal, events=[])
+
+    def test_thirty_three_events_is_over_the_cap(self, journal):
+        with pytest.raises(service.ControlInputRequestInvalid):
+            _deliver_sequence(journal, events=[{"type": "key", "key": "Escape"}] * 33)
+
+    def test_aggregate_text_bytes_are_capped(self, journal):
+        events = [{"type": "text", "text": "a" * 300}, {"type": "text", "text": "b" * 300}]
+        with pytest.raises(service.ControlInputRequestInvalid):
+            _deliver_sequence(journal, events=events)
+
+    def test_unknown_type_with_fields_is_a_shape_error(self, journal):
+        with pytest.raises(service.ControlInputRequestInvalid):
+            _deliver_sequence(journal, events=[{"type": "macro", "name": "x"}])
+
+    def test_v1_omitted_enter_keeps_the_wire_default(self, tmux, journal):
+        result = service.deliver_control_input(TERMINAL, control_id=CONTROL, text=TEXT, journal=journal)
+        assert result.outcome == ACCEPTED
+        assert tmux.writes[-1]["submit"] is True
+
+
+class TestSequenceDeliveryUnmanaged:
+    """The generic literal sink: ordering, coalescing, and honest outcomes."""
+
+    def test_text_then_enter_is_one_exact_write(self, tmux, journal):
+        result = _deliver_sequence(journal)
+        assert result.outcome == ACCEPTED
+        assert result.request_schema_version == 3
+        # The text+Enter pair is the exact v1 write: one call, one Enter.
+        assert tmux.writes == [
+            {"pane_id": PANE, "text": "make it so, + \\", "submit": True,
+             "expected_server_identity": SOCKET}
+        ]
+        assert result.text_sent is True
+        assert result.enter_sent is True
+        assert [event["outcome"] for event in result.events] == ["sent", "sent"]
+        assert result.events[0]["ordinal"] == 0
+        assert result.events[1] == {"ordinal": 1, "type": "key", "key": "Enter", "outcome": "sent"}
+
+    def test_ordered_mixed_events_write_in_order(self, tmux, journal):
+        events = [
+            {"type": "key", "key": "Escape"},
+            {"type": "text", "text": "a, b + c\\d"},
+            {"type": "key", "key": "Backspace"},
+            {"type": "key", "key": "C-c"},
+            {"type": "key", "key": "C-s"},
+            {"type": "key", "key": "Enter"},
+        ]
+        result = _deliver_sequence(journal, events=events)
+        assert result.outcome == ACCEPTED
+        kinds = []
+        for write in tmux.writes:
+            if "text" in write:
+                kinds.append(("literal", write["text"], write["submit"]))
+            elif "key" in write:
+                kinds.append(("key", write["key"]))
+            else:
+                kinds.append(("chord", write["chord"]))
+        assert kinds == [
+            ("key", "Escape"),
+            ("literal", "a, b + c\\d", False),  # comma/plus/backslash are ordinary text
+            ("key", "Backspace"),
+            ("key", "C-c"),
+            ("key", "C-s"),
+            ("literal", "", True),  # bare Enter is the submitting key on its own
+        ]
+        assert [event["outcome"] for event in result.events] == ["sent"] * 6
+
+    def test_bare_enter_without_text_is_sendable(self, tmux, journal):
+        result = _deliver_sequence(journal, events=[{"type": "key", "key": "Enter"}])
+        assert result.outcome == ACCEPTED
+        assert tmux.writes[0]["text"] == "" and tmux.writes[0]["submit"] is True
+        assert result.enter_sent is True
+        assert result.text_sent is False
+
+    def test_unsupported_key_is_a_zero_byte_refusal(self, tmux, journal):
+        result = _deliver_sequence(journal, events=[{"type": "key", "key": "M-x"}])
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_UNSUPPORTED_KEY
+        assert tmux.writes == []
+        assert journal.find(CONTROL) is None  # refused before the intent
+        assert [event["outcome"] for event in result.events] == ["refused"]
+
+    def test_unrepresentable_event_is_a_zero_byte_refusal(self, tmux, journal):
+        result = _deliver_sequence(journal, events=[{"type": "macro"}])
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_UNREPRESENTABLE_EVENT
+        assert tmux.writes == []
+        assert [event["outcome"] for event in result.events] == ["refused"]
+
+    def test_modifier_combinations_are_refused_never_approximated(self, tmux, journal):
+        for index, key in enumerate(("C-M-x", "M-Tab", "S-Enter", "C-c C-c")):
+            result = _deliver_sequence(
+                journal, events=[{"type": "key", "key": key}], control_id=f"ctl-mod-{index}"
+            )
+            assert result.outcome == REFUSED, key
+            assert result.reason_code == REASON_UNSUPPORTED_KEY, key
+        assert tmux.writes == []
+
+    def test_chord_event_reuses_the_provider_pin(self, tmux, journal):
+        # The fixture provider is "claude-code", which has no native control
+        # adapter, so the chord is the zero-byte refusal the v2 table gives.
+        result = _deliver_sequence(journal, events=[{"type": "chord", "chord": "C-s"}])
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_UNSUPPORTED_CHORD
+        assert tmux.writes == []
+
+    def test_mid_sequence_failure_is_ambiguous_with_the_event_boundary(self, journal):
+        calls = {"count": 0}
+
+        def fail_on_second():
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise TmuxLiteralSendError("tmux went away", chunks_sent=0, enter_attempted=False)
+
+        client = FakeTmux(on_write=fail_on_second)
+        events = [
+            {"type": "text", "text": "typed first"},
+            {"type": "key", "key": "Escape"},
+            {"type": "key", "key": "C-c"},
+        ]
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(service, "_tmux_client", lambda: client)
+            mp.setattr(service, "_terminal_metadata", lambda terminal_id: _metadata())
+            mp.setattr(service, "_managed_identity", lambda terminal_id: None)
+            result = _deliver_sequence(journal, events=events)
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == REASON_WRITE_INCOMPLETE
+        outcomes = [(event["type"], event.get("key"), event["outcome"]) for event in result.events]
+        assert outcomes == [
+            ("text", None, "sent"),
+            ("key", "Escape", "attempted"),
+            ("key", "C-c", "skipped"),
+        ]
+        record = journal.find(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+
+        # A possibly-partial write is never auto-replayed: an identical retry
+        # is answered from the stored row with zero new I/O.
+        writes_before = len(client.writes)
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(service, "_tmux_client", lambda: client)
+            mp.setattr(service, "_terminal_metadata", lambda terminal_id: _metadata())
+            mp.setattr(service, "_managed_identity", lambda terminal_id: None)
+            replay = _deliver_sequence(journal, events=events)
+        assert replay.outcome == AMBIGUOUS
+        assert replay.request_schema_version == 3
+        assert len(client.writes) == writes_before
+
+    def test_pane_busy_refusal_rearms_and_then_replays_terminally(self, journal):
+        client = FakeTmux()
+        events = [{"type": "text", "text": "busy test"}]
+        with _pane_held_elsewhere():
+            with pytest.MonkeyPatch().context() as mp:
+                mp.setattr(service, "_tmux_client", lambda: client)
+                mp.setattr(service, "_terminal_metadata", lambda terminal_id: _metadata())
+                mp.setattr(service, "_managed_identity", lambda terminal_id: None)
+                refused = _deliver_sequence(journal, events=events)
+        assert refused.outcome == REFUSED
+        assert refused.reason_code == REASON_PANE_BUSY
+        assert [event["outcome"] for event in refused.events] == ["refused"]
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(service, "_tmux_client", lambda: client)
+            mp.setattr(service, "_terminal_metadata", lambda terminal_id: _metadata())
+            mp.setattr(service, "_managed_identity", lambda terminal_id: None)
+            delivered = _deliver_sequence(journal, events=events)
+            assert delivered.outcome == ACCEPTED
+            writes_after_delivery = len(client.writes)
+            replay = _deliver_sequence(journal, events=events)
+        assert replay.outcome == ACCEPTED
+        assert replay.request_schema_version == 3
+        assert len(client.writes) == writes_after_delivery  # terminal replay: zero new I/O
+
+
+class TestSequenceIntentPolicy:
+    @pytest.mark.parametrize(
+        "event,intent",
+        [
+            ({"type": "text", "text": "x"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Enter"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Backspace"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Escape"}, service.INTENT_INTERRUPT),
+            ({"type": "key", "key": "C-c"}, service.INTENT_INTERRUPT),
+            ({"type": "key", "key": "C-s"}, service.INTENT_INTERRUPT),
+            ({"type": "chord", "chord": "C-s"}, service.INTENT_INTERRUPT),
+        ],
+    )
+    def test_every_event_form_has_one_class(self, event, intent):
+        assert service._sequence_event_intent(event) == intent
+
+    @pytest.mark.parametrize(
+        "events,gated",
+        [
+            ([{"type": "key", "key": "Escape"}], False),
+            ([{"type": "key", "key": "Escape"}, {"type": "key", "key": "C-c"}], False),
+            ([{"type": "chord", "chord": "C-s"}], False),
+            ([{"type": "text", "text": "x"}], True),
+            ([{"type": "key", "key": "Enter"}], True),
+            ([{"type": "key", "key": "Backspace"}], True),
+            # A mixed sequence is gated as a whole.
+            ([{"type": "key", "key": "Escape"}, {"type": "text", "text": "x"}], True),
+        ],
+    )
+    def test_sequence_gate_covers_any_composer_event(self, events, gated):
+        assert service._sequence_is_readiness_gated(events) is gated
+
+
+class _FakeSequenceAdapter:
+    """An adapter that executes plans through the transport, recording calls."""
+
+    class ComposerWriteInterrupted(Exception):
+        def __init__(self, detail, *, enter_attempted=False):
+            super().__init__(detail)
+            self.detail = detail
+            self.enter_attempted = enter_attempted
+
+    def __init__(self, *, raise_with=None):
+        self.calls = []
+        self._raise_with = raise_with
+
+    def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic=None):
+        self.calls.append((plan, submit))
+        transport.send_literal(plan["lines"][0])
+        if submit:
+            transport.send_enter()
+        if self._raise_with is not None:
+            raise self._raise_with
+
+
+class TestSequenceManagedAdapter:
+    """The managed native path: plans, the proven submit sequence, ordering."""
+
+    def _send(self, journal, client, events, *, adapter=None, dispatch_key=None):
+        adapter = adapter or _FakeSequenceAdapter()
+        plans = {
+            index: {"lines": [event["text"]]}
+            for index, event in enumerate(events)
+            if event["type"] == "text"
+        }
+        digest = control_input_request_digest_v3(
+            control_id=CONTROL, events=events, expected_identity=None
+        )
+        binding = _chord_binding(digest)
+        # The caller opens intent and claims the write before this runs.
+        journal.open_intent(binding)
+        journal.claim_write(CONTROL)
+        return adapter, service._send_sequence_through_native_adapter(
+            journal,
+            client,
+            binding,
+            adapter=adapter,
+            plans=plans,
+            events=events,
+            terminal_id=TERMINAL,
+            resolved=_chord_resolved(),
+            digest=digest,
+            deadline_monotonic=time.monotonic() + service.WRITE_DEADLINE_SECONDS,
+            dispatch_key=dispatch_key,
+        )
+
+    def test_text_then_enter_submits_through_the_adapter_once(self, journal):
+        client = _FakeChordClient()
+        events = [{"type": "text", "text": "hello"}, {"type": "key", "key": "Enter"}]
+        adapter, result = self._send(journal, client, events)
+        assert result.outcome == ACCEPTED
+        # One plan executed with submit=True: the adapter's proven submit
+        # sequence is the only submit mechanism — no second blind Enter.
+        assert adapter.calls == [({"lines": ["hello"]}, True)]
+        assert [event["outcome"] for event in result.events] == ["sent", "sent"]
+        assert result.enter_sent is True
+        record = journal.find(CONTROL)
+        assert record.state == DELIVERED
+        assert record.enter_attempted is True
+
+    def test_bare_enter_is_the_named_key_not_a_plan(self, journal):
+        client = _FakeChordClient()
+        adapter, result = self._send(journal, client, [{"type": "key", "key": "Enter"}])
+        assert result.outcome == ACCEPTED
+        assert adapter.calls == []  # no composer plan for a bare key
+        assert ("literal", "", True) in client.sent
+
+    def test_ordering_across_text_keys_and_chords(self, journal):
+        client = _FakeChordClient()
+        events = [
+            {"type": "key", "key": "Escape"},
+            {"type": "text", "text": "one"},
+            {"type": "key", "key": "C-c"},
+            {"type": "text", "text": "two"},
+            {"type": "key", "key": "Enter"},
+            {"type": "chord", "chord": "C-s"},
+        ]
+        adapter, result = self._send(journal, client, events)
+        assert result.outcome == ACCEPTED
+        kinds = [entry[0] for entry in client.sent]
+        assert kinds == ["key", "literal", "key", "literal", "literal", "chord"]
+        assert client.sent[0] == ("key", "Escape")
+        assert client.sent[2] == ("key", "C-c")
+        # The second text carried the Enter with it (submit=True): the text
+        # literal precedes the submitting Enter literal, both inside the
+        # adapter's one proven submit sequence.
+        assert client.sent[3] == ("literal", "two", False)
+        assert client.sent[4] == ("literal", "", True)
+        assert adapter.calls == [({"lines": ["one"]}, False), ({"lines": ["two"]}, True)]
+        assert [event["outcome"] for event in result.events] == ["sent"] * 6
+
+    def test_interrupted_text_leaves_the_tail_skipped(self, journal):
+        client = _FakeChordClient()
+        adapter = _FakeSequenceAdapter(
+            raise_with=_FakeSequenceAdapter.ComposerWriteInterrupted(
+                "transport died mid-line", enter_attempted=False
+            )
+        )
+        events = [
+            {"type": "text", "text": "partial"},
+            {"type": "key", "key": "Escape"},
+            {"type": "chord", "chord": "C-s"},
+        ]
+        _, result = self._send(journal, client, events, adapter=adapter)
+        assert result.outcome == AMBIGUOUS
+        outcomes = [event["outcome"] for event in result.events]
+        assert outcomes == ["attempted", "skipped", "skipped"]
+        record = journal.find(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        # The ambiguous record never gains new I/O on a lookup-replay.
+        again = service.lookup_control_input(CONTROL, journal=journal)
+        assert again.outcome == AMBIGUOUS
+
+    def test_enter_attempted_marks_text_sent_and_enter_attempted(self, journal):
+        client = _FakeChordClient()
+        interrupted = _FakeSequenceAdapter.ComposerWriteInterrupted(
+            "the Enter raised", enter_attempted=True
+        )
+
+        class _Adapter(_FakeSequenceAdapter):
+            def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic=None):
+                transport.send_literal(plan["lines"][0])
+                transport.enter_attempted = True
+                raise interrupted
+
+        events = [{"type": "text", "text": "typed"}, {"type": "key", "key": "Enter"}]
+        _, result = self._send(journal, client, events, adapter=_Adapter())
+        assert result.outcome == AMBIGUOUS
+        assert [event["outcome"] for event in result.events] == ["sent", "attempted"]
+
+
+class TestSequenceReadinessGate:
+    """The per-event intent policy at the managed boundary (§5.3)."""
+
+    def _wire(self, monkeypatch, resolved, adapter, plans, turn_status=TerminalStatus.IDLE):
+        from cli_agent_orchestrator.services import managed_launch_v2
+
+        with service._native_kimi_dispatch_guard_lock:
+            service._native_kimi_dispatch_times.clear()
+        monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
+        client = FakeTmux(identities=[FakePaneIdentity(
+            pane_id=resolved.pane_id, window_id=resolved.window_id, pane_pid=resolved.pane_pid,
+        )])
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        monkeypatch.setattr(
+            service,
+            "_native_sequence_preflight",
+            lambda *a, **k: (adapter, plans, None),
+        )
+
+        def _observe(provider, **kwargs):
+            if isinstance(turn_status, BaseException):
+                raise turn_status
+            return turn_status
+
+        monkeypatch.setattr(managed_launch_v2, "_observe_turn_state", _observe)
+        return client
+
+    def test_composer_sequence_is_idle_gated(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch, resolved, _FakeSequenceAdapter(), {0: {"lines": ["hello"]}},
+            turn_status=TerminalStatus.PROCESSING,
+        )
+        result = _deliver_sequence(journal, events=[{"type": "text", "text": "hello"}])
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PANE_BUSY
+        assert client.writes == []
+        assert [event["outcome"] for event in result.events] == ["refused"]
+
+    def test_interrupt_sequence_is_deliverable_during_an_active_turn(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch, resolved, _FakeSequenceAdapter(), {},
+            turn_status=TerminalStatus.PROCESSING,
+        )
+        events = [{"type": "key", "key": "Escape"}, {"type": "key", "key": "C-c"}]
+        result = _deliver_sequence(journal, events=events)
+        assert result.outcome == ACCEPTED
+        assert [write["key"] for write in client.writes] == ["Escape", "C-c"]
+
+    def test_chord_sequence_is_deliverable_during_an_active_turn(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch, resolved, _FakeSequenceAdapter(), {},
+            turn_status=TerminalStatus.PROCESSING,
+        )
+        result = _deliver_sequence(journal, events=[{"type": "chord", "chord": "C-s"}])
+        assert result.outcome == ACCEPTED
+        assert client.writes == [{"pane_id": PANE, "chord": "C-s", "expected_server_identity": SOCKET}]
+
+    def test_a_mixed_sequence_is_gated_as_a_whole(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch, resolved, _FakeSequenceAdapter(), {1: {"lines": ["hello"]}},
+            turn_status=TerminalStatus.PROCESSING,
+        )
+        events = [{"type": "key", "key": "Escape"}, {"type": "text", "text": "hello"}]
+        result = _deliver_sequence(journal, events=events)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PANE_BUSY
+        assert client.writes == []
+
+    def test_idle_composer_sequence_delivers(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch, resolved, _FakeSequenceAdapter(), {0: {"lines": ["hello"]}},
+            turn_status=TerminalStatus.IDLE,
+        )
+        result = _deliver_sequence(journal, events=[{"type": "text", "text": "hello"}])
+        assert result.outcome == ACCEPTED
+        assert len(client.writes) == 1
+
+    def test_unobservable_turn_state_is_a_zero_byte_refusal(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch, resolved, _FakeSequenceAdapter(), {0: {"lines": ["hello"]}},
+            turn_status=RuntimeError("pane unreadable"),
+        )
+        result = _deliver_sequence(journal, events=[{"type": "text", "text": "hello"}])
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PANE_BUSY
+        assert client.writes == []
+
+    def test_kimi_dispatch_grace_gates_composer_but_not_interrupt(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        binding = ControlInputBinding(
+            request_id=CONTROL,
+            terminal_id=TERMINAL,
+            pane_id=PANE,
+            window_id=WINDOW,
+            pane_pid=PANE_PID,
+            request_sha256="0" * 64,
+            generation=GENERATION,
+            server_socket_path=SOCKET,
+        )
+        # Marked after wiring: the harness clears the grace table to model a
+        # fresh server, so a dispatch marked before it never happened.
+        client = self._wire(
+            monkeypatch, resolved, _FakeSequenceAdapter(), {0: {"lines": ["hello"]}},
+            turn_status=TerminalStatus.IDLE,
+        )
+        service._mark_native_kimi_dispatch(service._native_kimi_dispatch_key(resolved, binding))
+        refused = _deliver_sequence(journal, events=[{"type": "text", "text": "hello"}])
+        assert refused.outcome == REFUSED
+        assert refused.reason_code == REASON_PANE_BUSY
+
+        delivered = _deliver_sequence(
+            journal, events=[{"type": "key", "key": "Escape"}], control_id="ctl-interrupt-1"
+        )
+        assert delivered.outcome == ACCEPTED
+        assert [write["key"] for write in client.writes] == ["Escape"]

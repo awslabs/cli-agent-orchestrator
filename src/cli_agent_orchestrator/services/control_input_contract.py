@@ -75,7 +75,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, Mapping, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 from cli_agent_orchestrator.services.canonical_json import build_canonical, canonical_sha256
 
@@ -176,6 +176,17 @@ REASON_UNSUPPORTED_CHORD = "unsupported-chord"
 # server.  A timeout on or after a pane-write call is ``ambiguous`` (the
 # post-claim reason set), never this one.
 REASON_WRITE_DEADLINE = "write-deadline"
+# A v3 ``key`` event naming a key outside the normalized name set
+# (:data:`SEQUENCE_KEY_NAMES`).  Decided against the pinned set before any
+# write, so it is proven zero bytes and a caller may retry with a named key
+# (or none).  Unsupported modifiers land here too: they are refused, never
+# silently dropped and never approximated into a key that was not asked for.
+REASON_UNSUPPORTED_KEY = "unsupported-key"
+# A v3 event whose ``type`` this schema version does not define (forwards
+# compatibility: a newer event form must fail closed, not be delivered as
+# something it is not).  Decided before any write, so it is proven zero
+# bytes.
+REASON_UNREPRESENTABLE_EVENT = "unrepresentable-event"
 
 # Every reason is bound to the one outcome it can honestly carry.
 #
@@ -208,6 +219,8 @@ REASON_OUTCOMES: "dict[str, str]" = {
     REASON_SERVER_IDENTITY_UNREADABLE: REFUSED,
     REASON_SERVER_IDENTITY_MISMATCH: REFUSED,
     REASON_UNSUPPORTED_CHORD: REFUSED,
+    REASON_UNSUPPORTED_KEY: REFUSED,
+    REASON_UNREPRESENTABLE_EVENT: REFUSED,
     REASON_WRITE_DEADLINE: REFUSED,
     REASON_CONTROL_ROUTE_ABSENT: UNSUPPORTED,
     REASON_PROTOCOL_MISMATCH: UNSUPPORTED,
@@ -559,6 +572,204 @@ def control_input_request_digest_v2(
                 ("text", text),
                 ("enter", enter),
                 ("chord", normalised_chord),
+                ("expected_identity", normalize_expected_identity(expected_identity)),
+            ]
+        )
+    )
+
+
+# --- Schema v3: ordered structured event sequences ------------------------
+
+# Schema v3 replaces the v1/v2 payload fields with an ordered ``events``
+# array and travels under its own domain, so a sequence request can never
+# collide with a v1 or v2 one.  A v3 request carries ``events`` *or* the
+# v1/v2 fields, never both; v1/v2 domains, digests, and behavior are
+# byte-identical regardless.
+CONTROL_INPUT_DIGEST_DOMAIN_V3 = "cao-control-input-request-v3"
+CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3 = 3
+
+# Fixed field order for the v3 digest preimage.  ``events`` sits where the
+# v1/v2 payload fields sat: after the control id, before the identity.
+REQUEST_DIGEST_FIELD_ORDER_V3 = (
+    "domain",
+    "schema_version",
+    "control_id",
+    "events",
+    "expected_identity",
+)
+
+SEQUENCE_EVENT_TYPE_TEXT = "text"
+SEQUENCE_EVENT_TYPE_KEY = "key"
+SEQUENCE_EVENT_TYPE_CHORD = "chord"
+SEQUENCE_EVENT_TYPES = frozenset(
+    {SEQUENCE_EVENT_TYPE_TEXT, SEQUENCE_EVENT_TYPE_KEY, SEQUENCE_EVENT_TYPE_CHORD}
+)
+
+# The normalized key-name set a ``key`` event may name (cond-0175 §5): the
+# exact representable control keystrokes, and nothing else.  A name outside
+# this set — including any modifier combination it does not list — is
+# refused with ``unsupported-key`` before any write rather than dropped or
+# approximated.  Membership is a service-layer decision; it is deliberately
+# *not* enforced by the digest path, for the same reason chord allowlist
+# membership is not: a digest must be computable for a request the server
+# will then refuse.
+SEQUENCE_KEY_NAMES = frozenset({"Escape", "C-c", "C-s", "Enter", "Backspace"})
+
+# Hard caps, both checked as shape errors before anything is journaled or
+# written: at most 32 events per sequence, and at most 512 UTF-8 bytes of
+# text across the whole sequence (the v1 single-text limit reused as the
+# aggregate).  A sequence is a short control burst, not a script.
+MAX_SEQUENCE_EVENTS = 32
+MAX_SEQUENCE_TEXT_BYTES = 512
+
+# Per-event outcome vocabulary.  One sequence is one at-most-once operation,
+# but its events land in order, so a failure mid-sequence has a per-event
+# boundary that must be recorded honestly rather than flattened into the
+# whole-sequence outcome:
+#
+# - ``sent``: tmux acknowledged this event's write.
+# - ``attempted``: the write was initiated and may have reached the pane;
+#   whether it did is not knowable.  The sequence as a whole is
+#   ``ambiguous`` the moment any event is in this state.
+# - ``skipped``: never initiated — an earlier event's failure stopped the
+#   sequence first, so zero bytes are proven for this event.
+# - ``refused``: the sequence was refused before any write, so zero bytes
+#   are proven for every event.
+EVENT_OUTCOME_SENT = "sent"
+EVENT_OUTCOME_ATTEMPTED = "attempted"
+EVENT_OUTCOME_SKIPPED = "skipped"
+EVENT_OUTCOME_REFUSED = "refused"
+SEQUENCE_EVENT_OUTCOMES = frozenset(
+    {
+        EVENT_OUTCOME_SENT,
+        EVENT_OUTCOME_ATTEMPTED,
+        EVENT_OUTCOME_SKIPPED,
+        EVENT_OUTCOME_REFUSED,
+    }
+)
+
+
+def _validate_sequence_event(event: Any) -> Dict[str, Any]:
+    """Normalise one sequence event to its canonical wire shape.
+
+    Structural validation only.  The returned mapping has the fixed key
+    order the digest encodes: ``type`` first, then the one payload field
+    the type carries.  An unknown *bare* type normalises to its name alone
+    so a server can still digest (and then typed-refuse) an event form a
+    newer schema version defines; an unknown type carrying other fields is
+    a shape error, because there is no canonical order for fields this
+    schema does not define and guessing one would fork the digest.
+    """
+    if not isinstance(event, Mapping):
+        raise ValueError(
+            f"a sequence event must be an object, got {type(event).__name__}"
+        )
+    event_type = event.get("type")
+    if not isinstance(event_type, str) or event_type == "":
+        raise ValueError("a sequence event requires a non-empty string 'type'")
+    if event_type not in SEQUENCE_EVENT_TYPES:
+        if len(event) != 1:
+            raise ValueError(
+                f"event type {event_type!r} is not defined by this schema version, so "
+                "no canonical field order exists for its other fields; a bare "
+                "{'type': ...} probe is the only digestible unknown form"
+            )
+        return {"type": event_type}
+    allowed = {"type", event_type}
+    unknown = sorted(key for key in event if key not in allowed)
+    if unknown:
+        raise ValueError(
+            f"a {event_type!r} event carries unknown field(s) {unknown!r}; rejected "
+            "rather than ignored, because an ignored field silently drops part of "
+            "the request the digest is supposed to bind"
+        )
+    if event_type == SEQUENCE_EVENT_TYPE_TEXT:
+        text = event.get("text")
+        if not isinstance(text, str) or text == "":
+            raise ValueError("a 'text' event requires a non-empty string 'text'")
+        encoded = len(text.encode("utf-8"))
+        if encoded > MAX_SEQUENCE_TEXT_BYTES:
+            raise ValueError(
+                f"a 'text' event is {encoded} UTF-8 bytes, over the "
+                f"{MAX_SEQUENCE_TEXT_BYTES}-byte per-event limit"
+            )
+        return {"type": event_type, "text": text}
+    if event_type == SEQUENCE_EVENT_TYPE_KEY:
+        key = event.get("key")
+        if not isinstance(key, str) or key == "":
+            raise ValueError("a 'key' event requires a non-empty string 'key'")
+        return {"type": event_type, "key": key}
+    # chord events reuse the v2 wire-field validation exactly — except that
+    # the field is mandatory here: a v2 request may name no chord, but a
+    # chord *event* without a chord is no event.
+    chord = event.get("chord")
+    if chord is None:
+        raise ValueError("a 'chord' event requires a non-empty string 'chord'")
+    return {"type": event_type, "chord": _validate_chord(chord)}
+
+
+def normalize_sequence_events(events: Any) -> List[Dict[str, Any]]:
+    """Normalise an ordered ``events`` array to its canonical wire shape.
+
+    Raises ``ValueError`` on any malformed shape: a request that cannot be
+    normalised cannot be digested, and an undigestible control is no
+    control.  Printable/content screening of text events and all membership
+    decisions (key names, chord allowlists) happen at the service layer —
+    this function pins structure and caps so the digest below is computable
+    for every syntactically valid sequence.
+    """
+    if not isinstance(events, (list, tuple)):
+        raise ValueError(f"events must be an array, got {type(events).__name__}")
+    if len(events) == 0:
+        raise ValueError("events must name at least one event; an empty sequence is no control")
+    if len(events) > MAX_SEQUENCE_EVENTS:
+        raise ValueError(
+            f"a sequence carries {len(events)} events, over the {MAX_SEQUENCE_EVENTS}-event "
+            "limit; a sequence is a short control burst, not a script"
+        )
+    normalised = [_validate_sequence_event(event) for event in events]
+    aggregate = sum(
+        len(event["text"].encode("utf-8"))
+        for event in normalised
+        if event["type"] == SEQUENCE_EVENT_TYPE_TEXT
+    )
+    if aggregate > MAX_SEQUENCE_TEXT_BYTES:
+        raise ValueError(
+            f"the sequence carries {aggregate} UTF-8 bytes of text across its events, "
+            f"over the {MAX_SEQUENCE_TEXT_BYTES}-byte aggregate limit"
+        )
+    return normalised
+
+
+def control_input_request_digest_v3(
+    *,
+    control_id: str,
+    events: Any,
+    expected_identity: Optional[Mapping[str, Any]],
+) -> str:
+    """The v3 digest: the same binding as v1/v2, over an ordered event array.
+
+    The preimage is :data:`REQUEST_DIGEST_FIELD_ORDER_V3` under the v3
+    domain.  Event order participates, so ``[Escape, Enter]`` and
+    ``[Enter, Escape]`` are different requests — they are different
+    controls, and a caller authorised exactly one of them.
+
+    Byte-identical to the conductor's v3 ``request_digest`` by the same
+    reconciliation that governs v1/v2: the field order, the domain, the
+    per-event canonical shape, and the canonical encoder are the contract,
+    asserted by a cross-implementation golden vector on each side.
+
+    Membership is *not* checked here — a digest must be computable for any
+    syntactically valid v3 request, including one a server will then
+    refuse, so the two sides never disagree about which requests exist.
+    """
+    return canonical_sha256(
+        build_canonical(
+            [
+                ("domain", CONTROL_INPUT_DIGEST_DOMAIN_V3),
+                ("schema_version", CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3),
+                ("control_id", control_id),
+                ("events", normalize_sequence_events(events)),
                 ("expected_identity", normalize_expected_identity(expected_identity)),
             ]
         )

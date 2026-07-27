@@ -478,11 +478,16 @@ class ControlInputRequest(BaseModel):
     """
 
     control_id: str
-    text: str
+    # v1/v2 payload fields.  Optional at parse time because a v3 request
+    # carries ``events`` instead; the service enforces the either/or rule
+    # and the non-empty-text requirement for v1/v2, so a missing field is
+    # a typed answer rather than an untyped pydantic failure.
+    text: Optional[str] = None
     # Stated, never inferred from the text.  Submitting is the
     # irreversible half of a control, and a default that guessed would
-    # make the caller's intent unreadable from the request.
-    enter: bool = True
+    # make the caller's intent unreadable from the request.  ``None``
+    # keeps the v1 wire default (submit) for v1/v2 requests.
+    enter: Optional[bool] = None
     expected_identity: Optional[Dict[str, Any]] = None
     request_digest: Optional[str] = None
     protocol: Optional[str] = None
@@ -492,6 +497,13 @@ class ControlInputRequest(BaseModel):
     # otherwise drop it and a v2 request would silently deliver as v1
     # text-without-chord.  ``None`` is v1; a non-empty string is v2.
     chord: Optional[str] = None
+    # v3 only: an ordered array of structured events
+    # (``{"type":"text","text":...}``, ``{"type":"key","key":...}``,
+    # ``{"type":"chord","chord":...}``) delivered as one at-most-once
+    # control.  Declared for the same reason ``chord`` is: an old server's
+    # parser must never silently drop a v3 payload and deliver the request
+    # as something else.  Never combined with the v1/v2 fields.
+    events: Optional[List[Dict[str, Any]]] = None
     # Bounded on purpose.  An unbounded wait converts a truthful
     # "the pane is busy, nothing was written, try again" into a request
     # that may never answer.
@@ -2861,6 +2873,7 @@ async def send_terminal_control_input(
                 request_digest=body.request_digest,
                 protocol=body.protocol,
                 chord=body.chord,
+                events=body.events,
                 lease_timeout=body.lease_timeout,
             )
         )

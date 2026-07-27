@@ -299,6 +299,238 @@ class TestV2ChordDigest:
             )
 
 
+class TestV3SequenceDigest:
+    """Schema v3 carries an ordered ``events`` array under its own domain.
+
+    A v3 request is a different request from every v1/v2 one, so it gets its
+    own domain and field order; v1/v2 stay byte-identical.  Membership
+    checks (key names, chord allowlists) are service-layer facts: the digest
+    must be computable for any syntactically valid sequence, including one
+    the server will then refuse, so the two sides never disagree about
+    which requests exist.
+    """
+
+    VECTOR = {
+        "control_id": "seq-1",
+        "events": [
+            {"type": "text", "text": "ping, plus+ back\\slash"},
+            {"type": "key", "key": "Enter"},
+            {"type": "chord", "chord": "C-s"},
+            {"type": "key", "key": "Escape"},
+            {"type": "key", "key": "C-c"},
+            {"type": "key", "key": "Backspace"},
+        ],
+        "expected_identity": {
+            "terminal_id": "term-1",
+            "terminal_generation": "gen-3",
+            "provider_process_id": 4242,
+            "provider": "kimi_cli",
+            "session_name": "cao-demo",
+        },
+    }
+    PREIMAGE = (
+        '{"domain":"cao-control-input-request-v3","schema_version":3,'
+        '"control_id":"seq-1",'
+        '"events":[{"type":"text","text":"ping, plus+ back\\\\slash"},'
+        '{"type":"key","key":"Enter"},{"type":"chord","chord":"C-s"},'
+        '{"type":"key","key":"Escape"},{"type":"key","key":"C-c"},'
+        '{"type":"key","key":"Backspace"}],'
+        '"expected_identity":{"terminal_id":"term-1",'
+        '"terminal_incarnation":null,"terminal_generation":"gen-3","pane_birth_id":null,'
+        '"provider_process_id":4242,"provider":"kimi_cli","native_session_id":null,'
+        '"execution_mode":null,"session_name":"cao-demo"}}\n'
+    )
+    DIGEST = "a78594e8f25ed430de24e2e1fed6672f794c18632b0bb485de748cf76c656231"
+
+    def test_v3_domain_is_separate_from_v1_and_v2(self):
+        assert contract.CONTROL_INPUT_DIGEST_DOMAIN_V3 == "cao-control-input-request-v3"
+        assert contract.CONTROL_INPUT_DIGEST_DOMAIN_V3 != contract.CONTROL_INPUT_DIGEST_DOMAIN
+        assert contract.CONTROL_INPUT_DIGEST_DOMAIN_V3 != contract.CONTROL_INPUT_DIGEST_DOMAIN_V2
+        assert contract.CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3 == 3
+
+    def test_v3_field_order_carries_events_before_identity(self):
+        order = contract.REQUEST_DIGEST_FIELD_ORDER_V3
+        assert order == (
+            "domain",
+            "schema_version",
+            "control_id",
+            "events",
+            "expected_identity",
+        )
+        assert order != tuple(sorted(order))
+
+    def test_matches_the_recorded_digest(self):
+        assert (
+            contract.control_input_request_digest_v3(
+                control_id=self.VECTOR["control_id"],
+                events=self.VECTOR["events"],
+                expected_identity=self.VECTOR["expected_identity"],
+            )
+            == self.DIGEST
+        )
+
+    def test_matches_the_recorded_preimage_byte_for_byte(self):
+        assert hashlib.sha256(self.PREIMAGE.encode("utf-8")).hexdigest() == self.DIGEST, (
+            "the recorded v3 preimage does not hash to the recorded digest"
+        )
+        encoded = canonical_json.encode_canonical(
+            {
+                "domain": contract.CONTROL_INPUT_DIGEST_DOMAIN_V3,
+                "schema_version": contract.CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+                "control_id": self.VECTOR["control_id"],
+                "events": contract.normalize_sequence_events(self.VECTOR["events"]),
+                "expected_identity": contract.normalize_expected_identity(
+                    self.VECTOR["expected_identity"]
+                ),
+            }
+        )
+        assert encoded.decode("utf-8") == self.PREIMAGE
+
+    def test_event_order_is_bound_into_the_digest(self):
+        reordered = contract.control_input_request_digest_v3(
+            control_id="seq-1",
+            events=[{"type": "key", "key": "Enter"}, {"type": "key", "key": "Escape"}],
+            expected_identity=None,
+        )
+        original = contract.control_input_request_digest_v3(
+            control_id="seq-1",
+            events=[{"type": "key", "key": "Escape"}, {"type": "key", "key": "Enter"}],
+            expected_identity=None,
+        )
+        assert reordered != original
+
+    @pytest.mark.parametrize(
+        "events",
+        [
+            [{"type": "text", "text": "changed"}],
+            [{"type": "text", "text": "ping, plus+ back\\slash"}, {"type": "key", "key": "Enter"}],
+            [{"type": "key", "key": "Escape"}],
+            [{"type": "chord", "chord": "C-c"}],
+        ],
+    )
+    def test_every_event_field_changes_the_digest(self, events):
+        assert (
+            contract.control_input_request_digest_v3(
+                control_id="seq-1",
+                events=events,
+                expected_identity=self.VECTOR["expected_identity"],
+            )
+            != self.DIGEST
+        )
+
+    def test_v1_and_v2_digests_are_unchanged_by_v3(self):
+        """The v3 addition must not move what a v1 or v2 request digests to."""
+        v1 = contract.control_input_request_digest(
+            control_id="req-1", text="/model opus", enter=True, expected_identity=None
+        )
+        v2 = contract.control_input_request_digest_v2(
+            control_id="req-1", text="/model opus", enter=False, chord="C-s",
+            expected_identity=None,
+        )
+        assert v1 == hashlib.sha256(
+            b'{"domain":"cao-control-input-request-v1","schema_version":1,'
+            b'"control_id":"req-1","text":"/model opus","enter":true,'
+            b'"expected_identity":{"terminal_id":null,"terminal_incarnation":null,'
+            b'"terminal_generation":null,"pane_birth_id":null,"provider_process_id":null,'
+            b'"provider":null,"native_session_id":null,"execution_mode":null,'
+            b'"session_name":null}}\n'
+        ).hexdigest()
+        assert v2 == hashlib.sha256(
+            b'{"domain":"cao-control-input-request-v2","schema_version":2,'
+            b'"control_id":"req-1","text":"/model opus","enter":false,"chord":"C-s",'
+            b'"expected_identity":{"terminal_id":null,"terminal_incarnation":null,'
+            b'"terminal_generation":null,"pane_birth_id":null,"provider_process_id":null,'
+            b'"provider":null,"native_session_id":null,"execution_mode":null,'
+            b'"session_name":null}}\n'
+        ).hexdigest()
+
+    def test_caps_are_pinned(self):
+        assert contract.MAX_SEQUENCE_EVENTS == 32
+        assert contract.MAX_SEQUENCE_TEXT_BYTES == 512
+        assert contract.MAX_SEQUENCE_TEXT_BYTES == 512  # aggregate across text events
+
+    def test_the_normalized_key_set_is_the_pinned_minimum(self):
+        assert contract.SEQUENCE_KEY_NAMES == {"Escape", "C-c", "C-s", "Enter", "Backspace"}
+
+    def test_new_reason_codes_are_refusals_decided_before_any_write(self):
+        assert contract.REASON_UNSUPPORTED_KEY == "unsupported-key"
+        assert contract.REASON_UNREPRESENTABLE_EVENT == "unrepresentable-event"
+        assert contract.outcome_for_reason(contract.REASON_UNSUPPORTED_KEY) == contract.REFUSED
+        assert (
+            contract.outcome_for_reason(contract.REASON_UNREPRESENTABLE_EVENT)
+            == contract.REFUSED
+        )
+        assert contract.REASON_UNSUPPORTED_KEY in contract.CONTROL_INPUT_REASON_CODES
+        assert contract.REASON_UNREPRESENTABLE_EVENT in contract.CONTROL_INPUT_REASON_CODES
+
+    def test_thirty_two_events_is_the_cap(self):
+        events = [{"type": "key", "key": "Escape"}] * 32
+        assert len(contract.normalize_sequence_events(events)) == 32
+        with pytest.raises(ValueError):
+            contract.normalize_sequence_events(events + [{"type": "key", "key": "Escape"}])
+
+    def test_aggregate_text_bytes_are_capped(self):
+        # 256 + 256 exactly fits; one more byte does not.
+        events = [
+            {"type": "text", "text": "a" * 256},
+            {"type": "text", "text": "b" * 256},
+        ]
+        assert len(contract.normalize_sequence_events(events)) == 2
+        with pytest.raises(ValueError):
+            contract.normalize_sequence_events(
+                [events[0], {"type": "text", "text": "b" * 257}]
+            )
+
+    def test_multibyte_text_is_measured_in_utf8_bytes(self):
+        with pytest.raises(ValueError):
+            contract.normalize_sequence_events([{"type": "text", "text": "é" * 300}])
+
+    @pytest.mark.parametrize(
+        "events",
+        [
+            [],
+            "not-a-list",
+            [{"type": "text"}],
+            [{"type": "text", "text": ""}],
+            [{"type": "text", "text": "a" * 513}],
+            [{"type": "text", "text": 42}],
+            [{"type": "key"}],
+            [{"type": "key", "key": ""}],
+            [{"type": "key", "key": 42}],
+            [{"type": "chord"}],
+            [{"type": "chord", "chord": ""}],
+            [{"type": "text", "text": "ok", "extra": "field"}],
+            [{"type": "macro", "name": "x"}],  # unknown type with extra fields
+            [{"key": "Enter"}],  # missing type
+            [{"type": ""}],
+            [{"type": 42}],
+            ["Escape"],
+        ],
+    )
+    def test_malformed_sequences_are_refused(self, events):
+        with pytest.raises(ValueError):
+            contract.normalize_sequence_events(events)
+
+    def test_membership_is_not_decided_by_the_digest(self):
+        """An unsupported key or unknown bare type still digests: the server
+        must be able to name the request it is about to refuse."""
+        digest = contract.control_input_request_digest_v3(
+            control_id="seq-2",
+            events=[{"type": "key", "key": "M-x"}, {"type": "macro"}],
+            expected_identity=None,
+        )
+        assert len(digest) == 64
+
+    def test_normalization_pins_the_wire_shape(self):
+        normalized = contract.normalize_sequence_events(self.VECTOR["events"])
+        assert normalized[0] == {"type": "text", "text": "ping, plus+ back\\slash"}
+        assert list(normalized[0].keys()) == ["type", "text"]
+        assert list(normalized[1].keys()) == ["type", "key"]
+        assert list(normalized[2].keys()) == ["type", "chord"]
+        # A bare unknown type normalizes to its name only.
+        assert contract.normalize_sequence_events([{"type": "macro"}]) == [{"type": "macro"}]
+
+
 class TestCrossImplementationDigest:
     """The fork and the conductor must produce the same 64 hex characters.
 

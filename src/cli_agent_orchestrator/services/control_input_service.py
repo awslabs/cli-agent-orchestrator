@@ -51,9 +51,9 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -67,7 +67,14 @@ from cli_agent_orchestrator.services.control_input_contract import (
     CONTROL_INPUT_REASON_CODES,
     CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
     CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
+    CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+    EVENT_OUTCOME_ATTEMPTED,
+    EVENT_OUTCOME_REFUSED,
+    EVENT_OUTCOME_SENT,
+    EVENT_OUTCOME_SKIPPED,
     IDENTITY_FIELDS,
+    MAX_SEQUENCE_EVENTS,
+    MAX_SEQUENCE_TEXT_BYTES,
     REASON_CONTROL_ROUTE_ABSENT,
     REASON_IDENTITY_MISMATCH,
     REASON_ILLEGAL_CONTROL_BYTES,
@@ -83,10 +90,17 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_STALE_GENERATION,
     REASON_SUBMISSION_UNPROVEN,
     REASON_UNKNOWN_TERMINAL,
+    REASON_UNREPRESENTABLE_EVENT,
     REASON_UNSUPPORTED_CHORD,
+    REASON_UNSUPPORTED_KEY,
     REASON_WRITE_DEADLINE,
     REASON_WRITE_INCOMPLETE,
     REFUSED,
+    SEQUENCE_EVENT_TYPE_CHORD,
+    SEQUENCE_EVENT_TYPE_KEY,
+    SEQUENCE_EVENT_TYPE_TEXT,
+    SEQUENCE_EVENT_TYPES,
+    SEQUENCE_KEY_NAMES,
     SUBMISSION_OBSERVED_VALUES,
     SUBMISSION_SUBMITTED,
     SUBMISSION_UNKNOWN,
@@ -94,8 +108,10 @@ from cli_agent_orchestrator.services.control_input_contract import (
     contains_bracketed_paste_sentinel,
     control_input_request_digest,
     control_input_request_digest_v2,
+    control_input_request_digest_v3,
     is_reattemptable,
     normalize_expected_identity,
+    normalize_sequence_events,
     normalize_server_identity,
     outcome_for_reason,
     server_identity_refusal,
@@ -638,6 +654,145 @@ def _require_shape(
         )
 
 
+# --- Schema v3: ordered structured event sequences --------------------------
+#
+# A v3 request carries an ordered ``events`` array instead of the v1/v2
+# text/enter/chord fields.  One sequence is one control: one control id, one
+# journal record, one at-most-once claim, one pane lease across the whole
+# ordered write.  If any event may have reached tmux when a write fails,
+# the *sequence* is ambiguous and is never auto-replayed — the per-event
+# outcomes record the boundary honestly, they do not license a retry of
+# the tail.
+
+
+def _require_sequence_shape(
+    control_id: Any, events: Any, request_digest: Any
+) -> List[Dict[str, Any]]:
+    """Refuse a malformed v3 request, or return its normalized events."""
+    if not isinstance(control_id, str) or not CONTROL_ID_PATTERN.match(control_id):
+        raise ControlInputRequestInvalid(
+            f"invalid control_id {control_id!r}: must match {CONTROL_ID_PATTERN.pattern}"
+        )
+    try:
+        normalized = normalize_sequence_events(events)
+    except ValueError as exc:
+        raise ControlInputRequestInvalid(str(exc)) from exc
+    if request_digest is not None and (
+        not isinstance(request_digest, str) or not _DIGEST_PATTERN.match(request_digest)
+    ):
+        raise ControlInputRequestInvalid(
+            "request_digest must be 64 lowercase hex characters when supplied"
+        )
+    return normalized
+
+
+# The per-event intent policy (cond-0175 §5.3), the documented server-side
+# table.  Every event form has exactly one delivery class:
+#
+# - ``composer`` (text, Enter, Backspace) shapes or submits composer
+#   content, so it retains every readiness guard the literal path already
+#   has: the provider-native live-turn idle gate (a parked composer) and
+#   the Kimi dispatch grace, both observed under the same pane lease
+#   before the write claim.
+# - ``interrupt`` (Escape, C-c, and the steer class — key C-s and every
+#   provider-pinned chord) interrupts or steers the provider, so it is
+#   deliverable during an active provider turn and does not inherit the
+#   parked-composer/idle gate.
+#
+# A sequence containing any composer-class event is gated as a whole: the
+# gate is evaluated once, under the lease, before the claim — a per-event
+# gate would order an ungated write against a turn that a gated one
+# started.  Identity binding and re-proof, the pane lease, and the journal
+# apply identically to both classes.
+INTENT_COMPOSER = "composer"
+INTENT_INTERRUPT = "interrupt"
+
+_SEQUENCE_INTERRUPT_KEYS = frozenset({"Escape", "C-c", "C-s"})
+
+
+def _sequence_event_intent(event: Mapping[str, Any]) -> str:
+    """The one delivery class of one normalized event."""
+    if event["type"] == SEQUENCE_EVENT_TYPE_CHORD:
+        return INTENT_INTERRUPT
+    if event["type"] == SEQUENCE_EVENT_TYPE_KEY:
+        return INTENT_INTERRUPT if event["key"] in _SEQUENCE_INTERRUPT_KEYS else INTENT_COMPOSER
+    return INTENT_COMPOSER
+
+
+def _sequence_is_readiness_gated(events: List[Dict[str, Any]]) -> bool:
+    """Whether this sequence shapes or submits composer content at all."""
+    return any(_sequence_event_intent(event) == INTENT_COMPOSER for event in events)
+
+
+def _sequence_event_refusal(
+    resolved: ResolvedControlIdentity, event: Mapping[str, Any]
+) -> Optional[Tuple[str, str]]:
+    """Reason/detail if this event cannot be represented here, or None.
+
+    Decided before the journal and before any write — the same position and
+    the same zero-bytes proof as the v2 steer-chord gate.  An unsupported
+    modifier or key name is refused, never silently dropped and never
+    approximated into a key that was not asked for; a failed control is
+    never reinterpreted as ordinary paste.
+    """
+    event_type = event["type"]
+    if event_type not in SEQUENCE_EVENT_TYPES:
+        return (
+            REASON_UNREPRESENTABLE_EVENT,
+            f"event type {event_type!r} is not defined by request schema v3, so this "
+            "server cannot represent it; refused with zero bytes rather than delivered "
+            "as something it is not",
+        )
+    if event_type == SEQUENCE_EVENT_TYPE_KEY and event["key"] not in SEQUENCE_KEY_NAMES:
+        return (
+            REASON_UNSUPPORTED_KEY,
+            f"key {event['key']!r} is not in the normalized key set "
+            f"{sorted(SEQUENCE_KEY_NAMES)}; unsupported keys and modifier combinations "
+            "are refused with zero bytes, never dropped or approximated",
+        )
+    if event_type == SEQUENCE_EVENT_TYPE_CHORD:
+        # The v2 provider-pinned validation, reused unchanged.
+        return _steer_chord_refusal(resolved, event["chord"])
+    return None
+
+
+def _sequence_events_with_outcome(
+    events: List[Dict[str, Any]], outcome: str
+) -> List[Dict[str, Any]]:
+    """The ordered events each stamped with one per-event outcome."""
+    return [
+        {"ordinal": index, **event, "outcome": outcome} for index, event in enumerate(events)
+    ]
+
+
+class _SequenceRun:
+    """Per-event outcome tracker for one sequence write.
+
+    Every event starts ``skipped``: it has not been initiated, and until it
+    is, zero bytes are provable for it.  An event becomes ``attempted``
+    immediately before its write (an exception leaving tmux cannot prove
+    the bytes did not land) and ``sent`` only after tmux acknowledged it.
+    The tracker never moves an event backwards, so a recorded ``sent`` is
+    never quietly rewritten by a later failure.
+    """
+
+    def __init__(self, events: List[Dict[str, Any]]) -> None:
+        self._states = _sequence_events_with_outcome(events, EVENT_OUTCOME_SKIPPED)
+
+    def mark_attempted(self, ordinal: int) -> None:
+        self._states[ordinal]["outcome"] = EVENT_OUTCOME_ATTEMPTED
+
+    def mark_sent(self, ordinal: int) -> None:
+        self._states[ordinal]["outcome"] = EVENT_OUTCOME_SENT
+
+    def outcome(self, ordinal: int) -> str:
+        return str(self._states[ordinal]["outcome"])
+
+    @property
+    def events(self) -> List[Dict[str, Any]]:
+        return [dict(state) for state in self._states]
+
+
 def screen_expected_identity(
     expected: Dict[str, Any], resolved: ResolvedControlIdentity
 ) -> Optional[Tuple[str, str]]:
@@ -832,6 +987,16 @@ class ControlInputResult:
     # what the provider did with the control remains an operator act.
     submission_observed: Optional[str] = None
     submission_evidence_ref: Optional[str] = None
+    # v3 sequence results echo the ordered events with their per-event
+    # outcomes (``sent`` / ``attempted`` / ``skipped`` / ``refused``).
+    # ``None`` for v1/v2 controls, which have no events.  Per-event
+    # outcomes are honest transport facts: an ``attempted`` event may have
+    # reached the pane, and says nothing about provider completion.
+    events: Optional[List[Dict[str, Any]]] = None
+    # The request schema version this result answers.  v1 and v2 results
+    # both report 1, exactly as before v3 existed (the field predates v2's
+    # introduction and was never restated for it); v3 results report 3.
+    request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION
     http_status: int = 200
 
     def __post_init__(self) -> None:
@@ -856,7 +1021,7 @@ class ControlInputResult:
     def as_response(self) -> Dict[str, Any]:
         return {
             "protocol": CONTROL_INPUT_PROTOCOL,
-            "request_schema_version": CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
+            "request_schema_version": self.request_schema_version,
             "control_id": self.control_id,
             "outcome": self.outcome,
             "reason_code": self.reason_code,
@@ -884,6 +1049,7 @@ class ControlInputResult:
             # guess which it is looking at.
             "submission_observed": self.submission_observed,
             "submission_evidence_ref": self.submission_evidence_ref,
+            "events": None if self.events is None else [dict(event) for event in self.events],
         }
 
 
@@ -993,6 +1159,79 @@ def _record_refusal(
     )
 
 
+def _sequence_refusal(
+    control_id: str,
+    reason: str,
+    detail: str,
+    *,
+    events: List[Dict[str, Any]],
+    terminal_id: Optional[str] = None,
+    resolved: Optional[ResolvedControlIdentity] = None,
+    digest: Optional[str] = None,
+    state: Optional[str] = None,
+) -> ControlInputResult:
+    """The v3 refusal: typed, and stamped with the refused sequence.
+
+    Every event is reported ``refused``: the refusal was decided before
+    any write, so zero bytes are proven for each event individually, not
+    just for the sequence as a whole.
+    """
+    return ControlInputResult(
+        control_id=control_id,
+        outcome=outcome_for_reason(reason),
+        reason_code=reason,
+        detail=detail,
+        state=state,
+        terminal_id=terminal_id,
+        request_digest=digest,
+        resolved_identity=None if resolved is None else resolved.as_dict(),
+        events=_sequence_events_with_outcome(events, EVENT_OUTCOME_REFUSED),
+        request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+    )
+
+
+def _record_sequence_refusal(
+    journal: ControlInputJournal,
+    control_id: str,
+    reason: str,
+    detail: str,
+    *,
+    events: List[Dict[str, Any]],
+    terminal_id: str,
+    resolved: ResolvedControlIdentity,
+    digest: str,
+) -> ControlInputResult:
+    """The journaled v3 refusal, for decisions made after the intent.
+
+    Same durability rule as the v1/v2 path — the refusal commits before
+    the answer is sent, so a lost response re-answers from the record.
+    """
+    result = _record_refusal(
+        journal,
+        control_id,
+        reason,
+        detail,
+        terminal_id=terminal_id,
+        resolved=resolved,
+        digest=digest,
+    )
+    if result.reason_code != reason:
+        # The transition was refused because another writer resolved the
+        # record first; that record's answer (already returned) stands and
+        # is not re-stamped with this refusal's events.
+        return replace(result, request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3)
+    return _sequence_refusal(
+        control_id,
+        reason,
+        detail,
+        events=events,
+        terminal_id=terminal_id,
+        resolved=resolved,
+        digest=digest,
+        state=result.state,
+    )
+
+
 def _steer_chord_refusal(
     resolved: ResolvedControlIdentity, chord: Optional[str]
 ) -> Optional[Tuple[str, str]]:
@@ -1056,12 +1295,13 @@ def deliver_control_input(
     terminal_id: str,
     *,
     control_id: Any,
-    text: Any,
-    enter: Any = True,
+    text: Any = None,
+    enter: Any = None,
     expected_identity: Optional[Mapping[str, Any]] = None,
     request_digest: Optional[str] = None,
     protocol: Optional[str] = None,
     chord: Any = None,
+    events: Any = None,
     lease_timeout: float = 0.0,
     journal: Optional[ControlInputJournal] = None,
 ) -> ControlInputResult:
@@ -1088,6 +1328,9 @@ def deliver_control_input(
             corrupted or partially-substituted request into a refusal
             rather than a control nobody authorised.
         protocol: The protocol literal the caller speaks.
+        events: Schema v3: an ordered array of ``text`` / ``key`` /
+            ``chord`` events delivered as one at-most-once control.  A
+            request carries ``events`` *or* the v1/v2 fields, never both.
         lease_timeout: Seconds to wait for the pane lease.  The default
             of 0 refuses immediately rather than queueing.
         journal: Journal override (tests / isolated state roots).
@@ -1121,20 +1364,64 @@ def deliver_control_input(
             http_status=422,
         )
 
-    _require_shape(control_id, text, enter, request_digest, chord)
+    is_sequence = events is not None
+    normalized_events: Optional[List[Dict[str, Any]]] = None
+    if is_sequence:
+        # The either/or rule: a v3 request's payload is its events.  An
+        # explicit v1/v2 field beside them is ambiguous intent, refused as
+        # a shape error rather than resolved by precedence, because a
+        # precedence rule would silently deliver one of the two controls
+        # the caller may have meant.
+        if text is not None or enter is not None or chord is not None:
+            raise ControlInputRequestInvalid(
+                "a v3 request carries an 'events' array or the v1/v2 fields (text, "
+                "enter, chord), never both; a sequence's payload is its events"
+            )
+        normalized_events = _require_sequence_shape(control_id, events, request_digest)
+    else:
+        if enter is None:
+            # The v1 wire default, preserved: a client that omits ``enter``
+            # asks for the submitting Enter.
+            enter = True
+        _require_shape(control_id, text, enter, request_digest, chord)
     try:
         expected = normalize_expected_identity(expected_identity)
     except ValueError as exc:
         raise ControlInputRequestInvalid(str(exc)) from exc
 
-    screened = screen_control_text(text)
-    if screened is not None:
-        return _refusal(control_id, screened[0], screened[1], terminal_id=terminal_id)
+    if normalized_events is not None:
+        # Every text event passes the same screen as a v1 payload: the v1
+        # printable validation reused per event, nothing normalised or
+        # stripped.  Comma, plus, and backslash are ordinary printable text
+        # here; no escaping exists anywhere on the wire path.
+        for event in normalized_events:
+            if event["type"] != SEQUENCE_EVENT_TYPE_TEXT:
+                continue
+            screened = screen_control_text(event["text"])
+            if screened is not None:
+                return _sequence_refusal(
+                    control_id,
+                    screened[0],
+                    screened[1],
+                    events=normalized_events,
+                    terminal_id=terminal_id,
+                )
+    else:
+        screened = screen_control_text(text)
+        if screened is not None:
+            return _refusal(control_id, screened[0], screened[1], terminal_id=terminal_id)
 
     # A chord request is a v2 request: it travels under the v2 digest domain
     # and field order, so the chord is bound into the digest the way text is.
-    # A v1 request names no chord and keeps its byte-identical v1 digest.
-    if chord is not None:
+    # A v1 request names no chord and keeps its byte-identical v1 digest.  A
+    # sequence request is v3: its ordered events are bound into the digest.
+    if normalized_events is not None:
+        digest = control_input_request_digest_v3(
+            control_id=control_id,
+            events=normalized_events,
+            expected_identity=expected,
+        )
+    elif chord is not None:
         digest = control_input_request_digest_v2(
             control_id=control_id,
             text=text,
@@ -1147,12 +1434,56 @@ def deliver_control_input(
             control_id=control_id, text=text, enter=enter, expected_identity=expected
         )
     if request_digest is not None and request_digest != digest:
+        rebound: ControlInputResult
+        if normalized_events is not None:
+            rebound = _sequence_refusal(
+                control_id,
+                REASON_REQUEST_REBOUND,
+                "the caller's request digest does not match the request that arrived; the "
+                "control the caller authorised is not the control this server would send",
+                events=normalized_events,
+                terminal_id=terminal_id,
+                digest=digest,
+            )
+        else:
+            rebound = _refusal(
+                control_id,
+                REASON_REQUEST_REBOUND,
+                "the caller's request digest does not match the request that arrived; the "
+                "control the caller authorised is not the control this server would send",
+                terminal_id=terminal_id,
+                digest=digest,
+            )
+        return rebound
+
+    def _refuse(
+        reason: str,
+        detail: str,
+        *,
+        resolved: Optional[ResolvedControlIdentity] = None,
+    ) -> ControlInputResult:
+        """One doorway for the shared identity gauntlet's refusals.
+
+        A v3 request is answered in v3 terms: the same typed reason and
+        the same zero-bytes proof, plus the sequence stamped per-event
+        refused.  v1/v2 answers are byte-identical to before.
+        """
+        if normalized_events is not None:
+            return _sequence_refusal(
+                control_id,
+                reason,
+                detail,
+                events=normalized_events,
+                terminal_id=terminal_id,
+                resolved=resolved,
+                digest=digest,
+            )
         return _refusal(
             control_id,
-            REASON_REQUEST_REBOUND,
-            "the caller's request digest does not match the request that arrived; the "
-            "control the caller authorised is not the control this server would send",
+            reason,
+            detail,
             terminal_id=terminal_id,
+            resolved=resolved,
             digest=digest,
         )
 
@@ -1162,38 +1493,25 @@ def deliver_control_input(
         # exists, and a 404 here would be indistinguishable from a server
         # that has no control route at all, which a caller must treat as
         # 'unsupported' instead of 'wrong terminal'.
-        return _refusal(
-            control_id,
+        return _refuse(
             REASON_UNKNOWN_TERMINAL,
             f"no terminal {terminal_id!r} is known to this server",
-            terminal_id=terminal_id,
-            digest=digest,
         )
 
     client = _tmux_client()
     if client is None:
         # Not a refusal: a refusal invites a re-attempt, and no re-attempt
         # under this backend can ever find a pane to bind to.
-        return _refusal(
-            control_id,
+        return _refuse(
             REASON_CONTROL_ROUTE_ABSENT,
             "this server is not running the tmux backend, so there is no pane to bind a "
             "control to; the route exists but can serve no terminal here",
-            terminal_id=terminal_id,
             resolved=resolved,
-            digest=digest,
         )
 
     mismatch = screen_expected_identity(expected, resolved)
     if mismatch is not None:
-        return _refusal(
-            control_id,
-            mismatch[0],
-            mismatch[1],
-            terminal_id=terminal_id,
-            resolved=resolved,
-            digest=digest,
-        )
+        return _refuse(mismatch[0], mismatch[1], resolved=resolved)
 
     # Checked once the mode has positively resolved to a native TUI, which
     # is where the ACP gate above stops protecting the pane and the
@@ -1202,61 +1520,47 @@ def deliver_control_input(
     # refused here rather than delivered on the pane tuple alone.
     unproven = _native_identity_refusal(resolved)
     if unproven is not None:
-        return _refusal(
-            control_id,
-            unproven[0],
-            unproven[1],
-            terminal_id=terminal_id,
-            resolved=resolved,
-            digest=digest,
-        )
+        return _refuse(unproven[0], unproven[1], resolved=resolved)
 
     # A chord is licensed per provider against the proven composer build,
     # decided here -- before the journal, before the lease, before any byte --
     # so an unproven chord is the zero-byte refusal it is.  See §3: any other
     # provider, mode, chord, or unpinned version is typed ``refused``, never a
-    # fallback to text-without-chord.
-    chord_refusal = _steer_chord_refusal(resolved, chord)
-    if chord_refusal is not None:
-        return _refusal(
-            control_id,
-            chord_refusal[0],
-            chord_refusal[1],
-            terminal_id=terminal_id,
-            resolved=resolved,
-            digest=digest,
-        )
+    # fallback to text-without-chord.  A v3 sequence gets the same decision
+    # per event: key names against the normalized set, chord events against
+    # the same provider-pinned table, unknown event forms unrepresentable.
+    event_refusal: Optional[Tuple[str, str]] = None
+    if normalized_events is not None:
+        for event in normalized_events:
+            event_refusal = _sequence_event_refusal(resolved, event)
+            if event_refusal is not None:
+                break
+    else:
+        event_refusal = _steer_chord_refusal(resolved, chord)
+    if event_refusal is not None:
+        return _refuse(event_refusal[0], event_refusal[1], resolved=resolved)
 
     if resolved.recorded_pane_id is None:
-        return _refusal(
-            control_id,
+        return _refuse(
             REASON_LINEAGE_UNPROVEN,
             "this terminal has never recorded an immutable pane identity, so there is "
             "nothing a control could be bound to; a control sent by window name would "
             "be bound to a mutable label rather than to a pane",
-            terminal_id=terminal_id,
             resolved=resolved,
-            digest=digest,
         )
     if resolved.pane_id is None or resolved.pane_dead:
-        return _refusal(
-            control_id,
+        return _refuse(
             REASON_PANE_DEAD,
             f"pane {resolved.recorded_pane_id!r} is gone or dead; tmux never re-uses a "
             "pane id, so this is the end of that pane rather than a pane to wait for",
-            terminal_id=terminal_id,
             resolved=resolved,
-            digest=digest,
         )
     if resolved.window_id is None or resolved.pane_pid is None:
-        return _refusal(
-            control_id,
+        return _refuse(
             REASON_LINEAGE_UNPROVEN,
             "the pane's window and root process could not both be observed, so the "
             "binding this control would be re-verified against cannot be formed",
-            terminal_id=terminal_id,
             resolved=resolved,
-            digest=digest,
         )
 
     # Before the binding is formed, because a binding that named a pane
@@ -1268,14 +1572,7 @@ def deliver_control_input(
         observed=resolved.observed_server_socket_path,
     )
     if server_refusal is not None:
-        return _refusal(
-            control_id,
-            server_refusal[0],
-            server_refusal[1],
-            terminal_id=terminal_id,
-            resolved=resolved,
-            digest=digest,
-        )
+        return _refuse(server_refusal[0], server_refusal[1], resolved=resolved)
 
     book = get_control_input_journal() if journal is None else journal
     binding = ControlInputBinding(
@@ -1291,14 +1588,7 @@ def deliver_control_input(
     try:
         record = book.open_intent(binding)
     except ControlInputRebound as exc:
-        return _refusal(
-            control_id,
-            REASON_REQUEST_REBOUND,
-            str(exc),
-            terminal_id=terminal_id,
-            resolved=resolved,
-            digest=digest,
-        )
+        return _refuse(REASON_REQUEST_REBOUND, str(exc), resolved=resolved)
 
     if record.state == WRITING:
         # Someone claimed this write.  If that owner is gone, the record
@@ -1311,11 +1601,29 @@ def deliver_control_input(
     if record.is_terminal:
         # The at-most-once replay.  A retried request after a lost
         # response is answered from the record rather than re-executed.
-        return _from_record(record, resolved=resolved)
+        result = _from_record(record, resolved=resolved)
+        if normalized_events is not None:
+            # A v3 request is answered in v3 terms.  The stored per-event
+            # outcomes attach here once the journal records them (v5);
+            # none are invented from the re-arriving request.
+            result = replace(
+                result, request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
+            )
+        return result
 
     holder = f"control-input:{control_id}"
     try:
         with pane_input_lease(resolved.pane_id, holder=holder, timeout=lease_timeout):
+            if normalized_events is not None:
+                return _deliver_sequence_under_lease(
+                    book,
+                    client,
+                    binding,
+                    events=normalized_events,
+                    terminal_id=terminal_id,
+                    resolved=resolved,
+                    digest=digest,
+                )
             return _deliver_under_lease(
                 book,
                 client,
@@ -1331,6 +1639,17 @@ def deliver_control_input(
         # Raised by the acquisition only; nothing inside the block can
         # produce it.  Nothing was written, so the control may be sent
         # again — which is why the journal re-arms a refused record.
+        if normalized_events is not None:
+            return _record_sequence_refusal(
+                book,
+                control_id,
+                REASON_PANE_BUSY,
+                f"another writer holds pane {resolved.pane_id}: {exc}",
+                events=normalized_events,
+                terminal_id=terminal_id,
+                resolved=resolved,
+                digest=digest,
+            )
         return _record_refusal(
             book,
             control_id,
@@ -1426,32 +1745,22 @@ class _NativeComposerTransport:
         self.chord_sent = True
 
 
-def _native_composer_preflight(
+def _reprove_native_identity(
     resolved: ResolvedControlIdentity,
     binding: ControlInputBinding,
     *,
-    text: str,
     deadline_monotonic: float,
 ) -> Tuple[Optional[Any], Optional[Any], Optional[Tuple[str, str]]]:
-    """Everything a native write must prove before the claim, or a refusal.
+    """The live identity re-proof every native write needs before the claim.
 
-    Returns ``(adapter, plan, refusal)`` with exactly one of the plan or
-    the refusal set.  Nothing here writes, which is the whole point of its
-    position: the journal has no ``(writing, refused)`` edge, so this is
-    the last place a zero-byte outcome can still be recorded as the
-    refusal it truthfully is.  After the claim the only honest encoding
-    left is ``ambiguous``, which would withhold the re-attempt this
-    refusal is entitled to grant.
-
-    Two proofs, in this order:
-
-    1. The identity, re-asked live rather than taken from the projection
-       the request was resolved against. That projection is a statement
-       about the past — a control arrives arbitrarily later than its bind.
-    2. The composer plan for the build this generation is *bound* to,
-       which is where the version pin and the proven newline keystroke are
-       decided. An unproven build is a permanent fact about this session,
-       so it is refused rather than typed at hopefully.
+    Returns ``(proven, adapter, refusal)`` with exactly one of the pair or
+    the refusal set.  The identity is re-asked live rather than taken from
+    the projection the request was resolved against, because that
+    projection is a statement about the past — a control arrives
+    arbitrarily later than its bind.  Nothing here writes, which is the
+    whole point of its position: the journal has no ``(writing, refused)``
+    edge, so this is the last place a zero-byte outcome can still be
+    recorded as the refusal it truthfully is.
     """
     from cli_agent_orchestrator.services import managed_launch, managed_launch_v2
 
@@ -1523,6 +1832,41 @@ def _native_composer_preflight(
         adapter = managed_launch_v2.native_control_adapter(proven["provider"])
     except managed_launch.ManagedLaunchError as exc:
         return (None, None, (REASON_PROVIDER_UNSUPPORTED, str(exc)))
+    return (proven, adapter, None)
+
+
+def _native_composer_preflight(
+    resolved: ResolvedControlIdentity,
+    binding: ControlInputBinding,
+    *,
+    text: str,
+    deadline_monotonic: float,
+) -> Tuple[Optional[Any], Optional[Any], Optional[Tuple[str, str]]]:
+    """Everything a native write must prove before the claim, or a refusal.
+
+    Returns ``(adapter, plan, refusal)`` with exactly one of the plan or
+    the refusal set.  Nothing here writes, which is the whole point of its
+    position: the journal has no ``(writing, refused)`` edge, so this is
+    the last place a zero-byte outcome can still be recorded as the
+    refusal it truthfully is.  After the claim the only honest encoding
+    left is ``ambiguous``, which would withhold the re-attempt this
+    refusal is entitled to grant.
+
+    Two proofs, in this order:
+
+    1. The identity, re-asked live rather than taken from the projection
+       the request was resolved against. That projection is a statement
+       about the past — a control arrives arbitrarily later than its bind.
+    2. The composer plan for the build this generation is *bound* to,
+       which is where the version pin and the proven newline keystroke are
+       decided. An unproven build is a permanent fact about this session,
+       so it is refused rather than typed at hopefully.
+    """
+    proven, adapter, refusal = _reprove_native_identity(
+        resolved, binding, deadline_monotonic=deadline_monotonic
+    )
+    if refusal is not None:
+        return (None, None, refusal)
 
     try:
         plan = adapter.plan_composer_keystrokes(
@@ -1563,6 +1907,63 @@ def _native_composer_preflight(
             ),
         )
     return (adapter, plan, None)
+
+
+def _native_sequence_preflight(
+    resolved: ResolvedControlIdentity,
+    binding: ControlInputBinding,
+    *,
+    events: List[Dict[str, Any]],
+    deadline_monotonic: float,
+) -> Tuple[Optional[Any], Optional[Dict[int, Any]], Optional[Tuple[str, str]]]:
+    """The v3 twin of the composer preflight: one plan per text event.
+
+    Returns ``(adapter, plans, refusal)`` with ``plans`` keyed by event
+    ordinal.  The identity re-proof is identical to the v1/v2 path — every
+    sequence, including a pure interrupt/steer one, is re-proven against
+    the live attachment before the claim.  The composer plan and its
+    proven-build evidence gate *text typing* only: a text event is typed
+    through the adapter exactly as v1 text is, while named keys and chords
+    carry their own pins (the normalized set, the steer-chord table) and
+    need no composer evidence.
+    """
+    proven, adapter, refusal = _reprove_native_identity(
+        resolved, binding, deadline_monotonic=deadline_monotonic
+    )
+    if refusal is not None:
+        return (None, None, refusal)
+
+    plans: Dict[int, Any] = {}
+    for ordinal, event in enumerate(events):
+        if event["type"] != SEQUENCE_EVENT_TYPE_TEXT:
+            continue
+        try:
+            plan = adapter.plan_composer_keystrokes(
+                event["text"],
+                provider_version=resolved.provider_version,
+                field=f"events[{ordinal}].text",
+            )
+        except adapter.NativeControlInvalid as exc:
+            # Unreachable by construction, as in the v1 preflight: the
+            # event text passed this service's stricter screen already.
+            logger.error("control-input adapter screening disagreement: %s", exc)
+            return (None, None, (REASON_ILLEGAL_CONTROL_BYTES, str(exc)))
+        if not plan.get("deliverable", True):
+            return (None, None, (REASON_PROVIDER_UNSUPPORTED, str(plan["undeliverable_reason"])))
+        if plan.get("composer_evidence") is None:
+            return (
+                None,
+                None,
+                (
+                    REASON_PROVIDER_UNSUPPORTED,
+                    f"no composer behaviour is proven for {proven['provider']} version "
+                    f"{resolved.provider_version!r}, so the submit keystroke this build "
+                    "needs is unknown; refusing rather than typing at a composer on an "
+                    "unproven build",
+                ),
+            )
+        plans[ordinal] = plan
+    return (adapter, plans, None)
 
 
 def _deliver_under_lease(
@@ -2441,6 +2842,644 @@ def _send_through_native_adapter(
     )
 
 
+def _deliver_sequence_under_lease(
+    journal: ControlInputJournal,
+    client: Any,
+    binding: ControlInputBinding,
+    *,
+    events: List[Dict[str, Any]],
+    terminal_id: str,
+    resolved: ResolvedControlIdentity,
+    digest: str,
+) -> ControlInputResult:
+    """Re-verify, gate, claim, and write one v3 sequence under the lease.
+
+    The v3 twin of ``_deliver_under_lease``: the same live re-verification
+    under the same lease, the same claim-before-first-byte ordering, and
+    the same refusal/ambiguous split.  One sequence is one claim — the
+    ordered events are the write, not separate operations.
+    """
+    control_id = binding.request_id
+    deadline = time.monotonic() + WRITE_DEADLINE_SECONDS
+    write_claimed = False
+
+    def _refuse_pre_claim(reason: str, detail: str) -> ControlInputResult:
+        return _record_sequence_refusal(
+            journal,
+            control_id,
+            reason,
+            detail,
+            events=events,
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+        )
+
+    def _deadline_breached() -> Optional[ControlInputResult]:
+        """The overall write deadline's typed outcome, or None to proceed.
+
+        Before the claim this is a zero-byte ``refused``/``write-deadline``;
+        after it the executor's own deadline checks report ``ambiguous``.
+        """
+        if time.monotonic() <= deadline:
+            return None
+        if write_claimed:
+            return None
+        return _refuse_pre_claim(
+            REASON_WRITE_DEADLINE,
+            f"the sequence write exceeded its overall {WRITE_DEADLINE_SECONDS:g}s write "
+            "deadline before any byte was written; nothing reached the pane and the "
+            "sequence may be sent again",
+        )
+
+    breached = _deadline_breached()
+    if breached is not None:
+        return breached
+    try:
+        live = client.pane_control_identity(pane_id=binding.pane_id, deadline_monotonic=deadline)
+    except subprocess.TimeoutExpired as exc:
+        return _refuse_pre_claim(
+            REASON_WRITE_DEADLINE,
+            f"the pre-write identity read exceeded its bound before any byte: {exc}; "
+            "nothing was written and the sequence may be sent again",
+        )
+    if live is None or live.dead:
+        return _refuse_pre_claim(
+            REASON_PANE_DEAD,
+            f"pane {binding.pane_id} is gone or dead as of the write lease",
+        )
+    if live.window_id != binding.window_id or live.pane_pid != binding.pane_pid:
+        return _refuse_pre_claim(
+            REASON_IDENTITY_MISMATCH,
+            f"pane {binding.pane_id} now reports window {live.window_id!r} and root pid "
+            f"{live.pane_pid}, not the bound {binding.window_id!r} / {binding.pane_pid}; "
+            "the pane this sequence was bound to is not the pane in front of it now",
+        )
+    # Re-verified before the claim for the same reason as on the v1/v2
+    # path: after the claim no zero-byte refusal can be recorded as one.
+    server_refusal = server_identity_refusal(
+        bound=binding.server_socket_path, observed=live.server_socket_path
+    )
+    if server_refusal is not None:
+        return _refuse_pre_claim(server_refusal[0], server_refusal[1])
+
+    adapter: Optional[Any] = None
+    plans: Optional[Dict[int, Any]] = None
+    dispatch_key: Optional[Tuple[str, Optional[str], str, int]] = None
+    if resolved.managed and resolved.execution_mode == EXECUTION_MODE_NATIVE_TUI:
+        breached = _deadline_breached()
+        if breached is not None:
+            return breached
+        try:
+            adapter, plans, native_refusal = _native_sequence_preflight(
+                resolved,
+                binding,
+                events=events,
+                deadline_monotonic=deadline,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return _refuse_pre_claim(
+                REASON_WRITE_DEADLINE,
+                f"the managed native identity observation exceeded its bound before any "
+                f"byte: {exc}; nothing was written and the sequence may be sent again",
+            )
+        if native_refusal is not None:
+            return _refuse_pre_claim(native_refusal[0], native_refusal[1])
+
+        # The per-event intent policy, applied to the sequence as a whole
+        # (see the table at _sequence_event_intent): a sequence that shapes
+        # or submits composer content inherits the readiness guards the
+        # literal path already has — the Kimi dispatch grace and the
+        # provider-native live-turn idle gate, observed under this lease so
+        # the idle proof and the write are atomic against a turn starting
+        # between them.  A pure interrupt/steer sequence is deliverable
+        # during an active turn and skips both.
+        if _sequence_is_readiness_gated(events):
+            if resolved.provider == "kimi_cli":
+                dispatch_key = _native_kimi_dispatch_key(resolved, binding)
+            if dispatch_key is not None and _native_kimi_dispatch_is_guarded(dispatch_key):
+                return _refuse_pre_claim(
+                    REASON_PANE_BUSY,
+                    "a preceding Enter was sent to this exact Kimi pane generation "
+                    "inside its dispatch grace; the ready-looking frame may be stale, "
+                    "so nothing was written",
+                )
+            from cli_agent_orchestrator.services import managed_launch_v2
+            from cli_agent_orchestrator.utils.terminal import managed_window_name
+
+            try:
+                turn_status = managed_launch_v2._observe_turn_state(
+                    resolved.provider,
+                    pane_id=binding.pane_id,
+                    terminal_id=terminal_id,
+                    session_name=resolved.session_name,
+                    window_name=managed_window_name(
+                        terminal_id, resolved.terminal_generation
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - "could not look" is not "idle"
+                return _refuse_pre_claim(
+                    REASON_PANE_BUSY,
+                    f"the receiver's turn state could not be observed, so nothing "
+                    f"was written: {exc}",
+                )
+            if turn_status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+                return _refuse_pre_claim(
+                    REASON_PANE_BUSY,
+                    f"the receiver is {turn_status.value}, not idle; a composer-class "
+                    "sequence is readiness-gated and nothing was written",
+                )
+
+    breached = _deadline_breached()
+    if breached is not None:
+        return breached
+    claim = journal.claim_write(control_id)
+    if not claim.granted:
+        # Exactly one caller ever writes for a control id.  A caller
+        # holding a refused claim must not write even when the record
+        # looks abandoned: that owner may be mid-write this instant.
+        result = _from_record(claim.record, resolved=resolved)
+        return replace(result, request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3)
+    write_claimed = True
+
+    if adapter is not None and plans is not None:
+        return _send_sequence_through_native_adapter(
+            journal,
+            client,
+            binding,
+            adapter=adapter,
+            plans=plans,
+            events=events,
+            terminal_id=terminal_id,
+            resolved=resolved,
+            digest=digest,
+            deadline_monotonic=deadline,
+            dispatch_key=dispatch_key,
+        )
+    return _send_sequence_through_literal_sink(
+        journal,
+        client,
+        binding,
+        events=events,
+        terminal_id=terminal_id,
+        resolved=resolved,
+        digest=digest,
+        deadline_monotonic=deadline,
+    )
+
+
+def _sequence_accepted(
+    control_id: str,
+    binding: ControlInputBinding,
+    run: _SequenceRun,
+    record: ControlInputRecord,
+    *,
+    via: str,
+    terminal_id: str,
+    resolved: ResolvedControlIdentity,
+    digest: str,
+    chunks_sent: int,
+    enter_attempted: bool,
+    chord: Optional[str],
+    chord_attempted: Optional[bool],
+    chord_sent: Optional[bool],
+) -> ControlInputResult:
+    """The accepted v3 answer: every event sent, in order, once."""
+    return ControlInputResult(
+        control_id=control_id,
+        outcome=ACCEPTED,
+        detail=(
+            f"delivered {len(run.events)} ordered event(s) into pane {binding.pane_id} "
+            f"{via}; every event was acknowledged"
+        ),
+        state=record.state,
+        terminal_id=terminal_id,
+        request_digest=digest,
+        resolved_identity=resolved.as_dict(),
+        text_sent=any(
+            event["type"] == SEQUENCE_EVENT_TYPE_TEXT and event["outcome"] == EVENT_OUTCOME_SENT
+            for event in run.events
+        ),
+        enter_sent=any(
+            event["type"] == SEQUENCE_EVENT_TYPE_KEY
+            and event["key"] == "Enter"
+            and event["outcome"] == EVENT_OUTCOME_SENT
+            for event in run.events
+        ),
+        chunks_sent=chunks_sent,
+        enter_attempted=enter_attempted,
+        chord=chord,
+        chord_attempted=chord_attempted,
+        chord_sent=chord_sent,
+        events=run.events,
+        request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+    )
+
+
+def _send_sequence_through_native_adapter(
+    journal: ControlInputJournal,
+    client: Any,
+    binding: ControlInputBinding,
+    *,
+    adapter: Any,
+    plans: Dict[int, Any],
+    events: List[Dict[str, Any]],
+    terminal_id: str,
+    resolved: ResolvedControlIdentity,
+    digest: str,
+    deadline_monotonic: float,
+    dispatch_key: Optional[Tuple[str, Optional[str], str, int]],
+) -> ControlInputResult:
+    """Write one claimed v3 sequence through the provider's own adapter.
+
+    Text events are typed through the adapter's composer plan exactly as v1
+    text is.  An Enter event immediately after a text event submits that
+    text through the adapter's proven submit sequence — the same pre-submit
+    reset and settle the v1 path uses, never a second blind Enter — while a
+    bare Enter is sent as the exact named key: the reset exists to make an
+    Enter land after a literal burst, and sending it where no burst
+    precedes would be a keystroke at a composer for no reason.  Per-event
+    outcomes are honest transport facts; none of them is provider
+    completion.
+    """
+    control_id = binding.request_id
+    transport = _NativeComposerTransport(
+        client,
+        binding.pane_id,
+        binding.server_socket_path,
+        deadline_monotonic=deadline_monotonic,
+    )
+    run = _SequenceRun(events)
+    last_chord: Optional[str] = None
+
+    def _mark_dispatch() -> None:
+        if dispatch_key is not None and transport.enter_attempted:
+            _mark_native_kimi_dispatch(dispatch_key)
+
+    def _ambiguous(detail: str) -> ControlInputResult:
+        _mark_dispatch()
+        journal.mark_ambiguous(
+            control_id,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            chunks_sent=transport.chunks_sent,
+            enter_attempted=transport.enter_attempted,
+            chord=last_chord,
+            chord_attempted=transport.chord_attempted,
+            chord_sent=transport.chord_sent,
+            evidence_digest=digest,
+        )
+        return ControlInputResult(
+            control_id=control_id,
+            outcome=AMBIGUOUS,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            detail=detail
+            + " What reached the pane is bounded by the per-event outcomes but is not "
+            "knowable exactly, so this sequence must not be sent again",
+            state=STATE_AMBIGUOUS,
+            terminal_id=terminal_id,
+            request_digest=digest,
+            resolved_identity=resolved.as_dict(),
+            chunks_sent=transport.chunks_sent,
+            enter_attempted=transport.enter_attempted,
+            chord=last_chord,
+            chord_attempted=transport.chord_attempted,
+            chord_sent=transport.chord_sent,
+            events=run.events,
+            request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+        )
+
+    def _deadline_ambiguity() -> Optional[ControlInputResult]:
+        if time.monotonic() <= deadline_monotonic:
+            return None
+        return _ambiguous(
+            f"the sequence write exceeded its overall {WRITE_DEADLINE_SECONDS:g}s "
+            "deadline after the write was claimed."
+        )
+
+    ordinal = 0
+    total = len(events)
+    while ordinal < total:
+        expired = _deadline_ambiguity()
+        if expired is not None:
+            return expired
+        event = events[ordinal]
+        event_type = event["type"]
+        if event_type == SEQUENCE_EVENT_TYPE_TEXT:
+            # An Enter immediately following submits this text through the
+            # adapter's proven submit sequence as one unit.
+            submits = (
+                ordinal + 1 < total
+                and events[ordinal + 1]["type"] == SEQUENCE_EVENT_TYPE_KEY
+                and events[ordinal + 1]["key"] == "Enter"
+            )
+            run.mark_attempted(ordinal)
+            try:
+                adapter.execute_composer_plan(
+                    plan=plans[ordinal],
+                    transport=transport,
+                    submit=submits,
+                    deadline_monotonic=deadline_monotonic,
+                )
+            except adapter.ComposerWriteInterrupted as exc:
+                if transport.enter_attempted:
+                    # Typing provably completed (the Enter stage was
+                    # reached); the Enter itself is the unknown event.
+                    run.mark_sent(ordinal)
+                    if submits:
+                        run.mark_attempted(ordinal + 1)
+                return _ambiguous(f"the composer write stopped part-way: {exc.detail}.")
+            except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
+                logger.error(
+                    "control-input sequence adapter raised for %s: %s", control_id, exc
+                )
+                if transport.enter_attempted:
+                    run.mark_sent(ordinal)
+                    if submits:
+                        run.mark_attempted(ordinal + 1)
+                return _ambiguous(f"the provider composer adapter raised while writing: {exc}.")
+            run.mark_sent(ordinal)
+            if submits:
+                run.mark_sent(ordinal + 1)
+                ordinal += 2
+            else:
+                ordinal += 1
+        elif event_type == SEQUENCE_EVENT_TYPE_KEY and event["key"] == "Enter":
+            # Bare Enter: the exact named key, after the readiness gate.
+            run.mark_attempted(ordinal)
+            try:
+                transport.send_enter()
+            except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
+                logger.error("control-input bare Enter raised for %s: %s", control_id, exc)
+                return _ambiguous(f"the Enter keystroke raised: {exc}.")
+            run.mark_sent(ordinal)
+            ordinal += 1
+        elif event_type == SEQUENCE_EVENT_TYPE_KEY:
+            run.mark_attempted(ordinal)
+            try:
+                client.send_sequence_key(
+                    binding.pane_id,
+                    event["key"],
+                    expected_server_identity=binding.server_socket_path,
+                    deadline_monotonic=deadline_monotonic,
+                )
+            except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
+                logger.error(
+                    "control-input sequence key %s raised for %s: %s",
+                    event["key"],
+                    control_id,
+                    exc,
+                )
+                return _ambiguous(f"the {event['key']} keystroke raised: {exc}.")
+            run.mark_sent(ordinal)
+            ordinal += 1
+        else:  # chord event — the provider-pinned steer effect
+            last_chord = event["chord"]
+            run.mark_attempted(ordinal)
+            try:
+                transport.send_chord(event["chord"])
+            except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
+                logger.error(
+                    "control-input sequence chord %s raised for %s: %s",
+                    event["chord"],
+                    control_id,
+                    exc,
+                )
+                return _ambiguous(f"the steer chord {event['chord']} raised: {exc}.")
+            run.mark_sent(ordinal)
+            ordinal += 1
+
+    expired = _deadline_ambiguity()
+    if expired is not None:
+        return expired
+    _mark_dispatch()
+    record = journal.mark_delivered(
+        control_id,
+        chunks_sent=transport.chunks_sent,
+        enter_attempted=transport.enter_attempted,
+        chord=last_chord,
+        chord_attempted=transport.chord_attempted,
+        chord_sent=transport.chord_sent,
+        evidence_digest=digest,
+    )
+    return _sequence_accepted(
+        control_id,
+        binding,
+        run,
+        record,
+        via=f"through the {resolved.provider} native composer adapter",
+        terminal_id=terminal_id,
+        resolved=resolved,
+        digest=digest,
+        chunks_sent=transport.chunks_sent,
+        enter_attempted=transport.enter_attempted,
+        chord=last_chord,
+        chord_attempted=transport.chord_attempted,
+        chord_sent=transport.chord_sent,
+    )
+
+
+def _send_sequence_through_literal_sink(
+    journal: ControlInputJournal,
+    client: Any,
+    binding: ControlInputBinding,
+    *,
+    events: List[Dict[str, Any]],
+    terminal_id: str,
+    resolved: ResolvedControlIdentity,
+    digest: str,
+    deadline_monotonic: float,
+) -> ControlInputResult:
+    """Write one claimed v3 sequence through the generic literal primitive.
+
+    For a native pane without a managed adapter, a text event is the v1
+    literal write, a text event immediately followed by an Enter is the
+    exact v1 text-plus-Enter write (one call, one Enter — the cond-0026
+    provider-pinned submission barrier covers this pair where it pins one,
+    exactly as it does the v1 path), and a bare Enter is the submitting
+    Enter on its own.  The error mapping is the v1 unmanaged path's: every
+    failure after the claim is ``ambiguous``, including the server-identity
+    anomaly that proves zero bytes — the journal has no (writing, refused)
+    edge, and no error type carves one out.
+    """
+    control_id = binding.request_id
+    run = _SequenceRun(events)
+    chunks = 0
+    enter_attempted = False
+    chord_attempted = False
+    chord_sent = False
+    last_chord: Optional[str] = None
+
+    def _ambiguous(detail: str) -> ControlInputResult:
+        journal.mark_ambiguous(
+            control_id,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            chunks_sent=chunks,
+            enter_attempted=enter_attempted,
+            chord=last_chord,
+            chord_attempted=chord_attempted,
+            chord_sent=chord_sent,
+            evidence_digest=digest,
+        )
+        return ControlInputResult(
+            control_id=control_id,
+            outcome=AMBIGUOUS,
+            reason_code=REASON_WRITE_INCOMPLETE,
+            detail=detail
+            + " What reached the pane is bounded by the per-event outcomes but is not "
+            "knowable exactly, so this sequence must not be sent again",
+            state=STATE_AMBIGUOUS,
+            terminal_id=terminal_id,
+            request_digest=digest,
+            resolved_identity=resolved.as_dict(),
+            chunks_sent=chunks,
+            enter_attempted=enter_attempted,
+            chord=last_chord,
+            chord_attempted=chord_attempted,
+            chord_sent=chord_sent,
+            events=run.events,
+            request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+        )
+
+    ordinal = 0
+    total = len(events)
+    while ordinal < total:
+        if time.monotonic() > deadline_monotonic:
+            return _ambiguous(
+                f"the sequence write exceeded its overall {WRITE_DEADLINE_SECONDS:g}s "
+                "deadline after the write was claimed."
+            )
+        event = events[ordinal]
+        event_type = event["type"]
+        try:
+            if event_type == SEQUENCE_EVENT_TYPE_TEXT:
+                submits = (
+                    ordinal + 1 < total
+                    and events[ordinal + 1]["type"] == SEQUENCE_EVENT_TYPE_KEY
+                    and events[ordinal + 1]["key"] == "Enter"
+                )
+                run.mark_attempted(ordinal)
+                written = client.send_literal_line(
+                    binding.pane_id,
+                    event["text"],
+                    submit=submits,
+                    expected_server_identity=binding.server_socket_path,
+                    deadline_monotonic=deadline_monotonic,
+                )
+                chunks += written
+                run.mark_sent(ordinal)
+                if submits:
+                    enter_attempted = True
+                    run.mark_sent(ordinal + 1)
+                    ordinal += 2
+                else:
+                    ordinal += 1
+            elif event_type == SEQUENCE_EVENT_TYPE_KEY and event["key"] == "Enter":
+                # Bare Enter: the submitting key on its own.
+                run.mark_attempted(ordinal)
+                enter_attempted = True
+                client.send_literal_line(
+                    binding.pane_id,
+                    "",
+                    submit=True,
+                    expected_server_identity=binding.server_socket_path,
+                    deadline_monotonic=deadline_monotonic,
+                )
+                run.mark_sent(ordinal)
+                ordinal += 1
+            elif event_type == SEQUENCE_EVENT_TYPE_KEY:
+                run.mark_attempted(ordinal)
+                client.send_sequence_key(
+                    binding.pane_id,
+                    event["key"],
+                    expected_server_identity=binding.server_socket_path,
+                    deadline_monotonic=deadline_monotonic,
+                )
+                run.mark_sent(ordinal)
+                ordinal += 1
+            else:  # chord event
+                last_chord = event["chord"]
+                run.mark_attempted(ordinal)
+                chord_attempted = True
+                client.send_steer_chord(
+                    binding.pane_id,
+                    event["chord"],
+                    expected_server_identity=binding.server_socket_path,
+                    deadline_monotonic=deadline_monotonic,
+                )
+                chord_sent = True
+                run.mark_sent(ordinal)
+                ordinal += 1
+        except TmuxServerIdentityError as exc:
+            # Unreachable by construction — the same comparison ran under
+            # this lease moments ago — and recorded as ambiguous despite
+            # proving zero bytes, for the same reason the v1 path records
+            # it so: the no-(writing, refused) invariant is stronger than
+            # any one error type's guarantee.
+            logger.error(
+                "control-input server identity changed under the write lease for %s: "
+                "bound=%r observed=%r",
+                control_id,
+                exc.bound,
+                exc.observed,
+            )
+            return _ambiguous(
+                f"the pane's tmux server changed while the write lease was held: {exc}. "
+                f"The underlying identity diagnostic was {exc.reason_code!r}. "
+                "Nothing was written, but the write had already been claimed, and a "
+                "claimed write is never reported as a refusal"
+            )
+        except TmuxLiteralSendError as exc:
+            chunks += exc.chunks_sent
+            if exc.enter_attempted:
+                enter_attempted = True
+                # The Enter stage was reached, so the text payload provably
+                # landed; the Enter itself is the unknown event.
+                if event["type"] == SEQUENCE_EVENT_TYPE_TEXT:
+                    run.mark_sent(ordinal)
+                    run.mark_attempted(ordinal + 1)
+            return _ambiguous(f"the write failed part-way through: {exc}.")
+        except ValueError as exc:
+            # A screening disagreement between this service and the sink:
+            # recorded, never raised, for the same reason as on v1.
+            logger.error("control-input screening disagreement for %s: %s", control_id, exc)
+            return _ambiguous(f"the write primitive rejected an already-screened event: {exc}")
+        except subprocess.TimeoutExpired as exc:
+            logger.error("control-input sequence write timed out for %s: %s", control_id, exc)
+            return _ambiguous(
+                f"a tmux call in the write path exceeded its bound after the claim: {exc}."
+            )
+
+    if time.monotonic() > deadline_monotonic:
+        return _ambiguous(
+            f"the sequence write exceeded its overall {WRITE_DEADLINE_SECONDS:g}s "
+            "deadline after the write was claimed."
+        )
+    record = journal.mark_delivered(
+        control_id,
+        chunks_sent=chunks,
+        enter_attempted=enter_attempted,
+        chord=last_chord,
+        chord_attempted=chord_attempted,
+        chord_sent=chord_sent,
+        evidence_digest=digest,
+    )
+    return _sequence_accepted(
+        control_id,
+        binding,
+        run,
+        record,
+        via="through the literal write primitive",
+        terminal_id=terminal_id,
+        resolved=resolved,
+        digest=digest,
+        chunks_sent=chunks,
+        enter_attempted=enter_attempted,
+        chord=last_chord,
+        chord_attempted=chord_attempted,
+        chord_sent=chord_sent,
+    )
+
+
 # --- Native inbox payload delivery ------------------------------------------
 #
 # The payload twin of the public control-input delivery, for ordinary inbox
@@ -2776,8 +3815,18 @@ def control_input_capability_block() -> Dict[str, Any]:
         "schema_versions": [
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
+            CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
         ],
         "chords": _advertised_steer_chords(),
+        # v3 structured sequences: the exact event forms, the normalized
+        # key set, and the caps, so a caller fails closed before sending a
+        # sequence a server cannot represent.
+        "sequence": {
+            "event_types": sorted(SEQUENCE_EVENT_TYPES),
+            "keys": sorted(SEQUENCE_KEY_NAMES),
+            "max_events": MAX_SEQUENCE_EVENTS,
+            "max_text_bytes": MAX_SEQUENCE_TEXT_BYTES,
+        },
     }
 
 
@@ -2795,13 +3844,14 @@ def control_input_capabilities() -> Dict[str, Any]:
         "protocol": CONTROL_INPUT_PROTOCOL,
         "request_schema_version": CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
         # The set of request schema versions this server speaks.  v2 adds the
-        # optional ``chord`` field; v1 is unchanged.  A conductor that needs
-        # v2 reads this (and the per-terminal block on the identity route)
-        # before sending a chord, and fails closed against a server that
-        # offers only v1.
+        # optional ``chord`` field; v3 adds the ordered ``events`` array; v1
+        # is unchanged.  A conductor that needs v2 or v3 reads this (and the
+        # per-terminal block on the identity route) before sending, and fails
+        # closed against a server that offers only earlier versions.
         "request_schema_versions": [
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
+            CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
         ],
         "digest_domain": CONTROL_INPUT_DIGEST_DOMAIN,
         "steer_chords": _advertised_steer_chords(),
@@ -2810,6 +3860,15 @@ def control_input_capabilities() -> Dict[str, Any]:
         "reason_codes": sorted(CONTROL_INPUT_REASON_CODES),
         "max_text_bytes": MAX_TEXT_BYTES,
         "control_id_pattern": CONTROL_ID_PATTERN.pattern,
+        # The v3 structured-sequence surface: exact representable event
+        # forms, the normalized key set, and the caps.  A sequence a server
+        # cannot represent is refused with zero bytes, never approximated.
+        "sequence": {
+            "event_types": sorted(SEQUENCE_EVENT_TYPES),
+            "keys": sorted(SEQUENCE_KEY_NAMES),
+            "max_events": MAX_SEQUENCE_EVENTS,
+            "max_text_bytes": MAX_SEQUENCE_TEXT_BYTES,
+        },
         # Stated so a caller never has to infer them from behaviour.
         "literal_write": True,
         "bracketed_paste": False,
