@@ -249,6 +249,60 @@ class NavigationModel:
         self._active_command = command
         return self._builder
 
+    # -- top-level leaf vs group (P1-2) ------------------------------------- #
+
+    def open_top_level(self, name: str) -> CommandBuilder:
+        """Open a runnable *leaf* top-level command into the U3 builder (P1-2).
+
+        A top-level entry with no subcommands (e.g. ``launch``, ``info``,
+        ``shutdown``) is a runnable command in its own right, not a group to
+        drill into. This routes its bare one-token path (``[name]``) into
+        :meth:`CommandBuilder.select` — the same nav -> build seam as
+        :meth:`open_command`, but for a top-level leaf whose path is just its
+        own name. U6 adds no CLI logic — it only routes the selection.
+
+        Args:
+            name: The top-level leaf command chosen by the operator.
+
+        Returns:
+            The bound :class:`CommandBuilder`, now selected on ``[name]``.
+        """
+
+        command = Command(name=name, summary="", path=[name])
+        self._builder.select(command.path)
+        self._active_command = command
+        return self._builder
+
+    def select_top_level(self, name: str) -> bool:
+        """Route a top-level selection: drill a group, or open a leaf command (P1-2).
+
+        This is the single entry point for a top-level Enter. It asks the catalog
+        for the entry's subcommands (the same source :meth:`enter_group` uses):
+
+        * has subcommands -> it is a **group**: drill into it via
+          :meth:`enter_group` and return ``False`` (no command opened).
+        * has no subcommands -> it is a **leaf command**: open it via
+          :meth:`open_top_level` and return ``True``.
+
+        Before this fix, every top-level Enter drilled as a group, so a leaf
+        top-level command (``info``, ``init``, ``install``, ``launch``,
+        ``mcp-server``, ``shutdown``, ``update``) yielded an empty command list
+        and dead-ended — it was unreachable. This routes it correctly.
+
+        Args:
+            name: The top-level entry the operator selected.
+
+        Returns:
+            ``True`` if it was a leaf command (now opened into the builder),
+            ``False`` if it was a group (now drilled into).
+        """
+
+        if self.commands(name):
+            self.enter_group(name)
+            return False
+        self.open_top_level(name)
+        return True
+
     # -- guided composers (FR-6.1) ------------------------------------------ #
 
     def enter_workflow(self) -> List[Command]:

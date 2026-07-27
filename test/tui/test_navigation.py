@@ -18,6 +18,8 @@ from __future__ import annotations
 from typing import List
 from unittest import mock
 
+import pytest
+
 from cli_agent_orchestrator.tui.command_catalog import Command, CommandGroup
 from cli_agent_orchestrator.tui.navigation import (
     MEMORY_GROUP,
@@ -161,6 +163,98 @@ def test_open_command_uses_full_path_for_nested_command() -> None:
     nav.open_command(WORKFLOW_COMMANDS[0])  # workflow run
 
     builder.select.assert_called_once_with(["workflow", "run"])
+
+
+# --------------------------------------------------------------------------- #
+# P1-2: leaf-vs-group routing at the top level (select_top_level).               #
+# The seven leaf top-level commands were previously UNREACHABLE — every         #
+# top-level Enter drilled as a group, so a leaf yielded an empty list and        #
+# dead-ended. select_top_level opens a leaf; a group still drills.               #
+# --------------------------------------------------------------------------- #
+
+# The seven leaf top-level commands (no subcommands) that must be reachable.
+LEAF_TOP_LEVELS = ("info", "init", "install", "launch", "mcp-server", "shutdown", "update")
+
+
+def _leaf_catalog() -> mock.MagicMock:
+    """A catalog where every top-level entry is a leaf (``commands`` → ``[]``)."""
+
+    catalog = mock.MagicMock()
+    catalog.groups.return_value = [CommandGroup(name, "") for name in LEAF_TOP_LEVELS]
+    catalog.commands.side_effect = lambda group: []
+    return catalog
+
+
+def test_select_top_level_opens_a_leaf_command() -> None:
+    """``select_top_level('launch')`` opens the leaf and routes ``select(['launch'])``.
+
+    ``launch`` has no subcommands (the fixture's ``launch: []``), so it is a leaf
+    top-level command. Before P1-2 it dead-ended; now selecting it opens the
+    command itself into the U3 builder with the bare one-token path.
+    """
+
+    builder = mock.MagicMock()
+    nav = NavigationModel(_catalog(), builder=builder)
+
+    was_leaf = nav.select_top_level("launch")
+
+    assert was_leaf is True
+    builder.select.assert_called_once_with(["launch"])
+    assert nav.active_command is not None
+    assert nav.active_command.path == ["launch"]
+    assert nav.active_command.name == "launch"
+
+
+def test_select_top_level_drills_a_group() -> None:
+    """``select_top_level('session')`` drills the group (returns False, lists cmds)."""
+
+    builder = mock.MagicMock()
+    nav = NavigationModel(_catalog(), builder=builder)
+
+    was_leaf = nav.select_top_level("session")
+
+    assert was_leaf is False
+    assert nav.level == "commands"
+    assert nav.active_group == "session"
+    assert nav.visible_commands()  # non-empty: the group's subcommands
+    assert [c.name for c in nav.visible_commands()] == ["status", "list"]
+    # Drilling a group must NOT open a command on the builder.
+    builder.select.assert_not_called()
+
+
+def test_open_top_level_routes_the_exact_bare_path() -> None:
+    """``open_top_level`` selects the exact one-token path and records it active."""
+
+    builder = mock.MagicMock()
+    nav = NavigationModel(_leaf_catalog(), builder=builder)
+
+    returned = nav.open_top_level("install")
+
+    assert returned is builder
+    builder.select.assert_called_once_with(["install"])
+    assert nav.active_command is not None
+    assert nav.active_command.path == ["install"]
+
+
+@pytest.mark.parametrize("leaf", LEAF_TOP_LEVELS)
+def test_all_seven_leaf_top_levels_are_reachable(leaf: str) -> None:
+    """Each of the seven leaf top-level commands is reachable (P1-2 regression).
+
+    A catalog reporting no subcommands for the entry means it is a leaf;
+    ``select_top_level`` must open it (return ``True``) and route the exact
+    bare path ``[leaf]`` into the builder — not silently drill into an empty
+    group as the pre-fix ``enter_group``-always behaviour did.
+    """
+
+    builder = mock.MagicMock()
+    nav = NavigationModel(_leaf_catalog(), builder=builder)
+
+    was_leaf = nav.select_top_level(leaf)
+
+    assert was_leaf is True, f"{leaf!r} must be opened as a leaf, not drilled"
+    builder.select.assert_called_once_with([leaf])
+    assert nav.active_command is not None
+    assert nav.active_command.path == [leaf]
 
 
 # --------------------------------------------------------------------------- #
