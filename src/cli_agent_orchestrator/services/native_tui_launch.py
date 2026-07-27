@@ -70,7 +70,9 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import struct
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Mapping, NoReturn, Optional, Protocol, Sequence
@@ -85,6 +87,7 @@ INNER_EXEC_CONVERGENCE_TIMEOUT_SECONDS = 2.0
 INNER_EXEC_CONVERGENCE_POLL_SECONDS = 0.05
 ENV_EXECUTABLE = os.path.realpath("/usr/bin/env")
 MAX_SHEBANG_LINE_BYTES = 512
+MAX_PROCESS_ARGV_BYTES = 1024 * 1024
 
 #: A fresh launch: this call declared the attachment, started the pane,
 #: and published the proven process identity.
@@ -1005,12 +1008,19 @@ class TmuxNativePane:
         if deadline_monotonic is None:
             start_marker = _process_field(pid, "lstart=")
             command = _process_field(pid, "args=")
+            process_argv = _process_argv(pid)
         else:
             start_marker = _process_field(pid, "lstart=", deadline_monotonic=deadline_monotonic)
             command = _process_field(pid, "args=", deadline_monotonic=deadline_monotonic)
+            process_argv = _process_argv(pid, deadline_monotonic=deadline_monotonic)
         if start_marker is None or command is None:
             raise NativeLaunchUnavailable(
                 f"the process table did not report the identity of pid {pid}"
+            )
+        if process_argv is None:
+            raise NativeLaunchUnavailable(
+                f"the kernel did not expose the exact argv of pid {pid}; refusing to "
+                "validate a whitespace-rendered process-table approximation"
             )
         if deadline_monotonic is None:
             cwd = _process_cwd(pid)
@@ -1029,13 +1039,13 @@ class TmuxNativePane:
             "pane_id": str(identity["pane_id"]),
             "pid": pid,
             "start_marker": start_marker,
-            # A whitespace split of the observed command line.  It is
-            # exact for the argv this module launches — the session id is
-            # validated to carry no whitespace, so the resume option and
-            # its argument stay adjacent tokens however the binary path
-            # splits — and any split that does not yield exactly one
-            # resume option fails the check rather than passing it.
-            "argv": command.split(),
+            # ps renders argv as one lossy string: an argument containing
+            # spaces is indistinguishable from several arguments.  The
+            # native launch proof compares the kernel's boundary-preserving
+            # argv instead.  ``command`` is still read above because failure
+            # to observe the process table remains an unreadable identity,
+            # but it is never tokenized into authoritative evidence.
+            "argv": process_argv,
             "cwd": cwd,
         }
 
@@ -1117,6 +1127,101 @@ def _process_field(
         return None
     value = proc.stdout.strip()
     return value or None
+
+
+def _parse_darwin_procargs2(raw: bytes) -> Optional[list[str]]:
+    """Decode one ``KERN_PROCARGS2`` payload without losing argv boundaries."""
+    if len(raw) < struct.calcsize("i"):
+        return None
+    argc = struct.unpack_from("i", raw)[0]
+    if argc <= 0 or argc > MAX_PROCESS_ARGV_BYTES:
+        return None
+
+    cursor = struct.calcsize("i")
+    executable_end = raw.find(b"\0", cursor)
+    if executable_end < 0:
+        return None
+    cursor = executable_end + 1
+    while cursor < len(raw) and raw[cursor] == 0:
+        cursor += 1
+
+    argv: list[str] = []
+    for _ in range(argc):
+        argument_end = raw.find(b"\0", cursor)
+        if argument_end < 0:
+            return None
+        argv.append(os.fsdecode(raw[cursor:argument_end]))
+        cursor = argument_end + 1
+    return argv if argv and argv[0] else None
+
+
+def _darwin_process_argv(pid: int) -> Optional[list[str]]:
+    """Read exact argv from Darwin's kernel-owned ``KERN_PROCARGS2``."""
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        sysctl = libc.sysctl
+        sysctl.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        sysctl.restype = ctypes.c_int
+        mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid
+        size = ctypes.c_size_t()
+        if sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+            return None
+        if size.value <= 0 or size.value > MAX_PROCESS_ARGV_BYTES:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+            return None
+        return _parse_darwin_procargs2(buffer.raw[: size.value])
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _process_argv(
+    pid: int,
+    *,
+    deadline_monotonic: Optional[float] = None,
+) -> Optional[list[str]]:
+    """The live process's exact argv, preserving every argument boundary.
+
+    Linux exposes NUL-delimited argv in procfs. Darwin exposes the same
+    kernel data through ``KERN_PROCARGS2``. A rendered ``ps args`` string
+    is intentionally not a fallback: once boundaries are lost, a launch
+    cannot prove that the process is running the exact admitted argv.
+    """
+    deadline_probe = ["process-argv", str(pid)]
+    if deadline_monotonic is not None:
+        _native_observation_timeout(deadline_monotonic, deadline_probe)
+
+    argv: Optional[list[str]] = None
+    proc_cmdline = f"/proc/{pid}/cmdline"
+    if os.path.isdir(f"/proc/{pid}"):
+        try:
+            with open(proc_cmdline, "rb") as handle:
+                raw = handle.read(MAX_PROCESS_ARGV_BYTES + 1)
+        except OSError:
+            raw = b""
+        if raw and len(raw) <= MAX_PROCESS_ARGV_BYTES:
+            fields = raw.split(b"\0")
+            if fields[-1:] == [b""]:
+                fields.pop()
+            candidate = [os.fsdecode(field) for field in fields]
+            if candidate and candidate[0]:
+                argv = candidate
+    elif sys.platform == "darwin":
+        argv = _darwin_process_argv(pid)
+
+    if deadline_monotonic is not None:
+        _native_observation_timeout(deadline_monotonic, deadline_probe)
+    return argv
 
 
 def _process_cwd(pid: int, *, deadline_monotonic: Optional[float] = None) -> Optional[str]:

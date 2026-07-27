@@ -306,6 +306,152 @@ def test_launch_waits_for_an_env_shebang_wrapper_to_exec_the_inner_binary(
     assert pane.observe_calls == 2
 
 
+def test_env_shebang_transient_preserves_whitespace_bearing_argv(
+    isolated_memory_db: Any,
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    pinned = _pinned_wrapper(tmp_path, b"#!/usr/bin/env python3\n")
+    wrapper, _ = pinned
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"inner")
+    inner.chmod(0o755)
+    inner_path = os.path.realpath(str(inner))
+    extra_args = ["--settings", '{"hook": "two words"}']
+    launch_tail = [*extra_args, native_tui_launch.kimi_native_launch.RESUME_OPTION, SESSION]
+    pane = SequencedPane(
+        [
+            _observation(
+                [
+                    native_tui_launch.ENV_EXECUTABLE,
+                    "python3",
+                    wrapper,
+                    *launch_tail,
+                ]
+            ),
+            _observation([inner_path, *launch_tail]),
+        ]
+    )
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+
+    result = _start(
+        pinned,
+        pane,
+        expected_inner_executable=inner_path,
+        extra_args=extra_args,
+    )
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert result["pane_observation"]["argv"] == [inner_path, *launch_tail]
+    assert pane.observe_calls == 2
+
+
+def test_interpreter_shebang_transient_preserves_whitespace_bearing_argv(
+    isolated_memory_db: Any,
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    pinned = _pinned_wrapper(tmp_path, b"#!/usr/bin/python3\n")
+    wrapper, _ = pinned
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"inner")
+    inner.chmod(0o755)
+    inner_path = os.path.realpath(str(inner))
+    extra_args = ["--settings", '{"hook": "two words"}']
+    launch_tail = [*extra_args, native_tui_launch.kimi_native_launch.RESUME_OPTION, SESSION]
+    pane = SequencedPane(
+        [
+            _observation(["/usr/bin/python3", wrapper, *launch_tail]),
+            _observation([inner_path, *launch_tail]),
+        ]
+    )
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+
+    result = _start(
+        pinned,
+        pane,
+        expected_inner_executable=inner_path,
+        extra_args=extra_args,
+    )
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert result["pane_observation"]["argv"] == [inner_path, *launch_tail]
+    assert pane.observe_calls == 2
+
+
+def test_env_shebang_transient_refuses_a_whitespace_tail_mismatch(
+    isolated_memory_db: Any,
+    tmp_path: Any,
+) -> None:
+    pinned = _pinned_wrapper(tmp_path, b"#!/usr/bin/env python3\n")
+    wrapper, _ = pinned
+    inner = tmp_path / "inner"
+    inner.write_bytes(b"inner")
+    inner.chmod(0o755)
+    extra_args = ["--settings", '{"hook": "two words"}']
+    pane = FakePane(
+        observation=_observation(
+            [
+                native_tui_launch.ENV_EXECUTABLE,
+                "python3",
+                wrapper,
+                "--settings",
+                '{"hook": "different words"}',
+                native_tui_launch.kimi_native_launch.RESUME_OPTION,
+                SESSION,
+            ]
+        )
+    )
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(
+            pinned,
+            pane,
+            expected_inner_executable=os.path.realpath(str(inner)),
+            extra_args=extra_args,
+        )
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH)
+
+
+def test_env_shebang_transient_accepts_a_wrapper_path_with_spaces(
+    isolated_memory_db: Any,
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    wrapper_dir = tmp_path / "wrapper dir"
+    wrapper_dir.mkdir()
+    pinned = _pinned_wrapper(wrapper_dir, b"#!/usr/bin/env python3\n")
+    wrapper, _ = pinned
+    inner_dir = tmp_path / "inner dir"
+    inner_dir.mkdir()
+    inner = inner_dir / "inner"
+    inner.write_bytes(b"inner")
+    inner.chmod(0o755)
+    inner_path = os.path.realpath(str(inner))
+    pane = SequencedPane(
+        [
+            _observation(
+                [
+                    native_tui_launch.ENV_EXECUTABLE,
+                    "python3",
+                    wrapper,
+                    "--session",
+                    SESSION,
+                ]
+            ),
+            _observation([inner_path, "--session", SESSION]),
+        ]
+    )
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+
+    result = _start(pinned, pane, expected_inner_executable=inner_path)
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert pane.observe_calls == 2
+
+
 @pytest.mark.parametrize(
     ("shebang", "observed_prefix"),
     [
@@ -927,7 +1073,7 @@ def test_tmux_transport_raises_when_the_pane_pid_is_unreadable(
         pane.observe()
 
 
-def test_tmux_transport_splits_the_observed_command_line(
+def test_tmux_transport_reads_exact_process_argv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pane = _pane(FakeBackend(identity={"pane_id": "%3"}, exists=True))
@@ -939,13 +1085,18 @@ def test_tmux_transport_splits_the_observed_command_line(
             "Thu Jul 24 10:00:00 2026" if field == "lstart=" else f"/bin/kimi --session {SESSION}"
         ),
     )
+    monkeypatch.setattr(
+        native_tui_launch,
+        "_process_argv",
+        lambda pid: ["/bin/kimi", "--settings", '{"hook": "two words"}', "--session", SESSION],
+    )
     monkeypatch.setattr(native_tui_launch, "_process_cwd", lambda pid: "/private/tmp/w")
     observed = pane.observe()
     assert observed == {
         "pane_id": "%3",
         "pid": 777,
         "start_marker": "Thu Jul 24 10:00:00 2026",
-        "argv": ["/bin/kimi", "--session", SESSION],
+        "argv": ["/bin/kimi", "--settings", '{"hook": "two words"}', "--session", SESSION],
         "cwd": "/private/tmp/w",
     }
 
@@ -972,14 +1123,19 @@ def test_tmux_transport_threads_one_deadline_through_the_whole_observation(
         observed_deadlines.append(deadline_monotonic)
         return "/private/tmp/w"
 
+    def _process_argv(pid: int, *, deadline_monotonic: float) -> list[str]:
+        observed_deadlines.append(deadline_monotonic)
+        return ["/bin/kimi", "--session", SESSION]
+
     monkeypatch.setattr(pane, "_pane_pid", _pane_pid)
     monkeypatch.setattr(native_tui_launch, "_process_field", _process_field)
+    monkeypatch.setattr(native_tui_launch, "_process_argv", _process_argv)
     monkeypatch.setattr(native_tui_launch, "_process_cwd", _process_cwd)
 
     pane.observe(deadline_monotonic=deadline)
 
     assert backend.identity_deadline == deadline
-    assert observed_deadlines == [deadline, deadline, deadline, deadline]
+    assert observed_deadlines == [deadline, deadline, deadline, deadline, deadline]
 
 
 def test_tmux_transport_raises_when_the_pane_cwd_is_unreadable(
@@ -1001,9 +1157,67 @@ def test_tmux_transport_raises_when_the_pane_cwd_is_unreadable(
             "Thu Jul 24 10:00:00 2026" if field == "lstart=" else f"/bin/kimi --session {SESSION}"
         ),
     )
+    monkeypatch.setattr(
+        native_tui_launch,
+        "_process_argv",
+        lambda pid: ["/bin/kimi", "--session", SESSION],
+    )
     monkeypatch.setattr(native_tui_launch, "_process_cwd", lambda pid: None)
     with pytest.raises(native_tui_launch.NativeLaunchUnavailable):
         pane.observe()
+
+
+def test_tmux_transport_refuses_an_unreadable_exact_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pane = _pane(FakeBackend(identity={"pane_id": "%3"}, exists=True))
+    monkeypatch.setattr(pane, "_pane_pid", lambda: 777)
+    monkeypatch.setattr(
+        native_tui_launch,
+        "_process_field",
+        lambda pid, field: (
+            "Thu Jul 24 10:00:00 2026" if field == "lstart=" else f"/bin/kimi --session {SESSION}"
+        ),
+    )
+    monkeypatch.setattr(native_tui_launch, "_process_argv", lambda pid: None)
+
+    with pytest.raises(native_tui_launch.NativeLaunchUnavailable):
+        pane.observe()
+
+
+def test_darwin_procargs2_parser_preserves_argument_boundaries() -> None:
+    import struct
+
+    argv = ["/usr/bin/env", "python3", "/tmp/wrapper", "alpha", "two words"]
+    raw = (
+        struct.pack("i", len(argv))
+        + b"/usr/bin/env\0"
+        + b"\0\0"
+        + b"\0".join(os.fsencode(argument) for argument in argv)
+        + b"\0"
+    )
+
+    assert native_tui_launch._parse_darwin_procargs2(raw) == argv
+
+
+def test_process_argv_preserves_whitespace_boundaries() -> None:
+    import subprocess
+    import sys
+    import time
+
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "two words"])
+    try:
+        for _ in range(50):
+            observed = native_tui_launch._process_argv(process.pid)
+            if observed is not None:
+                break
+            time.sleep(0.05)
+        assert observed is not None
+        assert observed[-1] == "two words"
+    finally:
+        process.kill()
+        process.wait()
+    assert native_tui_launch._process_argv(process.pid) is None
 
 
 def test_process_cwd_reads_the_real_directory_of_a_live_process() -> None:
