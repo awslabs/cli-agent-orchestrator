@@ -53,7 +53,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
 
 from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -1881,6 +1881,8 @@ def _native_composer_preflight(
     )
     if refusal is not None:
         return (None, None, refusal)
+    # The helper's contract: refusal is None only when both are set.
+    assert proven is not None and adapter is not None
 
     try:
         plan = adapter.plan_composer_keystrokes(
@@ -1946,6 +1948,8 @@ def _native_sequence_preflight(
     )
     if refusal is not None:
         return (None, None, refusal)
+    # The helper's contract: refusal is None only when both are set.
+    assert proven is not None and adapter is not None
 
     plans: Dict[int, Any] = {}
     for ordinal, event in enumerate(events):
@@ -2983,11 +2987,13 @@ def _deliver_sequence_under_lease(
 
             try:
                 turn_status = managed_launch_v2._observe_turn_state(
-                    resolved.provider,
+                    cast(str, resolved.provider),
                     pane_id=binding.pane_id,
                     terminal_id=terminal_id,
                     session_name=resolved.session_name,
-                    window_name=managed_window_name(terminal_id, resolved.terminal_generation),
+                    window_name=managed_window_name(
+                        terminal_id, cast(str, resolved.terminal_generation)
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001 - "could not look" is not "idle"
                 return _refuse_pre_claim(
