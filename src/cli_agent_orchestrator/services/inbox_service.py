@@ -61,8 +61,8 @@ _MANAGED_DELIVERY_LOCKS = tuple(threading.Lock() for _ in range(256))
 class _NativeManagedSendRefused(RuntimeError):
     """A native-TUI managed send was refused with zero bytes proven to the pane.
 
-    Retryable: the control journal proves nothing was typed, so resetting the
-    claimed rows to PENDING cannot duplicate a provider effect.
+    Retryable: the typed refusal proves nothing reached the pane, so resetting
+    the claimed rows to PENDING cannot duplicate a provider effect.
     """
 
 
@@ -71,8 +71,8 @@ class _NativeManagedSendUndeliverable(RuntimeError):
     zero-byte proof (ambiguous or otherwise not accepted/refused).
 
     Never replayed blindly: the rows terminalize under the existing hard-failure
-    semantics, and the durable control journal keeps the exact message id's
-    record for any later investigation.
+    semantics, preserving the inbox row state for later investigation without
+    claiming that an unjournaled pane write can be reconstructed exactly.
     """
 
 
