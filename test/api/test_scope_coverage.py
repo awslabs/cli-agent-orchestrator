@@ -24,8 +24,14 @@ _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 # Routes that use a mutating verb but perform no state change, so they are
 # intentionally not scope-gated. ``POST /workflows/validate`` only parses and
-# validates a spec file (read-only), mirroring a GET.
-_EXEMPT = {("POST", "/workflows/validate")}
+# validates a spec file (read-only), mirroring a GET. ``/agents/profiles/validate``
+# and ``/agents/profiles/preview`` are POSTs for the same reason — their config
+# travels in a JSON body — and mutate nothing (schema check / template render).
+_EXEMPT = {
+    ("POST", "/workflows/validate"),
+    ("POST", "/agents/profiles/validate"),
+    ("POST", "/agents/profiles/preview"),
+}
 
 
 def _has_scope_dependency(route) -> bool:

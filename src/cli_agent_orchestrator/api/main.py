@@ -1530,6 +1530,27 @@ async def list_agent_profiles_endpoint() -> List[Dict]:
         )
 
 
+def _resolve_template_name(template: str) -> str:
+    """Map a caller-supplied template id onto an enumerated template name.
+
+    Returns the matching value from ``list_templates()`` (built from filesystem
+    enumeration), never the caller's own string, so the identifier handed to the
+    scaffold service — and thence to ``Path`` — is not derived from request
+    data. This is the sanitizer that removes the taint CodeQL flags on the
+    scaffold path expressions; the allowlist regex and ``_check_containment``
+    remain as additional layers. Raises 404 for an unknown template.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import list_templates
+
+    for known in list_templates():
+        if known["name"] == template:
+            return str(known["name"])
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Template not found: {template}",
+    )
+
+
 # The static sub-paths below (`/search`, `/templates`, and the template schema
 # route) MUST stay declared ABOVE `/agents/profiles/{name}`. FastAPI resolves in
 # declaration order, so moving them below would let the `{name}` route capture
@@ -1591,8 +1612,9 @@ async def get_profile_template_schema_endpoint(category: str, name: str) -> Dict
             detail=f"Invalid template name: {template}",
         )
 
+    resolved = _resolve_template_name(template)
     try:
-        schema = get_template_schema(template)
+        schema = get_template_schema(resolved)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -1617,8 +1639,9 @@ async def validate_profile_template_config_endpoint(
     """
     from cli_agent_orchestrator.services.agent_scaffold import validate_config
 
+    resolved = _resolve_template_name(request.template)
     try:
-        errors = validate_config(request.template, request.config)
+        errors = validate_config(resolved, request.config)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -1637,8 +1660,9 @@ async def preview_profile_template_endpoint(
     """
     from cli_agent_orchestrator.services.agent_scaffold import render_template
 
+    resolved = _resolve_template_name(request.template)
     try:
-        content = render_template(request.template, request.config)
+        content = render_template(resolved, request.config)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:

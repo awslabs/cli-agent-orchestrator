@@ -8,7 +8,24 @@ paths as the CLI instead of reimplementing them.
 
 from unittest.mock import patch
 
+import pytest
+
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
+
+
+@pytest.fixture(autouse=True)
+def _known_template_catalog():
+    """Provide the enumerated names that endpoint tests may delegate with."""
+    templates = [
+        {"name": "aws/stepfunction", "description": "Step Functions agent", "path": "/t/sf"},
+        {"name": "aws/nothing", "description": "No-schema fixture", "path": "/t/none"},
+        {"name": "aws/nope", "description": "Missing-file fixture", "path": "/t/nope"},
+    ]
+    with patch(
+        "cli_agent_orchestrator.services.agent_scaffold.list_templates",
+        return_value=templates,
+    ):
+        yield
 
 
 class TestSearchAgentProfilesEndpoint:
@@ -233,6 +250,20 @@ class TestValidateProfileTemplateConfigEndpoint:
         )
 
         assert response.status_code == 422
+
+    def test_rejects_unknown_well_formed_template_before_service(self, client) -> None:
+        """A catalog miss must not pass the caller's string to the scaffold service."""
+        with patch(
+            "cli_agent_orchestrator.services.agent_scaffold.validate_config"
+        ) as mock_validate:
+            response = client.post(
+                "/agents/profiles/validate",
+                json={"template": "aws/not-in-catalog", "config": {}},
+            )
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Template not found: aws/not-in-catalog"
+        assert not mock_validate.called
 
     def test_config_defaults_to_empty_dict(self, client) -> None:
         """Omitting ``config`` should validate an empty config, not 422."""
