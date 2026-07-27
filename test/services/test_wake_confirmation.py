@@ -67,7 +67,9 @@ def _past_deadline() -> str:
 
 class TestWakeConfirmed:
     @pytest.mark.asyncio
-    async def test_a_transition_out_of_idle_confirms(self, store, bus_on_loop, monkeypatch):
+    async def test_a_transition_out_of_idle_confirms(
+        self, store, bus_on_loop, monkeypatch, terminal_identity
+    ):
         monkeypatch.setattr(
             inbox_service.status_monitor, "get_status", lambda tid: TerminalStatus.IDLE
         )
@@ -79,10 +81,18 @@ class TestWakeConfirmed:
             native_session_id=None,
             delivered_at=wake_receipts.utcnow(),
             deadline_at=_future_deadline(),
+            delivery_identity=terminal_identity,
         )
         svc = InboxService()
         svc._loop = bus_on_loop
-        task = asyncio.create_task(svc._watch_wake("term-1", "1202", _future_deadline()))
+        task = asyncio.create_task(
+            svc._watch_wake(
+                "term-1",
+                "1202",
+                _future_deadline(),
+                delivery_identity=terminal_identity,
+            )
+        )
         await asyncio.sleep(0)  # let the watcher subscribe
         bus.publish("terminal.term-1.status", {"status": TerminalStatus.PROCESSING.value})
         await asyncio.wait_for(task, timeout=2.0)
@@ -94,7 +104,7 @@ class TestWakeConfirmed:
 
     @pytest.mark.asyncio
     async def test_a_transition_is_bound_to_the_exact_message_id(
-        self, store, bus_on_loop, monkeypatch
+        self, store, bus_on_loop, monkeypatch, terminal_identity
     ):
         monkeypatch.setattr(
             inbox_service.status_monitor, "get_status", lambda tid: TerminalStatus.IDLE
@@ -107,11 +117,19 @@ class TestWakeConfirmed:
                 native_session_id=None,
                 delivered_at=wake_receipts.utcnow(),
                 deadline_at=_future_deadline(),
+                delivery_identity=terminal_identity,
             )
         svc = InboxService()
         svc._loop = bus_on_loop
         tasks = [
-            asyncio.create_task(svc._watch_wake("term-1", mid, _future_deadline()))
+            asyncio.create_task(
+                svc._watch_wake(
+                    "term-1",
+                    mid,
+                    _future_deadline(),
+                    delivery_identity=terminal_identity,
+                )
+            )
             for mid in ("1202", "1207")
         ]
         await asyncio.sleep(0)
@@ -120,6 +138,44 @@ class TestWakeConfirmed:
         # Each message confirms independently, exactly once.
         assert wake_receipts.get("term-1", "1202")["state"] == wake_receipts.WAKE_CONFIRMED
         assert wake_receipts.get("term-1", "1207")["state"] == wake_receipts.WAKE_CONFIRMED
+
+    @pytest.mark.asyncio
+    async def test_a_transition_from_a_replaced_terminal_does_not_confirm(
+        self, store, bus_on_loop, monkeypatch, terminal_identity
+    ):
+        current_identity = dict(terminal_identity)
+        monkeypatch.setattr(
+            inbox_service.terminal_service,
+            "get_terminal",
+            lambda _terminal_id: dict(current_identity),
+        )
+        wake_receipts.ensure_watching(
+            "term-1",
+            "1208",
+            native_session_id=None,
+            delivered_at=wake_receipts.utcnow(),
+            deadline_at=_future_deadline(),
+            delivery_identity=terminal_identity,
+        )
+        svc = InboxService()
+        svc._loop = bus_on_loop
+        task = asyncio.create_task(
+            svc._watch_wake(
+                "term-1",
+                "1208",
+                _future_deadline(),
+                delivery_identity=terminal_identity,
+            )
+        )
+        await asyncio.sleep(0)
+        current_identity["pane_id"] = "%99"
+        bus.publish("terminal.term-1.status", {"status": TerminalStatus.PROCESSING.value})
+
+        await asyncio.wait_for(task, timeout=2.0)
+
+        record = wake_receipts.get("term-1", "1208")
+        assert record["state"] == wake_receipts.WAKE_UNCONFIRMED
+        assert "identity changed" in record["note"]
 
 
 class TestOneNudge:
@@ -210,6 +266,82 @@ class TestEnsureIsIdempotent:
 
 
 class TestDeliveryOrdering:
+    def test_observer_setup_failure_cannot_leave_an_unsent_message_delivered(
+        self, store, monkeypatch
+    ):
+        message = InboxMessage(
+            id=9200,
+            sender_id="sender",
+            receiver_id="term-1",
+            message="not-sent",
+            status=MessageStatus.PENDING,
+            created_at=datetime.now(),
+        )
+        statuses = []
+        send = MagicMock()
+        monkeypatch.setattr(inbox_service, "get_pending_messages", lambda _tid, limit=1: [message])
+        monkeypatch.setattr(
+            inbox_service, "update_message_status", lambda mid, status: statuses.append(status)
+        )
+        monkeypatch.setattr(
+            inbox_service.managed_launch, "managed_control_identity", lambda _tid: None
+        )
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            lambda *_args, **_kwargs: False,
+        )
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", send)
+        service = InboxService()
+        monkeypatch.setattr(
+            service,
+            "_prepare_wake_confirmation",
+            MagicMock(side_effect=RuntimeError("observer setup failed")),
+        )
+
+        service.deliver_pending("term-1")
+
+        send.assert_not_called()
+        assert statuses == [MessageStatus.DELIVERED, MessageStatus.FAILED]
+
+    def test_post_send_receipt_failure_does_not_license_duplicate_delivery(
+        self, store, monkeypatch
+    ):
+        message = InboxMessage(
+            id=9203,
+            sender_id="sender",
+            receiver_id="term-1",
+            message="sent-once",
+            status=MessageStatus.PENDING,
+            created_at=datetime.now(),
+        )
+        statuses = []
+        send = MagicMock()
+        monkeypatch.setattr(inbox_service, "get_pending_messages", lambda _tid, limit=1: [message])
+        monkeypatch.setattr(
+            inbox_service, "update_message_status", lambda mid, status: statuses.append(status)
+        )
+        monkeypatch.setattr(
+            inbox_service.managed_launch, "managed_control_identity", lambda _tid: None
+        )
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            lambda *_args, **_kwargs: False,
+        )
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", send)
+        service = InboxService()
+        monkeypatch.setattr(
+            service,
+            "_commit_wake_confirmation",
+            MagicMock(side_effect=RuntimeError("receipt persistence failed")),
+        )
+
+        service.deliver_pending("term-1")
+
+        send.assert_called_once_with("term-1", "sent-once")
+        assert statuses == [MessageStatus.DELIVERED]
+
     @pytest.mark.asyncio
     async def test_transition_inside_send_is_observed_without_a_later_nudge(
         self, store, bus_on_loop, monkeypatch

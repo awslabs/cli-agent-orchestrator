@@ -19,7 +19,7 @@ from contextlib import contextmanager
 
 import pytest
 
-from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError
+from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
 from cli_agent_orchestrator.services import control_input_service as service
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
@@ -40,6 +40,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     REASON_PANE_DEAD,
     REASON_PROTOCOL_MISMATCH,
     REASON_REQUEST_REBOUND,
+    REASON_SERVER_IDENTITY_UNREADABLE,
     REASON_STALE_GENERATION,
     REASON_UNKNOWN_TERMINAL,
     REASON_WRITE_INCOMPLETE,
@@ -894,8 +895,9 @@ class _FakeChordAdapter:
 class _FakeChordClient:
     """Records literal writes and steer-chord presses, nothing else."""
 
-    def __init__(self, *, chord_error=None):
+    def __init__(self, *, literal_error=None, chord_error=None):
         self.sent = []
+        self._literal_error = literal_error
         self._chord_error = chord_error
 
     def send_literal_line(
@@ -907,6 +909,8 @@ class _FakeChordClient:
         expected_server_identity,
         deadline_monotonic=None,
     ):
+        if self._literal_error is not None:
+            raise self._literal_error
         self.sent.append(("literal", text, submit))
         return 1
 
@@ -1034,6 +1038,20 @@ class TestChordExecution:
         assert record.chord_attempted is True
         assert record.chord_sent is False
 
+    def test_text_write_failure_preserves_requested_chord_facts(self, journal):
+        client = _FakeChordClient(literal_error=RuntimeError("literal write failed"))
+
+        result = self._send(journal, client, chord="C-s")
+
+        assert result.outcome == AMBIGUOUS
+        assert result.chord == "C-s"
+        assert result.chord_attempted is False
+        assert result.chord_sent is False
+        record = journal.find(CONTROL)
+        assert record.chord == "C-s"
+        assert record.chord_attempted is False
+        assert record.chord_sent is False
+
     def test_no_chord_skips_the_chord_press(self, journal):
         client = _FakeChordClient()
         result = self._send(journal, client, chord=None, enter=False)
@@ -1138,6 +1156,26 @@ class TestBoundedWriteDeadline:
         assert result.reason_code == REASON_WRITE_INCOMPLETE
         # A write timeout is never a reattempt licence.
         assert result.as_response()["reattemptable"] is False
+
+    def test_a_post_claim_server_identity_error_is_durably_ambiguous(self, monkeypatch, journal):
+        client = FakeTmux(
+            write_error=TmuxServerIdentityError(
+                "tmux server identity became unreadable",
+                reason_code=REASON_SERVER_IDENTITY_UNREADABLE,
+                bound=SOCKET,
+                observed=None,
+            )
+        )
+
+        result = self._deliver_with(monkeypatch, journal, client)
+
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == REASON_WRITE_INCOMPLETE
+        assert REASON_SERVER_IDENTITY_UNREADABLE in result.detail
+        record = journal.get(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        assert record.reason_code == REASON_WRITE_INCOMPLETE
+        assert service.lookup_control_input(CONTROL, journal=journal).outcome == AMBIGUOUS
 
     def test_a_hung_write_releases_the_lease_for_a_fresh_control(self, monkeypatch, journal):
         hung = FakeTmux(write_error=subprocess.TimeoutExpired(cmd=["tmux"], timeout=10))

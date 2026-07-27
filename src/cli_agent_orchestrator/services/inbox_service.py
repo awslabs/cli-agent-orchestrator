@@ -138,6 +138,28 @@ class InboxService:
             return None
         return identity
 
+    def _record_wake_confirmed_if_current(
+        self,
+        terminal_id: str,
+        message_id: str,
+        *,
+        delivery_identity: Optional[dict[str, Any]],
+        observed: dict[str, Any],
+    ) -> bool:
+        """Confirm a wake only while the delivery-time terminal still owns it."""
+        if delivery_identity is None or self._delivery_identity(terminal_id) != delivery_identity:
+            wake_receipts.record_wake_unconfirmed(
+                terminal_id,
+                message_id,
+                note="a wake transition was observed after the delivery-time terminal "
+                "identity changed or became unreadable; it cannot confirm this delivery",
+            )
+            self._emit_wake_event(terminal_id, message_id, wake_receipts.WAKE_UNCONFIRMED)
+            return False
+        wake_receipts.record_wake_confirmed(terminal_id, message_id, observed=observed)
+        self._emit_wake_event(terminal_id, message_id, wake_receipts.WAKE_CONFIRMED)
+        return True
+
     def _prepare_wake_confirmation(
         self,
         terminal_id: str,
@@ -311,8 +333,12 @@ class InboxService:
                 baseline_status=baseline_status,
             )
             if transition is not None:
-                wake_receipts.record_wake_confirmed(terminal_id, message_id, observed=transition)
-                self._emit_wake_event(terminal_id, message_id, wake_receipts.WAKE_CONFIRMED)
+                self._record_wake_confirmed_if_current(
+                    terminal_id,
+                    message_id,
+                    delivery_identity=delivery_identity,
+                    observed=transition,
+                )
                 return
             await self._nudge_once(
                 queue,
@@ -393,9 +419,10 @@ class InboxService:
         status = status_monitor.get_status(terminal_id)
         status_value = self._status_value(status)
         if status_value not in _PARKED_STATUSES:
-            wake_receipts.record_wake_confirmed(
+            self._record_wake_confirmed_if_current(
                 terminal_id,
                 message_id,
+                delivery_identity=delivery_identity,
                 observed={
                     "event": "status-transition",
                     "from_status": None,
@@ -403,7 +430,6 @@ class InboxService:
                     "at": wake_receipts.utcnow(),
                 },
             )
-            self._emit_wake_event(terminal_id, message_id, wake_receipts.WAKE_CONFIRMED)
             return
         if delivery_identity is None or self._delivery_identity(terminal_id) != delivery_identity:
             wake_receipts.record_wake_unconfirmed(
@@ -445,8 +471,12 @@ class InboxService:
         )
         transition = await self._await_wake_transition(queue, terminal_id, post_deadline)
         if transition is not None:
-            wake_receipts.record_wake_confirmed(terminal_id, message_id, observed=transition)
-            self._emit_wake_event(terminal_id, message_id, wake_receipts.WAKE_CONFIRMED)
+            self._record_wake_confirmed_if_current(
+                terminal_id,
+                message_id,
+                delivery_identity=delivery_identity,
+                observed=transition,
+            )
         else:
             wake_receipts.record_wake_unconfirmed(
                 terminal_id,
@@ -568,26 +598,25 @@ class InboxService:
             batch = list(group)
             combined = "\n".join(m.message for m in batch)
             preparations: list[_WakePreparation] = []
-            if idle_bound_delivery:
-                # Re-prove the parked baseline immediately before this batch.
-                # The subscribers are provisional: they can buffer a transition
-                # emitted synchronously by send_input, but become durable only
-                # after that send returns successfully.
-                batch_status = status_monitor.get_status(terminal_id)
-                if batch_status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
-                    preparations = [
-                        preparation
-                        for message in batch
-                        if (
-                            preparation := self._prepare_wake_confirmation(
+            try:
+                if idle_bound_delivery:
+                    # Re-prove the parked baseline immediately before this batch.
+                    # The subscribers are provisional: they can buffer a transition
+                    # emitted synchronously by send_input, but become durable only
+                    # after that send returns successfully.
+                    batch_status = status_monitor.get_status(terminal_id)
+                    if batch_status in (
+                        TerminalStatus.IDLE,
+                        TerminalStatus.COMPLETED,
+                    ):
+                        for message in batch:
+                            preparation = self._prepare_wake_confirmation(
                                 terminal_id,
                                 message.id,
                                 baseline_status=batch_status,
                             )
-                        )
-                        is not None
-                    ]
-            try:
+                            if preparation is not None:
+                                preparations.append(preparation)
                 if registry is None:
                     terminal_service.send_input(terminal_id, combined)
                 else:
@@ -599,14 +628,6 @@ class InboxService:
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
                 logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
-                # Unmanaged paste path only (managed receivers ack via the
-                # bridge above).  One idempotent wake-confirmation trigger per
-                # message: a watching receipt is opened, and the watcher (owned
-                # by this service's event loop) awaits a wake transition or
-                # nudges at most once.  Idempotent across the POST, event-loop,
-                # poller, and reconcile paths that all funnel through here.
-                for preparation in preparations:
-                    self._commit_wake_confirmation(preparation)
             except TerminalNotFoundError as e:
                 for preparation in preparations:
                     self._abort_wake_confirmation(preparation)
@@ -626,6 +647,21 @@ class InboxService:
                 for message in batch:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
                     update_message_status(message.id, MessageStatus.FAILED)
+            else:
+                # The pane send has succeeded. Wake-receipt persistence is a
+                # separate post-send observation: if it fails, do not mark the
+                # already-sent inbox row FAILED and license duplicate delivery.
+                for preparation in preparations:
+                    try:
+                        self._commit_wake_confirmation(preparation)
+                    except Exception:  # noqa: BLE001 - delivery already succeeded
+                        self._abort_wake_confirmation(preparation)
+                        logger.exception(
+                            "could not persist wake confirmation for delivered "
+                            "message %s to terminal %s; the message remains delivered",
+                            preparation.message_id,
+                            terminal_id,
+                        )
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.

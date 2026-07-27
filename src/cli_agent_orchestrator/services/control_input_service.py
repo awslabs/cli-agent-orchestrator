@@ -1687,7 +1687,7 @@ def _deliver_under_lease(
         )
         journal.mark_ambiguous(
             control_id,
-            reason_code=exc.reason_code,
+            reason_code=REASON_WRITE_INCOMPLETE,
             chunks_sent=0,
             enter_attempted=False,
             evidence_digest=digest,
@@ -1695,9 +1695,10 @@ def _deliver_under_lease(
         return ControlInputResult(
             control_id=control_id,
             outcome=AMBIGUOUS,
-            reason_code=exc.reason_code,
+            reason_code=REASON_WRITE_INCOMPLETE,
             detail=(
                 f"the pane's tmux server changed while the write lease was held: {exc}. "
+                f"The underlying identity diagnostic was {exc.reason_code!r}. "
                 "Nothing was written, but the write had already been claimed, and a "
                 "claimed write is never reported as a refusal"
             ),
@@ -1920,6 +1921,9 @@ def _send_through_native_adapter(
             reason_code=REASON_WRITE_INCOMPLETE,
             chunks_sent=transport.chunks_sent,
             enter_attempted=transport.enter_attempted,
+            chord=chord,
+            chord_attempted=transport.chord_attempted,
+            chord_sent=transport.chord_sent,
             evidence_digest=digest,
         )
         return ControlInputResult(
@@ -1937,6 +1941,9 @@ def _send_through_native_adapter(
             resolved_identity=resolved.as_dict(),
             chunks_sent=transport.chunks_sent,
             enter_attempted=transport.enter_attempted,
+            chord=chord,
+            chord_attempted=transport.chord_attempted,
+            chord_sent=transport.chord_sent,
         )
     except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
         # Includes the server-identity error the transport's primitives
@@ -1952,6 +1959,9 @@ def _send_through_native_adapter(
             reason_code=REASON_WRITE_INCOMPLETE,
             chunks_sent=transport.chunks_sent,
             enter_attempted=transport.enter_attempted,
+            chord=chord,
+            chord_attempted=transport.chord_attempted,
+            chord_sent=transport.chord_sent,
             evidence_digest=digest,
         )
         return ControlInputResult(
@@ -1965,6 +1975,9 @@ def _send_through_native_adapter(
             resolved_identity=resolved.as_dict(),
             chunks_sent=transport.chunks_sent,
             enter_attempted=transport.enter_attempted,
+            chord=chord,
+            chord_attempted=transport.chord_attempted,
+            chord_sent=transport.chord_sent,
         )
 
     expired = deadline_ambiguity()
