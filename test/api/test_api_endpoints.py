@@ -380,6 +380,37 @@ class TestCreateSession:
         assert response.json()["detail"] == "initial_message must not be empty"
         mock_svc.create_session.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("payload", "expected_detail"),
+        [
+            (
+                {"initial_message_orchestration_type": "send_message"},
+                "initial_message_orchestration_type requires initial_message",
+            ),
+            (
+                {
+                    "initial_message": "Review the current change",
+                    "initial_message_orchestration_type": "invalid",
+                },
+                "invalid initial_message_orchestration_type: 'invalid'",
+            ),
+        ],
+    )
+    def test_create_session_rejects_invalid_initial_message_orchestration(
+        self, client, payload, expected_detail
+    ):
+        """Invalid initial-message orchestration fails at the API boundary."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json=payload,
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == expected_detail
+        mock_svc.create_session.assert_not_called()
+
     def test_create_session_with_session_name(self, client):
         """POST /sessions with explicit session_name."""
         mock_terminal = Terminal(

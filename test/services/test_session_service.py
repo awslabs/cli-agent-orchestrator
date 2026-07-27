@@ -100,6 +100,19 @@ class TestCreateSession:
 
         mock_create_terminal.assert_not_called()
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_create_session_rejects_empty_initial_message(self, mock_create_terminal):
+        """Direct callers cannot turn an empty first task into deferred initialization."""
+        with pytest.raises(ValueError, match="initial_message must not be empty"):
+            await create_session(
+                provider="codex",
+                agent_profile="my_agent",
+                initial_message="",
+            )
+
+        mock_create_terminal.assert_not_called()
+
 
 class TestListSessions:
     """Tests for list_sessions function."""
