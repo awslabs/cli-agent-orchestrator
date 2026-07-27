@@ -1393,7 +1393,9 @@ def _v2_native_control_projection(reservation_id: str) -> dict[str, Any]:
     return projection
 
 
-def verify_managed_native_identity(reservation_id: str) -> dict[str, Any]:
+def verify_managed_native_identity(
+    reservation_id: str, *, deadline_monotonic: Optional[float] = None
+) -> dict[str, Any]:
     """Re-prove, live, that this generation still holds its provider session.
 
     The projection a control was resolved from is a statement about the
@@ -1420,7 +1422,9 @@ def verify_managed_native_identity(reservation_id: str) -> dict[str, Any]:
             f"reservation {reservation_id} runs in {record['execution_mode']!r}, not "
             f"{em.NATIVE_TUI!r}; only a native generation has a composer to type into"
         )
-    return v2.validate_native_identity_against_live_pane(record)
+    return v2.validate_native_identity_against_live_pane(
+        record, deadline_monotonic=deadline_monotonic
+    )
 
 
 def managed_control_identity(terminal_id: str) -> Optional[dict[str, Any]]:

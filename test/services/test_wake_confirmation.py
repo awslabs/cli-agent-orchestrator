@@ -496,6 +496,34 @@ class TestRestartNeverReNudges:
         assert nudge.call_count == 0
         assert wake_receipts.get("term-1", "1202")["state"] == wake_receipts.WAKE_UNCONFIRMED
 
+    @pytest.mark.asyncio
+    async def test_a_future_record_without_prior_intent_is_observation_only_after_restart(
+        self, store, bus_on_loop, monkeypatch
+    ):
+        nudge = MagicMock()
+        monkeypatch.setattr(inbox_service.terminal_service, "send_special_key", nudge)
+        monkeypatch.setattr(
+            inbox_service.status_monitor, "get_status", lambda tid: TerminalStatus.IDLE
+        )
+        wake_receipts.ensure_watching(
+            "term-1",
+            "1203",
+            native_session_id=None,
+            delivered_at=wake_receipts.utcnow(),
+            deadline_at=_future_deadline(0.2),
+        )
+        svc = InboxService()
+        svc._loop = bus_on_loop
+
+        svc._load_wake_confirmations()
+        await asyncio.sleep(0.45)
+
+        record = wake_receipts.get("term-1", "1203")
+        assert nudge.call_count == 0
+        assert record["state"] == wake_receipts.WAKE_UNCONFIRMED
+        assert record["nudge_intent_at"] is None
+        assert "observation-only" in record["note"]
+
 
 class TestManagedPathUnchanged:
     def test_a_managed_paste_does_not_open_a_wake_receipt(self, store, monkeypatch):

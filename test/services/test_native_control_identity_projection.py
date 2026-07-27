@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import time
 import uuid
 from typing import Any, Mapping, Optional
 
@@ -52,7 +53,10 @@ from cli_agent_orchestrator.services import managed_provider_bridge as bridge
 from cli_agent_orchestrator.services import native_attachment
 from cli_agent_orchestrator.services import native_pane_input as npi
 from cli_agent_orchestrator.services import native_tui_launch
-from cli_agent_orchestrator.services.control_input_journal import ControlInputJournal
+from cli_agent_orchestrator.services.control_input_journal import (
+    STATE_REFUSED,
+    ControlInputJournal,
+)
 
 PINNED_VERSION_BANNER = "kimi 0.29.0"
 SESSION_ID = "session_9f2c41ab"
@@ -160,7 +164,14 @@ class _Pane:
     def __init__(self, state: "_Native") -> None:
         self._state = state
 
-    def observe(self) -> Optional[Mapping[str, Any]]:
+    def observe(self, *, deadline_monotonic: Optional[float] = None) -> Optional[Mapping[str, Any]]:
+        self._state.observed_deadlines.append(deadline_monotonic)
+        if self._state.pane_timeout:
+            assert deadline_monotonic is not None
+            remaining = max(0.0, deadline_monotonic - time.monotonic())
+            if remaining:
+                time.sleep(remaining)
+            raise subprocess.TimeoutExpired(["tmux", "list-panes"], remaining)
         if self._state.pane_gone:
             return None
         if self._state.pane_unreadable:
@@ -180,6 +191,8 @@ class _Native:
         self.terminals: list[dict[str, Any]] = []
         self.pane_gone = False
         self.pane_unreadable = False
+        self.pane_timeout = False
+        self.observed_deadlines: list[Optional[float]] = []
         self.observed_pane_id = PANE_ID
         self.observed_pid = PANE_PID
         self.observed_start_marker = START_MARKER
@@ -571,6 +584,20 @@ class TestTheLiveReverificationBeforeAnyWrite:
         assert proven["pane_id"] == PANE_ID
         assert v2.published_process_id(proven["process_identity"]) == PROVEN_PROCESS_ID
 
+    @pytest.mark.asyncio
+    async def test_the_control_deadline_reaches_the_live_native_observer(
+        self, isolated_memory_db, worktree, tmp_path, native
+    ):
+        reservation_id, _ = await _bound_native(worktree, tmp_path)
+        deadline = time.monotonic() + 1.0
+
+        managed_launch.verify_managed_native_identity(
+            reservation_id,
+            deadline_monotonic=deadline,
+        )
+
+        assert native.observed_deadlines[-1] == deadline
+
 
 # --------------------------------------------------------------------
 # 2. Delivery through the provider's own adapter
@@ -759,6 +786,41 @@ class TestTheGatesRunBeforeTheWriteClaim:
     withholds the re-attempt a proven zero-byte refusal is entitled to
     grant.  Every gate that can fail therefore runs before the claim.
     """
+
+    @pytest.mark.asyncio
+    async def test_a_native_identity_timeout_is_bounded_and_releases_the_lease(
+        self, isolated_memory_db, worktree, tmp_path, native, wired, monkeypatch
+    ):
+        tmux, journal = wired
+        _, bound = await _bound_native(worktree, tmp_path)
+        native.pane_timeout = True
+        monkeypatch.setattr(cis, "WRITE_DEADLINE_SECONDS", 0.05)
+
+        started = time.monotonic()
+        result = _deliver(
+            bound["terminal_id"],
+            tmux,
+            journal,
+            control_id="c-native-timeout",
+        )
+        elapsed = time.monotonic() - started
+
+        assert result.outcome == cis.REFUSED
+        assert result.reason_code == cis.REASON_WRITE_DEADLINE
+        assert result.as_response()["reattemptable"] is True
+        assert elapsed < 0.15
+        assert tmux.events == []
+        assert journal.get("c-native-timeout").state == STATE_REFUSED
+
+        native.pane_timeout = False
+        monkeypatch.setattr(cis, "WRITE_DEADLINE_SECONDS", 5.0)
+        healthy = _deliver(
+            bound["terminal_id"],
+            tmux,
+            journal,
+            control_id="c-after-native-timeout",
+        )
+        assert healthy.outcome == cis.ACCEPTED
 
     @pytest.mark.asyncio
     async def test_an_unproven_build_refuses_with_nothing_typed(

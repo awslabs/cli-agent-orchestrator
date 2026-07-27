@@ -1,15 +1,18 @@
 """Tests for the event-driven InboxService."""
 
 import asyncio
+import threading
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services import inbox_service
 from cli_agent_orchestrator.services.inbox_service import InboxService
 
 
@@ -218,6 +221,70 @@ class TestDeliverPending:
         # Final status is PENDING (reset after the optimistic DELIVERED), never FAILED.
         assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
         assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
+
+    def test_two_concurrent_callers_send_one_pending_message_once(
+        self, isolated_memory_db, monkeypatch
+    ):
+        database.create_terminal(
+            "term-race",
+            "cao-race",
+            "worker",
+            "codex",
+        )
+        message = database.create_inbox_message("sender-1", "term-race", "callback-once")
+        real_get_pending = database.get_pending_messages
+        both_selected = threading.Barrier(2)
+
+        def synchronized_get(terminal_id, limit=1):
+            selected = real_get_pending(terminal_id, limit=limit)
+            both_selected.wait(timeout=5)
+            return selected
+
+        sends = []
+        send_lock = threading.Lock()
+
+        def record_send(terminal_id, text):
+            with send_lock:
+                sends.append((terminal_id, text))
+
+        monkeypatch.setattr(inbox_service, "get_pending_messages", synchronized_get)
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "managed_control_identity",
+            lambda _terminal_id: None,
+        )
+        monkeypatch.setattr(
+            inbox_service.status_monitor,
+            "get_status",
+            lambda _terminal_id: TerminalStatus.IDLE,
+        )
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", record_send)
+        monkeypatch.setattr(
+            InboxService,
+            "_prepare_wake_confirmation",
+            lambda *args, **kwargs: None,
+        )
+
+        service = InboxService()
+        errors = []
+
+        def deliver():
+            try:
+                service.deliver_pending("term-race")
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        callers = [threading.Thread(target=deliver) for _ in range(2)]
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join(timeout=5)
+
+        assert not errors
+        assert all(not caller.is_alive() for caller in callers)
+        assert sends == [("term-race", "callback-once")]
+        stored = database.get_inbox_messages("term-race", limit=10)
+        assert [(row.id, row.status) for row in stored] == [(message.id, MessageStatus.DELIVERED)]
 
 
 class TestEagerInboxDelivery:
@@ -658,4 +725,9 @@ class TestManagedBridgeDelivery:
         svc.deliver_pending("term-1")
 
         mock_term_svc.send_input.assert_not_called()
-        mock_update.assert_not_called()
+        mock_update.assert_has_calls(
+            [
+                call(1, MessageStatus.DELIVERED),
+                call(1, MessageStatus.PENDING),
+            ]
+        )

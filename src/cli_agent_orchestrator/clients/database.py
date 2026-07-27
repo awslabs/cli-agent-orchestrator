@@ -2362,8 +2362,30 @@ def list_aliases_for_project(project_id: str) -> List[Dict[str, Any]]:
 
 
 def update_message_status(message_id: int, status: MessageStatus) -> bool:
-    """Update message status to MessageStatus.DELIVERED or MessageStatus.FAILED."""
+    """Update one inbox row, atomically claiming a pending delivery.
+
+    ``PENDING -> DELIVERED`` is the effect claim: concurrent delivery
+    callers may both have selected the same pending row, but only the caller
+    whose conditional update succeeds may touch the provider or pane.
+    Rollback/failure transitions remain unconditional because they are issued
+    only by that winning caller after its own effect attempt.
+    """
     with SessionLocal() as db:
+        if status == MessageStatus.DELIVERED:
+            updated = (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.id == message_id,
+                    InboxModel.status == MessageStatus.PENDING.value,
+                )
+                .update(
+                    {InboxModel.status: MessageStatus.DELIVERED.value},
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            return updated == 1
+
         message = db.query(InboxModel).filter(InboxModel.id == message_id).first()
         if message:
             message.status = status.value

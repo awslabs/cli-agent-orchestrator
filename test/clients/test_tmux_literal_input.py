@@ -10,6 +10,7 @@ caller named.
 
 import logging
 import os
+import time
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import List, Optional, Union
@@ -683,6 +684,42 @@ class TestPaneControlIdentityLookup:
 
         assert identity is not None
         assert identity.pane_id == "%263"
+
+    def test_deadline_bound_window_identity_uses_direct_bounded_enumeration(
+        self, client, mock_subprocess, answers
+    ):
+        answers.panes = _ok(_pane_line())
+        deadline = time.monotonic() + 1.0
+
+        identity = client.window_identity(
+            "cao-1a2b3c4d",
+            "claude-9f8e",
+            deadline_monotonic=deadline,
+        )
+
+        assert identity == {
+            "pane_id": "%263",
+            "window_id": "@261",
+            "session_id": "$7",
+            "pane_pid": "74654",
+            "server_socket_path": SOCKET,
+        }
+        assert _all_argv(mock_subprocess) == [[TMUX, "list-panes", "-a", "-F", PANE_FORMAT]]
+        timeout = mock_subprocess.run.call_args.kwargs["timeout"]
+        assert 0 < timeout <= 1.0
+        client.server.sessions.get.assert_not_called()
+
+    def test_deadline_bound_window_existence_preserves_unreadable_server(
+        self, client, mock_subprocess, answers
+    ):
+        answers.panes = _fail("server unavailable")
+
+        with pytest.raises(RuntimeError, match="unavailable or unreadable"):
+            client.window_exists(
+                "cao-1a2b3c4d",
+                "claude-9f8e",
+                deadline_monotonic=time.monotonic() + 1.0,
+            )
 
     def test_unknown_pane_is_absent_not_guessed(self, client, mock_subprocess, answers):
         answers.panes = _ok(_pane_line(pane_id="%100"))

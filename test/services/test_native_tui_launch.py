@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import time
 from typing import Any, Mapping, Optional, Sequence
 
 import pytest
@@ -868,10 +869,24 @@ class FakeBackend:
         self.calls.append((session_name, window_name, terminal_id, tuple(argv)))
         return window_name
 
-    def window_identity(self, session_name: str, window_name: str) -> Any:
+    def window_identity(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Any:
+        self.identity_deadline = deadline_monotonic
         return self.identity
 
-    def window_exists(self, session_name: str, window_name: str) -> bool:
+    def window_exists(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
+        self.exists_deadline = deadline_monotonic
         return self.exists
 
 
@@ -933,6 +948,38 @@ def test_tmux_transport_splits_the_observed_command_line(
         "argv": ["/bin/kimi", "--session", SESSION],
         "cwd": "/private/tmp/w",
     }
+
+
+def test_tmux_transport_threads_one_deadline_through_the_whole_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeBackend(identity={"pane_id": "%3"}, exists=True)
+    pane = _pane(backend)
+    deadline = time.monotonic() + 1.0
+    observed_deadlines: list[float] = []
+
+    def _pane_pid(*, deadline_monotonic: float) -> int:
+        observed_deadlines.append(deadline_monotonic)
+        return 777
+
+    def _process_field(pid: int, field: str, *, deadline_monotonic: float) -> str:
+        observed_deadlines.append(deadline_monotonic)
+        if field == "lstart=":
+            return "Thu Jul 24 10:00:00 2026"
+        return f"/bin/kimi --session {SESSION}"
+
+    def _process_cwd(pid: int, *, deadline_monotonic: float) -> str:
+        observed_deadlines.append(deadline_monotonic)
+        return "/private/tmp/w"
+
+    monkeypatch.setattr(pane, "_pane_pid", _pane_pid)
+    monkeypatch.setattr(native_tui_launch, "_process_field", _process_field)
+    monkeypatch.setattr(native_tui_launch, "_process_cwd", _process_cwd)
+
+    pane.observe(deadline_monotonic=deadline)
+
+    assert backend.identity_deadline == deadline
+    assert observed_deadlines == [deadline, deadline, deadline, deadline]
 
 
 def test_tmux_transport_raises_when_the_pane_cwd_is_unreadable(

@@ -242,6 +242,7 @@ class InboxService:
         queue: Optional[asyncio.Queue] = None,
         baseline_status: Optional[str] = None,
         delivery_identity: Optional[dict[str, Any]] = None,
+        allow_nudge: bool = True,
     ) -> None:
         loop = self._loop
         if loop is None or not loop.is_running():
@@ -260,6 +261,7 @@ class InboxService:
                 queue=queue,
                 baseline_status=baseline_status,
                 delivery_identity=delivery_identity,
+                allow_nudge=allow_nudge,
             ),
             loop,
         )
@@ -309,6 +311,7 @@ class InboxService:
                     record.get("deadline_at"),
                     baseline_status=record.get("baseline_status"),
                     delivery_identity=record.get("delivery_identity"),
+                    allow_nudge=False,
                 )
 
     async def _watch_wake(
@@ -320,6 +323,7 @@ class InboxService:
         queue: Optional[asyncio.Queue] = None,
         baseline_status: Optional[str] = None,
         delivery_identity: Optional[dict[str, Any]] = None,
+        allow_nudge: bool = True,
     ) -> None:
         """Watch one receiver for a wake transition, or nudge once and conclude."""
         key = (terminal_id, message_id)
@@ -338,6 +342,19 @@ class InboxService:
                     message_id,
                     delivery_identity=delivery_identity,
                     observed=transition,
+                )
+                return
+            if not allow_nudge:
+                wake_receipts.record_wake_unconfirmed(
+                    terminal_id,
+                    message_id,
+                    note="the watcher was restored after process restart and was "
+                    "observation-only; no new nudge was sent",
+                )
+                self._emit_wake_event(
+                    terminal_id,
+                    message_id,
+                    wake_receipts.WAKE_UNCONFIRMED,
                 )
                 return
             await self._nudge_once(
@@ -532,20 +549,43 @@ class InboxService:
         # acknowledgement is ever inferred.
         remaining = []
         managed_identity = managed_launch.managed_control_identity(terminal_id)
-        for message in messages:
-            if managed_launch.deliver_inbox_via_bridge(
-                terminal_id,
-                message_id=message.id,
-                message=message.message,
-                sender_id=message.sender_id,
-            ):
-                update_message_status(message.id, MessageStatus.DELIVERED)
-                logger.info(
-                    f"Delivered message {message.id} to terminal {terminal_id} "
-                    "via the managed provider bridge (provider-native ack)"
-                )
-            else:
-                remaining.append(message)
+        if managed_identity is None:
+            remaining = messages
+        else:
+            for message in messages:
+                # The conditional PENDING -> DELIVERED update is the effect
+                # claim. Another status-event/poller/reconcile caller may have
+                # selected this row concurrently, but only one of them may reach
+                # the provider bridge.
+                if update_message_status(message.id, MessageStatus.DELIVERED) is False:
+                    continue
+                try:
+                    bridged = managed_launch.deliver_inbox_via_bridge(
+                        terminal_id,
+                        message_id=message.id,
+                        message=message.message,
+                        sender_id=message.sender_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - no duplicate effect
+                    update_message_status(message.id, MessageStatus.FAILED)
+                    logger.error(
+                        "Failed to deliver message %s to managed terminal %s: %s",
+                        message.id,
+                        terminal_id,
+                        exc,
+                    )
+                    continue
+                if bridged:
+                    logger.info(
+                        f"Delivered message {message.id} to terminal {terminal_id} "
+                        "via the managed provider bridge (provider-native ack)"
+                    )
+                else:
+                    # The bridge declined before accepting a provider effect.
+                    # Release the optimistic claim so a later provider path may
+                    # claim it.
+                    update_message_status(message.id, MessageStatus.PENDING)
+                    remaining.append(message)
         messages = remaining
         if not messages:
             return
@@ -580,14 +620,18 @@ class InboxService:
             if not eager_eligible:
                 return
 
-        # Mark DELIVERED before sending (#164). send_input() types into the tmux
-        # pane; that output flows back through the FIFO/StatusMonitor pipeline and
-        # can re-emit an IDLE/COMPLETED status event, re-entering deliver_pending.
-        # If the messages were still PENDING then, they would be delivered twice.
-        # Marking them DELIVERED first closes that window; the except path resets
-        # them to FAILED.
+        # Claim each row before sending (#164). send_input() types into the tmux
+        # pane; that output can re-enter deliver_pending, while independent
+        # status/poller/reconcile callers can already be running. The atomic
+        # conditional PENDING -> DELIVERED update admits exactly one caller to
+        # the pane effect; the except path resets only that caller's rows.
+        claimed_messages = []
         for message in messages:
-            update_message_status(message.id, MessageStatus.DELIVERED)
+            if update_message_status(message.id, MessageStatus.DELIVERED) is not False:
+                claimed_messages.append(message)
+        messages = claimed_messages
+        if not messages:
+            return
 
         # Deliver in contiguous runs of the same sender. With the default
         # num_messages=1 this is a single run; when draining all pending messages

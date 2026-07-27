@@ -965,32 +965,57 @@ class TmuxNativePane:
         )
         return str(handle)
 
-    def observe(self) -> Optional[Mapping[str, Any]]:
-        identity = self._backend.window_identity(self._session_name, self._window_name)
+    def observe(self, *, deadline_monotonic: Optional[float] = None) -> Optional[Mapping[str, Any]]:
+        if deadline_monotonic is None:
+            identity = self._backend.window_identity(self._session_name, self._window_name)
+        else:
+            identity = self._backend.window_identity(
+                self._session_name,
+                self._window_name,
+                deadline_monotonic=deadline_monotonic,
+            )
         if identity is None:
             # No identity and no window is a real absence.  No identity
             # while the window exists is a failed read, and saying
             # "absent" for that would license a relaunch on top of a live
             # process, so it raises instead.
-            if not self._backend.window_exists(self._session_name, self._window_name):
+            if deadline_monotonic is None:
+                exists = self._backend.window_exists(self._session_name, self._window_name)
+            else:
+                exists = self._backend.window_exists(
+                    self._session_name,
+                    self._window_name,
+                    deadline_monotonic=deadline_monotonic,
+                )
+            if not exists:
                 return None
             raise NativeLaunchUnavailable(
                 f"tmux window {self._session_name}:{self._window_name} exists but its "
                 "pane identity could not be read"
             )
-        pid = self._pane_pid()
+        if deadline_monotonic is None:
+            pid = self._pane_pid()
+        else:
+            pid = self._pane_pid(deadline_monotonic=deadline_monotonic)
         if pid is None:
             raise NativeLaunchUnavailable(
                 f"the primary process of {self._session_name}:{self._window_name} has no "
                 "readable pid"
             )
-        start_marker = _process_field(pid, "lstart=")
-        command = _process_field(pid, "args=")
+        if deadline_monotonic is None:
+            start_marker = _process_field(pid, "lstart=")
+            command = _process_field(pid, "args=")
+        else:
+            start_marker = _process_field(pid, "lstart=", deadline_monotonic=deadline_monotonic)
+            command = _process_field(pid, "args=", deadline_monotonic=deadline_monotonic)
         if start_marker is None or command is None:
             raise NativeLaunchUnavailable(
                 f"the process table did not report the identity of pid {pid}"
             )
-        cwd = _process_cwd(pid)
+        if deadline_monotonic is None:
+            cwd = _process_cwd(pid)
+        else:
+            cwd = _process_cwd(pid, deadline_monotonic=deadline_monotonic)
         if cwd is None:
             # Raised, not omitted.  A caller that could not read the cwd
             # has not proven the pane is in the right directory, and the
@@ -1014,26 +1039,31 @@ class TmuxNativePane:
             "cwd": cwd,
         }
 
-    def _pane_pid(self) -> Optional[int]:
+    def _pane_pid(self, *, deadline_monotonic: Optional[float] = None) -> Optional[int]:
         from cli_agent_orchestrator.clients.tmux import tmux_binary
 
+        argv = [
+            tmux_binary(),
+            "display-message",
+            "-p",
+            "-t",
+            f"{self._session_name}:{self._window_name}",
+            "-F",
+            "#{pane_pid}",
+        ]
         try:
             proc = subprocess.run(
-                [
-                    tmux_binary(),
-                    "display-message",
-                    "-p",
-                    "-t",
-                    f"{self._session_name}:{self._window_name}",
-                    "-F",
-                    "#{pane_pid}",
-                ],
+                argv,
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=_native_observation_timeout(deadline_monotonic, argv),
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
+            if deadline_monotonic is not None:
+                raise
+            return None
+        except OSError:
             return None
         if proc.returncode != 0:
             return None
@@ -1041,7 +1071,22 @@ class TmuxNativePane:
         return int(raw) if raw.isdigit() and int(raw) > 0 else None
 
 
-def _process_field(pid: int, field: str) -> Optional[str]:
+def _native_observation_timeout(deadline_monotonic: Optional[float], argv: Sequence[str]) -> float:
+    """Bound one native-identity subprocess by the shared control deadline."""
+    if deadline_monotonic is None:
+        return 5.0
+    remaining = deadline_monotonic - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(list(argv), 0)
+    return min(5.0, remaining)
+
+
+def _process_field(
+    pid: int,
+    field: str,
+    *,
+    deadline_monotonic: Optional[float] = None,
+) -> Optional[str]:
     """One ``ps`` field for one pid, or ``None`` when it cannot be read.
 
     Queried one field per call.  ``lstart`` contains spaces, so asking
@@ -1053,15 +1098,20 @@ def _process_field(pid: int, field: str) -> Optional[str]:
     ps = shutil.which("ps")
     if not ps:
         return None
+    argv = [os.path.realpath(ps), "-o", field, "-p", str(pid)]
     try:
         proc = subprocess.run(
-            [os.path.realpath(ps), "-o", field, "-p", str(pid)],
+            argv,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=_native_observation_timeout(deadline_monotonic, argv),
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        if deadline_monotonic is not None:
+            raise
+        return None
+    except OSError:
         return None
     if proc.returncode != 0:
         return None
@@ -1069,7 +1119,7 @@ def _process_field(pid: int, field: str) -> Optional[str]:
     return value or None
 
 
-def _process_cwd(pid: int) -> Optional[str]:
+def _process_cwd(pid: int, *, deadline_monotonic: Optional[float] = None) -> Optional[str]:
     """The live working directory of one pid, or ``None`` if unreadable.
 
     Read from the kernel rather than from anything the launcher recorded,
@@ -1092,15 +1142,20 @@ def _process_cwd(pid: int) -> Optional[str]:
     lsof = shutil.which("lsof")
     if not lsof:
         return None
+    argv = [os.path.realpath(lsof), "-a", "-d", "cwd", "-p", str(pid), "-Fn"]
     try:
         proc = subprocess.run(
-            [os.path.realpath(lsof), "-a", "-d", "cwd", "-p", str(pid), "-Fn"],
+            argv,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=_native_observation_timeout(deadline_monotonic, argv),
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        if deadline_monotonic is not None:
+            raise
+        return None
+    except OSError:
         return None
     if proc.returncode != 0:
         return None

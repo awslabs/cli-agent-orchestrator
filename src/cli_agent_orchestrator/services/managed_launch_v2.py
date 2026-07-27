@@ -4153,7 +4153,9 @@ def resolve_native_identity_of_record(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def validate_native_identity_against_live_pane(record: dict[str, Any]) -> dict[str, Any]:
+def validate_native_identity_against_live_pane(
+    record: dict[str, Any], *, deadline_monotonic: Optional[float] = None
+) -> dict[str, Any]:
     """Prove the bound native identity is still exactly what was bound.
 
     Runs before anything is claimed and before a single byte is written,
@@ -4194,7 +4196,10 @@ def validate_native_identity_against_live_pane(record: dict[str, Any]) -> dict[s
     # reporting the second as the first would close a delivery that is
     # still open.
     try:
-        observed = pane.observe()
+        if deadline_monotonic is None:
+            observed = pane.observe()
+        else:
+            observed = pane.observe(deadline_monotonic=deadline_monotonic)
     except native_tui_launch.NativeLaunchError as exc:
         raise ManagedLaunchUnavailable(
             f"the bound native pane could not be observed, so the task was not sent: {exc}"

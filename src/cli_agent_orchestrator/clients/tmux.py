@@ -861,8 +861,23 @@ class TmuxClient:
             logger.error(f"Failed to kill window {session_name}:{window_name}: {e}")
             return False
 
-    def window_exists(self, session_name: str, window_name: str) -> bool:
+    def window_exists(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> bool:
         """Check the exact tmux window while preserving unreadable-server errors."""
+        if deadline_monotonic is not None:
+            records = self.list_pane_control_identities(deadline_monotonic=deadline_monotonic)
+            if records is None:
+                raise RuntimeError("tmux server is unavailable or unreadable")
+            return any(
+                record.session_name == session_name and record.window_name == window_name
+                for record in records
+            )
+
         # ``Server.sessions`` turns every ``list-sessions`` failure into an empty
         # QueryList.  Prove the server is readable first so a permission or
         # subprocess failure cannot masquerade as an absent session.
@@ -873,7 +888,13 @@ class TmuxClient:
             return False
         return session.windows.get(window_name=window_name, default=None) is not None
 
-    def window_identity(self, session_name: str, window_name: str) -> Optional[Dict[str, str]]:
+    def window_identity(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> Optional[Dict[str, str]]:
         """Server-owned immutable tmux identity of a window: its tmux-assigned
         ``window_id`` (``@N``) and active ``pane_id`` (``%N``). Unlike window
         names these are immutable for the resource's life — the only tmux
@@ -900,6 +921,24 @@ class TmuxClient:
         the window) is precisely what let a write land in an unrelated live
         composer.
         """
+        if deadline_monotonic is not None:
+            observed = self.pane_control_identity(
+                session_name=session_name,
+                window_name=window_name,
+                deadline_monotonic=deadline_monotonic,
+            )
+            if observed is None:
+                return None
+            identity = {
+                "pane_id": observed.pane_id,
+                "window_id": observed.window_id,
+                "session_id": observed.session_id,
+                "pane_pid": str(observed.pane_pid),
+            }
+            if observed.server_socket_path is not None:
+                identity["server_socket_path"] = observed.server_socket_path
+            return identity
+
         try:
             session = self.server.sessions.get(session_name=session_name)
             if not session:

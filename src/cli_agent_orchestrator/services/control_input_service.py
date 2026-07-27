@@ -1341,6 +1341,7 @@ def _native_composer_preflight(
     binding: ControlInputBinding,
     *,
     text: str,
+    deadline_monotonic: float,
 ) -> Tuple[Optional[Any], Optional[Any], Optional[Tuple[str, str]]]:
     """Everything a native write must prove before the claim, or a refusal.
 
@@ -1377,7 +1378,10 @@ def _native_composer_preflight(
         )
 
     try:
-        proven = managed_launch.verify_managed_native_identity(reservation_id)
+        proven = managed_launch.verify_managed_native_identity(
+            reservation_id,
+            deadline_monotonic=deadline_monotonic,
+        )
     except managed_launch.ManagedLaunchUnavailable as exc:
         # "We could not look" is not "it is gone", and reporting the
         # second as the first would close a delivery that is still open.
@@ -1620,7 +1624,24 @@ def _deliver_under_lease(
         breached = _deadline_breached()
         if breached is not None:
             return breached
-        adapter, plan, native_refusal = _native_composer_preflight(resolved, binding, text=text)
+        try:
+            adapter, plan, native_refusal = _native_composer_preflight(
+                resolved,
+                binding,
+                text=text,
+                deadline_monotonic=deadline,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return _record_refusal(
+                journal,
+                control_id,
+                REASON_WRITE_DEADLINE,
+                f"the managed native identity observation exceeded its bound before any "
+                f"byte: {exc}; nothing was written and the control may be sent again",
+                terminal_id=terminal_id,
+                resolved=resolved,
+                digest=digest,
+            )
         if native_refusal is not None:
             return _record_refusal(
                 journal,
