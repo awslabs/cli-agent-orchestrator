@@ -45,6 +45,7 @@ their control surface is the generation-bound managed operations API.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import subprocess
@@ -2083,6 +2084,228 @@ def _send_through_native_adapter(
         chord_attempted=transport.chord_attempted,
         chord_sent=transport.chord_sent,
     )
+
+
+# --- Native inbox payload delivery ------------------------------------------
+#
+# The payload twin of the public control-input delivery, for ordinary inbox
+# messages bound to a native-TUI managed receiver.  Ordinary agent prose is
+# unrestricted — long and multiline — while the public control shape is
+# deliberately "a command or one short line".  This path reuses everything
+# the control delivery already proves (identity resolution and live
+# re-proof, the provider adapter's composer plan, the shared pane lease,
+# the identity-bound chunked transport) and drops the control-plane
+# discipline (byte cap, single-line rule, control id, chord, journal).  The
+# inbox row's atomic PENDING→DELIVERED claim is the idempotency anchor, and
+# crash semantics are the ordinary path's: a claimed row is never re-typed,
+# a pre-claim crash yields exactly one later delivery, and a mid-send crash
+# can leave operator-visible partial composer content that is never
+# silently re-typed.
+
+
+def screen_inbox_payload_text(text: str) -> Optional[Tuple[str, str]]:
+    """The inbox-payload byte-safety screen, narrower than the control screen.
+
+    Only the byte-unsafe class is refused: control characters below 0x20
+    OTHER than ``\\n`` (LF is the payload newline; ``\\r`` is an ambiguous
+    submit on these TUIs), 0x7F, and the C1 range 0x80-0x9F.  Bracket-paste
+    sentinel bytes fall in the refused class by construction (ESC).  There
+    is no length cap and no multiline rule — multiline is a proven composer
+    encoding, and literal emission is chunked deterministically downstream.
+    """
+    for index, char in enumerate(text):
+        point = ord(char)
+        if (
+            char == "\r"
+            or (point < 0x20 and char != "\n")
+            or point == 0x7F
+            or 0x80 <= point <= 0x9F
+        ):
+            return (
+                REASON_ILLEGAL_CONTROL_BYTES,
+                f"payload byte U+{point:04X} at offset {index} is unsafe to aim at a "
+                "composer: LF is the only control character an inbox payload may carry",
+            )
+    return None
+
+
+@dataclass(frozen=True)
+class NativePayloadResult:
+    """The typed outcome of one native inbox payload send (journal-free).
+
+    Same outcome vocabulary as the control path.  ``REFUSED`` — and only
+    ``REFUSED`` — proves zero bytes reached the pane and permits a later
+    re-attempt; ``AMBIGUOUS`` means the write stopped part-way and must
+    never be blindly replayed.
+    """
+
+    outcome: str
+    reason_code: str
+    detail: str
+    chunks_sent: int = 0
+    enter_sent: bool = False
+
+
+def deliver_native_inbox_payload(
+    terminal_id: str,
+    *,
+    text: Any,
+    expected_identity: Optional[Mapping[str, Any]] = None,
+    lease_timeout: float = 0.0,
+) -> NativePayloadResult:
+    """Type one ordinary inbox payload into a native-TUI managed composer, once.
+
+    Blocking, like the control delivery: an async caller must dispatch it
+    to a worker thread.  Multiline and multi-KB payloads are first-class:
+    the composer plan encodes line breaks as proven soft-newline keystrokes
+    and the transport emits literal text in bounded chunks, with exactly
+    one submit sequence after the final chunk.  ``REFUSED`` — and only
+    ``REFUSED`` — proves zero bytes reached the pane.
+    """
+    if not isinstance(text, str) or text == "":
+        return NativePayloadResult(
+            REFUSED,
+            REASON_ILLEGAL_CONTROL_BYTES,
+            "payload must be a non-empty string; nothing was typed",
+        )
+    screened = screen_inbox_payload_text(text)
+    if screened is not None:
+        return NativePayloadResult(REFUSED, screened[0], screened[1])
+
+    resolved = resolve_control_identity(terminal_id)
+    if resolved is None:
+        return NativePayloadResult(
+            REFUSED,
+            REASON_UNKNOWN_TERMINAL,
+            f"no terminal {terminal_id!r} is known to this server; nothing was typed",
+        )
+    try:
+        expected = normalize_expected_identity(expected_identity)
+    except ValueError as exc:
+        return NativePayloadResult(REFUSED, REASON_IDENTITY_MISMATCH, str(exc))
+    identity_refusal = screen_expected_identity(expected, resolved)
+    if identity_refusal is not None:
+        return NativePayloadResult(REFUSED, identity_refusal[0], identity_refusal[1])
+    if resolved.pane_id is None or resolved.pane_dead:
+        return NativePayloadResult(
+            REFUSED,
+            REASON_PANE_DEAD,
+            f"pane {resolved.recorded_pane_id!r} is gone or dead; nothing was typed",
+        )
+    if resolved.window_id is None or resolved.pane_pid is None:
+        return NativePayloadResult(
+            REFUSED,
+            REASON_LINEAGE_UNPROVEN,
+            "the pane's window and root process could not both be observed; " "nothing was typed",
+        )
+    server_refusal = server_identity_refusal(
+        bound=resolved.bound_server_socket_path,
+        observed=resolved.observed_server_socket_path,
+    )
+    if server_refusal is not None:
+        return NativePayloadResult(REFUSED, server_refusal[0], server_refusal[1])
+
+    # A data carrier for the re-proof and transport below — no journal
+    # record is opened: the inbox row's claim is the at-most-once anchor.
+    binding = ControlInputBinding(
+        request_id="inbox-payload",
+        terminal_id=terminal_id,
+        pane_id=resolved.pane_id,
+        window_id=resolved.window_id,
+        pane_pid=resolved.pane_pid,
+        request_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        generation=resolved.terminal_generation,
+        server_socket_path=resolved.bound_server_socket_path,
+    )
+    client = _tmux_client()
+    deadline = time.monotonic() + WRITE_DEADLINE_SECONDS
+    try:
+        with pane_input_lease(
+            resolved.pane_id, holder=f"inbox-payload:{terminal_id}", timeout=lease_timeout
+        ):
+            # The same live re-read the control path requires: a pane that
+            # died or was replaced between the resolution and the write is
+            # a refusal, never a write into a stranger's composer.
+            try:
+                live = client.pane_control_identity(
+                    pane_id=binding.pane_id, deadline_monotonic=deadline
+                )
+            except subprocess.TimeoutExpired as exc:
+                return NativePayloadResult(
+                    REFUSED,
+                    REASON_WRITE_DEADLINE,
+                    f"the pre-write identity read exceeded its bound before any "
+                    f"byte: {exc}; nothing was typed",
+                )
+            if live is None or live.dead:
+                return NativePayloadResult(
+                    REFUSED,
+                    REASON_PANE_DEAD,
+                    f"pane {binding.pane_id} is gone or dead as of the write lease; "
+                    "nothing was typed",
+                )
+            if live.window_id != binding.window_id or live.pane_pid != binding.pane_pid:
+                return NativePayloadResult(
+                    REFUSED,
+                    REASON_IDENTITY_MISMATCH,
+                    f"pane {binding.pane_id} now reports window {live.window_id!r} and "
+                    f"root pid {live.pane_pid}, not the bound {binding.window_id!r} / "
+                    f"{binding.pane_pid}; nothing was typed",
+                )
+            adapter, plan, refusal = _native_composer_preflight(
+                resolved, binding, text=text, deadline_monotonic=deadline
+            )
+            if refusal is not None:
+                return NativePayloadResult(REFUSED, refusal[0], refusal[1])
+            transport = _NativeComposerTransport(
+                client,
+                binding.pane_id,
+                binding.server_socket_path,
+                deadline_monotonic=deadline,
+            )
+            try:
+                adapter.execute_composer_plan(
+                    plan=plan,
+                    transport=transport,
+                    submit=True,
+                    deadline_monotonic=deadline,
+                )
+            except adapter.ComposerWriteInterrupted as exc:
+                return NativePayloadResult(
+                    AMBIGUOUS,
+                    REASON_WRITE_INCOMPLETE,
+                    f"the composer write stopped part-way: {exc.detail}; the composer "
+                    "may hold partial content, which is operator-visible and never "
+                    "silently re-typed",
+                    chunks_sent=transport.chunks_sent,
+                    enter_sent=transport.enter_attempted,
+                )
+            except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
+                logger.error("native inbox payload adapter raised for %s: %s", terminal_id, exc)
+                return NativePayloadResult(
+                    AMBIGUOUS,
+                    REASON_WRITE_INCOMPLETE,
+                    f"the provider composer adapter raised while writing: {exc}; what "
+                    "reached the pane is not knowable exactly, so the payload is not "
+                    "re-typed",
+                    chunks_sent=transport.chunks_sent,
+                    enter_sent=transport.enter_attempted,
+                )
+            return NativePayloadResult(
+                ACCEPTED,
+                "delivered",
+                f"typed {transport.chunks_sent} literal write(s) into pane "
+                f"{binding.pane_id} through the {resolved.provider} native composer "
+                "adapter and submitted with one Enter",
+                chunks_sent=transport.chunks_sent,
+                enter_sent=True,
+            )
+    except PaneBusyError as exc:
+        return NativePayloadResult(
+            REFUSED,
+            REASON_PANE_BUSY,
+            f"another writer holds pane {resolved.pane_id}: {exc}; nothing was typed",
+        )
 
 
 # --- Resolving a lost response --------------------------------------------

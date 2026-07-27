@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -1241,3 +1242,177 @@ class TestChordJournalReplay:
         assert wire["chord"] == "C-s"
         assert wire["chord_sent"] is True
         assert wire["chord_attempted"] is True
+
+
+class TestNativeInboxPayload:
+    """The internal generation-bound native inbox payload path.
+
+    Ordinary inbox prose is long and multiline, which the public control
+    shape deliberately refuses; the payload path keeps every proof the
+    control path makes (identity resolution, live re-read under the shared
+    lease, generation re-proof, proven composer plan, identity-bound
+    transport) while dropping the control-plane discipline (byte cap,
+    single-line rule, control id, chord, journal).  REFUSED — and only
+    REFUSED — proves zero bytes reached the pane.
+    """
+
+    def _resolved(self, terminal_id="ntvpay01"):
+        return service.ResolvedControlIdentity(
+            terminal_id=terminal_id,
+            terminal_incarnation=None,
+            terminal_generation="gen-payload-1",
+            provider="kimi_cli",
+            native_session_id="ns-1",
+            execution_mode="native_tui",
+            session_name="cao-payload",
+            provider_process_id="4321@marker",
+            provider_version="0.29.2",
+            pane_id="%1",
+            window_id="@1",
+            pane_pid=4321,
+            pane_dead=False,
+            recorded_pane_id="%1",
+            bound_server_socket_path="/tmp/payload-sock",
+            observed_server_socket_path="/tmp/payload-sock",
+        )
+
+    def _wire(self, monkeypatch, resolved, adapter, plan):
+        monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
+        live = SimpleNamespace(dead=False, window_id=resolved.window_id, pane_pid=resolved.pane_pid)
+        client = SimpleNamespace(pane_control_identity=lambda *, pane_id, deadline_monotonic: live)
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        monkeypatch.setattr(
+            service,
+            "_native_composer_preflight",
+            lambda *a, **k: (adapter, plan, None) if adapter is not None else (None, None, plan),
+        )
+
+    def test_happy_path_types_the_plan_once(self, monkeypatch):
+        resolved = self._resolved()
+        executed = []
+
+        class _Adapter:
+            def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic):
+                executed.append((plan, submit))
+                transport.chunks_sent = 5
+                transport.enter_attempted = True
+                return {"lines_typed": 3, "enter_sent": True}
+
+        adapter = _Adapter()
+        plan = {"deliverable": True, "lines": ["a", "b"]}
+        self._wire(monkeypatch, resolved, adapter, plan)
+
+        result = service.deliver_native_inbox_payload("ntvpay01", text="a\nb")
+
+        assert result.outcome == ACCEPTED
+        assert result.enter_sent is True
+        assert result.chunks_sent == 5
+        assert executed == [(plan, True)]
+
+    def test_preflight_refusal_is_zero_bytes(self, monkeypatch):
+        resolved = self._resolved()
+        self._wire(
+            monkeypatch,
+            resolved,
+            None,
+            ("provider-unsupported", "no composer behaviour is proven for this build"),
+        )
+
+        result = service.deliver_native_inbox_payload("ntvpay01", text="hello")
+
+        assert result.outcome == REFUSED
+        assert result.reason_code == "provider-unsupported"
+        assert result.chunks_sent == 0
+
+    def test_adapter_interruption_is_ambiguous_never_replayed(self, monkeypatch):
+        from cli_agent_orchestrator.services import kimi_native_control as knc
+
+        resolved = self._resolved()
+
+        class _Adapter:
+            ComposerWriteInterrupted = knc.ComposerWriteInterrupted
+
+            def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic):
+                transport.chunks_sent = 2
+                raise knc.ComposerWriteInterrupted(
+                    "transport raised while typing line 2 of 3",
+                    enter_attempted=False,
+                )
+
+        self._wire(monkeypatch, resolved, _Adapter(), {"deliverable": True})
+
+        result = service.deliver_native_inbox_payload("ntvpay01", text="a\nb\nc")
+
+        assert result.outcome == AMBIGUOUS
+        assert result.chunks_sent == 2
+        assert result.enter_sent is False
+
+    def test_lease_busy_refuses_with_zero_bytes(self, monkeypatch):
+        resolved = self._resolved()
+        self._wire(monkeypatch, resolved, object(), {"deliverable": True})
+
+        @contextmanager
+        def _busy_lease(*a, **k):
+            raise service.PaneBusyError("held by another writer")
+
+        monkeypatch.setattr(service, "pane_input_lease", _busy_lease)
+
+        result = service.deliver_native_inbox_payload("ntvpay01", text="hello")
+
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PANE_BUSY
+        assert result.chunks_sent == 0
+
+
+class TestInboxPayloadScreen:
+    """The payload byte-safety screen: LF prose passes; every other control
+    byte class refuses before any I/O."""
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["line one\rline two", "esc\x1b[200~paste", "c1\x85byte", "del\x7fbyte", "bell\x07"],
+    )
+    def test_unsafe_bytes_refuse_before_any_io(self, monkeypatch, bad):
+        def _boom(tid):  # resolution must never be reached for a screened payload
+            raise AssertionError("resolve called for a screened payload")
+
+        monkeypatch.setattr(service, "resolve_control_identity", _boom)
+
+        result = service.deliver_native_inbox_payload("ntvpay01", text=bad)
+
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_ILLEGAL_CONTROL_BYTES
+        assert result.chunks_sent == 0
+
+    def test_empty_payload_refuses_before_any_io(self, monkeypatch):
+        def _boom(tid):
+            raise AssertionError("resolve called for an empty payload")
+
+        monkeypatch.setattr(service, "resolve_control_identity", _boom)
+
+        result = service.deliver_native_inbox_payload("ntvpay01", text="")
+
+        assert result.outcome == REFUSED
+
+    def test_multiline_and_long_prose_passes_the_screen(self):
+        paragraph = "ordinary agent prose with detail\n"
+        payload = paragraph * 300  # ~10 KB, 300 embedded LFs
+        assert service.screen_inbox_payload_text(payload) is None
+
+
+class TestPublicControlShapeStaysStrict:
+    """The public control-input shape is unchanged by the payload path:
+    over-512-byte and multiline requests are still rejected."""
+
+    def test_over_512_bytes_still_rejected(self):
+        with pytest.raises(service.ControlInputRequestInvalid):
+            service.deliver_control_input(
+                "deadbeef", control_id="c-shape-1", text="x" * 513, enter=True
+            )
+
+    def test_multiline_still_rejected(self):
+        result = service.deliver_control_input(
+            "deadbeef", control_id="c-shape-2", text="line one\nline two", enter=True
+        )
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_MULTILINE_REJECTED

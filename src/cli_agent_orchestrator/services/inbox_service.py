@@ -28,8 +28,15 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
-from cli_agent_orchestrator.services import managed_launch, terminal_service, wake_receipts
+from cli_agent_orchestrator.services import (
+    control_input_service,
+    managed_launch,
+    terminal_service,
+    wake_receipts,
+)
+from cli_agent_orchestrator.services.control_input_contract import ACCEPTED, REFUSED
 from cli_agent_orchestrator.services.event_bus import bus
+from cli_agent_orchestrator.services.execution_mode import NATIVE_TUI
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
@@ -49,6 +56,25 @@ WAKE_NUDGE_WINDOW_SECONDS = 15.0
 # bridge journal.
 MANAGED_DELIVERY_LOCK_TIMEOUT_SECONDS = 0.25
 _MANAGED_DELIVERY_LOCKS = tuple(threading.Lock() for _ in range(256))
+
+
+class _NativeManagedSendRefused(RuntimeError):
+    """A native-TUI managed send was refused with zero bytes proven to the pane.
+
+    Retryable: the typed refusal proves nothing reached the pane, so resetting
+    the claimed rows to PENDING cannot duplicate a provider effect.
+    """
+
+
+class _NativeManagedSendUndeliverable(RuntimeError):
+    """A native-TUI managed send ended without a delivery proof and without a
+    zero-byte proof (ambiguous or otherwise not accepted/refused).
+
+    Never replayed blindly: the rows terminalize under the existing hard-failure
+    semantics, preserving the inbox row state for later investigation without
+    claiming that an unjournaled pane write can be reconstructed exactly.
+    """
+
 
 # Statuses that mean "still parked": a transition to anything else is a wake.
 _PARKED_STATUSES = frozenset(
@@ -562,9 +588,22 @@ class InboxService:
         # durable submitted acknowledgement. Anything the bridge cannot take
         # falls through to the ordinary paste path, from which NO
         # acknowledgement is ever inferred.
+        #
+        # The managed branch dispatches on the reservation's execution mode.
+        # An ACP generation (every v1; a v2 'acp'; a legacy NULL mode, which
+        # never reads as native) keeps the byte-identical bridge path below.
+        # A native-TUI v2 generation has NO bridge process by design, so the
+        # bridge attempt could only fail and the preserve guard would park the
+        # row forever; instead it skips both and falls through to the ordinary
+        # idle-gated machinery, with the pane send performed by the
+        # generation-bound native text delivery rather than the unmanaged
+        # paste (which hard-refuses managed identities anyway).
         remaining = []
         managed_identity = managed_launch.managed_control_identity(terminal_id)
-        if managed_identity is None:
+        native_managed = (
+            managed_identity is not None and managed_identity.get("execution_mode") == NATIVE_TUI
+        )
+        if managed_identity is None or native_managed:
             remaining = messages
         else:
             for message in messages:
@@ -623,7 +662,7 @@ class InboxService:
         messages = remaining
         if not messages:
             return
-        if managed_identity is not None:
+        if managed_identity is not None and not native_managed:
             # A managed bridge owns provider stdin.  If native delivery is
             # temporarily unavailable, preserve the inbox rows as pending;
             # falling through to terminal paste would write into a renderer
@@ -695,7 +734,9 @@ class InboxService:
                             )
                             if preparation is not None:
                                 preparations.append(preparation)
-                if registry is None:
+                if native_managed:
+                    self._send_native_managed_text(terminal_id, combined, managed_identity)
+                elif registry is None:
                     terminal_service.send_input(terminal_id, combined)
                 else:
                     terminal_service.send_input(
@@ -719,6 +760,19 @@ class InboxService:
                     f"Pane not resolvable for terminal {terminal_id}; leaving "
                     f"{len(batch)} message(s) pending for retry: {e}"
                 )
+            except _NativeManagedSendRefused as e:
+                for preparation in preparations:
+                    self._abort_wake_confirmation(preparation)
+                # The typed refusal proves zero bytes reached the pane, so
+                # resetting the exact rows cannot duplicate a provider effect:
+                # the inbox row's atomic claim remains the at-most-once
+                # anchor, and a later cycle re-attempts the same payload.
+                for message in batch:
+                    update_message_status(message.id, MessageStatus.PENDING)
+                logger.info(
+                    f"Native managed send for terminal {terminal_id} refused with "
+                    f"zero bytes proven; leaving {len(batch)} message(s) pending: {e}"
+                )
             except Exception as e:
                 for preparation in preparations:
                     self._abort_wake_confirmation(preparation)
@@ -740,6 +794,48 @@ class InboxService:
                             preparation.message_id,
                             terminal_id,
                         )
+
+    @staticmethod
+    def _send_native_managed_text(terminal_id: str, text: str, managed_identity: dict) -> None:
+        """Send one claimed sender run to a native-TUI managed receiver.
+
+        The run's messages are LF-joined into ONE payload, exactly like the
+        unmanaged path's combined send: one composer submission per sender
+        run, so a second message is never typed after the first turn has
+        already started.  The composer plan inside is read from the bound
+        generation's recorded provider_version (no live probe) and types
+        literal bytes only — multiline included, no bracketed-paste framing.
+        The inbox rows' atomic claim is the at-most-once anchor: claimed
+        rows are never re-typed, and terminalized rows survive any bounce
+        exactly as on the ordinary path.  ``send_input``'s managed guard
+        stays untouched: this path never passes through it, and no
+        acknowledgement is inferred beyond the typed ACCEPTED outcome.
+
+        Raises:
+            _NativeManagedSendRefused: the send was refused with zero bytes
+                proven; the caller resets the batch to PENDING.
+            _NativeManagedSendUndeliverable: the send ended neither accepted
+                nor refused; the caller terminalizes the batch under the
+                existing hard-failure semantics (no blind replay).
+        """
+        result = control_input_service.deliver_native_inbox_payload(
+            terminal_id,
+            text=text,
+            expected_identity={
+                "terminal_id": terminal_id,
+                "terminal_generation": managed_identity.get("generation"),
+            },
+        )
+        if result.outcome == ACCEPTED:
+            return
+        if result.outcome == REFUSED:
+            raise _NativeManagedSendRefused(
+                f"sender run refused ({result.reason_code}); zero bytes reached the pane"
+            )
+        raise _NativeManagedSendUndeliverable(
+            f"sender run ended {result.outcome!r} "
+            f"({result.reason_code}); not reattempted blindly"
+        )
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.
