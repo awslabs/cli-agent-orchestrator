@@ -1408,6 +1408,31 @@ class TestNativeInboxPayload:
             )
         ]
 
+    def test_completed_observation_admits_the_write_under_the_lease(self, monkeypatch):
+        """A completed turn is parked at the same input-ready composer as IDLE."""
+        resolved = self._resolved()
+        executed = []
+
+        class _Adapter:
+            def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic):
+                executed.append(plan)
+                transport.chunks_sent = 1
+                transport.enter_attempted = True
+
+        self._wire(
+            monkeypatch,
+            resolved,
+            _Adapter(),
+            {"deliverable": True},
+            TerminalStatus.COMPLETED,
+        )
+
+        result = service.deliver_native_inbox_payload("a1b2c3d4", text="follow up")
+
+        assert result.outcome == ACCEPTED
+        assert result.enter_sent is True
+        assert executed == [{"deliverable": True}]
+
     def test_non_idle_observation_refuses_with_zero_bytes(self, monkeypatch):
         resolved = self._resolved()
         adapter = MagicMock()

@@ -2256,9 +2256,11 @@ def deliver_native_inbox_payload(
             # The idle gate for an ordinary payload: the provider's own live
             # turn state, observed under this same lease so the idle proof
             # and the write are atomic against a turn starting between them.
-            # Only an exact IDLE admits the send; every other status — and
-            # any observation failure — is a zero-byte refusal, so the busy
-            # queue is unchanged and a later pass re-observes.
+            # IDLE and COMPLETED both mean the rendered provider is parked at
+            # an input-ready composer; COMPLETED additionally records that a
+            # prior turn produced a response. Every active/unknown status —
+            # and any observation failure — is a zero-byte refusal, so the
+            # busy queue is unchanged and a later pass re-observes.
             from cli_agent_orchestrator.services import managed_launch_v2
             from cli_agent_orchestrator.utils.terminal import managed_window_name
 
@@ -2277,7 +2279,7 @@ def deliver_native_inbox_payload(
                     f"the receiver's turn state could not be observed, so nothing "
                     f"was typed: {exc}",
                 )
-            if turn_status is not TerminalStatus.IDLE:
+            if turn_status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
                 return NativePayloadResult(
                     REFUSED,
                     REASON_PANE_BUSY,
