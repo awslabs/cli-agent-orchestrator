@@ -660,6 +660,17 @@ class _FakeTmux:
             raise RuntimeError("staged keystroke failure")
         self.events.append(("key", key))
 
+    # The cond-0178 copy-mode guard primitives.  Default: the pane is
+    # provably not in copy mode, so no exit control is ever recorded for a
+    # test that does not model the wheel path.
+    def pane_in_copy_mode(self, pane_id, *, expected_server_identity, deadline_monotonic=None):
+        return False
+
+    def send_copy_mode_cancel(self, pane_id, *, expected_server_identity, deadline_monotonic=None):
+        self.server_identities.append(expected_server_identity)
+        self.events.append(("copy-mode-cancel", ""))
+        return True
+
 
 @pytest.fixture
 def wired(monkeypatch, tmp_path):

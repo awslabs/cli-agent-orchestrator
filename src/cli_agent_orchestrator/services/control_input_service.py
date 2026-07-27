@@ -2002,10 +2002,10 @@ def _native_sequence_preflight(
     return (adapter, plans, None)
 
 
-# --- Copy-mode-safe managed delivery (cond-0178) -----------------------------
+# --- Copy-mode-safe managed delivery ------------------------------------------
 #
-# The supported dashboard wheel path (cond-0131) can leave a managed tmux
-# pane in copy mode (``pane_in_mode=1``).  A payload written into that mode
+# The supported dashboard wheel-scroll path can leave a managed tmux pane
+# in copy mode (``pane_in_mode=1``).  A payload written into that mode
 # still reaches the pane, but the Enter that submits it is consumed by the
 # mode — the text rests unsubmitted while every transport fact reads
 # success, which is a provider-submission claim nobody can prove.  The
@@ -2312,7 +2312,7 @@ def _deliver_under_lease(
             digest=digest,
         )
 
-    # cond-0178: the copy-mode guard runs here — under this lease, after
+    # The copy-mode guard runs here — under this lease, after
     # the identity re-proof above, and before the claim below, so a pane
     # the dashboard wheel path left in copy mode is exited exactly once on
     # the exact pane and the payload then delivered exactly once, or the
@@ -3154,7 +3154,7 @@ def _deliver_sequence_under_lease(
     if server_refusal is not None:
         return _refuse_pre_claim(server_refusal[0], server_refusal[1])
 
-    # cond-0178: the copy-mode guard runs before the readiness gates below
+    # The copy-mode guard runs before the readiness gates below
     # as well as before the claim — a frozen copy-mode frame reads as a
     # stale idle prompt to the turn observation, and a payload Enter aimed
     # into the mode is consumed by it.  Same lease, same exact-pane rule:
@@ -4012,7 +4012,7 @@ def deliver_native_inbox_payload(
                     f"root pid {live.pane_pid}, not the bound {binding.window_id!r} / "
                     f"{binding.pane_pid}; nothing was typed",
                 )
-            # cond-0178: the copy-mode guard runs before the readiness
+            # The copy-mode guard runs before the readiness
             # observations below — a frozen copy-mode frame reads as a stale
             # idle prompt to the turn observation, and a payload Enter aimed
             # into the mode is consumed by it.  A guard refusal is zero

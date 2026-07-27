@@ -1589,7 +1589,7 @@ class TmuxClient:
     ) -> Optional[bool]:
         """Whether this exact pane is proven to be in a tmux mode (copy mode).
 
-        The copy-mode guard's detection read (cond-0178).  The reading
+        The copy-mode guard's detection read.  The reading
         comes from ``display-message -p -t <pane> '#{pane_in_mode}'``: an
         immutable pane-id target either resolves to that exact pane or
         fails, so the answer is never about a stranger's pane.  The same
@@ -1668,8 +1668,8 @@ class TmuxClient:
         """Send the copy-mode-exit control to this exact pane; True iff tmux acked.
 
         The ONLY non-payload keystroke the managed write boundary may ever
-        send (cond-0178): ``send-keys -X cancel`` exits the copy mode the
-        dashboard wheel path (cond-0131) can leave a pane in, so the
+        send: ``send-keys -X cancel`` exits the copy mode the
+        dashboard wheel-scroll path can leave a pane in, so the
         payload Enter that follows is read by the provider rather than
         consumed by the mode.  It is licensed only by a just-proven
         ``pane_in_mode=1`` reading on this exact pane and is never sent
