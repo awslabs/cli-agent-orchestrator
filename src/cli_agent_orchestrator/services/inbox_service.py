@@ -38,6 +38,11 @@ from cli_agent_orchestrator.services.control_input_contract import ACCEPTED, REF
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.execution_mode import NATIVE_TUI
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+# Imported by name (not via the terminal_service module handle) so the
+# typed-refusal catch below keeps working in tests that replace the whole
+# ``inbox_service.terminal_service`` module attribute with a mock.
+from cli_agent_orchestrator.services.terminal_service import TerminalInputRefusedError
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
@@ -785,6 +790,26 @@ class InboxService:
                 logger.info(
                     f"Native managed send for terminal {terminal_id} refused with "
                     f"zero bytes proven; leaving {len(batch)} message(s) pending: {e}"
+                )
+            except TerminalInputRefusedError as e:
+                for preparation in preparations:
+                    self._abort_wake_confirmation(preparation)
+                # The v1 copy-mode-safe write boundary refused before any
+                # payload byte (pane busy, identity drift under the lease,
+                # or copy mode it could not prove exited).  Zero bytes are
+                # proven, so the rows go back to PENDING under the same
+                # at-most-once anchor as the native refusal above — the
+                # queue/idle-gating contract is preserved, the message is
+                # never marked delivered, and no provider submission is
+                # ever claimed.  A later cycle re-attempts the same
+                # payload; an ambiguous partial write never lands here and
+                # keeps the hard-failure mapping below.
+                for message in batch:
+                    update_message_status(message.id, MessageStatus.PENDING)
+                logger.info(
+                    f"v1 send for terminal {terminal_id} refused "
+                    f"({e.reason_code}) with zero bytes proven; leaving "
+                    f"{len(batch)} message(s) pending: {e.detail}"
                 )
             except Exception as e:
                 for preparation in preparations:
