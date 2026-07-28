@@ -298,7 +298,10 @@ def _poll_to_terminal(run_id, as_json):
     ADR-4 Option A: a fixed-interval poll of the snapshot route (NOT the events
     stream — that live follower is U10, FP-2). Renders progress between polls
     unless ``as_json`` is set (a machine consumer wants only the final JSON, not a
-    stream of human lines). Each poll uses the normal per-call ``MCP_REQUEST_TIMEOUT``
+    stream of human lines). Progress is keyed on the ``(state, current_step_id)`` PAIR,
+    not the run state alone — the run state is ``running`` for the ENTIRE drive, so
+    state-only keying prints one line and then goes silent for the whole run (FP-6).
+    Each poll uses the normal per-call ``MCP_REQUEST_TIMEOUT``
     (FP-4 — the long ``WORKFLOW_RUN_REQUEST_TIMEOUT`` bounds only the ``--wait``
     blocking call, never a single snapshot read), sleeping
     ``WORKFLOW_POLL_INTERVAL_SECONDS`` between polls (FP-5).
@@ -310,6 +313,7 @@ def _poll_to_terminal(run_id, as_json):
     """
     transport_failures = 0
     last_state = None
+    last_step = None
     while True:
         try:
             response = requests.get(
@@ -337,10 +341,18 @@ def _poll_to_terminal(run_id, as_json):
         transport_failures = 0
         snapshot = response.json()
         state = snapshot.get("state")
-        if not as_json and state != last_state:
-            current = snapshot.get("current_step_id") or "(none)"
+        current = snapshot.get("current_step_id") or "(none)"
+        # Print on a change of EITHER the run state OR the current step (FP-6). Run
+        # state alone is not enough to be a progress display: it is ``running`` for
+        # the ENTIRE drive, so a keying-on-state-only loop prints one line and then
+        # goes silent until the run finishes — a 10-step, 40-minute workflow looked
+        # identical to a hung one. ``current_step_id`` is already in the snapshot and
+        # advances per step, so keying on the (state, step) PAIR turns the same poll
+        # into real per-step progress with no extra requests.
+        if not as_json and (state, current) != (last_state, last_step):
             click.echo(f"[{state}] current: {current}")
             last_state = state
+            last_step = current
 
         if state in _TERMINAL_RUN_STATES:
             return state
@@ -717,6 +729,33 @@ def _open_events_stream(run_id: str, cursor):
     )
 
 
+def _events_route_or_run_missing(run_id: str) -> click.ClickException:
+    """Turn an ambiguous 404 from the events route into the RIGHT error (CD-1).
+
+    The events route (``GET /workflows/runs/{run_id}/events``) ships with issue
+    #504. Until that lands, every request to it 404s — for healthy runs included —
+    and the naive reading ("unknown run") is actively misleading: it points the
+    operator at their run instead of at the missing capability.
+
+    The snapshot route is present in every build, so it discriminates: if the run
+    is READABLE there, the 404 came from the absent route, not a missing run.
+    A transport failure on the probe falls back to the run-scoped message rather
+    than asserting a server capability it could not verify.
+    """
+    try:
+        probe = requests.get(f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT)
+    except requests.exceptions.RequestException:
+        return click.ClickException(f"unknown run '{run_id}'")
+    if probe.status_code == 200:
+        return click.ClickException(
+            f"this cao-server has no live event stream for run '{run_id}' "
+            f"(GET /workflows/runs/{run_id}/events is not available on this build); "
+            f"the run itself is fine — follow it with `cao workflow wait {run_id}` "
+            f"or read a snapshot with `cao workflow status {run_id}`."
+        )
+    return click.ClickException(f"unknown run '{run_id}'")
+
+
 def _render_event_frame(frame: SseFrame, machine: bool) -> None:
     """Render one NORMAL event frame (event_type, step_id, state, seq), in order.
 
@@ -783,7 +822,13 @@ def _stream_event_frames(run_id: str, cursor):
     """
     response = _open_events_stream(run_id, cursor)
     if response.status_code == 404:
-        raise click.ClickException(f"unknown run '{run_id}'")
+        # A 404 here is AMBIGUOUS and the two causes need opposite messages (CD-1):
+        # the RUN may be unknown, or the events ROUTE may not exist on this server
+        # (it ships with issue #504; until that merges, this path 404s for every
+        # perfectly healthy run). Reporting "unknown run" for a live run sends the
+        # operator hunting a nonexistent problem, so discriminate against the
+        # snapshot route — which this build always has — before naming the cause.
+        raise _events_route_or_run_missing(run_id)
     if response.status_code != 200:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
     yield from parse_sse_frames(response.iter_lines(decode_unicode=True))
@@ -830,7 +875,9 @@ def _events_batch_read(run_id: str, after_seq, as_json: bool) -> None:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
-        raise click.ClickException(f"unknown run '{run_id}'")
+        # Same ambiguity as the follow path (CD-1) — the batch variant lives on the
+        # SAME route, so it is equally absent until #504 lands.
+        raise _events_route_or_run_missing(run_id)
     if response.status_code != 200:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
 

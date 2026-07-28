@@ -149,6 +149,77 @@ def test_run_json_follow_stable_and_preserves_exit(runner):
     assert payload == {"run_id": "run1", "state": "completed"}
 
 
+def test_follow_renders_each_step_transition(runner):
+    """FP-6 (issue #505 review): the follow loop renders STEP progress, not just run
+    state.
+
+    The bug: the printer keyed on the run state alone, and the run state is ``running``
+    for the ENTIRE drive — so a 10-step, 40-minute workflow printed
+    ``[running] current: (none)`` once and then nothing until it finished, looking
+    identical to a hung run. ``current_step_id`` is already in every snapshot, so
+    keying on the ``(state, current_step_id)`` PAIR yields real per-step progress at
+    no extra request cost.
+
+    MUTATION PROOF: revert the predicate to ``state != last_state`` and this goes RED
+    (only the first line is printed; s2/s3 never appear).
+    """
+    with (
+        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
+        patch("cli_agent_orchestrator.cli.commands.workflow._machine_mode", return_value=False),
+    ):
+        mock_req.post.return_value = _submit_resp()
+        mock_req.get.side_effect = [
+            _resp(200, _snap("running", current="s1")),
+            _resp(200, _snap("running", current="s2")),
+            _resp(200, _snap("running", current="s3")),
+            _resp(200, _snap("completed", current=None)),
+        ]
+        result = runner.invoke(workflow, ["run", "wf"])
+    assert result.exit_code == 0
+    for step in ("s1", "s2", "s3"):
+        assert f"[running] current: {step}" in result.output, f"step {step} was never rendered"
+
+
+def test_follow_does_not_reprint_an_unchanged_step(runner):
+    """FP-6 must not become chatty: repeated identical (state, step) snapshots print
+    ONCE, so a 1s poll on a 10-minute step does not emit 600 identical lines."""
+    with (
+        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
+        patch("cli_agent_orchestrator.cli.commands.workflow._machine_mode", return_value=False),
+    ):
+        mock_req.post.return_value = _submit_resp()
+        mock_req.get.side_effect = [
+            _resp(200, _snap("running", current="s1")),
+            _resp(200, _snap("running", current="s1")),
+            _resp(200, _snap("running", current="s1")),
+            _resp(200, _snap("completed", current=None)),
+        ]
+        result = runner.invoke(workflow, ["run", "wf"])
+    assert result.exit_code == 0
+    assert result.output.count("[running] current: s1") == 1
+
+
+def test_follow_json_mode_emits_no_progress_lines(runner):
+    """FP-6 must not leak human progress lines into a machine stream: under ``--json``
+    the step-transition printer stays silent and stdout is exactly one JSON object."""
+    with (
+        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
+    ):
+        mock_req.post.return_value = _submit_resp()
+        mock_req.get.side_effect = [
+            _resp(200, _snap("running", current="s1")),
+            _resp(200, _snap("running", current="s2")),
+            _resp(200, _snap("completed", current=None)),
+        ]
+        result = runner.invoke(workflow, ["run", "wf", "--json"])
+    assert result.exit_code == 0
+    assert "current:" not in result.stdout
+    assert json.loads(result.stdout) == {"run_id": "run1", "state": "completed"}
+
+
 def test_run_ctrl_c_detaches_without_cancel(runner):
     """T4 (CC-1, MANDATED): a KeyboardInterrupt mid-follow DETACHES — exit 0, a
     "still running" hint is printed, and NO cancel POST is issued."""

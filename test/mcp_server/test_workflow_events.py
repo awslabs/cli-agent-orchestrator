@@ -202,6 +202,155 @@ class TestWorkflowEventsNeverRaises:
         assert len(out["events"]) == 1
 
 
+class TestWorkflowEventsBounds:
+    """issue #505 review: the socket is closed on EVERY path (FD-1) and the call is
+    bounded in WALL-CLOCK, not only in events (TB-1)."""
+
+    def test_non_200_closes_the_streamed_socket(self):
+        """FD-1: the non-200 early return must close the streamed response.
+
+        The request is made with ``stream=True``, so the connection stays open until
+        it is explicitly closed or fully drained. The error arm returned without
+        closing — leaking the socket/FD — while the success path correctly used
+        ``try``/``finally``.
+
+        MUTATION PROOF: revert the arm to a bare
+        ``return {"ok": False, "error": detail}`` (no ``finally: response.close()``)
+        and this goes RED.
+        """
+        stream = _stream_resp(status_code=503)
+        stream.json.return_value = {"detail": "unavailable"}
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.get", return_value=stream):
+            out = asyncio.run(workflow_events("run1"))
+        assert out["ok"] is False
+        stream.close.assert_called_once()
+
+    def test_transport_error_while_reading_detail_still_closes(self):
+        """FD-1 corner: even if reading the error body itself raises, the socket is
+        still closed — the close sits in a ``finally``, not after the read."""
+        stream = _stream_resp(status_code=500)
+        stream.json.side_effect = ValueError("not json")
+        stream.text = "boom"
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.get", return_value=stream):
+            out = asyncio.run(workflow_events("run1"))
+        assert out["ok"] is False
+        stream.close.assert_called_once()
+
+    def test_heartbeat_only_stream_is_bounded_by_wall_clock(self):
+        """TB-1: a heartbeat-only stream terminates on the WALL-CLOCK bound.
+
+        This is the unbounded case the tool's own "BOUNDED" docstring did not cover.
+        SSE ``:keep-alive`` comment lines are skipped inside ``parse_sse_frames``, so
+        they yield NO frame: they never increment ``len(events)`` toward
+        ``max_events`` and never carry a terminal ``event:`` type — while still being
+        traffic that resets the socket read timeout. So NEITHER pre-existing bound
+        could ever be reached and the loop blocked forever.
+
+        The stream here is INFINITE by construction: if the wall-clock bound is not
+        enforced, this test hangs rather than fails. The deadline is monkeypatched to
+        0 so the bound trips immediately without a real sleep.
+
+        MUTATION PROOF: remove the ``_deadline_bounded`` wrapper and this test HANGS
+        (the infinite heartbeat generator is never exhausted).
+        """
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = 200
+        resp.close.return_value = None
+
+        def _infinite_heartbeats():
+            while True:
+                yield ":keep-alive"
+
+        resp.iter_lines.return_value = _infinite_heartbeats()
+        with patch("cli_agent_orchestrator.mcp_server.server.WORKFLOW_EVENTS_MCP_MAX_SECONDS", 0.0):
+            with patch("cli_agent_orchestrator.mcp_server.server.requests.get", return_value=resp):
+                out = asyncio.run(workflow_events("run1"))
+        # It RETURNED (the property under test) with an explicit timed_out marker.
+        assert out["ok"] is True
+        assert out["timed_out"] is True
+        assert out["events"] == []
+        assert out["state"] is None
+        resp.close.assert_called_once()
+
+    def test_normal_terminal_stream_is_not_marked_timed_out(self):
+        """TB-1 must not over-fire: a stream that reaches a terminal frame within the
+        window reports ``timed_out: False``, so the caller can tell "the run ended"
+        from "my window closed" and know whether to resume via ``after_seq``.
+        """
+        stream = _stream_resp(
+            _event_frame(1, "step.completed", "s1", "completed"),
+            _event_frame(2, "run.completed", None, "completed"),
+        )
+        with patch("cli_agent_orchestrator.mcp_server.server.requests.get", return_value=stream):
+            out = asyncio.run(workflow_events("run1"))
+        assert out["ok"] is True
+        assert out["timed_out"] is False
+        assert out["state"] == "completed"
+
+
+class TestWorkflowEventsAbsentRoute:
+    """CD-1: a 404 must distinguish an unknown RUN from an absent events ROUTE (the
+    route ships with issue #504), and hand the agent an actionable alternative."""
+
+    def test_absent_route_flagged_as_events_unavailable(self):
+        """A readable run + a 404 from the events route means the ROUTE is missing.
+        The envelope carries a machine-readable ``events_unavailable`` discriminator
+        so an agent can branch without parsing prose.
+
+        MUTATION PROOF: drop the ``_classify_events_404`` call and this goes RED.
+        """
+        stream = _stream_resp(status_code=404)
+        stream.json.return_value = {"detail": "Not Found"}
+        snapshot = MagicMock()
+        snapshot.status_code = 200
+        snapshot.json.return_value = {"run_id": "live-1", "state": "running"}
+
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.get",
+            side_effect=[stream, snapshot],
+        ):
+            out = asyncio.run(workflow_events("live-1"))
+        assert out["ok"] is False
+        assert out["events_unavailable"] is True
+        assert "no event stream" in out["error"]
+        assert "workflow_status" in out["error"]
+        # FD-1 still holds on this path: the streamed socket is closed.
+        stream.close.assert_called_once()
+
+    def test_unknown_run_is_not_flagged_unavailable(self):
+        """A 404 on BOTH means the run is genuinely unknown — no capability claim,
+        and no ``events_unavailable`` key for the agent to mis-branch on."""
+        stream = _stream_resp(status_code=404)
+        stream.json.return_value = {"detail": "unknown run 'ghost'"}
+        snapshot = MagicMock()
+        snapshot.status_code = 404
+        snapshot.json.return_value = {"detail": "unknown run 'ghost'"}
+
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.get",
+            side_effect=[stream, snapshot],
+        ):
+            out = asyncio.run(workflow_events("ghost"))
+        assert out["ok"] is False
+        assert "events_unavailable" not in out
+        assert "unknown run" in out["error"]
+
+    def test_probe_failure_keeps_original_detail(self):
+        """Conservatism: a failed probe must not let the tool assert a capability it
+        could not verify — the original detail survives unchanged."""
+        stream = _stream_resp(status_code=404)
+        stream.json.return_value = {"detail": "unknown run 'maybe'"}
+
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.get",
+            side_effect=[stream, requests.ConnectionError("probe down")],
+        ):
+            out = asyncio.run(workflow_events("maybe"))
+        assert out["ok"] is False
+        assert "events_unavailable" not in out
+        assert "unknown run" in out["error"]
+
+
 def test_mcp_server_stays_http_only_boundary():
     """FR-7.4 / C-2: workflow_events reaches the run over HTTP only — it must not
     import #504's event read DAL. The dedicated AST guard

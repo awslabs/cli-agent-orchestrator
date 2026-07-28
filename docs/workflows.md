@@ -128,31 +128,47 @@ int, everything else stays a string — but the engine still validates the coerc
 against the declared type, so a mismatch surfaces as an error rather than running with
 the wrong value.
 
-## Running: blocking vs. background
+## Running: submit-and-follow, detach, or block
 
-A run **blocks until the workflow finishes** — the `cao workflow run` command (and the
-`workflow_run` MCP tool) wait for the whole run. Choose the invocation by how it's
-triggered, because the two paths have very different client-side ceilings:
+`cao workflow run` **submits the run asynchronously and then follows it** — it prints the
+run id as soon as the run is durably recorded, then polls until the run reaches a terminal
+state, exiting 0 on `completed` and 1 on `failed`/`cancelled`. Because the id is printed
+before the run finishes, the run is addressable (`status`, `wait`, `result`, `cancel`) for
+its whole life.
 
-- **`cao workflow run` (CLI)** uses a client socket timeout of **~8820s (~2.45h)**, so the
-  CLI itself won't give up early on a long run.
-- **`workflow_run` MCP tool (from inside an agent session)** is bounded instead by the
-  **MCP host's own per-tool-call timeout** — a host-dependent limit (anywhere from tens of
-  seconds to a few minutes, depending on the host) that can **drop a long blocking call and
-  lose its return value even though the server run keeps going**.
+Three shapes:
 
-So:
+| Invocation | Behavior |
+| --- | --- |
+| `cao workflow run <name>` | Submit, print the id, follow to terminal. **Ctrl-C detaches** — it never cancels; the run keeps going server-side. |
+| `cao workflow run <name> --detach` | Submit, print the id, exit 0 immediately without following. |
+| `cao workflow run <name> --wait` | The retained fully-blocking path: hold the socket until the run finishes. |
 
-- **Short runs**: run blocking and read the result directly.
-- **Long runs**: **background the run** and poll, rather than blocking on it —
+> **Breaking change (issue #505) — `--json` output shape.** `run --json` previously echoed
+> the complete `WorkflowRunResult` (`run_id`, `workflow_name`, `state`, `steps[]`,
+> timestamps, `kind`). Because the default path now *follows* rather than blocks, it emits
+> only the stable terminal object:
+>
+> ```json
+> { "run_id": "hello-1", "state": "completed" }
+> ```
+>
+> A non-TTY plain `run` (no `--json`) also emits this JSON, so a piped invocation has one
+> stable machine format. **Scripts that read `steps[]` or `workflow_name` off `run --json`
+> must change**: fetch the full result explicitly with `cao workflow result <id> --json`
+> (or `cao workflow status <id> --json` for a mid-run snapshot). `--wait` follows the same
+> new shape; `result`/`status` are the full-detail surfaces. Exit codes are unchanged and
+> identical across TTY, non-TTY, and `--json`.
 
-  ```bash
-  cao workflow run <name> --run-id <id> --json &
-  cao workflow status <id> --json
-  ```
+Choose the shape by how the run is triggered, because the client-side ceilings differ:
 
-  Backgrounding keeps the run alive server-side without a short MCP host timeout silently
-  dropping the return value.
+- **`cao workflow run` (CLI)** follows by polling, so no single request has to survive the
+  whole run. `--wait` uses a client socket timeout of **~8820s (~2.45h)**.
+- **`workflow_run` MCP tool (from inside an agent session)** blocks, and is bounded by the
+  **MCP host's own per-tool-call timeout** — a host-dependent limit (tens of seconds to a
+  few minutes) that can **drop a long blocking call and lose its return value even though
+  the server run keeps going**. For a long run from an agent, prefer submit + poll:
+  `workflow_run` with a pre-announced id, then `workflow_status` / `workflow_wait`.
 
 Always **pre-announce the run-id** before starting, so you (or the user) can
 `cao workflow status <id>` and `cao workflow cancel <id>`.
@@ -221,7 +237,7 @@ resumes cleanly with no code change; a nondeterministic one surfaces
 
 ## CLI reference
 
-All eight verbs live under `cao workflow`.
+All twelve verbs live under `cao workflow`.
 
 | Verb | Flags | Description |
 | --- | --- | --- |
@@ -229,8 +245,12 @@ All eight verbs live under `cao workflow`.
 | `list` | `--dir <path>`, `--json` | List indexed workflows (rebuilt from spec files on disk). Script-tier rows show `-` for step count. |
 | `get <name>` | `--json` | Show the parsed/validated spec for a name or file path. |
 | `delete <name>` | `--yes` / `-y` | Delete a workflow's spec file and index row (prompts unless `--yes`). |
-| `run <name_or_path>` | `--input k=v` (repeatable), `--run-id <id>`, `--json` | Run a workflow to completion (blocks). Exit 0 completed, 1 failed/cancelled. |
-| `status <run_id>` | `--json` | Point-in-time status snapshot for a run. |
+| `run <name_or_path>` | `--input k=v` (repeatable), `--run-id <id>`, `--detach`, `--wait`, `--json` | Submit a run and follow it to a terminal state. `--detach` submits and exits; `--wait` blocks inline. Exit 0 completed, 1 failed/cancelled. `--json` emits `{run_id, state}` — see the breaking-change note above. |
+| `status <run_id>` | `--json` | Point-in-time status snapshot for a run (full detail, including steps). |
+| `runs` | `--state <state>`, `--limit <n>`, `--json` | List recorded runs from the durable journal, newest first. |
+| `wait <run_id>` | `--json` | Follow an already-submitted run by polling until terminal. Same exit codes as `run`. |
+| `result <run_id>` | `--json` | The complete `WorkflowRunResult` for a finished run — the full-detail surface `run --json` no longer prints. |
+| `events <run_id>` | `--follow/--no-follow`, `--after-seq <n>`, `--json` | Stream live per-run ordered progress (SSE). `--no-follow` does a one-shot batch read. Requires the events route from issue #504 — on a build without it, both modes report that the stream is unavailable and point at `wait`/`status`, rather than claiming the run is unknown. |
 | `resume <run_id>` | `--json` | Resume a crashed/failed run from its journal (blocks). |
 | `cancel <run_id>` | — | Cooperatively cancel a running workflow. |
 

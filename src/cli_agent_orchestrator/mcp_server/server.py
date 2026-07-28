@@ -16,6 +16,7 @@ from cli_agent_orchestrator.constants import (
     DEFAULT_PROVIDER,
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
+    WORKFLOW_EVENTS_MCP_MAX_SECONDS,
     WORKFLOW_EVENTS_READ_TIMEOUT,
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
@@ -2372,6 +2373,35 @@ async def workflow_wait(
     return envelope
 
 
+def _classify_events_404(run_id: str, detail: str) -> tuple:
+    """Disambiguate a 404 from the events route (CD-1).
+
+    Returns ``(detail, events_unavailable)``. The events route ships with issue
+    #504; until it lands, every request to it 404s — healthy runs included — and
+    reporting that as "unknown run" points the agent at its run instead of at the
+    missing capability. The snapshot route exists in every build, so a 200 there
+    proves the run is fine and the 404 came from the absent route.
+
+    A transport failure on the probe returns the ORIGINAL detail unchanged rather
+    than asserting a server capability it could not verify.
+    """
+    try:
+        probe = requests.get(f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=_mcp_timeout())
+    except requests.RequestException:
+        return detail, False
+    if probe.status_code == 200:
+        return (
+            (
+                f"this cao-server has no event stream for run '{run_id}' "
+                f"(GET /workflows/runs/{run_id}/events is not available on this "
+                f"build); the run itself is readable — use workflow_status or "
+                f"workflow_wait instead."
+            ),
+            True,
+        )
+    return detail, False
+
+
 @mcp.tool()
 async def workflow_events(
     run_id: str = Field(description="The run id whose live event stream to follow"),
@@ -2396,8 +2426,10 @@ async def workflow_events(
     A thin, CONSUMER-ONLY HTTP client over #504's events-follow SSE route
     (``GET /workflows/runs/{run_id}/events`` with ``Accept: text/event-stream``).
     An MCP tool call cannot stream forever, so this drains frames only up to a
-    terminal state OR ``max_events`` (whichever first), then returns
-    ``{ok, run_id, state, events: [...], gaps: [...]}``:
+    terminal state OR ``max_events`` OR ``WORKFLOW_EVENTS_MCP_MAX_SECONDS`` of
+    wall-clock (whichever comes FIRST — the time bound is what makes the call bounded
+    on a heartbeat-only stream, which reaches neither of the other two, TB-1), then
+    returns ``{ok, run_id, state, events: [...], gaps: [...], timed_out}``:
 
     * ``events`` — the normal frames rendered in per-run ``seq`` order, each
       ``{seq, event_type, step_id, state, ts}``.
@@ -2407,6 +2439,10 @@ async def workflow_events(
     * ``state`` — the terminal RUN state if a terminal ``run.*`` frame arrived
       within the bound, else ``None`` (a step's ``state`` is never mistaken for
       the run's; the caller reads ``workflow_status`` for a mid-run snapshot).
+    * ``timed_out`` — ``True`` iff the WALL-CLOCK bound closed the window rather
+      than the run ending or an event ceiling being hit. Distinguishes "the run is
+      over" from "my window closed"; resume with ``after_seq`` = the last drained
+      ``seq`` to continue.
 
     Returns a structured envelope on EVERY path — a server error, a transport
     error, and a mid-stream read failure all yield ``{ok: False, error}``; it
@@ -2441,11 +2477,56 @@ async def workflow_events(
         return {"ok": False, "error": f"could not reach cao-server: {e}"}
 
     if response.status_code != 200:
-        detail = _extract_error_detail(response, f"status {response.status_code}")
+        # FD-1: close the streamed socket on the error path too. ``stream=True``
+        # leaves the connection open until it is explicitly closed or drained, so a
+        # bare early return here leaks the socket/FD — the success path's
+        # ``try``/``finally`` below is what this arm was missing.
+        try:
+            detail = _extract_error_detail(response, f"status {response.status_code}")
+            if response.status_code == 404:
+                # CD-1: a 404 is AMBIGUOUS — unknown RUN, or an events ROUTE this
+                # build does not have (it ships with issue #504). Naming the wrong
+                # one sends the agent to re-check a run that is perfectly fine, so
+                # discriminate against the snapshot route (present in every build)
+                # and hand back an actionable alternative instead. ``events_
+                # unavailable`` is a machine-readable discriminator so an agent can
+                # branch without parsing prose.
+                detail, unavailable = _classify_events_404(run_id, detail)
+                if unavailable:
+                    return {"ok": False, "error": detail, "events_unavailable": True}
+        finally:
+            response.close()
         return {"ok": False, "error": detail}
 
+    # TB-1: WALL-CLOCK bound. ``max_events`` and the terminal-frame break bound the
+    # stream only in EVENTS; NEITHER is reached by a heartbeat-only stream. SSE
+    # ``:keep-alive`` comment lines are skipped inside ``parse_sse_frames``
+    # (utils/workflow_events.py L155-156) and yield NO frame, so they never increment
+    # ``len(events)`` nor carry a terminal ``event:`` type — and because they are
+    # traffic, they also keep resetting the socket read timeout. A run that emits
+    # only heartbeats would therefore block this call forever, which is exactly what
+    # a tool documenting itself as BOUNDED must not do.
+    #
+    # The deadline is enforced at the LINE level, not the frame level: a frame-level
+    # check would never execute, because a heartbeat-only stream never produces a
+    # frame to check on. ``_deadline_bounded`` wraps the raw line iterator and stops
+    # it once the deadline passes, which terminates ``parse_sse_frames`` normally and
+    # leaves whatever was drained intact. ``time.monotonic`` is used so a wall-clock
+    # step cannot extend or collapse the bound.
+    deadline = time.monotonic() + WORKFLOW_EVENTS_MCP_MAX_SECONDS
+    timed_out = False
+
+    def _deadline_bounded(lines: Any) -> Any:
+        """Yield lines until the wall-clock deadline passes (TB-1)."""
+        nonlocal timed_out
+        for line in lines:
+            if time.monotonic() >= deadline:
+                timed_out = True
+                return
+            yield line
+
     try:
-        for frame in parse_sse_frames(response.iter_lines(decode_unicode=True)):
+        for frame in parse_sse_frames(_deadline_bounded(response.iter_lines(decode_unicode=True))):
             if frame.is_gap:
                 d = frame.data
                 gaps.append(
@@ -2483,11 +2564,23 @@ async def workflow_events(
             "state": state,
             "events": events,
             "gaps": gaps,
+            "timed_out": timed_out,
         }
     finally:
         response.close()
 
-    return {"ok": True, "run_id": run_id, "state": state, "events": events, "gaps": gaps}
+    # ``timed_out`` is reported on the success envelope rather than as an error: the
+    # call did what it promised (drain a BOUNDED window), and the caller needs to
+    # distinguish "the run ended" from "my window closed first" to decide whether to
+    # resume with ``after_seq`` at the last drained seq (TB-1).
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "state": state,
+        "events": events,
+        "gaps": gaps,
+        "timed_out": timed_out,
+    }
 
 
 # The MCP Apps surface — tools (render_dashboard / render_agent_view /

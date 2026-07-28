@@ -335,9 +335,15 @@ def async_yaml_env(client, monkeypatch, tmp_path):
     workflow_service._active_drives.clear()
 
 
-def test_submit_202_shape_and_all_five_links(client, async_yaml_env):
+def test_submit_202_shape_and_unconditional_links(client, async_yaml_env):
     """RR-1 + RR-2: a successful submit returns 202 with ``{run_id, state, links}``,
-    state == "running", and all five relative-URL link roles."""
+    state == "running", and the four ALWAYS-PRESENT relative-URL link roles.
+
+    ``events`` is deliberately EXCLUDED from this set: it is conditional on the
+    build actually serving the route (CD-1) and is covered by the two tests below.
+    Previously it was advertised unconditionally, so every accepted-run response
+    carried a link that 404s on this branch (the route ships with issue #504).
+    """
     resp = client.post(
         "/workflows/runs:submit", json={"name_or_path": "wf", "inputs": {}, "run_id": "async-1"}
     )
@@ -346,14 +352,82 @@ def test_submit_202_shape_and_all_five_links(client, async_yaml_env):
     assert body["run_id"] == "async-1"
     assert body["state"] == "running"
     links = body["links"]
-    assert set(links) == {"self", "status", "events", "result", "cancel"}
+    assert {"self", "status", "result", "cancel"} <= set(links)
     for role, url in links.items():
         assert url.startswith("/workflows/runs/"), f"{role} must be a relative path"
     assert links["cancel"] == "/workflows/runs/async-1/cancel"
-    assert links["events"] == "/workflows/runs/async-1/events"
     assert links["result"] == "/workflows/runs/async-1/result"
     assert links["self"] == "/workflows/runs/async-1"
     assert links["status"] == "/workflows/runs/async-1"
+
+
+def test_submit_omits_events_link_when_route_absent(client, async_yaml_env):
+    """CD-1: with no events route registered (this branch's actual state), the 202
+    body carries NO ``events`` role — a ``links`` map is a capability advertisement,
+    and an advertised role that 404s is worse than an absent one.
+
+    MUTATION PROOF: make ``_run_links`` add ``events`` unconditionally and this goes
+    RED.
+    """
+    from cli_agent_orchestrator.api import main as api_main
+
+    # Precondition: this build really does not serve the route (guards against the
+    # test passing for the wrong reason once #504 merges — see the paired test).
+    assert not api_main._events_route_registered()
+
+    resp = client.post(
+        "/workflows/runs:submit", json={"name_or_path": "wf", "inputs": {}, "run_id": "async-noev"}
+    )
+    assert resp.status_code == 202
+    assert "events" not in resp.json()["links"]
+
+
+def test_submit_includes_events_link_when_route_registered(client, async_yaml_env):
+    """CD-1, the other direction: once the route IS served (post-#504-merge), the
+    link reappears with NO code change — the check reads the live route table.
+
+    This is what makes the conditional self-healing rather than a hard-coded
+    omission needing a follow-up edit at the rebase.
+
+    Registers a REAL route on the app and lets the SHIPPED predicate decide, rather
+    than monkeypatching ``_events_route_registered`` to True. Stubbing the predicate
+    would make this test pass even if ``_EVENTS_ROUTE_PATH`` did not match any route
+    #504 actually declares — the exact condition that must hold at the rebase, and
+    the one thing this test exists to prove. Proven necessary: corrupting
+    ``_EVENTS_ROUTE_PATH`` to an unmatchable string left the stubbed version GREEN.
+    """
+    from cli_agent_orchestrator.api import main as api_main
+
+    async def _stand_in_events_route(run_id: str):  # pragma: no cover - never called
+        return []
+
+    # The path is written as a LITERAL, deliberately NOT via _EVENTS_ROUTE_PATH: this
+    # is the contract with #504's route (its api/main.py declares exactly
+    # "/workflows/runs/{run_id}/events"). Registering via the constant would make the
+    # test move in lockstep with the constant, so corrupting the constant would leave
+    # this GREEN — which is exactly what happened on the first attempt. Hard-coding
+    # the real path is what makes the constant's correctness testable at all.
+    api_main.app.get("/workflows/runs/{run_id}/events")(_stand_in_events_route)
+    try:
+        assert api_main._events_route_registered(), (
+            "the shipped predicate must SEE a route registered at _EVENTS_ROUTE_PATH "
+            "— if this fails, the path constant does not match a real route shape"
+        )
+        resp = client.post(
+            "/workflows/runs:submit",
+            json={"name_or_path": "wf", "inputs": {}, "run_id": "async-ev"},
+        )
+        assert resp.status_code == 202
+        assert resp.json()["links"]["events"] == "/workflows/runs/async-ev/events"
+    finally:
+        api_main.app.routes[:] = [
+            r
+            for r in api_main.app.routes
+            if getattr(r, "endpoint", None) is not _stand_in_events_route
+        ]
+    # Post-cleanup: the app is back to having no events route, so this test cannot
+    # leak a registered route into any later test's view of the route table.
+    assert not api_main._events_route_registered()
 
 
 def test_submit_run_id_allocated_before_ack(client, async_yaml_env):
@@ -450,6 +524,106 @@ def test_submit_colliding_caller_id_with_missing_spec_is_409_not_404(client, mon
     )
     resp = client.post("/workflows/runs:submit", json={"name_or_path": "ghost", "run_id": "dup-id"})
     assert resp.status_code == 409
+
+
+@pytest.mark.parametrize(
+    "bad_run_id",
+    [
+        "../escape",
+        "..",
+        ".",
+        "has space",
+        "has/slash",
+        "semi;colon",
+        "a" * 65,
+    ],
+)
+def test_submit_malformed_run_id_400_matches_blocking_twin(client, async_yaml_env, bad_run_id):
+    """TWIN PARITY (issue #505 review, must-fix): a malformed ``run_id`` is rejected
+    400 by ``POST /workflows/runs:submit`` — the SAME status its blocking twin
+    returns — and leaves NO durable row and NO registry entry.
+
+    The bug: step 0 ran only the UNIQUENESS gate (``_check_run_id_available``) and
+    never the FORMAT gate (``_validate_key_part``, ``^[A-Za-z0-9_-]{1,64}$``). The
+    async path's engine entry ``start_run_prepared`` is the drive-only tail of
+    ``start_run`` and deliberately re-runs NO admission, so the format check was
+    reached NOWHERE on this route. Identical input therefore returned 400 on
+    ``POST /workflows/runs`` and 202 here, and a durable journal row committed for a
+    run that could never execute while the caller got a run_id plus a ``links`` block
+    that would never resolve.
+
+    MUTATION PROOF: delete the ``_validate_key_part`` call at step 0 of
+    ``submit_workflow_run_endpoint`` and this test goes RED (202, plus a durable row).
+    """
+    resp = client.post(
+        "/workflows/runs:submit",
+        json={"name_or_path": "wf", "inputs": {}, "run_id": bad_run_id},
+    )
+    assert (
+        resp.status_code == 400
+    ), f"expected 400 for run_id {bad_run_id!r}, got {resp.status_code}"
+    # No durable row and no registry entry for a rejected id (no orphan RUNNING).
+    assert async_yaml_env["journal"].get_run(bad_run_id) is None
+    assert bad_run_id not in workflow_service.run_registry
+
+
+def test_submit_and_blocking_agree_on_malformed_run_id(client, async_yaml_env):
+    """The split-contract test proper: both entrypoints return the SAME status for the
+    SAME malformed id. Asserts AGREEMENT rather than a hard-coded pair, so the twins
+    cannot drift apart in either direction.
+
+    Note ``start_run`` is deliberately NOT mocked here: it is the real
+    ``_validate_key_part`` inside it that produces the blocking route's 400, so
+    stubbing the engine would remove the very behavior under comparison.
+    """
+    body = {"name_or_path": "wf", "inputs": {}, "run_id": "bad id/../x"}
+    blocking = client.post("/workflows/runs", json=body)
+    submit = client.post("/workflows/runs:submit", json=body)
+    assert blocking.status_code == submit.status_code == 400
+    assert async_yaml_env["journal"].get_run("bad id/../x") is None
+
+
+def test_submit_empty_run_id_mints_one_like_the_blocking_twin(client, async_yaml_env):
+    """Boundary: ``run_id: ""`` is FALSY, so both routes treat it as absent and MINT an
+    id rather than rejecting it — the twins agree, which is the property under test.
+    Pinned explicitly so the new format gate is never "fixed" into rejecting it (that
+    would itself re-split the contract, in the other direction).
+    """
+    body = {"name_or_path": "wf", "inputs": {}, "run_id": ""}
+    submit = client.post("/workflows/runs:submit", json=body)
+    assert submit.status_code == 202
+    assert submit.json()["run_id"].startswith("run-")
+
+
+def test_submit_format_gate_precedes_uniqueness_gate(client, async_yaml_env, monkeypatch):
+    """Ordering: FORMAT (400) is checked BEFORE UNIQUENESS (409), matching the order
+    the blocking twin runs them in ``start_run`` (``_validate_key_part`` then
+    ``_check_run_id_available``). An id that is both malformed and already claimed
+    must report the malformation — the permanent, caller-fixable fault — not the
+    collision.
+    """
+    import types
+
+    monkeypatch.setattr(
+        workflow_service, "run_registry", {"bad id": types.SimpleNamespace(tier="yaml")}
+    )
+    resp = client.post(
+        "/workflows/runs:submit", json={"name_or_path": "wf", "inputs": {}, "run_id": "bad id"}
+    )
+    assert resp.status_code == 400
+
+
+def test_submit_wellformed_run_id_still_accepted(client, async_yaml_env):
+    """The new format gate must not over-reject: the full legal alphabet
+    (``^[A-Za-z0-9_-]{1,64}$``) still submits 202. Guards against a regex that
+    accidentally excludes ``-``/``_`` or a boundary length.
+    """
+    ok_id = "Run_id-With.MIXED".replace(".", "-") + "-" + "9" * 8
+    resp = client.post(
+        "/workflows/runs:submit", json={"name_or_path": "wf", "inputs": {}, "run_id": ok_id}
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["run_id"] == ok_id
 
 
 def test_submit_invalid_inputs_400_no_orphan_row(client, async_yaml_env):
@@ -680,6 +854,177 @@ async def test_run_in_background_backstop_write_failure_swallowed(monkeypatch, t
     )
     # Must NOT raise despite BOTH the drive and the backstop write failing.
     await _run_in_background(record, _SPEC, "bg-fail-2", "yaml", {})
+
+
+# ---------------------------------------------------------------------------
+# issue #505 review — background-drive lifecycle: strong task reference (BG-1),
+# cancellation-aware FAILED backstop (BR-2a), admission bound (AB-1).
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_background_drive_task_is_strongly_referenced(monkeypatch, tmp_path):
+    """BG-1: the scheduled drive Task is held in a module-level STRONG reference.
+
+    ``asyncio`` keeps only a WEAK reference to a task, so a bare
+    ``asyncio.create_task(...)`` whose Task is discarded can be garbage collected
+    while suspended on a future it alone roots — the drive stops silently and the
+    journal row stays RUNNING forever. Asserts the task is registered while running
+    AND discarded by the done-callback afterwards (so the set cannot grow unbounded).
+
+    MUTATION PROOF: replace ``_schedule_background_drive``'s body with a bare
+    ``asyncio.create_task(...)`` (no set add) and this goes RED.
+    """
+    import asyncio as _asyncio
+
+    from cli_agent_orchestrator.api import main as api_main
+
+    started = _asyncio.Event()
+    release = _asyncio.Event()
+
+    async def _slow(record):
+        started.set()
+        await release.wait()
+        return _result()
+
+    monkeypatch.setattr(workflow_service, "start_run_prepared", _slow)
+
+    record = workflow_service.RunRecord(
+        run_id="bg-ref",
+        workflow_name="wf",
+        spec=_SPEC,
+        inputs={},
+        state=RunState.RUNNING,
+        step_states={},
+        started_at="2026-07-27T00:00:00Z",
+    )
+    task = api_main._schedule_background_drive(record, _SPEC, "bg-ref", "yaml", {})
+    await started.wait()
+    # In flight: the registry holds a strong ref to this exact task.
+    assert task in api_main._background_drives
+    release.set()
+    await task
+    # Settled: the done-callback discarded it (no unbounded growth).
+    assert task not in api_main._background_drives
+
+
+@pytest.mark.asyncio
+async def test_background_drive_cancellation_marks_failed_and_reraises(monkeypatch, tmp_path):
+    """BR-2a: a CANCELLED drive still settles the durable row FAILED, then re-raises.
+
+    ``CancelledError`` derives from ``BaseException``, not ``Exception``, so the
+    original ``except Exception`` backstop never saw it: on shutdown the cancellation
+    propagated straight out and left the journal row stuck in RUNNING forever —
+    precisely the durable record this feature exists to provide. The re-raise is part
+    of the contract (swallowing a cancellation breaks cooperative cancellation).
+
+    MUTATION PROOF: delete the ``except asyncio.CancelledError`` arm and this goes RED
+    (the row stays ``running``).
+    """
+    import asyncio as _asyncio
+
+    from cli_agent_orchestrator.api.main import _run_in_background
+    from cli_agent_orchestrator.clients.database import (
+        _migrate_workflow_run,
+        _migrate_workflow_run_step,
+    )
+
+    db_path = tmp_path / "wf.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+    _migrate_workflow_run()
+    _migrate_workflow_run_step()
+    workflow_journal.insert_run(
+        run_id="bg-cancel",
+        workflow_name="wf",
+        spec_snapshot="{}",
+        inputs_json="{}",
+        state=RunState.RUNNING.value,
+        started_at="2026-07-27T00:00:00Z",
+    )
+
+    entered = _asyncio.Event()
+
+    async def _hang(record):
+        entered.set()
+        await _asyncio.Event().wait()  # never completes; only cancellation ends this
+
+    monkeypatch.setattr(workflow_service, "start_run_prepared", _hang)
+
+    record = workflow_service.RunRecord(
+        run_id="bg-cancel",
+        workflow_name="wf",
+        spec=_SPEC,
+        inputs={},
+        state=RunState.RUNNING,
+        step_states={},
+        started_at="2026-07-27T00:00:00Z",
+    )
+    task = _asyncio.create_task(_run_in_background(record, _SPEC, "bg-cancel", "yaml", {}))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(_asyncio.CancelledError):
+        await task
+
+    # The whole point: the durable row is NOT left in RUNNING.
+    row = workflow_journal.get_run("bg-cancel")
+    assert row is not None and row.state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_background_drives_are_admission_bounded(monkeypatch, tmp_path):
+    """AB-1: concurrent background drives are capped by a semaphore.
+
+    The blocking route was self-throttling because the caller held the socket for the
+    whole run — the property the async route deliberately removes. Without a bound, N
+    submits mean N concurrent drives. Drives past the cap must QUEUE (not fail), and
+    the bound is applied INSIDE the task so a queued run keeps its durable row and its
+    already-returned 202.
+
+    MUTATION PROOF: remove the ``async with _get_drive_semaphore()`` wrapper and
+    ``peak`` reaches 5, failing the assertion.
+    """
+    import asyncio as _asyncio
+
+    from cli_agent_orchestrator.api import main as api_main
+
+    # Cap of 2 so the test does not depend on the shipped constant's value.
+    monkeypatch.setattr(api_main, "_drive_semaphore", _asyncio.Semaphore(2), raising=False)
+
+    live = 0
+    peak = 0
+    release = _asyncio.Event()
+
+    async def _occupy(record):
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
+        await release.wait()
+        live -= 1
+        return _result()
+
+    monkeypatch.setattr(workflow_service, "start_run_prepared", _occupy)
+
+    tasks = []
+    for i in range(5):
+        record = workflow_service.RunRecord(
+            run_id=f"bg-cap-{i}",
+            workflow_name="wf",
+            spec=_SPEC,
+            inputs={},
+            state=RunState.RUNNING,
+            step_states={},
+            started_at="2026-07-27T00:00:00Z",
+        )
+        tasks.append(api_main._schedule_background_drive(record, _SPEC, f"bg-cap-{i}", "yaml", {}))
+
+    # Let the admitted drives reach the semaphore and settle at the ceiling.
+    for _ in range(20):
+        await _asyncio.sleep(0)
+    assert peak <= 2, f"admission bound breached: {peak} concurrent drives"
+    assert live == 2, "the cap should be saturated, not under-used"
+
+    # All five still COMPLETE — the bound queues, it never drops a run.
+    release.set()
+    await _asyncio.gather(*tasks)
+    assert live == 0
 
 
 # ---------------------------------------------------------------------------

@@ -2543,22 +2543,95 @@ async def record_step_output_endpoint(
 # WorkflowEngineError -> 500. Narrow exceptions in the service; mapped here.
 
 
+_EVENTS_ROUTE_PATH = "/workflows/runs/{run_id}/events"
+
+
+def _events_route_registered() -> bool:
+    """Whether THIS build actually serves the events route (CD-1).
+
+    The events route is owned by issue #504 and is absent from this branch, so
+    advertising it unconditionally put a link that 404s into EVERY accepted-run
+    response. Rather than hard-code either answer — which would need a follow-up
+    edit the moment the merge order changed — ask the running app what it serves.
+    The check is over the app's own route table (no I/O, no network) and it
+    self-heals: the link appears automatically once #504's route is registered,
+    with no code change at the rebase.
+    """
+    return any(getattr(r, "path", None) == _EVENTS_ROUTE_PATH for r in app.routes)
+
+
 def _run_links(run_id: str) -> Dict[str, str]:
     """Build the 202 body's ``links`` map for a submitted run (U2, ADR-1, RR-2).
 
-    Five roles keyed by name, each a **relative** URL (host/port/scheme-agnostic
-    so they work behind a proxy and in the test client, which joins them onto its
-    own base URL). ``cancel`` resolves to the existing cancel route; ``events``
-    names the #504-owned route (inert until #504 ships it); ``self``/``status``
-    both point at the snapshot route.
+    Each value is a **relative** URL (host/port/scheme-agnostic so they work behind
+    a proxy and in the test client, which joins them onto its own base URL).
+    ``cancel`` resolves to the existing cancel route; ``self``/``status`` both point
+    at the snapshot route.
+
+    ``events`` is CONDITIONAL (CD-1): it is present only when this build actually
+    serves the route (#504). A ``links`` map is a capability advertisement, and a
+    role that 404s is worse than an absent one — a client that feature-detects by
+    key presence does the right thing either way, whereas one that trusts an
+    advertised role gets a 404 on its first call. Clients must therefore treat
+    ``events`` as optional; the four unconditional roles are always present.
     """
-    return {
+    links = {
         "self": f"/workflows/runs/{run_id}",
         "status": f"/workflows/runs/{run_id}",
-        "events": f"/workflows/runs/{run_id}/events",
         "result": f"/workflows/runs/{run_id}/result",
         "cancel": f"/workflows/runs/{run_id}/cancel",
     }
+    if _events_route_registered():
+        links["events"] = f"/workflows/runs/{run_id}/events"
+    return links
+
+
+# --- Background-drive task registry + admission bound (issue #505 review) ---
+#
+# STRONG REFERENCES (BG-1). ``asyncio`` keeps only a WEAK reference to a task, so a
+# bare ``asyncio.create_task(...)`` whose Task object is discarded can be garbage
+# collected while it is suspended on a future it alone roots — the drive simply
+# stops, and the journal row it was going to settle stays RUNNING forever. Those
+# rows are the durable record this feature exists to provide, so every drive task
+# is held in this module-level set until it completes and discards itself via a
+# done-callback.
+_background_drives: "set[asyncio.Task]" = set()
+
+# ADMISSION BOUND (AB-1). See WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES: the async
+# route has none of the blocking route's natural back-pressure, so the semaphore is
+# the only thing standing between N submits and N concurrent drives. Created lazily
+# because a module-level asyncio primitive binds to whatever loop is current at
+# import time, which is not necessarily the loop the app runs on (notably under
+# TestClient, which creates a fresh loop per client).
+_drive_semaphore: "Optional[asyncio.Semaphore]" = None
+
+
+def _get_drive_semaphore() -> asyncio.Semaphore:
+    """Return the process-wide background-drive admission semaphore (AB-1, lazy)."""
+    from cli_agent_orchestrator.constants import WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES
+
+    global _drive_semaphore
+    if _drive_semaphore is None:
+        _drive_semaphore = asyncio.Semaphore(WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES)
+    return _drive_semaphore
+
+
+def _schedule_background_drive(
+    record: Any, spec: Any, run_id: str, tier: str, inputs: Dict[str, Any]
+) -> "asyncio.Task":
+    """Schedule a background drive, holding a STRONG reference to its Task (BG-1).
+
+    The done-callback discards the reference on EVERY completion path (normal,
+    exception, cancellation), so the set cannot grow without bound. Returns the
+    Task so a caller/test can await or cancel it.
+    """
+    task = asyncio.create_task(
+        _run_in_background(record, spec, run_id, tier, inputs),
+        name=f"workflow-drive-{run_id}",
+    )
+    _background_drives.add(task)
+    task.add_done_callback(_background_drives.discard)
+    return task
 
 
 async def _run_in_background(
@@ -2580,32 +2653,52 @@ async def _run_in_background(
     bug can never orphan a run stuck in RUNNING. The ``ScriptRunRecord`` carries no
     ``inputs`` field, so the resolved inputs are threaded in explicitly to build the
     script spawn env via the single-homed public ``build_env`` seam.
+
+    BR-2a (issue #505 review): the backstop covers CANCELLATION too. ``CancelledError``
+    derives from ``BaseException``, NOT ``Exception``, so an ``except Exception``
+    backstop does not see it — on interpreter shutdown (or any task cancel) the
+    exception would propagate straight out and leave the journal row stuck in
+    RUNNING forever, exactly the outcome BR-2 exists to prevent. It is handled in its
+    OWN arm that writes the same FAILED backstop and then RE-RAISES, because
+    swallowing a cancellation would break cooperative-cancellation semantics for the
+    caller. The semaphore (AB-1) is acquired here rather than in the handler so a
+    queued run still holds its durable row and its already-returned 202.
     """
     from cli_agent_orchestrator.models.workflow_runtime import RunState
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
 
-    try:
-        if tier == "yaml":
-            await workflow_service.start_run_prepared(record)
-        else:
-            env = script_runner.build_env(run_id, "1", inputs)
-            await script_runner.run_script_workflow_prepared(record, spec.path, env)
-    except Exception:  # noqa: BLE001 — BR-1: the task must never re-raise into the loop
-        logger.error("background workflow run '%s' drive failed", run_id, exc_info=True)
-        # BR-2: best-effort FAILED backstop, itself guarded so the backstop write
-        # can never re-raise either. The engine's own write-through normally
-        # settles the terminal state; this only fires if the exception escaped
-        # before the engine settled the row.
+    def _failed_backstop(why: str) -> None:
+        """Best-effort mark the run FAILED; itself guarded so it can never re-raise."""
         try:
             workflow_journal.update_run_state(
                 run_id, RunState.FAILED.value, workflow_service._now()
             )
         except Exception:  # noqa: BLE001 — the backstop is itself best-effort
             logger.error(
-                "background workflow run '%s' FAILED-backstop journal write failed",
+                "background workflow run '%s' FAILED-backstop journal write failed (%s)",
                 run_id,
+                why,
                 exc_info=True,
             )
+
+    try:
+        async with _get_drive_semaphore():
+            if tier == "yaml":
+                await workflow_service.start_run_prepared(record)
+            else:
+                env = script_runner.build_env(run_id, "1", inputs)
+                await script_runner.run_script_workflow_prepared(record, spec.path, env)
+    except asyncio.CancelledError:
+        # BR-2a: cancellation is NOT an Exception subclass — settle the durable row
+        # before letting the cancellation continue to propagate.
+        logger.warning("background workflow run '%s' drive cancelled; marking FAILED", run_id)
+        _failed_backstop("cancelled")
+        raise
+    except Exception:  # noqa: BLE001 — BR-1: the task must never re-raise into the loop
+        logger.error("background workflow run '%s' drive failed", run_id, exc_info=True)
+        # BR-2: the engine's own write-through normally settles the terminal state;
+        # this only fires if the exception escaped before the engine settled the row.
+        _failed_backstop("drive raised")
 
 
 @app.post("/workflows/runs")
@@ -2715,10 +2808,14 @@ async def submit_workflow_run_endpoint(
 
     The steps run STRICTLY in order — reordering breaks one of the two invariants:
 
-    0. Admission gate FIRST for a caller-supplied id (OR-4): a colliding
-       ``body.run_id`` returns 409 even when ``name_or_path`` names a nonexistent
-       spec (the duplicate-id check precedes spec resolve, so a collision is never
-       masked by a 404).
+    0. Key-shape validation THEN the admission gate, both for a caller-supplied id
+       and both BEFORE spec resolve (OR-4). A malformed ``body.run_id`` returns 400
+       and a colliding one returns 409, in each case even when ``name_or_path``
+       names a nonexistent spec — so neither is masked by a 404. Validating the key
+       shape HERE (not only inside the engine entry) is load-bearing: the prepared
+       background entries are reached only AFTER the durable insert and the 202, so
+       an engine-side ``_validate_key_part`` failure would surface as a background
+       task error on an already-acked run instead of the blocking twin's 400.
     1. Resolve the spec (same error mapping as the blocking route).
     2. Mint or accept the run id (identical to the blocking route).
     3. Validate + cap inputs BEFORE any create (OR-1, NFR-4) — no row yet.
@@ -2752,7 +2849,23 @@ async def submit_workflow_run_endpoint(
     # BEFORE spec resolve, so a colliding id + nonexistent spec returns 409, not
     # 404. A minted id has no step-0 gate (collision probability negligible; the
     # atomic insert's IntegrityError is the backstop).
+    #
+    # TWO checks, in the SAME order the blocking twin runs them (workflow_service
+    # .start_run L795-796): FORMAT first (_validate_key_part -> 400), then
+    # UNIQUENESS (_check_run_id_available -> 409). Both are required here because
+    # the async path's prepared engine entry (``start_run_prepared``) is the
+    # drive-only tail of ``start_run`` — it deliberately re-runs NO admission, so
+    # it never validates the key. Without this line the twins split their contract:
+    # the same malformed id yields 400 on POST /workflows/runs and 202 here, and a
+    # durable journal row commits for a run that can never execute while the caller
+    # holds a run_id and a ``links`` block that will never resolve. (Nothing escapes
+    # onto disk either way — ``step_output_store`` re-validates both key parts at
+    # its own boundary, L129-130 — so this is a contract defect, not traversal.)
     if body.run_id:
+        try:
+            workflow_service._validate_key_part(body.run_id, "run_id")
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         try:
             workflow_service._check_run_id_available(body.run_id)
         except KeyError as e:
@@ -2892,7 +3005,10 @@ async def submit_workflow_run_endpoint(
     workflow_service.run_registry[run_id] = record
 
     # --- Step 7: schedule the fire-and-forget background drive (C2). ---
-    asyncio.create_task(_run_in_background(record, spec, run_id, tier, resolved))
+    # Via the registry helper, NOT a bare create_task: the Task must be strongly
+    # referenced or it can be collected mid-drive (BG-1), and the drive itself is
+    # admission-bounded (AB-1) inside the task.
+    _schedule_background_drive(record, spec, run_id, tier, resolved)
 
     # --- Step 8: ack 202. The insert (step 5) is awaited and durable before this,
     # so the instant this returns, get_run(run_id) finds the row (INV-1). ---

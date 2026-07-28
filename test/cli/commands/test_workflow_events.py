@@ -385,12 +385,81 @@ def test_non_tty_json_no_gap_frame_still_no_synthesized_gap(runner):
 # error surfacing + the --no-follow batch read + the thin-client boundary.
 # ---------------------------------------------------------------------------
 def test_unknown_run_404(runner):
+    """A 404 on BOTH the events route and the snapshot probe means the RUN is
+    genuinely unknown — the message must stay run-scoped."""
     stream = _stream_resp(status_code=404)
     stream.json.return_value = {"detail": "unknown run 'ghost'"}
     with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "ghost"])
     assert result.exit_code != 0
     assert "unknown run" in result.output
+
+
+def test_absent_events_route_reported_as_capability_not_unknown_run(runner):
+    """CD-1: a 404 from the events route on a run that IS readable means the ROUTE is
+    missing (it ships with issue #504), not the run.
+
+    Reporting "unknown run" for a perfectly healthy run sends the operator hunting a
+    nonexistent problem. The snapshot route discriminates: 200 there proves the run
+    exists, so the 404 came from the absent route, and the message must say so and
+    name a working alternative.
+
+    MUTATION PROOF: revert the 404 arm to a bare
+    ``raise click.ClickException(f"unknown run '{run_id}'")`` and this goes RED.
+    """
+    events_404 = _stream_resp(status_code=404)
+    events_404.json.return_value = {"detail": "Not Found"}
+    snapshot_200 = MagicMock()
+    snapshot_200.status_code = 200
+    snapshot_200.json.return_value = {"run_id": "live-1", "state": "running", "steps": []}
+
+    with patch(
+        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        side_effect=[events_404, snapshot_200],
+    ):
+        result = runner.invoke(workflow, ["events", "live-1"])
+    assert result.exit_code != 0
+    # Names the CAPABILITY, not the run, and points at something that works.
+    assert "no live event stream" in result.output
+    assert "unknown run" not in result.output
+    assert "cao workflow wait live-1" in result.output
+
+
+def test_absent_events_route_on_batch_read_also_degrades(runner):
+    """CD-1: ``--no-follow`` reads the SAME route, so it is equally absent and must
+    give the same capability-scoped message rather than "unknown run"."""
+    batch_404 = MagicMock()
+    batch_404.status_code = 404
+    batch_404.json.return_value = {"detail": "Not Found"}
+    snapshot_200 = MagicMock()
+    snapshot_200.status_code = 200
+    snapshot_200.json.return_value = {"run_id": "live-2", "state": "running", "steps": []}
+
+    with patch(
+        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        side_effect=[batch_404, snapshot_200],
+    ):
+        result = runner.invoke(workflow, ["events", "live-2", "--no-follow"])
+    assert result.exit_code != 0
+    assert "no live event stream" in result.output
+    assert "unknown run" not in result.output
+
+
+def test_probe_transport_failure_falls_back_to_run_scoped_message(runner):
+    """CD-1 conservatism: if the discriminating probe itself fails, do NOT assert a
+    server capability that could not be verified — fall back to the run-scoped
+    message rather than blaming a missing route on no evidence."""
+    events_404 = _stream_resp(status_code=404)
+    events_404.json.return_value = {"detail": "unknown run 'maybe'"}
+
+    with patch(
+        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        side_effect=[events_404, requests.ConnectionError("probe down")],
+    ):
+        result = runner.invoke(workflow, ["events", "maybe"])
+    assert result.exit_code != 0
+    assert "unknown run" in result.output
+    assert "no live event stream" not in result.output
 
 
 def test_no_follow_batch_read(runner):
