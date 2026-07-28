@@ -42,12 +42,17 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
       err.detailMeta = detailMeta
       throw err
     }
-    // A 204 No Content (or any empty body) success — e.g. the workflow-run
-    // DELETE (U7/#504) — has no JSON to parse. Return undefined rather than
-    // letting res.json() throw on an empty body. Additive: no pre-existing
-    // endpoint returns 204, so existing callers are unaffected.
-    if (res.status === 204) return undefined as T
-    return res.json()
+    // A 204 No Content — e.g. the workflow-run DELETE (U7/#504) — has no JSON
+    // to parse. Neither does ANY successful response whose body is empty or
+    // whitespace-only, which is a real deployment condition on this
+    // SSE-adjacent surface: an intermediary proxy can strip a body. Read the
+    // body as text once and parse it ourselves so both cases return undefined
+    // instead of letting res.json() throw. Additive: every pre-existing
+    // endpoint returns a non-empty JSON body, so existing callers are
+    // unaffected.
+    const text = await res.text()
+    if (text.trim() === '') return undefined as T
+    return JSON.parse(text) as T
   } finally {
     clearTimeout(timeout)
   }

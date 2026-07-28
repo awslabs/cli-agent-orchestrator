@@ -6,7 +6,7 @@
 // event numbering (BR-4). An ARIA live region announces the selected event as
 // playback moves. Transport + ScrubBar drive the shared selectedIndex.
 
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import type { WorkflowEvent, GapMarker } from '../../api'
 import { PlaybackTransport } from './PlaybackTransport'
 import { ScrubBar } from './ScrubBar'
@@ -91,11 +91,16 @@ export function WorkflowTimeline({
         {events.map((ev, i) => {
           const gap = gapByBeforeSeq.get(ev.seq)
           return (
-            <li key={ev.seq}>
+            <Fragment key={ev.seq}>
+              {/* A declared gap is its OWN <li> sibling, not a nested one: an
+                  <li> is already implicitly role="listitem", so putting the
+                  marker inside the event's <li> and giving it role="listitem"
+                  too nested two listitems and confused assistive tech. As a
+                  sibling <li> it is a real list item, which is also what keeps
+                  its aria-label exposed (a bare roleless div's label is not). */}
               {gap && (
-                <div
+                <li
                   data-testid="timeline-gap"
-                  role="listitem"
                   aria-label={`${GAP_CUE.sr}: ${gap.missing_count} event(s) missing between seq ${gap.after_seq} and ${gap.before_seq}, reason ${gap.reason}`}
                   className="flex items-center gap-2 my-1 px-3 py-1.5 rounded border border-yellow-600/40 text-xs text-yellow-300 bg-[repeating-linear-gradient(45deg,rgba(250,204,21,0.12),rgba(250,204,21,0.12)_6px,transparent_6px,transparent_12px)]"
                 >
@@ -105,24 +110,26 @@ export function WorkflowTimeline({
                   <span className="text-yellow-400/80">
                     {gap.missing_count} missing (seq {gap.after_seq}→{gap.before_seq}) · {gap.reason}
                   </span>
-                </div>
+                </li>
               )}
-              <button
-                type="button"
-                onClick={() => handleJump(i)}
-                aria-current={i === selectedIndex}
-                className={`w-full text-left flex items-center gap-3 px-3 py-1.5 rounded text-xs font-mono transition-colors ${
-                  i === selectedIndex
-                    ? 'bg-emerald-900/30 text-emerald-200 ring-1 ring-emerald-600/40'
-                    : 'text-gray-400 hover:bg-gray-800/50'
-                }`}
-              >
-                <span className="text-gray-600 tabular-nums w-10 shrink-0">#{ev.seq}</span>
-                <span className="truncate">{ev.event_type}</span>
-                {ev.step_id && <span className="text-gray-500 truncate">{ev.step_id}</span>}
-                {ev.state && <span className="text-gray-500 ml-auto">{ev.state}</span>}
-              </button>
-            </li>
+              <li>
+                <button
+                  type="button"
+                  onClick={() => handleJump(i)}
+                  aria-current={i === selectedIndex}
+                  className={`w-full text-left flex items-center gap-3 px-3 py-1.5 rounded text-xs font-mono transition-colors ${
+                    i === selectedIndex
+                      ? 'bg-emerald-900/30 text-emerald-200 ring-1 ring-emerald-600/40'
+                      : 'text-gray-400 hover:bg-gray-800/50'
+                  }`}
+                >
+                  <span className="text-gray-600 tabular-nums w-10 shrink-0">#{ev.seq}</span>
+                  <span className="truncate">{ev.event_type}</span>
+                  {ev.step_id && <span className="text-gray-500 truncate">{ev.step_id}</span>}
+                  {ev.state && <span className="text-gray-500 ml-auto">{ev.state}</span>}
+                </button>
+              </li>
+            </Fragment>
           )
         })}
       </ol>

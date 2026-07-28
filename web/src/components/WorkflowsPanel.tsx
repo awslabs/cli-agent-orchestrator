@@ -21,17 +21,19 @@ export function WorkflowsPanel() {
   useEffect(() => {
     let cancelled = false
     setLoading(true)
-    // fetchWorkflowRuns surfaces its own error via snackbar; we mirror it into
-    // the list's inline error state for a self-contained panel.
-    fetchWorkflowRuns()
-      .catch((e: any) => {
-        if (!cancelled) setError(e?.message || 'Failed to load runs')
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
+    // fetchWorkflowRuns surfaces its own error via snackbar AND resolves to the
+    // message (null on success) — it never rejects. We mirror that signal into
+    // the list's inline error state for a self-contained panel, and clear it on
+    // a later successful poll so a transient blip heals itself.
+    const load = async () => {
+      const message = await fetchWorkflowRuns()
+      if (!cancelled) setError(message)
+    }
+    load().finally(() => {
+      if (!cancelled) setLoading(false)
+    })
     // Poll the list on the same 10s cadence the sessions poll uses.
-    const interval = setInterval(fetchWorkflowRuns, 10000)
+    const interval = setInterval(load, 10000)
     return () => {
       cancelled = true
       clearInterval(interval)

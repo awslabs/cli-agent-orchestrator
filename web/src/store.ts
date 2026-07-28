@@ -50,7 +50,11 @@ interface Store {
   selectedIndex: number
   followConnected: boolean
 
-  fetchWorkflowRuns: () => Promise<void>
+  // Resolves to an error message when the list read failed, or null on success.
+  // The snackbar still fires here; the returned signal is what lets a caller
+  // (WorkflowsPanel) also render an inline error. It never rejects, so the 10s
+  // poll cannot produce an unhandled rejection.
+  fetchWorkflowRuns: () => Promise<string | null>
   selectWorkflowRun: (runId: string | null) => Promise<void>
   setWorkflowEvents: (events: WorkflowEvent[], gaps: GapMarker[]) => void
   appendWorkflowEvent: (event: WorkflowEvent) => void
@@ -156,10 +160,15 @@ export const useStore = create<Store>((set, get) => ({
     try {
       const runs = await api.listWorkflowRuns()
       if (!jsonEqual(get().workflowRuns, runs)) set({ workflowRuns: runs })
+      return null
     } catch (e: any) {
       // Surface, do not swallow: an unreachable list endpoint is a real error
       // the RunList renders. Keep any prior list so a transient blip is inert.
-      get().showSnackbar({ type: 'error', message: e?.message || 'Failed to load workflow runs' })
+      const message = e?.message || 'Failed to load workflow runs'
+      get().showSnackbar({ type: 'error', message })
+      // Returned (not thrown) so the caller can mirror it into an inline error
+      // without every call site needing a .catch to stay rejection-safe.
+      return message
     }
   },
 

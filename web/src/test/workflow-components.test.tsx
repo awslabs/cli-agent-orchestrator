@@ -4,6 +4,7 @@ import { RunList } from '../components/workflow/RunList'
 import { WorkflowTimeline } from '../components/workflow/WorkflowTimeline'
 import { SyncedTerminalPane, hasTerminalOffsets } from '../components/workflow/SyncedTerminalPane'
 import { DeleteRunButton } from '../components/workflow/DeleteRunButton'
+import { WorkflowsPanel } from '../components/WorkflowsPanel'
 import { api } from '../api'
 import { useStore } from '../store'
 import type { RunSummaryRow, WorkflowEvent, GapMarker } from '../api'
@@ -155,5 +156,88 @@ describe('DeleteRunButton', () => {
     fireEvent.click(screen.getByRole('button', { name: /delete this run/i }))
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(del).not.toHaveBeenCalled()
+  })
+})
+
+// ── PR #526 review remediation ─────────────────────────────────────────────
+
+describe('WorkflowTimeline — declared-gap list semantics (a11y)', () => {
+  const events: WorkflowEvent[] = [
+    { run_id: 'r', seq: 1, event_type: 'step.started', event_schema_version: 1, ts: '', step_id: 'a', state: 'running' },
+    { run_id: 'r', seq: 5, event_type: 'step.completed', event_schema_version: 1, ts: '', step_id: 'a', state: 'completed' },
+  ]
+  const gaps: GapMarker[] = [{ after_seq: 1, before_seq: 5, missing_count: 3, reason: 'append_swallowed' }]
+
+  // Guards the nested-listitem fix: the gap marker must be a SIBLING list item,
+  // never a listitem nested inside the event's <li>. Reverting the fix (putting
+  // the marker back inside the <li> with role="listitem") makes the gap's
+  // closest <li> BE the event's <li>, so both assertions below go red.
+  it('renders the gap as its own <li>, not a listitem nested in an event <li>', () => {
+    render(<WorkflowTimeline events={events} gaps={gaps} selectedIndex={0} onSelectIndex={() => {}} />)
+    const gap = screen.getByTestId('timeline-gap')
+
+    // The marker itself IS the list item — not a div wrapped in one.
+    expect(gap.tagName).toBe('LI')
+    // ...and it contains no nested listitem, and sits in no <li> ancestor.
+    expect(gap.querySelector('[role="listitem"], li')).toBeNull()
+    expect(gap.parentElement?.tagName).toBe('OL')
+
+    // The gap is a sibling of the event's list item, so the list has 3 items
+    // (1 gap + 2 events), each exactly one level under the <ol>.
+    const items = screen.getAllByRole('listitem')
+    expect(items).toHaveLength(3)
+    for (const li of items) expect(li.parentElement?.tagName).toBe('OL')
+  })
+
+  // A roleless div's aria-label is not exposed; a real <li> keeps it addressable.
+  it('keeps the gap announcement reachable by its accessible name', () => {
+    render(<WorkflowTimeline events={events} gaps={gaps} selectedIndex={0} onSelectIndex={() => {}} />)
+    const gap = screen.getByRole('listitem', { name: /3 event\(s\) missing between seq 1 and 5/i })
+    expect(gap).toHaveAttribute('data-testid', 'timeline-gap')
+  })
+})
+
+describe('WorkflowsPanel — inline error is genuinely reachable', () => {
+  beforeEach(() => {
+    useStore.setState({ workflowRuns: [], selectedRun: null, wfEvents: [], wfGaps: [], snackbar: null })
+  })
+
+  // The Copilot finding: fetchWorkflowRuns handles its own errors, so the old
+  // `.catch(...)` never ran and RunList's error branch was dead code. The store
+  // action now RESOLVES to the message, and the panel mirrors it. Reverting
+  // either half (store returning void, or the panel using .catch) leaves the
+  // inline error unrendered and this test goes red.
+  it('renders RunList\'s inline error when the list read fails', async () => {
+    vi.spyOn(api, 'listWorkflowRuns').mockRejectedValue(new Error('502 Bad Gateway'))
+    render(<WorkflowsPanel />)
+    expect(await screen.findByText('502 Bad Gateway')).toBeInTheDocument()
+    // Still surfaced via the snackbar too — the two are complementary.
+    expect(useStore.getState().snackbar?.type).toBe('error')
+  })
+
+  it('clears the inline error once a later poll succeeds', async () => {
+    const spy = vi.spyOn(api, 'listWorkflowRuns')
+      .mockRejectedValueOnce(new Error('502 Bad Gateway'))
+      .mockResolvedValue([sampleRun])
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      render(<WorkflowsPanel />)
+      await waitFor(() => expect(screen.getByText('502 Bad Gateway')).toBeInTheDocument())
+      await vi.advanceTimersByTimeAsync(10_000)
+      await waitFor(() => expect(screen.queryByText('502 Bad Gateway')).not.toBeInTheDocument())
+      expect(spy.mock.calls.length).toBeGreaterThanOrEqual(2)
+      expect(screen.getByText('my-workflow')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // fetchWorkflowRuns must never REJECT: the 10s setInterval calls it with no
+  // catch, so a throwing action would raise an unhandled rejection every poll.
+  it('fetchWorkflowRuns resolves (never rejects) and returns the message', async () => {
+    vi.spyOn(api, 'listWorkflowRuns').mockRejectedValue(new Error('boom'))
+    await expect(useStore.getState().fetchWorkflowRuns()).resolves.toBe('boom')
+    vi.spyOn(api, 'listWorkflowRuns').mockResolvedValue([])
+    await expect(useStore.getState().fetchWorkflowRuns()).resolves.toBeNull()
   })
 })
