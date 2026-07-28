@@ -2288,6 +2288,20 @@ class TestSequenceIntentPolicy:
             ({"type": "key", "key": "C-c"}, service.INTENT_INTERRUPT),
             ({"type": "key", "key": "C-s"}, service.INTENT_INTERRUPT),
             ({"type": "chord", "chord": "C-s"}, service.INTENT_INTERRUPT),
+            # §3.2, pinned: every one of the eleven new navigation/editing
+            # keys is composer-class — idle-gated like any composer write,
+            # because no per-provider evidence supports exempting them.
+            ({"type": "key", "key": "Up"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Down"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Left"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Right"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Home"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "End"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "PageUp"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "PageDown"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Delete"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Insert"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Tab"}, service.INTENT_COMPOSER),
         ],
     )
     def test_every_event_form_has_one_class(self, event, intent):
@@ -2406,6 +2420,27 @@ class TestSequenceManagedAdapter:
         assert client.sent[3] == ("literal", "two", False)
         assert client.sent[4] == ("literal", "", True)
         assert adapter.calls == [({"lines": ["one"]}, False), ({"lines": ["two"]}, True)]
+        assert [event["outcome"] for event in result.events] == ["sent"] * 6
+
+    def test_ordering_across_text_navigation_and_chords(self, journal):
+        """The §3.2 extension rides the same ordering: text, navigation
+        keys, and a chord land in sequence order with per-event outcomes."""
+        client = _FakeChordClient()
+        events = [
+            {"type": "text", "text": "/model"},
+            {"type": "key", "key": "Up"},
+            {"type": "key", "key": "Up"},
+            {"type": "key", "key": "PageDown"},
+            {"type": "key", "key": "Enter"},
+            {"type": "chord", "chord": "C-s"},
+        ]
+        adapter, result = self._send(journal, client, events)
+        assert result.outcome == ACCEPTED
+        kinds = [entry[0] for entry in client.sent]
+        assert kinds == ["literal", "key", "key", "key", "literal", "chord"]
+        assert client.sent[1] == ("key", "Up")
+        assert client.sent[2] == ("key", "Up")
+        assert client.sent[3] == ("key", "PageDown")
         assert [event["outcome"] for event in result.events] == ["sent"] * 6
 
     def test_interrupted_text_leaves_the_tail_skipped(self, journal):
@@ -2598,6 +2633,382 @@ class TestSequenceReadinessGate:
         )
         assert delivered.outcome == ACCEPTED
         assert [write["key"] for write in client.writes] == ["Escape"]
+
+
+# --- §4.1: the declared command-class guard ----------------------------------
+
+from cli_agent_orchestrator.services.control_input_contract import (  # noqa: E402
+    REASON_COMPOSER_NONEMPTY,
+    REASON_MALFORMED_COMMAND_DECLARATION,
+    REASON_PROVIDER_UNSUPPORTED,
+    control_input_request_digest_v4,
+)
+
+COMMAND_EVENTS = [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
+
+
+def _deliver_declared(journal, events=COMMAND_EVENTS, **overrides):
+    kwargs = {"control_id": CONTROL, "events": events, "payload_class": "command"}
+    kwargs.update(overrides)
+    return service.deliver_control_input(TERMINAL, journal=journal, **kwargs)
+
+
+class TestCommandDeclarationShape:
+    """The v4 carrier's request-level rules: the either/or, the typed
+    malformed-declaration refusal, and the no-shape-detection rule."""
+
+    def test_payload_class_beside_the_v1_fields_is_a_shape_error(self, journal):
+        """v4 = v3 + the declaration carrier: the field is undefined beside
+        text/enter, refused as a shape error rather than silently dropped
+        (a declared command delivered as prose is a control nobody authorised)."""
+        with pytest.raises(service.ControlInputRequestInvalid):
+            service.deliver_control_input(
+                TERMINAL,
+                control_id=CONTROL,
+                text="/compact",
+                enter=True,
+                payload_class="command",
+                journal=journal,
+            )
+
+    def test_payload_class_beside_v2_chord_is_a_shape_error(self, journal):
+        with pytest.raises(service.ControlInputRequestInvalid):
+            service.deliver_control_input(
+                TERMINAL,
+                control_id=CONTROL,
+                text="/compact",
+                enter=False,
+                chord="C-s",
+                payload_class="command",
+                journal=journal,
+            )
+
+    def test_an_unknown_payload_class_value_is_the_typed_refusal(self, tmux, journal):
+        result = _deliver_declared(journal, payload_class="probe")
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_MALFORMED_COMMAND_DECLARATION
+        assert result.request_schema_version == 4
+        assert result.as_response()["reattemptable"] is True
+        assert tmux.writes == []
+
+    def test_a_non_string_payload_class_is_the_typed_refusal(self, tmux, journal):
+        result = _deliver_declared(journal, payload_class=42)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_MALFORMED_COMMAND_DECLARATION
+        assert tmux.writes == []
+
+    @pytest.mark.parametrize(
+        "events",
+        [
+            [{"type": "text", "text": "prose"}],
+            [{"type": "text", "text": "see /tmp/x"}],
+            [{"type": "key", "key": "Enter"}],
+            [{"type": "text", "text": "/a"}, {"type": "text", "text": "/b"}],
+            [{"type": "text", "text": "/a"}, {"type": "key", "key": "Escape"}],
+            [
+                {"type": "text", "text": "/a"},
+                {"type": "key", "key": "Enter"},
+                {"type": "key", "key": "Enter"},
+            ],
+        ],
+    )
+    def test_a_declared_command_outside_the_grammar_is_the_typed_refusal(
+        self, tmux, journal, events
+    ):
+        result = _deliver_declared(journal, events=events)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_MALFORMED_COMMAND_DECLARATION
+        assert [event["outcome"] for event in result.events] == ["refused"] * len(events)
+        assert tmux.writes == []
+
+    def test_an_explicit_null_payload_class_is_the_absent_declaration(self, tmux, journal):
+        """A JSON null is the prose spelling: the request is v3, and the
+        guard never fires."""
+        result = service.deliver_control_input(
+            TERMINAL,
+            control_id=CONTROL,
+            events=[{"type": "text", "text": "hello"}],
+            payload_class=None,
+            journal=journal,
+        )
+        assert result.outcome == ACCEPTED
+        assert result.request_schema_version == 3
+
+    def test_a_declared_request_rebinds_against_a_v3_caller_digest(self, tmux, journal):
+        """The declaration participates in the digest: a caller that
+        authorised the v3 (undeclared) request is not bound to the
+        declared one — rebound blindness is what the carrier prevents."""
+        v3_digest = control_input_request_digest_v3(
+            control_id=CONTROL, events=COMMAND_EVENTS, expected_identity=None
+        )
+        result = _deliver_declared(journal, request_digest=v3_digest)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_REQUEST_REBOUND
+        assert tmux.writes == []
+
+
+class TestCommandClassGuard:
+    """The never-concatenate guard (§4.1): a declared command is written
+    only against a composer *proven empty*, under the lease, before the
+    claim — and undeclared payloads never see the guard at all."""
+
+    def _wire(
+        self, monkeypatch, resolved, adapter, plans, *, empty, turn_status=TerminalStatus.IDLE
+    ):
+        from cli_agent_orchestrator.services import managed_launch_v2
+
+        with service._native_kimi_dispatch_guard_lock:
+            service._native_kimi_dispatch_times.clear()
+        monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
+        client = FakeTmux(
+            identities=[
+                FakePaneIdentity(
+                    pane_id=resolved.pane_id,
+                    window_id=resolved.window_id,
+                    pane_pid=resolved.pane_pid,
+                )
+            ]
+        )
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        monkeypatch.setattr(
+            service,
+            "_native_sequence_preflight",
+            lambda *a, **k: (adapter, plans, None),
+        )
+        monkeypatch.setattr(managed_launch_v2, "_observe_turn_state", lambda *a, **k: turn_status)
+        if isinstance(empty, BaseException):
+            monkeypatch.setattr(
+                native_pane_input, "observe_composer_empty", self._raising_observer(empty)
+            )
+        else:
+            observations = []
+            monkeypatch.setattr(
+                native_pane_input,
+                "observe_composer_empty",
+                lambda pane_id, pin, **k: observations.append((pane_id, pin)) or empty,
+            )
+            return client, observations
+        return client, None
+
+    @staticmethod
+    def _raising_observer(exc):
+        def _observe(pane_id, pin, **kwargs):
+            raise exc
+
+        return _observe
+
+    def _declared(self, journal, monkeypatch, *, empty, resolved=None, **overrides):
+        resolved = resolved or _seq_resolved()
+        adapter = _FakeSequenceAdapter()
+        plans = {0: {"lines": ["/compact"]}}
+        wired = self._wire(monkeypatch, resolved, adapter, plans, empty=empty)
+        client = wired[0]
+        result = _deliver_declared(journal, **overrides)
+        return result, client, adapter, wired[1]
+
+    def test_a_nonempty_composer_is_the_zero_byte_refusal(self, monkeypatch, journal):
+        result, client, adapter, _ = self._declared(journal, monkeypatch, empty=False)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_COMPOSER_NONEMPTY
+        assert result.request_schema_version == 4
+        assert result.as_response()["reattemptable"] is True
+        # Zero command bytes — and zero bytes of any kind: the guard
+        # observes and refuses, it never clears (no Escape, no edit keys).
+        assert client.writes == []
+        assert adapter.calls == []
+        assert [event["outcome"] for event in result.events] == ["refused"] * 2
+
+    def test_an_unobservable_composer_fails_closed_identically(self, monkeypatch, journal):
+        """ "Could not look" is not "empty": an unproven composer is the
+        same zero-byte refusal as a proven-non-empty one."""
+        result, client, adapter, _ = self._declared(journal, monkeypatch, empty=None)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_COMPOSER_NONEMPTY
+        assert client.writes == []
+        assert adapter.calls == []
+
+    def test_a_failed_observation_also_fails_closed(self, monkeypatch, journal):
+        result, client, adapter, _ = self._declared(
+            journal, monkeypatch, empty=NativePaneInputUnavailable("tmux died")
+        )
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_COMPOSER_NONEMPTY
+        assert client.writes == []
+        assert adapter.calls == []
+
+    def test_a_proven_empty_composer_delivers_exactly_the_command(self, monkeypatch, journal):
+        result, client, adapter, observations = self._declared(journal, monkeypatch, empty=True)
+        assert result.outcome == ACCEPTED
+        assert result.request_schema_version == 4
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+        assert [event["outcome"] for event in result.events] == ["sent"] * 2
+        # The observation ran under the lease against the bound pane.
+        assert observations == [
+            (PANE, native_pane_input.composer_emptiness_pin_for("kimi_cli", "0.29.0"))
+        ]
+
+    def test_a_provider_build_without_a_pin_is_provider_unsupported(self, monkeypatch, journal):
+        """No proven emptiness determination for this exact build: refused
+        rather than guessed at (§4.1)."""
+        result, client, adapter, _ = self._declared(
+            journal, monkeypatch, empty=True, resolved=_seq_resolved(provider_version="0.28.0")
+        )
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PROVIDER_UNSUPPORTED
+        assert client.writes == []
+        assert adapter.calls == []
+
+    def test_the_guard_is_journaled_and_reconciles_by_exact_id(self, monkeypatch, journal):
+        result, _, _, _ = self._declared(journal, monkeypatch, empty=False)
+        assert result.reason_code == REASON_COMPOSER_NONEMPTY
+        looked_up = service.lookup_control_input(CONTROL, journal=journal)
+        assert looked_up.outcome == REFUSED
+        assert looked_up.reason_code == REASON_COMPOSER_NONEMPTY
+        assert [event["outcome"] for event in looked_up.events] == ["refused"] * 2
+
+    def test_a_retry_after_the_refusal_rearms_and_delivers(self, monkeypatch, journal):
+        """refusal proves zero bytes, so the same control id may re-arm
+        (the deployed refused → intent edge): once the operator clears the
+        composer, the identical retry delivers."""
+        refused, _, _, _ = self._declared(journal, monkeypatch, empty=False)
+        assert refused.reason_code == REASON_COMPOSER_NONEMPTY
+        accepted, _, adapter, _ = self._declared(journal, monkeypatch, empty=True)
+        assert accepted.outcome == ACCEPTED
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+
+    def test_the_readiness_gate_still_precedes_the_guard(self, monkeypatch, journal):
+        """During an active turn the answer is the deployed pane-busy, and
+        the composer is never observed: the guard adds nothing to the
+        existing gates."""
+        resolved = _seq_resolved()
+        adapter = _FakeSequenceAdapter()
+        client, observations = self._wire(
+            monkeypatch,
+            resolved,
+            adapter,
+            {0: {"lines": ["/compact"]}},
+            empty=AssertionError("the guard must not observe during a turn"),
+            turn_status=TerminalStatus.PROCESSING,
+        )
+        result = _deliver_declared(journal)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PANE_BUSY
+        assert client.writes == []
+
+    def test_a_stale_identity_never_reaches_the_guard(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        adapter = _FakeSequenceAdapter()
+        self._wire(
+            monkeypatch,
+            resolved,
+            adapter,
+            {0: {"lines": ["/compact"]}},
+            empty=AssertionError("the guard must not observe for a stale binding"),
+        )
+        result = _deliver_declared(
+            journal, expected_identity={"terminal_generation": "gen-from-before"}
+        )
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_STALE_GENERATION
+        assert result.request_schema_version == 4
+
+    def test_undeclared_command_shaped_text_is_prose_and_never_guarded(self, monkeypatch, journal):
+        """The r7 carrier case: a batch whose text begins with '/' is
+        undeclared prose.  The streamed `see /tmp/x` split — a batch
+        starting '/tmp/x' after the quiet timer — sails through with no
+        guard and no observation, exactly as before v4 existed."""
+        resolved = _seq_resolved()
+        adapter = _FakeSequenceAdapter()
+        self._wire(
+            monkeypatch,
+            resolved,
+            adapter,
+            {0: {"lines": ["/tmp/x"]}},
+            empty=AssertionError("undeclared prose must never be observed"),
+        )
+        result = _deliver_sequence(journal, events=[{"type": "text", "text": "/tmp/x"}])
+        assert result.outcome == ACCEPTED
+        assert result.request_schema_version == 3
+        assert adapter.calls == [({"lines": ["/tmp/x"]}, False)]
+
+    def test_undeclared_compact_text_stays_the_deployed_button(self, monkeypatch, journal):
+        """The deployed Compact button sends '/compact' as ordinary text:
+        undeclared, unguarded, byte-identical behaviour (§4: compact-as-
+        composer-text is preserved; only the registry built-in declares)."""
+        resolved = _seq_resolved()
+        adapter = _FakeSequenceAdapter()
+        self._wire(
+            monkeypatch,
+            resolved,
+            adapter,
+            {0: {"lines": ["/compact"]}},
+            empty=AssertionError("undeclared prose must never be observed"),
+        )
+        result = _deliver_sequence(journal, events=COMMAND_EVENTS)
+        assert result.outcome == ACCEPTED
+        assert result.request_schema_version == 3
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+
+
+class TestPaneBusyDetailDiscriminators:
+    """The three pane-busy detail strings, verbatim and pairwise-disjoint
+    (§10.1): streaming's pause/disarm routing reads them, so a wording
+    tweak must fail this suite loudly rather than silently re-route."""
+
+    GRACE = "inside its dispatch grace"
+    TURN = "not idle"
+    LEASE = "input lease is held by"
+
+    def test_the_three_discriminators_are_pairwise_disjoint(self):
+        for mine, theirs in (
+            (self.GRACE, (self.TURN, self.LEASE)),
+            (self.TURN, (self.GRACE, self.LEASE)),
+            (self.LEASE, (self.GRACE, self.TURN)),
+        ):
+            assert all(mine not in other for other in theirs)
+
+    def test_dispatch_grace_detail(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        binding = _chord_binding(
+            control_input_request_digest_v3(
+                control_id=CONTROL,
+                events=[{"type": "text", "text": "hello"}],
+                expected_identity=None,
+            )
+        )
+        gate = TestSequenceReadinessGate()
+        gate._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["hello"]}},
+            turn_status=TerminalStatus.IDLE,
+        )
+        service._mark_native_kimi_dispatch(service._native_kimi_dispatch_key(resolved, binding))
+        result = _deliver_sequence(journal, events=[{"type": "text", "text": "hello"}])
+        assert result.reason_code == REASON_PANE_BUSY
+        assert self.GRACE in result.detail
+
+    def test_turn_state_detail(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        gate = TestSequenceReadinessGate()
+        gate._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["hello"]}},
+            turn_status=TerminalStatus.PROCESSING,
+        )
+        result = _deliver_sequence(journal, events=[{"type": "text", "text": "hello"}])
+        assert result.reason_code == REASON_PANE_BUSY
+        assert self.TURN in result.detail
+
+    def test_arbiter_contention_detail(self, tmux, journal):
+        with _pane_held_elsewhere():
+            result = _deliver_sequence(journal, events=[{"type": "key", "key": "Up"}])
+        assert result.reason_code == REASON_PANE_BUSY
+        assert self.LEASE in result.detail
+        assert tmux.writes == []
 
 
 class TestSequenceJournalReplay:

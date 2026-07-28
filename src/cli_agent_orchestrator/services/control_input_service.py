@@ -68,6 +68,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
     CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
     CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+    CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
     EVENT_OUTCOME_ATTEMPTED,
     EVENT_OUTCOME_REFUSED,
     EVENT_OUTCOME_SENT,
@@ -75,11 +76,14 @@ from cli_agent_orchestrator.services.control_input_contract import (
     IDENTITY_FIELDS,
     MAX_SEQUENCE_EVENTS,
     MAX_SEQUENCE_TEXT_BYTES,
+    PAYLOAD_CLASS_COMMAND,
+    REASON_COMPOSER_NONEMPTY,
     REASON_CONTROL_ROUTE_ABSENT,
     REASON_COPY_MODE_ACTIVE,
     REASON_IDENTITY_MISMATCH,
     REASON_ILLEGAL_CONTROL_BYTES,
     REASON_LINEAGE_UNPROVEN,
+    REASON_MALFORMED_COMMAND_DECLARATION,
     REASON_MANAGED_ACP_PANE,
     REASON_MULTILINE_REJECTED,
     REASON_OWNER_LOST_BEFORE_WRITE,
@@ -106,10 +110,12 @@ from cli_agent_orchestrator.services.control_input_contract import (
     SUBMISSION_SUBMITTED,
     SUBMISSION_UNKNOWN,
     SUBMISSION_UNSUBMITTED,
+    command_declaration_violation,
     contains_bracketed_paste_sentinel,
     control_input_request_digest,
     control_input_request_digest_v2,
     control_input_request_digest_v3,
+    control_input_request_digest_v4,
     is_reattemptable,
     normalize_expected_identity,
     normalize_sequence_events,
@@ -117,6 +123,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     outcome_for_reason,
     server_identity_refusal,
 )
+from cli_agent_orchestrator.services import provider_controls
 from cli_agent_orchestrator.services.control_input_journal import (
     STATE_AMBIGUOUS,
     WRITING,
@@ -1201,6 +1208,7 @@ def _sequence_refusal(
     resolved: Optional[ResolvedControlIdentity] = None,
     digest: Optional[str] = None,
     state: Optional[str] = None,
+    request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
 ) -> ControlInputResult:
     """The v3 refusal: typed, and stamped with the refused sequence.
 
@@ -1218,7 +1226,7 @@ def _sequence_refusal(
         request_digest=digest,
         resolved_identity=None if resolved is None else resolved.as_dict(),
         events=_sequence_events_with_outcome(events, EVENT_OUTCOME_REFUSED),
-        request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+        request_schema_version=request_schema_version,
     )
 
 
@@ -1232,6 +1240,7 @@ def _record_sequence_refusal(
     terminal_id: str,
     resolved: ResolvedControlIdentity,
     digest: str,
+    request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
 ) -> ControlInputResult:
     """The journaled v3 refusal, for decisions made after the intent.
 
@@ -1262,6 +1271,7 @@ def _record_sequence_refusal(
         resolved=resolved,
         digest=digest,
         state=result.state,
+        request_schema_version=request_schema_version,
     )
 
 
@@ -1335,6 +1345,7 @@ def deliver_control_input(
     protocol: Optional[str] = None,
     chord: Any = None,
     events: Any = None,
+    payload_class: Any = None,
     lease_timeout: float = 0.0,
     journal: Optional[ControlInputJournal] = None,
 ) -> ControlInputResult:
@@ -1364,6 +1375,12 @@ def deliver_control_input(
         events: Schema v3: an ordered array of ``text`` / ``key`` /
             ``chord`` events delivered as one at-most-once control.  A
             request carries ``events`` *or* the v1/v2 fields, never both.
+        payload_class: Schema v4: the optional declaration carrier.  The
+            sole defined value is ``"command"``; absent (or null) means
+            prose.  Command-class is never derived from payload shape —
+            only this field declares it, and only a declared command runs
+            the composer-emptiness guard.  Accompanies an ``events``
+            array, never the v1/v2 fields.
         lease_timeout: Seconds to wait for the pane lease.  The default
             of 0 refuses immediately rather than queueing.
         journal: Journal override (tests / isolated state roots).
@@ -1412,6 +1429,19 @@ def deliver_control_input(
             )
         normalized_events = _require_sequence_shape(control_id, events, request_digest)
     else:
+        if payload_class is not None:
+            # v4 is v3 + the declaration carrier: ``payload_class`` exists
+            # only beside an ``events`` array.  Beside the v1/v2 fields it
+            # is a shape error rather than a silently-dropped declaration —
+            # the same discipline that keeps ``chord`` off v1: a declared
+            # command delivered as ordinary prose is a control the caller
+            # did not authorise.
+            raise ControlInputRequestInvalid(
+                "payload_class accompanies an 'events' array (request schema v4 = v3 "
+                "+ the declaration carrier); it is not defined beside the v1/v2 "
+                "fields, so this request is refused as a shape error rather than "
+                "delivered with its declaration silently dropped"
+            )
         if enter is ENTER_EXPLICIT_NULL:
             raise ControlInputRequestInvalid(
                 "enter must be a boolean when stated; an explicit JSON null is not the "
@@ -1453,7 +1483,33 @@ def deliver_control_input(
     # and field order, so the chord is bound into the digest the way text is.
     # A v1 request names no chord and keeps its byte-identical v1 digest.  A
     # sequence request is v3: its ordered events are bound into the digest.
-    if normalized_events is not None:
+    # A stated ``payload_class`` makes the request v4: the declaration is
+    # bound into the digest under the v4 domain, so a declared command and
+    # the same events undeclared are different requests.
+    declared_command = False
+    if normalized_events is not None and payload_class is not None:
+        if not isinstance(payload_class, str):
+            # A typed refusal, never a shape error: the declaration is
+            # well-formed enough to refuse (zero bytes proven), and the
+            # caller may retry with a corrected or absent declaration.
+            return _sequence_refusal(
+                control_id,
+                REASON_MALFORMED_COMMAND_DECLARATION,
+                f"payload_class must be a string or absent, got "
+                f"{type(payload_class).__name__}; the sole declared class is "
+                f"{PAYLOAD_CLASS_COMMAND!r} and the declaration is never inferred "
+                "from payload shape",
+                events=normalized_events,
+                terminal_id=terminal_id,
+                request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
+            )
+        digest = control_input_request_digest_v4(
+            control_id=control_id,
+            events=normalized_events,
+            payload_class=payload_class,
+            expected_identity=expected,
+        )
+    elif normalized_events is not None:
         digest = control_input_request_digest_v3(
             control_id=control_id,
             events=normalized_events,
@@ -1494,6 +1550,42 @@ def deliver_control_input(
             )
         return rebound
 
+    # The declaration's validity, decided once the digest is settled and
+    # before any identity work: it is a request-level fact, and a malformed
+    # declaration is the same refusal aimed at any terminal.  Only the
+    # declared field triggers any of this — an undeclared payload is prose
+    # and never enters the command grammar at all, including a batch whose
+    # text happens to begin with '/' (the streamed `/tmp/x` split case).
+    if payload_class is not None:
+        assert normalized_events is not None  # the v4 either/or rule above
+        if payload_class != PAYLOAD_CLASS_COMMAND:
+            return _sequence_refusal(
+                control_id,
+                REASON_MALFORMED_COMMAND_DECLARATION,
+                f"payload_class {payload_class!r} is not a declared class this schema "
+                f"defines; the sole v4 value is {PAYLOAD_CLASS_COMMAND!r}. The "
+                "declaration is refused rather than approximated into prose, because "
+                "a caller that declared something is owed the declaration it made, "
+                "not a guess at it",
+                events=normalized_events,
+                terminal_id=terminal_id,
+                digest=digest,
+                request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
+            )
+        violation = command_declaration_violation(normalized_events)
+        if violation is not None:
+            return _sequence_refusal(
+                control_id,
+                REASON_MALFORMED_COMMAND_DECLARATION,
+                violation + "; the declaration is refused with zero bytes rather than executed "
+                "partially or approximated into prose",
+                events=normalized_events,
+                terminal_id=terminal_id,
+                digest=digest,
+                request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
+            )
+        declared_command = True
+
     def _refuse(
         reason: str,
         detail: str,
@@ -1515,6 +1607,11 @@ def deliver_control_input(
                 terminal_id=terminal_id,
                 resolved=resolved,
                 digest=digest,
+                request_schema_version=(
+                    CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
+                    if declared_command
+                    else CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
+                ),
             )
         return _refusal(
             control_id,
@@ -1655,6 +1752,7 @@ def deliver_control_input(
                     terminal_id=terminal_id,
                     resolved=resolved,
                     digest=digest,
+                    declared_command=declared_command,
                 )
             return _deliver_under_lease(
                 book,
@@ -1681,6 +1779,11 @@ def deliver_control_input(
                 terminal_id=terminal_id,
                 resolved=resolved,
                 digest=digest,
+                request_schema_version=(
+                    CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
+                    if declared_command
+                    else CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
+                ),
             )
         return _record_refusal(
             book,
@@ -3073,6 +3176,59 @@ def _send_through_native_adapter(
     )
 
 
+def _command_class_guard_refusal(
+    resolved: ResolvedControlIdentity,
+    binding: ControlInputBinding,
+    *,
+    deadline_monotonic: float,
+) -> Optional[Tuple[str, str]]:
+    """Reason/detail when a declared command may not be written, or None.
+
+    The §4.1 never-concatenate guard: a declared command-class control is
+    written only against a composer *proven empty* by the provider+build
+    pinned determination, observed under the same pane-input lease before
+    the first command byte.  A provider/build without a proven emptiness
+    determination is ``provider-unsupported`` rather than guessed at; a
+    composer that holds content — or whose emptiness cannot be proven —
+    is ``composer-nonempty`` with zero command bytes and the prefill
+    untouched.  No blind clearing: the guard observes and refuses, it
+    never sends a keystroke (prefill has been observed to survive Escape,
+    so no keystroke-count ritual may be specified as a clear).
+    """
+    pin = native_pane_input.composer_emptiness_pin_for(resolved.provider, resolved.provider_version)
+    if pin is None:
+        return (
+            REASON_PROVIDER_UNSUPPORTED,
+            f"no composer-emptiness determination is proven for {resolved.provider!r} "
+            f"version {resolved.provider_version!r}, so a declared command cannot be "
+            "protected against concatenating with composer prefill; refused with zero "
+            "bytes rather than typed at a composer whose layout was never read",
+        )
+    try:
+        empty = native_pane_input.observe_composer_empty(
+            binding.pane_id, pin, deadline_monotonic=deadline_monotonic
+        )
+    except Exception as exc:  # noqa: BLE001 - "could not look" is not "empty"
+        logger.error("composer-emptiness observation raised for %s: %s", binding.pane_id, exc)
+        empty = None
+    if empty is True:
+        return None
+    if empty is False:
+        return (
+            REASON_COMPOSER_NONEMPTY,
+            "the composer holds content; a declared command submitted now would "
+            "concatenate with the queued prefill and deliver as ordinary prompt text. "
+            "Zero command bytes were written and the prefill is untouched — submit or "
+            "clear it as the operator, then retry the command",
+        )
+    return (
+        REASON_COMPOSER_NONEMPTY,
+        "the composer's emptiness could not be proven (the input region was "
+        "unreadable or unparseable), and a declared command is written only against "
+        "a proven-empty composer; zero bytes were written",
+    )
+
+
 def _deliver_sequence_under_lease(
     journal: ControlInputJournal,
     client: Any,
@@ -3082,17 +3238,25 @@ def _deliver_sequence_under_lease(
     terminal_id: str,
     resolved: ResolvedControlIdentity,
     digest: str,
+    declared_command: bool = False,
 ) -> ControlInputResult:
     """Re-verify, gate, claim, and write one v3 sequence under the lease.
 
     The v3 twin of ``_deliver_under_lease``: the same live re-verification
     under the same lease, the same claim-before-first-byte ordering, and
     the same refusal/ambiguous split.  One sequence is one claim — the
-    ordered events are the write, not separate operations.
+    ordered events are the write, not separate operations.  A declared
+    command-class sequence additionally proves the composer empty before
+    the claim (§4.1); undeclared sequences never see that guard.
     """
     control_id = binding.request_id
     deadline = time.monotonic() + WRITE_DEADLINE_SECONDS
     write_claimed = False
+    result_schema_version = (
+        CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
+        if declared_command
+        else CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
+    )
 
     def _refuse_pre_claim(reason: str, detail: str) -> ControlInputResult:
         return _record_sequence_refusal(
@@ -3104,6 +3268,7 @@ def _deliver_sequence_under_lease(
             terminal_id=terminal_id,
             resolved=resolved,
             digest=digest,
+            request_schema_version=result_schema_version,
         )
 
     def _deadline_breached() -> Optional[ControlInputResult]:
@@ -3231,6 +3396,17 @@ def _deliver_sequence_under_lease(
                     "sequence is readiness-gated and nothing was written",
                 )
 
+    if declared_command:
+        # The §4.1 never-concatenate guard, under this lease and before
+        # the claim: the composer must be *proven empty* by the
+        # provider+build pinned determination.  Runs only for declared
+        # command-class requests — undeclared payloads are prose and never
+        # see this guard — and refuses with zero command bytes and the
+        # prefill untouched.  Blind clearing is prohibited.
+        guard_refusal = _command_class_guard_refusal(resolved, binding, deadline_monotonic=deadline)
+        if guard_refusal is not None:
+            return _refuse_pre_claim(guard_refusal[0], guard_refusal[1])
+
     breached = _deadline_breached()
     if breached is not None:
         return breached
@@ -3255,6 +3431,7 @@ def _deliver_sequence_under_lease(
             digest=digest,
             deadline_monotonic=deadline,
             dispatch_key=dispatch_key,
+            request_schema_version=result_schema_version,
         )
     return _send_sequence_through_literal_sink(
         journal,
@@ -3265,6 +3442,7 @@ def _deliver_sequence_under_lease(
         resolved=resolved,
         digest=digest,
         deadline_monotonic=deadline,
+        request_schema_version=result_schema_version,
     )
 
 
@@ -3285,6 +3463,7 @@ def _sequence_accepted(
     chord_sent: Optional[bool],
     submission_observed: Optional[str] = None,
     submission_evidence_ref: Optional[str] = None,
+    request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
 ) -> ControlInputResult:
     """The accepted v3 answer: every event sent, in order, once."""
     return ControlInputResult(
@@ -3316,7 +3495,7 @@ def _sequence_accepted(
         submission_observed=submission_observed,
         submission_evidence_ref=submission_evidence_ref,
         events=run.events,
-        request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+        request_schema_version=request_schema_version,
     )
 
 
@@ -3333,6 +3512,7 @@ def _send_sequence_through_native_adapter(
     digest: str,
     deadline_monotonic: float,
     dispatch_key: Optional[Tuple[str, Optional[str], str, int]],
+    request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
 ) -> ControlInputResult:
     """Write one claimed v3 sequence through the provider's own adapter.
 
@@ -3390,7 +3570,7 @@ def _send_sequence_through_native_adapter(
             chord_attempted=transport.chord_attempted,
             chord_sent=transport.chord_sent,
             events=run.events,
-            request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+            request_schema_version=request_schema_version,
         )
 
     def _deadline_ambiguity() -> Optional[ControlInputResult]:
@@ -3519,6 +3699,7 @@ def _send_sequence_through_native_adapter(
         chord=last_chord,
         chord_attempted=transport.chord_attempted,
         chord_sent=transport.chord_sent,
+        request_schema_version=request_schema_version,
     )
 
 
@@ -3532,6 +3713,7 @@ def _send_sequence_through_literal_sink(
     resolved: ResolvedControlIdentity,
     digest: str,
     deadline_monotonic: float,
+    request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
 ) -> ControlInputResult:
     """Write one claimed v3 sequence through the generic literal primitive.
 
@@ -3601,7 +3783,7 @@ def _send_sequence_through_literal_sink(
             submission_observed=observed,
             submission_evidence_ref=evidence_ref,
             events=run.events,
-            request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+            request_schema_version=request_schema_version,
         )
 
     ordinal = 0
@@ -3843,6 +4025,7 @@ def _send_sequence_through_literal_sink(
         chord_sent=chord_sent,
         submission_observed=submission_observed,
         submission_evidence_ref=submission_evidence_ref,
+        request_schema_version=request_schema_version,
     )
 
 
@@ -4177,8 +4360,17 @@ def lookup_control_input(
 
 # --- Capability advertisement ---------------------------------------------
 
+# The streaming-mode policy facts the server owns (§3.5): the client reads
+# them rather than hardcoding, so pacing policy can be tuned without a
+# client release.  ``coalesce_window_ms`` is the quiet-timer default (OD4);
+# ``max_in_flight`` is the §3.4 one-batch-per-terminal rule.
+STREAMING_COALESCE_WINDOW_MS = 200
+STREAMING_MAX_IN_FLIGHT = 1
 
-def control_input_capability_block() -> Dict[str, Any]:
+
+def control_input_capability_block(
+    resolved: Optional[ResolvedControlIdentity] = None,
+) -> Dict[str, Any]:
     """The per-terminal discovery block advertised on the identity route.
 
     A conductor that needs v2 reads this before sending a chord, because a
@@ -4187,12 +4379,21 @@ def control_input_capability_block() -> Dict[str, Any]:
     advertised is the one safe answer to a server whose allowlist a caller
     cannot observe: it fails closed with the typed ``unsupported`` verdict
     and zero bytes, never degrading to text-without-chord.
+
+    When the terminal's resolved identity is supplied, the block also
+    carries the §3.5 send-authority entry: this terminal's provider
+    controls resolved at this terminal's exact build (whose
+    ``steer_chords`` is the exact set the server would admit for this
+    pane), and whether the §4.1 composer-emptiness guard can protect a
+    declared command on this build.  Providers with no registry entry
+    advertise no ``provider_controls`` key (§13 OD3).
     """
-    return {
+    block: Dict[str, Any] = {
         "schema_versions": [
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+            CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
         ],
         "chords": _advertised_steer_chords(),
         # v3 structured sequences: the exact event forms, the normalized
@@ -4205,6 +4406,21 @@ def control_input_capability_block() -> Dict[str, Any]:
             "max_text_bytes": MAX_SEQUENCE_TEXT_BYTES,
         },
     }
+    if resolved is not None and resolved.provider is not None:
+        controls = provider_controls.controls_block_for(
+            resolved.provider, resolved.provider_version
+        )
+        if controls is not None:
+            block["provider_controls"] = {resolved.provider: controls}
+        block["command_controls"] = {
+            "composer_nonempty_guard": (
+                native_pane_input.composer_emptiness_pin_for(
+                    resolved.provider, resolved.provider_version
+                )
+                is not None
+            )
+        }
+    return block
 
 
 def control_input_capabilities() -> Dict[str, Any]:
@@ -4221,14 +4437,16 @@ def control_input_capabilities() -> Dict[str, Any]:
         "protocol": CONTROL_INPUT_PROTOCOL,
         "request_schema_version": CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
         # The set of request schema versions this server speaks.  v2 adds the
-        # optional ``chord`` field; v3 adds the ordered ``events`` array; v1
-        # is unchanged.  A conductor that needs v2 or v3 reads this (and the
-        # per-terminal block on the identity route) before sending, and fails
-        # closed against a server that offers only earlier versions.
+        # optional ``chord`` field; v3 adds the ordered ``events`` array; v4
+        # adds the optional ``payload_class`` declaration carrier; v1 is
+        # unchanged.  A conductor that needs v2, v3, or v4 reads this (and
+        # the per-terminal block on the identity route) before sending, and
+        # fails closed against a server that offers only earlier versions.
         "request_schema_versions": [
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+            CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
         ],
         "digest_domain": CONTROL_INPUT_DIGEST_DOMAIN,
         "steer_chords": _advertised_steer_chords(),
@@ -4246,6 +4464,25 @@ def control_input_capabilities() -> Dict[str, Any]:
             "max_events": MAX_SEQUENCE_EVENTS,
             "max_text_bytes": MAX_SEQUENCE_TEXT_BYTES,
         },
+        # Streaming is a client mode, not a transport (D3): the server
+        # advertises that the v3 batching discipline exists and owns the
+        # pacing facts, so policy stays server-owned (§3.5, OD4).
+        "streaming": {
+            "supported": True,
+            "max_in_flight": STREAMING_MAX_IN_FLIGHT,
+            "coalesce_window_ms": STREAMING_COALESCE_WINDOW_MS,
+        },
+        # The provider-control registry (§4), discovery only: the union
+        # over builds.  Send authority is the per-terminal, build-exact
+        # block on the identity route — a chord absent from it is refused
+        # locally at capture time with zero POSTs (D9).
+        "provider_controls": provider_controls.advertised_provider_controls(),
+        # The §4.1 declared-command surface: the composer-emptiness guard
+        # exists on this server.  A client sends ``payload_class`` only
+        # when this block is advertised — never earlier, never as a shape
+        # probe — and the per-terminal block says whether the guard can
+        # prove emptiness for that terminal's build.
+        "command_controls": {"composer_nonempty_guard": True},
         # Stated so a caller never has to infer them from behaviour.
         "literal_write": True,
         "bracketed_paste": False,

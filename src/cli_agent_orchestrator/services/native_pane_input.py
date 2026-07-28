@@ -41,11 +41,12 @@ by the version-pinned caller.
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.control_input_contract import (
@@ -261,6 +262,29 @@ def capture_pane_screen(pane_id: str, *, timeout: float = _DEFAULT_TIMEOUT_SECON
     """
     result = _run(
         [_tmux_binary(), "capture-pane", "-p", "-t", pane_id],
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip() or f"tmux exited {result.returncode}"
+        raise NativePaneInputUnavailable(f"could not capture pane {pane_id}: {detail}")
+    return (result.stdout or "").splitlines()
+
+
+def capture_pane_screen_styled(
+    pane_id: str, *, timeout: float = _DEFAULT_TIMEOUT_SECONDS
+) -> list[str]:
+    """The pane's visible rows with SGR styling preserved (``-e``).
+
+    The one consumer is the declared-command composer-emptiness proof for
+    Claude (§4.1): Claude's composer draws a *placeholder* in an empty
+    input box, and the placeholder is distinguishable from operator
+    prefill only by its dim styling — the rendered text cells are
+    identical otherwise.  The escape-free capture above cannot make that
+    distinction, so this sibling exists.  It changes nothing for the
+    status detectors, which keep reading the composited text.
+    """
+    result = _run(
+        [_tmux_binary(), "capture-pane", "-e", "-p", "-t", pane_id],
         timeout=timeout,
     )
     if result.returncode != 0:
@@ -613,3 +637,282 @@ def observe_submission(
     if last_rows is not None and not deadline_cut:
         return (SUBMISSION_UNSUBMITTED, submission_evidence_ref(pane_id, last_rows))
     return (SUBMISSION_UNKNOWN, None)
+
+
+# --- Declared-command composer-emptiness proof (§4.1) -----------------------
+#
+# A declared command-class control must never concatenate with queued
+# composer prefill: the r5 evidence is a provider command appended to a
+# prefill that survived Escape and submitted as one ordinary prompt.  The
+# guard therefore proves the composer *empty* — under the pane-input
+# lease, before the first command byte — through a per-provider+build
+# pinned determination, with the same evidence discipline as the
+# submission-barrier table above.  Three answers, never a guess:
+#
+# - ``True``  — the composer is proven empty; the command may be written.
+# - ``False`` — the composer is proven to hold content.
+# - ``None``  — emptiness could not be proven (unparseable or unreadable
+#   region, failed capture).  "Could not look" is not "empty".
+#
+# Both negative answers surface as the typed zero-byte ``composer-nonempty``
+# refusal; a provider/build with no pin is ``provider-unsupported`` instead.
+# The pins are live-verified per build in §10.3.  Blind clearing is
+# prohibited: nothing here ever sends a keystroke.
+
+_RULE_KIMI_INPUT_BOX = "kimi-input-box"
+_RULE_CLAUDE_PROMPT_BOX = "claude-prompt-box"
+
+
+@dataclass(frozen=True)
+class ComposerEmptinessPin:
+    """How one provider build's composer is proven empty.
+
+    ``rule`` names the region determination (each build family draws its
+    composer differently); ``styled`` whether the proof needs the
+    escape-preserving capture (a placeholder is only distinguishable from
+    prefill by its dim styling).  ``evidence`` records what the pin was
+    read from, so review can check it without re-walking the tree.
+    """
+
+    provider: str
+    rule: str
+    styled: bool
+    evidence: str
+
+
+_KIMI_EMPTY_EVIDENCE = (
+    "composer layout read from real Kimi Code TUI captures (in-tree "
+    "fixtures, test_kimi_cli_unit.py NEW_TUI_*): the input box is a "
+    "'── input ──' rule, blank content rows, a closing rule, then the "
+    "status bar — an empty composer renders no placeholder, so any content "
+    "row is prefill; emptiness determination live-verified per §10.3"
+)
+
+_CLAUDE_EMPTY_EVIDENCE = (
+    "composer layout read from the Claude Code 2.1.220 composer (in-tree "
+    "fixtures, test_claude_code_unit.py): the prompt box is two '─' rules "
+    "framing a '❯' prompt row; an empty composer shows only a dim-styled "
+    "placeholder (SGR 2; the cursor cell inverse), so placeholder cells are "
+    "told from prefill by styling, never by matching the rotating "
+    "placeholder text; emptiness determination live-verified per §10.3"
+)
+
+
+#: The per-provider+build emptiness pins, keyed by normalized version.
+#: A build appears here only when its composer layout was read; an
+#: unpinned build refuses command-class controls ``provider-unsupported``
+#: rather than guessing at a region.
+_COMPOSER_EMPTINESS_PINS: dict[str, dict[str, ComposerEmptinessPin]] = {
+    "kimi_cli": {
+        version: ComposerEmptinessPin(
+            provider="kimi_cli",
+            rule=_RULE_KIMI_INPUT_BOX,
+            styled=False,
+            evidence=_KIMI_EMPTY_EVIDENCE,
+        )
+        for version in ("0.29.0", "0.29.1", "0.29.2")
+    },
+    "claude_code": {
+        "2.1.220": ComposerEmptinessPin(
+            provider="claude_code",
+            rule=_RULE_CLAUDE_PROMPT_BOX,
+            styled=True,
+            evidence=_CLAUDE_EMPTY_EVIDENCE,
+        ),
+    },
+}
+
+
+def composer_emptiness_pin_for(
+    provider: Optional[str], provider_version: Optional[str]
+) -> Optional[ComposerEmptinessPin]:
+    """The pinned emptiness determination for this exact build, or None.
+
+    None means "no determination is proven for this provider/build" — the
+    caller refuses ``provider-unsupported`` rather than guessing.  The
+    version is normalized the same way the adapters' composer pins
+    normalize theirs, so all per-build tables agree about which build a
+    request names.
+    """
+    if not provider or not provider_version:
+        return None
+    from cli_agent_orchestrator.services import provider_contracts
+
+    return _COMPOSER_EMPTINESS_PINS.get(provider, {}).get(
+        provider_contracts.normalized_version(provider_version)
+    )
+
+
+# The Kimi Code composer's own frame: a "── input ──" rule, the content
+# rows, and a closing rule.  The status bar below the closing rule is
+# never composer content, so the region stops there.
+_KIMI_INPUT_RULE = re.compile(r"^\s*─+\s*input\s*─+\s*$")
+_KIMI_BOX_RULE = re.compile(r"^\s*─{3,}\s*$")
+
+
+def _kimi_input_box_rows(rows: Sequence[str]) -> Optional[List[str]]:
+    """The content rows of the Kimi input box, or None when not found."""
+    top = None
+    for index in range(len(rows) - 1, -1, -1):
+        if _KIMI_INPUT_RULE.match(rows[index]):
+            top = index
+            break
+    if top is None:
+        return None
+    for index in range(top + 1, len(rows)):
+        if _KIMI_BOX_RULE.match(rows[index]):
+            return list(rows[top + 1 : index])
+    return None
+
+
+def _kimi_composer_empty(rows: Sequence[str]) -> Optional[bool]:
+    """Empty iff every input-box content row is blank.
+
+    The pinned builds render no placeholder in an empty box (the real
+    captures show blank rows), so any non-blank content row is prefill.
+    An unlocatable box is unproven, never "probably empty".
+    """
+    content = _kimi_input_box_rows(rows)
+    if content is None:
+        return None
+    return all(not row.strip() for row in content)
+
+
+# The Claude composer's frame: two horizontal rules framing the '❯'
+# prompt row.  The rules also appear between transcript entries, so the
+# region is the *last* rule pair on screen.
+_CLAUDE_BOX_RULE = re.compile(r"^\s*─{3,}\s*$")
+_CLAUDE_PROMPT_GLYPH = "❯"
+
+
+def _parse_styled_rows(rows: Sequence[str]) -> Optional[List[List[Tuple[str, bool, bool]]]]:
+    """Each row as ``(char, dim, inverse)`` cells, or None when unparseable.
+
+    A minimal SGR tracker over the escape-preserving capture: ``dim``
+    follows SGR 2/22 and ``inverse`` SGR 7/27; color and other parameters
+    are tracked past without effect, OSC sequences are skipped, and state
+    carries across rows the way the renderer's does.  Anything that is
+    not a well-formed escape sequence makes the whole capture unproven —
+    a guessed styling state could read prefill as placeholder, which is
+    the one direction this proof must never err in.
+    """
+    dim = False
+    inverse = False
+    parsed_rows: List[List[Tuple[str, bool, bool]]] = []
+    for row in rows:
+        cells: List[Tuple[str, bool, bool]] = []
+        index = 0
+        while index < len(row):
+            char = row[index]
+            if char == "\x1b":
+                if row.startswith("\x1b[", index):
+                    end = index + 2
+                    while end < len(row) and not ("\x40" <= row[end] <= "\x7e"):
+                        end += 1
+                    if end >= len(row):
+                        return None
+                    final = row[end]
+                    if final == "m":
+                        params = row[index + 2 : end].split(";")
+                        for param in params:
+                            if param in ("", "0"):
+                                dim = False
+                                inverse = False
+                            elif param == "2":
+                                dim = True
+                            elif param == "22":
+                                dim = False
+                            elif param == "7":
+                                inverse = True
+                            elif param == "27":
+                                inverse = False
+                            # Color and other parameters leave dim/inverse
+                            # untouched; they do not distinguish prefill.
+                    index = end + 1
+                    continue
+                if row.startswith("\x1b]", index):
+                    # OSC: runs to BEL or ST.  Content (titles, hyperlinks)
+                    # is not composer cells.
+                    bel = row.find("\x07", index + 2)
+                    st = row.find("\x1b\\", index + 2)
+                    ends = [pos for pos in (bel, st) if pos != -1]
+                    if not ends:
+                        return None
+                    terminator = min(ends)
+                    index = terminator + (2 if terminator == st else 1)
+                    continue
+                # Any other escape form: the styling state is unknowable.
+                return None
+            cells.append((char, dim, inverse))
+            index += 1
+        parsed_rows.append(cells)
+    return parsed_rows
+
+
+def _claude_composer_empty(styled_rows: Sequence[str]) -> Optional[bool]:
+    """Empty iff the prompt box holds only dim/inverse-styled content.
+
+    An empty Claude composer shows a *placeholder*: dim-styled suggestion
+    text whose first cell sits under the inverse-video cursor.  Operator
+    prefill renders in normal video.  The proof therefore never pattern-
+    matches the placeholder text (the pool rotates and is unknowable); it
+    reads styling: any normally-styled, non-whitespace cell after the
+    prompt glyph is content, and whitespace carries no content either way.
+    """
+    parsed = _parse_styled_rows(styled_rows)
+    if parsed is None:
+        return None
+    plain = ["".join(char for char, _, _ in row) for row in parsed]
+    rule_indices = [i for i, text in enumerate(plain) if _CLAUDE_BOX_RULE.match(text)]
+    if len(rule_indices) < 2:
+        return None
+    content = parsed[rule_indices[-2] + 1 : rule_indices[-1]]
+    if not content:
+        # No prompt row between the rules: this is not a prompt box.
+        return None
+    first = content[0]
+    prompt_at = next(
+        (i for i, (char, _, _) in enumerate(first) if char == _CLAUDE_PROMPT_GLYPH), None
+    )
+    if prompt_at is None:
+        return None
+    cells = [cell for cell in first[prompt_at + 1 :]] + [
+        cell for row in content[1:] for cell in row
+    ]
+    for char, dim, inverse in cells:
+        if char.isspace():
+            continue
+        if not (dim or inverse):
+            return False
+    return True
+
+
+def observe_composer_empty(
+    pane_id: str,
+    pin: ComposerEmptinessPin,
+    *,
+    deadline_monotonic: Optional[float] = None,
+    screen: Optional[Callable[[], Sequence[str]]] = None,
+) -> Optional[bool]:
+    """Whether the composer in ``pane_id`` is proven empty, under the pin.
+
+    One capture, one determination, no keystrokes — the guard observes
+    and refuses, it never "prepares" the composer.  A failed capture or an
+    unparseable region is ``None`` (unproven), which the caller treats
+    exactly like proven-non-empty: a typed zero-byte refusal.
+    """
+    timeout = _OBSERVATION_CAPTURE_TIMEOUT_SECONDS
+    if deadline_monotonic is not None:
+        timeout = max(0.2, min(timeout, deadline_monotonic - time.monotonic()))
+    if screen is not None:
+        rows: Sequence[str] = screen()
+    elif pin.styled:
+        rows = capture_pane_screen_styled(pane_id, timeout=timeout)
+    else:
+        rows = capture_pane_screen(pane_id, timeout=timeout)
+    if pin.rule == _RULE_KIMI_INPUT_BOX:
+        return _kimi_composer_empty(rows)
+    if pin.rule == _RULE_CLAUDE_PROMPT_BOX:
+        return _claude_composer_empty(rows)
+    # A rule this build does not know proves nothing.
+    return None
