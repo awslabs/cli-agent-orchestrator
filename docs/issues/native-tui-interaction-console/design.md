@@ -8,7 +8,9 @@ revised from live proof on pinned 0.29.2 in round
 `native-tui-console/spec-kimi-staged-path-r3`; post-review adjudication
 applied in round 4 — Sol/xhigh and Fable-5/Ultracode findings F10-F13,
 with steers `root-r4-attachment-speed-guard-008` and
-`root-r4-fable-delta-gate-009`; implementation NOT green-lit — a fresh
+`root-r4-fable-delta-gate-009`; command-class guard added in round 5
+(F14, live prefilled-composer command-drift evidence); implementation NOT
+green-lit — a fresh
 Fable-5/Ultracode exact-head delta approval is the required next gate)
 
 Task ID: `native-tui-console/spec-initial-v1`
@@ -626,6 +628,84 @@ Rules:
 - Stop for kimi is `Escape` (single key; matches claude; Ctrl+C remains
   available as the provider-agnostic `C-c` key event). Live acceptance on the
   pinned 0.29.x build is the verification (§10.3, OD2).
+
+### 4.1 Provider command controls — command-class (r5 P1 amendment)
+
+Origin: live owner evidence (2026-07-28, terminal `f4d25eb9`, native Claude
+session `80a8272f-01ed-42e4-b0e0-5be4e1c0d627`, control record
+`root-fable-agents-panel-013`): a queued text prefill survived `Escape` in
+the Claude 2.1.220 composer, and an identity-bound `/agents` command was
+then **appended to the prefill and submitted as one ordinary prompt** — the
+command never executed standalone. The durable record proves identity-bound
+posting (HTTP 200, `accepted`) and honestly records
+`provider_completion.observed: false`; it does not prove standalone command
+execution, and this contract never treats transport acceptance as command
+execution.
+
+**Definition.** A control is **command-class** when its payload is a
+provider command — leading-`/` text (the registry Compact built-in;
+supervisor `/agents`-class commands). Command-class is a property of the
+payload, declared by the caller and re-derived by the server from the
+events; ordinary prose and key/chord sequences are unaffected.
+
+**Rules.**
+
+1. **Never concatenate.** Before the first command byte, under the same
+   pane-input lease, the server must prove the composer **empty** through
+   the adapter's composer observation — built on the deployed
+   `capture_pane_screen` primitive (`native_pane_input.py:253-270`) with a
+   per-provider+build pinned composer-region determination (same evidence
+   discipline as the codex submission-barrier table,
+   `native_pane_input.py:400-435`; the emptiness determination itself is
+   new pinned logic, live-verified per build in §10.3). A composer that is
+   non-empty — or whose emptiness cannot be proven — is a typed refusal
+   **`composer-nonempty`** (new refusal reason, bound to `REFUSED`:
+   decided before any write, zero command bytes, reattemptable, prefill
+   untouched). The only permitted alternative is a separately proven,
+   per-provider+build-pinned **atomic clear/replace** after which exactly
+   the command is submitted; none is pinned today. **Blind
+   Escape/Enter/key-count clearing is prohibited** — the r5 evidence shows
+   prefill surviving Escape, so no keystroke-count ritual may be specified
+   as a clear.
+2. **Same arbiter, same record.** Command-class rides the v3
+   control-input route unchanged: 9-field identity, pane-input lease,
+   journal intent/claim, exact-id reconcile. No raw websocket, no
+   unmanaged write path, no second operation kind (D2).
+3. **Honest outcome, never forced completion.** A command-class control
+   records transport acceptance plus the deployed `submission_observed`
+   vocabulary at most (`submitted` = the composer was seen to give up the
+   text). **Provider command execution is a pane-observable fact and is
+   never inferred from transport or submission.** When execution is not
+   observed, the honest terminal state is the existing `ambiguous` class
+   with manual reconciliation by exact-id query and operator judgment —
+   never a forced `completed`. Crash and response-loss behavior is the
+   deployed discipline, unchanged: a lost response is resolved by exactly
+   one exact-id `GET` (never a resend), and a dead owner mid-write sweeps
+   to `ambiguous/owner-lost-mid-write` (pre-write:
+   `refused/owner-lost-before-write`, reattemptable) — §1.2/§3.4.
+   Cross-repo coordination note (grounded, r5):
+   the installed conductor record schema (cao-conductor 0.1.7,
+   `conduct/lib/control_input.py:151-166`) defines `partial-ambiguous` and
+   `resolved-manual` but makes them **unreachable from `posted`** —
+   `LEGAL_TRANSITIONS["posted"] == frozenset({"completed"})` (`:156`) and
+   `completed` requires an observed provider completion (`:693-695`), with
+   the transition validator refusing any other target (`:852-855`). A
+   posted command with unknown provider meaning can therefore only be
+   falsely completed or stranded on the conductor side. This is a
+   conductor-tooling gap for the supervisor to route (the conductor's own
+   schema evolution adding a `posted → partial-ambiguous` edge); the CAO
+   wire vocabulary already carries `ambiguous` and needs no change.
+4. **Advertisement and compatibility.** Additive capability block
+   `"command_controls": { "composer_nonempty_guard": true }` alongside
+   `provider_controls` when Lane A lands it. An old server without the
+   block offers no guard: the client must say so where a command control
+   is offered ("prefill-concatenation guard unavailable on this server"),
+   never imply it. A provider/build without a proven emptiness
+   determination refuses command-class controls `provider-unsupported`
+   rather than guessing.
+
+The registry Compact built-in (§5.5) is command-class and gains this
+guard; the stop built-in (a bare key) is unaffected.
 
 ## 5. Durable operator macro persistence (Lane B)
 
@@ -1319,6 +1399,13 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
   capability key stays exact.
 - Notation parser: golden vectors shared with the TS parser (checked into
   `test/fixtures/notation_vectors.json`, consumed by both suites).
+- **Command-class guard (§4.1):** a leading-`/` text sequence against a
+  composer observed non-empty is refused `composer-nonempty` with **zero**
+  tmux calls and the prefill untouched; an unobservable composer fails
+  closed identically; an observed-empty composer delivers exactly the
+  command; the new reason is bound to `REFUSED` in `REASON_OUTCOMES`
+  (import-time assert covers it); non-command payloads never trigger the
+  guard; the `command_controls` capability block is additive-only.
 
 ### 10.2 Live tmux (Lane A; `pytest -m e2e`, isolated server fixtures)
 
@@ -1358,6 +1445,19 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
   (withhold → one scheduled re-attempt with a fresh id → accepted), not by
   disarm. If the menu does not read idle, the deviation is recorded here
   and §3.2/§6.4 corrected before Lane A closes.
+- **Command-class guard acceptance (r5, §4.1):** on disposable Kimi and
+  Claude native-TUI sessions, seed the composer with queued text, press
+  Escape (the r5 evidence shows prefill may survive it — that is the point
+  of the case), then issue a command-class control (`/compact` built-in;
+  `/agents`-class): prove the typed `composer-nonempty` refusal with zero
+  command bytes delivered and the prefill byte-identical, **or** — only if
+  a proven atomic clear/replace has since been pinned — standalone command
+  execution with zero concatenation (pane transcript shows the command's
+  own UI, not an ordinary prompt echo). Cover response loss (exact-id
+  reconcile answers from the journal; never resend), crash windows
+  (dead-owner sweep outcomes), and old/new compatibility (new client
+  against a server without the `command_controls` block shows the
+  guard-absent statement; old client against the new server is unchanged).
 
 ### 10.4 Web unit + component (Lane B; vitest)
 
@@ -1481,7 +1581,9 @@ jobs with the two projects of §10.5.
 - **P1 (compatibility core — ships first):** §3.2 key-set extension + tmux
   mapping + §3.3 refusal completion; §4 registry (Compact/Stop/Steer blocks)
   + capabilities; §10.1-10.3 tests including live navigation acceptance; the
-  built-in Compact/Stop favorites *data* (registry entries). Rationale:
+  built-in Compact/Stop favorites *data* (registry entries); the §4.1
+  command-class guard (`composer-nonempty`) that keeps provider commands
+  from concatenating with composer prefill (r5, F14). Rationale:
   navigation keys and provider controls are currently lost when a session
   becomes managed; every later feature rides on them.
 - **P2 (product overhaul — after P1 merges):** §5 macro store + notation +
@@ -1606,6 +1708,18 @@ jobs with the two projects of §10.5.
   recorder row (the deployed bundle renders it whenever the composer is
   visible); the baseline is annotated rather than re-captured (§0/§1.5),
   and §10.5's visual acceptance measures the current deployed render.
+- **F14 (P1, amended in r5):** live owner evidence (terminal `f4d25eb9`,
+  record `root-fable-agents-panel-013`) proved a provider command
+  concatenates with composer prefill that survived Escape and is submitted
+  as ordinary prompt text — identity-bound posting without standalone
+  command execution. Root causes pinned: no composer-emptiness gate exists
+  for command payloads, and the installed conductor schema (0.1.7) strands
+  the honest partial state (`posted → partial-ambiguous` illegal; only
+  `completed`, requiring observed completion). Amended as the §4.1
+  command-class contract (`composer-nonempty` typed refusal, prohibited
+  blind clearing, honest ambiguity with manual reconcile, guard
+  capability advertisement) + §10.1/§10.3 acceptance. The conductor-side
+  schema edge is a supervisor-routed coordination item, not edited here.
 
 ## 15. Challenges applied (per track mandate)
 
