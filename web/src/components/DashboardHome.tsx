@@ -377,6 +377,10 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
               if (!latest) return t.last_active
               return new Date(t.last_active) > new Date(latest) ? t.last_active : latest
             }, null)
+            const isExpanded = expandedSessions.has(session.name)
+            // Session names are validated tmux names ([A-Za-z0-9_-] only), so
+            // they are already safe to embed in an HTML id.
+            const terminalsRegionId = `session-${session.name}-terminals`
 
             return (
               <div key={session.name} className="bg-gray-800/60 border border-gray-700/50 rounded-xl overflow-hidden relative">
@@ -389,31 +393,46 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                   <Trash2 size={12} />
                 </button>
 
-                {/* Session header */}
-                <button onClick={() => toggleSession(session.name)} className="w-full text-left p-4 pr-12 hover:bg-gray-800/40 transition-colors">
+                {/* Session header (§7.6) — a plain container: all metadata is
+                    selectable/copyable text and never toggles the card.
+                    Expand/collapse belongs exclusively to the chevron button. */}
+                <div className="p-4 pr-12">
                   <div className="flex items-center gap-3">
-                    {expandedSessions.has(session.name) ? <ChevronDown size={14} className="text-gray-500" /> : <ChevronRight size={14} className="text-gray-500" />}
-                    <Users size={14} className="text-emerald-400" />
-                    <span className="text-sm font-mono text-gray-200">{session.name}</span>
-                    <span className="text-xs text-gray-500">{session.terminals.length} agent{session.terminals.length !== 1 ? 's' : ''}</span>
-                  </div>
-                  <div className="ml-8 mt-1.5 flex flex-col gap-1">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      {typeSummary.map(([type, count]) => (
-                        <span key={type} className="text-[10px] bg-gray-700/60 text-gray-400 px-1.5 py-0.5 rounded">{type}{count > 1 ? ` ×${count}` : ''}</span>
-                      ))}
+                    <button
+                      type="button"
+                      onClick={() => toggleSession(session.name)}
+                      aria-label={isExpanded ? `Collapse session ${session.name}` : `Expand session ${session.name}`}
+                      aria-expanded={isExpanded}
+                      aria-controls={terminalsRegionId}
+                      className="flex items-center justify-center shrink-0 min-h-[44px] min-w-[44px] rounded-lg text-gray-500 hover:text-gray-200 hover:bg-gray-700/60 transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    >
+                      {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                    </button>
+                    <div className="flex-1 min-w-0 select-text cursor-default">
+                      <div className="flex items-center gap-3">
+                        <Users size={14} className="text-emerald-400" />
+                        <span className="text-sm font-mono text-gray-200">{session.name}</span>
+                        <span className="text-xs text-gray-500">{session.terminals.length} agent{session.terminals.length !== 1 ? 's' : ''}</span>
+                      </div>
+                      <div className="ml-8 mt-1.5 flex flex-col gap-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {typeSummary.map(([type, count]) => (
+                            <span key={type} className="text-[10px] bg-gray-700/60 text-gray-400 px-1.5 py-0.5 rounded">{type}{count > 1 ? ` ×${count}` : ''}</span>
+                          ))}
+                        </div>
+                        <StatusSummary counts={statusCounts} />
+                        <div className="flex items-center gap-3 text-[10px] text-gray-600">
+                          {sessionStart && <span title={fmtAbs(sessionStart) || ''}>Started {fmtRel(sessionStart)}</span>}
+                          {sessionLastActive && <span title={fmtAbs(sessionLastActive) || ''}>Active {fmtRel(sessionLastActive)}</span>}
+                        </div>
+                      </div>
                     </div>
-                    <StatusSummary counts={statusCounts} />
-                    <div className="flex items-center gap-3 text-[10px] text-gray-600">
-                      {sessionStart && <span title={fmtAbs(sessionStart) || ''}>Started {fmtRel(sessionStart)}</span>}
-                      {sessionLastActive && <span title={fmtAbs(sessionLastActive) || ''}>Active {fmtRel(sessionLastActive)}</span>}
-                    </div>
                   </div>
-                </button>
+                </div>
 
                 {/* Terminals grouped by agent type */}
-                {expandedSessions.has(session.name) && (
-                  <div className="border-t border-gray-700/30 px-4 pb-4 space-y-3 pt-3">
+                {isExpanded && (
+                  <div id={terminalsRegionId} className="border-t border-gray-700/30 px-4 pb-4 space-y-3 pt-3">
                     {Object.entries(grouped).map(([agentType, terminals]) => (
                       <div key={agentType}>
                         <div className="flex items-center gap-2 mb-2">
@@ -428,7 +447,11 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                             const showActive = relActive && relActive !== relCreated
                             return (
                               <div key={t.id} className="bg-gray-900/50 border border-gray-700/30 rounded-lg px-3 py-2 space-y-1.5">
-                                <div className="flex items-center justify-between">
+                                {/* flex-wrap keeps narrow (mobile) widths from
+                                    overflowing the card: the action buttons
+                                    wrap under the identity line instead of
+                                    forcing a wider-than-viewport layout. */}
+                                <div className="flex flex-wrap items-center justify-between gap-y-1.5">
                                   <div className="flex items-center gap-2 min-w-0">
                                     <TermIcon size={12} className="text-gray-500 shrink-0" />
                                     <span className="text-xs font-medium text-gray-300 truncate">{t.agent_profile || 'default'}</span>

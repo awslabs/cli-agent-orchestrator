@@ -12,6 +12,9 @@ export default defineConfig({
     globals: true,
     environment: 'jsdom',
     setupFiles: './src/test/setup.ts',
+    // The §10.5 Playwright suite lives in e2e/ and runs under
+    // @playwright/test, never vitest.
+    include: ['src/**/*.{test,spec}.{ts,tsx}'],
   },
   server: {
     host: 'localhost',
@@ -25,6 +28,8 @@ export default defineConfig({
       '/flows': { target: 'http://localhost:9889', changeOrigin: true },
       '/memory': { target: 'http://localhost:9889', changeOrigin: true },
       '/graph': { target: 'http://localhost:9889', changeOrigin: true },
+      '/macros': { target: 'http://localhost:9889', changeOrigin: true },
+      '/control-input': { target: 'http://localhost:9889', changeOrigin: true },
     },
   },
 })

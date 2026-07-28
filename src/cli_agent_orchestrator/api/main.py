@@ -1438,6 +1438,147 @@ async def set_skill_dirs_endpoint(
     }
 
 
+# ── Operator macro library (§5.4) ────────────────────────────────────────
+#
+# The durable macro store of §5: versioned JSON at CAO_HOME_DIR/macros.json,
+# flock-serialized atomic writes, quarantine reporting on every list.  READ
+# scope for list/parse, WRITE scope for mutations — the settings-route
+# discipline.  Validation failures are 422 with an ``errors`` array of
+# ``{offset, message}`` pairs (§5.3); built-in mutation attempts are 409;
+# unknown ids are 404.  Sending a macro is deliberately NOT a store
+# operation (§5.4): the client takes the resolved events and sends an
+# ordinary v3 control-input request (D2) — the store never writes to panes.
+
+
+class MacroScopeBody(BaseModel):
+    kind: str
+    provider: Optional[str] = None
+    profile: Optional[str] = None
+
+
+class MacroWriteBody(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    scope: Optional[MacroScopeBody] = None
+    events: Optional[List[Dict[str, Any]]] = None
+    notation: Optional[str] = None
+    favorite: Optional[bool] = None
+
+
+class MacroDuplicateBody(BaseModel):
+    name: Optional[str] = None
+
+
+def _macro_validation_response(exc: "macro_store.MacroValidationError") -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"errors": exc.errors},
+    )
+
+
+def _macro_write_kwargs(body: MacroWriteBody) -> Dict[str, Any]:
+    return {
+        "name": body.name,
+        "description": body.description,
+        "scope": body.scope.model_dump() if body.scope is not None else None,
+        "events": body.events,
+        "notation": body.notation,
+        "favorite": body.favorite,
+    }
+
+
+@app.get("/macros")
+async def list_macros_endpoint(
+    provider: Optional[str] = None,
+    profile: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """The visible macro set: registry built-ins for ``provider`` (synthesized,
+    D6) plus user records whose scope is global, provider-matching, or
+    profile-matching, in the pinned server-side order (§5.4).  Reports
+    ``quarantine`` while a quarantine file exists (§5.2)."""
+    from cli_agent_orchestrator.services import macro_store
+
+    return await asyncio.to_thread(macro_store.list_macros, provider, profile)
+
+
+@app.post("/macros", status_code=status.HTTP_201_CREATED)
+async def create_macro_endpoint(
+    body: MacroWriteBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Create a user macro from ``events`` or ``notation`` (exactly one)."""
+    from cli_agent_orchestrator.services import macro_store
+
+    try:
+        return await asyncio.to_thread(macro_store.create_macro, **_macro_write_kwargs(body))
+    except macro_store.MacroValidationError as exc:
+        return _macro_validation_response(exc)
+
+
+@app.put("/macros/{macro_id}")
+async def update_macro_endpoint(
+    macro_id: str,
+    body: MacroWriteBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Full replace of a user record's mutable fields; built-in ids 409."""
+    from cli_agent_orchestrator.services import macro_store
+
+    try:
+        return await asyncio.to_thread(
+            macro_store.update_macro, macro_id, **_macro_write_kwargs(body)
+        )
+    except macro_store.MacroValidationError as exc:
+        return _macro_validation_response(exc)
+    except macro_store.BuiltinMacroConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except macro_store.MacroNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no macro with id {macro_id!r}",
+        ) from exc
+
+
+@app.delete("/macros/{macro_id}")
+async def delete_macro_endpoint(
+    macro_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Delete a user record; built-in ids 409."""
+    from cli_agent_orchestrator.services import macro_store
+
+    try:
+        return await asyncio.to_thread(macro_store.delete_macro, macro_id)
+    except macro_store.BuiltinMacroConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except macro_store.MacroNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no macro with id {macro_id!r}",
+        ) from exc
+
+
+@app.post("/macros/{macro_id}/duplicate", status_code=status.HTTP_201_CREATED)
+async def duplicate_macro_endpoint(
+    macro_id: str,
+    body: MacroDuplicateBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Mint a user record from any source — the only way to "edit" a built-in."""
+    from cli_agent_orchestrator.services import macro_store
+
+    try:
+        return await asyncio.to_thread(macro_store.duplicate_macro, macro_id, name=body.name)
+    except macro_store.MacroValidationError as exc:
+        return _macro_validation_response(exc)
+    except macro_store.MacroNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no macro with id {macro_id!r}",
+        ) from exc
+
+
 @app.get("/skills/{name}", response_model=SkillContentResponse)
 async def get_skill_content(name: str) -> SkillContentResponse:
     """Return the full Markdown body for an installed skill."""

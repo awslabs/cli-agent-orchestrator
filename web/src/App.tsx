@@ -84,7 +84,7 @@ export default function App() {
     <div className="min-h-screen bg-[#0f0f14] text-gray-200">
       {/* Header */}
       <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-sm sticky top-0 z-40">
-        <div className="max-w-7xl mx-auto px-6 py-3 flex items-center justify-between">
+        <div className="max-w-7xl mx-auto px-6 py-3 flex flex-wrap items-center justify-between gap-y-1">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center">
               <Bot size={18} className="text-white" />
@@ -110,7 +110,7 @@ export default function App() {
       {/* Tab Bar */}
       <div className="border-b border-gray-800">
         <div className="max-w-7xl mx-auto px-6">
-          <nav className="flex gap-1 py-2" role="tablist">
+          <nav className="flex flex-wrap gap-1 py-2" role="tablist">
             {visibleTabs.map((t, i) => (
               <button
                 key={t.key}

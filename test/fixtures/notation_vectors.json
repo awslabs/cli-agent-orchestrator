@@ -565,6 +565,33 @@
           "message": "invalid JSON string: Invalid \\escape; text uses JSON escaping exactly (comma, plus, slash and backslash are literal inside quotes)"
         }
       ]
+    },
+    {
+      "notation": "up*100",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "this event brings the sequence past the 32-event cap; a repeat expansion counts every event it stands for"
+        }
+      ]
+    },
+    {
+      "notation": "up*999999999999999999999999999999",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "this event brings the sequence past the 32-event cap; a repeat expansion counts every event it stands for"
+        }
+      ]
+    },
+    {
+      "notation": "\"\\ud800\"",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "the text contains a lone surrogate that is not UTF-8-encodable; an unrepresentable macro is refused, never approximated"
+        }
+      ]
     }
   ]
 }

@@ -122,3 +122,55 @@ class TestFailFast:
         assert result.events is None
         assert len(result.errors) == 1
         assert result.errors[0].offset == len("enter ")
+
+
+_CAP_MESSAGE = (
+    "this event brings the sequence past the 32-event cap; a repeat "
+    "expansion counts every event it stands for"
+)
+
+
+class TestRepeatConversionSafety:
+    """The r11 repeat guard, ported onto this canonical parser (Lane B steer
+    033 → integration steer 044): a repeat count that can never fit the
+    32-event budget fails BEFORE the integer conversion (CPython refuses
+    over-long digit strings with a bare ValueError from its
+    int-max-str-digits guard), so the failure keeps the ordinary
+    offset-bearing shape and the endpoint answers 422, never 500."""
+
+    def test_thousands_of_digits_repeat_is_the_cap_error(self):
+        result = parse_notation("up*" + "9" * 5000)
+        assert result.events is None
+        assert [(e.offset, e.message) for e in result.errors] == [(0, _CAP_MESSAGE)]
+
+    def test_the_cap_message_is_bounded_for_absurd_counts(self):
+        result = parse_notation("up*" + "9" * 5000)
+        assert len(result.errors) == 1
+        # The message embeds no token, so it is bounded by construction.
+        assert len(result.errors[0].message) < 120
+
+    def test_three_digit_counts_fail_before_conversion(self):
+        result = parse_notation("up*100")
+        assert [(e.offset, e.message) for e in result.errors] == [(0, _CAP_MESSAGE)]
+
+    def test_two_digit_counts_still_convert_and_check_the_budget(self):
+        assert parse_notation("up*99").errors[0].message == _CAP_MESSAGE
+        # Exactly at the budget the macro is legal.
+        assert len(parse_notation("up*32").events) == 32
+
+
+class TestLoneSurrogate:
+    """A lone surrogate is valid JSON but not UTF-8-encodable: it must be an
+    offset-bearing parse failure, never an encode crash (same defect class
+    as the r11 repeat guard — the endpoint answers 422, never 500)."""
+
+    def test_lone_surrogate_is_an_offset_error(self):
+        result = parse_notation('"\\ud800"')
+        assert result.events is None
+        assert [(e.offset, e.message) for e in result.errors] == [
+            (
+                0,
+                "the text contains a lone surrogate that is not UTF-8-encodable; "
+                "an unrepresentable macro is refused, never approximated",
+            )
+        ]

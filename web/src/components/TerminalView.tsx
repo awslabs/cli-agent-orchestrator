@@ -3,15 +3,17 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { X, Terminal as TermIcon } from 'lucide-react'
-import { api, type ApiError } from '../api'
 import {
-  applyKeyToRecording,
-  previewToken,
-  sequenceTextBytes,
-  MAX_SEQUENCE_EVENTS,
-  MAX_SEQUENCE_TEXT_BYTES,
-  type SequenceEvent,
-} from '../lib/sequenceRecorder'
+  api,
+  type ApiError,
+  type ControlInputCapabilities,
+  type MacroRecord,
+} from '../api'
+import { type SequenceEvent } from '../lib/sequenceRecorder'
+import { StreamingEngine, type SendResult, type TraceEntry } from '../lib/streaming'
+import { StreamingPanel } from './StreamingPanel'
+import { FavoriteStrip } from './FavoriteStrip'
+import { MacroLibraryModal } from './MacroLibraryModal'
 
 interface TerminalViewProps {
   terminalId: string
@@ -28,6 +30,36 @@ const DEFAULT_LINE_HEIGHT = Math.round(TERMINAL_FONT_SIZE * 1.2)
 const CONTROL_UNSUPPORTED_STATUSES = new Set([404, 405, 501])
 const CONTROL_AMBIGUOUS_STATUSES = new Set([408, 425, 500, 502, 503, 504])
 
+// §3.2: the full sixteen-name key set. The streaming toggle arms only when
+// the live capabilities advertise streaming support AND this whole set
+// (§6.1); anything less degrades per the §3.5 old-server rows.
+const FULL_SEQUENCE_KEY_SET = [
+  'Escape', 'C-c', 'C-s', 'Enter', 'Backspace',
+  'Up', 'Down', 'Left', 'Right',
+  'Home', 'End', 'PageUp', 'PageDown',
+  'Delete', 'Insert', 'Tab',
+]
+
+// The composer's delivery path is the control-input path; its 512-byte cap
+// is a contract feature (F8) and the status line names it live (§7.1).
+const MAX_COMPOSER_BYTES = 512
+
+const EXPECTED_IDENTITY_FIELDS = [
+  'terminal_id',
+  'terminal_incarnation',
+  'terminal_generation',
+  'pane_birth_id',
+  'provider_process_id',
+  'provider',
+  'native_session_id',
+  'execution_mode',
+  'session_name',
+]
+
+// Refusal reasons that mean the pinned identity drifted; on these the
+// disarm explanation refetches identity so it names the new generation (§6.4).
+const IDENTITY_REFUSAL_CODES = new Set(['stale-generation', 'identity-mismatch', 'pane-dead'])
+
 function isWheelMouseReport(data: string): boolean {
   const sgr = /^\x1b\[<(\d+);\d+;\d+[Mm]$/.exec(data)
   if (sgr) return (Number(sgr[1]) & 64) === 64
@@ -40,6 +72,51 @@ function isWheelMouseReport(data: string): boolean {
     return button >= 0 && (button & 64) === 64
   }
   return false
+}
+
+/** The 9-field expected_identity bound into every control-input request. */
+function pickExpectedIdentity(identity: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(EXPECTED_IDENTITY_FIELDS.map(key => [key, identity[key] ?? null]))
+}
+
+/** Normalize a typed control-input body (POST 200 or journaled GET record). */
+function typedOutcome(body: Record<string, unknown>): {
+  outcome: string
+  reasonCode?: string
+  reasonDetail?: string
+} {
+  return {
+    outcome: String(body.outcome || 'unknown'),
+    reasonCode: body.reason_code ? String(body.reason_code) : undefined,
+    reasonDetail: body.reason_detail ? String(body.reason_detail) : undefined,
+  }
+}
+
+interface PerTerminalProviderControlEntry {
+  steer_chords?: string[]
+  dispatch_grace_ms?: number
+}
+
+/**
+ * The per-terminal provider_controls entry from the identity route's
+ * control_input block (§3.5): the exact chord set and dispatch grace the
+ * server would admit for THIS terminal's provider+build. The top-level
+ * capabilities union is discovery only — it never licenses a send.
+ */
+function perTerminalProviderControls(
+  identity: Record<string, unknown>,
+): PerTerminalProviderControlEntry | undefined {
+  const block = identity?.control_input as Record<string, unknown> | undefined
+  const controls = block?.provider_controls as
+    | Record<string, PerTerminalProviderControlEntry>
+    | undefined
+  if (!controls) return undefined
+  const provider = identity.provider
+  return typeof provider === 'string' ? controls[provider] : undefined
+}
+
+function perTerminalSteerChords(identity: Record<string, unknown>): string[] {
+  return perTerminalProviderControls(identity)?.steer_chords ?? []
 }
 
 export function TerminalView({ terminalId, provider, agentProfile, onClose }: TerminalViewProps) {
@@ -56,9 +133,31 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   const [controlBusy, setControlBusy] = useState(false)
   const [controlStatus, setControlStatus] = useState('')
   const [sequenceSupported, setSequenceSupported] = useState(false)
-  const [recording, setRecording] = useState(false)
-  const [recordedEvents, setRecordedEvents] = useState<SequenceEvent[]>([])
-  const [recordNotice, setRecordNotice] = useState('')
+  const [capabilities, setCapabilities] = useState<ControlInputCapabilities | null>(null)
+
+  // ── Lane B: macro library + streaming state ──────────────────────────
+  const [macros, setMacros] = useState<MacroRecord[]>([])
+  const [macroQuarantine, setMacroQuarantine] = useState<
+    { count: number | null; path: string } | undefined
+  >()
+  const [macrosUnavailable, setMacrosUnavailable] = useState(false)
+  const [macroModalOpen, setMacroModalOpen] = useState(false)
+  // The per-terminal advertised chord set: the ONLY chord send authority
+  // (§3.5 — the top-level union is discovery only, never a license).
+  const [advertisedChords, setAdvertisedChords] = useState<ReadonlySet<string>>(new Set())
+  const [streamingArmed, setStreamingArmed] = useState(false)
+  const [arming, setArming] = useState(false)
+  const [streamingTrace, setStreamingTrace] = useState<TraceEntry[]>([])
+  const [streamingTick, setStreamingTick] = useState(0)
+  const [disarmInfo, setDisarmInfo] = useState<{ reason: string; reasonCode?: string } | null>(null)
+  const [streamingTarget, setStreamingTarget] = useState<{
+    provider: string
+    profile: string | null
+    generationShort: string
+  }>({ provider: provider ?? 'unknown', profile: agentProfile ?? null, generationShort: '—' })
+  const engineRef = useRef<StreamingEngine | null>(null)
+  const macrosButtonRef = useRef<HTMLButtonElement>(null)
+  const streamingWsCloseRef = useRef<() => void>(() => {})
 
   useEffect(() => {
     managedRef.current = null
@@ -72,19 +171,21 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         setNativeControlResolved(result.execution_mode !== 'native_tui')
         if (result.managed && result.execution_mode === 'native_tui') {
           api.getControlInputCapabilities()
-            .then(capabilities => {
+            .then(liveCapabilities => {
+              setCapabilities(liveCapabilities)
               setNativeControlSupported(
-                capabilities.execution_modes.includes('native_tui')
-                && capabilities.literal_write === true
-                && capabilities.bracketed_paste === false
-                && capabilities.enter_required === true,
+                liveCapabilities.execution_modes.includes('native_tui')
+                && liveCapabilities.literal_write === true
+                && liveCapabilities.bracketed_paste === false
+                && liveCapabilities.enter_required === true,
               )
-              // The structured-sequence recorder is v3-only: a server that
-              // does not advertise it gets the literal bar alone, and the
-              // recorder's absence is stated rather than silently missing.
-              setSequenceSupported(
-                (capabilities.request_schema_versions ?? []).includes(3),
-              )
+              // v3 is the macro/streaming floor: a server that does not
+              // advertise it offers the literal bar alone, and the absence
+              // of the library affordances is stated rather than silently
+              // missing (§3.5).
+              const v3 = (liveCapabilities.request_schema_versions ?? []).includes(3)
+              setSequenceSupported(v3)
+              if (v3) loadMacroLibrary()
               setNativeControlResolved(true)
             })
             .catch(() => {
@@ -107,6 +208,70 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         setControlStatus('terminal control identity unavailable')
       })
   }, [terminalId])
+
+  // The macro library (§5.4): fetched for the terminal's provider/profile.
+  // A 404 is the old-server signal — the library UI is hidden behind a
+  // notice, never a fallback to local storage as the authoritative store
+  // (§3.5). The per-terminal chord set comes from the identity route's
+  // control_input.provider_controls entry — the only chord send authority;
+  // absent means the empty set (fail closed, D9).
+  const loadMacroLibrary = () => {
+    api
+      .listMacros({ provider, profile: agentProfile ?? undefined })
+      .then(response => {
+        setMacros(response.macros)
+        setMacroQuarantine(response.quarantine)
+        setMacrosUnavailable(false)
+      })
+      .catch((error: ApiError) => {
+        if (error.status === 404) {
+          setMacros([])
+          setMacrosUnavailable(true)
+        } else {
+          setControlStatus('macro library unavailable')
+        }
+      })
+    api
+      .getControlIdentity(terminalId)
+      .then(identity => {
+        setAdvertisedChords(new Set(perTerminalSteerChords(identity)))
+      })
+      .catch(() => setAdvertisedChords(new Set()))
+  }
+
+  // Disarm streaming when the terminal is closed or swapped out: timers die
+  // with the view and nothing typed later is ever sent (§6.4).
+  useEffect(() => {
+    return () => {
+      engineRef.current?.disarm('terminal view closed')
+      engineRef.current = null
+    }
+  }, [terminalId])
+
+  // Environment disarm (§6.4): page hidden / pagehide while armed.
+  useEffect(() => {
+    if (!streamingArmed) return
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        engineRef.current?.disarm('page hidden')
+      }
+    }
+    const onPageHide = () => engineRef.current?.disarm('page hidden')
+    document.addEventListener('visibilitychange', onVisibility)
+    window.addEventListener('pagehide', onPageHide)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('pagehide', onPageHide)
+    }
+  }, [streamingArmed])
+
+  // Environment disarm (§6.4): the output websocket closing while armed.
+  // The websocket lives in the xterm effect below; it calls this ref.
+  useEffect(() => {
+    streamingWsCloseRef.current = () => {
+      if (streamingArmed) engineRef.current?.disarm('output websocket closed')
+    }
+  }, [streamingArmed])
 
   const runManagedOperation = async (body: {
     action: string
@@ -227,76 +392,31 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     }
   }
 
-  // --- Structured key-sequence recorder (cond-0175) ------------------------
+  // --- Lane B: macro sends and streaming (§5.4 send path, §6) -------------
   //
-  // Record captures the ordered, representable events; the preview renders
-  // them readably; send submits the exact structured events through the
-  // arbiter with terminal/pane/process/generation re-proof (the same
-  // expected-identity re-fetch the literal send uses) and a fresh request
-  // id; cancel before send writes nothing — no request is ever sent on a
-  // discard.
+  // Sending a macro is NOT a store operation (§5.4): the client takes the
+  // resolved events and sends an ordinary v3 control-input request (D2)
+  // with the deployed per-send identity re-proof and outcome reporting.
+  // Streaming pins the identity once at arm instead (§6.3 step 4).
 
-  const startRecording = () => {
-    setRecordedEvents([])
-    setRecordNotice('')
-    setRecording(true)
-  }
-
-  const stopRecording = () => {
-    setRecording(false)
-    setRecordNotice('')
-  }
-
-  const cancelRecording = () => {
-    // Discard is purely local: no request id is minted and nothing is
-    // sent, so a cancelled sequence provably wrote nothing.
-    setRecording(false)
-    setRecordedEvents([])
-    setRecordNotice('')
-    setControlStatus('sequence: cancelled — nothing was sent')
-  }
-
-  const onRecorderKeyDown = (event: React.KeyboardEvent) => {
-    // While recording, every key is the payload: none of them may reach
-    // the terminal, the page, or the browser's own bindings.
-    event.preventDefault()
-    event.stopPropagation()
-    const result = applyKeyToRecording(recordedEvents, {
-      key: event.key,
-      ctrlKey: event.ctrlKey,
-      metaKey: event.metaKey,
-      altKey: event.altKey,
-    })
-    if (result.refused) {
-      setRecordNotice(result.refused)
-      return
-    }
-    setRecordNotice('')
-    setRecordedEvents(result.events)
-  }
-
-  const runNativeSequence = async (events: SequenceEvent[]) => {
+  const runNativeSequence = async (
+    events: SequenceEvent[],
+    label = 'sequence',
+    options?: { commandClass?: boolean },
+  ) => {
     const controlId = crypto.randomUUID()
     setControlBusy(true)
-    setControlStatus(`sequence: submitting… (${controlId})`)
+    setControlStatus(`${label}: submitting… (${controlId})`)
     try {
       const identity = await api.getControlIdentity(terminalId)
-      const expectedIdentity = Object.fromEntries(
-        [
-          'terminal_id',
-          'terminal_incarnation',
-          'terminal_generation',
-          'pane_birth_id',
-          'provider_process_id',
-          'provider',
-          'native_session_id',
-          'execution_mode',
-          'session_name',
-        ].map(key => [key, identity[key] ?? null]),
-      )
+      const expectedIdentity = pickExpectedIdentity(identity)
       const response = await api.sendControlInput(terminalId, {
         control_id: controlId,
         events,
+        // §4.1: only the registry Compact built-in declares command-class,
+        // and only after the command_controls block is advertised (gated by
+        // the caller). Streaming and ordinary macros NEVER set this field.
+        ...(options?.commandClass ? { payload_class: 'command' as const } : {}),
         expected_identity: expectedIdentity,
       })
       const outcome = String(response.outcome || 'unknown')
@@ -307,17 +427,13 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
             .join(', ')}]`
         : ''
       setControlStatus(
-        `sequence: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}${perEvent}`,
+        `${label}: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}${perEvent}`,
       )
-      if (outcome === 'accepted') {
-        setRecording(false)
-        setRecordedEvents([])
-      }
     } catch (error) {
       const apiError = error as ApiError
       if (apiError.status && CONTROL_UNSUPPORTED_STATUSES.has(apiError.status)) {
         setControlStatus(
-          `sequence: unsupported (HTTP ${apiError.status})`
+          `${label}: unsupported (HTTP ${apiError.status})`
           + (apiError.detail ? ` — ${apiError.detail}` : ''),
         )
         return
@@ -329,7 +445,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         && apiError.status < 500
       ) {
         setControlStatus(
-          `sequence: refused (HTTP ${apiError.status})`
+          `${label}: refused (HTTP ${apiError.status})`
           + (apiError.detail ? ` — ${apiError.detail}` : ''),
         )
         return
@@ -341,15 +457,143 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         const outcome = String(response.outcome || 'unknown')
         const reason = response.reason_code || response.reason_detail
         setControlStatus(
-          `sequence: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}`,
+          `${label}: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}`,
         )
       } catch {
         setControlStatus(
-          `sequence: response unavailable; control ${controlId} retained for reconciliation`,
+          `${label}: response unavailable; control ${controlId} retained for reconciliation`,
         )
       }
     } finally {
       setControlBusy(false)
+    }
+  }
+
+  // One tap = one v3 request (§7.2, D2). The Compact built-in is
+  // command-class (§4.1): it declares payload_class "command" only when the
+  // server advertised the command_controls block; otherwise it sends
+  // without the field and the guard-absent notice says why (§3.5).
+  const sendMacro = (macro: MacroRecord) => {
+    void runNativeSequence(macro.events, `macro "${macro.name}"`, {
+      commandClass: macro.builtin_kind === 'compact' && commandGuardAvailable,
+    })
+  }
+
+  // §6.3 step 7 + §3.4: the POST's typed body wins; an ambiguous transport
+  // result (including a lost response) is reconciled by exactly one
+  // exact-id GET — the journaled record is the truth and a batch is never
+  // re-sent. The engine routes the resolved outcome per §6.4.
+  const sendStreamBatch = async (
+    controlId: string,
+    events: SequenceEvent[],
+    expectedIdentity: Record<string, unknown>,
+  ): Promise<SendResult> => {
+    try {
+      const response = await api.sendControlInput(terminalId, {
+        control_id: controlId,
+        events,
+        expected_identity: expectedIdentity,
+      })
+      return { kind: 'resolved', result: typedOutcome(response) }
+    } catch (error) {
+      const apiError = error as ApiError
+      if (apiError.status && CONTROL_UNSUPPORTED_STATUSES.has(apiError.status)) {
+        return { kind: 'resolved', result: { outcome: 'unsupported', reasonDetail: apiError.detail } }
+      }
+      if (
+        apiError.status
+        && !CONTROL_AMBIGUOUS_STATUSES.has(apiError.status)
+        && apiError.status >= 400
+        && apiError.status < 500
+      ) {
+        return { kind: 'resolved', result: { outcome: 'refused', reasonDetail: apiError.detail } }
+      }
+      try {
+        const record = await api.queryControlInput(controlId)
+        return { kind: 'resolved', result: typedOutcome(record) }
+      } catch {
+        return { kind: 'reconcile-failed' }
+      }
+    }
+  }
+
+  // §6.1 arming: fetch managed-control, control-identity, and capabilities
+  // fresh; pin the 9-field expected_identity and the per-terminal chord
+  // set; display provider / agent profile / generation in the armed
+  // header. Arming replaces the composer with the capture surface; the
+  // ordinary composer is restored on disarm with its draft preserved.
+  const armStreaming = async () => {
+    setArming(true)
+    setControlStatus('')
+    try {
+      const [managedControl, identity, liveCapabilities] = await Promise.all([
+        api.getManagedControl(terminalId),
+        api.getControlIdentity(terminalId),
+        api.getControlInputCapabilities(),
+      ])
+      if (!managedControl.managed || managedControl.execution_mode !== 'native_tui') {
+        setControlStatus('streaming: terminal is no longer native-managed')
+        return
+      }
+      const fullKeySet = FULL_SEQUENCE_KEY_SET.every(key =>
+        liveCapabilities.sequence?.keys?.includes(key),
+      )
+      if (liveCapabilities.streaming?.supported !== true || !fullKeySet) {
+        setControlStatus('streaming: server predates streaming')
+        return
+      }
+      const expectedIdentity = pickExpectedIdentity(identity)
+      const providerEntry = perTerminalProviderControls(identity)
+      const chords = new Set(providerEntry?.steer_chords ?? [])
+      const graceMs =
+        providerEntry?.dispatch_grace_ms ??
+        (provider ? liveCapabilities.provider_controls?.[provider]?.dispatch_grace_ms : undefined)
+      const generationShort = String(
+        identity.terminal_generation ?? managedControl.generation ?? '—',
+      ).slice(0, 6)
+      const engine = new StreamingEngine(
+        {
+          coalesceWindowMs: liveCapabilities.streaming.coalesce_window_ms ?? 200,
+          dispatchGraceMs: graceMs,
+          advertisedChords: chords,
+        },
+        {
+          onSendBatch: (controlId, events) => sendStreamBatch(controlId, events, expectedIdentity),
+          onTrace: trace => setStreamingTrace(trace),
+          onDisarm: (reason, reasonCode) => {
+            setStreamingArmed(false)
+            setDisarmInfo({ reason, reasonCode })
+            if (reasonCode && IDENTITY_REFUSAL_CODES.has(reasonCode)) {
+              // §6.4: on any identity refusal, refetch identity so the
+              // explanation names the new generation.
+              api
+                .getControlIdentity(terminalId)
+                .then(fresh => {
+                  const gen = String(fresh.terminal_generation ?? '?').slice(0, 6)
+                  setDisarmInfo(info =>
+                    info ? { ...info, reason: `${info.reason} — current generation ${gen}` } : info,
+                  )
+                })
+                .catch(() => {})
+            }
+          },
+          onChange: () => setStreamingTick(tick => tick + 1),
+        },
+      )
+      engineRef.current = engine
+      setAdvertisedChords(chords)
+      setStreamingTarget({
+        provider: provider ?? 'unknown',
+        profile: agentProfile ?? null,
+        generationShort,
+      })
+      setStreamingTrace([])
+      setDisarmInfo(null)
+      setStreamingArmed(true)
+    } catch {
+      setControlStatus('streaming could not arm: capabilities or identity fetch failed')
+    } finally {
+      setArming(false)
     }
   }
 
@@ -488,6 +732,8 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
 
     ws.onclose = () => {
       term.write('\r\n\x1b[33m[Connection closed]\x1b[0m\r\n')
+      // §6.4 environment disarm: the output websocket closing while armed.
+      streamingWsCloseRef.current()
     }
 
     // Copy selection to clipboard on mouse-up
@@ -562,6 +808,29 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   const nativeManaged = managed && executionMode === 'native_tui'
   const acpManaged = managed && executionMode === 'acp'
 
+  // ── Lane B capability gating (§3.5/D9: advertisement, never probing) ──
+  const fullKeySetAdvertised = FULL_SEQUENCE_KEY_SET.every(key =>
+    capabilities?.sequence?.keys?.includes(key),
+  )
+  const streamingAdvertised = capabilities?.streaming?.supported === true && fullKeySetAdvertised
+  const providerControlEntry = provider ? capabilities?.provider_controls?.[provider] : undefined
+  // §3.5: provider_controls absent → built-ins hidden (user macros still
+  // available when v3 is advertised); providers with no registry entry hide
+  // the built-ins and the modal states why (§13, OD3).
+  const builtinsVisible = providerControlEntry != null
+  // §4.1 rule 4: payload_class is sent only when command_controls is
+  // advertised — never earlier, never as a shape probe.
+  const commandGuardAvailable = capabilities?.command_controls != null
+  const visibleMacros = macros.filter(macro =>
+    macro.origin === 'builtin' ? builtinsVisible : sequenceSupported,
+  )
+  const favorites = visibleMacros.filter(macro => macro.favorite)
+  const compactGuardNotice =
+    !commandGuardAvailable && visibleMacros.some(macro => macro.builtin_kind === 'compact')
+      ? 'prefill-concatenation guard unavailable on this server'
+      : null
+  const composerBytes = new TextEncoder().encode(message).length
+
   return (
     <div className="fixed inset-0 z-50 flex flex-col" style={{ background: '#0d1117' }}>
       {/* Header */}
@@ -593,110 +862,171 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         </div>
       </div>
       {nativeManaged && nativeControlSupported && (
-        <div className="shrink-0 border-b border-gray-700/50 bg-gray-950 px-4 py-2 space-y-2">
-          <div className="flex gap-2">
-            <input
-              value={message}
-              onChange={event => setMessage(event.target.value)}
-              onKeyDown={event => {
-                if (event.key === 'Enter' && message.trim() && !controlBusy) {
-                  void runNativeControl(message.trim(), 'send')
-                }
-              }}
-              placeholder="Send literal text to the native composer…"
-              className="min-w-0 flex-1 rounded border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none"
+        <div
+          data-testid="native-control-area"
+          className="shrink-0 border-b border-gray-700/50 bg-gray-950 px-4 py-2 space-y-2"
+        >
+          {streamingArmed && engineRef.current ? (
+            <StreamingPanel
+              engine={engineRef.current}
+              provider={streamingTarget.provider}
+              agentProfile={streamingTarget.profile}
+              generationShort={streamingTarget.generationShort}
+              trace={streamingTrace}
+              tick={streamingTick}
+              onStop={() => engineRef.current?.disarm('operator stopped streaming')}
+              onClearTrace={() => engineRef.current?.clearTrace()}
             />
-            <button
-              disabled={controlBusy || !message.trim()}
-              onClick={() => void runNativeControl(message.trim(), 'send')}
-              className="rounded bg-emerald-700 px-3 py-1.5 text-xs text-white disabled:opacity-40"
-            >
-              Send
-            </button>
-            <button
-              disabled={controlBusy}
-              onClick={() => void runNativeControl('/compact', 'compact')}
-              className="rounded bg-indigo-700 px-3 py-1.5 text-xs text-white disabled:opacity-40"
-            >
-              Compact
-            </button>
-          </div>
-          <div className="flex items-center gap-2 text-[11px] text-gray-500">
-            <span>Cancel, route, effort, and resume controls are unavailable for native TUI sessions.</span>
-            <span className="min-w-0 truncate">{controlStatus}</span>
-          </div>
-          {sequenceSupported && (
-            <div className="space-y-1 border-t border-gray-800 pt-2">
-              <div className="flex items-center gap-2">
-                {!recording ? (
-                  <button
-                    disabled={controlBusy}
-                    onClick={startRecording}
-                    className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
-                  >
-                    Record
-                  </button>
-                ) : (
-                  <button
-                    disabled={controlBusy}
-                    onClick={stopRecording}
-                    className="rounded bg-amber-700 px-3 py-1 text-xs text-white disabled:opacity-40"
-                  >
-                    Stop
-                  </button>
-                )}
-                {recording && (
-                  <div
-                    tabIndex={0}
-                    onKeyDown={onRecorderKeyDown}
-                    ref={element => element?.focus()}
-                    className="min-w-0 flex-1 rounded border border-amber-600/60 bg-gray-900 px-3 py-1 text-xs text-amber-200 focus:outline-none"
-                  >
-                    Recording — press keys now ({recordedEvents.length}/{MAX_SEQUENCE_EVENTS}{' '}
-                    events, {sequenceTextBytes(recordedEvents)}/{MAX_SEQUENCE_TEXT_BYTES} B)
-                  </div>
-                )}
-                {!recording && recordedEvents.length > 0 && (
-                  <div className="min-w-0 flex-1 truncate rounded border border-gray-700 bg-gray-900 px-3 py-1 font-mono text-xs text-gray-200">
-                    {recordedEvents.map((event, index) => (
-                      <span key={index} className="mr-2">
-                        {previewToken(event)}
-                      </span>
-                    ))}
-                  </div>
-                )}
+          ) : (
+            <div data-testid="composer-row" className="flex flex-wrap items-center gap-2">
+              <input
+                value={message}
+                onChange={event => setMessage(event.target.value)}
+                onKeyDown={event => {
+                  if (event.key === 'Enter' && message.trim() && !controlBusy) {
+                    void runNativeControl(message.trim(), 'send')
+                  }
+                }}
+                placeholder="Send a message to the native composer…"
+                aria-label="Message to the native composer"
+                className="min-w-0 flex-1 rounded border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none"
+              />
+              <button
+                disabled={controlBusy || !message.trim()}
+                onClick={() => void runNativeControl(message.trim(), 'send')}
+                className="min-h-[36px] rounded bg-emerald-700 px-3 py-1.5 text-xs text-white transition-colors hover:bg-emerald-600 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              >
+                Send
+              </button>
+              <button
+                type="button"
+                aria-pressed={false}
+                disabled={controlBusy || arming || !streamingAdvertised}
+                onClick={() => void armStreaming()}
+                title={
+                  streamingAdvertised
+                    ? 'Arm streaming mode: type directly to the terminal in bounded identity-bound batches'
+                    : 'Streaming needs a server advertising streaming support and the full key set'
+                }
+                className="min-h-[36px] rounded bg-gray-800 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-700 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              >
+                {arming ? 'Arming…' : 'Streaming'}
+              </button>
+              {sequenceSupported && !macrosUnavailable && (
                 <button
-                  disabled={controlBusy || recording || recordedEvents.length === 0}
-                  onClick={() => void runNativeSequence(recordedEvents)}
-                  className="rounded bg-emerald-700 px-3 py-1 text-xs text-white disabled:opacity-40"
+                  type="button"
+                  ref={macrosButtonRef}
+                  onClick={() => setMacroModalOpen(true)}
+                  className="relative min-h-[36px] rounded bg-gray-800 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                 >
-                  Send sequence
+                  Macros
+                  {visibleMacros.length > 0 && (
+                    <span className="ml-1.5 rounded-full bg-gray-700 px-1.5 py-0.5 text-[10px] text-gray-300">
+                      {visibleMacros.length}
+                    </span>
+                  )}
                 </button>
-                <button
-                  disabled={controlBusy || (!recording && recordedEvents.length === 0)}
-                  onClick={cancelRecording}
-                  className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
-                >
-                  Cancel
-                </button>
-              </div>
-              {recordNotice && (
-                <div className="text-[11px] text-amber-300">{recordNotice}</div>
               )}
-              <div className="text-[10px] text-gray-600">
-                Records exact representable events only: Escape, Ctrl+C, Ctrl+S (steer chord),
-                Enter, Backspace, and printable text. Comma, plus, and backslash are ordinary
-                text. Terminal protocols cannot express arbitrary simultaneous physical-key
-                combinations; a combination this surface cannot represent is refused with a
-                message, never approximated. Cancel before send writes nothing.
+            </div>
+          )}
+          {disarmInfo && !streamingArmed && (
+            <div
+              role="alert"
+              className="space-y-1 rounded border border-amber-600/60 bg-amber-950/30 px-3 py-2"
+            >
+              <div className="text-xs text-amber-200">
+                Streaming disarmed: {disarmInfo.reason}
+              </div>
+              {streamingTrace.length > 0 && (
+                <div className="max-h-24 space-y-0.5 overflow-y-auto font-mono text-[10px] text-gray-400">
+                  {streamingTrace.map((entry, index) => (
+                    <div key={index}>
+                      {entry.preview || '(no events)'} — {entry.outcome}
+                      {entry.reasonCode ? `/${entry.reasonCode}` : ''} ({entry.controlIdShort})
+                      {entry.note ? ` ${entry.note}` : ''}
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  disabled={arming || !streamingAdvertised}
+                  onClick={() => void armStreaming()}
+                  className="min-h-[36px] rounded bg-emerald-700 px-3 py-1 text-xs text-white transition-colors hover:bg-emerald-600 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                >
+                  Re-arm
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    engineRef.current = null
+                    setDisarmInfo(null)
+                    setStreamingTrace([])
+                  }}
+                  className="min-h-[36px] rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 transition-colors hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                >
+                  Dismiss
+                </button>
               </div>
             </div>
           )}
+          {favorites.length > 0 && (
+            <FavoriteStrip
+              favorites={favorites}
+              disabled={controlBusy}
+              onSend={sendMacro}
+              guardNotice={compactGuardNotice}
+            />
+          )}
+          <div className="flex items-center gap-2 text-[11px] text-gray-400">
+            <span>Cancel, route, effort, and resume controls are unavailable for native TUI sessions.</span>
+            <span className="min-w-0 truncate">{controlStatus}</span>
+          </div>
+          <div className="text-[10px] text-gray-400">
+            delivers as control input · {composerBytes}/{MAX_COMPOSER_BYTES} B
+            {composerBytes > MAX_COMPOSER_BYTES && (
+              <span className="text-amber-300">
+                {' '}
+                — over the {MAX_COMPOSER_BYTES}-byte control-input limit; this draft will be
+                refused (a control input is a command or one short line, not a document)
+              </span>
+            )}
+          </div>
           {nativeControlResolved && !sequenceSupported && (
             <div className="text-[10px] text-gray-600">
-              Sequence recording needs control-input schema v3; this server offers the literal
+              Macros and streaming need control-input schema v3; this server offers the literal
               control only.
             </div>
+          )}
+          {sequenceSupported && !streamingAdvertised && (
+            <div className="text-[10px] text-gray-600">
+              Streaming is unavailable: this server predates streaming (or does not advertise the
+              full key set).
+            </div>
+          )}
+          {sequenceSupported && macrosUnavailable && (
+            <div className="text-[10px] text-gray-600">
+              The macro library is unavailable on this server.
+            </div>
+          )}
+          {macroModalOpen && (
+            <MacroLibraryModal
+              provider={provider}
+              agentProfile={agentProfile}
+              macros={macros}
+              quarantine={macroQuarantine}
+              builtinsVisible={builtinsVisible}
+              commandGuardAvailable={commandGuardAvailable}
+              advertisedChords={advertisedChords}
+              busy={controlBusy}
+              onClose={() => {
+                setMacroModalOpen(false)
+                macrosButtonRef.current?.focus()
+              }}
+              onSend={sendMacro}
+              onChanged={loadMacroLibrary}
+            />
           )}
         </div>
       )}

@@ -90,6 +90,12 @@ def _multi_modifier_failure(notation: str, pos: int) -> NotationResult:
 # so an unrepresentable macro cannot be saved.
 _ILLEGAL_TEXT_CHARS = ("\x1b", "\x9b", "\r", "\n")
 
+# A lone surrogate (a high surrogate not followed by a low one, or a low
+# one not preceded by a high one) is valid JSON but not UTF-8-encodable.
+_LONE_SURROGATE_RE = re.compile(
+    r"[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]"
+)
+
 
 @dataclass(frozen=True)
 class NotationError:
@@ -194,6 +200,17 @@ def parse_notation(notation: str) -> NotationResult:
                         "the control path can never send honestly; an unrepresentable "
                         "macro is refused, never approximated",
                     )
+            if _LONE_SURROGATE_RE.search(decoded) is not None:
+                # A lone surrogate parses as valid JSON but is not
+                # UTF-8-encodable, so it can never become a wire event's
+                # text; screening here keeps the failure in the ordinary
+                # offset-bearing shape (the endpoint answers 422, never
+                # 500) — the same defect class as the r11 repeat guard.
+                return _fail(
+                    event_pos,
+                    "the text contains a lone surrogate that is not UTF-8-encodable; "
+                    "an unrepresentable macro is refused, never approximated",
+                )
             text_bytes += len(decoded.encode("utf-8"))
             if text_bytes > MAX_SEQUENCE_TEXT_BYTES:
                 return _fail(
@@ -257,7 +274,22 @@ def parse_notation(notation: str) -> NotationResult:
                     "a repeat count is a positive integer written [1-9][0-9]* "
                     "(zero and empty counts are malformed, not no-ops)",
                 )
-            count = int(digits.group(0))
+            count_text = digits.group(0)
+            if len(count_text) > 2:
+                # A count of 100+ can never fit the 32-event budget, even
+                # in an empty sequence — fail BEFORE the integer
+                # conversion (CPython refuses over-long digit strings with
+                # a bare ValueError from its int-max-str-digits guard).
+                # r11/Sol: the failure keeps the ordinary offset-bearing
+                # shape, and the endpoint answers 422, never 500; the
+                # message embeds no token, so it is bounded by
+                # construction.
+                return _fail(
+                    event_pos,
+                    f"this event brings the sequence past the {MAX_SEQUENCE_EVENTS}-event "
+                    "cap; a repeat expansion counts every event it stands for",
+                )
+            count = int(count_text)
             pos = digits.end()
 
         if len(events) + count > MAX_SEQUENCE_EVENTS:
