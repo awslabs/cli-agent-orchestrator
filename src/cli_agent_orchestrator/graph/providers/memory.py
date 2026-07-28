@@ -141,8 +141,19 @@ class MemoryGraphProvider(GraphProvider):
                 MemoryRelationshipService,
             )
 
+            # Bound the query to THIS projection's node set. Without
+            # source_keys the read loads every active relationship in the
+            # (scope, scope_id) and discards the out-of-set rows in Python,
+            # where the pre-#511 related_keys read was naturally bounded to
+            # the current keys.
+            #
+            # This bounds the SOURCE side only. The both-endpoints check below
+            # is still required and must NOT be removed: a source inside the
+            # node set may legitimately point at a target outside it, and
+            # dropping that edge is what enforces FR-9 (never a cross-scope
+            # edge) and keeps GraphView's endpoint validation satisfied.
             active = MemoryRelationshipService().list_relationships(
-                scope, scope_id, status="active"
+                scope, scope_id, status="active", source_keys=keys
             )
         except Exception as e:  # degrade to a relationship-free graph, never 500
             logger.warning("memory graph provider: relationship read failed: %r", e)

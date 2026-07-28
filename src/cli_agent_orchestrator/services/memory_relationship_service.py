@@ -27,7 +27,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.clients.database import (
@@ -137,6 +137,40 @@ def _iso(value: Any) -> Optional[str]:
     return str(value)
 
 
+def _sort_dt(value: Any) -> datetime:
+    """Normalise a ``created_at`` to a tz-AWARE UTC datetime for sorting.
+
+    Sorting relationship rows on a raw ``created_at`` is unsafe in two ways, and
+    a tz-aware sentinel alone only fixes the first:
+
+    1. ``created_at`` is nullable with no DB default, so a NULL row previously
+       fell back to a NAIVE ``datetime.min`` while a populated row on a
+       ``DateTime(timezone=True)`` column is tz-AWARE — comparing them raises
+       ``TypeError: can't compare offset-naive and offset-aware datetimes``.
+    2. SQLite does not persist timezone offsets, so two POPULATED rows can also
+       disagree on awareness depending on how each was written. Normalising both
+       sides (rather than only the sentinel) closes that wider hole too.
+
+    A naive value is interpreted as UTC — the only sane reading, since every
+    write path stamps UTC (``_utcnow``).
+    """
+    if not isinstance(value, datetime):
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _rank_then_created(row: Any) -> tuple:
+    """The See-Also / recall projection order: ``(rank, created_at)``.
+
+    NULL rank sorts last (``1_000_000`` sentinel, preserved from the original
+    ordering); ``created_at`` is normalised by ``_sort_dt`` so a NULL or naive
+    value never crashes the comparison.
+    """
+    return (row.rank if row.rank is not None else 1_000_000, _sort_dt(row.created_at))
+
+
 class MemoryRelationshipService:
     """Sole reader/writer of the ``memory_relationships`` table."""
 
@@ -201,10 +235,25 @@ class MemoryRelationshipService:
             return None
         if not isinstance(attributes, dict):
             raise ValueError("attributes must be a dict or None")
-        encoded = json.dumps(attributes, separators=(",", ":"), sort_keys=True)
-        if len(encoded.encode("utf-8")) > MAX_ATTRIBUTES_BYTES:
+        # json.dumps raises TypeError for a non-serialisable value and ValueError
+        # for a circular reference. A TypeError escaping here would break TWO
+        # contracts, so it is re-raised as ValueError (the service's single
+        # fail-closed validation type, per this module's docstring):
+        #   1. every REST handler maps ONLY ValueError -> 400/404, so a TypeError
+        #      surfaces as an unhandled 500 instead of a client error;
+        #   2. replace_set's per-edge soft rejection catches ONLY ValueError, so
+        #      one bad edge would abort the whole batch instead of being dropped.
+        try:
+            encoded = json.dumps(attributes, separators=(",", ":"), sort_keys=True)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"attributes must be JSON-serialisable: {e}") from e
+        # The limit is enforced in BYTES, so the message must report bytes — a
+        # char count understates any multi-byte payload and misleads the caller
+        # about how much to trim.
+        encoded_bytes = len(encoded.encode("utf-8"))
+        if encoded_bytes > MAX_ATTRIBUTES_BYTES:
             raise ValueError(
-                f"attributes exceed {MAX_ATTRIBUTES_BYTES} bytes ({len(encoded)} chars)"
+                f"attributes exceed {MAX_ATTRIBUTES_BYTES} bytes ({encoded_bytes} bytes)"
             )
         return encoded
 
@@ -610,10 +659,20 @@ class MemoryRelationshipService:
         types: Optional[List[str]] = None,
         stale_only: bool = False,
         include_non_active: bool = False,
+        source_keys: Optional[List[str]] = None,
     ) -> List[RelationshipDTO]:
         """Query relationships. Default returns ACTIVE only (FR-4.3); an explicit
         ``status`` or ``include_non_active`` widens. Computes the derived
-        ``stale`` flag; ``stale_only`` filters to stale rows."""
+        ``stale`` flag; ``stale_only`` filters to stale rows.
+
+        ``source_keys`` bounds the rows FETCHED to edges leaving that set of
+        source keys — used by the graph provider to scope its query to the
+        current node set instead of loading every active relationship in the
+        scope. It is a fetch bound ONLY: it can constrain the source side but
+        says nothing about targets, so a caller that needs both endpoints inside
+        a node set MUST still check the target side itself (an edge may
+        legitimately point at a key outside the set).
+        """
         sentinel = self._to_sentinel(scope_id)
         with SessionLocal() as db:
             q = db.query(MemoryRelationshipModel).filter(
@@ -622,6 +681,24 @@ class MemoryRelationshipService:
             )
             if source_key is not None:
                 q = q.filter(MemoryRelationshipModel.source_key == self._sanitize_key(source_key))
+            if source_keys is not None:
+                # An EMPTY set means "no nodes", which must yield no edges — not
+                # "unfiltered". in_([]) is the correct, empty-result filter.
+                #
+                # A key that cannot sanitize (e.g. a malformed index entry like
+                # "...") is DROPPED from the filter rather than allowed to raise.
+                # Every stored source_key was sanitized at write time, so an
+                # unsanitizable key can never match a row — but raising here
+                # would abort the whole query, and the graph provider's except
+                # branch would then silently discard EVERY edge in the scope
+                # because of one bad index entry.
+                sanitized_sources = []
+                for k in source_keys:
+                    try:
+                        sanitized_sources.append(self._sanitize_key(k))
+                    except ValueError:
+                        continue
+                q = q.filter(MemoryRelationshipModel.source_key.in_(sanitized_sources))
             if status is not None:
                 if isinstance(status, (list, tuple, set)):
                     q = q.filter(MemoryRelationshipModel.status.in_(list(status)))
@@ -670,13 +747,59 @@ class MemoryRelationshipService:
                 )
                 .all()
             )
-        rows.sort(
-            key=lambda r: (
-                r.rank if r.rank is not None else 1_000_000,
-                r.created_at or datetime.min,
-            )
-        )
+        rows.sort(key=_rank_then_created)
         return [r.target_key for r in rows]
+
+    def active_targets_for(
+        self,
+        scope: str,
+        scope_id: Optional[str],
+        source_keys: List[str],
+        type: str = "relates_to",
+    ) -> Dict[str, List[str]]:
+        """BATCH form of ``active_targets``: the ordered active targets of
+        ``type`` for MANY source keys in one ``(scope, scope_id)``, in ONE query.
+
+        Mirrors the ``superseded_targets`` batching precedent. Recall's one-level
+        expansion groups its primaries by ``(scope, scope_id)`` already, so one
+        call per group replaces one query per primary (the N+1 this fixes).
+
+        Returns ``{source_key: [target_key, ...]}`` keyed by the CALLER's
+        original key strings, with each list in the same ``(rank, created_at)``
+        order single-key ``active_targets`` returns. A source key with no active
+        edges is ABSENT from the mapping (callers use ``.get(key, [])`` and treat
+        absence as "the store has nothing", which is what triggers the legacy
+        ``related_keys`` fallback).
+        """
+        if not source_keys:
+            return {}
+        sentinel = self._to_sentinel(scope_id)
+        # Map sanitized -> caller's original, as superseded_targets does. A dict
+        # also collapses duplicate inputs, so the IN list carries no repeats.
+        sanitized = {self._sanitize_key(k): k for k in source_keys}
+        with SessionLocal() as db:
+            rows = (
+                db.query(MemoryRelationshipModel)
+                .filter(
+                    MemoryRelationshipModel.scope == scope,
+                    MemoryRelationshipModel.scope_id == sentinel,
+                    MemoryRelationshipModel.type == type,
+                    MemoryRelationshipModel.status == "active",
+                    MemoryRelationshipModel.source_key.in_(list(sanitized.keys())),
+                )
+                .all()
+            )
+        grouped: Dict[str, List[Any]] = {}
+        for row in rows:
+            original = sanitized.get(row.source_key)
+            if original is None:  # pragma: no cover - IN filter makes this unreachable
+                continue
+            grouped.setdefault(original, []).append(row)
+        out: Dict[str, List[str]] = {}
+        for original, group in grouped.items():
+            group.sort(key=_rank_then_created)
+            out[original] = [r.target_key for r in group]
+        return out
 
     def is_superseded(self, scope: str, scope_id: Optional[str], key: str) -> bool:
         """True iff an ACTIVE ``supersedes`` edge TARGETS ``key`` (FR-4.6 ranking

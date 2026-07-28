@@ -22,13 +22,19 @@ Scenarios:
 """
 
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database as db_mod
-from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
+from cli_agent_orchestrator.clients.database import (
+    Base,
+    MemoryMetadataModel,
+    MemoryRelationshipModel,
+)
 from cli_agent_orchestrator.services import memory_relationship_service as mrs_mod
 from cli_agent_orchestrator.services.memory_relationship_service import (
     EdgeInput,
@@ -53,7 +59,31 @@ def bound(monkeypatch, db_engine):
     return Session
 
 
-def _seed_memory(db_engine, key, scope="global", scope_id=None, body="body"):
+def _seed_memory(db_engine, key, scope="global", scope_id=None, body=None, body_dir=None):
+    """Seed a memory_metadata row.
+
+    ``body`` is the memory's CONTENT. Memory bodies live in files, not in
+    ``memory_metadata`` (the table has no body/content column), so a body is
+    only storable when the caller supplies ``body_dir``: the file is written
+    there and ``file_path`` points at it, making the content genuinely
+    retrievable from the row.
+
+    This signature deliberately refuses to accept-and-discard a body. An earlier
+    version took ``body="body"`` and silently dropped it, which made every
+    "the secret must not leak" assertion pass vacuously — the secret had never
+    been written anywhere. If you pass ``body`` you MUST pass ``body_dir``.
+    """
+    if body is not None and body_dir is None:
+        raise AssertionError(
+            "_seed_memory: body requires body_dir — a body with nowhere to live "
+            "would be discarded, making content-leak assertions vacuous"
+        )
+    if body is not None:
+        file_path = str(Path(body_dir) / f"{key}.md")
+        Path(body_dir).mkdir(parents=True, exist_ok=True)
+        Path(file_path).write_text(body, encoding="utf-8")
+    else:
+        file_path = f"/{key}.md"
     Session = sessionmaker(bind=db_engine)
     s = Session()
     try:
@@ -64,7 +94,7 @@ def _seed_memory(db_engine, key, scope="global", scope_id=None, body="body"):
                 memory_type="project",
                 scope=scope,
                 scope_id=scope_id,
-                file_path=f"/{key}.md",
+                file_path=file_path,
                 tags="t",
             )
         )
@@ -460,23 +490,50 @@ def test_s6_legacy_related_keys_unconverted_still_expands(bound, db_engine, tmp_
     ), f"unconverted legacy related_keys must still expand; got {keys}"
 
 
-def test_s1_composed_path_and_content_free(bound, db_engine):
+def test_s1_composed_path_and_content_free(bound, db_engine, tmp_path):
     """S1 (end-to-end) + SEC-IP4 content-free: a compiler-written edge is
     projectable and every read surface (list DTO, active_targets) exposes only
-    content-free fields — no body/body_hash/prompt. (See Also/recall/graph
-    composition over MemoryService is covered by the provider + memory_service
-    suites; here we assert the store->DTO path is content-free.)"""
+    content-free fields — no body/body_hash/prompt.
+
+    The secret is written to the seeded memories' real FILES, and those files are
+    reachable from the store's own rows (``memory_metadata.file_path``). That is
+    what gives this assertion a genuine failure mode: a projection that resolved
+    an endpoint's ``file_path`` and inlined its content — the plausible way this
+    boundary would actually leak — turns the test RED.
+
+    Guarding the guard: the test asserts the secret IS retrievable through the
+    row before asserting the DTO omits it. Without that first assertion the
+    whole check passes vacuously whenever the content was never stored, which is
+    precisely the defect this test previously had (it passed a ``body`` argument
+    that ``_seed_memory`` silently discarded).
+    """
+    secret = "SECRET BODY TEXT that must never leak"
     for k in ("a", "b"):
-        _seed_memory(db_engine, k, body="SECRET BODY TEXT that must never leak")
+        _seed_memory(db_engine, k, body=secret, body_dir=tmp_path / "wiki")
+    # PRE-ASSERTION: the secret is genuinely stored and reachable from the row,
+    # so "not in the DTO" is a real claim about the projection.
+    Session = sessionmaker(bind=db_engine)
+    s = Session()
+    try:
+        row = s.query(MemoryMetadataModel).filter(MemoryMetadataModel.key == "a").first()
+        assert row is not None and row.file_path
+        assert secret in Path(row.file_path).read_text(
+            encoding="utf-8"
+        ), "content must actually exist behind the row, or the leak check is vacuous"
+    finally:
+        s.close()
+
     svc = _svc()
     svc.replace_set("global", None, "a", "compiler", "relates_to", [EdgeInput("b")])
     # active_targets is the See-Also/recall projection helper
-    assert svc.active_targets("global", None, "a") == ["b"]
+    targets = svc.active_targets("global", None, "a")
+    assert targets == ["b"]
+    assert secret not in str(targets), "active_targets must project keys only, never content"
     dto = svc.list_relationships("global", None, "a")[0]
     d = dto.to_dict()
-    for forbidden in ("body", "body_hash", "prompt"):
+    for forbidden in ("body", "body_hash", "prompt", "content", "file_path"):
         assert forbidden not in d, f"DTO must be content-free ({forbidden})"
-    assert "SECRET BODY" not in str(d), "no memory body may leak into the DTO"
+    assert secret not in str(d), "no memory body may leak into the DTO"
 
 
 def test_secs12_audit_written_and_content_free(bound, db_engine, tmp_path, monkeypatch):
@@ -570,3 +627,343 @@ def test_stale_flag_and_filter(bound, db_engine):
     all_edges = svc.list_relationships("global", None, "a")
     assert all_edges and all_edges[0].stale is True
     assert len(svc.list_relationships("global", None, "a", stale_only=True)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# PR #524 review-round regressions (each fails on the pre-fix code)
+# --------------------------------------------------------------------------- #
+def test_rank_then_created_handles_null_and_naive_created_at():
+    """FR-3.1/FR-3.2: the sort key never raises on a NULL or naive ``created_at``.
+
+    Why this is asserted on the sort FUNCTION and not through a DB round-trip:
+    ``DATABASE_URL`` is SQLite-only (constants.py) and SQLite does not persist
+    timezone offsets, so every ``created_at`` READ BACK from the DB is naive —
+    including on the ``DateTime(timezone=True)`` column. A DB-level test can
+    therefore never produce the naive/aware mix, and asserting there would pass
+    whether or not the fix is present (a vacuous test).
+
+    The mix IS reachable at the function boundary: ``_utcnow`` stamps an AWARE
+    value, so a row object still holding its Python-side default (not yet
+    refreshed from the DB) sorts aware, while a NULL row falls back to the
+    sentinel and any DB-loaded row is naive. Pre-fix the key was
+    ``r.created_at or datetime.min`` — a NAIVE sentinel — so mixing it with an
+    aware value raised ``TypeError: can't compare offset-naive and offset-aware
+    datetimes``. Both sides are now normalised to tz-aware UTC.
+
+    Equal ranks force the datetime comparison; with distinct ranks the tuple's
+    first element decides and ``created_at`` is never compared.
+    """
+
+    class _Row:
+        def __init__(self, rank, created_at, target_key):
+            self.rank = rank
+            self.created_at = created_at
+            self.target_key = target_key
+
+    aware = _Row(1, datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc), "t-aware")
+    naive = _Row(1, datetime(2026, 6, 1, 12, 0), "t-naive")
+    nulled = _Row(1, None, "t-null")
+
+    # Pre-fix: sorting these together raises TypeError.
+    rows = [aware, nulled, naive]
+    rows.sort(key=mrs_mod._rank_then_created)
+    assert [r.target_key for r in rows] == ["t-null", "t-naive", "t-aware"], (
+        "NULL sorts first (earliest instant), then the naive value read as UTC, "
+        "then the later aware value"
+    )
+    # Every normalised key is tz-aware, so any pair is comparable.
+    for row in rows:
+        assert mrs_mod._sort_dt(row.created_at).tzinfo is not None
+
+
+def test_active_targets_orders_by_rank_then_created_at(bound, db_engine):
+    """FR-3.1 through the real DB path: a NULL ``created_at`` row alongside a
+    populated one sorts without raising, and the NULL row comes first.
+
+    This is the end-to-end companion to the function-level test above. On SQLite
+    both values read back naive, so this cannot reproduce the naive/aware
+    TypeError — it guards the NULL-fallback ordering itself.
+    """
+    for k in ("src", "t-null", "t-populated"):
+        _seed_memory(db_engine, k)
+    svc = _svc()
+    svc.create("global", None, "src", "t-populated", "relates_to", "human", rank=1)
+    svc.create("global", None, "src", "t-null", "relates_to", "human", rank=1)
+    Session = sessionmaker(bind=db_engine)
+    s = Session()
+    try:
+        row = (
+            s.query(MemoryRelationshipModel)
+            .filter(MemoryRelationshipModel.target_key == "t-null")
+            .first()
+        )
+        assert row is not None
+        row.created_at = None
+        s.commit()
+    finally:
+        s.close()
+
+    targets = svc.active_targets("global", None, "src")
+    assert sorted(targets) == ["t-null", "t-populated"]
+    assert targets[0] == "t-null", "the NULL-created_at row sorts first"
+
+
+def test_active_targets_for_batches_many_sources(bound, db_engine):
+    """FR-2.1/FR-2.5: the batched read returns per-source ordered targets and
+    matches single-key ``active_targets`` for every source."""
+    for k in ("s1", "s2", "s3", "t1", "t2", "t3"):
+        _seed_memory(db_engine, k)
+    svc = _svc()
+    # s1 -> t2 (rank 2), t1 (rank 1): rank decides the order, not insertion.
+    svc.create("global", None, "s1", "t2", "relates_to", "compiler", rank=2)
+    svc.create("global", None, "s1", "t1", "relates_to", "compiler", rank=1)
+    svc.create("global", None, "s2", "t3", "relates_to", "compiler")
+    # s3 has no edges at all.
+    out = svc.active_targets_for("global", None, ["s1", "s2", "s3"])
+    assert out["s1"] == ["t1", "t2"], "must honour (rank, created_at) order"
+    assert out["s2"] == ["t3"]
+    assert "s3" not in out, "a source with no active edges is absent, not empty"
+    # Batched result agrees with the single-key helper for every source.
+    for k in ("s1", "s2", "s3"):
+        assert out.get(k, []) == svc.active_targets("global", None, k)
+    # Empty input short-circuits.
+    assert svc.active_targets_for("global", None, []) == {}
+
+
+def test_active_targets_for_excludes_non_active_and_other_types(bound, db_engine):
+    """FR-2.5: the batched read applies the same status/type filters as the
+    single-key helper — only ACTIVE edges of the requested type."""
+    for k in ("s", "t-active", "t-rejected", "t-contra"):
+        _seed_memory(db_engine, k)
+    svc = _svc()
+    svc.create("global", None, "s", "t-active", "relates_to", "human")
+    rejected = svc.create("global", None, "s", "t-rejected", "relates_to", "human")
+    svc.reject(rejected.id)
+    svc.create("global", None, "s", "t-contra", "contradiction", "wiki_lint")
+    out = svc.active_targets_for("global", None, ["s"])
+    assert out["s"] == ["t-active"]
+    contra = svc.active_targets_for("global", None, ["s"], type="contradiction")
+    assert contra["s"] == ["t-contra"]
+
+
+def test_list_relationships_source_keys_bounds_the_fetch(bound, db_engine):
+    """FR-2.3: the ``source_keys`` filter bounds which rows are fetched."""
+    for k in ("in1", "in2", "out1", "t"):
+        _seed_memory(db_engine, k)
+    svc = _svc()
+    for src in ("in1", "in2", "out1"):
+        svc.create("global", None, src, "t", "relates_to", "human")
+    bounded = svc.list_relationships("global", None, source_keys=["in1", "in2"])
+    assert sorted(d.source_key for d in bounded) == ["in1", "in2"]
+    # An EMPTY node set means no edges — not "unfiltered".
+    assert svc.list_relationships("global", None, source_keys=[]) == []
+    # Absent filter still returns everything.
+    assert len(svc.list_relationships("global", None)) == 3
+
+
+def test_validate_attributes_rejects_unserialisable_as_valueerror(bound, db_engine):
+    """FR-4.1/FR-4.2: a non-JSON-serialisable attribute raises ValueError, not
+    TypeError.
+
+    A TypeError would escape the REST layer's ``ValueError -> 400`` mapping (an
+    unhandled 500) and defeat ``replace_set``'s per-edge soft rejection, which
+    catches only ValueError.
+    """
+    _seed_memory(db_engine, "a")
+    _seed_memory(db_engine, "b")
+    svc = _svc()
+    with pytest.raises(ValueError, match="JSON-serialisable"):
+        svc.create("global", None, "a", "b", "relates_to", "human", attributes={"bad": {1, 2, 3}})
+
+
+def test_replace_set_soft_rejects_unserialisable_edge_not_whole_batch(bound, db_engine):
+    """FR-4.2: the per-edge soft rejection now covers an unserialisable
+    attribute — pre-fix the TypeError aborted the entire batch."""
+    for k in ("s", "good", "bad"):
+        _seed_memory(db_engine, k)
+    svc = _svc()
+    report = svc.replace_set(
+        "global",
+        None,
+        "s",
+        "compiler",
+        "relates_to",
+        [EdgeInput("bad", attributes={"x": {1, 2}}), EdgeInput("good")],
+    )
+    assert report.added == 1, "the good edge must still land"
+    assert report.rejected, "the unserialisable edge must be soft-rejected"
+    assert svc.active_targets("global", None, "s") == ["good"]
+
+
+def test_attributes_size_error_reports_bytes(bound, db_engine):
+    """FR-4.3: the size message reports the unit actually enforced (bytes).
+
+    A multi-byte payload is used so a char count and a byte count differ — a
+    message still reporting chars would show the smaller, misleading number.
+    """
+    _seed_memory(db_engine, "a")
+    _seed_memory(db_engine, "b")
+    svc = _svc()
+    # Each "€" is 3 UTF-8 bytes, so chars << bytes.
+    oversized = {"k": "€" * 1200}
+    with pytest.raises(ValueError, match=r"exceed 2048 bytes \(\d+ bytes\)") as e:
+        svc.create("global", None, "a", "b", "relates_to", "human", attributes=oversized)
+    assert "chars" not in str(e.value)
+
+
+def test_superseded_keys_does_not_cross_project_scope_ids(bound, db_engine, monkeypatch):
+    """FR-5.4: the same key in two DIFFERENT project scope_ids must not share a
+    superseded verdict.
+
+    ``memory_metadata`` is unique on ``(key, scope, scope_id)``, so "guide" in
+    project P1 and "guide" in project P2 are DIFFERENT memories. Pre-fix
+    ``_superseded_keys`` returned ``{(scope, key)}``, so superseding P1's copy
+    marked P2's untouched copy as superseded too whenever a recall spanned both
+    projects. The identity is now the full ``(scope, scope_id, key)`` 3-tuple.
+    """
+    from datetime import datetime as _dt
+
+    from cli_agent_orchestrator.models.memory import Memory
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+
+    # "guide" exists in BOTH projects; only p1's copy is superseded.
+    _seed_memory(db_engine, "guide", scope="project", scope_id="p1")
+    _seed_memory(db_engine, "newer", scope="project", scope_id="p1")
+    _seed_memory(db_engine, "guide", scope="project", scope_id="p2")
+    _svc().create("project", "p1", "newer", "guide", "supersedes", "human")
+
+    def _mem(key, scope_id):
+        now = _dt.now(timezone.utc)
+        return Memory(
+            id=str(uuid.uuid4()),
+            key=key,
+            memory_type="project",
+            scope="project",
+            scope_id=scope_id,
+            file_path=f"/{key}.md",
+            tags="",
+            created_at=now,
+            updated_at=now,
+        )
+
+    svc = MemoryService()
+    p1_mem, p2_mem = _mem("guide", "p1"), _mem("guide", "p2")
+    hits = svc._superseded_keys([p1_mem, p2_mem])
+
+    # BEHAVIOURAL assertion: the demotion predicate recall actually applies must
+    # mark p1's copy and spare p2's. Expressed exactly as the recall sort does,
+    # so this fails for a set keyed too loosely REGARDLESS of tuple arity.
+    def _is_demoted(m):
+        return (m.scope, svc._effective_scope_id(m), m.key) in hits or (
+            m.scope,
+            m.key,
+        ) in hits
+
+    assert _is_demoted(p1_mem), "p1's superseded copy must be demoted"
+    assert not _is_demoted(
+        p2_mem
+    ), "p2's untouched copy must NOT be demoted — a (scope, key) set cross-project-demotes it"
+    # And the identity stored is the full 3-tuple.
+    assert ("project", "p1", "guide") in hits
+    assert ("project", "p2", "guide") not in hits
+
+
+def test_expand_related_does_not_query_the_store_per_primary(bound, db_engine, monkeypatch):
+    """FR-2.2: the store read in recall's expansion is BATCHED per
+    (scope, scope_id) — one call for N primaries, not one per primary.
+
+    A correctness test cannot catch this: an N+1 returns exactly the right
+    answers, just with N queries. So the guard counts service calls. The legacy
+    ``related_keys`` fallback beside it was already batched; the store read was
+    not, which made the AUTHORITATIVE path the slow one.
+    """
+    from datetime import datetime as _dt
+
+    from cli_agent_orchestrator.models.memory import Memory
+    from cli_agent_orchestrator.services import memory_service as ms_mod
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+
+    primaries_keys = ["p1", "p2", "p3", "p4", "p5"]
+    for k in primaries_keys + ["t1"]:
+        _seed_memory(db_engine, k)
+    svc_rel = _svc()
+    for k in primaries_keys:
+        svc_rel.create("global", None, k, "t1", "relates_to", "compiler")
+
+    calls = {"batched": 0, "per_key": 0}
+    real_batched = mrs_mod.MemoryRelationshipService.active_targets_for
+    real_single = mrs_mod.MemoryRelationshipService.active_targets
+
+    def _counting_batched(self, *a, **kw):
+        calls["batched"] += 1
+        return real_batched(self, *a, **kw)
+
+    def _counting_single(self, *a, **kw):
+        calls["per_key"] += 1
+        return real_single(self, *a, **kw)
+
+    monkeypatch.setattr(mrs_mod.MemoryRelationshipService, "active_targets_for", _counting_batched)
+    monkeypatch.setattr(mrs_mod.MemoryRelationshipService, "active_targets", _counting_single)
+    monkeypatch.setattr(ms_mod, "MEMORY_BASE_DIR", Path(str(db_engine.url).split("///")[-1]).parent)
+
+    def _mem(key):
+        now = _dt.now(timezone.utc)
+        return Memory(
+            id=str(uuid.uuid4()),
+            key=key,
+            memory_type="project",
+            scope="global",
+            scope_id=None,
+            file_path=f"/{key}.md",
+            tags="",
+            created_at=now,
+            updated_at=now,
+        )
+
+    svc = MemoryService()
+    svc._expand_related([_mem(k) for k in primaries_keys])
+
+    assert calls["batched"] == 1, (
+        f"5 primaries in ONE (scope, scope_id) must cost ONE batched store read, "
+        f"got {calls['batched']}"
+    )
+    assert calls["per_key"] == 0, (
+        f"the per-primary active_targets call is the N+1 — it must not be used in "
+        f"the expansion path, got {calls['per_key']} calls"
+    )
+
+
+def test_patch_rejects_unserialisable_attributes_as_valueerror(bound, db_engine):
+    """FR-4.1 on the PATCH path: ``patch`` validates attributes through the same
+    helper as ``create``, so it must also raise ValueError (not TypeError).
+
+    The PATCH handler maps ValueError to 404-or-400; a TypeError would surface as
+    a 500 there exactly as it did on create. Reviewer finding: the create path had
+    a test and the patch path did not, even though both call the same validator.
+    """
+    _seed_memory(db_engine, "a")
+    _seed_memory(db_engine, "b")
+    svc = _svc()
+    dto = svc.create("global", None, "a", "b", "relates_to", "human")
+    with pytest.raises(ValueError, match="JSON-serialisable"):
+        svc.patch(dto.id, attributes={"bad": {1, 2}})
+    # The row is unchanged (validation happens before the field is assigned).
+    assert svc.get(dto.id).attributes is None
+
+
+def test_list_relationships_source_keys_drops_unsanitizable_key(bound, db_engine):
+    """A malformed key in the node set must not abort the whole query.
+
+    Reviewer finding: ``source_keys`` sanitizes each key, and ``_sanitize_key``
+    RAISES for a key that reduces to empty (e.g. "..."). If that propagated, the
+    graph provider's ``except`` branch would degrade the ENTIRE scope to a
+    relationship-free graph because of one bad index entry. Unsanitizable keys are
+    dropped from the filter instead — they can never match a stored row anyway,
+    since every stored source_key was sanitized at write time.
+    """
+    _seed_memory(db_engine, "good")
+    _seed_memory(db_engine, "t")
+    svc = _svc()
+    svc.create("global", None, "good", "t", "relates_to", "human")
+    dtos = svc.list_relationships("global", None, source_keys=["good", "...", "___"])
+    assert [d.source_key for d in dtos] == ["good"], "the valid key's edge must survive"

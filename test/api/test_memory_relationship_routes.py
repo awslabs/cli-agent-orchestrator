@@ -56,3 +56,47 @@ def test_get_memory_relationships_resolves_to_relationships_handler():
                 matched = r.name
                 break
     assert matched == "list_relationships_endpoint"
+
+
+def test_create_maps_unserialisable_attributes_to_400_not_500(monkeypatch):
+    """FR-4.2 at the HTTP boundary: an unserialisable attribute value must
+    surface as a 400, not an unhandled 500.
+
+    Every relationship handler catches ONLY ValueError. The service's
+    ``_validate_attributes`` previously let ``json.dumps``' TypeError escape, so
+    this input produced an unhandled 500. The handler is driven directly (no
+    server) and the service's real validator runs, so this asserts the actual
+    exception-mapping contract rather than a stub's.
+    """
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from cli_agent_orchestrator.api.main import (
+        RelationshipCreateRequest,
+        create_relationship_endpoint,
+    )
+
+    body = RelationshipCreateRequest(
+        scope="global",
+        source_key="a",
+        target_key="b",
+        type="relates_to",
+        origin="human",
+    )
+    # A set is not JSON-serialisable. Bypass pydantic's own coercion by setting
+    # the attribute post-construction — the point under test is the SERVICE's
+    # validator and the handler's except clause, not request-model validation.
+    object.__setattr__(body, "attributes", {"bad": {1, 2, 3}})
+
+    try:
+        asyncio.run(create_relationship_endpoint(body, _scopes=[]))
+    except HTTPException as e:
+        assert e.status_code == 400, f"must map to 400, got {e.status_code}"
+        assert "JSON-serialisable" in str(e.detail)
+    except TypeError as e:  # pragma: no cover - this is the pre-fix failure
+        raise AssertionError(
+            f"TypeError escaped the handler and would surface as a 500: {e}"
+        ) from e
+    else:
+        raise AssertionError("expected an HTTPException(400)")

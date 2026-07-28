@@ -1561,10 +1561,23 @@ class MemoryService:
         return None
 
     def _superseded_keys(self, memories: list) -> set:
-        """Return {(scope, key)} for memories that are the target of an active
-        supersedes edge (FR-4.6 ranking input). BATCHED per (scope, scope_id) —
-        one query per scope group, not one per memory (avoids N queries on a
-        large recall). Best-effort; empty on failure."""
+        """Return ``{(scope, scope_id, key)}`` for memories that are the target of
+        an active supersedes edge (FR-4.6 ranking input). BATCHED per
+        (scope, scope_id) — one query per scope group, not one per memory (avoids
+        N queries on a large recall). Best-effort; empty on failure.
+
+        The identity is the FULL 3-tuple matching ``MemoryMetadataModel``'s
+        ``(key, scope, scope_id)`` uniqueness. Keying on ``(scope, key)`` alone
+        would let the same key in one project's scope_id mark a DIFFERENT,
+        non-superseded memory as superseded whenever a recall spans projects.
+
+        ``scope_id`` here is the LOGICAL value from ``_effective_scope_id`` —
+        ``None`` for global — never the ``""`` sentinel. That sentinel belongs to
+        the ``memory_relationships`` table's own NOT NULL column (it exists so
+        the dedup UNIQUE index is total); ``MemoryMetadataModel.scope_id`` is
+        genuinely nullable, and the Memory objects compared against this set
+        carry the logical value.
+        """
         if not memories:
             return set()
         try:
@@ -1585,7 +1598,7 @@ class MemoryService:
             except Exception:  # noqa: BLE001 — non-blocking
                 continue
             for k in hits:
-                out.add((g_scope, k))
+                out.add((g_scope, g_scope_id, k))
         return out
 
     def _expand_related(self, primaries: list) -> list:
@@ -1626,26 +1639,39 @@ class MemoryService:
         for m in primaries:
             groups.setdefault((m.scope, self._effective_scope_id(m)), []).append(m)
         legacy_lookups: dict = {}
+        # Batch-load the STORE's active relates_to targets per (scope, scope_id)
+        # too — one query per group, matching the legacy lookup's grouping. A
+        # per-primary active_targets call here was an N+1 on the authoritative
+        # read path while the legacy fallback beside it was already batched.
+        store_lookups: dict = {}
         for (g_scope, g_scope_id), members in groups.items():
+            member_keys = [m.key for m in members]
             try:
                 legacy_lookups[(g_scope, g_scope_id)] = self._related_keys_lookup(
-                    [m.key for m in members], g_scope, g_scope_id
+                    member_keys, g_scope, g_scope_id
                 )
             except Exception as e:  # noqa: BLE001 — non-blocking
                 logger.debug(f"related_keys lookup failed for {g_scope}: {e}")
                 legacy_lookups[(g_scope, g_scope_id)] = {}
+            if rel_svc is None:
+                store_lookups[(g_scope, g_scope_id)] = {}
+                continue
+            try:
+                store_lookups[(g_scope, g_scope_id)] = rel_svc.active_targets_for(
+                    g_scope, g_scope_id, member_keys, type="relates_to"
+                )
+            except Exception as e:  # noqa: BLE001 — non-blocking
+                logger.debug(f"active_targets_for failed for {g_scope}: {e}")
+                store_lookups[(g_scope, g_scope_id)] = {}
 
         for primary in primaries:
             primary_scope_id = self._effective_scope_id(primary)
-            targets: list = []
-            if rel_svc is not None:
-                try:
-                    targets = rel_svc.active_targets(
-                        primary.scope, primary_scope_id, primary.key, type="relates_to"
-                    )
-                except Exception as e:  # noqa: BLE001 — non-blocking
-                    logger.debug(f"active_targets failed for {primary.key}: {e}")
-                    targets = []
+            # Absent from the map == the store has no active edges for this
+            # primary, which is exactly the condition the legacy fallback below
+            # keys on (the store stays authoritative whenever it HAS edges).
+            targets: list = list(
+                store_lookups.get((primary.scope, primary_scope_id), {}).get(primary.key) or []
+            )
             # Legacy fallback: only when the store yielded nothing for this
             # primary (the store is authoritative when it has edges).
             if not targets:
@@ -1983,7 +2009,16 @@ class MemoryService:
                 try:
                     superseded = self._superseded_keys(results)
                     if superseded:
-                        results.sort(key=lambda m: 1 if (m.scope, m.key) in superseded else 0)
+                        # Full (scope, scope_id, key) identity — see
+                        # _superseded_keys. A (scope, key) comparison would
+                        # cross-project-demote a same-named memory.
+                        results.sort(
+                            key=lambda m: (
+                                1
+                                if (m.scope, self._effective_scope_id(m), m.key) in superseded
+                                else 0
+                            )
+                        )
                 except Exception as e:  # noqa: BLE001 — non-blocking
                     logger.debug(f"superseded demotion skipped: {e}")
             if not scope:

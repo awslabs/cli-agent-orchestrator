@@ -245,6 +245,34 @@ class TestMemoryProviderEdgeCases:
         assert view.edges == []
 
     @pytest.mark.asyncio
+    async def test_stored_edge_to_out_of_node_set_target_is_dropped(
+        self, svc, db_engine, monkeypatch
+    ):
+        """FR-2.3a: the node-set query bound must NOT replace the target check.
+
+        The provider now passes ``source_keys=<node set>`` to bound the rows
+        FETCHED, but that bounds only the SOURCE side. Here source "a" IS in the
+        node set while its target "ghost" is NOT (no index entry), so the row is
+        fetched and must still be dropped in Python. Without the surviving
+        both-endpoints check this would emit an edge to a non-existent node,
+        breaking GraphView's endpoint validation and FR-9's no-cross-scope-edge
+        guarantee — i.e. a performance fix turning into a correctness bug.
+        """
+        path_a = _write_topic(svc, "a")
+        _write_index(svc, ["a"])
+        _insert_row(db_engine, "a", path_a, tags="t")
+        # A real, ACTIVE store row whose target is outside this scope's node set.
+        _insert_relationship(db_engine, "a", "ghost", type_="relates_to", origin="compiler")
+        _disable_llm(monkeypatch)
+        _patch_lint_env(monkeypatch, db_engine, svc)
+        provider = MemoryGraphProvider(memory_service=svc)
+
+        view = await provider.project(scope="global")
+
+        assert {n.id for n in view.nodes} == {"a"}
+        assert view.edges == [], "an edge whose target is outside the node set must be dropped"
+
+    @pytest.mark.asyncio
     async def test_session_scope_id_filters_shared_index(self, svc, db_engine, monkeypatch):
         """FR-9(c): session/agent entries live in the shared global index
         with scope_id embedded in the entry path; projecting one session
