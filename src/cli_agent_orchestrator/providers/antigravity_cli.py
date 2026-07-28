@@ -403,11 +403,18 @@ class AntigravityCliProvider(BaseProvider):
     def _unregister_mcp_servers(self) -> None:
         """Remove the MCP servers this provider registered.
 
-        Called via ``asyncio.to_thread`` from ``cleanup()`` so the lock is
-        never acquired on the event-loop thread. Shares
-        ``_MCP_CONFIG_WRITE_LOCK`` with ``_register_mcp_servers`` so this
-        can't interleave with another terminal's concurrent registration and
-        corrupt the shared ``mcp_config.json`` read-modify-write.
+        Scheduled via ``loop.run_in_executor`` (fire-and-forget) from
+        ``cleanup()`` when called on the event-loop thread, or run inline
+        when already on a worker thread. Shares ``_MCP_CONFIG_WRITE_LOCK``
+        with ``_register_mcp_servers`` so this can't interleave with another
+        terminal's concurrent registration and corrupt the shared
+        ``mcp_config.json`` read-modify-write.
+
+        An ownership check ensures only entries whose
+        ``env.CAO_TERMINAL_ID`` matches this instance's terminal_id are
+        removed — entries belonging to a newer terminal that re-registered
+        under the same server name are left intact, making fire-and-forget
+        scheduling safe regardless of executor ordering.
         """
         if not self._mcp_server_names:
             return
@@ -422,6 +429,9 @@ class AntigravityCliProvider(BaseProvider):
                 servers = config.get("mcpServers") if isinstance(config, dict) else None
                 if isinstance(servers, dict):
                     for name in self._mcp_server_names:
+                        entry = servers.get(name)
+                        if isinstance(entry, dict) and entry.get("env", {}).get("CAO_TERMINAL_ID") != self.terminal_id:
+                            continue  # belongs to a different terminal — leave it
                         servers.pop(name, None)
                     tmp_path = path.with_suffix(".json.tmp")
                     with open(tmp_path, "w") as f:

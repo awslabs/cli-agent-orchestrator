@@ -1,5 +1,6 @@
 """Unit tests for the Antigravity CLI (``agy``) provider."""
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -656,6 +657,36 @@ def test_unregister_handles_non_dict_config(tmp_path, payload):
     with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
         p.cleanup()  # non-dict config -> no raise, state reset
     assert p._mcp_server_names == []
+
+
+def test_unregister_skips_entry_owned_by_different_terminal(tmp_path):
+    """_unregister_mcp_servers must only remove entries whose
+    env.CAO_TERMINAL_ID matches this terminal — entries re-registered by
+    a newer terminal under the same server name must survive."""
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text(json.dumps({
+        "mcpServers": {
+            "cao-mcp-server": {
+                "command": "cao-mcp-server",
+                "args": [],
+                "env": {"CAO_TERMINAL_ID": "new-terminal-99"},
+            },
+            "cao-ops-mcp-server": {
+                "command": "cao-ops-mcp-server",
+                "args": [],
+                "env": {"CAO_TERMINAL_ID": "test-tid"},
+            },
+        }
+    }))
+    p = make_provider()  # terminal_id="test-tid"
+    p._mcp_server_names = ["cao-mcp-server", "cao-ops-mcp-server"]
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
+        p._unregister_mcp_servers()
+    result = json.loads(cfg.read_text())
+    # "cao-mcp-server" belongs to new-terminal-99 -> must survive
+    assert "cao-mcp-server" in result["mcpServers"]
+    # "cao-ops-mcp-server" belongs to test-tid -> must be removed
+    assert "cao-ops-mcp-server" not in result["mcpServers"]
 
 
 # --------------------------------------------------------------------------- #
