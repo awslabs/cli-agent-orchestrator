@@ -865,6 +865,8 @@ def promote_cmd(agent_name, do_apply, min_recalls, profile_path):
     )
     if report.skipped:
         click.echo(f"  skipped (at {MAX_LESSONS}-lesson cap): {', '.join(report.skipped)}")
+
+
 # --------------------------------------------------------------------------- #
 # Relationship review surface (issue #511, U7). Thin adapter over the single
 # MemoryRelationshipService — list proposals, inspect endpoints + provenance,
