@@ -35,8 +35,7 @@ import pytest
 
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.services import inbox_service
-from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services import inbox_service, terminal_service
 from cli_agent_orchestrator.services.control_input_contract import (
     REASON_COPY_MODE_ACTIVE,
     REASON_IDENTITY_MISMATCH,
