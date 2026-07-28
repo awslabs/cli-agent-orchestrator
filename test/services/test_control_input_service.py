@@ -2753,9 +2753,18 @@ class TestCommandClassGuard:
     claim — and undeclared payloads never see the guard at all."""
 
     def _wire(
-        self, monkeypatch, resolved, adapter, plans, *, empty, turn_status=TerminalStatus.IDLE
+        self,
+        monkeypatch,
+        resolved,
+        adapter,
+        plans,
+        *,
+        empty,
+        turn_status=TerminalStatus.IDLE,
+        execution_close=None,
     ):
         from cli_agent_orchestrator.services import managed_launch_v2
+        from cli_agent_orchestrator.services.control_input_contract import SUBMISSION_SUBMITTED
 
         with service._native_kimi_dispatch_guard_lock:
             service._native_kimi_dispatch_times.clear()
@@ -2776,6 +2785,20 @@ class TestCommandClassGuard:
             lambda *a, **k: (adapter, plans, None),
         )
         monkeypatch.setattr(managed_launch_v2, "_observe_turn_state", lambda *a, **k: turn_status)
+        # The pre-write baseline capture and the r11 post-write execution
+        # observation: no real pane exists here, so both are staged.  The
+        # default close is the proven one — submitted with an evidence ref —
+        # and two-close tests pass their own (observed, ref) pair.
+        monkeypatch.setattr(
+            native_pane_input, "capture_execution_rows", lambda pane_id, pin, **k: []
+        )
+        if execution_close is None:
+            execution_close = (SUBMISSION_SUBMITTED, "capture-pane:%17:test:sha256:beef")
+        monkeypatch.setattr(
+            native_pane_input,
+            "observe_command_execution",
+            lambda pane_id, pin, **k: execution_close,
+        )
         if isinstance(empty, BaseException):
             monkeypatch.setattr(
                 native_pane_input, "observe_composer_empty", self._raising_observer(empty)
@@ -2797,13 +2820,17 @@ class TestCommandClassGuard:
 
         return _observe
 
-    def _declared(self, journal, monkeypatch, *, empty, resolved=None, **overrides):
+    def _declared(
+        self, journal, monkeypatch, *, empty, resolved=None, execution_close=None, **overrides
+    ):
         # 0.29.2 is the live-verified emptiness pin; an unpinned build is
         # the provider-unsupported case, pinned separately below.
         resolved = resolved or _seq_resolved(provider_version="0.29.2")
         adapter = _FakeSequenceAdapter()
         plans = {0: {"lines": ["/compact"]}}
-        wired = self._wire(monkeypatch, resolved, adapter, plans, empty=empty)
+        wired = self._wire(
+            monkeypatch, resolved, adapter, plans, empty=empty, execution_close=execution_close
+        )
         client = wired[0]
         result = _deliver_declared(journal, **overrides)
         return result, client, adapter, wired[1]
@@ -2848,6 +2875,15 @@ class TestCommandClassGuard:
         assert observations == [
             (PANE, native_pane_input.composer_emptiness_pin_for("kimi_cli", "0.29.2"))
         ]
+        # The r11 close: accepted only with the execution evidence attached
+        # — an accepted declared-command record with a null submission
+        # observation or evidence ref is the PR #48 defect class.
+        assert result.submission_observed == "submitted"
+        assert result.submission_evidence_ref == "capture-pane:%17:test:sha256:beef"
+        record = journal.find(CONTROL)
+        assert record.state == DELIVERED
+        assert record.submission_observed == "submitted"
+        assert record.submission_evidence_ref == "capture-pane:%17:test:sha256:beef"
 
     def test_a_provider_build_without_a_pin_is_provider_unsupported(self, monkeypatch, journal):
         """No proven emptiness determination for this exact build: refused
@@ -2950,6 +2986,127 @@ class TestCommandClassGuard:
         assert result.outcome == ACCEPTED
         assert result.request_schema_version == 3
         assert adapter.calls == [({"lines": ["/compact"]}, True)]
+
+
+class TestCommandTwoClose:
+    """The r11 two-close rule for declared commands (§4.1): transport
+    acceptance is not command execution — ``accepted`` only with the
+    pinned execution signal observed and its evidence journaled;
+    otherwise ``ambiguous``/``submission-unproven``, terminal, never a
+    retry licence."""
+
+    def _declared(self, journal, monkeypatch, *, execution_close, resolved=None, **overrides):
+        harness = TestCommandClassGuard()
+        resolved = resolved or _seq_resolved(provider_version="0.29.2")
+        adapter = _FakeSequenceAdapter()
+        harness._wire(
+            monkeypatch,
+            resolved,
+            adapter,
+            {0: {"lines": ["/compact"]}},
+            empty=True,
+            execution_close=execution_close,
+        )
+        result = _deliver_declared(journal, **overrides)
+        return result, adapter
+
+    def test_an_unproven_execution_closes_ambiguous_never_accepted(self, monkeypatch, journal):
+        result, adapter = self._declared(
+            journal, monkeypatch, execution_close=(SUBMISSION_UNKNOWN, None)
+        )
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        assert result.request_schema_version == 4
+        assert result.submission_observed == "unknown"
+        assert "execution signal" in result.detail
+        # The write happened; the close is terminal for automation — the
+        # exact-id reconcile replays the record and a re-POST never resends.
+        record = journal.find(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        assert record.submission_observed == "unknown"
+        looked_up = service.lookup_control_input(CONTROL, journal=journal)
+        assert looked_up.outcome == AMBIGUOUS
+        assert looked_up.reason_code == "submission-unproven"
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]  # exactly one write, ever
+
+    def test_a_resting_command_closes_unsubmitted_with_evidence(self, monkeypatch, journal):
+        result, _ = self._declared(
+            journal,
+            monkeypatch,
+            execution_close=(SUBMISSION_UNSUBMITTED, "capture-pane:%17:t2:sha256:cafe"),
+        )
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        assert result.submission_observed == "unsubmitted"
+        assert result.submission_evidence_ref == "capture-pane:%17:t2:sha256:cafe"
+
+    def test_a_same_id_repost_replays_the_ambiguous_record_with_zero_new_writes(
+        self, monkeypatch, journal
+    ):
+        result, adapter = self._declared(
+            journal, monkeypatch, execution_close=(SUBMISSION_UNKNOWN, None)
+        )
+        assert result.outcome == AMBIGUOUS
+        replay, _ = self._declared(journal, monkeypatch, execution_close=(SUBMISSION_UNKNOWN, None))
+        assert replay.outcome == AMBIGUOUS
+        assert replay.reason_code == "submission-unproven"
+        # One composer plan execution total — the replay answered from the
+        # journal, never from the pane.
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+
+    def test_a_build_without_the_execution_pin_is_refused_pre_write(self, monkeypatch, journal):
+        """Both pins are required: an emptiness pin alone would close on
+        transport facts — the PR #48 defect class."""
+        monkeypatch.setattr(native_pane_input, "command_execution_pin_for", lambda *a: None)
+        result, adapter = self._declared(journal, monkeypatch, execution_close=None)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PROVIDER_UNSUPPORTED
+        assert "execution observation" in result.detail
+        assert adapter.calls == []
+
+    def test_a_failed_baseline_capture_fails_the_guard_closed(self, monkeypatch, journal):
+        harness = TestCommandClassGuard()
+        resolved = _seq_resolved(provider_version="0.29.2")
+        adapter = _FakeSequenceAdapter()
+        harness._wire(monkeypatch, resolved, adapter, {0: {"lines": ["/compact"]}}, empty=True)
+        monkeypatch.setattr(
+            native_pane_input,
+            "capture_execution_rows",
+            lambda *a, **k: (_ for _ in ()).throw(NativePaneInputUnavailable("tmux died")),
+        )
+        # The baseline feeds the guard's observation, so an empty baseline
+        # is an unproven composer — zero bytes, never a guessed write.
+        monkeypatch.setattr(
+            native_pane_input,
+            "observe_composer_empty",
+            lambda pane_id, pin, **k: None if k.get("screen")() == [] else True,
+        )
+        result = _deliver_declared(journal)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_COMPOSER_NONEMPTY
+        assert adapter.calls == []
+
+    def test_every_accepted_declared_command_carries_execution_evidence(self, monkeypatch, journal):
+        """The PR #48 regression shape, forbidden outright: no accepted
+        declared-command record may have a null submission observation or
+        a null evidence reference."""
+        result, _ = self._declared(
+            journal,
+            monkeypatch,
+            execution_close=(SUBMISSION_SUBMITTED, "capture-pane:%17:t3:sha256:d00d"),
+        )
+        assert result.outcome == ACCEPTED
+        assert result.submission_observed is not None
+        assert result.submission_evidence_ref is not None
+        record = journal.find(CONTROL)
+        assert record.state == DELIVERED
+        assert record.submission_observed is not None
+        assert record.submission_evidence_ref is not None
+        # And the replayed answer carries the same evidence, not a null.
+        looked_up = service.lookup_control_input(CONTROL, journal=journal)
+        assert looked_up.outcome == ACCEPTED
+        assert looked_up.submission_observed == "submitted"
+        assert looked_up.submission_evidence_ref == "capture-pane:%17:t3:sha256:d00d"
 
 
 class TestPaneBusyDetailDiscriminators:

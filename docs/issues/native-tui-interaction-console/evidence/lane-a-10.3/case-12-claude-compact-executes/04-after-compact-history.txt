@@ -7,7 +7,7 @@
 │                        ▘▘ ▝▝                       │ Added Claude Opus 5 (`claude-opus-5`), now… │
 │     Sonnet 5 with xhigh effort · Claude Max ·      │ Added `sandbox.network.strictAllowlist` se… │
 │     <ACCOUNT>'s Organization          │ /release-notes for more                     │
-│   /…/pytest-508/cao_scratch_1030/worktree-claude   │                                             │
+│   /…/pytest-533/cao_scratch_1030/worktree-claude   │                                             │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 
  ⚠ 1 MCP server needs authentication · run /mcp

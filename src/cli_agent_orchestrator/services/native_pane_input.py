@@ -946,3 +946,207 @@ def observe_composer_empty(
         return _claude_composer_empty(rows)
     # A rule this build does not know proves nothing.
     return None
+
+
+# --- Declared-command execution observation (§4.1, r11 two-close rule) -------
+#
+# Transport acceptance is not command execution: a declared command is
+# closed ``accepted`` only when the provider/build-pinned execution signal
+# is observed on the pane within a bounded post-write window, with the
+# evidence reference journaled.  Otherwise the close is ``ambiguous`` with
+# the deployed ``submission-unproven`` reason — terminal for automation,
+# never a retry licence, never a forced completion.  The signals below are
+# the ones live-proven on the pinned builds (§10.3, evidence lane-a-10.3);
+# a provider/build without one refuses declared commands
+# ``provider-unsupported`` pre-write — both pins are required, never one.
+
+_RULE_KIMI_COMPACTION_SIGNAL = "kimi-compaction-signal"
+_RULE_CLAUDE_COMMAND_ECHO_RESPONSE = "claude-command-echo-response"
+
+
+@dataclass(frozen=True)
+class CommandExecutionPin:
+    """How one provider build's declared-command execution is observed.
+
+    ``rule`` names the signal matcher; ``signal`` is the short human name
+    for it (used in refusal/ambiguous detail strings); ``styled`` whether
+    the observation needs the escape-preserving capture (the composer
+    end-check shares the emptiness pin's need).  ``evidence`` records what
+    the pin was read from, per the same discipline as the emptiness pins.
+    """
+
+    provider: str
+    rule: str
+    signal: str
+    styled: bool
+    evidence: str
+
+
+_KIMI_EXECUTION_EVIDENCE = (
+    "live-proven on the installed Kimi Code 0.29.2 (§10.3, 2026-07-28, "
+    "evidence lane-a-10.3 case-08): a declared /compact drives the "
+    "compaction notice ' ● Compacting context...' in the transcript; the "
+    "occurrence count over a pre-write baseline distinguishes this "
+    "command's notice from any earlier compaction's"
+)
+
+_CLAUDE_EXECUTION_EVIDENCE = (
+    "live-proven on the installed Claude Code 2.1.220 (§10.3, 2026-07-28, "
+    "evidence lane-a-10.3 case-12): a declared command's own UI is the "
+    "'❯ <command>' echo row followed by a '⎿' response row (an ordinary "
+    "prompt echo draws no '⎿'); the pair count over a pre-write baseline "
+    "distinguishes this command's pair from any earlier one"
+)
+
+
+#: The per-provider+build execution pins.  Same scope as the emptiness
+#: pins — a build appears only with live evidence; an unpinned build
+#: refuses declared commands ``provider-unsupported`` pre-write.
+_COMMAND_EXECUTION_PINS: dict[str, dict[str, CommandExecutionPin]] = {
+    "kimi_cli": {
+        "0.29.2": CommandExecutionPin(
+            provider="kimi_cli",
+            rule=_RULE_KIMI_COMPACTION_SIGNAL,
+            signal="the compaction notice/UI",
+            styled=False,
+            evidence=_KIMI_EXECUTION_EVIDENCE,
+        ),
+    },
+    "claude_code": {
+        "2.1.220": CommandExecutionPin(
+            provider="claude_code",
+            rule=_RULE_CLAUDE_COMMAND_ECHO_RESPONSE,
+            signal="the command echo plus its response region",
+            styled=True,
+            evidence=_CLAUDE_EXECUTION_EVIDENCE,
+        ),
+    },
+}
+
+
+def command_execution_pin_for(
+    provider: Optional[str], provider_version: Optional[str]
+) -> Optional[CommandExecutionPin]:
+    """The pinned execution observation for this exact build, or None.
+
+    None means "no execution signal is proven for this provider/build" —
+    the caller refuses declared commands ``provider-unsupported`` pre-write
+    rather than closing on transport facts alone.
+    """
+    if not provider or not provider_version:
+        return None
+    from cli_agent_orchestrator.services import provider_contracts
+
+    return _COMMAND_EXECUTION_PINS.get(provider, {}).get(
+        provider_contracts.normalized_version(provider_version)
+    )
+
+
+# The live-proven compaction notice on kimi 0.29.2.
+_KIMI_COMPACTION_NOTICE = "Compacting context"
+_CLAUDE_RESPONSE_GLYPH = "⎿"
+
+
+def _execution_signal_count(
+    pin: CommandExecutionPin, rows: Sequence[str], command_text: str
+) -> int:
+    """Occurrences of the pinned execution signal in one capture.
+
+    Counted rather than matched once, and compared against a pre-write
+    baseline by the caller, so a stale signal from an earlier command in
+    the same session can never be read as this command's execution.
+    """
+    if pin.rule == _RULE_KIMI_COMPACTION_SIGNAL:
+        return sum(1 for row in rows if _KIMI_COMPACTION_NOTICE in row)
+    if pin.rule == _RULE_CLAUDE_COMMAND_ECHO_RESPONSE:
+        parsed = _parse_styled_rows(rows)
+        if parsed is None:
+            return 0
+        plain = ["".join(char for char, _, _ in row) for row in parsed]
+        pairs = 0
+        for index, text in enumerate(plain):
+            if text.strip() == f"❯ {command_text}" and any(
+                later.lstrip().startswith(_CLAUDE_RESPONSE_GLYPH) for later in plain[index + 1 :]
+            ):
+                pairs += 1
+        return pairs
+    return 0
+
+
+# The observation polls the pane at this interval until the signal appears
+# or the remaining write deadline closes the window.
+_EXECUTION_POLL_SECONDS = 0.25
+
+
+def capture_execution_rows(
+    pane_id: str,
+    pin: CommandExecutionPin,
+    *,
+    deadline_monotonic: Optional[float] = None,
+) -> List[str]:
+    """One escape-form capture for the execution observation, per the pin.
+
+    Styled when the pin needs styling (the composer end-check shares the
+    emptiness determination's need), plain otherwise; the timeout is
+    bounded by the remaining write deadline so the observation always fits
+    inside it.
+    """
+    timeout = _OBSERVATION_CAPTURE_TIMEOUT_SECONDS
+    if deadline_monotonic is not None:
+        timeout = max(0.2, min(timeout, deadline_monotonic - time.monotonic()))
+    if pin.styled:
+        return capture_pane_screen_styled(pane_id, timeout=timeout)
+    return capture_pane_screen(pane_id, timeout=timeout)
+
+
+def observe_command_execution(
+    pane_id: str,
+    pin: CommandExecutionPin,
+    *,
+    command_text: str,
+    composer_pin: ComposerEmptinessPin,
+    baseline_rows: Optional[Sequence[str]] = None,
+    deadline_monotonic: Optional[float] = None,
+    screen: Optional[Callable[[], Sequence[str]]] = None,
+) -> Tuple[str, Optional[str]]:
+    """The two-close observation for one written declared command.
+
+    Returns ``(submission_observed, evidence_ref)``:
+
+    - ``submitted`` — the pinned execution signal's occurrence count rose
+      above the pre-write baseline within the bounded window: the
+      command's own UI/effect was observed.  This is the only shape that
+      may close ``accepted``, and the evidence ref travels with it.
+    - ``unsubmitted`` — the window expired and the composer still holds
+      content (the emptiness determination on the final capture): the
+      command provably never submitted.
+    - ``unknown`` — no classification could be made (every capture failed,
+      or the text left the composer without the signal appearing).  Never
+      read as "probably executed".
+    """
+    baseline_count = (
+        _execution_signal_count(pin, baseline_rows, command_text)
+        if baseline_rows is not None
+        else 0
+    )
+    last_rows: Optional[Sequence[str]] = None
+    while True:
+        if screen is not None:
+            rows: Optional[Sequence[str]] = screen()
+        else:
+            try:
+                rows = capture_execution_rows(pane_id, pin, deadline_monotonic=deadline_monotonic)
+            except NativePaneInputUnavailable:
+                rows = None
+        if rows is not None:
+            last_rows = rows
+            if _execution_signal_count(pin, rows, command_text) > baseline_count:
+                return (SUBMISSION_SUBMITTED, submission_evidence_ref(pane_id, rows))
+        if deadline_monotonic is None or time.monotonic() >= deadline_monotonic:
+            break
+        time.sleep(min(_EXECUTION_POLL_SECONDS, max(0.0, deadline_monotonic - time.monotonic())))
+    if last_rows is not None:
+        still = observe_composer_empty(pane_id, composer_pin, screen=lambda: last_rows)
+        if still is False:
+            return (SUBMISSION_UNSUBMITTED, submission_evidence_ref(pane_id, last_rows))
+    return (SUBMISSION_UNKNOWN, None)

@@ -1242,8 +1242,9 @@ class TestCommandClassOverTheWire:
     commands run the guard; undeclared payloads are prose, byte-identical
     to before the carrier existed."""
 
-    def _wire_managed_kimi(self, monkeypatch, *, empty):
+    def _wire_managed_kimi(self, monkeypatch, *, empty, execution_close=None):
         from cli_agent_orchestrator.services import managed_launch_v2
+        from cli_agent_orchestrator.services.control_input_contract import SUBMISSION_SUBMITTED
 
         # A fresh server, dispatch-wise: an earlier test's accepted Enter
         # would otherwise sit inside its grace and answer pane-busy where
@@ -1265,6 +1266,16 @@ class TestCommandClassOverTheWire:
         monkeypatch.setattr(
             native_pane_input, "observe_composer_empty", lambda pane_id, pin, **k: empty
         )
+        monkeypatch.setattr(
+            native_pane_input, "capture_execution_rows", lambda pane_id, pin, **k: []
+        )
+        if execution_close is None:
+            execution_close = (SUBMISSION_SUBMITTED, "capture-pane:%17:wire:sha256:beef")
+        monkeypatch.setattr(
+            native_pane_input,
+            "observe_command_execution",
+            lambda pane_id, pin, **k: execution_close,
+        )
         return client, adapter
 
     def test_a_declared_compact_against_a_proven_empty_composer_is_accepted(
@@ -1284,6 +1295,33 @@ class TestCommandClassOverTheWire:
         assert body["request_schema_version"] == CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
         assert adapter.calls == [({"lines": ["/compact"]}, True)]
         assert [event["outcome"] for event in body["events"]] == ["sent", "sent"]
+        # The r11 close: accepted only with the execution evidence attached
+        # — over the wire as in the journal (no null-evidence acceptance).
+        assert body["submission_observed"] == "submitted"
+        assert body["submission_evidence_ref"] == "capture-pane:%17:wire:sha256:beef"
+        # The exact-id reconcile replays the evidence-bearing record.
+        looked_up = client.get(f"/control-input/{CONTROL}").json()
+        assert looked_up["outcome"] == ACCEPTED
+        assert looked_up["submission_observed"] == "submitted"
+        assert looked_up["submission_evidence_ref"] == "capture-pane:%17:wire:sha256:beef"
+
+    def test_a_declared_command_with_execution_unproven_closes_ambiguous(self, client, monkeypatch):
+        from cli_agent_orchestrator.services.control_input_contract import SUBMISSION_UNKNOWN
+
+        tmux_client, adapter = self._wire_managed_kimi(
+            monkeypatch, empty=True, execution_close=(SUBMISSION_UNKNOWN, None)
+        )
+        events = [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
+        response = _post(client, text=None, events=events, payload_class="command")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["outcome"] == AMBIGUOUS
+        assert body["reason_code"] == "submission-unproven"
+        assert body["reattemptable"] is False
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]  # one write, never resent
+        looked_up = client.get(f"/control-input/{CONTROL}").json()
+        assert looked_up["outcome"] == AMBIGUOUS
+        assert looked_up["reason_code"] == "submission-unproven"
 
     def test_a_declared_compact_against_a_nonempty_composer_is_the_typed_refusal(
         self, client, monkeypatch

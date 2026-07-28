@@ -3175,37 +3175,66 @@ def _send_through_native_adapter(
     )
 
 
+def _command_class_pins(
+    resolved: ResolvedControlIdentity,
+) -> Tuple[Optional[Any], Optional[Any]]:
+    """The two pins a declared command requires for this exact build.
+
+    Returns ``(emptiness_pin, execution_pin)``; either is None when the
+    provider/build has no live-verified determination.  Declared commands
+    require BOTH — an emptiness proof without an execution observation
+    would close on transport facts alone, which is the PR #48 defect
+    class (§4.1 r11).
+    """
+    emptiness = native_pane_input.composer_emptiness_pin_for(
+        resolved.provider, resolved.provider_version
+    )
+    execution = native_pane_input.command_execution_pin_for(
+        resolved.provider, resolved.provider_version
+    )
+    return (emptiness, execution)
+
+
 def _command_class_guard_refusal(
     resolved: ResolvedControlIdentity,
     binding: ControlInputBinding,
     *,
     deadline_monotonic: float,
+    screen: Optional[Any] = None,
 ) -> Optional[Tuple[str, str]]:
     """Reason/detail when a declared command may not be written, or None.
 
     The §4.1 never-concatenate guard: a declared command-class control is
     written only against a composer *proven empty* by the provider+build
     pinned determination, observed under the same pane-input lease before
-    the first command byte.  A provider/build without a proven emptiness
-    determination is ``provider-unsupported`` rather than guessed at; a
-    composer that holds content — or whose emptiness cannot be proven —
-    is ``composer-nonempty`` with zero command bytes and the prefill
+    the first command byte.  A provider/build without BOTH pins (the
+    emptiness determination and the r11 execution observation) is
+    ``provider-unsupported`` rather than guessed at; a composer that
+    holds content — or whose emptiness cannot be proven — is
+    ``composer-nonempty`` with zero command bytes and the prefill
     untouched.  No blind clearing: the guard observes and refuses, it
     never sends a keystroke (prefill has been observed to survive Escape,
     so no keystroke-count ritual may be specified as a clear).
     """
-    pin = native_pane_input.composer_emptiness_pin_for(resolved.provider, resolved.provider_version)
-    if pin is None:
+    pin, execution_pin = _command_class_pins(resolved)
+    if pin is None or execution_pin is None:
+        if pin is None and execution_pin is None:
+            missing = "no composer-emptiness determination or command-execution observation"
+        elif pin is None:
+            missing = "no composer-emptiness determination"
+        else:
+            missing = "no command-execution observation"
         return (
             REASON_PROVIDER_UNSUPPORTED,
-            f"no composer-emptiness determination is proven for {resolved.provider!r} "
-            f"version {resolved.provider_version!r}, so a declared command cannot be "
-            "protected against concatenating with composer prefill; refused with zero "
+            f"{missing} is proven for {resolved.provider!r} version "
+            f"{resolved.provider_version!r}, and a declared command requires both "
+            "pins: the emptiness proof against prefill concatenation and the "
+            "execution observation that keeps the close honest. Refused with zero "
             "bytes rather than typed at a composer whose layout was never read",
         )
     try:
         empty = native_pane_input.observe_composer_empty(
-            binding.pane_id, pin, deadline_monotonic=deadline_monotonic
+            binding.pane_id, pin, deadline_monotonic=deadline_monotonic, screen=screen
         )
     except Exception as exc:  # noqa: BLE001 - "could not look" is not "empty"
         logger.error("composer-emptiness observation raised for %s: %s", binding.pane_id, exc)
@@ -3395,16 +3424,39 @@ def _deliver_sequence_under_lease(
                     "sequence is readiness-gated and nothing was written",
                 )
 
+    command_observation: Optional[Tuple[Any, Any, str, Any]] = None
     if declared_command:
         # The §4.1 never-concatenate guard, under this lease and before
         # the claim: the composer must be *proven empty* by the
         # provider+build pinned determination.  Runs only for declared
         # command-class requests — undeclared payloads are prose and never
         # see this guard — and refuses with zero command bytes and the
-        # prefill untouched.  Blind clearing is prohibited.
-        guard_refusal = _command_class_guard_refusal(resolved, binding, deadline_monotonic=deadline)
+        # prefill untouched.  Blind clearing is prohibited.  The same
+        # capture is the pre-write baseline the r11 execution observation
+        # counts against, so a stale signal from an earlier command in
+        # this session can never close this one; a failed baseline fails
+        # the guard closed (zero bytes), never the other way.
+        emptiness_pin, execution_pin = _command_class_pins(resolved)
+        baseline_rows: List[str] = []
+        if emptiness_pin is not None and execution_pin is not None:
+            try:
+                baseline_rows = native_pane_input.capture_execution_rows(
+                    binding.pane_id, execution_pin, deadline_monotonic=deadline
+                )
+            except Exception as exc:  # noqa: BLE001 - a failed baseline is unproven
+                logger.error("command baseline capture failed for %s: %s", binding.pane_id, exc)
+                baseline_rows = []
+        guard_refusal = _command_class_guard_refusal(
+            resolved, binding, deadline_monotonic=deadline, screen=lambda: baseline_rows
+        )
         if guard_refusal is not None:
             return _refuse_pre_claim(guard_refusal[0], guard_refusal[1])
+        command_observation = (
+            execution_pin,
+            emptiness_pin,
+            events[0]["text"],
+            baseline_rows,
+        )
 
     breached = _deadline_breached()
     if breached is not None:
@@ -3431,6 +3483,7 @@ def _deliver_sequence_under_lease(
             deadline_monotonic=deadline,
             dispatch_key=dispatch_key,
             request_schema_version=result_schema_version,
+            command_observation=command_observation,
         )
     return _send_sequence_through_literal_sink(
         journal,
@@ -3442,6 +3495,7 @@ def _deliver_sequence_under_lease(
         digest=digest,
         deadline_monotonic=deadline,
         request_schema_version=result_schema_version,
+        command_observation=command_observation,
     )
 
 
@@ -3512,6 +3566,7 @@ def _send_sequence_through_native_adapter(
     deadline_monotonic: float,
     dispatch_key: Optional[Tuple[str, Optional[str], str, int]],
     request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+    command_observation: Optional[Tuple[Any, Any, str, Any]] = None,
 ) -> ControlInputResult:
     """Write one claimed v3 sequence through the provider's own adapter.
 
@@ -3523,7 +3578,11 @@ def _send_sequence_through_native_adapter(
     Enter land after a literal burst, and sending it where no burst
     precedes would be a keystroke at a composer for no reason.  Per-event
     outcomes are honest transport facts; none of them is provider
-    completion.
+    completion.  A declared command (``command_observation`` set)
+    additionally closes by the r11 two-close rule: ``accepted`` only with
+    the execution signal observed and its evidence journaled, otherwise
+    ``ambiguous``/``submission-unproven`` — never a transport-only
+    acceptance, never a retry licence.
     """
     control_id = binding.request_id
     transport = _NativeComposerTransport(
@@ -3539,23 +3598,31 @@ def _send_sequence_through_native_adapter(
         if dispatch_key is not None and transport.enter_attempted:
             _mark_native_kimi_dispatch(dispatch_key)
 
-    def _ambiguous(detail: str) -> ControlInputResult:
+    def _ambiguous(
+        detail: str,
+        *,
+        reason: str = REASON_WRITE_INCOMPLETE,
+        observed: Optional[str] = None,
+        evidence_ref: Optional[str] = None,
+    ) -> ControlInputResult:
         _mark_dispatch()
         journal.mark_ambiguous(
             control_id,
-            reason_code=REASON_WRITE_INCOMPLETE,
+            reason_code=reason,
             chunks_sent=transport.chunks_sent,
             enter_attempted=transport.enter_attempted,
             chord=last_chord,
             chord_attempted=transport.chord_attempted,
             chord_sent=transport.chord_sent,
+            submission_observed=observed,
+            submission_evidence_ref=evidence_ref,
             sequence_event_outcomes=[(event["ordinal"], event["outcome"]) for event in run.events],
             evidence_digest=digest,
         )
         return ControlInputResult(
             control_id=control_id,
             outcome=AMBIGUOUS,
-            reason_code=REASON_WRITE_INCOMPLETE,
+            reason_code=reason,
             detail=detail
             + " What reached the pane is bounded by the per-event outcomes but is not "
             "knowable exactly, so this sequence must not be sent again",
@@ -3568,6 +3635,8 @@ def _send_sequence_through_native_adapter(
             chord=last_chord,
             chord_attempted=transport.chord_attempted,
             chord_sent=transport.chord_sent,
+            submission_observed=observed,
+            submission_evidence_ref=evidence_ref,
             events=run.events,
             request_schema_version=request_schema_version,
         )
@@ -3673,6 +3742,36 @@ def _send_sequence_through_native_adapter(
     expired = _deadline_ambiguity()
     if expired is not None:
         return expired
+    submission_observed: Optional[str] = None
+    submission_evidence_ref: Optional[str] = None
+    if command_observation is not None:
+        # The r11 two-close rule: transport acceptance is not command
+        # execution.  A declared command closes accepted only when the
+        # pinned execution signal is observed on the pane within the
+        # remaining write deadline; anything else is the terminal
+        # ambiguity it is, with no retry licence — never a forced
+        # completion and never a transport-only acceptance.
+        execution_pin, composer_pin, command_text, baseline_rows = command_observation
+        observed, evidence_ref = native_pane_input.observe_command_execution(
+            binding.pane_id,
+            execution_pin,
+            command_text=command_text,
+            composer_pin=composer_pin,
+            baseline_rows=baseline_rows,
+            deadline_monotonic=deadline_monotonic,
+        )
+        if observed != SUBMISSION_SUBMITTED:
+            return _ambiguous(
+                f"the declared command {command_text!r} was written, but its execution "
+                f"signal ({execution_pin.signal}) was not observed within the bound "
+                f"(observation: {observed}); transport acceptance is not command "
+                "execution, so this control closes ambiguous rather than accepted.",
+                reason=REASON_SUBMISSION_UNPROVEN,
+                observed=observed,
+                evidence_ref=evidence_ref,
+            )
+        submission_observed = observed
+        submission_evidence_ref = evidence_ref
     _mark_dispatch()
     record = journal.mark_delivered(
         control_id,
@@ -3681,6 +3780,8 @@ def _send_sequence_through_native_adapter(
         chord=last_chord,
         chord_attempted=transport.chord_attempted,
         chord_sent=transport.chord_sent,
+        submission_observed=submission_observed,
+        submission_evidence_ref=submission_evidence_ref,
         sequence_event_outcomes=[(event["ordinal"], event["outcome"]) for event in run.events],
         evidence_digest=digest,
     )
@@ -3698,6 +3799,8 @@ def _send_sequence_through_native_adapter(
         chord=last_chord,
         chord_attempted=transport.chord_attempted,
         chord_sent=transport.chord_sent,
+        submission_observed=submission_observed,
+        submission_evidence_ref=submission_evidence_ref,
         request_schema_version=request_schema_version,
     )
 
@@ -3713,6 +3816,7 @@ def _send_sequence_through_literal_sink(
     digest: str,
     deadline_monotonic: float,
     request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+    command_observation: Optional[Tuple[Any, Any, str, Any]] = None,
 ) -> ControlInputResult:
     """Write one claimed v3 sequence through the generic literal primitive.
 
@@ -3996,6 +4100,32 @@ def _send_sequence_through_literal_sink(
             observed=submission_observed,
             evidence_ref=submission_evidence_ref,
         )
+    if command_observation is not None:
+        # The r11 two-close rule, identical to the adapter path's: a
+        # declared command closes accepted only with the pinned execution
+        # signal observed inside the remaining write deadline; anything
+        # else is terminal ambiguity with no retry licence.
+        execution_pin, composer_pin, command_text, baseline_rows = command_observation
+        observed, evidence_ref = native_pane_input.observe_command_execution(
+            binding.pane_id,
+            execution_pin,
+            command_text=command_text,
+            composer_pin=composer_pin,
+            baseline_rows=baseline_rows,
+            deadline_monotonic=deadline_monotonic,
+        )
+        if observed != SUBMISSION_SUBMITTED:
+            return _ambiguous(
+                f"the declared command {command_text!r} was written, but its execution "
+                f"signal ({execution_pin.signal}) was not observed within the bound "
+                f"(observation: {observed}); transport acceptance is not command "
+                "execution, so this control closes ambiguous rather than accepted.",
+                reason=REASON_SUBMISSION_UNPROVEN,
+                observed=observed,
+                evidence_ref=evidence_ref,
+            )
+        submission_observed = observed
+        submission_evidence_ref = evidence_ref
     record = journal.mark_delivered(
         control_id,
         chunks_sent=chunks,

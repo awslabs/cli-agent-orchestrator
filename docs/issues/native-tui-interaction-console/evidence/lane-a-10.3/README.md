@@ -22,18 +22,27 @@ CAO_LANE_A_EVIDENCE_DIR="$PWD/docs/issues/native-tui-interaction-console/evidenc
   uv run pytest -m e2e test/e2e/test_native_tui_provider_acceptance.py -v --tb=short -p no:cacheprovider
 ```
 
-Two rounds, same day:
+Three rounds, same day:
 
-- **Round 1: 14 passed, 1 failed in 133 s** (`run/pytest-summary.txt`). The one
+- **Round 1: 14 passed, 1 failed in 133 s** (`run/round-1/`). The one
   failure was intentional: case-08 was **IMPOSSIBLE** on the installed kimi
   build (F1 below) and the test was written to stay red until the pin matched
   the build it names.
 - **Round 2 (after the F1 pin correction): 15 passed in 140 s.** The kimi
   emptiness pin was corrected from this evidence to the installed rounded-box
   composer; case-08 then passed with the declared `/compact` **accepted** on a
-  proven-empty composer (`case-08-kimi-compact-executes/03-declared-compact-response.json`),
-  and case-07's refusal reads the proven-nonempty variant. The red-by-design
-  regression guard stays in the test.
+  proven-empty composer, and case-07's refusal reads the proven-nonempty
+  variant. The red-by-design regression guard stays in the test.
+- **Round 3 (r11 declared-command two-close): 15 passed in 149 s.** The r11
+  repair: declared commands require both the emptiness pin and the
+  command-execution observation pin pre-write, and close `accepted` only with
+  the execution signal observed and its evidence journaled. The kept evidence
+  from this round is exactly the two-close proof: case-08 and case-12's
+  accepted records carry `submission_observed: submitted` and a
+  `capture-pane:` evidence reference, replayed by exact id (earlier rounds
+  recorded `submission_observed: null` — the PR #48 defect the r11 review
+  flagged). Other cases' regenerated churn was restored per the steer-040
+  scope guard.
 
 ## Case index
 
@@ -51,10 +60,10 @@ Two rounds, same day:
 | 3 steer mid-turn | `test_05_steer_mid_turn` | PASS with **deviation D3** | `case-05-kimi-steer/` |
 | 4 escape interrupt | `test_06_escape_interrupts_streaming` | PASS — transcript shows `Interrupted by user` | `case-06-kimi-escape/` |
 | 6a guard (kimi) | `test_07_declared_compact_refused_with_prefill` | PASS — **proven-nonempty** refusal after the F1 correction, prefill byte-identical, zero bytes | `case-07-kimi-guard-prefill/` |
-| 6b compact executes (kimi) | `test_08_declared_compact_executes_on_empty_composer` | PASS after the **F1** correction — accepted; compaction UI in transcript | `case-08-kimi-compact-executes/` |
+| 6b compact executes (kimi) | `test_08_declared_compact_executes_on_empty_composer` | PASS — accepted **with execution evidence** (`submitted` + `capture-pane:` ref, r11) | `case-08-kimi-compact-executes/` |
 | 6c slash carrier (kimi) | `test_09_undeclared_slash_text_is_prose` | PASS — undeclared `/tmp/x` delivered as prose | `case-09-kimi-slash-carrier/` |
 | 8a guard (claude) | `test_01_declared_compact_refused_with_prefill` (claude) | PASS — **proven-nonempty** refusal, styled composer region byte-identical | `case-11-claude-guard-prefill/` |
-| 8b compact executes (claude) | `test_02_declared_compact_executes_on_empty_composer` (claude) | PASS — accepted; transcript shows the command's own UI | `case-12-claude-compact-executes/` |
+| 8b compact executes (claude) | `test_02_declared_compact_executes_on_empty_composer` (claude) | PASS — accepted **with execution evidence** (`submitted` + `capture-pane:` ref, r11) | `case-12-claude-compact-executes/` |
 | 9 escape (claude) | `test_03_escape_interrupts_active_turn` | PASS — spinner `· Ideating…` gone after Escape | `case-13-claude-escape/` |
 
 ## F1 — RESOLVED: the kimi composer-emptiness pin was corrected from this evidence

@@ -1,0 +1,232 @@
+"""The §4.1 r11 execution-observation pins and the two-close observation.
+
+Transport acceptance is not command execution: a declared command may
+close ``accepted`` only when the provider/build-pinned execution signal
+is observed above its pre-write baseline.  These tests pin the matchers
+against the live-proven screen shapes (§10.3 evidence lane-a-10.3), the
+stale-signal protection, and the three observation answers.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from cli_agent_orchestrator.services import native_pane_input as npi
+from cli_agent_orchestrator.services.control_input_contract import (
+    SUBMISSION_SUBMITTED,
+    SUBMISSION_UNKNOWN,
+    SUBMISSION_UNSUBMITTED,
+)
+
+ESC = "\x1b"
+RESET = f"{ESC}[0m"
+DIM = f"{ESC}[2m"
+
+
+def _kimi_screen(notice_rows):
+    return [
+        " ✨ Please reconsider this path",
+        "   Interrupted by user",
+        *notice_rows,
+        " ╭────────────────────────────────────────────────────────────────────────────────────────────────╮",
+        " │ >                                                                                              │",
+        " ╰────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        " K2.7 Coding Highspeed thinking  /tmp/work  master",
+        "                                                                          context: 10% (23.7k/256k)",
+    ]
+
+
+_KIMI_NOTICE = " ● Compacting context... · Tip: /goal next to queue follow-up work while the current goal keeps"
+
+
+def _claude_screen(tail_rows):
+    return [
+        "⏺ Here is the response",
+        f"{ESC}[38;2;136;136;136m────────────────────────{RESET}",
+        *tail_rows,
+        f"{ESC}[38;2;136;136;136m────────────────────────{RESET}",
+        "❯ ",
+        f"{ESC}[38;2;136;136;136m────────────────────────{RESET}",
+        "  sonnet-5 │ xhigh │ /tmp/work │ master",
+    ]
+
+
+class TestExecutionPins:
+    def test_the_pinned_builds_are_exactly_the_live_verified_ones(self):
+        pin = npi.command_execution_pin_for("kimi_cli", "0.29.2")
+        assert pin is not None and pin.rule == "kimi-compaction-signal" and not pin.styled
+        assert pin.signal and pin.evidence
+        pin = npi.command_execution_pin_for("claude_code", "2.1.220")
+        assert pin is not None and pin.rule == "claude-command-echo-response" and pin.styled
+
+    def test_unpinned_builds_have_no_execution_pin(self):
+        # Same honesty as the emptiness pins: no live evidence, no pin.
+        assert npi.command_execution_pin_for("kimi_cli", "0.29.0") is None
+        assert npi.command_execution_pin_for("kimi_cli", "0.29.1") is None
+        assert npi.command_execution_pin_for("claude_code", "2.1.218") is None
+        assert npi.command_execution_pin_for("codex", "0.145.0") is None
+        assert npi.command_execution_pin_for(None, "0.29.2") is None
+
+    def test_version_banners_normalize(self):
+        assert npi.command_execution_pin_for("kimi_cli", "kimi 0.29.2") is not None
+        assert npi.command_execution_pin_for("claude_code", "2.1.220 (Claude Code)") is not None
+
+
+class TestSignalCount:
+    def test_kimi_compaction_notice_is_counted_per_occurrence(self):
+        pin = npi.command_execution_pin_for("kimi_cli", "0.29.2")
+        assert npi._execution_signal_count(pin, _kimi_screen([_KIMI_NOTICE]), "/compact") == 1
+        assert (
+            npi._execution_signal_count(pin, _kimi_screen([_KIMI_NOTICE, _KIMI_NOTICE]), "/compact")
+            == 2
+        )
+        assert npi._execution_signal_count(pin, _kimi_screen([]), "/compact") == 0
+
+    def test_claude_echo_plus_response_row_is_one_pair(self):
+        pin = npi.command_execution_pin_for("claude_code", "2.1.220")
+        rows = _claude_screen(["❯ /compact", "  ⎿  Not enough messages to compact."])
+        assert npi._execution_signal_count(pin, rows, "/compact") == 1
+
+    def test_claude_echo_without_a_response_row_is_not_a_pair(self):
+        pin = npi.command_execution_pin_for("claude_code", "2.1.220")
+        assert npi._execution_signal_count(pin, _claude_screen(["❯ /compact"]), "/compact") == 0
+
+    def test_claude_response_row_without_the_echo_is_not_a_pair(self):
+        pin = npi.command_execution_pin_for("claude_code", "2.1.220")
+        rows = _claude_screen(["  ⎿  Not enough messages to compact."])
+        assert npi._execution_signal_count(pin, rows, "/compact") == 0
+
+    def test_an_ordinary_prompt_echo_is_not_the_command_signal(self):
+        pin = npi.command_execution_pin_for("claude_code", "2.1.220")
+        rows = _claude_screen(["❯ hello there", "⏺ Here is the response"])
+        assert npi._execution_signal_count(pin, rows, "/compact") == 0
+        # And a different command's pair never answers for this command.
+        rows = _claude_screen(["❯ /agents", "  ⎿  some other response"])
+        assert npi._execution_signal_count(pin, rows, "/compact") == 0
+
+    def test_two_pairs_are_two(self):
+        pin = npi.command_execution_pin_for("claude_code", "2.1.220")
+        rows = _claude_screen(
+            [
+                "❯ /compact",
+                "  ⎿  Not enough messages to compact.",
+                "❯ /compact",
+                "  ⎿  Compacted.",
+            ]
+        )
+        assert npi._execution_signal_count(pin, rows, "/compact") == 2
+
+    def test_unparseable_styled_rows_count_nothing(self):
+        pin = npi.command_execution_pin_for("claude_code", "2.1.220")
+        assert npi._execution_signal_count(pin, ["❯ /compact" + ESC + "[38;2;1"], "/compact") == 0
+
+
+class TestObserveCommandExecution:
+    def test_the_signal_above_baseline_closes_submitted_with_evidence(self):
+        pin = npi.command_execution_pin_for("kimi_cli", "0.29.2")
+        composer = npi.composer_emptiness_pin_for("kimi_cli", "0.29.2")
+        observed, ref = npi.observe_command_execution(
+            "%1",
+            pin,
+            command_text="/compact",
+            composer_pin=composer,
+            baseline_rows=_kimi_screen([]),
+            screen=lambda: _kimi_screen([_KIMI_NOTICE]),
+        )
+        assert observed == SUBMISSION_SUBMITTED
+        assert ref and ref.startswith("capture-pane:%1:")
+
+    def test_a_stale_signal_from_an_earlier_command_never_closes(self):
+        """The baseline count protection: a compaction notice already on
+        screen before the write is not this command's execution."""
+        pin = npi.command_execution_pin_for("kimi_cli", "0.29.2")
+        composer = npi.composer_emptiness_pin_for("kimi_cli", "0.29.2")
+        observed, ref = npi.observe_command_execution(
+            "%1",
+            pin,
+            command_text="/compact",
+            composer_pin=composer,
+            baseline_rows=_kimi_screen([_KIMI_NOTICE]),
+            deadline_monotonic=__import__("time").monotonic() + 0.1,
+            screen=lambda: _kimi_screen([_KIMI_NOTICE]),
+        )
+        assert observed != SUBMISSION_SUBMITTED
+
+    def test_a_second_identical_command_closes_on_the_new_occurrence(self):
+        pin = npi.command_execution_pin_for("claude_code", "2.1.220")
+        composer = npi.composer_emptiness_pin_for("claude_code", "2.1.220")
+        baseline = _claude_screen(["❯ /compact", "  ⎿  Not enough messages to compact."])
+        after = _claude_screen(
+            [
+                "❯ /compact",
+                "  ⎿  Not enough messages to compact.",
+                "❯ /compact",
+                "  ⎿  Compacted.",
+            ]
+        )
+        observed, ref = npi.observe_command_execution(
+            "%1",
+            pin,
+            command_text="/compact",
+            composer_pin=composer,
+            baseline_rows=baseline,
+            screen=lambda: after,
+        )
+        assert observed == SUBMISSION_SUBMITTED
+        assert ref
+
+    def test_an_expired_window_with_content_resting_is_unsubmitted(self):
+        import time
+
+        pin = npi.command_execution_pin_for("kimi_cli", "0.29.2")
+        composer = npi.composer_emptiness_pin_for("kimi_cli", "0.29.2")
+
+        def screen():
+            rows = _kimi_screen([])
+            rows[3] = (
+                " │ > /compact                                                                                     │"
+            )
+            return rows
+
+        observed, ref = npi.observe_command_execution(
+            "%1",
+            pin,
+            command_text="/compact",
+            composer_pin=composer,
+            baseline_rows=_kimi_screen([]),
+            deadline_monotonic=time.monotonic() + 0.1,
+            screen=screen,
+        )
+        assert observed == SUBMISSION_UNSUBMITTED
+        assert ref and ref.startswith("capture-pane:%1:")
+
+    def test_an_expired_window_without_content_or_signal_is_unknown(self):
+        import time
+
+        pin = npi.command_execution_pin_for("kimi_cli", "0.29.2")
+        composer = npi.composer_emptiness_pin_for("kimi_cli", "0.29.2")
+        observed, ref = npi.observe_command_execution(
+            "%1",
+            pin,
+            command_text="/compact",
+            composer_pin=composer,
+            baseline_rows=_kimi_screen([]),
+            deadline_monotonic=time.monotonic() + 0.1,
+            screen=lambda: _kimi_screen([]),
+        )
+        assert observed == SUBMISSION_UNKNOWN
+        assert ref is None
+
+    def test_claude_signal_above_baseline_closes_submitted(self):
+        pin = npi.command_execution_pin_for("claude_code", "2.1.220")
+        composer = npi.composer_emptiness_pin_for("claude_code", "2.1.220")
+        observed, ref = npi.observe_command_execution(
+            "%1",
+            pin,
+            command_text="/compact",
+            composer_pin=composer,
+            baseline_rows=_claude_screen([]),
+            screen=lambda: _claude_screen(["❯ /compact", "  ⎿  Not enough messages to compact."]),
+        )
+        assert observed == SUBMISSION_SUBMITTED
+        assert ref

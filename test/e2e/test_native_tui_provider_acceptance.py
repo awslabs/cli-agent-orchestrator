@@ -1538,6 +1538,17 @@ class TestKimiCommandGuard:
                 "and every declared command fails closed. The pin must match the build it names."
             )
         assert accepted["outcome"] == "accepted", accepted
+        # The r11 two-close rule, live: the accepted record carries the
+        # execution observation and its evidence reference — never a
+        # transport-only acceptance with a null observation.
+        assert accepted.get("submission_observed") == "submitted", accepted
+        assert accepted.get("submission_evidence_ref", "").startswith("capture-pane:"), accepted
+        replayed = requests.get(
+            f"{harness.server.url}/control-input/{request['control_id']}", timeout=30
+        ).json()
+        assert replayed["outcome"] == "accepted", replayed
+        assert replayed.get("submission_observed") == "submitted", replayed
+        assert replayed.get("submission_evidence_ref") == accepted["submission_evidence_ref"]
 
         # Compaction is a provider operation; give it a generous window.
         found = _await(
@@ -1552,8 +1563,9 @@ class TestKimiCommandGuard:
         assert found, f"no compaction UI appeared within 90 s:\n{history}"
         harness.evidence.note(
             case,
-            f"PASS: declared /compact accepted on a proven-empty composer; "
-            f"compaction UI lines: {compact_lines!r}.",
+            f"PASS: declared /compact accepted on a proven-empty composer WITH execution "
+            f"evidence (submission_observed=submitted, ref "
+            f"{accepted['submission_evidence_ref']!r}); compaction UI lines: {compact_lines!r}.",
         )
         _ensure_idle(harness, kimi_session, case=case)
 
@@ -1722,6 +1734,16 @@ class TestClaudeCommandGuard:
         harness.evidence.write_json(case, "02-declared-compact-request.json", request)
         harness.evidence.write_json(case, "03-declared-compact-response.json", accepted)
         assert accepted["outcome"] == "accepted", accepted
+        # The r11 two-close rule, live: the accepted record carries the
+        # execution observation and its evidence reference.
+        assert accepted.get("submission_observed") == "submitted", accepted
+        assert accepted.get("submission_evidence_ref", "").startswith("capture-pane:"), accepted
+        replayed = requests.get(
+            f"{harness.server.url}/control-input/{request['control_id']}", timeout=30
+        ).json()
+        assert replayed["outcome"] == "accepted", replayed
+        assert replayed.get("submission_observed") == "submitted", replayed
+        assert replayed.get("submission_evidence_ref") == accepted["submission_evidence_ref"]
 
         # The command's own UI is the result line, not the submission
         # echo: on this fresh session the honest result is "Not enough
@@ -1743,7 +1765,9 @@ class TestClaudeCommandGuard:
         assert result_found, f"no compaction result line appeared within 120 s:\n{history}"
         harness.evidence.note(
             case,
-            f"PASS: declared /compact accepted on a proven-empty composer; the transcript shows "
+            f"PASS: declared /compact accepted on a proven-empty composer WITH execution "
+            f"evidence (submission_observed=submitted, ref "
+            f"{accepted['submission_evidence_ref']!r}); the transcript shows "
             f"the command's own UI (result line, not a prompt echo): {compact_lines!r}.",
         )
         _ensure_idle(harness, claude_session, case=case)
