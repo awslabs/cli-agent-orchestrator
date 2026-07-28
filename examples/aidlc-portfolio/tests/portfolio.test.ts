@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -65,6 +66,41 @@ describe("portfolio workspace", () => {
     expect(
       initializeWorkspace(root, "another-portfolio", "Another Portfolio"),
     ).rejects.toBeInstanceOf(PortfolioError);
+  });
+
+  test("rejects live locks and recovers locks owned by dead processes", async () => {
+    const root = await temporaryRoot();
+    await initializeWorkspace(root, "sample-portfolio", "Sample Portfolio");
+    const lock = join(root, "portfolio/.portfolio.lock");
+    await mkdir(lock);
+    await writeFile(
+      join(lock, "owner.json"),
+      `${JSON.stringify({
+        token: "live-owner",
+        pid: process.pid,
+        createdAt: new Date().toISOString(),
+      })}\n`,
+    );
+
+    await expect(registerProject(root, "api")).rejects.toThrow(
+      "portfolio is locked by another operation",
+    );
+
+    await rm(lock, { recursive: true });
+    const exited = Bun.spawn(["true"]);
+    await exited.exited;
+    await mkdir(lock);
+    await writeFile(
+      join(lock, "owner.json"),
+      `${JSON.stringify({
+        token: "dead-owner",
+        pid: exited.pid,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      })}\n`,
+    );
+
+    await expect(registerProject(root, "api")).resolves.toBeUndefined();
+    expect(await pathExists(lock)).toBe(false);
   });
 
   test("registers projects and initializes child session state", async () => {
@@ -179,12 +215,18 @@ describe("portfolio workspace", () => {
     expect(checkDispatch(root, "web", "feature")).rejects.toThrow(
       "blocked by incomplete project api",
     );
+    await expect(
+      updateSession(root, "feature", "web", "active", "web-runner"),
+    ).rejects.toThrow("blocked by incomplete project api");
 
     await updateSession(root, "feature", "api", "completed");
     await expect(checkDispatch(root, "web", "feature")).resolves.toMatchObject({
       branch: "feat/feature-web",
       aidlcIntent: "feature-web",
     });
+    await expect(
+      updateSession(root, "feature", "web", "active", "web-runner"),
+    ).resolves.toBeUndefined();
   });
 
   test("dispatch check enforces catalog dependencies marked for dispatch", async () => {
@@ -232,6 +274,9 @@ describe("portfolio workspace", () => {
     expect(checkDispatch(root, "web", "feature")).rejects.toThrow(
       "blocked at dispatch by dependency web-to-api",
     );
+    await expect(
+      updateSession(root, "feature", "web", "active", "web-runner"),
+    ).rejects.toThrow("blocked at dispatch by dependency web-to-api");
 
     await updateSession(root, "feature", "api", "completed");
     await expect(checkDispatch(root, "web", "feature")).resolves.toMatchObject({
@@ -334,6 +379,15 @@ describe("portfolio workspace", () => {
       aidlcIntent: "feature-api",
     });
 
+    await writeFile(
+      join(root, "worktrees/api/feature/.claude/settings.json"),
+      "{}\n",
+    );
+    await expect(
+      updateSession(root, "feature", "api", "active", "runner-terminal"),
+    ).rejects.toThrow("AI-DLC harness verification failed");
+    await syncHarness(root, "claude", "api", "feature");
+
     await registerProject(root, "worker");
     await expect(checkDispatch(root, "api", "feature")).rejects.toThrow(
       "discovery confirmation is stale",
@@ -420,6 +474,45 @@ describe("portfolio workspace", () => {
       await readFile(join(root, "portfolio/state.json"), "utf8"),
     );
     expect(stateActive.sessions["feature:api"].status).toBe("active");
+    await updateSession(root, "feature", "api", "completed");
+    const stateCompleted = JSON.parse(
+      await readFile(join(root, "portfolio/state.json"), "utf8"),
+    );
+    expect(stateCompleted.activeIntent).toBeNull();
+  });
+
+  test("preserves worktree memory when HEAD cannot be inspected", async () => {
+    const root = await temporaryRoot();
+    await initializeWorkspace(root, "sample-portfolio", "Sample Portfolio");
+    await registerProject(root, "api");
+    await registerIntent(root, {
+      id: "feature",
+      projects: [
+        {
+          project: "api",
+          aidlcIntent: "feature-api",
+          branch: "feat/feature-api",
+          worktree: "worktrees/api/feature",
+          dependsOn: [],
+        },
+      ],
+    });
+    const worktree = join(root, "worktrees/api/feature");
+    await mkdir(worktree, { recursive: true });
+    await runGit(worktree, ["init", "-b", "feat/feature-api"]);
+    const memory = join(
+      worktree,
+      "aidlc/spaces/default/memory/project.md",
+    );
+    const content = "## Corrections\n\n- Keep this child learning.\n";
+    await mkdir(join(memory, ".."), { recursive: true });
+    await writeFile(memory, content);
+    const revision = createHash("sha256").update(content).digest("hex");
+
+    await expect(
+      cleanWorktreeMemory(root, "api", "feature", "project", revision),
+    ).rejects.toThrow("cannot inspect worktree memory");
+    expect(await readFile(memory, "utf8")).toBe(content);
   });
 
   test("rejects question packets that a runner has already answered", async () => {
@@ -790,11 +883,14 @@ async function runGit(directory: string, args: string[]): Promise<void> {
     stdout: "pipe",
     stderr: "pipe",
   });
-  const [code, stderr] = await Promise.all([
+  const [code, stdout, stderr] = await Promise.all([
     process.exited,
+    new Response(process.stdout).text(),
     new Response(process.stderr).text(),
   ]);
   if (code !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${stderr}`);
+    throw new Error(
+      `git ${args.join(" ")} failed: ${stderr.trim() || stdout.trim()}`,
+    );
   }
 }

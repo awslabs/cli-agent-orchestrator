@@ -307,6 +307,7 @@ export async function checkConvergence(
         }
 
         if (
+          dependency.source.project === mapping.project &&
           dependency.blockingAt.some((point) =>
             ["integration", "release"].includes(point),
           )
@@ -519,15 +520,16 @@ function createRisk(input: {
   decidable: boolean;
   suffix?: string;
 }): ConvergenceRisk {
-  const id = [
+  const identity = [
     input.intent,
     input.project,
     input.dependency,
     input.category,
     input.suffix,
-  ]
-    .filter(Boolean)
-    .join("-");
+  ];
+  const id = `${input.intent}-${input.project}-${input.category}-${revisionOf(
+    identity,
+  ).slice(0, 12)}`;
   const core = {
     id,
     intent: input.intent,

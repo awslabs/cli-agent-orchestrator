@@ -7,6 +7,7 @@ import {
   readdir,
   rename,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
@@ -221,6 +222,20 @@ export interface MemorySnapshot {
   mergeClean: boolean | null;
 }
 
+interface DispatchReadiness {
+  worktree: string;
+  branch: string;
+  aidlcIntent: string;
+  aidlcSpace: string;
+  memory: Record<MemoryDestination, { revision: string; path: string }>;
+}
+
+interface PortfolioLockOwner {
+  token: string;
+  pid: number;
+  createdAt: string;
+}
+
 const SCHEMA_FILES: Record<DocumentKind | "portfolio", string> = {
   portfolio: "portfolio.schema.json",
   project: "project.schema.json",
@@ -269,6 +284,8 @@ const NEXT_PHASE: Record<PortfolioPhase, PortfolioPhase | null> = {
   integrate: "learn",
   learn: null,
 };
+
+const LOCK_OWNER_GRACE_MS = 30_000;
 
 export class PortfolioError extends Error {}
 
@@ -899,11 +916,9 @@ export async function updateSession(
       throw new PortfolioError(`intent ${intentId} does not contain project ${projectId}`);
     }
     if (status === "active") {
-      requireLifecyclePhase(loaded, "dispatch");
-      const discovery = await requireConfirmedDiscovery(root, loaded);
-      requireCurrentPlanAcceptance(loaded, discovery);
+      await assertDispatchable(root, loaded, mapping, projectId, intentId);
     }
-    if (status === "active" || status === "completed") {
+    if (status === "completed") {
       const pendingQuestions = await listQuestionPackets(
         root,
         projectId,
@@ -946,8 +961,7 @@ export async function updateSession(
       terminalId: terminalId ?? previous?.terminalId ?? null,
       updatedAt: new Date().toISOString(),
     };
-    loaded.state.activeIntent =
-      status === "active" || status === "waiting" ? intentId : loaded.state.activeIntent;
+    loaded.state.activeIntent = activeIntentFrom(loaded.state.sessions);
     loaded.state.updatedAt = new Date().toISOString();
     await atomicWrite(
       workspacePaths(root).stateFile,
@@ -964,42 +978,68 @@ export async function createWorktree(
   base: string,
 ): Promise<string> {
   const root = resolve(rootInput);
-  const loaded = await loadWorkspace(root);
-  const project = loaded.projects.find((item) => item.id === projectId);
-  const intent = loaded.intents.find((item) => item.id === intentId);
-  const mapping = intent?.projects.find((item) => item.project === projectId);
-  if (!project || !intent || !mapping) {
-    throw new PortfolioError(`project ${projectId} is not registered in intent ${intentId}`);
-  }
-  if (mapping.branch !== branch) {
-    throw new PortfolioError(`branch must match intent mapping: ${mapping.branch}`);
-  }
+  return withLock(root, async () => {
+    const loaded = await loadWorkspace(root);
+    const project = loaded.projects.find((item) => item.id === projectId);
+    const intent = loaded.intents.find((item) => item.id === intentId);
+    const mapping = intent?.projects.find((item) => item.project === projectId);
+    if (!project || !intent || !mapping) {
+      throw new PortfolioError(
+        `project ${projectId} is not registered in intent ${intentId}`,
+      );
+    }
+    if (mapping.branch !== branch) {
+      throw new PortfolioError(`branch must match intent mapping: ${mapping.branch}`);
+    }
 
-  const repository = resolveInside(root, project.repository, workspacePaths(root).repositories);
-  const worktree = resolveInside(root, mapping.worktree, workspacePaths(root).worktrees);
-  if (!(await pathExists(repository))) {
-    throw new PortfolioError(`repository does not exist: ${repository}`);
-  }
-  if (await pathExists(worktree)) {
-    throw new PortfolioError(`worktree already exists: ${worktree}`);
-  }
+    const repository = resolveInside(
+      root,
+      project.repository,
+      workspacePaths(root).repositories,
+    );
+    const worktree = resolveInside(
+      root,
+      mapping.worktree,
+      workspacePaths(root).worktrees,
+    );
+    if (!(await pathExists(repository))) {
+      throw new PortfolioError(`repository does not exist: ${repository}`);
+    }
+    if (await pathExists(worktree)) {
+      throw new PortfolioError(`worktree already exists: ${worktree}`);
+    }
 
-  await mkdir(dirname(worktree), { recursive: true });
-  await runCommand(["git", "-C", repository, "worktree", "add", "-b", branch, worktree, base]);
-  return worktree;
+    const parent = dirname(worktree);
+    const parentExisted = await pathExists(parent);
+    await mkdir(parent, { recursive: true });
+    try {
+      await runCommand([
+        "git",
+        "-C",
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        branch,
+        "--",
+        worktree,
+        base,
+      ]);
+      return worktree;
+    } catch (error) {
+      if (!parentExisted && (await readdir(parent)).length === 0) {
+        await rm(parent, { recursive: true });
+      }
+      throw error;
+    }
+  });
 }
 
 export async function checkDispatch(
   rootInput: string,
   projectId: string,
   intentId: string,
-): Promise<{
-  worktree: string;
-  branch: string;
-  aidlcIntent: string;
-  aidlcSpace: string;
-  memory: Record<MemoryDestination, { revision: string; path: string }>;
-}> {
+): Promise<DispatchReadiness> {
   const root = resolve(rootInput);
   const validation = await doctorWorkspace(root);
   if (!validation.ok) {
@@ -1007,21 +1047,24 @@ export async function checkDispatch(
   }
 
   const loaded = await loadWorkspace(root);
-  const discovery = await requireConfirmedDiscovery(root, loaded);
-  requireLifecyclePhase(loaded, "dispatch");
-  requireCurrentPlanAcceptance(loaded, discovery);
   const intent = loaded.intents.find((item) => item.id === intentId);
   const mapping = intent?.projects.find((item) => item.project === projectId);
   if (!intent || !mapping) {
     throw new PortfolioError(`project ${projectId} is not registered in intent ${intentId}`);
   }
+  return assertDispatchable(root, loaded, mapping, projectId, intentId);
+}
 
-  const current = loaded.state.sessions[sessionKey(intentId, projectId)];
-  if (current?.status === "active" || current?.status === "waiting") {
-    throw new PortfolioError(
-      `session ${intentId}:${projectId} is already ${current.status}`,
-    );
-  }
+async function assertDispatchable(
+  root: string,
+  loaded: LoadedWorkspace,
+  mapping: IntentProject,
+  projectId: string,
+  intentId: string,
+): Promise<DispatchReadiness> {
+  const discovery = await requireConfirmedDiscovery(root, loaded);
+  requireLifecyclePhase(loaded, "dispatch");
+  requireCurrentPlanAcceptance(loaded, discovery);
   const pendingQuestions = await listQuestionPackets(
     root,
     projectId,
@@ -1033,6 +1076,12 @@ export async function checkDispatch(
       `session ${intentId}:${projectId} has unanswered human questions: ${pendingQuestions
         .map((packet) => packet.id)
         .join(", ")}`,
+    );
+  }
+  const current = loaded.state.sessions[sessionKey(intentId, projectId)];
+  if (current?.status === "active" || current?.status === "waiting") {
+    throw new PortfolioError(
+      `session ${intentId}:${projectId} is already ${current.status}`,
     );
   }
 
@@ -1420,20 +1469,6 @@ export async function rejectLearningProposal(
     proposal.updatedAt = now;
     await atomicWrite(learningPath(root, id), stringify(proposal));
   });
-}
-
-export async function findPortfolioRoot(startInput: string): Promise<string | null> {
-  let current = resolve(startInput);
-  while (true) {
-    if (await pathExists(join(current, "portfolio", "portfolio.yaml"))) {
-      return current;
-    }
-    const parent = dirname(current);
-    if (parent === current) {
-      return null;
-    }
-    current = parent;
-  }
 }
 
 async function loadWorkspace(root: string): Promise<LoadedWorkspace> {
@@ -2223,15 +2258,25 @@ async function setSessionStatus(
     terminalId: previous?.terminalId ?? null,
     updatedAt: new Date().toISOString(),
   };
-  loaded.state.activeIntent =
-    status === "active" || status === "waiting"
-      ? intentId
-      : loaded.state.activeIntent;
+  loaded.state.activeIntent = activeIntentFrom(loaded.state.sessions);
   loaded.state.updatedAt = new Date().toISOString();
   await atomicWrite(
     workspacePaths(loaded.root).stateFile,
     `${JSON.stringify(loaded.state, null, 2)}\n`,
   );
+}
+
+function activeIntentFrom(
+  sessions: Record<string, SessionRecord>,
+): string | null {
+  const active = Object.entries(sessions)
+    .filter(([, session]) =>
+      session.status === "active" || session.status === "waiting",
+    )
+    .sort((left, right) =>
+      right[1].updatedAt.localeCompare(left[1].updatedAt),
+    );
+  return active[0]?.[0].split(":")[0] ?? null;
 }
 
 async function readLearningProposals(root: string): Promise<LearningProposal[]> {
@@ -2370,15 +2415,106 @@ async function atomicWrite(file: string, content: string): Promise<void> {
 
 async function withLock<T>(root: string, operation: () => Promise<T>): Promise<T> {
   const lock = join(workspacePaths(root).portfolio, ".portfolio.lock");
-  try {
-    await mkdir(lock);
-  } catch {
-    throw new PortfolioError(`portfolio is locked by another operation: ${lock}`);
-  }
+  const owner: PortfolioLockOwner = {
+    token: crypto.randomUUID(),
+    pid: process.pid,
+    createdAt: new Date().toISOString(),
+  };
+  await acquirePortfolioLock(lock, owner);
   try {
     return await operation();
   } finally {
-    await rm(lock, { recursive: true, force: true });
+    await releasePortfolioLock(lock, owner.token);
+  }
+}
+
+async function acquirePortfolioLock(
+  lock: string,
+  owner: PortfolioLockOwner,
+): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await mkdir(lock);
+    } catch (error) {
+      if (
+        !isFileSystemError(error, "EEXIST") ||
+        attempt > 0 ||
+        !(await reclaimAbandonedLock(lock))
+      ) {
+        throw new PortfolioError(
+          `portfolio is locked by another operation: ${lock}`,
+        );
+      }
+      continue;
+    }
+
+    try {
+      await writeFile(
+        join(lock, "owner.json"),
+        `${JSON.stringify(owner, null, 2)}\n`,
+        { flag: "wx" },
+      );
+      return;
+    } catch (error) {
+      await rm(lock, { recursive: true, force: true });
+      throw error;
+    }
+  }
+}
+
+async function reclaimAbandonedLock(lock: string): Promise<boolean> {
+  try {
+    const owner = JSON.parse(
+      await readFile(join(lock, "owner.json"), "utf8"),
+    ) as Partial<PortfolioLockOwner>;
+    if (
+      typeof owner.pid === "number" &&
+      Number.isInteger(owner.pid) &&
+      owner.pid > 0 &&
+      typeof owner.createdAt === "string"
+    ) {
+      if (processIsAlive(owner.pid)) return false;
+      await rm(lock, { recursive: true, force: true });
+      return true;
+    }
+  } catch (error) {
+    if (isFileSystemError(error, "ENOENT")) {
+      try {
+        const metadata = await stat(lock);
+        if (Date.now() - metadata.mtimeMs < LOCK_OWNER_GRACE_MS) return false;
+      } catch (statError) {
+        return isFileSystemError(statError, "ENOENT");
+      }
+    } else if (!(error instanceof SyntaxError)) {
+      throw error;
+    }
+  }
+
+  const metadata = await stat(lock);
+  if (Date.now() - metadata.mtimeMs < LOCK_OWNER_GRACE_MS) return false;
+  await rm(lock, { recursive: true, force: true });
+  return true;
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !isFileSystemError(error, "ESRCH");
+  }
+}
+
+async function releasePortfolioLock(lock: string, token: string): Promise<void> {
+  try {
+    const owner = JSON.parse(
+      await readFile(join(lock, "owner.json"), "utf8"),
+    ) as Partial<PortfolioLockOwner>;
+    if (owner.token === token) {
+      await rm(lock, { recursive: true, force: true });
+    }
+  } catch (error) {
+    if (!isFileSystemError(error, "ENOENT")) throw error;
   }
 }
 
@@ -2402,18 +2538,40 @@ async function readHeadMemory(
 ): Promise<{ exists: boolean; content: string } | null> {
   if (!(await pathExists(join(worktree, ".git")))) return null;
   const gitPath = relativeMemory.split(sep).join("/");
-  const process = Bun.spawn(["git", "-C", worktree, "show", `HEAD:${gitPath}`], {
+  await runGitForMemory(worktree, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  const treeEntry = await runGitForMemory(worktree, [
+    "ls-tree",
+    "--name-only",
+    "HEAD",
+    "--",
+    gitPath,
+  ]);
+  if (!treeEntry.trim()) return { exists: false, content: "" };
+  const content = await runGitForMemory(worktree, ["show", `HEAD:${gitPath}`]);
+  return { exists: true, content };
+}
+
+async function runGitForMemory(
+  worktree: string,
+  args: string[],
+): Promise<string> {
+  const child = Bun.spawn(["git", "-C", worktree, ...args], {
     stdout: "pipe",
     stderr: "pipe",
   });
-  const [exitCode, stdout] = await Promise.all([
-    process.exited,
-    new Response(process.stdout).text(),
-    new Response(process.stderr).text(),
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
   ]);
-  return exitCode === 0
-    ? { exists: true, content: stdout }
-    : { exists: false, content: "" };
+  if (exitCode !== 0) {
+    throw new PortfolioError(
+      `cannot inspect worktree memory with git ${args.join(" ")}: ${
+        stderr.trim() || stdout.trim()
+      }`,
+    );
+  }
+  return stdout;
 }
 
 function dirnameFromRelative(file: string, relativePath: string): string {
@@ -2426,4 +2584,13 @@ function dirnameFromRelative(file: string, relativePath: string): string {
 
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isFileSystemError(error: unknown, code: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === code
+  );
 }

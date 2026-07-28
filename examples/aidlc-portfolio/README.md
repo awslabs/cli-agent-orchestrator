@@ -172,6 +172,7 @@ my-portfolio/
 |   |-- state.json
 |   |-- projects/
 |   |-- dependencies/
+|   |-- contracts/
 |   |-- intents/
 |   |-- questions/
 |   |-- learnings/
@@ -266,7 +267,7 @@ bun run check
 
 The suite does not invoke a provider or perform real project development. It
 tests the deterministic portfolio control plane with temporary Git
-repositories and worktrees.
+repositories and worktrees. CAO's main CI workflow runs the same command.
 
 ## Boundaries
 

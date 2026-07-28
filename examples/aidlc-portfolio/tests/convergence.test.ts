@@ -150,9 +150,12 @@ describe("cross-project convergence", () => {
 
     let report = await checkConvergence(root);
     expect(report.ok).toBe(false);
-    const ordering = report.risks.find(
+    const orderingRisks = report.risks.filter(
       (item) => item.category === "dependency-order",
-    )!;
+    );
+    expect(orderingRisks).toHaveLength(1);
+    expect(orderingRisks[0]?.project).toBe("web");
+    const ordering = orderingRisks[0]!;
     await expect(
       decideConvergenceRisk(
         root,

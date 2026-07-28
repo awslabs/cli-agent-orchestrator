@@ -97,3 +97,8 @@ only after the decision is durable.
 CAO terminals are disposable; AI-DLC state is durable. On terminal loss, inspect
 registered worktree and child status, then launch the same runner against the
 same intent. Never birth a replacement intent merely because a terminal ended.
+
+Portfolio mutations record the lock owner's process ID and timestamp. A later
+mutation rejects a live owner and automatically reclaims a lock whose process
+has exited; a newly created lock without valid owner metadata receives a short
+grace period before reclamation.
