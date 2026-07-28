@@ -1,0 +1,30 @@
+╭─── Claude Code v2.1.220 ─────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                    │
+│                 Welcome back Amber!                │ Run /init to create a CLAUDE.md file with … │
+│                                                    │ ─────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                  │
+│                      ▝▜█████▛▘                     │ Bug fixes and reliability improvements      │
+│                        ▘▘ ▝▝                       │ Added Claude Opus 5 (`claude-opus-5`), now… │
+│     Sonnet 5 with xhigh effort · Claude Max ·      │ Added `sandbox.network.strictAllowlist` se… │
+│     <ACCOUNT>'s Organization          │ /release-notes for more                     │
+│   /…/pytest-508/cao_scratch_1030/worktree-claude   │                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 1 MCP server needs authentication · run /mcp
+
+❯ /compact
+
+❯ /compact
+  ⎿  Not enough messages to compact.
+
+❯ Count from 1 to 150 slowly, one number per line.
+
+✽ Ebbing…
+  ⎿  Tip: Dynamic workflows let Claude write a script that orchestrates many agents for you. Mention
+     the keyword ultracode or ask Claude to use a workflow directly.
+                                                                                  ◉ xhigh · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  sonnet-5 │ xhigh │ /…/cao_scratch_1030/worktree-claude │ master
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 3 agents

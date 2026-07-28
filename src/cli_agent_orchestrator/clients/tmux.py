@@ -36,8 +36,43 @@ logger = logging.getLogger(__name__)
 # error on a name it does not know: it falls back to sending the argument
 # as literal bytes, so the wire's ``Backspace`` would type the nine
 # characters "Backspace" into the composer.  tmux's name for the erase
-# key is ``BSpace``; names absent from this table are already tmux's.
-_TMUX_SEQUENCE_KEY_NAMES = {"Backspace": "BSpace"}
+# key is ``BSpace``.
+#
+# The table is TOTAL over :data:`SEQUENCE_KEY_NAMES` (asserted below): a
+# wire name absent from it never reaches ``send-keys`` — a drifted
+# contract set fails the assert at import rather than passing an
+# untranslated name to a sink that silently literalizes unknown names.
+# The navigation/editing names map to tmux's canonical primary names
+# (native-TUI-console §3.2): ``PageUp``/``PageDown``/``Delete``/``Insert``
+# are passed exactly, never the documented aliases
+# ``PPage``/``NPage``/``DC``/``IC``; tmux then encodes for the pane's mode
+# (SS3 cursors under DECCKM, CSI otherwise) — the translation is tmux's,
+# not this table's.
+_TMUX_SEQUENCE_KEY_NAMES = {
+    "Escape": "Escape",
+    "C-c": "C-c",
+    "C-s": "C-s",
+    "Enter": "Enter",
+    "Backspace": "BSpace",
+    "Up": "Up",
+    "Down": "Down",
+    "Left": "Left",
+    "Right": "Right",
+    "Home": "Home",
+    "End": "End",
+    "PageUp": "PageUp",
+    "PageDown": "PageDown",
+    "Delete": "Delete",
+    "Insert": "Insert",
+    "Tab": "Tab",
+}
+
+# Totality, pinned at import: the wire contract's normalized key set and
+# this translation table must cover exactly the same names.  A key added
+# to the contract without a translation here (or a stale translation left
+# behind) fails the process at import — loudly, at startup — rather than
+# at a pane, where an untranslated name would type itself into a composer.
+assert set(_TMUX_SEQUENCE_KEY_NAMES) == set(SEQUENCE_KEY_NAMES)
 
 _TMUX_BINARY: Optional[str] = None
 
@@ -1452,8 +1487,9 @@ class TmuxClient:
 
         The keystroke primitive for schema-v3 structured sequences
         (cond-0175): one event, one named key, from the contract's
-        normalized name set (:data:`SEQUENCE_KEY_NAMES` — ``Escape``,
-        ``C-c``, ``C-s``, ``Enter``, ``Backspace``).  The set is the sink's
+        normalized name set (:data:`SEQUENCE_KEY_NAMES` — the deployed
+        ``Escape``, ``C-c``, ``C-s``, ``Enter``, ``Backspace`` plus the
+        §3.2 navigation/editing keys).  The set is the sink's
         own bound: ``send-keys`` without ``-l`` interprets its argument as
         key names, so an unrestricted parameter here would let a caller
         deliver arbitrary keystrokes through the structured path.  The
@@ -1505,7 +1541,7 @@ class TmuxClient:
             )
 
         self._run_literal_write(
-            [tmux_binary(), "send-keys", "-t", pane_id, _TMUX_SEQUENCE_KEY_NAMES.get(key, key)],
+            [tmux_binary(), "send-keys", "-t", pane_id, _TMUX_SEQUENCE_KEY_NAMES[key]],
             chunks_sent=0,
             enter_attempted=False,
             deadline_monotonic=deadline_monotonic,

@@ -1,0 +1,55 @@
+{
+  "chord": null,
+  "chord_attempted": null,
+  "chord_sent": null,
+  "chunks_sent": null,
+  "control_id": "ctl-9fae3cc677",
+  "detail": "the composer holds content; a declared command submitted now would concatenate with the queued prefill and deliver as ordinary prompt text. Zero command bytes were written and the prefill is untouched \u2014 submit or clear it as the operator, then retry the command",
+  "enter_attempted": null,
+  "enter_sent": false,
+  "events": [
+    {
+      "ordinal": 0,
+      "outcome": "refused",
+      "text": "/compact",
+      "type": "text"
+    },
+    {
+      "key": "Enter",
+      "ordinal": 1,
+      "outcome": "refused",
+      "type": "key"
+    }
+  ],
+  "in_flight": false,
+  "outcome": "refused",
+  "protocol": "cao-control-input-v1",
+  "reason_code": "composer-nonempty",
+  "reattemptable": true,
+  "request_digest": "25b7301f7a8b9cbf6ba29145caaa66df0bfcc73d87350b543426b581a1283f1e",
+  "request_schema_version": 4,
+  "resolved_identity": {
+    "execution_mode": "native_tui",
+    "native_session_id": "a155a5c3-679a-421d-80a7-8aedad0efb4c",
+    "pane": {
+      "bound_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "dead": false,
+      "observed_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "pane_id": "%4",
+      "pane_pid": 30162,
+      "window_id": "@4"
+    },
+    "pane_birth_id": "%4",
+    "provider": "claude_code",
+    "provider_process_id": "30162@Tue Jul 28 13:12:57 2026",
+    "session_name": "cao-a103-claude-d1a278",
+    "terminal_generation": "b19b64bb-2f01-4d4e-be89-ab71d632846b",
+    "terminal_id": "47f32838",
+    "terminal_incarnation": null
+  },
+  "state": "refused",
+  "submission_evidence_ref": null,
+  "submission_observed": null,
+  "terminal_id": "47f32838",
+  "text_sent": false
+}

@@ -1,14 +1,14 @@
 /**
  * Operator-macro notation: the §5.3 editing-surface grammar (TS live preview).
  *
- * This is the client-side *preview* parser. The server
- * (`services/macro_notation.py`, provisional until Lane A's contract-co-located
- * parser lands — §9) is the authority: it decides what may be saved or sent,
- * and both parsers are pinned byte-for-byte by the shared golden vectors in
- * `web/src/test/fixtures/macroNotationVectors.json`, mirroring the digest
- * golden-vector precedent. Any grammar change lands in both parsers and the
- * vectors in one change — a needed-but-absent grammar item is a spec
- * amendment, never a frontend invention.
+ * The server (`services/macro_notation.py`, Lane A's canonical parser) is the
+ * authority: it decides what may be saved or sent. This TypeScript preview is
+ * its mirror — same tokenization, same messages, same offsets — pinned
+ * byte-for-byte by the shared golden vectors in
+ * `test/fixtures/notation_vectors.json`, mirroring the digest golden-vector
+ * precedent. Any grammar change lands in both parsers and the vectors in one
+ * change — a needed-but-absent grammar item is a spec amendment, never a
+ * frontend invention.
  *
  * Grammar (pinned, §5.3):
  *
@@ -20,8 +20,10 @@
  *   repeat   := (named|chord) '*' [1-9][0-9]*   — expansion counts toward
  *                                                 the 32-event cap
  *
- * WS is pinned to the ASCII whitespace set so the two parsers agree exactly
- * (Python's str.isspace() and JS's \s diverge on edge characters).
+ * Known residuals (documented, never hit by realistic editor input):
+ * Python's str.isspace() and JS's \s differ on U+0085 and U+FEFF; malformed
+ * \uXXXX escapes report Python's "Invalid \escape" rather than CPython's
+ * \u-specific wording. The server authority is the gate for both.
  */
 
 import type { SequenceEvent } from './sequenceRecorder'
@@ -50,12 +52,31 @@ const WIRE_TO_NOTATION: Record<string, string> = Object.fromEntries(
   Object.entries(NAMED_KEYS).map(([name, wire]) => [wire, name]),
 )
 
-const WHITESPACE = new Set([' ', '\t', '\n', '\r', '\v', '\f'])
+// The sorted known-names list rendered exactly as Python's str(sorted(...)).
+const KNOWN_NAMES =
+  "['backspace', 'delete', 'down', 'end', 'enter', 'escape', 'home', 'insert', " +
+  "'left', 'page-down', 'page-up', 'right', 'tab', 'up']"
 
-const SYMBOL_RE = /[a-z0-9+\-*]+/y
-const REPEAT_COUNT_RE = /^[1-9][0-9]*$/
-const CHORD_LETTER_RE = /^C-([a-z])$/
+// Modifier words a combination may be built from (§3.3): a combination of
+// them has no standard-mode byte encoding, so it is named and refused.
+const MODIFIER_WORDS = new Set(['ctrl', 'alt', 'meta', 'cmd', 'shift', 'super'])
+
+const NAMED_RE = /[a-z][a-z0-9-]*/y
+const COMBINATION_RE = /[a-z0-9][a-z0-9+\-]*/y
+const REPEAT_RE = /[1-9][0-9]*/y
+
+// Chars that end the modifier check after a modifier word (Python's
+// ``notation[word.end()] in "+ \t\n"``).
+const MODIFIER_ENDERS = new Set(['+', ' ', '\t', '\n'])
+
+// Text bytes the control path can never send honestly (ESC, C1 CSI, CR, LF).
+const ILLEGAL_TEXT_CHARS = ['\x1b', '\x9b', '\r', '\n']
+
 const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+
+const CAP_MESSAGE =
+  `this event brings the sequence past the ${MAX_SEQUENCE_EVENTS}-event cap; ` +
+  'a repeat expansion counts every event it stands for'
 
 export interface NotationErrorInfo {
   offset: number
@@ -79,10 +100,33 @@ export class NotationParseError extends Error {
 
 const encoder = new TextEncoder()
 
+function isSpace(ch: string): boolean {
+  return /\s/.test(ch)
+}
+
+function multiModifierFailure(notation: string, pos: number): NotationParseError {
+  COMBINATION_RE.lastIndex = pos
+  const match = COMBINATION_RE.exec(notation)
+  const combination = match !== null ? match[0] : notation.slice(pos)
+  return new NotationParseError(
+    pos,
+    `multi-modifier combination '${combination}' cannot be represented: no ` +
+      'standard-mode terminal byte encoding exists for it (tmux would inject the ' +
+      'base key or a wrong encoding), so it is refused, never approximated',
+  )
+}
+
+/**
+ * Scan and decode the JSON string opening at `start`, reproducing the Python
+ * authority's error taxonomy (unterminated / invalid escape / invalid
+ * control character) with Python-identical offsets and messages for the
+ * pinned cases.
+ */
 function scanJsonString(notation: string, start: number): [string, number] {
+  const n = notation.length
   let k = start + 1
   let closed = false
-  while (k < notation.length) {
+  while (k < n) {
     const ch = notation[k]
     if (ch === '\\') {
       k += 2
@@ -95,145 +139,183 @@ function scanJsonString(notation: string, start: number): [string, number] {
     k += 1
   }
   if (!closed) {
-    throw new NotationParseError(start, 'unterminated text event')
+    throw new NotationParseError(start, 'unterminated string: a text token is a JSON string')
   }
-  const fragment = notation.slice(start, k + 1)
-  let value: unknown
-  try {
-    value = JSON.parse(fragment)
-  } catch {
-    throw new NotationParseError(start, 'invalid JSON string in text event')
-  }
-  if (typeof value !== 'string') {
-    throw new NotationParseError(start, 'invalid JSON string in text event')
-  }
-  return [value, k + 1]
-}
-
-/** A repeat token as embedded in an error message, bounded in length. */
-function displayToken(token: string): string {
-  return token.length <= 24 ? token : `${token.slice(0, 23)}…`
-}
-
-function splitRepeat(token: string, start: number): [string, number | null] {
-  const star = token.indexOf('*')
-  if (star === -1) return [token, null]
-  const base = token.slice(0, star)
-  const countText = token.slice(star + 1)
-  if (!REPEAT_COUNT_RE.test(countText)) {
-    throw new NotationParseError(
-      start + base.length,
-      `invalid repeat count '*${countText}': expected '*' followed by a positive integer`,
-    )
-  }
-  // A count with more than two digits is ≥ 100, which can never fit the
-  // 32-event budget even in an empty sequence — fail before the numeric
-  // conversion (huge digit strings lose precision/overflow to Infinity;
-  // the failure keeps the ordinary offset-bearing shape). Mirrors the
-  // Python authority exactly.
-  if (countText.length > 2) {
-    throw new NotationParseError(
-      start,
-      `repeat '${displayToken(token)}' expands past the ${MAX_SEQUENCE_EVENTS}-event cap`,
-    )
-  }
-  return [base, Number(countText)]
-}
-
-function mapSymbol(base: string, start: number): SequenceEvent {
-  if (base.startsWith('ctrl+')) {
-    const rest = base.slice('ctrl+'.length)
-    if (rest.length === 1 && rest >= 'a' && rest <= 'z') {
-      if (rest === 'c') return { type: 'key', key: 'C-c' }
-      return { type: 'chord', chord: `C-${rest}` }
+  const token = notation.slice(start, k + 1)
+  // Validate escape sequences and raw control characters with CPython's
+  // messages (the authority's ``json`` errors, offset = the offending index
+  // inside the token, reported at event_pos + index).
+  for (let i = 1; i < token.length - 1; i += 1) {
+    const ch = token[i]
+    if (ch === '\\') {
+      const next = token[i + 1]
+      if (next === undefined || !'"\\/bfnrtu'.includes(next)) {
+        throw new NotationParseError(
+          start + i,
+          'invalid JSON string: Invalid \\escape; text uses JSON escaping exactly ' +
+            '(comma, plus, slash and backslash are literal inside quotes)',
+        )
+      }
+      i += 1
+      continue
     }
-    throw new NotationParseError(
-      start,
-      `unrepresentable chord '${base}': only ctrl+<letter> has a pinned terminal byte encoding`,
-    )
+    if (ch < ' ') {
+      throw new NotationParseError(
+        start + i,
+        'invalid JSON string: Invalid control character at; text uses JSON escaping ' +
+          'exactly (comma, plus, slash and backslash are literal inside quotes)',
+      )
+    }
   }
-  const wire = NAMED_KEYS[base]
-  if (wire !== undefined) return { type: 'key', key: wire }
-  if (base.includes('+')) {
-    throw new NotationParseError(
-      start,
-      `unrepresentable event '${base}': terminal byte streams cannot express ` +
-        'modifier combinations other than ctrl+<letter>',
-    )
-  }
-  throw new NotationParseError(start, `unknown key name '${base}'`)
+  const decoded = JSON.parse(token) as string
+  return [decoded, k + 1]
 }
 
 /**
  * Parse §5.3 notation into a v3 event array. Throws NotationParseError with
- * an offset and message on any failure; caps are enforced as events
- * accumulate so the failing token's offset is always known.
+ * an offset and message on any failure; at most one error is reported — the
+ * parse fails fast at the first malformed token.
  */
 export function parseNotation(notation: string): SequenceEvent[] {
+  const length = notation.length
+  let pos = 0
+  while (pos < length && isSpace(notation[pos])) pos += 1
+  if (pos === length) {
+    throw new NotationParseError(pos, 'a macro names at least one event')
+  }
+
   const events: SequenceEvent[] = []
   let textBytes = 0
-  let i = 0
-  const n = notation.length
-  for (;;) {
-    while (i < n && WHITESPACE.has(notation[i])) i += 1
-    if (i >= n) break
-    const start = i
-    const ch = notation[i]
-    if (ch === '"') {
-      const [value, end] = scanJsonString(notation, i)
-      i = end
-      if (i < n && !WHITESPACE.has(notation[i])) {
-        throw new NotationParseError(i, 'expected whitespace between events')
+
+  while (pos < length) {
+    const eventPos = pos
+    let event: SequenceEvent | null = null
+    let repeatable = false
+    const char = notation[pos]
+
+    if (char === '"') {
+      const [decoded, end] = scanJsonString(notation, pos)
+      if (decoded === '') {
+        throw new NotationParseError(eventPos, 'a text event must be a non-empty string')
       }
-      if (LONE_SURROGATE_RE.test(value)) {
-        throw new NotationParseError(
-          start,
-          'text event is not UTF-8-encodable (lone surrogate); it can never become a wire event',
-        )
-      }
-      textBytes += encoder.encode(value).length
-      if (textBytes > MAX_SEQUENCE_TEXT_BYTES) {
-        throw new NotationParseError(
-          start,
-          `text event pushes the sequence past the ${MAX_SEQUENCE_TEXT_BYTES}-byte aggregate cap`,
-        )
-      }
-      events.push({ type: 'text', text: value })
-    } else if (ch >= 'a' && ch <= 'z') {
-      SYMBOL_RE.lastIndex = i
-      const match = SYMBOL_RE.exec(notation)
-      if (match === null) throw new Error('unreachable: event-start char is in the symbol class')
-      const token = match[0]
-      i = SYMBOL_RE.lastIndex
-      if (i < n && !WHITESPACE.has(notation[i])) {
-        throw new NotationParseError(i, 'expected whitespace between events')
-      }
-      const [base, count] = splitRepeat(token, start)
-      const event = mapSymbol(base, start)
-      if (count === null) {
-        if (events.length + 1 > MAX_SEQUENCE_EVENTS) {
-          throw new NotationParseError(start, `sequence holds at most ${MAX_SEQUENCE_EVENTS} events`)
-        }
-        events.push(event)
-      } else {
-        if (events.length + count > MAX_SEQUENCE_EVENTS) {
+      for (const illegal of ILLEGAL_TEXT_CHARS) {
+        if (decoded.includes(illegal)) {
           throw new NotationParseError(
-            start,
-            `repeat '${displayToken(token)}' expands past the ${MAX_SEQUENCE_EVENTS}-event cap`,
+            eventPos,
+            'the text contains a control character (ESC, C1 CSI, CR, or LF) ' +
+              'the control path can never send honestly; an unrepresentable ' +
+              'macro is refused, never approximated',
           )
         }
-        for (let k = 0; k < count; k += 1) events.push({ ...event })
       }
+      if (LONE_SURROGATE_RE.test(decoded)) {
+        throw new NotationParseError(
+          eventPos,
+          'the text contains a lone surrogate that is not UTF-8-encodable; ' +
+            'an unrepresentable macro is refused, never approximated',
+        )
+      }
+      textBytes += encoder.encode(decoded).length
+      if (textBytes > MAX_SEQUENCE_TEXT_BYTES) {
+        throw new NotationParseError(
+          eventPos,
+          `this text pushes the sequence past the ${MAX_SEQUENCE_TEXT_BYTES}-byte ` +
+            'aggregate text cap; a macro is a short control burst, not a document',
+        )
+      }
+      event = { type: 'text', text: decoded }
+      pos = end
+    } else if (notation.startsWith('ctrl+', pos)) {
+      const letterAt = pos + 'ctrl+'.length
+      if (letterAt < length) {
+        NAMED_RE.lastIndex = letterAt
+        const word = NAMED_RE.exec(notation)
+        if (
+          word !== null &&
+          MODIFIER_WORDS.has(word[0]) &&
+          (NAMED_RE.lastIndex >= length || MODIFIER_ENDERS.has(notation[NAMED_RE.lastIndex]))
+        ) {
+          // ``ctrl+shift+x`` and friends: a modifier where the chord's
+          // single letter must be.
+          throw multiModifierFailure(notation, pos)
+        }
+      }
+      if (letterAt >= length || !(notation[letterAt] >= 'a' && notation[letterAt] <= 'z')) {
+        throw new NotationParseError(
+          letterAt,
+          "a chord is 'ctrl+' followed by one letter a-z; multi-modifier and " +
+            'non-letter chords are unrepresentable and refused, never approximated',
+        )
+      }
+      const letter = notation[letterAt]
+      event = letter === 'c' ? { type: 'key', key: 'C-c' } : { type: 'chord', chord: `C-${letter}` }
+      repeatable = true
+      pos = letterAt + 1
     } else {
-      throw new NotationParseError(
-        start,
-        'expected an event (a "quoted" text, a key name, or ctrl+<letter>)',
-      )
+      NAMED_RE.lastIndex = pos
+      const match = NAMED_RE.exec(notation)
+      if (match === null) {
+        throw new NotationParseError(
+          pos,
+          `expected a quoted text, a named key, or a ctrl+<letter> chord, ` +
+            `not '${char}'; known key names are ${KNOWN_NAMES}`,
+        )
+      }
+      const name = match[0]
+      if (MODIFIER_WORDS.has(name) && NAMED_RE.lastIndex < length && notation[NAMED_RE.lastIndex] === '+') {
+        // ``alt+x``, ``meta+x`` and friends at event position.
+        throw multiModifierFailure(notation, pos)
+      }
+      const wire = NAMED_KEYS[name]
+      if (wire === undefined) {
+        throw new NotationParseError(
+          pos,
+          `unknown named key '${name}'; known key names are ${KNOWN_NAMES} — ` +
+            'unlisted keys (BTab, modified arrows, F-keys) are refused, never approximated',
+        )
+      }
+      event = { type: 'key', key: wire }
+      repeatable = true
+      pos = NAMED_RE.lastIndex
+    }
+
+    let count = 1
+    if (repeatable && pos < length && notation[pos] === '*') {
+      const repeatPos = pos
+      REPEAT_RE.lastIndex = pos + 1
+      const digits = REPEAT_RE.exec(notation)
+      if (digits === null) {
+        throw new NotationParseError(
+          repeatPos + 1,
+          'a repeat count is a positive integer written [1-9][0-9]* ' +
+            '(zero and empty counts are malformed, not no-ops)',
+        )
+      }
+      if (digits[0].length > 2) {
+        // A count of 100+ can never fit the 32-event budget, even in an
+        // empty sequence — fail before the numeric conversion (huge digit
+        // strings lose precision/overflow to Infinity). r11: the failure
+        // keeps the ordinary offset-bearing shape; the message embeds no
+        // token, so it is bounded by construction.
+        throw new NotationParseError(eventPos, CAP_MESSAGE)
+      }
+      count = Number(digits[0])
+      pos = REPEAT_RE.lastIndex
+    }
+
+    if (events.length + count > MAX_SEQUENCE_EVENTS) {
+      throw new NotationParseError(eventPos, CAP_MESSAGE)
+    }
+    for (let k = 0; k < count; k += 1) events.push({ ...(event as SequenceEvent) })
+
+    if (pos < length) {
+      if (!isSpace(notation[pos])) {
+        throw new NotationParseError(pos, `expected whitespace between events, not '${notation[pos]}'`)
+      }
+      while (pos < length && isSpace(notation[pos])) pos += 1
     }
   }
-  if (events.length === 0) {
-    throw new NotationParseError(0, 'empty notation: name at least one event')
-  }
+
   return events
 }
 
@@ -265,7 +347,7 @@ function eventNotation(event: SequenceEvent): string {
     return name
   }
   if (event.type === 'chord') {
-    const match = CHORD_LETTER_RE.exec(event.chord ?? '')
+    const match = /^C-([a-z])$/.exec(event.chord ?? '')
     // ctrl+c parses to key C-c (D7), so a chord C-c has no faithful
     // notation form — rendering one would round-trip to a different event.
     if (match === null || match[1] === 'c') {
@@ -287,9 +369,10 @@ function sameNonTextEvent(a: SequenceEvent, b: SequenceEvent): boolean {
 }
 
 /**
- * Render the canonical notation for a validated v3 event array. Runs of two
- * or more identical non-text events fold to `name*N`; text events never
- * fold. parseNotation(renderNotation(events)) deep-equals events.
+ * Render the canonical notation for a validated v3 event array (client-side:
+ * the §7.4 recorder keeps its tokens and notation in sync through this and
+ * the pinned parser; the server never renders notation). Runs of two or more
+ * identical non-text events fold to `name*N`; text events never fold.
  */
 export function renderNotation(events: SequenceEvent[]): string {
   const tokens: string[] = []

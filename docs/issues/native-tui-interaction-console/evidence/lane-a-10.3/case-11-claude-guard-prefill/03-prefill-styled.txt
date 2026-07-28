@@ -1,0 +1,29 @@
+╭─── Claude Code v2.1.220 ─────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                    │
+│                 Welcome back Amber!                │ Run /init to create a CLAUDE.md file with … │
+│                                                    │ ─────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                  │
+│                      ▝▜█████▛▘                     │ Bug fixes and reliability improvements      │
+│                        ▘▘ ▝▝                       │ Added Claude Opus 5 (`claude-opus-5`), now… │
+│     Sonnet 5 with xhigh effort · Claude Max ·      │ Added `sandbox.network.strictAllowlist` se… │
+│     <ACCOUNT>'s Organization          │ /release-notes for more                     │
+│   /…/pytest-508/cao_scratch_1030/worktree-claude   │                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                  ◉ xhigh · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ queued draft
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  sonnet-5 │ xhigh │ /…/cao_scratch_1030/worktree-claude │ master
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

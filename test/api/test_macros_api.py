@@ -92,8 +92,10 @@ class TestCreateEndpoint:
         assert response.json()["errors"] == [
             {
                 "offset": 0,
-                "message": "unrepresentable chord 'ctrl+shift+x': only ctrl+<letter> "
-                "has a pinned terminal byte encoding",
+                "message": "multi-modifier combination 'ctrl+shift+x' cannot be "
+                "represented: no standard-mode terminal byte encoding exists for it "
+                "(tmux would inject the base key or a wrong encoding), so it is "
+                "refused, never approximated",
             }
         ]
 
@@ -214,17 +216,17 @@ class TestParseNotationEndpoint:
         assert response.json() == {
             "errors": [
                 {
-                    "offset": 2,
-                    "message": "invalid repeat count '*0': expected '*' followed by a "
-                    "positive integer",
+                    "offset": 3,
+                    "message": "a repeat count is a positive integer written [1-9][0-9]* "
+                    "(zero and empty counts are malformed, not no-ops)",
                 }
             ]
         }
 
     def test_missing_notation_is_422(self, client, store):
+        # The field is required by the request model: never a 500.
         response = client.post("/macros/parse-notation", json={})
         assert response.status_code == 422
-        assert response.json()["errors"][0]["message"] == "'notation' is required"
 
     def test_absurd_repeat_count_is_the_ordinary_offset_422_not_500(self, client, store):
         """r11 regression: the over-budget repeat fails before the integer
@@ -235,7 +237,10 @@ class TestParseNotationEndpoint:
         assert response.status_code == 422
         errors = response.json()["errors"]
         assert errors[0]["offset"] == 0
-        assert errors[0]["message"].endswith("expands past the 32-event cap")
+        assert errors[0]["message"] == (
+            "this event brings the sequence past the 32-event cap; a repeat "
+            "expansion counts every event it stands for"
+        )
         assert "sys.set_int_max_str_digits" not in errors[0]["message"]
 
 
@@ -252,7 +257,10 @@ class TestCreateRepeatRegression:
         assert response.status_code == 422
         errors = response.json()["errors"]
         assert errors[0]["offset"] == 0
-        assert errors[0]["message"].endswith("expands past the 32-event cap")
+        assert errors[0]["message"] == (
+            "this event brings the sequence past the 32-event cap; a repeat "
+            "expansion counts every event it stands for"
+        )
 
 
 class TestScopeGating:

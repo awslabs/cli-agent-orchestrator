@@ -239,7 +239,9 @@ describe('MacroLibraryModal', () => {
     // previous valid events, and disables Save.
     fireEvent.change(notation, { target: { value: 'up*0' } })
     expect(
-      screen.getByText(/invalid repeat count '\*0': expected '\*' followed by a positive integer/),
+      screen.getByText(
+        /a repeat count is a positive integer written \[1-9\]\[0-9\]\* \(zero and empty counts are malformed, not no-ops\)/,
+      ),
     ).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
   })

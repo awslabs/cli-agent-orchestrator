@@ -11,7 +11,7 @@ import stat
 import pytest
 
 from cli_agent_orchestrator.services import macro_store
-from cli_agent_orchestrator.services.macro_builtins import (
+from cli_agent_orchestrator.services.macro_store import (
     builtin_macro_id,
     builtin_macros_for_provider,
     resolve_builtin,
@@ -86,9 +86,9 @@ class TestCreateAndList:
             macro_store.create_macro(name="x", scope={"kind": "global"}, notation="up*0")
         assert excinfo.value.errors == [
             {
-                "offset": 2,
-                "message": "invalid repeat count '*0': expected '*' followed by a "
-                "positive integer",
+                "offset": 3,
+                "message": "a repeat count is a positive integer written [1-9][0-9]* "
+                "(zero and empty counts are malformed, not no-ops)",
             }
         ]
 

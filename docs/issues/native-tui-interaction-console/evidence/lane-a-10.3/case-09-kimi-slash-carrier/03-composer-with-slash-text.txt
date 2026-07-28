@@ -1,0 +1,30 @@
+982
+   983
+   984
+   985
+   986
+   987
+   988
+   989
+   990
+   991
+   992
+   993
+   994
+   995
+   996
+   997
+   998
+   999
+   1000
+
+ ✨ Please reconsider this path
+   Interrupted by user
+
+ ● Compaction complete (1058 → 440 tokens) (Ctrl-O to show compaction summary)
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > /tmp/x                                                                                       │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+ K2.7 Coding Highspeed thinking  …/pytest-508/cao_scratch_1030/worktree-kimi  master
+                                                                             context: 1% (440/256k)

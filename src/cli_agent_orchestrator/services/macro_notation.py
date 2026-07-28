@@ -1,50 +1,48 @@
-"""Operator-macro notation: the §5.3 editing-surface grammar.
+"""The macro notation: one pinned grammar, and this is the authority.
 
-**Provisional server authority (Lane B).**  §9 assigns the server notation
-parser to Lane A, co-located with the control-input contract, consumed by
-Lane B's §5.4 routes.  Lane A has not merged on this base, so this module is
-Lane B's provisional authority.  It implements the frozen §5.3 grammar
-*exactly* — nothing here is a frontend invention — and the shared golden
-vectors (``web/src/test/fixtures/macroNotationVectors.json``) pin
-byte-identical behaviour between this parser and the TypeScript live-preview
-parser, mirroring the digest golden-vector precedent.  When Lane A lands,
-integration swaps this implementation for the contract-co-located one; the
-§5.4 routes keep calling the same two functions and the same vectors must
-keep passing.
+Native-TUI-console §5.3.  Two parsers exist — this Python authority
+(server-side, behind ``POST /macros/parse-notation``) and Lane B's
+TypeScript live preview — and they are tested against the same golden
+vectors (``test/fixtures/notation_vectors.json``), mirroring the digest
+golden-vector precedent: the two sides cannot drift into spelling the
+same macro two ways.
 
-Grammar (pinned, §5.3)::
+The grammar, exactly:
+
+.. code-block:: text
 
     sequence := event (WS+ event)*
     event    := text | named | chord | repeat
-    text     := '"' JSON-string '"'      # JSON escaping exactly
-    named    := [a-z][a-z0-9-]*          # the fourteen names in NAMED_KEYS
-    chord    := 'ctrl+' [a-z]            # ctrl+c ctrl+s … (D7 mapping)
-    repeat   := (named|chord) '*' [1-9][0-9]*   # up*3; expansion counts
-                                                # toward the 32-event cap
+    text     := '"' JSON-string '"'        # JSON escaping exactly; , + / \\ literal inside quotes
+    named    := [a-z][a-z0-9-]*            # enter escape up down left right home end
+                                           # page-up page-down delete insert tab backspace
+    chord    := 'ctrl+' [a-z]              # ctrl+c ctrl+s … (D7 mapping)
+    repeat   := (named|chord) '*' [1-9][0-9]*   # up*3; expansion counts toward the 32-event cap
 
-Notation names map to wire names (``enter`` → ``Enter``, ``page-up`` →
-``PageUp``, …); ``ctrl+c`` → ``key C-c`` (provider-agnostic interrupt);
-every other ``ctrl+x`` → ``chord C-x`` (D7).  Parse errors carry an offset
-and a message; unparseable or unrepresentable notation cannot be saved or
-sent (the client disables the action; the server 422s).
-
-Notation never touches disk (§5.1): the stored/transmitted correctness
-boundary is the v3 event array, and every parse result is validated through
-the contract's ``normalize_sequence_events``.
+Notation never touches disk (§5.1): the stored and transmitted
+correctness boundary is the v3 event array, and this module's only
+product is that array plus its readable preview.  Parse errors carry a
+0-based character offset and a message; an unparseable or
+unrepresentable macro cannot be saved or sent.
 """
+
+from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.services.control_input_contract import (
     MAX_SEQUENCE_EVENTS,
     MAX_SEQUENCE_TEXT_BYTES,
-    normalize_sequence_events,
 )
 
-# The fourteen named keys of the §5.3 grammar, notation name → wire name.
-NAMED_KEYS: Dict[str, str] = {
+# Notation names to wire key names (§5.3).  The set is the §3.2 key set
+# spelled in notation form; a name outside it is a parse error, never a
+# guess (``BTab``, modified arrows, and F-keys have no notation spelling
+# because the wire refuses them).
+NOTATION_KEY_NAMES = {
     "enter": "Enter",
     "escape": "Escape",
     "up": "Up",
@@ -61,299 +59,292 @@ NAMED_KEYS: Dict[str, str] = {
     "backspace": "Backspace",
 }
 
-# Wire name → notation name, for the canonical renderer.
-WIRE_TO_NOTATION: Dict[str, str] = {wire: name for name, wire in NAMED_KEYS.items()}
+_NAMED_PATTERN = re.compile(r"[a-z][a-z0-9-]*")
+_CHORD_PREFIX = "ctrl+"
+_REPEAT_PATTERN = re.compile(r"[1-9][0-9]*")
 
-# A symbol token is a maximal run of these characters; quoting is handled
-# separately (a text event may itself contain whitespace).
-_SYMBOL_RE = re.compile(r"[a-z0-9+\-*]+")
-
-# WS between events is pinned to the ASCII whitespace set.  The grammar's
-# ``WS+`` is deliberately *not* Python's ``str.isspace()`` (nor JavaScript's
-# ``\s``): the two parsers — this authority and the TS live preview — must
-# agree byte-for-byte, and the platform whitespace classes diverge on edge
-# characters (U+0085, U+FEFF, the C0 separators).
-_WHITESPACE = " \t\n\r\v\f"
-
-_REPEAT_COUNT_RE = re.compile(r"[1-9][0-9]*")
-
-_CHORD_LETTER_RE = re.compile(r"C-([a-z])")
+# Modifier words a combination may be built from.  A combination of them
+# (``ctrl+shift+x``, ``alt+x``, …) has no standard-mode byte encoding —
+# tmux would inject the base key or a wrong encoding (§3.3) — so it is
+# named and refused rather than misread as a single-modifier chord.
+_MODIFIER_WORDS = frozenset({"ctrl", "alt", "meta", "cmd", "shift", "super"})
+_COMBINATION_PATTERN = re.compile(r"[a-z0-9][a-z0-9+\-]*")
 
 
-class NotationError(ValueError):
-    """One parse/render failure carrying the §5.3 (offset, message) pair."""
-
-    def __init__(self, offset: int, message: str) -> None:
-        super().__init__(message)
-        self.offset = offset
-        self.message = message
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {"offset": self.offset, "message": self.message}
-
-
-def _utf8_len(text: str) -> int:
-    try:
-        return len(text.encode("utf-8"))
-    except UnicodeEncodeError as exc:
-        # A lone surrogate parses as valid JSON but is not UTF-8-encodable,
-        # so it can never become a wire event's text.
-        raise ValueError("lone-surrogate") from exc
+def _multi_modifier_failure(notation: str, pos: int) -> NotationResult:
+    """The §3.3 refusal for a combination the byte stream cannot carry."""
+    match = _COMBINATION_PATTERN.match(notation, pos)
+    combination = match.group(0) if match is not None else notation[pos:]
+    return _fail(
+        pos,
+        f"multi-modifier combination {combination!r} cannot be represented: no "
+        "standard-mode terminal byte encoding exists for it (tmux would inject the "
+        "base key or a wrong encoding), so it is refused, never approximated",
+    )
 
 
-def _scan_json_string(notation: str, start: int) -> Tuple[str, int]:
-    """Parse the JSON string opening at ``start``; return (value, end)."""
-    n = len(notation)
-    k = start + 1
-    closed = False
-    while k < n:
-        ch = notation[k]
-        if ch == "\\":
-            k += 2
-            continue
-        if ch == '"':
-            closed = True
-            break
-        k += 1
-    if not closed:
-        raise NotationError(start, "unterminated text event")
-    fragment = notation[start : k + 1]
-    try:
-        value = json.loads(fragment)
-    except json.JSONDecodeError:
-        raise NotationError(start, "invalid JSON string in text event") from None
-    if not isinstance(value, str):  # pragma: no cover - '"' forces a string
-        raise NotationError(start, "invalid JSON string in text event")
-    return value, k + 1
+# Text bytes a pane can never be sent honestly through the control path
+# (the deployed literal screen): ESC and its C1 spelling synthesise
+# escape sequences; CR/LF submit at a point the caller did not choose.
+# The send path screens them again; the parse authority refuses them here
+# so an unrepresentable macro cannot be saved.
+_ILLEGAL_TEXT_CHARS = ("\x1b", "\x9b", "\r", "\n")
+
+# A lone surrogate (a high surrogate not followed by a low one, or a low
+# one not preceded by a high one) is valid JSON but not UTF-8-encodable.
+_LONE_SURROGATE_RE = re.compile(
+    r"[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]"
+)
 
 
-def _display_token(token: str) -> str:
-    """A repeat token as embedded in an error message, bounded in length."""
-    return token if len(token) <= 24 else f"{token[:23]}…"
+@dataclass(frozen=True)
+class NotationError:
+    """One parse failure: where, and what is wrong there."""
+
+    offset: int
+    message: str
 
 
-def _split_repeat(token: str, start: int) -> Tuple[str, Optional[int]]:
-    """Split ``base[*N]``; the repeat count obeys [1-9][0-9]* exactly.
+@dataclass(frozen=True)
+class NotationResult:
+    """The parse answer: the events and preview, or the errors.
 
-    A count with more than two digits is ≥ 100, which can never fit the
-    32-event budget even in an empty sequence — so it fails *before* the
-    integer conversion (CPython refuses over-long digit strings with a bare
-    ValueError from its int-max-str-digits guard; that conversion is never
-    reached, and the failure keeps the ordinary offset-bearing shape).
+    ``errors`` is empty exactly when the parse succeeded; ``events`` and
+    ``preview`` are then both set.  At most one error is reported — the
+    parse fails fast at the first malformed token, because a parser that
+    continues past an error would be guessing at intent from then on.
     """
-    if "*" not in token:
-        return token, None
-    base, _, count_text = token.partition("*")
-    if _REPEAT_COUNT_RE.fullmatch(count_text) is None:
-        raise NotationError(
-            start + len(base),
-            f"invalid repeat count '*{count_text}': expected '*' followed by a " "positive integer",
-        )
-    if len(count_text) > 2:
-        raise NotationError(
-            start,
-            f"repeat '{_display_token(token)}' expands past the "
-            f"{MAX_SEQUENCE_EVENTS}-event cap",
-        )
-    return base, int(count_text)
+
+    events: Optional[List[Dict[str, Any]]]
+    preview: Optional[str]
+    errors: List[NotationError]
 
 
-def _map_symbol(base: str, start: int) -> Dict[str, Any]:
-    """Map one named key or ctrl chord to its wire event (D7)."""
-    if base.startswith("ctrl+"):
-        rest = base[len("ctrl+") :]
-        if len(rest) == 1 and "a" <= rest <= "z":
-            if rest == "c":
-                return {"type": "key", "key": "C-c"}
-            return {"type": "chord", "chord": f"C-{rest}"}
-        raise NotationError(
-            start,
-            f"unrepresentable chord '{base}': only ctrl+<letter> has a pinned "
-            "terminal byte encoding",
-        )
-    if base in NAMED_KEYS:
-        return {"type": "key", "key": NAMED_KEYS[base]}
-    if "+" in base:
-        raise NotationError(
-            start,
-            f"unrepresentable event '{base}': terminal byte streams cannot "
-            "express modifier combinations other than ctrl+<letter>",
-        )
-    raise NotationError(start, f"unknown key name '{base}'")
+def _fail(offset: int, message: str) -> NotationResult:
+    return NotationResult(events=None, preview=None, errors=[NotationError(offset, message)])
 
 
-def parse_notation(notation: str) -> List[Dict[str, Any]]:
-    """Parse §5.3 notation into a normalized v3 event array.
+def _chord_event(letter: str) -> Dict[str, Any]:
+    """The wire event for one ``ctrl+<letter>`` token (D7).
 
-    Raises :class:`NotationError` with an offset and message on any failure:
-    unparseable or unrepresentable notation never becomes events.  Caps are
-    enforced as the events accumulate — a repeat expansion counts toward the
-    32-event cap — so the failing token's offset is always known.
+    ``ctrl+c`` maps to the provider-agnostic ``key`` event ``C-c``; every
+    other letter maps to a ``chord`` event (which the server admits only
+    when the provider+build pins it — a send-time, per-terminal fact this
+    parser cannot know and therefore does not check).
+    """
+    if letter == "c":
+        return {"type": "key", "key": "C-c"}
+    return {"type": "chord", "chord": f"C-{letter}"}
+
+
+def parse_notation(notation: str) -> NotationResult:
+    """Parse one notation string into its v3 events and readable preview.
+
+    The single authority for the grammar above.  Never approximates: a
+    token that is not exactly one of the four event forms is an error
+    with an offset, and an unrepresentable one (an over-cap expansion, an
+    over-budget text, a control character the pane cannot be sent) is
+    refused rather than approximated into something else.
     """
     if not isinstance(notation, str):
-        raise TypeError(f"notation must be a string, got {type(notation).__name__}")
+        return _fail(0, f"notation must be a string, got {type(notation).__name__}")
+    length = len(notation)
+    pos = 0
+    while pos < length and notation[pos].isspace():
+        pos += 1
+    if pos == length:
+        return _fail(pos, "a macro names at least one event")
+
     events: List[Dict[str, Any]] = []
     text_bytes = 0
-    i = 0
-    n = len(notation)
-    while True:
-        while i < n and notation[i] in _WHITESPACE:
-            i += 1
-        if i >= n:
-            break
-        start = i
-        ch = notation[i]
-        if ch == '"':
-            value, i = _scan_json_string(notation, i)
-            if i < n and notation[i] not in _WHITESPACE:
-                raise NotationError(i, "expected whitespace between events")
+
+    while pos < length:
+        event_pos = pos
+        base: Optional[Dict[str, Any]] = None
+        repeatable = False
+        char = notation[pos]
+
+        if char == '"':
+            # A JSON string, scanned to its closing quote (backslash
+            # escapes honoured) and decoded by JSON's own rules, exactly.
+            index = pos + 1
+            closed = False
+            while index < length:
+                c = notation[index]
+                if c == "\\":
+                    index += 2
+                    continue
+                if c == '"':
+                    closed = True
+                    break
+                index += 1
+            if not closed:
+                return _fail(event_pos, "unterminated string: a text token is a JSON string")
+            token = notation[event_pos : index + 1]
             try:
-                text_bytes += _utf8_len(value)
-            except ValueError:
-                raise NotationError(
-                    start,
-                    "text event is not UTF-8-encodable (lone surrogate); it can "
-                    "never become a wire event",
-                ) from None
-            if text_bytes > MAX_SEQUENCE_TEXT_BYTES:
-                raise NotationError(
-                    start,
-                    f"text event pushes the sequence past the "
-                    f"{MAX_SEQUENCE_TEXT_BYTES}-byte aggregate cap",
+                decoded = json.loads(token)
+            except json.JSONDecodeError as exc:
+                return _fail(
+                    event_pos + exc.pos,
+                    f"invalid JSON string: {exc.msg}; text uses JSON escaping exactly "
+                    "(comma, plus, slash and backslash are literal inside quotes)",
                 )
-            events.append({"type": "text", "text": value})
-        elif "a" <= ch <= "z":
-            match = _SYMBOL_RE.match(notation, i)
-            assert match is not None  # ch already matched the class
-            token = match.group(0)
-            i = match.end()
-            if i < n and notation[i] not in _WHITESPACE:
-                raise NotationError(i, "expected whitespace between events")
-            base, count = _split_repeat(token, start)
-            event = _map_symbol(base, start)
-            if count is None:
-                if len(events) + 1 > MAX_SEQUENCE_EVENTS:
-                    raise NotationError(
-                        start,
-                        f"sequence holds at most {MAX_SEQUENCE_EVENTS} events",
+            if not isinstance(decoded, str) or decoded == "":
+                return _fail(event_pos, "a text event must be a non-empty string")
+            for illegal in _ILLEGAL_TEXT_CHARS:
+                at = decoded.find(illegal)
+                if at != -1:
+                    return _fail(
+                        event_pos,
+                        "the text contains a control character (ESC, C1 CSI, CR, or LF) "
+                        "the control path can never send honestly; an unrepresentable "
+                        "macro is refused, never approximated",
                     )
-                events.append(event)
-            else:
-                if len(events) + count > MAX_SEQUENCE_EVENTS:
-                    raise NotationError(
-                        start,
-                        f"repeat '{_display_token(token)}' expands past the "
-                        f"{MAX_SEQUENCE_EVENTS}-event cap",
-                    )
-                events.extend(dict(event) for _ in range(count))
+            if _LONE_SURROGATE_RE.search(decoded) is not None:
+                # A lone surrogate parses as valid JSON but is not
+                # UTF-8-encodable, so it can never become a wire event's
+                # text; screening here keeps the failure in the ordinary
+                # offset-bearing shape (the endpoint answers 422, never
+                # 500) — the same defect class as the r11 repeat guard.
+                return _fail(
+                    event_pos,
+                    "the text contains a lone surrogate that is not UTF-8-encodable; "
+                    "an unrepresentable macro is refused, never approximated",
+                )
+            text_bytes += len(decoded.encode("utf-8"))
+            if text_bytes > MAX_SEQUENCE_TEXT_BYTES:
+                return _fail(
+                    event_pos,
+                    f"this text pushes the sequence past the {MAX_SEQUENCE_TEXT_BYTES}-byte "
+                    "aggregate text cap; a macro is a short control burst, not a document",
+                )
+            base = {"type": "text", "text": decoded}
+            pos = index + 1
+        elif notation.startswith(_CHORD_PREFIX, pos):
+            letter_at = pos + len(_CHORD_PREFIX)
+            if letter_at < length:
+                word = _NAMED_PATTERN.match(notation, letter_at)
+                if (
+                    word is not None
+                    and word.group(0) in _MODIFIER_WORDS
+                    and (word.end() >= length or notation[word.end()] in "+ \t\n")
+                ):
+                    # ``ctrl+shift+x`` and friends: a modifier where the
+                    # chord's single letter must be.
+                    return _multi_modifier_failure(notation, pos)
+            if letter_at >= length or not ("a" <= notation[letter_at] <= "z"):
+                return _fail(
+                    letter_at,
+                    "a chord is 'ctrl+' followed by one letter a-z; multi-modifier and "
+                    "non-letter chords are unrepresentable and refused, never approximated",
+                )
+            base = _chord_event(notation[letter_at])
+            repeatable = True
+            pos = letter_at + 1
         else:
-            raise NotationError(
-                start,
-                'expected an event (a "quoted" text, a key name, or ' "ctrl+<letter>)",
+            match = _NAMED_PATTERN.match(notation, pos)
+            if match is None:
+                return _fail(
+                    pos,
+                    f"expected a quoted text, a named key, or a ctrl+<letter> chord, "
+                    f"not {char!r}; known key names are {sorted(NOTATION_KEY_NAMES)}",
+                )
+            name = match.group(0)
+            if name in _MODIFIER_WORDS and match.end() < length and notation[match.end()] == "+":
+                # ``alt+x``, ``meta+x`` and friends at event position.
+                return _multi_modifier_failure(notation, pos)
+            if name not in NOTATION_KEY_NAMES:
+                return _fail(
+                    pos,
+                    f"unknown named key {name!r}; known key names are "
+                    f"{sorted(NOTATION_KEY_NAMES)} — unlisted keys (BTab, modified "
+                    "arrows, F-keys) are refused, never approximated",
+                )
+            base = {"type": "key", "key": NOTATION_KEY_NAMES[name]}
+            repeatable = True
+            pos = match.end()
+
+        count = 1
+        if repeatable and pos < length and notation[pos] == "*":
+            repeat_pos = pos
+            digits = _REPEAT_PATTERN.match(notation, pos + 1)
+            if digits is None:
+                return _fail(
+                    repeat_pos + 1,
+                    "a repeat count is a positive integer written [1-9][0-9]* "
+                    "(zero and empty counts are malformed, not no-ops)",
+                )
+            count_text = digits.group(0)
+            if len(count_text) > 2:
+                # A count of 100+ can never fit the 32-event budget, even
+                # in an empty sequence — fail BEFORE the integer
+                # conversion (CPython refuses over-long digit strings with
+                # a bare ValueError from its int-max-str-digits guard).
+                # r11/Sol: the failure keeps the ordinary offset-bearing
+                # shape, and the endpoint answers 422, never 500; the
+                # message embeds no token, so it is bounded by
+                # construction.
+                return _fail(
+                    event_pos,
+                    f"this event brings the sequence past the {MAX_SEQUENCE_EVENTS}-event "
+                    "cap; a repeat expansion counts every event it stands for",
+                )
+            count = int(count_text)
+            pos = digits.end()
+
+        if len(events) + count > MAX_SEQUENCE_EVENTS:
+            return _fail(
+                event_pos,
+                f"this event brings the sequence past the {MAX_SEQUENCE_EVENTS}-event "
+                "cap; a repeat expansion counts every event it stands for",
             )
-    if not events:
-        raise NotationError(0, "empty notation: name at least one event")
-    # The contract is the correctness boundary: what parsed must also be a
-    # valid wire sequence (shape and caps), never a notation-only dialect.
-    return normalize_sequence_events(events)
+        events.extend(base for _ in range(count))
 
+        if pos < length:
+            if not notation[pos].isspace():
+                return _fail(pos, f"expected whitespace between events, not {notation[pos]!r}")
+            while pos < length and notation[pos].isspace():
+                pos += 1
 
-def _event_notation(event: Dict[str, Any]) -> str:
-    """One event's canonical notation token (no repeat folding)."""
-    event_type = event.get("type")
-    if event_type == "text":
-        # Canonical text form: JSON escaping exactly, non-ASCII literal.
-        return json.dumps(event["text"], ensure_ascii=False)
-    if event_type == "key":
-        key = event.get("key")
-        if key == "C-c":
-            return "ctrl+c"
-        name = WIRE_TO_NOTATION.get(key if isinstance(key, str) else "")
-        if name is None:
-            raise ValueError(f"key {key!r} has no notation name")
-        return name
-    if event_type == "chord":
-        chord = event.get("chord")
-        match = _CHORD_LETTER_RE.fullmatch(chord if isinstance(chord, str) else "")
-        # ``ctrl+c`` parses to ``key C-c`` (D7), so a chord C-c has no
-        # faithful notation form — rendering one would round-trip to a
-        # different event.
-        if match is None or match.group(1) == "c":
-            raise ValueError(f"chord {chord!r} has no notation form")
-        return f"ctrl+{match.group(1)}"
-    raise ValueError(f"event type {event_type!r} has no notation form")
-
-
-def render_notation(events: List[Dict[str, Any]]) -> str:
-    """Render the canonical notation for a validated v3 event array.
-
-    Runs of two or more identical non-text events fold to ``name*N``; text
-    events never fold.  ``parse_notation(render_notation(events)) == events``
-    for every representable array — the round-trip the §7.4 editor relies on.
-    """
-    normalized = normalize_sequence_events(events)
-    tokens: List[str] = []
-    i = 0
-    while i < len(normalized):
-        event = normalized[i]
-        token = _event_notation(event)
-        if event["type"] == "text":
-            tokens.append(token)
-            i += 1
-            continue
-        run_end = i
-        while (
-            run_end < len(normalized)
-            and normalized[run_end]["type"] != "text"
-            and normalized[run_end] == event
-        ):
-            run_end += 1
-        run = run_end - i
-        tokens.append(f"{token}*{run}" if run >= 2 else token)
-        i = run_end
-    return " ".join(tokens)
+    return NotationResult(events=events, preview=preview_sequence(events), errors=[])
 
 
 def _preview_token(event: Dict[str, Any]) -> str:
-    """One event's preview token: ``"text"``, ``[Enter]``, ``[Ctrl+S]``."""
+    """One event's canonical preview token, extending the deployed recorder.
+
+    Text renders as its JSON string (the notation's own spelling, so the
+    preview round-trips); a chord renders ``[Ctrl+X]``; the provider-
+    agnostic interrupt key renders ``[Ctrl+C]``; every other key renders
+    its wire name in brackets.
+    """
     if event["type"] == "text":
         return json.dumps(event["text"], ensure_ascii=False)
     if event["type"] == "chord":
-        chord = event.get("chord", "")
-        letter = chord[2:] if chord.startswith("C-") else chord
-        return f"[Ctrl+{letter.upper()}]"
-    key = event.get("key", "")
-    if key == "C-c":
+        return f"[Ctrl+{event['chord'][2:].upper()}]"
+    if event["key"] == "C-c":
         return "[Ctrl+C]"
-    return f"[{key}]"
+    return f"[{event['key']}]"
 
 
-def render_preview(events: List[Dict[str, Any]]) -> str:
-    """The §5.3 normalized preview: ``"text" [Enter] [Up]×3 [Ctrl+S]``."""
-    normalized = normalize_sequence_events(events)
+def preview_sequence(events: List[Dict[str, Any]]) -> str:
+    """The canonical one-line preview: ``"text" [Enter] [Up]×3 [Ctrl+S]``.
+
+    A run of two or more identical key/chord events collapses to
+    ``[Name]×N`` — the normalized form, whether the run came from a
+    repeat token or from spelled-out repetition.  Text events are never
+    collapsed: two adjacent text events are different content, not a
+    repeat.
+    """
     tokens: List[str] = []
-    i = 0
-    while i < len(normalized):
-        event = normalized[i]
+    index = 0
+    while index < len(events):
+        event = events[index]
+        run_end = index + 1
+        if event["type"] != "text":
+            while run_end < len(events) and events[run_end] == event:
+                run_end += 1
         token = _preview_token(event)
-        if event["type"] == "text":
-            tokens.append(token)
-            i += 1
-            continue
-        run_end = i
-        while (
-            run_end < len(normalized)
-            and normalized[run_end]["type"] != "text"
-            and normalized[run_end] == event
-        ):
-            run_end += 1
-        run = run_end - i
-        tokens.append(f"{token}×{run}" if run >= 2 else token)
-        i = run_end
+        run = run_end - index
+        tokens.append(f"{token}×{run}" if run > 1 else token)
+        index = run_end
     return " ".join(tokens)
-
-
-def parse_with_preview(notation: str) -> Tuple[List[Dict[str, Any]], str]:
-    """The §5.3 authority endpoint's success shape: (events, preview)."""
-    events = parse_notation(notation)
-    return events, render_preview(events)

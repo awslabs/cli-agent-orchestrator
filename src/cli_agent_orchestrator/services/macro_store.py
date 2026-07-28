@@ -20,7 +20,8 @@ A small versioned JSON store at ``CAO_HOME_DIR/macros.json`` (inheriting the
   never fails to start over a macro file (loads are lazy, one per
   operation, under the flock).
 - **Only the CAO server writes this file.**  Built-ins are synthesized at
-  read time (D6, ``macro_builtins``) and never persisted.
+  read time from the §4 provider-control registry (D6, below) and never
+  persisted.
 
 Scope discipline matches the settings routes: READ for list, WRITE for
 mutations; the routes live in ``api/main.py``.
@@ -42,14 +43,9 @@ from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.services.control_input_contract import (
     normalize_sequence_events,
 )
-from cli_agent_orchestrator.services.macro_builtins import (
-    BUILTIN_ID_PREFIX,
-    builtin_macros_for_provider,
-    resolve_builtin,
-)
-from cli_agent_orchestrator.services.macro_notation import (
-    NotationError,
-    parse_notation,
+from cli_agent_orchestrator.services.macro_notation import parse_notation
+from cli_agent_orchestrator.services.provider_controls import (
+    advertised_provider_controls,
 )
 
 SCHEMA_VERSION = 1
@@ -60,6 +56,82 @@ MACROS_PATH = CAO_HOME_DIR / "macros.json"
 # then by scope rank global → provider → profile, then case-insensitive
 # name.  Built-ins resolve in the provider scope group (§5.5).
 _SCOPE_RANKS = {"global": 0, "provider": 1, "profile": 2}
+
+# ── Built-in synthesis (§5.5, D6) ────────────────────────────────────────
+# The §4 provider-control registry (services/provider_controls.py) is the
+# sole provider-control authority: built-ins are synthesized from its
+# advertised entries at read time and never persisted, so immutability is
+# structural and the data can never drift from the version-pinned evidence.
+# IDs are deterministic and namespaced (§5.5): ``builtin:<provider>:<kind>``;
+# the ``builtin:`` prefix is reserved (user-record IDs are UUIDs).
+BUILTIN_ID_PREFIX = "builtin:"
+
+_BUILTIN_LABELS = {
+    "compact": {"name": "Compact", "description": "Provider-native /compact"},
+    "stop": {"name": "Stop", "description": "Interrupt the current turn (Escape)"},
+}
+
+
+def builtin_macro_id(provider: str, kind: str) -> str:
+    """The deterministic built-in ID: ``builtin:<provider>:<kind>``."""
+    return f"{BUILTIN_ID_PREFIX}{provider}:{kind}"
+
+
+def builtin_macros_for_provider(provider: Optional[str]) -> List[Dict[str, Any]]:
+    """Synthesize the §5.5 built-ins for one provider from the registry.
+
+    Each record carries ``origin: "builtin"``, ``mutable: False``,
+    ``favorite: True`` (built-ins sort first in resolution order and cannot
+    be un-favorited — duplicating one makes a user macro that can), and the
+    provider scope group.  A provider with no registry entry yields nothing;
+    the dashboard hides the built-ins and states why (§13, OD3).
+    """
+    if not provider:
+        return []
+    controls = advertised_provider_controls().get(provider)
+    if not controls:
+        return []
+    builtins: List[Dict[str, Any]] = []
+    for kind in ("compact", "stop"):
+        block = controls.get(kind)
+        if block is None:
+            continue
+        labels = _BUILTIN_LABELS[kind]
+        builtins.append(
+            {
+                "id": builtin_macro_id(provider, kind),
+                "name": labels["name"],
+                "description": labels["description"],
+                "scope": {"kind": "provider", "provider": provider},
+                "events": [dict(event) for event in block["events"]],
+                "favorite": True,
+                "origin": "builtin",
+                "mutable": False,
+                "builtin_kind": kind,
+                "created_at": None,
+                "updated_at": None,
+            }
+        )
+    return builtins
+
+
+def resolve_builtin(macro_id: str) -> Optional[Dict[str, Any]]:
+    """Resolve a deterministic built-in ID back to its synthesized record.
+
+    ``POST /macros/{id}/duplicate`` uses this so a built-in id fetched from a
+    list response resolves to the same built-in at duplicate time (§5.5 ID
+    stability).  Unknown or malformed ids return ``None``.
+    """
+    if not isinstance(macro_id, str) or not macro_id.startswith(BUILTIN_ID_PREFIX):
+        return None
+    remainder = macro_id[len(BUILTIN_ID_PREFIX) :]
+    provider, sep, kind = remainder.rpartition(":")
+    if not sep or not provider or kind not in _BUILTIN_LABELS:
+        return None
+    for record in builtin_macros_for_provider(provider):
+        if record["id"] == macro_id:
+            return record
+    return None
 
 
 class MacroValidationError(ValueError):
@@ -363,14 +435,16 @@ def _resolve_events(
         )
         return None
     if has_notation:
-        try:
-            return parse_notation(notation)
-        except NotationError as exc:
-            errors.append(exc.as_dict())
+        # The §5.3 authority parses; its failures are already in the
+        # (offset, message) shape the route reports.
+        result = parse_notation(notation)
+        if result.errors:
+            errors.extend(
+                {"offset": error.offset, "message": error.message} for error in result.errors
+            )
             return None
-        except (TypeError, ValueError) as exc:
-            errors.append({"offset": None, "message": f"invalid notation: {exc}"})
-            return None
+        assert result.events is not None
+        return result.events
     try:
         return normalize_sequence_events(events)
     except (TypeError, ValueError) as exc:
