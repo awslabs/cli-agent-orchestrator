@@ -1,0 +1,1342 @@
+# Native TUI Interaction Console — Execution Specification
+
+Status: canonical execution specification (supersedes the initial design
+brief, reconciled against the deployed source on 2026-07-28; scope addendum
+integrated per steers `root-image-composer-addendum-steer-001` and
+`root-image-screenshot-path-steer-001`)
+
+Task ID: `native-tui-console/spec-initial-v1`
+
+This document is the implementable, reviewable specification for the Native
+TUI Interaction Console track. It reconciles the initial brief against the
+exact deployed source, pins the contract the implementation lanes build
+against, and partitions the work P0/P1/P2. Where the brief and the deployed
+source disagreed, the source won and the divergence is named in §13
+(Unresolved decisions) rather than silently smoothed over.
+
+## 0. Repository, base, and ownership pins
+
+| Pin | Value |
+|---|---|
+| Repository / design worktree | `/Users/colin/Projects/cli-agent-orchestrator-worktrees/native-tui-console-spec` |
+| Deployed base SHA | `82e5d9230d800b80d11b84991f69a3146fb332d6` (`origin/main` at branch time) |
+| Design branch | `feature/native-tui-interaction-console` |
+| `origin` remote | `https://github.com/colindmurray/cli-agent-orchestrator.git` |
+| `upstream` remote | AWS Labs repository (read-only reference) |
+| PR target | `origin/main` via the integration branch (§9) |
+| Canonical document | this file, on the design branch |
+| Visual baseline for Lane C | `docs/issues/native-tui-interaction-console/baseline-dashboard.png` (operator screenshot of the deployed dashboard, 2026-07-27) |
+
+Every file:line reference below was verified against the deployed base SHA
+above. If implementation rebases onto a newer `main`, the references must be
+re-verified and this section amended.
+
+## 1. Control-compatibility baseline (verified deployed facts)
+
+This section is the ground truth all lanes build on. It exists so a reviewer
+can check every claim without re-walking the tree.
+
+### 1.1 The wire contract (server)
+
+`src/cli_agent_orchestrator/services/control_input_contract.py` pins:
+
+- Protocol literal `cao-control-input-v1` (`:82`) and request schema versions
+  1 (text+enter), 2 (+`chord`), 3 (ordered `events` array) (`:379-381`,
+  `:597-598`). Each version travels under its own digest domain
+  (`cao-control-input-request-v1/-v2/-v3`, `:368/:374/:597`), so requests of
+  different versions can never collide.
+- v3 event types: `text`, `key`, `chord` (`:610-615`).
+- **v3 normalized key set today:** `SEQUENCE_KEY_NAMES = {"Escape", "C-c",
+  "C-s", "Enter", "Backspace"}` (`:625`). **No navigation keys exist on the
+  deployed base.** This is the P1 gap.
+- Caps: `MAX_SEQUENCE_EVENTS = 32`, `MAX_SEQUENCE_TEXT_BYTES = 512` (aggregate
+  across text events) (`:631-632`). The 512-byte cap is a *contract feature*:
+  the deployed 422 refusal reads "a control input is a command or one short
+  line, not a document" (Finding F8).
+- Typed outcomes `accepted | refused | ambiguous | unsupported` with a closed
+  reason set; every reason is bound to exactly one outcome in
+  `REASON_OUTCOMES` (`:209-240`). Only `refused` is reattemptable
+  (`REATTEMPTABLE_OUTCOMES`, `:98`), because only a refusal is decided before
+  the first byte. `ambiguous` is terminal for automation and is reconciled by
+  an exact-request-id query, never by re-sending.
+- Refusal reasons that already cover this track: `unsupported-chord` (`:172`),
+  `unsupported-key` (`:184`), `unrepresentable-event` (`:189`),
+  `stale-generation`, `identity-mismatch`, `pane-dead`, `pane-busy`,
+  `copy-mode-active`, `write-deadline`, `request-rebound`, `response-lost`,
+  `write-incomplete`, `owner-lost-before-write`, `owner-lost-mid-write`.
+- Key/chord membership is deliberately **not** enforced by the digest path
+  (`:617-624`): a digest must be computable for a request the server will
+  then refuse, so the two sides never disagree about which requests exist.
+  Membership is a service-layer, capability-advertised decision — this is
+  what makes the §3 in-place key-set extension legal.
+- Bracketed-paste sentinels are screened in both ESC and C1 spellings
+  (`:792-808`); the control path never emits them.
+
+### 1.2 Delivery path and arbiter
+
+- HTTP routes (`src/cli_agent_orchestrator/api/main.py`):
+  `POST /terminals/{id}/control-input` (`:2871`, WRITE/ADMIN scope),
+  `GET /control-input/capabilities` (`:2792`, unauthenticated),
+  `GET /control-input/{control_id}` (`:2804`, READ+; keyed by control id
+  alone, deliberately not terminal-scoped, `:2809-2814`),
+  `GET /terminals/{id}/control-identity` (`:2825`).
+  Terminal-level failures are `200` with a typed outcome; `422` is reserved
+  for shape errors and protocol mismatch; `404` is reserved for "server has
+  no control route at all" (contract docstring `:27-33`).
+- `deliver_control_input` (`services/control_input_service.py:1327`)
+  pipeline: protocol check → v3 either/or shape rule → normalization →
+  per-text screening → caller-digest comparison → identity resolution +
+  expectation screen → per-event representability → pane/server formation →
+  journal intent → replay check → **pane-input lease** → under-lease live
+  identity re-proof (pane alive, `window_id`, `pane_pid`, tmux server socket
+  §24.7) → copy-mode guard → readiness gate → `claim_write` (commits before
+  the first byte) → dispatch.
+- The pane-input arbiter (`services/pane_input_arbiter.py:170`) is an
+  in-process per-pane `threading.Lock` plus a cross-process `fcntl.flock` on
+  `CAO_HOME_DIR/pane-input-locks/pane-*.lock`. Non-reentrant by design. No
+  TTL — it is a `with`-block lease, time-bounded by
+  `WRITE_DEADLINE_SECONDS = 20.0` (`control_input_service.py:150`) threaded
+  into every tmux call as `deadline_monotonic`. Contention → `PaneBusyError`
+  → journaled `pane-busy` refusal (zero bytes proven, reattemptable).
+  Current lease holders (exhaustive): control-input delivery
+  (`control_input_service.py:1648`), native inbox payloads (`:3983`), and
+  ordinary legacy send-input (`terminal_service.py:2418`).
+- The journal (`services/control_input_journal.py`, SQLite schema v5 at
+  `CAO_HOME_DIR/db/control-input.sqlite3`) records intent before the first
+  byte; states `intent → writing → delivered | ambiguous`, `intent →
+  refused`, with **no `writing → refused` edge** (`:130-149`).
+  `claim_write` is a `BEGIN IMMEDIATE` CAS — exactly one claimant across
+  threads and processes. Duplicate `control_id` with a byte-identical binding
+  replays the stored answer with zero new I/O; a divergent one is refused
+  `request-rebound`. `sweep_stranded` resolves dead-owner `intent` →
+  `refused/owner-lost-before-write` and dead-owner `writing` →
+  `ambiguous/owner-lost-mid-write`. `get(request_id)` is the exact-id
+  reconciliation query.
+- Every tmux write primitive re-proves the pane's canonical server socket
+  identity immediately before the first byte (`clients/tmux.py:1329-1340`,
+  `:1423-1434`, `:1494-1505`, `:1563-1574`).
+- Copy-mode guard (cond-0178): the only non-payload keystroke the managed
+  write boundary may send is `send-keys -X cancel`; any unproven step is
+  `refused/copy-mode-active` before any payload byte
+  (`control_input_service.py:2052`).
+
+### 1.3 Event → tmux mapping (deployed)
+
+| v3 event | tmux argv | Source |
+|---|---|---|
+| `text` (not Enter-fused) | `send-keys -t %N -l -- <chunk>` (1024-char chunks) | `clients/tmux.py:1234-1358` |
+| `text` fused with following `key:Enter` | literal chunks, then `send-keys -t %N Enter` | `control_input_service.py:3621-3706`, `clients/tmux.py:1359-1365` |
+| `key` | `send-keys -t %N <name>` via `send_sequence_key`, wire→tmux translation table `_TMUX_SEQUENCE_KEY_NAMES` (today only `Backspace→BSpace`) | `clients/tmux.py:1443-1512`, table at `:40` |
+| `chord` | `send-keys -t %N <chord>` via `send_steer_chord`, sink pattern `^C-[A-Za-z]$` | `clients/tmux.py:1514-1581`, `:126` |
+
+Critical sink property (`clients/tmux.py:31-40`): `send-keys` without `-l`
+**never errors on an unknown key name — it sends the argument as literal
+bytes.** Every managed write therefore goes through an explicit allowlist and
+translation table; passing an unvetted name to tmux is a silent wrong-bytes
+bug, not an error.
+
+### 1.4 Provider-control facts (deployed)
+
+- There is **no single provider-control registry** on the base. Capabilities
+  live in: the adapter table `native_control_adapter` (kimi_cli, claude_code
+  only — `services/managed_launch_v2.py:1022-1032`); Kimi's build-pinned
+  `_PROVEN_STEER_CHORDS` (`kimi_native_control.py:290-296`, `C-s` for
+  0.29.0/0.29.1/0.29.2); `CONTROL_COMPACT = "/compact"` in both adapters
+  (`kimi_native_control.py:127`, `claude_native_control.py:92`, the latter
+  with `ADVERTISED_CONTROLS = ("/compact",)` at `:93`); the wire key set
+  (§1.1); and the sink allowlists.
+- Codex has **no** native control adapter and **no** native-TUI launch
+  binder (`native_tui_launch.py` supports "the two supported providers",
+  `:15-20`). Managed Codex is ACP-only on this base.
+- Interrupt-key evidence: Claude Code shows "esc to interrupt"
+  (`providers/claude_code.py:104`); Codex shows "esc to interrupt"
+  (`providers/codex.py:72-78`); Kimi's official keyboard reference documents
+  `Esc` = "Close a popup / cancel completion / interrupt streaming output or
+  context compaction" and `Ctrl-C` = "Interrupt the current streaming output"
+  (primary source, Appendix A.6). There is no per-provider interrupt table in
+  the repo today; `_SEQUENCE_INTERRUPT_KEYS = {"Escape","C-c","C-s"}`
+  (`control_input_service.py:723`) is provider-agnostic.
+- Version pins: `SUPPORTED_VERSIONS` kimi `("0.29.2","0.29.1","0.29.0")`,
+  claude `("2.1.220",)`, codex `("0.145.0",)`
+  (`services/provider_contracts.py:77-81`).
+- Only `execution_mode == native_tui` panes accept control input; ACP panes
+  are refused `managed-acp-pane` (`control_input_service.py:831-847`).
+- **Adapter composer plans:** both native adapters carry build-pinned
+  multi-line composer evidence (`_PROVEN_COMPOSER_NEWLINE`,
+  `kimi_native_control.py:217-280` for 0.29.0-0.29.2 — `C-j` line breaks,
+  `End` burst reset, 0.25 s settle; `claude_native_control.py:124-141` for
+  2.1.220 — `C-j`, 2.0 s settle), and journaled at-most-once operation
+  stores (`queue`/`steer`/`control` with states intended → posted →
+  accepted/completed, frozen `ambiguous` resolvable only by exact-id
+  reconcile). These are the deployed mechanisms Lane C's operator-message
+  path builds on (§8).
+
+### 1.5 Dashboard (deployed)
+
+- `web/src/components/TerminalView.tsx` gates the native composer on
+  `managed && execution_mode === 'native_tui'` (`:562`), then on four
+  capability facts (`:77-80`). Every send re-proves identity via
+  `GET /terminals/{id}/control-identity` and binds all nine
+  `expected_identity` fields (`:166-179`). Sends are v1 `{text, enter:true}`
+  (`web/src/api.ts:228-245`) or v3 `{events}` (`TerminalView.tsx:278-354`).
+  Outcomes are read from the typed body; ambiguous/unknown transport results
+  are reconciled by `GET /control-input/{control_id}` and **never resent**
+  (`:186-191`, `:337-338`). No client queue; one `controlBusy` flag.
+- The existing **Compact button sends `/compact` as ordinary literal text**
+  through the identity-bound path (`TerminalView.tsx:618`) — the macro
+  built-in preserves exactly this behavior as a v3 sequence.
+- The v3 recorder (`web/src/lib/sequenceRecorder.ts`, cond-0175) captures
+  Escape/Enter/Backspace/C-c/C-s + printable text, merges trailing text,
+  enforces 32 events / 512 bytes, and **refuses arrows, Tab, F-keys, and all
+  other modifier combos with a message, never approximates** (`:124-137`).
+  It is preview-only: **no notation parser, no repetition syntax, no
+  persistence** — recordings die with component state.
+- Exactly one websocket: `/terminals/{id}/ws`. Client→server frames are
+  `{"type":"resize"}` and `{"type":"input","data":...}`. The input frame is
+  sent only when the pane is unmanaged, or managed + wheel-mouse report
+  (`TerminalView.tsx:513-527`; server filter `_web_terminal_input_bytes`,
+  `api/main.py:3892-3903`). **There is no raw keystroke path into a managed
+  pane today, and this track must not create one** (§6.6).
+- No `localStorage`/`sessionStorage` usage anywhere in `web/src`. No mobile
+  layout (single `sm:grid-cols-3` in `DashboardHome.tsx:243` is the only
+  responsive class; `TerminalView` is a fixed fullscreen overlay `:566`).
+  Touch: single-finger swipe is translated to synthetic line-mode wheel
+  events (`:412-470`); `.xterm` opts out of browser pan/zoom
+  (`web/src/index.css:19-25`).
+- Web tests: vitest only, `web/src/test/` (incl. `terminalView.test.tsx` 686
+  lines, `sequenceRecorder.test.ts`). **No web e2e infra** (Playwright exists
+  only in `cao_mcp_apps/`).
+- **Visual baseline:** the deployed control area is one compact header row
+  (identity chips left, close right) + a single composer row (full-width
+  input, green **Send**, indigo **Compact**) + one quiet status line — see
+  `baseline-dashboard.png` (§0). Lane C must preserve this vertical
+  footprint.
+
+### 1.6 Settings persistence (deployed)
+
+- `settings.json` at `CAO_HOME_DIR` (`services/settings_service.py:14`) is
+  the operator-level per-installation store, but it has **no schema version
+  and non-atomic plain write_text saves** (`:37-40`). It is unsuitable as the
+  macro library home (Finding F1).
+- The versioned-store precedent is the control-input journal (SQLite,
+  `journal_meta` schema version, snapshot-before-migration) and the
+  `mkstemp`+`os.replace` atomic receipt writers
+  (`services/wake_receipts.py:136-142`).
+- `CAO_HOME_DIR` is `~/.aws/cli-agent-orchestrator` by default, relocatable
+  via `CAO_STATE_ROOT` (`constants.py:75,86-142`) — the macro store and the
+  Lane C attachment staging area inherit this, which is what "tied to the
+  local CAO operator installation, not one campaign database or terminal
+  generation" means mechanically.
+
+### 1.7 Baseline test status
+
+- Python control-input tier at the base SHA: **529 passed** (contract,
+  service, journal, arbiter, endpoint suites; run
+  `uv run pytest test/services/test_control_input_contract.py
+  test/services/test_control_input_service.py
+  test/services/test_control_input_journal.py
+  test/services/test_pane_input_arbiter.py
+  test/api/test_control_input_endpoint.py -q --no-cov`).
+- Web vitest tier at the base SHA: **107 passed, 8 files** (`npm ci && npm
+  test` in `web/`).
+- Live tiers: `pytest -m e2e` deselected by default (`pyproject.toml:152`),
+  gated on tmux/provider binaries (`test/e2e/conftest.py:41-125`, incl.
+  `require_kimi` `:75`, `require_claude` `:61`). Private-server fixtures:
+  `test/fixtures/tmux_server.py` (isolated `-S` socket, sanitized env,
+  ownership-proven teardown), `test/fixtures/cao_server.py` (real
+  `cao-server` subprocess, redirected `$HOME`). Existing live control-input
+  evidence: `test/e2e/test_control_input_live.py` (real pane byte
+  assertions), `test_tmux_isolation.py`, and
+  `test/clients/test_tmux_sequence_key_boundary.py` (live, inline-gated).
+
+## 2. Architecture decisions
+
+Numbered decisions are the contract of this spec. Alternatives considered are
+recorded with the rejection reason so review can challenge the reasoning, not
+reopen settled ground by accident.
+
+- **D1 — Extend the v3 key set in place; no new digest domain.** Add the
+  eleven navigation/editing keys of §3.2 to `SEQUENCE_KEY_NAMES` under
+  request schema v3. The digest preimage shape is unchanged (a key name is an
+  opaque string inside `events`), and membership is explicitly a
+  service-layer, capability-advertised decision (§1.1). An old server typed-
+  refuses a new key `unsupported-key` (zero bytes, safe); a new client gates
+  on the advertised `sequence.keys`. *Rejected alternative:* schema v4 with a
+  new digest domain — the domain versioning exists for preimage-shape
+  changes; burning a version on a membership change would force every client
+  to track two dimensions for no safety gain.
+- **D2 — One write path for control input. Streaming and macros reuse
+  `POST /terminals/{id}/control-input` (v3); no new control write endpoint,
+  no websocket input for managed panes, no second arbiter.** Every batch is
+  one identity-bound v3 sequence: one `control_id`, one journal intent, one
+  lease, one claim. (Lane C's operator messages are a *separate typed
+  operation* — not control input — with equal discipline; see D11 and §8.)
+- **D3 — Streaming is a client mode, not a transport.** The server already
+  delivers ordered v3 sequences atomically under one lease; streaming is the
+  dashboard converting focused keystrokes into bounded v3 batches with strict
+  client-side serialization (§6). *Rejected alternative:* a websocket
+  streaming channel — it would either bypass the arbiter (prohibited) or
+  re-implement the journal/claim/reconcile machinery on a second transport.
+- **D4 — Provider-control registry as a new server module.** Lane A creates
+  `services/provider_controls.py` as the single source for Compact/Stop/
+  Steer (and Lane C's message/image capability blocks), **consuming** the
+  adapters' existing pins (it imports `CONTROL_COMPACT`; it does not retype
+  `"/compact"`). Advertised through additive blocks in
+  `/control-input/capabilities`. *Rejected alternative:* a frontend table —
+  the brief's explicit prohibition, and it would drift from the
+  version-pinned evidence.
+- **D5 — Macro library is a new versioned JSON store, not a settings
+  section.** `CAO_HOME_DIR/macros.json`, `schema_version`, atomic
+  mkstemp+rename writes under an flock, migration with explicit quarantine
+  (§5). *Rejected alternatives:* a `settings.json` section (unversioned,
+  non-atomic — Finding F1); SQLite (the journal pattern is correct for an
+  append-only audit log and overkill for a small CRUD library a human should
+  be able to inspect).
+- **D6 — Built-ins are synthesized, never persisted.** The API merges
+  registry-derived built-ins (`origin:"builtin"`, `mutable:false`) with file
+  records at read time. Immutability is then structural — there is nothing on
+  disk to overwrite — and duplication mints a real user record.
+- **D7 — Chord admission stays provider-pinned and build-gated.** New chords
+  enter only through the registry with evidence; the wire `chord` event and
+  `unsupported-chord` refusal are unchanged. `ctrl+c` in notation maps to the
+  deployed `key` event `C-c` (provider-agnostic interrupt); every other
+  `ctrl+x` maps to a `chord` event. Multi-modifier and non-letter chords are
+  parser-refused as unrepresentable until a registry pin admits them (§3.3,
+  OD1).
+- **D8 — Capture reuses the recorder's focused-div mechanism, not an xterm
+  key hook.** The deployed recorder pattern (focused `div`, `onKeyDown`,
+  `preventDefault`) is extended for streaming and recording. xterm.js keeps
+  zero input handlers for managed panes, so double-encoding is structurally
+  impossible (§6.2). *Rejected alternative:*
+  `attachCustomKeyEventHandler`+`return false` on the xterm instance —
+  workable (Appendix A.5) but it puts the capture surface underneath the
+  output surface, splits focus management, and must re-implement what the
+  recorder already does under test.
+- **D9 — The advertised capability set, not the schema version, gates client
+  UI.** New-server/old-client and old-server/new-client behavior is defined
+  by capability membership (§3.5). A client that sends an unadvertised key
+  has a bug; the server's typed refusal is the backstop, never the mechanism.
+- **D10 — Mobile is a first-class acceptance surface, tested with
+  Playwright.** Lane B adds a minimal Playwright suite to `web/` (in-repo
+  precedent: `cao_mcp_apps/playwright.config.ts`) with desktop and
+  mobile-viewport projects (§10.5).
+- **D11 — Operator messages (long text, multi-line, attachments) are a
+  distinct typed operation, never an extension of control-input.** Lane C
+  adds a sibling service with its own journaled at-most-once operations,
+  its own limits, and the same identity/lease/reconciliation discipline
+  (§8). Control-input's 512-byte short-command invariant stays exactly as
+  deployed — the refusal is correct; what changes is that the composer
+  stops implying the field is a general message box (F8). *Rejected
+  alternative:* a control-input schema v4 with a larger text budget — it
+  would blur the one invariant that makes the control contract auditable
+  ("a control input is a command or one short line, not a document") and
+  would force macros/streaming semantics to co-evolve with message
+  semantics for no gain.
+- **D12 — Images are delivered as staged-file references, never as bytes.**
+  No supported provider can receive image bytes through injected keystrokes —
+  all three CLIs read the OS clipboard in-process (Appendix A.9-A.11). The
+  only faithful delivery mechanism available to a tmux-keystroke server is a
+  validated file staged on disk whose path is delivered as text per the
+  provider's documented contract (§8.4). A provider/build without evidence
+  for an image mechanism is refused honestly (kimi 0.29.x, §8.4).
+
+## 3. The versioned shared event contract
+
+This section is the frozen interface Lane B consumes. Lane B must not invent
+an event name, key name, chord, or capability key absent from this section;
+a needed-but-absent item is a spec amendment, not a PR decision. (Lane C
+consumes §3.6 plus §8 only.)
+
+### 3.1 Unchanged foundations
+
+Protocol literal, digest domains, outcome/reason vocabulary, identity fields,
+caps (32 events / 512 UTF-8 bytes aggregate), HTTP status discipline, and the
+request-ID reconciliation rule are exactly the deployed contract (§1.1-1.2).
+An ordered sequence remains one identity-bound operation: one `control_id`,
+one journal intent, one pane-input lease, one claim, per-event outcomes
+(`sent | attempted | skipped | refused`) journaled on failure.
+
+### 3.2 Extended normalized key set (P1)
+
+`SEQUENCE_KEY_NAMES` becomes, exactly and in this advertised order:
+
+```text
+Escape  C-c  C-s  Enter  Backspace                (deployed)
+Up  Down  Left  Right                             (new, P1)
+Home  End  PageUp  PageDown                       (new, P1)
+Delete  Insert  Tab                               (new, P1)
+```
+
+Wire→tmux mapping, added to `_TMUX_SEQUENCE_KEY_NAMES`
+(`clients/tmux.py:40`). Every new name maps to the tmux key name in the
+second column; tmux then encodes for the pane's mode (Appendix A.1-A.3):
+
+| Wire name | tmux `send-keys` arg | Bytes the pane receives | Mode dependence |
+|---|---|---|---|
+| `Up`/`Down`/`Right`/`Left` | same | `ESC[A/B/C/D` | tmux emits `ESC O A/B/C/D` (SS3) when the pane application set DECCKM application-cursor mode; correct for both readline-style and fullscreen TUIs — tmux performs the translation, the spec does not |
+| `Home` | `Home` | `ESC[1~` | **not** DECCKM-switched by tmux (hard-coded, Appendix A.3); live acceptance must confirm the pinned provider menus accept it (F4) |
+| `End` | `End` | `ESC[4~` | same caveat |
+| `PageUp` | `PageUp` (alias `PPage`) | `ESC[5~` | none |
+| `PageDown` | `PageDown` (alias `NPage`) | `ESC[6~` | none |
+| `Delete` | `Delete` (alias `DC`) | `ESC[3~` | none |
+| `Insert` | `Insert` (alias `IC`) | `ESC[2~` | none |
+| `Tab` | `Tab` | `0x09` | none |
+| `Enter` | `Enter` | `0x0D` | deployed |
+| `Backspace` | `BSpace` | `0x7f` (tmux `backspace` option default) | deployed |
+| `Escape` | `Escape` | `0x1B` | deployed |
+| `C-c` | `C-c` | `0x03` | deployed; provider-agnostic interrupt |
+| `C-s` | `C-s` | `0x13` | deployed as key; also a registry steer chord for kimi |
+
+Rules:
+
+- The sink translation is table-driven and total: a wire name absent from
+  `_TMUX_SEQUENCE_KEY_NAMES` never reaches `send-keys` (§1.3 sink property).
+- `BTab` (Shift+Tab, `ESC[Z`), modified arrows (`C-Up` → `ESC[1;5A`), and
+  `F1`-`F12` are **not** in the P1 set. The mechanism exists in tmux
+  (Appendix A.1) but no managed provider has evidence of consuming them;
+  they are refused `unsupported-key` until a registry pin admits them (OD1).
+- Browser capture maps `KeyboardEvent.key` values `ArrowUp/ArrowDown/
+  ArrowLeft/ArrowRight/Home/End/PageUp/PageDown/Delete/Insert/Tab` to these
+  wire names one-to-one (Appendix A.4: `key` values are standardized by UI
+  Events; `key`+modifier booleans is the portable identification).
+
+### 3.3 Chord support and refusal rules
+
+- A v3 `chord` event remains the only chord carrier; membership is decided by
+  `_steer_chord_refusal` against the registry before any write (deployed:
+  `control_input_service.py:1268-1301`).
+- **Notation mapping (Lane B parser, server re-validates):** `ctrl+c` →
+  `{type:"key", key:"C-c"}`; `ctrl+s` → `{type:"chord", chord:"C-s"}`; any
+  other `ctrl+<letter>` → `{type:"chord", chord:"C-<letter>"}` (server will
+  refuse unless the registry pins it for this provider+build).
+- **Refused at capture/parse, with a specific explanation, never
+  approximated:**
+  - Multi-modifier chords (`ctrl+shift+x`, `ctrl+alt+x`, `alt+x`,
+    `meta/cmd+anything`): no standard-mode byte encoding exists; tmux would
+    inject the base key or a wrong encoding (Appendix A.1, A.3 — e.g. `C-;`
+    parses as a tmux key but injects a plain `;`). Refusal text names the
+    combination and states that the terminal byte stream cannot represent it.
+  - Browser/OS-owned combinations (`ctrl+w`, `ctrl+n`, `ctrl+t`, `⌘q`, `⌘w`,
+    `F11`, `ctrl+shift+delete`, …): these never reach page JavaScript
+    (Appendix A.4; no normative list exists — the vendor lists are treated as
+    non-exhaustive). The recorder/streaming surface states this class of
+    refusal statically in its help text, because it cannot observe the key at
+    all: "combinations owned by the browser or OS never reach this page and
+    cannot be recorded or streamed."
+  - Case-distinct chords (`ctrl+shift+c` vs `ctrl+c`): distinguishable in the
+    DOM but **not** in the byte stream (both are `0x03`); the capture layer
+    must not claim the distinction — `ctrl+shift+letter` is refused as
+    unrepresentable rather than folded to `ctrl+letter`.
+- IME composition during streaming/recording: `compositionstart` suspends
+  capture with a visible notice ("IME composition is not streamed; use the
+  literal composer for composed text"); composed characters are never
+  partially forwarded.
+
+### 3.4 Batch and request-ID reconciliation (streaming and macros)
+
+- One batch = one v3 request = one `control_id` (UUID). At most **one batch
+  in flight per terminal**; keystrokes arriving during a flight accumulate
+  into the next batch in order.
+- Response handling is the deployed taxonomy: typed body outcome wins;
+  `{404,405,501}` → `unsupported`; `{408,425,500,502,503,504}` and any
+  no-response → `ambiguous`; other 4xx → `refused`.
+- Any `ambiguous` transport result (including a lost response) is reconciled
+  by exactly one `GET /control-input/{control_id}`; the journaled record is
+  the answer. **A batch is never re-sent.** Only a `refused` outcome may be
+  followed by a fresh attempt with a **new** `control_id`, and the streaming
+  disarm policy (§6.4) decides whether that attempt is automatic (never, in
+  streaming) or operator-initiated.
+- Server-side semantics are unchanged: duplicate `control_id` + identical
+  binding replays the stored answer; divergent binding is `request-rebound`.
+
+### 3.5 Capabilities and old/new compatibility
+
+`GET /control-input/capabilities` gains additive keys (JSON: old clients
+ignore unknown keys):
+
+```jsonc
+{
+  // … every deployed key unchanged (§1.2) …
+  "sequence": {
+    "event_types": ["text", "key", "chord"],
+    "keys": ["Escape","C-c","C-s","Enter","Backspace",
+             "Up","Down","Left","Right",
+             "Home","End","PageUp","PageDown",
+             "Delete","Insert","Tab"],
+    "max_events": 32,
+    "max_text_bytes": 512
+  },
+  "streaming": { "supported": true, "max_in_flight": 1, "coalesce_window_ms": 200 },
+  "provider_controls": {
+    "kimi_cli":    { "compact": { "events": [ {"type":"text","text":"/compact"}, {"type":"key","key":"Enter"} ] },
+                     "stop":    { "events": [ {"type":"key","key":"Escape"} ] },
+                     "steer_chords": ["C-s"] },
+    "claude_code": { "compact": { "events": [ {"type":"text","text":"/compact"}, {"type":"key","key":"Enter"} ] },
+                     "stop":    { "events": [ {"type":"key","key":"Escape"} ] },
+                     "steer_chords": [] }
+  }
+}
+```
+
+- The per-terminal block on `GET /terminals/{id}/control-identity` grows the
+  same `sequence.keys` and a `provider_controls` entry for that terminal's
+  provider (or its absence).
+- Providers with no registry entry (codex and all others on this base) have
+  **no** `provider_controls` entry; the dashboard hides the built-ins and
+  states why (§13, OD3).
+- **New server / old client:** old clients read only deployed keys;
+  `literal_write` path byte-identical; additive keys ignored. No migration.
+- **Old server / new client:** `sequence.keys` lacks navigation keys →
+  navigation UI hidden/disabled with the stated reason; `streaming` absent →
+  the toggle is disabled with "server predates streaming"; `provider_controls`
+  absent → built-ins hidden, user macros still available if `sequence` v3 is
+  advertised; `/macros` 404 → the library UI is hidden behind a notice, never
+  a fallback to local storage as the authoritative store.
+- A client never sends a key/chord the server did not advertise; the server's
+  typed refusal is the backstop for buggy clients, not the mechanism.
+- Lane C's `operator_message` and `image` capability blocks (§8.6) follow
+  the same additive rule when Lane C lands.
+
+### 3.6 Interface Lane B consumes (frozen)
+
+1. v3 event schema and `sequence.keys` from §3.2 (live, per-server,
+   per-terminal — never hardcoded).
+2. `provider_controls` from §3.5 for built-ins and steer-chord gating.
+3. The macro API of §5.4.
+4. The notation parse endpoint of §5.3 (server-authoritative) plus the
+   pinned grammar of §5.3 for live client preview.
+5. Reconciliation rules of §3.4.
+
+## 4. Provider-control registry (Lane A)
+
+New module `src/cli_agent_orchestrator/services/provider_controls.py`:
+
+```python
+ProviderControls = TypedDict  # {"compact": sequence | None, "stop": sequence | None,
+                              #  "steer_chords": tuple[str, ...],
+                              #  "operator_message": {...} | None,   # Lane C, §8.6
+                              #  "image": {...} | None,               # Lane C, §8.6
+                              #  "evidence": dict}
+PROVIDER_CONTROLS: dict[str, ProviderControls]
+def controls_for(provider: str) -> ProviderControls | None
+def advertised_provider_controls() -> dict[str, ProviderControls]  # capabilities shape
+```
+
+Contents and sourcing:
+
+| Provider | Compact | Stop | Steer | Evidence |
+|---|---|---|---|---|
+| `kimi_cli` | `[text("/compact"), key(Enter)]` — imported from `kimi_native_control.CONTROL_COMPACT` (`:127`) | `[key(Escape)]` | `C-s` (build-gated by the existing `_PROVEN_STEER_CHORDS`, consumed not copied) | Kimi keyboard reference (Appendix A.6): Esc interrupts streaming output/compaction |
+| `claude_code` | `[text("/compact"), key(Enter)]` — imported from `claude_native_control.CONTROL_COMPACT` (`:92`) | `[key(Escape)]` | none | `providers/claude_code.py:104` "esc to interrupt" |
+
+Rules:
+
+- The registry never restates a literal the adapters already pin; it imports
+  and re-shapes. Adding a provider is adding one row plus its evidence — no
+  wire-schema change (this is the codex on-ramp, OD3).
+- Entries carry an `evidence` dict (source pointers) and are gated to
+  `SUPPORTED_VERSIONS` builds (`provider_contracts.py:77-81`). An entry whose
+  evidence fails live acceptance is removed or corrected, never approximated.
+- Compact travels as ordinary composer text through the v3 path — identical
+  to the deployed Compact button (`TerminalView.tsx:618`). The kimi adapter's
+  `control()` gating on provider-advertised commands applies to the adapter
+  operation path, not the composer-text path; the registry documents this
+  distinction.
+- Stop for kimi is `Escape` (single key; matches claude; Ctrl+C remains
+  available as the provider-agnostic `C-c` key event). Live acceptance on the
+  pinned 0.29.x build is the verification (§10.3, OD2).
+
+## 5. Durable operator macro persistence (Lane B)
+
+### 5.1 Store
+
+- File: `CAO_HOME_DIR/macros.json` (inherits `CAO_STATE_ROOT` relocation).
+- Shape:
+
+```jsonc
+{
+  "schema_version": 1,
+  "macros": [
+    {
+      "id": "uuid",
+      "name": "Model K2.7",
+      "description": "optional",
+      "scope": { "kind": "global" },                       // or {"kind":"provider","provider":"kimi_cli"}
+                                                           // or {"kind":"profile","profile":"spec-writer-k3"}
+      "events": [ {"type":"text","text":"/model"}, {"type":"key","key":"Enter"},
+                  {"type":"key","key":"Up"}, {"type":"key","key":"Up"},
+                  {"type":"key","key":"Up"}, {"type":"key","key":"Enter"} ],
+      "favorite": true,
+      "created_at": "…Z", "updated_at": "…Z"
+    }
+  ]
+}
+```
+
+- The stored/transmitted correctness boundary is the v3 event array; every
+  record is validated through the contract's `normalize_sequence_events` on
+  load and on every write. Notation never touches disk.
+- **Writes are atomic and serialized:** an flock on
+  `CAO_HOME_DIR/macros.json.lock` (same flock discipline as the pane-input
+  locks) wraps read-modify-write; the write itself is `mkstemp` in the same
+  directory + `os.replace` (receipt-writer precedent,
+  `services/wake_receipts.py:136-142`), file mode `0600`.
+- Only the CAO server writes this file. Browser `localStorage` may keep
+  ephemeral UI state (last filter, modal size) and is never the authoritative
+  library (today the dashboard uses no web storage at all, §1.5).
+
+### 5.2 Migration and quarantine
+
+- `schema_version` newer than supported, unparseable JSON, or a top-level
+  shape violation → the whole file is moved aside to
+  `macros.quarantine-<utc-isots>.json`, the store starts empty, and every
+  list response reports `quarantine: {"count": N, "path": "…"}` until the
+  operator deletes the quarantine file. The server never fails to start over
+  a macro file.
+- Per-record validation failure on load (bad events, unknown scope kind,
+  missing id/name) → that record is appended to the quarantine file and
+  dropped from the working set; the rest load. **Nothing is ever silently
+  dropped.**
+- Version upgrades migrate in place where lossless; a migration that cannot
+  preserve a record quarantines it. Migration runs under the same flock.
+
+### 5.3 Macro notation (editing surface)
+
+Grammar (pinned; the two parsers — TS preview, Python authority — are tested
+against shared golden vectors, mirroring the digest golden-vector precedent):
+
+```text
+sequence := event (WS+ event)*
+event    := text | named | chord | repeat
+text     := '"' JSON-string '"'                 # JSON escaping exactly; , + / \ are literal inside quotes
+named    := [a-z][a-z0-9-]*                     # enter escape up down left right home end
+                                                # page-up page-down delete insert tab backspace
+chord    := 'ctrl+' [a-z]                       # ctrl+c ctrl+s … (D7 mapping)
+repeat   := (named|chord) '*' [1-9][0-9]*       # up*3; expansion counts toward the 32-event cap
+```
+
+- Notation names map to wire names: `enter→Enter`, `escape→Escape`,
+  `page-up→PageUp`, …, `backspace→Backspace`; `ctrl+c→key C-c`, other
+  `ctrl+x→chord C-x` (D7).
+- Parse errors carry an offset and a message; unparseable or unrepresentable
+  macros cannot be saved or sent (client disables the action; server 422s).
+- The normalized preview renders the canonical token form
+  (`"text" [Enter] [Up]×3 [Ctrl+S]` — extending the deployed
+  `previewToken`) and the exact event JSON before save/send.
+- Server authority endpoint: `POST /macros/parse-notation` `{notation}` →
+  `{events, preview}` or `422 {errors: [{offset, message}]}`.
+
+### 5.4 API (FastAPI; READ scope for list, WRITE scope for mutations — same
+discipline as the settings routes, `api/main.py:1331-1410`)
+
+| Route | Behavior |
+|---|---|
+| `GET /macros?provider=&profile=` | Visible set = registry built-ins for `provider` (synthesized, D6) + user records whose scope is global, provider-matching, or profile-matching. Each item annotated `origin: builtin|user`, `mutable: bool`. **Server-side ordering (pinned):** favorites first, then non-favorites; within each group by scope rank (global → provider → profile), then case-insensitive name. Response includes `quarantine` when present. |
+| `POST /macros` | `{name, description?, scope, events` **or** `notation, favorite?}`. Server validates (notation via §5.3; events via contract normalization) → 422 with errors. |
+| `PUT /macros/{id}` | User records only; a built-in id → `409`. Full replace of mutable fields; `updated_at` bumps. |
+| `DELETE /macros/{id}` | User records only; built-in → `409`. |
+| `POST /macros/{id}/duplicate` | Mints a user record (new id; name editable); works on built-ins — this is the only way to "edit" a built-in. |
+| `POST /macros/parse-notation` | §5.3. |
+
+Sending a macro is **not** a store operation: the client takes the resolved
+`events` and sends an ordinary v3 control-input request (D2). The store never
+writes to panes.
+
+### 5.5 Built-ins
+
+For each registry provider (§4): **Compact** and **Stop**, `origin:"builtin"`,
+`mutable:false`, visually distinguished, `favorite:true` in resolution order
+(they sort first; an operator cannot un-favorite a built-in — duplicating it
+makes a user macro that can). Scope: built-ins resolve in the provider scope
+group. The deployed standalone Compact button is removed from the header;
+Compact becomes this built-in favorite (§7.1).
+
+## 6. Streaming mode (Lane B UI on the Lane A contract)
+
+### 6.1 Arming
+
+Streaming is an explicit toggle in the header, available only when:
+`nativeManaged`, the live capabilities advertise `streaming.supported` and the
+full §3.2 key set, and identity resolved. On arm the client fetches
+`managed-control`, `control-identity`, and capabilities fresh, pins the
+9-field `expected_identity`, and displays provider / agent profile /
+generation in the armed header (§7.3). Arming replaces the composer with the
+capture surface; the ordinary literal composer is restored on disarm with its
+draft preserved (attachments, once Lane C exists, survive arm/disarm as draft
+state — §8.7).
+
+### 6.2 Capture
+
+- The capture surface is a focused `div` extending the deployed recorder
+  mechanism (D8): `onKeyDown` with `preventDefault`/`stopPropagation`.
+  `KeyboardEvent.key` mapping: single printable chars (`.length === 1`, no
+  ctrl/meta) → trailing text event merge; `Enter/Backspace/Escape/Tab/Delete/
+  Insert/Home/End/PageUp/PageDown/Arrow*` → named key events per §3.2;
+  `ctrl+c` → `key C-c`; `ctrl+s` → `chord C-s`; other `ctrl+letter` → chord
+  event (server-gated); everything else → refused in place with the §3.3
+  explanation, never approximated, and the refusal is trace-visible.
+- `paste` on the capture surface → `preventDefault`; clipboard text becomes a
+  `text` event (screened against the remaining byte budget; over-budget
+  refused with message). IME per §3.3. (Clipboard *images* on the capture
+  surface are refused with a pointer to the composer's attachment flow —
+  streaming is keystrokes only.)
+- xterm.js keeps **no** input handlers for managed panes; output rendering,
+  selection copy, and wheel/touch behavior are exactly as deployed.
+- **Prohibition:** the streaming layer never synthesizes key events from
+  mouse-wheel or touch-scroll input. Wheel/touch scrolling keeps its deployed
+  semantics (§1.5) and never becomes provider keystrokes.
+
+### 6.3 Batching and the wire-to-arbiter sequence
+
+Coalescing and flush (values advertised by the server, §3.5, so policy stays
+server-owned):
+
+1. Keystroke → normalized event appended to the pending batch (trailing text
+   merged).
+2. Flush the pending batch when: a non-text event follows text (boundary),
+   the quiet timer `coalesce_window_ms` (default 200 ms) fires with pending
+   events, or the pending text event reaches 48 chars. Hard caps always: 32
+   events / 512 UTF-8 bytes (server-enforced).
+3. Flush → `POST /terminals/{id}/control-input` `{control_id: <new uuid>,
+   events, expected_identity: <pinned at arm>}` with the deployed 15 s
+   timeout. The client does **not** refetch identity per batch — the server's
+   under-lease re-proof is the authoritative gate (§1.2); a drifted identity
+   comes back as a typed refusal and disarms (§6.4).
+4. Exactly one batch in flight (§3.4); events arriving during a flight form
+   the next batch.
+5. Server side per batch (all deployed): journal intent → pane-input lease
+   (cross-process, `control-input:{control_id}` holder) → live identity
+   re-proof → copy-mode guard → claim → ordered event writes with per-write
+   server-identity proof → outcome.
+6. Response: `accepted` → trace appends the batch outcome and streaming
+   continues. Lost response → one `GET /control-input/{control_id}` → the
+   journaled record is the truth (§3.4) → then §6.4.
+
+### 6.4 Disarm conditions (automatic, each with an explicit on-screen reason)
+
+- Outcome `refused` with any reason (`stale-generation`,
+  `identity-mismatch`, `pane-dead`, `pane-busy` = concurrent input,
+  `copy-mode-active`, `unsupported-key`, …) or `ambiguous`
+  (`write-incomplete`, `response-lost` after reconcile, `owner-lost-*`,
+  `submission-unproven`). Streaming never auto-retries: `refused` means the
+  operator decides; `ambiguous` means the batch's delivery state is settled
+  by the journal, not by resending.
+- Reconciliation query fails, or identity refetch (on disarm or re-arm) shows
+  a changed generation/pane.
+- Capabilities/identity fetch fails at arm → streaming does not arm.
+- Output websocket closes while armed (the transcript is the only liveness
+  signal; typing blind is not offered).
+- `visibilitychange → hidden` / `pagehide` (mobile suspension makes identity
+  staleness likely; re-arming is one tap).
+- The **Stop streaming** button — a visible mouse/touch control, never a
+  keyboard shortcut (the shortcut itself may have been forwarded).
+
+On disarm the surface shows the reason and the terminal trace, offers
+**Re-arm**, and — on any identity refusal — refetches identity so the
+explanation names the new generation.
+
+### 6.5 Diagnostics
+
+Bounded trace (last 50 batches): per batch the normalized preview, short
+`control_id`, outcome + `reason_code`, event/byte counts. Target line:
+provider, agent profile, short generation, armed indicator in a
+high-contrast active color (§7.3). **Clear trace** button. The trace is
+diagnostic only — never an input buffer; editing it edits nothing.
+
+### 6.6 The websocket invariant (restated, test-enforced)
+
+For managed panes the websocket input frame remains wheel-mouse-only
+(deployed filter, `api/main.py:3892-3903`). Streaming, macros, literal sends,
+and provider controls carry **zero** `{"type":"input"}` frames on managed
+panes. Lane B extends the deployed vitest guard
+(`terminalView.test.tsx:312-349`) to assert the streaming surface sends no
+websocket input while armed; Lane C's attachment/message flow likewise sends
+none (uploads and message submission are ordinary HTTPS). The
+unmanaged-terminal raw channel is unchanged and out of scope.
+
+## 7. Layout and accessibility acceptance (Lanes B and C)
+
+### 7.1 Header (all widths)
+
+One primary row (wraps to two on narrow widths):
+
+```text
+[📎] ┌ Send a message to the native composer… ┐ [Send] [Streaming] [Macros]
+```
+
+- The attachment button (`📎`/paperclip icon) exists only when Lane C has
+  landed and the terminal's provider advertises `operator_message` (§8.6);
+  until then the row is exactly the deployed composer + Send + Streaming +
+  Macros.
+- Composer takes remaining width; **Send** disabled until content (text or
+  attachment); **Streaming** is a toggle with a clear armed state;
+  **Macros** opens the library modal with a count badge when the visible set
+  is non-empty.
+- The composer is no longer labeled as if it were only a short-command
+  field, and never silently truncates: a live status line names the delivery
+  path the current draft will take (§8.5 routing). The deployed 512-byte 422
+  stays correct for the control-input path (F8).
+- The standalone **Compact** button is removed (built-in favorite macro,
+  §5.5). The recorder row (deployed) is absorbed into the macro modal's
+  recorder; the header keeps no third row.
+- Acceptance: row height ≤ 48 px at ≥1024 px; ≤ 96 px total (two rows) at
+  390 px; terminal viewport keeps ≥ 50 % of viewport height with header +
+  favorite strip visible at 390×844. (Matches the §0 visual baseline's
+  compact footprint.)
+
+### 7.2 Favorite strip
+
+Appears only when favorites exist; horizontally scrollable, never wraps:
+
+```text
+Global: [Compact] [Stop]   Kimi: [Steer] [Model K2.7]   This agent: [Max effort]
+```
+
+- Grouping labels carry scope; buttons do not repeat it. Order = server
+  order (§5.4). Tooltip (desktop) / long-press (touch) shows the normalized
+  preview before send. Strip height ≤ 40 px; buttons ≥ 44×44 px touch target
+  (Apple HIG goal; WCAG 2.2 SC 2.5.8 floor 24×24 px).
+- Sending from the strip is one tap = one v3 request (D2) with the deployed
+  outcome/status reporting.
+
+### 7.3 Streaming surface
+
+```text
+● STREAMING TO kimi_cli / spec-writer-k3 · gen a1b2c3
+  text("/model") [Enter] [Up] … accepted (8f3a)       [Clear trace] [Stop streaming]
+```
+
+- Armed border/indicator in a high-contrast active color (contrast ≥ 4.5:1
+  against the terminal background); `role="status"` + `aria-live="polite"`
+  for outcome changes. Target line shows provider, profile, short generation.
+- Trace bounded per §6.5. **Stop streaming** always visible and reachable by
+  mouse/touch and keyboard focus order.
+
+### 7.4 Macro modal
+
+- Desktop (≥1024 px): two-pane modal ≤ 920 px wide. Left: search, scope
+  filter, favorites filter, list (each row with a direct **Send**), **New
+  Macro**. Right: name, description, scope selector, favorite toggle,
+  recorder (event tokens + notation), editable notation with live normalized
+  preview and parse errors, **Send Test**, **Save**, **Duplicate**,
+  **Delete**. Built-in rows: badge, no edit/delete, **Duplicate** and
+  **Send** only.
+- Mobile: full-height sheet (`100dvh`) with list view and editor view (back
+  navigation); every list row keeps its direct **Send**.
+- Recorder: captures per §6.2 with the §3.3 refusal messaging; recorded
+  events render as editable tokens and as notation, kept in sync (editing
+  either re-derives the other through the pinned parser).
+- Focus trap while open; `Escape` closes the modal unless a capture surface
+  is actively recording (then `Escape` is recorded input); focus returns to
+  the invoking control on close.
+
+### 7.5 Accessibility acceptance (WCAG 2.2 AA)
+
+- Text contrast ≥ 4.5:1; armed-streaming indicator not color-only (icon +
+  text).
+- All controls keyboard-operable; visible focus ring; icon-only buttons have
+  `aria-label`.
+- Touch targets ≥ 44×44 px on the streaming/strip/sheet surfaces.
+- Modal `role="dialog"` + `aria-modal`; sheet respects safe-area insets.
+- Honor `prefers-reduced-motion` for the streaming indicator animation.
+- Lane C additions in §8.7 item 8.
+
+## 8. Lane C — image-capable operator-message composer (scope addendum)
+
+Origin: `.conductor/tasks/native-tui-console-image-composer-addendum.md`
+(owner request 2026-07-27), integrated per steer
+`root-image-composer-addendum-steer-001`. Lane C is part of the P2 UI
+overhaul and changes nothing about the P1 identity-bound control path; it is
+a **separate typed operation** (D11) delivered in its own PR and isolated
+worktree after the interaction contract (Lanes A/B) is accepted.
+
+### 8.1 The defect being fixed (F8)
+
+The deployed composer looks like a general message box but is backed by the
+control-input 512-byte short-command cap; the owner's 866-byte message was
+refused with a 422. The refusal is *correct contract behavior* — the defect
+is the UX contract mismatch: one field implying two different operations.
+Lane C resolves it by giving long text and attachments their own typed
+operation (§8.3) and making the composer honest about which operation a
+draft will use (§8.5). Control-input is **not** enlarged (D11).
+
+### 8.2 Provider delivery evidence (researched, primary sources)
+
+- **No provider accepts image bytes via keystrokes.** Claude Code, Codex,
+  and Kimi ≥0.43 all read the OS clipboard inside the app on their paste
+  chord (Appendix A.9-A.11). A tmux-keystroke server cannot paste an image;
+  injecting `C-v` would read the *server host's* clipboard — wrong machine,
+  wrong semantics, prohibited.
+- **claude_code (pinned 2.1.220):** documented image-via-path flow —
+  "Provide an image path to Claude. E.g., 'Analyze this image:
+  /path/to/your/image.png'" (Appendix A.9). The model reads the staged file
+  with its tools. Anthropic API limits: JPEG/PNG/GIF/WebP, ≤ 5 MB per image,
+  ≤ 8000×8000 px (Appendix A.9). No CLI-level format/size documentation —
+  CAO pins its own limits (§8.3).
+- **kimi_cli (pinned 0.29.x): no image support exists.** Image input was
+  added upstream in kimi-cli 0.43 ("Support image input if the LLM model
+  supports it", Appendix A.10) — after the pinned range. Image attachments
+  for kimi must be refused with that exact explanation (OD7). Long/multi-line
+  *text* messages remain deliverable via the adapter's build-proven composer
+  newline plan (§1.4).
+- **codex:** no native-TUI managed path exists on this base (§1.4), so codex
+  is out of Lane C's scope regardless of its TUI's image features
+  (Appendix A.11 recorded for the future codex track).
+
+### 8.3 The operator-message operation (new typed path)
+
+New sibling service `services/operator_message_service.py` + routes — the
+same discipline as control-input, different operation:
+
+| Property | Pinned value |
+|---|---|
+| Submit route | `POST /terminals/{id}/operator-message` (WRITE/ADMIN scope) |
+| Reconcile route | `GET /operator-message/{operation_id}` (READ+; keyed by operation id alone, mirroring the control-input reconcile) |
+| Request | `{operation_id: uuid, text: str, attachments: [attachment_id, …], token_map: {"1": attachment_id, …}, expected_identity: <9 fields>}` |
+| Outcomes | the same closed vocabulary — `accepted / refused / ambiguous / unsupported` — with message-specific refusal reasons added: `provider-unsupported` (reused), `attachment-unknown`, `attachment-not-ready`, `attachment-too-large`, `attachment-type-unsupported`, `message-too-large`, `multiline-unproven` (build lacks a proven composer-newline plan) |
+| Text limit | ≤ 8192 UTF-8 bytes (pinned; 16× the control cap). Multi-line allowed **only** through the provider's build-proven composer-newline plan (§1.4) — unproven build → refused `multiline-unproven`, zero bytes |
+| Attachments | ≤ 4 per message; each ≤ 5 MB; dimensions ≤ 8000×8000 px (matches the tightest documented downstream limit, Appendix A.9) |
+| At-most-once | journaled through the provider adapter's operation store (deployed `queue` semantics: intended → posted → accepted/completed, frozen `ambiguous`, exact-id reconcile). Duplicate `operation_id` + identical payload replays the stored answer; divergent payload is refused |
+| Arbiter | the service acquires `pane_input_lease(pane_id, holder="operator-message:{operation_id}")` around the whole plan execution — it does **not** ride the unleased v2 admission path (F2); readiness/idle gating and the copy-mode guard apply exactly as in the control path |
+| Identity | the same 9-field `expected_identity`; the server re-proves pane, window, pid, server socket, generation, provider/native session under the lease before the first byte |
+| Reconciliation | lost response → one `GET /operator-message/{operation_id}` → the journaled record is the answer; **a message is never re-sent automatically**; `refused` permits an operator-initiated fresh attempt with a new id |
+
+### 8.4 Attachment staging and delivery contract
+
+- **Upload:** `POST /terminals/{id}/attachments` (multipart). The server
+  validates *content*, not filenames: magic-byte sniff + structure/dimension
+  decode (PNG signature + IHDR at minimum); type allowlist per provider
+  evidence (PNG mandatory for all; JPEG/GIF/WebP admitted only for providers
+  with documented support — claude_code per Appendix A.9). Over-limit,
+  corrupt, or mismatched-content uploads fail with an actionable inline
+  error; nothing is half-written (temp file + rename, like every other CAO
+  store).
+- **Storage:** `CAO_HOME_DIR/attachments/{terminal_id}/{attachment_id}.{ext}`
+  — server-generated names only; the client-supplied filename is display
+  metadata, never a path component. Files are mode `0600`, owned by the
+  operator's CAO installation (the provider process runs as the same local
+  user and can read them).
+- **Typed state:** `staging → ready | failed`, `ready → removed | submitted`.
+  Only `ready` attachments may be referenced by a submit. `submitted`
+  attachments are retained read-only for a pinned TTL (24 h) so the provider
+  can still read the path mid-turn; `removed` and expired files are deleted
+  by a sweep at server start and periodically. Orphans from a crashed upload
+  are swept the same way.
+- **Token mapping:** the composer draft carries `[Image #N]` as editable
+  text; the client maps `#N` → `attachment_id` in `token_map`. At submit the
+  server verifies every referenced attachment is `ready` and owned by this
+  terminal, then performs the provider's reference substitution (§8.6
+  `image.reference_template`) — for claude_code the template inserts the
+  absolute path at the token position, matching the documented
+  path-in-prompt flow. A token without a mapping, or a mapping to a
+  non-ready attachment, is a 422/refusal — never silently dropped, never
+  partially submitted.
+- **Delivery mechanism per provider (honest matrix):**
+
+| Provider (pinned build) | Long/multi-line text | Image attachments |
+|---|---|---|
+| `claude_code` 2.1.220 | adapter composer plan (proven C-j newline) | staged path inserted as text per documented flow; live acceptance required (§10.6) |
+| `kimi_cli` 0.29.x | adapter composer plan (proven C-j newline) | **refused — `attachment-type-unsupported` / `provider-unsupported`** with "pinned kimi 0.29.x has no image input (added upstream in 0.43)" (OD7) |
+| all others | refused `provider-unsupported` | refused `provider-unsupported` |
+
+### 8.5 Composer routing rule (the honest-UX half of F8)
+
+One composer, two explicitly-labeled operations — never implicit magic:
+
+- Draft is **text-only and ≤ 512 bytes** → Send uses the deployed
+  identity-bound control-input v1 path, byte-identical to today.
+- Draft has **attachments, is multi-line, or is > 512 bytes** → Send uses
+  the operator-message path (§8.3). If the provider does not advertise
+  `operator_message`, Send is disabled with the reason. If attachments are
+  present for an image-unsupported provider, the inline error names the
+  provider limitation (e.g., kimi 0.29.x, OD7).
+- The status line always names the path the current draft will take
+  ("control input — short command" / "operator message — 1.2 KB, 1 image" /
+  "operator message unavailable for this provider"), with a live byte
+  counter. **Never** silent truncation, never a surprise 422.
+
+### 8.6 Capability advertisement (additive, when Lane C lands)
+
+`provider_controls` entries gain, per provider:
+
+```jsonc
+"operator_message": { "supported": true, "max_text_bytes": 8192, "multiline": true,
+                      "max_attachments": 4 },
+"image": { "supported": true, "formats": ["png","jpeg","gif","webp"],
+           "max_bytes": 5242880, "max_width": 8000, "max_height": 8000,
+           "mechanism": "staged-path-text", "reference_template": "{path}" }
+```
+
+kimi_cli advertises `"operator_message": {…, "multiline": true}` with
+`"image": { "supported": false, "reason": "pinned kimi 0.29.x has no image
+input (added upstream in 0.43)" }`. Absent blocks (old server) → the
+dashboard hides the attachment button and routes over-limit drafts to a
+disabled Send with explanation (D9).
+
+### 8.7 Lane C UI composition (per addendum + §0 visual baseline)
+
+1. Identity/status row stays visually quiet (baseline row 1 untouched).
+2. Attachment chips appear in a compact, horizontally scrollable strip
+   **only when attachments exist** — thumbnail, display filename/type/size,
+   state (`staging` spinner, `failed` inline error with retry/remove),
+   remove action. Strip height ≤ 56 px.
+3. Main composer row stays text-first: attachment button, text field, Send,
+   Streaming, Macros (§7.1).
+4. `[Image #N]` remains editable draft text, visually linked to chip `N`
+   (matching number badge); deleting the token detaches the attachment
+   (state → `removed`); removing the chip selects/offers to delete the
+   token.
+5. Mobile: chips scroll horizontally; controls wrap at most once; the
+   terminal keeps ≥ 50 % viewport height (consistent with §7.1).
+6. Paste: `Cmd+V`/`Ctrl+V` with an image on the clipboard while the composer
+   is focused → upload (state `staging`) + `[Image #N]` token at the caret +
+   chip. Paste with plain text → ordinary text paste. Paste while streaming
+   is armed → refused per §6.2.
+7. File picker: keyboard-operable button (`<input type="file"
+   accept="image/png,image/jpeg,image/gif,image/webp">` filtered per the
+   advertised `image.formats`), same staging flow.
+8. Accessibility: chips have descriptive alt text (`"Image #1: screenshot
+   .png, 244 KB, ready"`); upload progress and failures announced via
+   `aria-live="polite"`; remove buttons ≥ 44×44 px with `aria-label`;
+   failed uploads keep focus on an actionable control; the file chooser is
+   reachable in tab order.
+
+### 8.8 Lane C test requirements
+
+- Unit: staging validation (magic bytes, dimension decode, size/count
+  limits, MIME spoofing), state machine transitions, token-map validation
+  and substitution per provider template, cleanup sweep.
+- Service/API: routes (upload/list/delete/submit/reconcile), typed outcomes
+  incl. every §8.3 reason, duplicate-operation replay, identity drift
+  refusal, lease contention with a concurrent control-input write
+  (`pane-busy`), never-resend after a lost response.
+- Component (vitest): chip strip states, token/chip linkage, routing-rule
+  status line, paste and picker flows, kimi refusal messaging, old-server
+  degradation (hidden button).
+- Live provider (installed, §10.6): claude_code native session receives a
+  staged PNG reference and the model can read the file; kimi pinned build
+  refuses attachments with the pinned message and still accepts a >512-byte
+  text-only message via the plan.
+- Browser/visual QA (Playwright, §10.5): desktop 1280×800 and mobile
+  390×844 against the §0 baseline — chip strip, wrap behavior, terminal
+  height rule, streaming-off/on scrolling unaffected; screenshots in the PR.
+- Regression: ordinary text-only sends byte-identical (deployed suites
+  unchanged); macros, streaming, scrolling, and §3.5 old/new compatibility
+  all green.
+
+## 9. Delivery lanes and integration ordering
+
+Three lanes, each its own PR (and Lane C its own isolated worktree, per the
+addendum), serialized at the integration branch.
+
+### Lane A — transport/protocol (server)
+
+Deliverables: §3.2 key-set extension (`control_input_contract.py`,
+`clients/tmux.py` mapping table, `control_input_service.py` representability
+path if needed); §4 registry + capabilities extension; §3.5 compatibility
+behavior; server notation parser + `/macros/parse-notation` **authority**
+(co-located with the contract; consumed by Lane B's §5.4 routes);
+tests per §10.1-10.3.
+
+### Lane B — UI/persistence (dashboard + macro store)
+
+Deliverables: §5 store + routes + TS preview parser; §6 streaming; §7
+layout (minus Lane C items); §10.4-10.5 tests. Lane B writes **no** contract
+code and consumes §3.6 only.
+
+### Lane C — image-capable operator-message composer
+
+Deliverables: §8 (service + routes + staging + registry blocks + composer
+routing + UI + tests). Lane C consumes the accepted Lane A contract and the
+Lane B header it extends; it must not modify the control-input contract,
+the macro store schema, or the streaming capture layer — shared types and
+identity primitives only (per the addendum's isolation requirement).
+
+### Ordering and the serialization points
+
+1. This spec is the frozen interface (§3.6, §8). Lanes A and B may implement
+   in parallel against it.
+2. **Lane A merges first.** Serialization point 1 is the merge of the
+   contract+registry+capabilities change: until it lands, Lane B integrates
+   against a stubbed capabilities response pinned to §3.5.
+3. **Lane B merges second** (integration of UI + macro persistence).
+4. **Lane C starts after the Lane A contract is accepted** and merges last,
+   in its own PR/worktree. Serialization point 2 is the acceptance of the
+   operator-message contract (§8.3) at spec review; Lane C's only
+   cross-lane touchpoints are the registry blocks (additive), the header row
+   it extends, and the capabilities response.
+5. Any lane-discovered need for a contract change is a spec amendment in
+   this file (with the decision log updated), agreed before implementation —
+   never a frontend invention (D9).
+
+Suggested branches (one PR per lane, serialized into the integration
+branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
+`feature/native-tui-interaction-console` → `main` as one reviewed PR.
+
+## 10. Test matrix and acceptance
+
+### 10.1 Server unit/contract (Lane A; default pytest suite)
+
+- Contract: extended `SEQUENCE_KEY_NAMES` pinned verbatim; new keys digest
+  identically under v3 (golden vector unchanged for old keys); refusals for
+  `BTab`, `C-Up`, `F1`, empty/unknown names (`unsupported-key`).
+- tmux client: `send_sequence_key` argv for every §3.2 row (mock subprocess;
+  extend `test/clients/test_tmux_literal_input.py` pattern); unknown name
+  never reaches argv.
+- Service: v3 sequences mixing text+navigation+chord delivered in order with
+  per-event outcomes; refusal before any write leaves zero tmux calls;
+  readiness-gate classification of navigation keys (interrupt-class vs
+  composer-class — the gate's deployed IDLE/COMPLETED rule applies
+  unchanged).
+- Registry: contents pinned; `advertised_provider_controls` shape; no literal
+  duplication of adapter pins (assert import identity).
+- Capabilities endpoint: additive keys present; deployed keys unchanged
+  (golden response diff).
+- Notation parser: golden vectors shared with the TS parser (checked into
+  `test/fixtures/notation_vectors.json`, consumed by both suites).
+
+### 10.2 Live tmux (Lane A; `pytest -m e2e`, isolated server fixtures)
+
+- `test/e2e/test_control_input_live.py` pattern, real pane running a
+  byte-recorder: assert exact bytes for `Up` (normal vs application cursor
+  mode via a mode-setting helper app), `Home`/`End` (`ESC[1~`/`ESC[4~`),
+  `PageUp`/`PageDown`, `Delete`, `Insert`, `Tab`.
+- Ordered mixed sequence lands byte-exact and in order; concurrent lease
+  contender gets `pane-busy`; copy-mode guard still precedes payload.
+
+### 10.3 Installed provider acceptance (Lane A + supervisor-run;
+`require_kimi` / `require_claude` fixtures, real `cao_server`)
+
+- Disposable **Kimi** native-TUI session (pinned 0.29.x):
+  `text("/model") enter up*3 enter` changes the model selection
+  deterministically; `text("/model") enter left*2 right enter` changes the
+  reasoning level (over-navigate-to-edge sequences from the brief);
+  `text("Please reconsider this path") ctrl+s` steers mid-turn; `escape`
+  interrupts streaming output (OD2 verification — if the pinned build's menu
+  or interrupt behavior differs, the registry is corrected and the deviation
+  recorded here before Lane A closes).
+- Disposable **Claude** native-TUI session: built-in Compact executes;
+  `escape` interrupts ("esc to interrupt").
+- Codex: no native-TUI path exists (§1.4); acceptance asserts the registry
+  advertises no codex entry and the dashboard hides the built-ins with the
+  stated reason (OD3).
+- Home/End against both providers' menus (F4): if a pinned build requires
+  SS3 Home/End, record the limitation, restrict the registry, and refuse
+  honestly rather than approximating.
+
+### 10.4 Web unit + component (Lane B; vitest)
+
+- Extended recorder/capture mapping for §3.2 + §3.3 refusals; notation TS
+  parser against the shared golden vectors; streaming batching/serialization/
+  reconcile/disarm logic (mock api); macro store client + scope grouping +
+  server ordering rendering; built-in immutability UI; old-server capability
+  degradation (each §3.5 row as a test); the §6.6 websocket-silence guard
+  while streaming; layout smoke (header/strip/modal presence by viewport
+  size via jsdom stubs where feasible).
+
+### 10.5 Browser + mobile evidence (Lanes B and C; new Playwright suite in
+`web/`)
+
+Projects: desktop Chromium 1280×800 and mobile Chromium 390×844
+(device-scale, touch). Against a stubbed server (MSW-style route mocks or
+the `cao_mcp_apps` harness pattern): header/strip/modal render and operate at
+both widths; terminal keeps ≥ 50 % height at mobile width; streaming arms,
+captures, shows trace, and Stop-streaming works with touch; macro sheet
+list→editor navigation; Lane C chip strip, picker, paste, and wrap behavior
+against the §0 visual baseline; wheel scrolling works with streaming off and
+on (synthetic wheel events); screenshots checked into the PRs as evidence.
+Accessibility: axe-core scan of header/strip/modal/streaming/chip surfaces,
+zero serious violations.
+
+### 10.6 Lane C installed live-provider acceptance
+
+- Disposable **Claude** native-TUI session: staged PNG submitted via the
+  operator-message path; transcript observation confirms the path reference
+  reached the composer and the provider can read the staged file.
+- Disposable **Kimi** native-TUI session (pinned 0.29.x): attachment submit
+  refused with the pinned explanation; a >512-byte multi-line text-only
+  message delivered via the proven composer plan.
+- At-most-once drill: killed response mid-submit → reconcile by
+  `operation_id` → no duplicate provider submission.
+
+### 10.7 Compatibility and regression gates
+
+- Old-client/new-server: deployed `terminalView.test.tsx` suite passes
+  unchanged against the new capabilities shape (additive-only assertion).
+- New-client/old-server: §3.5/§8.6 degradation tests (10.4).
+- The deployed literal composer retains queuing, identity, and
+  no-bracketed-paste behavior: the deployed Python + web suites are the
+  regression gate; §10.1 capabilities golden diff proves additive-only.
+- Identity/no-duplicate: deployed journal/arbiter suites unchanged and
+  green; new streaming/message tests assert never-resend and exact-id
+  reconcile.
+
+### 10.8 CI integration
+
+Default `uv run pytest` and `npm test` stay green; the live tiers run
+on-demand (`-m e2e`) per deployed gating; Playwright runs in the Lane B/C CI
+jobs with the two projects of §10.5.
+
+## 11. Deployment and rollback
+
+- **Deployment:** additive server capabilities + new store files + new
+  dashboard UI, per lane in §9 order. No database migration; the
+  control-input journal schema is untouched. Server first within each lane.
+- **Rollback:** revert the lane PR. New server with old dashboard: old
+  dashboard ignores additive capability keys; literal path byte-identical.
+  Old server with new dashboard: §3.5/§8.6 degradation. `macros.json` and
+  `attachments/` are inert to a rolled-back server (unread files; left in
+  place — deleting them would destroy operator data and is never part of
+  rollback). Lane C's routes simply 404 on a rolled-back server and the
+  dashboard hides the affordances.
+- **Feature flags:** none required; capability advertisement *is* the flag.
+
+## 12. Priority partition
+
+- **P0 (blockers):** none found. Baseline is green (§1.7); no defect on the
+  base blocks starting Lane A.
+- **P1 (compatibility core — ships first):** §3.2 key-set extension + tmux
+  mapping + §3.3 refusal completion; §4 registry (Compact/Stop/Steer blocks)
+  + capabilities; §10.1-10.3 tests including live navigation acceptance; the
+  built-in Compact/Stop favorites *data* (registry entries). Rationale:
+  navigation keys and provider controls are currently lost when a session
+  becomes managed; every later feature rides on them.
+- **P2 (product overhaul — after P1 merges):** §5 macro store + notation +
+  library UI; §6 streaming; §7 layout overhaul; §8 Lane C operator-message
+  composer; §10.4-10.6. The streaming and message *mechanics* are spec'd now
+  so later lanes need no contract amendment; *polish* (trace ergonomics,
+  coalesce tuning, chip styling) is P2.
+- **Explicitly out (non-goals, restated):** reconstructing physical keyboard
+  state the browser/terminal/provider cannot distinguish; shell-script
+  macros; cloud sync of macros; hard-coded dashboard copies of provider
+  menus; clipboard-injection image delivery (impossible by construction,
+  §8.2); kimi image support on pinned 0.29.x (upstream feature gap, OD7).
+
+## 13. Unresolved decisions (flagged for product/supervisor)
+
+- **OD1 — Multi-modifier chords.** The brief's acceptance lists "supported
+  multi-modifier chords". No managed provider has evidence of consuming any
+  multi-modifier chord, and chords without legacy byte encodings cannot be
+  delivered faithfully (Appendix A.1/A.3). This spec ships the admission
+  mechanism (registry-pinned chord events) with an empty multi-modifier table
+  and honest refusals. Admitting e.g. `C-Up` requires per-provider,
+  per-build evidence — recommend P2 follow-up issue with live experiments.
+  **Needs product sign-off** that "supported multi-modifier chords" is
+  satisfied by "the registry mechanism + refusal honesty, zero admitted
+  chords today".
+- **OD2 — Kimi Stop key.** Escape per the official keyboard reference
+  (Appendix A.6); Ctrl+C also documented. Spec picks Escape (single key,
+  consistent with Claude/Codex hints). §10.3 live acceptance is the
+  verification; failure corrects the registry.
+- **OD3 — Codex built-ins.** No codex native control adapter or native-TUI
+  launch binder exists on this base (§1.4), so codex Compact/Stop cannot be
+  delivered through the managed path. The brief's "as supported" phrasing is
+  read as conditional: codex is excluded, registry and UI designed to admit
+  it without schema change. **Confirm** that enabling codex native TUI is a
+  separate provider-enablement track, not this one.
+- **OD4 — Coalesce defaults.** 200 ms quiet window / 48-char text flush are
+  starting values, server-advertised (§3.5) so they can be tuned without a
+  client release.
+- **OD5 — Home/End encoding.** tmux injects `ESC[1~`/`ESC[4~` regardless of
+  the pane's DECCKM mode (Appendix A.3, source-observed, not
+  man-page-documented). Live acceptance (§10.3) verifies the pinned provider
+  menus accept it; the fallback is registry restriction, never approximation.
+- **OD6 — Operator-message at-most-once store.** §8.3 pins the provider
+  adapter's operation store (deployed, journaled, reconcile-ready) rather
+  than a third journal. If review prefers a dedicated operator-message
+  journal mirroring `control_input_journal`, that is a contained Lane C
+  change — flagged so the choice is conscious.
+- **OD7 — kimi 0.29.x image refusal.** The pinned kimi builds predate
+  upstream image input (0.43, Appendix A.10), so Lane C refuses image
+  attachments for kimi with that explanation. Delivering kimi images would
+  require a provider-version re-pin with fresh composer evidence — a
+  separate track. **Confirm** this refusal is the desired product behavior
+  for the current pins.
+- **OD8 — Message text limit.** 8192 bytes is a spec pin, not a measured
+  provider limit (no provider documents one). Lane C live acceptance may
+  lower it per evidence; raising it requires re-review.
+
+## 14. Findings register (from reconciliation; P-ranked)
+
+- **F1 (P2, resolved by design D5):** `settings.json` has no schema version
+  and non-atomic writes (`settings_service.py:37-40`) — unsuitable for the
+  macro library; the store is a new versioned file instead. No change to
+  settings_service in this track.
+- **F2 (P2, deferred):** the v2 native *admission* write path
+  (`managed_launch_v2.py:4533`) writes through `TmuxPaneInput` without the
+  pane-input lease (idle-gated and adapter-journaled instead). Pre-existing,
+  not reachable from the browser, and disjoint from this track's lanes;
+  Lane C deliberately does not reuse it (§8.3 takes the lease itself).
+  Recommend a follow-up issue to bring the admission path under the arbiter.
+- **F3 (P3, noted):** v2 results report `request_schema_version: 1`
+  (`control_input_service.py:1007-1010` — "v1 and v2 results both report
+  1"). Cosmetic; fix opportunistically if Lane A touches that code.
+- **F4 (P2, verification pinned in §10.3):** tmux Home/End injection ignores
+  DECCKM (OD5).
+- **F5 (P2, accepted into plan):** no web e2e infra; Lanes B/C add
+  Playwright to `web/` (precedent: `cao_mcp_apps/`). New dev dependency —
+  flagged.
+- **F6 (P2, design constraint):** no normative list of browser-reserved
+  shortcuts exists (Appendix A.4); refusal UX is designed for unobservable
+  keys (static messaging) rather than per-key detection.
+- **F7 (P3, noted):** the arbiter's own docstring still lists ordinary
+  delivery as "once it is migrated" (`pane_input_arbiter.py:12-14`);
+  ordinary `/input` is in fact leased today (`terminal_service.py:2418`).
+  Comment drift only.
+- **F8 (P1-UX, resolved by Lane C):** the deployed composer's 512-byte
+  control-input cap refuses real operator messages with a correct-but-
+  surprising 422 (the owner's 866-byte case). Resolved by the §8.5 routing
+  rule and the §8.3 operator-message operation — without enlarging
+  control-input (D11).
+- **F9 (P2, design constraint):** no provider CLI documents image
+  format/size limits; only Anthropic's API-level limits are documented
+  (Appendix A.9). Lane C therefore pins CAO-side limits (§8.3) and treats
+  undocumented provider behavior as refused.
+
+## 15. Challenges applied (per track mandate)
+
+- **Second write path:** rejected everywhere. Streaming/macros/provider
+  controls reuse the one control-input route (D2/D3); the operator-message
+  path is a *sibling typed operation* with the same arbiter, identity, and
+  reconciliation discipline — not a bypass (D11, §8.3); the websocket input
+  frame stays wheel-only for managed panes with test-enforced guards (§6.6).
+- **Weakened identity binding:** rejected. Every streaming batch and every
+  operator message carries the full 9-field `expected_identity`; the server
+  re-proves pane, window, pid, server socket, generation, and
+  provider/native session under the lease before the first byte (deployed,
+  §1.2). No "stream token" or lease hand-off exists; the lease is acquired
+  per operation.
+- **Encodings the browser/terminal cannot preserve:** refused, never
+  approximated (§3.3): multi-modifier and non-letter chords, case-distinct
+  ctrl chords, browser/OS-owned combinations, IME composition during
+  streaming. Home/End's tmux encoding caveat is named (OD5) rather than
+  claimed away. Clipboard image bytes are undeliverable by construction —
+  Lane C stages files instead of pretending (D12, §8.2).
+
+## 16. Handoff for independent spec review
+
+A reviewer can verify this spec by: (1) checking §0 pins against the repo;
+(2) spot-checking §1 file:line claims (all verified at the base SHA);
+(3) confirming §3.2's byte claims and §8.2's provider claims against
+Appendix A primary sources; (4) walking one P1 sequence (`text("/model")
+enter up*3 enter`) and one Lane C submission (PNG + 1 KB text to claude)
+through §3/§4/§8/§10 end-to-end; (5) confirming no section introduces a
+write path outside §1.2's and §8.3's routes. The decisions most likely to
+deserve challenge are D1 (in-place key-set extension vs schema v4), D5
+(JSON store vs SQLite), D11/D12 (message-path separation and staged-file
+images), and OD1 (zero admitted multi-modifier chords) — each records its
+alternative and rejection reason.
+
+## Appendix A. Primary sources (external claims)
+
+- **A.1 tmux key names and modifiers:** [tmux(1) man page](https://man7.org/linux/man-pages/man1/tmux.1.html) — special key names "Up, Down, Left, Right, BSpace, BTab, DC (Delete), End, Enter, Escape, F1 to F12, Home, IC (Insert), NPage/PageDown/PgDn, PPage/PageUp/PgUp, Space, and Tab"; modifiers "C- or ^", "S-", "M-"; `send-keys` name lookup vs `-l` literal ("if the string is not recognised as a key, it is sent as a series of characters"). Alias table: [tmux `key-string.c`](https://github.com/tmux/tmux/blob/master/key-string.c).
+- **A.2 xterm encodings:** [XTerm Control Sequences](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html) — cursor keys `CSI A/B/C/D` normal vs `SS3` application per DECCKM ("The cursor keys transmit the following escape sequences depending on the mode specified via the DECCKM escape sequence"); VT220 editing keypad `CSI 2~/3~/1~/4~/5~/6~` unaffected by DECCKM; backspace 0x08/0x7f per DECBKM.
+- **A.3 tmux injection translation:** [tmux `input-keys.c`](https://github.com/tmux/tmux/blob/master/input-keys.c) — cursor keys carry `KEYC_CURSOR` variants (`\033OA` vs `\033[A`), gated by the pane's application mode ("If not in application keypad or cursor mode, remove the respective flags from the key"); Home/End hard-coded `\033[1~`/`\033[4~`; Ctrl letters converted to C0 bytes (`key & 0x1f`) so `C-s` injects `0x13` regardless of keyboard-enhancement protocols; Meta as ESC prefix. Unverified-by-man-page items are flagged as source-observed.
+- **A.4 Browser keyboard:** [UI Events key values](https://w3c.github.io/uievents-key/) (standardized `"ArrowUp"`, `"Enter"`, …), [UI Events spec](https://w3c.github.io/uievents/) (shifted vs unshifted `key`), [MDN keydown](https://developer.mozilla.org/en-US/docs/Web/API/Element/keydown_event) ("fired for all keys"), [WICG Keyboard Lock](https://wicg.github.io/keyboard-lock/) (keys "normally reserved by the underlying host operating system" never reach pages without it), [Chrome keyboard shortcuts](https://support.google.com/chrome/answer/157179) (vendor list, treated as non-exhaustive — no normative enumeration exists).
+- **A.5 xterm.js interception:** [xterm.js typings](https://github.com/xtermjs/xterm.js/blob/master/typings/xterm.d.ts) — `attachCustomKeyEventHandler` "is run before keys are processed, giving consumers of xterm.js ultimate control as to what keys should be processed"; built-in encoding reference [Keyboard.ts](https://github.com/xtermjs/xterm.js/blob/master/src/common/input/Keyboard.ts).
+- **A.6 Kimi keyboard reference:** [Kimi Code Docs — Keyboard Shortcuts](https://www.kimi.com/code/docs/en/kimi-code-cli/reference/keyboard.html) — "Esc: Close a popup / cancel completion / interrupt streaming output or context compaction"; "Ctrl-C: Interrupt the current streaming output".
+- **A.7 Accessibility:** [WCAG 2.2](https://www.w3.org/TR/WCAG22/) — SC 2.5.8 Target Size (Minimum) 24×24 CSS px; SC 1.4.3 Contrast (Minimum) 4.5:1. Apple HIG 44×44 pt touch target as the design goal.
+- **A.8 Kimi arrow-key menus (supporting):** [Kimi CLI slash commands](https://moonshotai.github.io/kimi-cli/en/reference/slash-commands.html) — "Use arrow keys to select …, press Enter to confirm" (session selector; model/reasoning selectors verified live in §10.3).
+- **A.9 Claude Code images:** [Claude Code common workflows — Work with images](https://code.claude.com/docs/en/common-workflows) — "Drag and drop an image … paste it into the CLI with Ctrl+V … Provide an image path to Claude. E.g., 'Analyze this image: /path/to/your/image.png'"; [interactive mode](https://code.claude.com/docs/en/interactive-mode) — paste "Inserts an `[Image #N]` chip at the cursor". Limits: [Anthropic vision docs](https://docs.claude.com/en/docs/build-with-claude/vision) — "JPEG, PNG, GIF, or WebP", "Maximum 5MB per image", larger than 8000×8000 rejected (API-level; no CLI-level limits documented). App-side clipboard capture corroborated by [anthropics/claude-code#43942](https://github.com/anthropics/claude-code/issues/43942).
+- **A.10 Kimi image support by version:** [kimi-cli changelog](https://moonshotai.github.io/kimi-cli/en/release-notes/changelog.html) — 0.43 "Support image input if the LLM model supports it" (first image entry; **pinned 0.29.x predates it**), 0.83 `ReadMediaFile` tool, 0.85 "Cache pasted images to disk", 1.41.0 xclip/wl-paste headless fallback; [interaction guide](https://moonshotai.github.io/kimi-cli/en/guides/interaction.html) — "`Ctrl-V` to paste text, images, or video files … cached to disk and displayed as an `[image:…]` placeholder". No format/size limits documented.
+- **A.11 Codex images (recorded for the future codex track):** [Codex CLI docs](https://developers.openai.com/codex/cli/) — "`codex --image` … or paste an image into the interactive composer"; [CLI reference](https://developers.openai.com/codex/cli/reference) — "`--image, -i | path[,path...]`"; composer renders `[Image #N]` placeholders and auto-attaches pasted image paths (source: `chat_composer.rs`, paste-handler only — typed paths unverified). Codex has no managed native-TUI path on this base (§1.4).
