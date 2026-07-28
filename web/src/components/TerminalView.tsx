@@ -832,12 +832,17 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   const composerBytes = new TextEncoder().encode(message).length
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col" style={{ background: '#0d1117' }}>
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2 bg-gray-900 border-b border-gray-700/50 shrink-0">
-        <div className="flex items-center gap-3">
-          <TermIcon size={16} className="text-emerald-400" />
-          <span className="text-sm font-mono text-gray-300">{terminalId}</span>
+    // marginTop: 0 — DashboardHome lays this view out as a later sibling
+    // inside a `space-y-6` container, whose `> * + *` rule would otherwise
+    // apply a 24 px margin-top even to this fixed overlay, leaving a
+    // dashboard strip visible above the supposedly fullscreen terminal.
+    <div className="fixed inset-0 z-50 flex flex-col" style={{ background: '#0d1117', marginTop: 0 }}>
+      {/* Header — wraps within the viewport so Close stays reachable at
+          mobile widths instead of overflowing past the right edge. */}
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b border-gray-700/50 bg-gray-900 px-4 py-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+          <TermIcon size={16} className="shrink-0 text-emerald-400" />
+          <span className="truncate text-sm font-mono text-gray-300">{terminalId}</span>
           {provider && <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">{provider}</span>}
           {agentProfile && <span className="text-xs text-emerald-400 bg-emerald-900/30 px-2 py-0.5 rounded">{agentProfile}</span>}
           {managed && (
@@ -850,11 +855,11 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
             </span>
           )}
         </div>
-        <div className="flex items-center gap-3">
-          <span className="text-[10px] text-gray-600">Click X to close</span>
+        <div className="ml-auto flex shrink-0 items-center gap-3">
+          <span className="hidden text-[10px] text-gray-600 sm:block">Click X to close</span>
           <button
             onClick={onClose}
-            className="p-1 text-gray-500 hover:text-white transition-colors rounded"
+            className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded p-1 text-gray-500 transition-colors hover:text-white"
             title="Close terminal"
           >
             <X size={18} />
@@ -864,7 +869,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       {nativeManaged && nativeControlSupported && (
         <div
           data-testid="native-control-area"
-          className="shrink-0 border-b border-gray-700/50 bg-gray-950 px-4 py-2 space-y-2"
+          className="shrink min-h-0 overflow-y-auto border-b border-gray-700/50 bg-gray-950 px-4 py-2 space-y-2"
         >
           {streamingArmed && engineRef.current ? (
             <StreamingPanel
@@ -1117,8 +1122,11 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
           </div>
         </div>
       )}
-      {/* Terminal — absolute positioning gives xterm.js real pixel dimensions to measure */}
-      <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+      {/* Terminal — absolute positioning gives xterm.js real pixel dimensions to measure.
+          The 50dvh floor keeps the armed streaming terminal at or above half the
+          viewport on mobile; the control area above scrolls instead of
+          squeezing the xterm below it. */}
+      <div style={{ flex: 1, position: 'relative', overflow: 'hidden', minHeight: '50dvh' }}>
         <div ref={containerRef} style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }} />
       </div>
     </div>

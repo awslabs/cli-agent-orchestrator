@@ -154,8 +154,13 @@ export class StreamingEngine {
       advertisedChords: config.advertisedChords,
       now: config.now ?? (() => Date.now()),
       mintId: config.mintId ?? (() => crypto.randomUUID()),
-      setTimeoutFn: config.setTimeoutFn ?? setTimeout,
-      clearTimeoutFn: config.clearTimeoutFn ?? clearTimeout,
+      // Browser timer intrinsics must be invoked with the global as their
+      // receiver: calling a bare `setTimeout` reference as a method of this
+      // config object (`this.config.setTimeoutFn(...)`) throws
+      // `TypeError: Illegal invocation` in browsers, which killed the quiet
+      // timer on the first captured key. Bind the defaults to globalThis.
+      setTimeoutFn: config.setTimeoutFn ?? setTimeout.bind(globalThis),
+      clearTimeoutFn: config.clearTimeoutFn ?? clearTimeout.bind(globalThis),
     }
     this.hooks = hooks
   }

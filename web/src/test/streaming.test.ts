@@ -240,6 +240,92 @@ describe('streaming grace pacing (§6.3 step 3, §10.4)', () => {
   })
 })
 
+describe('streaming timers under browser receiver semantics (§10.4 Sol P1 regression)', () => {
+  // Browsers require the timer intrinsics to be invoked with the global as
+  // their receiver. The engine stores its defaults on `this.config` and calls
+  // them as methods (`this.config.setTimeoutFn(...)`), so a bare `setTimeout`
+  // default runs with the config object as `this` — Chrome rejects that with
+  // `TypeError: Illegal invocation`, which killed the quiet timer on the
+  // first captured printable key (no batch, no trace). Node's timers never
+  // check the receiver, so every test above is blind to it; this harness
+  // wraps the globals with the browser's receiver check.
+  const realSetTimeout = globalThis.setTimeout
+  const realClearTimeout = globalThis.clearTimeout
+
+  function browserReceiverCheck<T extends (...args: never[]) => unknown>(fn: T): T {
+    const wrapped = function (this: unknown, ...args: unknown[]) {
+      // Sloppy-mode/direct calls arrive with undefined or the global itself;
+      // anything else (e.g. a config object) is the browser's illegal case.
+      if (this !== undefined && this !== globalThis) {
+        throw new TypeError('Illegal invocation')
+      }
+      return Reflect.apply(fn, undefined, args)
+    }
+    return wrapped as unknown as T
+  }
+
+  beforeEach(() => {
+    globalThis.setTimeout = browserReceiverCheck(realSetTimeout)
+    globalThis.clearTimeout = browserReceiverCheck(realClearTimeout)
+  })
+  afterEach(() => {
+    globalThis.setTimeout = realSetTimeout
+    globalThis.clearTimeout = realClearTimeout
+  })
+
+  it('first printable capture has no exception, forms a batch and a trace on the control route', async () => {
+    const sent: Array<{ controlId: string; events: SequenceEvent[] }> = []
+    const deferreds: Array<{ resolve: (result: SendResult) => void }> = []
+    let trace: TraceEntry[] = []
+    let idCounter = 0
+    const engine = new StreamingEngine(
+      {
+        coalesceWindowMs: 5,
+        advertisedChords: NO_CHORDS,
+        mintId: () => `control-${(idCounter += 1)}`,
+        // No setTimeoutFn/clearTimeoutFn: the engine must bind its defaults.
+      },
+      {
+        onSendBatch: (controlId, events) => {
+          sent.push({ controlId, events })
+          return new Promise<SendResult>(resolve => deferreds.push({ resolve }))
+        },
+        onTrace: next => {
+          trace = next
+        },
+        onDisarm: () => {},
+      },
+    )
+
+    // The first printable key must not throw (the P1 repro), and the quiet
+    // timer must arm so the batch flushes on the coalesce window alone.
+    expect(() => engine.handleKey(plain('a'))).not.toThrow()
+    await new Promise(resolve => realSetTimeout(resolve, 40))
+    expect(sent).toHaveLength(1)
+    expect(sent[0].events).toEqual([{ type: 'text', text: 'a' }])
+    // Only the identity-bound control route carries the batch: the engine is
+    // DOM-free and its sole egress is onSendBatch with the minted control id.
+    expect(sent[0].controlId).toBe('control-1')
+
+    deferreds.shift()?.resolve(accepted)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(trace.map(entry => entry.outcome)).toEqual(['accepted'])
+    expect(trace[0].controlIdShort).toBe('control-')
+
+    // The cancel path (Enter-after-text fusion calls clearTimeout) is covered
+    // by the same receiver check: no throw, the fused batch sends at once.
+    expect(() => engine.handleKey(plain('b'))).not.toThrow()
+    expect(() => engine.handleKey(plain('Enter'))).not.toThrow()
+    expect(sent).toHaveLength(2)
+    expect(sent[1].events).toEqual([
+      { type: 'text', text: 'b' },
+      { type: 'key', key: 'Enter' },
+    ])
+    engine.disarm('test done')
+  })
+})
+
 describe('streaming pause and disarm (§6.4)', () => {
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => vi.useRealTimers())
