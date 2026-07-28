@@ -29,13 +29,6 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from test.fixtures.cao_server import CaoServer, _pick_free_port, _start_cao_server
-from test.fixtures.tmux_server import TmuxServer, isolated_tmux_server
-from typing import Iterator, List, Optional
-
-import pytest
-import requests
-
 from test.e2e.test_control_input_live import (
     LivePane,
     _await,
@@ -43,6 +36,12 @@ from test.e2e.test_control_input_live import (
     _send,
     _settled,
 )
+from test.fixtures.cao_server import CaoServer, _pick_free_port, _start_cao_server
+from test.fixtures.tmux_server import TmuxServer, isolated_tmux_server
+from typing import Iterator, List, Optional
+
+import pytest
+import requests
 
 pytestmark = pytest.mark.e2e
 

@@ -57,7 +57,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
 
 from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.services import native_pane_input
+from cli_agent_orchestrator.services import native_pane_input, provider_controls
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
     AMBIGUOUS,
@@ -123,7 +123,6 @@ from cli_agent_orchestrator.services.control_input_contract import (
     outcome_for_reason,
     server_identity_refusal,
 )
-from cli_agent_orchestrator.services import provider_controls
 from cli_agent_orchestrator.services.control_input_journal import (
     STATE_AMBIGUOUS,
     WRITING,
