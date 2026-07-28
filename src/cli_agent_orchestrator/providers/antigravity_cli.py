@@ -42,9 +42,11 @@ counter, since the TUI looks identical in both states).
 import asyncio
 import json
 import logging
+import os
 import re
 import shlex
 import shutil
+import stat
 import threading
 import time
 from pathlib import Path
@@ -64,10 +66,11 @@ logger = logging.getLogger(__name__)
 
 # Serializes concurrent _register_mcp_servers()/_unregister_mcp_servers()
 # read-modify-writes to ~/.gemini/config/mcp_config.json -- after the async
-# conversion (issue #494), initialize()/cleanup() run this on a worker thread
-# via asyncio.to_thread, so N concurrent inits/teardowns can race the shared
-# file. Without a lock, one thread's write can clobber another's read-before-
-# write, silently dropping a concurrently-registered (or unregistered) server.
+# conversion (issue #494), both paths run on worker threads (initialize() via
+# asyncio.to_thread, cleanup() via loop.run_in_executor), so N concurrent
+# inits/teardowns can race the shared file. Without a lock, one thread's write
+# can clobber another's read-before-write, silently dropping a concurrently-
+# registered (or unregistered) server.
 _MCP_CONFIG_WRITE_LOCK = threading.Lock()
 
 
@@ -390,16 +393,20 @@ class AntigravityCliProvider(BaseProvider):
                 servers[server_name] = entry
                 self._mcp_server_names.append(server_name)
 
-            with open(path, "w") as f:
+            tmp_path = path.with_suffix(".json.tmp")
+            with open(tmp_path, "w") as f:
                 json.dump(config, f, indent=2)
+            if path.exists():
+                os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
+            os.replace(tmp_path, path)
 
     def _unregister_mcp_servers(self) -> None:
         """Remove the MCP servers this provider registered.
 
-        Called synchronously from ``cleanup()`` (on the event-loop thread, not
-        offloaded). Shares ``_MCP_CONFIG_WRITE_LOCK`` with
-        ``_register_mcp_servers`` so this can't interleave with another
-        terminal's concurrent ``asyncio.to_thread``-run registration and
+        Called via ``asyncio.to_thread`` from ``cleanup()`` so the lock is
+        never acquired on the event-loop thread. Shares
+        ``_MCP_CONFIG_WRITE_LOCK`` with ``_register_mcp_servers`` so this
+        can't interleave with another terminal's concurrent registration and
         corrupt the shared ``mcp_config.json`` read-modify-write.
         """
         if not self._mcp_server_names:
@@ -416,8 +423,11 @@ class AntigravityCliProvider(BaseProvider):
                 if isinstance(servers, dict):
                     for name in self._mcp_server_names:
                         servers.pop(name, None)
-                    with open(path, "w") as f:
+                    tmp_path = path.with_suffix(".json.tmp")
+                    with open(tmp_path, "w") as f:
                         json.dump(config, f, indent=2)
+                    os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
+                    os.replace(tmp_path, path)
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("Failed to unregister MCP servers from %s: %s", path, exc)
             finally:
@@ -811,8 +821,26 @@ class AntigravityCliProvider(BaseProvider):
         return "/quit"
 
     def cleanup(self) -> None:
-        """Remove the MCP servers this provider registered and reset state."""
-        self._unregister_mcp_servers()
+        """Remove the MCP servers this provider registered and reset state.
+
+        _unregister_mcp_servers acquires _MCP_CONFIG_WRITE_LOCK and does file
+        I/O. When cleanup() is called on the event-loop thread (e.g. from
+        flow_service.execute_flow → cleanup_provider), running it inline would
+        block the loop. Offload to a worker thread so the lock is never held
+        on the event-loop thread — mirroring how _register_mcp_servers is
+        already offloaded via asyncio.to_thread in initialize().
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            # On the event-loop thread — offload blocking I/O + lock to a worker.
+            loop.run_in_executor(None, self._unregister_mcp_servers)
+        else:
+            # Already on a worker thread (e.g. api delete_terminal path) — safe
+            # to run inline.
+            self._unregister_mcp_servers()
         self._initialized = False
 
     def mark_input_received(self) -> None:

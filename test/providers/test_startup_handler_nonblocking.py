@@ -178,3 +178,53 @@ _HEARTBEAT_CASES = [
 async def test_handler_does_not_starve_event_loop(name, run_case):
     ticks = await run_case()
     assert ticks > 0, f"{name}: event loop starved while its backend call was in flight"
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: cleanup() lock offload -- _unregister_mcp_servers must not block
+# the event loop when cleanup() is called from an async context (e.g.
+# flow_service.execute_flow → cleanup_provider on the loop thread).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_antigravity_cleanup_does_not_block_event_loop(tmp_path):
+    """cleanup() offloads _unregister_mcp_servers via run_in_executor so the
+    _MCP_CONFIG_WRITE_LOCK + file I/O never runs on the event-loop thread."""
+    import json
+
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text(json.dumps({"mcpServers": {"cao-mcp-server": {"command": "x"}}}))
+    provider = AntigravityCliProvider("t1", "sess", "win")
+    provider._mcp_server_names = ["cao-mcp-server"]
+
+    # Make _unregister_mcp_servers block long enough for heartbeat detection.
+    original_unregister = provider._unregister_mcp_servers
+
+    def _slow_unregister():
+        time.sleep(_BLOCKING_CALL_SECONDS)
+        original_unregister()
+
+    ticks = 0
+    stop = asyncio.Event()
+
+    async def _ticker():
+        nonlocal ticks
+        while not stop.is_set():
+            await asyncio.sleep(_TICKER_INTERVAL_SECONDS)
+            ticks += 1
+
+    ticker_task = asyncio.create_task(_ticker())
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
+        with patch.object(provider, "_unregister_mcp_servers", _slow_unregister):
+            # cleanup() detects the running loop and offloads to executor.
+            provider.cleanup()
+            # Give the executor time to complete.
+            await asyncio.sleep(_BLOCKING_CALL_SECONDS * 3)
+    stop.set()
+    ticker_task.cancel()
+    try:
+        await ticker_task
+    except asyncio.CancelledError:
+        pass
+    assert ticks > 0, "event loop starved during cleanup's _unregister_mcp_servers"
