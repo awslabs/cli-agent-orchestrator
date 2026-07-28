@@ -3479,6 +3479,169 @@ async def export_memories_endpoint(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Memory relationship routes (issue #511).
+#
+# Registered BEFORE the single-segment ``/memory/{key}`` catch-all below so the
+# literal ``/memory/relationships`` collection is not captured as a key (FR-5.2;
+# same precedent as ``/memory/export`` above). A route-resolution test guards
+# this ordering. All go through the single MemoryRelationshipService; the route
+# layer is a thin adapter that maps ValueError -> 400 and not-found -> 404 and
+# never issues SQL. Responses are content-free RelationshipDTOs (NFR-1.7).
+# --------------------------------------------------------------------------- #
+
+
+class RelationshipCreateRequest(BaseModel):
+    scope: str
+    scope_id: Optional[str] = None
+    source_key: str
+    target_key: str
+    type: str
+    origin: str
+    status: str = "active"
+    confidence: Optional[float] = None
+    rank: Optional[int] = None
+    attributes: Optional[Dict[str, Any]] = None
+
+
+class RelationshipPatchRequest(BaseModel):
+    status: Optional[str] = None
+    confidence: Optional[float] = None
+    rank: Optional[int] = None
+    attributes: Optional[Dict[str, Any]] = None
+
+
+def _relationship_service():
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        MemoryRelationshipService,
+    )
+
+    return MemoryRelationshipService()
+
+
+@app.get("/memory/relationships")
+async def list_relationships_endpoint(
+    scope: str,
+    scope_id: Optional[str] = None,
+    source_key: Optional[str] = None,
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    stale: bool = False,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """List relationships (read scope). Default returns ACTIVE only; ``status``
+    widens; ``stale=true`` filters to stale edges. Each row is a content-free
+    RelationshipDTO exposing provenance/status/timestamps (FR-5.4, AC-7)."""
+    _require_memory_enabled()
+    svc = _relationship_service()
+    dtos = svc.list_relationships(
+        scope,
+        scope_id,
+        source_key,
+        status=status_filter,
+        stale_only=stale,
+        include_non_active=status_filter is not None,
+    )
+    return [d.to_dict() for d in dtos]
+
+
+@app.post("/memory/relationships")
+async def create_relationship_endpoint(
+    body: RelationshipCreateRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Create/upsert a relationship (write scope). Fail-closed: the service
+    rejects invalid type/status/confidence/attributes, self-links, and
+    cross-scope/dangling endpoints with ValueError -> 400, before persistence."""
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.create(
+            body.scope,
+            body.scope_id,
+            body.source_key,
+            body.target_key,
+            body.type,
+            body.origin,
+            status=body.status,
+            confidence=body.confidence,
+            rank=body.rank,
+            attributes=body.attributes,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return dto.to_dict()
+
+
+@app.patch("/memory/relationships/{relationship_id}")
+async def patch_relationship_endpoint(
+    relationship_id: str,
+    body: RelationshipPatchRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.patch(
+            relationship_id,
+            status=body.status,
+            confidence=body.confidence,
+            rank=body.rank,
+            attributes=body.attributes,
+        )
+    except ValueError as e:
+        # not-found is raised as ValueError by the service; map to 404, other
+        # validation errors to 400.
+        detail = str(e)
+        code = status.HTTP_404_NOT_FOUND if "not found" in detail else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=code, detail=detail)
+    return dto.to_dict()
+
+
+@app.post("/memory/relationships/{relationship_id}/promote")
+async def promote_relationship_endpoint(
+    relationship_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.promote(relationship_id)
+    except ValueError as e:
+        detail = str(e)
+        code = status.HTTP_404_NOT_FOUND if "not found" in detail else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=code, detail=detail)
+    return dto.to_dict()
+
+
+@app.post("/memory/relationships/{relationship_id}/reject")
+async def reject_relationship_endpoint(
+    relationship_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.reject(relationship_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return dto.to_dict()
+
+
+@app.delete("/memory/relationships/{relationship_id}")
+async def delete_relationship_endpoint(
+    relationship_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Soft-delete (write scope): status -> deleted, row retained (auditable)."""
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.soft_delete(relationship_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return dto.to_dict()
+
+
 @app.get("/memory/{key}", response_model=MemoryDetail)
 async def get_memory_endpoint(
     key: MemoryKey,

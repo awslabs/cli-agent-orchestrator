@@ -11,6 +11,7 @@ from sqlalchemy import (
     CheckConstraint,
     Column,
     DateTime,
+    Float,
     Integer,
     String,
     Text,
@@ -110,6 +111,95 @@ class MemoryMetadataModel(Base):
     )
 
 
+# Relationship-store sentinel: ``memory_relationships.scope_id`` is NOT NULL and
+# stores this value for global/federated scope. SQLite treats ``NULL != NULL``
+# in a UNIQUE index, so a nullable scope_id would make the dedup index (and thus
+# ``INSERT ... ON CONFLICT``) inert for global scope — silently duplicating
+# exactly the edges hardest to notice. Storing a NOT-NULL sentinel keeps the
+# dedup tuple total. ``""`` cannot collide with a real sanitized scope_id
+# (``MemoryService._sanitize_key``/``_sanitize_scope_id`` never yield empty —
+# the latter returns ``"unknown"``). This sentinel is scoped to the
+# ``memory_relationships`` table ONLY; ``MemoryMetadataModel.scope_id`` remains
+# genuinely nullable (stores real NULL for global), so cross-table endpoint
+# checks against it use logical ``None`` + ``.is_(None)`` (see the relationship
+# service), never this sentinel.
+RELATIONSHIP_SCOPE_ID_SENTINEL = ""
+
+
+class MemoryRelationshipModel(Base):
+    """SQLAlchemy model for a typed, durable memory relationship edge (issue #511).
+
+    The authoritative relationship store that replaces the lossy
+    ``memory_metadata.related_keys`` text column. One row per typed edge between
+    two memory keys in the same ``(scope, scope_id)``. Written and read ONLY
+    through ``MemoryRelationshipService`` — no other component issues SQL against
+    this table (FR-2.1 single-boundary invariant).
+
+    ``related_keys`` on ``MemoryMetadataModel`` is retained UNCHANGED as the
+    compiler's computation-state marker (NULL = never computed/error, ``""`` =
+    computed-empty) and is NOT modified or retired by this table (retirement is a
+    separate, later change gated on a loss-free proof).
+    """
+
+    __tablename__ = "memory_relationships"
+
+    # Application-generated uuid4 string PK, matching ``MemoryMetadataModel.id``
+    # (str(uuid4())). API-stable identifier exposed in mutation responses.
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    scope = Column(String, nullable=False)
+    # NOT NULL: sentinel RELATIONSHIP_SCOPE_ID_SENTINEL ("") for global/federated
+    # so the dedup UNIQUE index is total (see the sentinel comment above).
+    scope_id = Column(String, nullable=False)
+    source_key = Column(String, nullable=False)
+    target_key = Column(String, nullable=False)
+    # Closed taxonomy reusing the graph EdgeType values.
+    type = Column(String, nullable=False)  # relates_to | contradiction | supersedes
+    # compiler | wiki_lint | human | legacy_related_keys | external_import(reserved)
+    origin = Column(String, nullable=False)
+    # active | proposal | rejected | superseded | deleted (auditable soft-delete)
+    status = Column(String, nullable=False, default="active")
+    # Optional evidence metadata. NULL = no evidence (NEVER fabricated / coerced
+    # to 0); a stored value is a validated REAL in [0, 1].
+    confidence = Column(Float, nullable=True, default=None)
+    # Optional ordering hint (e.g. legacy related_keys position). NULL if none.
+    rank = Column(Integer, nullable=True, default=None)
+    # Bounded JSON blob. NULL if none; the CHECK caps FRESH DBs, the service
+    # caps existing DBs (mirrors the ck_related_keys_length precedent).
+    attributes_json = Column(Text, nullable=True, default=None)
+    # The source memory's updated_at at write time; basis for staleness
+    # detection (an edge is stale when this predates the source's current
+    # updated_at). NULL when unknown.
+    source_updated_at = Column(DateTime(timezone=True), nullable=True, default=None)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        # Dedup: differing type or origin coexist as distinct rows (multi-edge +
+        # provenance-aware coexistence); a repeat of the same tuple upserts.
+        # Every column is non-NULL (scope_id sentinel), so the index and
+        # ON CONFLICT fire for ALL scopes including global.
+        UniqueConstraint(
+            "scope",
+            "scope_id",
+            "source_key",
+            "target_key",
+            "type",
+            "origin",
+            name="uq_memory_rel",
+        ),
+        # FRESH-DB CHECKs only (SQLite cannot retro-add a CHECK); the service
+        # validates confidence range and attributes size on existing DBs.
+        CheckConstraint(
+            "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
+            name="ck_memory_rel_confidence_range",
+        ),
+        CheckConstraint(
+            "attributes_json IS NULL OR length(attributes_json) <= 2048",
+            name="ck_memory_rel_attributes_size",
+        ),
+    )
+
+
 class ProjectAliasModel(Base):
     """SQLAlchemy model for project identity aliases (Phase 2.5 U6).
 
@@ -205,6 +295,10 @@ def init_db() -> None:
     _migrate_workflow_run()
     _migrate_workflow_run_step()
     _migrate_workflow_outcome_indexes()
+    # Appended LAST (issue #511). Disjoint from the workflow_run* tables that
+    # #504 also migrates, so registry order is immaterial — never reorder the
+    # entries above.
+    _migrate_memory_relationships()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -358,6 +452,176 @@ def _migrate_add_related_keys() -> None:
                 logger.info("Migration: added related_keys column to memory_metadata")
     except Exception as e:
         logger.debug(f"Migration check for related_keys failed: {e}")
+
+
+def _migrate_memory_relationships() -> None:
+    """Create the ``memory_relationships`` table + indexes and backfill legacy
+    links (issue #511). Appended LAST to the ``init_db()`` registry.
+
+    Idempotent, zero-arg, self-connecting — mirrors the existing migrators.
+    Failure is logged at debug and never propagated (a missing table is
+    recoverable; the service degrades). ``CREATE TABLE IF NOT EXISTS`` covers
+    existing DBs where ``Base.metadata.create_all`` (which builds the model with
+    its CHECK constraints on fresh DBs) has already run or will run — the same
+    fresh-vs-existing split the codebase uses for ``related_keys``.
+
+    Disjoint from the ``workflow_run*`` tables (#504); registry order is
+    immaterial.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS memory_relationships ("
+                "id TEXT PRIMARY KEY, "
+                "scope TEXT NOT NULL, "
+                "scope_id TEXT NOT NULL, "
+                "source_key TEXT NOT NULL, "
+                "target_key TEXT NOT NULL, "
+                "type TEXT NOT NULL, "
+                "origin TEXT NOT NULL, "
+                "status TEXT NOT NULL DEFAULT 'active', "
+                "confidence REAL, "
+                "rank INTEGER, "
+                "attributes_json TEXT, "
+                "source_updated_at DATETIME, "
+                "created_at DATETIME, "
+                "updated_at DATETIME"
+                ")"
+            )
+            # Dedup UNIQUE index — total because scope_id is NOT NULL (sentinel),
+            # so ON CONFLICT fires for all scopes including global.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_rel ON memory_relationships "
+                "(scope, scope_id, source_key, target_key, type, origin)"
+            )
+            # Lookup index for the common (scope, scope_id, source_key) read path.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_rel_lookup ON memory_relationships "
+                "(scope, scope_id, source_key)"
+            )
+            conn.commit()
+            _backfill_legacy_related_keys(conn)
+    except Exception as e:
+        logger.debug(f"memory_relationships migration skipped: {e}")
+
+
+def _backfill_legacy_related_keys(conn: Any) -> None:
+    """One-time, idempotent backfill of ``memory_metadata.related_keys`` into
+    ``memory_relationships`` as ``type=relates_to, origin=legacy_related_keys,
+    status=active, confidence=NULL`` rows (issue #511, FR-1.4/FR-1.5).
+
+    - Gated per source memory: if any ``legacy_related_keys`` row already exists
+      for that ``(scope, scope_id, source_key)``, the source is skipped, so
+      re-running ``init_db()`` is a no-op (idempotent).
+    - ``related_keys IS NULL`` or ``""`` yields zero rows (never-computed /
+      computed-empty carry no edge). The NULL-vs-"" marker stays on
+      ``related_keys`` UNCHANGED — this backfill only READS it (ADR-4).
+    - ``confidence`` is always NULL (never fabricated — NFR-2.1). Order is
+      preserved as ``rank``.
+    - A target that no longer resolves to an in-scope memory, a self-link, or a
+      key that fails the sanitiser is REPORTED (logged) and NOT written active
+      (FR-1.5) — never silently activated.
+    - ``scope_id`` is normalised to the sentinel ``""`` for global/federated so
+      the dedup index is total.
+
+    Best-effort: any failure is logged at debug and never propagated (the
+    service can compute relationships later; a partial backfill is safe because
+    the per-source gate resumes cleanly).
+    """
+    # Lazy import to avoid a circular import (memory_service imports database).
+    try:
+        from cli_agent_orchestrator.services.memory_service import MemoryService
+    except Exception as e:  # pragma: no cover - import guard
+        logger.debug(f"backfill skipped (memory_service import): {e}")
+        return
+
+    now_iso = _utcnow().isoformat()
+    reported: list[str] = []
+    try:
+        rows = conn.execute(
+            "SELECT key, scope, scope_id, related_keys, updated_at "
+            "FROM memory_metadata "
+            "WHERE related_keys IS NOT NULL AND related_keys != ''"
+        ).fetchall()
+    except Exception as e:
+        logger.debug(f"backfill skipped (memory_metadata read): {e}")
+        return
+
+    for key, scope, scope_id, related_keys, src_updated_at in rows:
+        sentinel = scope_id if scope_id is not None else RELATIONSHIP_SCOPE_ID_SENTINEL
+        # Per-source idempotency gate (exact = on the sentinel, never IS NULL).
+        existing = conn.execute(
+            "SELECT 1 FROM memory_relationships "
+            "WHERE source_key = ? AND scope = ? AND scope_id = ? "
+            "AND origin = 'legacy_related_keys' LIMIT 1",
+            (key, scope, sentinel),
+        ).fetchone()
+        if existing is not None:
+            continue
+
+        targets = MemoryService._parse_related_keys(related_keys, scope)
+        # Resolve which target keys actually exist in the SAME (scope, scope_id).
+        for rank, target in enumerate(targets):
+            if target == key:
+                reported.append(f"{scope}/{scope_id}/{key}->{target}: self-link")
+                continue
+            # Endpoint existence against memory_metadata: scope_id is genuinely
+            # nullable there (real NULL for global), so match logical NULL, NOT
+            # the sentinel.
+            if scope_id is None:
+                found = conn.execute(
+                    "SELECT 1 FROM memory_metadata "
+                    "WHERE key = ? AND scope = ? AND scope_id IS NULL LIMIT 1",
+                    (target, scope),
+                ).fetchone()
+            else:
+                found = conn.execute(
+                    "SELECT 1 FROM memory_metadata "
+                    "WHERE key = ? AND scope = ? AND scope_id = ? LIMIT 1",
+                    (target, scope, scope_id),
+                ).fetchone()
+            if found is None:
+                reported.append(f"{scope}/{scope_id}/{key}->{target}: dangling")
+                continue
+            try:
+                conn.execute(
+                    "INSERT INTO memory_relationships "
+                    "(id, scope, scope_id, source_key, target_key, type, origin, "
+                    "status, confidence, rank, attributes_json, source_updated_at, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'relates_to', 'legacy_related_keys', "
+                    "'active', NULL, ?, NULL, ?, ?, ?) "
+                    "ON CONFLICT (scope, scope_id, source_key, target_key, type, origin) "
+                    "DO NOTHING",
+                    (
+                        str(uuid.uuid4()),
+                        scope,
+                        sentinel,
+                        key,
+                        target,
+                        rank,
+                        src_updated_at,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+            except Exception as e:
+                logger.debug(f"backfill insert skipped for {key}->{target}: {e}")
+    try:
+        conn.commit()
+    except Exception:  # pragma: no cover
+        pass
+    if reported:
+        logger.warning(
+            "memory_relationships backfill reported %d stale/malformed legacy "
+            "links (NOT activated): %s",
+            len(reported),
+            "; ".join(reported[:20]),
+        )
 
 
 def _migrate_workflow_index() -> None:

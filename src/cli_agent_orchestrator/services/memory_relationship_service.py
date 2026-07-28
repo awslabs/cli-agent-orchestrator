@@ -1,0 +1,749 @@
+"""Memory relationship service — the single authoritative boundary for the
+``memory_relationships`` table (issue #511).
+
+Every surface (compiler, wiki lint, REST API, CLI, MemoryGraphProvider, recall,
+See Also, future importers) reads and writes relationships THROUGH this service;
+no other component issues SQL against the table (FR-2.1 single-boundary
+invariant). The service owns endpoint resolution + scope checks, type/status
+validation, create/upsert, producer-scoped replacement, dedup, stale detection,
+transactional writes, and read projections.
+
+Design principles held:
+- Absence is not deletion (principle 6): ``replace_set`` replaces only the
+  ``(scope, scope_id, source_key, origin, type)`` tuple's rows, never another
+  producer's or another type's.
+- Confidence is evidence, not invented certainty (principle 7): legacy links and
+  unscored producers store ``confidence=NULL``; a value is stored only when a
+  producer supplies a validated number in [0, 1]; NULL is never coerced to 0 and
+  ranking treats NULL as absence-of-evidence.
+- Scope isolation is invariant (principle 3): both endpoints must resolve inside
+  the same ``(scope, scope_id)``; cross-scope and self-links are rejected before
+  persistence.
+
+Fail-closed: every validation raises ``ValueError`` BEFORE any DB write.
+"""
+
+import json
+import logging
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from cli_agent_orchestrator.clients.database import (
+    RELATIONSHIP_SCOPE_ID_SENTINEL,
+    MemoryMetadataModel,
+    MemoryRelationshipModel,
+    SessionLocal,
+    _utcnow,
+)
+from cli_agent_orchestrator.services.memory_service import MemoryService
+
+logger = logging.getLogger(__name__)
+
+# Closed taxonomies (reuse the graph EdgeType string values, ADR-5).
+VALID_TYPES = frozenset({"relates_to", "contradiction", "supersedes"})
+VALID_STATUSES = frozenset({"active", "proposal", "rejected", "superseded", "deleted"})
+VALID_ORIGINS = frozenset(
+    {"compiler", "wiki_lint", "human", "legacy_related_keys", "external_import"}
+)
+
+# Bounds (NFR-1.6). Final numeric values.
+MAX_EDGES_PER_MUTATION = 64
+MAX_ATTRIBUTES_BYTES = 2048
+
+# Types that recall one-level expansion follows (FR-4.2). contradiction is
+# symmetric evidence (not a traversal edge); supersedes affects ranking, not
+# expansion.
+RECALL_EDGE_TYPES = frozenset({"relates_to"})
+
+# The content-free audit event for relationship mutations (NFR-1.7). MUST be
+# registered in NOWAIT_AUDIT_EVENTS or audit_log drops it silently.
+AUDIT_EVENT = "relationship_mutation"
+
+
+@dataclass
+class RelationshipDTO:
+    """The inspectable, content-free return/response contract (FR-5.4).
+
+    Contains keys/type/origin/status/confidence/rank/attributes/timestamps and a
+    derived ``stale`` flag — NEVER a memory body or prompt (NFR-1.7). ``scope_id``
+    is denormalised back to ``None`` for global/federated (the row stores the
+    sentinel).
+    """
+
+    id: str
+    scope: str
+    scope_id: Optional[str]
+    source_key: str
+    target_key: str
+    type: str
+    origin: str
+    status: str
+    confidence: Optional[float]
+    rank: Optional[int]
+    attributes: Optional[Dict[str, Any]]
+    source_updated_at: Optional[str]
+    created_at: Optional[str]
+    updated_at: Optional[str]
+    stale: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "scope": self.scope,
+            "scope_id": self.scope_id,
+            "source_key": self.source_key,
+            "target_key": self.target_key,
+            "type": self.type,
+            "origin": self.origin,
+            "status": self.status,
+            "confidence": self.confidence,
+            "rank": self.rank,
+            "attributes": self.attributes,
+            "source_updated_at": self.source_updated_at,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "stale": self.stale,
+        }
+
+
+@dataclass
+class ReplaceReport:
+    """Result of a producer-scoped ``replace_set`` (content-free)."""
+
+    added: int = 0
+    kept: int = 0
+    removed: int = 0
+    rejected: List[Dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class EdgeInput:
+    """One edge in a ``replace_set`` batch."""
+
+    target_key: str
+    confidence: Optional[float] = None
+    rank: Optional[int] = None
+    attributes: Optional[Dict[str, Any]] = None
+
+
+def _iso(value: Any) -> Optional[str]:
+    """Normalise a datetime/str timestamp to an ISO string (or None)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+class MemoryRelationshipService:
+    """Sole reader/writer of the ``memory_relationships`` table."""
+
+    def __init__(self) -> None:
+        # Reuse MemoryService's static sanitizers; no instance state shared.
+        self._sanitize_key = MemoryService._sanitize_key
+        self._sanitize_scope_id = MemoryService._sanitize_scope_id
+
+    # ------------------------------------------------------------------ #
+    # scope_id normalisation (sentinel is scoped to memory_relationships)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _to_sentinel(scope_id: Optional[str]) -> str:
+        """Map a logical scope_id to the memory_relationships storage form.
+
+        None (global/federated) -> the NOT-NULL sentinel; else the value.
+        """
+        return scope_id if scope_id is not None else RELATIONSHIP_SCOPE_ID_SENTINEL
+
+    @staticmethod
+    def _from_sentinel(stored: Optional[str]) -> Optional[str]:
+        """Denormalise a stored scope_id back to the logical value for the DTO."""
+        if stored is None or stored == RELATIONSHIP_SCOPE_ID_SENTINEL:
+            return None
+        return stored
+
+    # ------------------------------------------------------------------ #
+    # validation (fail-closed, before any persist)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _validate_type(type_: str) -> str:
+        if type_ not in VALID_TYPES:
+            raise ValueError(f"invalid relationship type: {type_!r}")
+        return type_
+
+    @staticmethod
+    def _validate_status(status: str) -> str:
+        if status not in VALID_STATUSES:
+            raise ValueError(f"invalid relationship status: {status!r}")
+        return status
+
+    @staticmethod
+    def _validate_origin(origin: str) -> str:
+        if origin not in VALID_ORIGINS:
+            raise ValueError(f"invalid relationship origin: {origin!r}")
+        return origin
+
+    @staticmethod
+    def _validate_confidence(confidence: Optional[float]) -> Optional[float]:
+        if confidence is None:
+            return None
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+            raise ValueError(f"confidence must be a number in [0,1] or None: {confidence!r}")
+        value = float(confidence)
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"confidence out of range [0,1]: {value}")
+        return value
+
+    @staticmethod
+    def _validate_attributes(attributes: Optional[Dict[str, Any]]) -> Optional[str]:
+        if attributes is None:
+            return None
+        if not isinstance(attributes, dict):
+            raise ValueError("attributes must be a dict or None")
+        encoded = json.dumps(attributes, separators=(",", ":"), sort_keys=True)
+        if len(encoded.encode("utf-8")) > MAX_ATTRIBUTES_BYTES:
+            raise ValueError(
+                f"attributes exceed {MAX_ATTRIBUTES_BYTES} bytes ({len(encoded)} chars)"
+            )
+        return encoded
+
+    def _sanitize_endpoints(self, source_key: str, target_key: str) -> tuple:
+        """Sanitise both endpoint keys; reject a self-link. Returns (src, tgt)."""
+        src = self._sanitize_key(source_key)
+        tgt = self._sanitize_key(target_key)
+        if src == tgt:
+            raise ValueError(f"self-link rejected: {src!r}")
+        return src, tgt
+
+    def _assert_endpoint_exists(
+        self, db: Any, scope: str, scope_id: Optional[str], key: str
+    ) -> None:
+        """Assert a memory with ``key`` exists in the SAME (scope, scope_id).
+
+        Queries MemoryMetadataModel, whose scope_id is genuinely nullable (real
+        NULL for global), so match logical None with ``.is_(None)`` — NOT the
+        relationship-table sentinel (which would match nothing for global).
+        """
+        q = db.query(MemoryMetadataModel).filter(
+            MemoryMetadataModel.key == key,
+            MemoryMetadataModel.scope == scope,
+        )
+        if scope_id is not None:
+            q = q.filter(MemoryMetadataModel.scope_id == scope_id)
+        else:
+            q = q.filter(MemoryMetadataModel.scope_id.is_(None))
+        if q.first() is None:
+            raise ValueError(f"endpoint does not resolve in scope ({scope},{scope_id}): {key!r}")
+
+    # ------------------------------------------------------------------ #
+    # DTO projection
+    # ------------------------------------------------------------------ #
+    def _to_dto(
+        self, row: Any, source_updated_lookup: Optional[datetime] = None
+    ) -> RelationshipDTO:
+        attrs = None
+        if row.attributes_json:
+            try:
+                attrs = json.loads(row.attributes_json)
+            except (ValueError, TypeError):
+                attrs = None
+        stale = False
+        if row.source_updated_at is not None and source_updated_lookup is not None:
+            stale = row.source_updated_at < source_updated_lookup
+        return RelationshipDTO(
+            id=row.id,
+            scope=row.scope,
+            scope_id=self._from_sentinel(row.scope_id),
+            source_key=row.source_key,
+            target_key=row.target_key,
+            type=row.type,
+            origin=row.origin,
+            status=row.status,
+            confidence=row.confidence,
+            rank=row.rank,
+            attributes=attrs,
+            source_updated_at=_iso(row.source_updated_at),
+            created_at=_iso(row.created_at),
+            updated_at=_iso(row.updated_at),
+            stale=stale,
+        )
+
+    def _audit(self, action: str, row: Any) -> None:
+        """Emit a content-free relationship_mutation audit event (NFR-1.7)."""
+        try:
+            from cli_agent_orchestrator.services.audit_log import write_audit_nowait
+
+            write_audit_nowait(
+                AUDIT_EVENT,
+                f"relationship {action}",
+                action=action,
+                id=row.id,
+                scope=row.scope,
+                scope_id=str(row.scope_id),
+                source_key=row.source_key,
+                target_key=row.target_key,
+                type=row.type,
+                origin=row.origin,
+                status=row.status,
+            )
+        except Exception as e:  # pragma: no cover - audit must never break a write
+            logger.debug(f"relationship audit emit failed ({action}): {e}")
+
+    # ------------------------------------------------------------------ #
+    # write operations
+    # ------------------------------------------------------------------ #
+    def create(
+        self,
+        scope: str,
+        scope_id: Optional[str],
+        source_key: str,
+        target_key: str,
+        type: str,
+        origin: str,
+        *,
+        status: str = "active",
+        confidence: Optional[float] = None,
+        rank: Optional[int] = None,
+        attributes: Optional[Dict[str, Any]] = None,
+        source_updated_at: Optional[datetime] = None,
+    ) -> RelationshipDTO:
+        """Create-or-upsert one relationship. Validates fail-closed, then upserts
+        on the dedup tuple (existing row updates mutable fields; FR-2.6). One
+        transaction (NFR-1.5)."""
+        self._validate_type(type)
+        self._validate_status(status)
+        self._validate_origin(origin)
+        conf = self._validate_confidence(confidence)
+        attrs_json = self._validate_attributes(attributes)
+        src, tgt = self._sanitize_endpoints(source_key, target_key)
+        sentinel = self._to_sentinel(scope_id)
+
+        with SessionLocal() as db:
+            self._assert_endpoint_exists(db, scope, scope_id, src)
+            self._assert_endpoint_exists(db, scope, scope_id, tgt)
+            existing = (
+                db.query(MemoryRelationshipModel)
+                .filter(
+                    MemoryRelationshipModel.scope == scope,
+                    MemoryRelationshipModel.scope_id == sentinel,
+                    MemoryRelationshipModel.source_key == src,
+                    MemoryRelationshipModel.target_key == tgt,
+                    MemoryRelationshipModel.type == type,
+                    MemoryRelationshipModel.origin == origin,
+                )
+                .first()
+            )
+            if existing is not None:
+                existing.status = status
+                existing.confidence = conf
+                existing.rank = rank
+                existing.attributes_json = attrs_json
+                if source_updated_at is not None:
+                    existing.source_updated_at = source_updated_at
+                existing.updated_at = _utcnow()
+                db.commit()
+                db.refresh(existing)
+                self._audit("create", existing)
+                return self._to_dto(existing)
+            row = MemoryRelationshipModel(
+                id=str(uuid.uuid4()),
+                scope=scope,
+                scope_id=sentinel,
+                source_key=src,
+                target_key=tgt,
+                type=type,
+                origin=origin,
+                status=status,
+                confidence=conf,
+                rank=rank,
+                attributes_json=attrs_json,
+                source_updated_at=source_updated_at,
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            self._audit("create", row)
+            return self._to_dto(row)
+
+    def replace_set(
+        self,
+        scope: str,
+        scope_id: Optional[str],
+        source_key: str,
+        origin: str,
+        type: str,
+        edges: List[EdgeInput],
+    ) -> ReplaceReport:
+        """Producer-scoped replacement (principle 6, FR-2.5).
+
+        In ONE transaction, replaces exactly the rows matching
+        ``(scope, scope_id, source_key, origin, type)`` with ``edges``: rows of
+        that tuple whose target is absent from ``edges`` are deleted; edges are
+        upserted. Rows of ANY OTHER origin or type — human, wiki_lint, legacy,
+        supersedes, contradiction — are structurally outside the WHERE clause and
+        are never touched. Producers MUST pass their FULL current set.
+        """
+        self._validate_type(type)
+        self._validate_origin(origin)
+        if len(edges) > MAX_EDGES_PER_MUTATION:
+            raise ValueError(f"replace_set exceeds {MAX_EDGES_PER_MUTATION} edges: {len(edges)}")
+        src = self._sanitize_key(source_key)
+        sentinel = self._to_sentinel(scope_id)
+        report = ReplaceReport()
+
+        # Validate + resolve the incoming set first (fail-closed); collect valid
+        # targets, report the rest (FR-1.5-style) without aborting the whole op.
+        valid: Dict[str, EdgeInput] = {}
+        with SessionLocal() as db:
+            for edge in edges:
+                try:
+                    tgt = self._sanitize_key(edge.target_key)
+                except ValueError:
+                    report.rejected.append({"target": edge.target_key, "reason": "unsanitised"})
+                    continue
+                if tgt == src:
+                    report.rejected.append({"target": tgt, "reason": "self"})
+                    continue
+                # Per-edge SOFT rejection for confidence/attributes, consistent
+                # with self/dangling above (reviewer F3): one bad edge in a batch
+                # is reported, not a hard abort of the whole replace_set.
+                try:
+                    self._validate_confidence(edge.confidence)
+                    self._validate_attributes(edge.attributes)
+                except ValueError:
+                    report.rejected.append({"target": tgt, "reason": "invalid_attrs_or_confidence"})
+                    continue
+                try:
+                    self._assert_endpoint_exists(db, scope, scope_id, tgt)
+                except ValueError:
+                    report.rejected.append({"target": tgt, "reason": "dangling"})
+                    continue
+                valid[tgt] = edge
+            # Source must exist too.
+            self._assert_endpoint_exists(db, scope, scope_id, src)
+
+            existing_rows = (
+                db.query(MemoryRelationshipModel)
+                .filter(
+                    MemoryRelationshipModel.scope == scope,
+                    MemoryRelationshipModel.scope_id == sentinel,
+                    MemoryRelationshipModel.source_key == src,
+                    MemoryRelationshipModel.origin == origin,
+                    MemoryRelationshipModel.type == type,
+                )
+                .all()
+            )
+            existing_by_target = {r.target_key: r for r in existing_rows}
+            new_targets = set(valid.keys())
+
+            # Delete this producer's rows whose target is not in the new set.
+            for tgt, r in existing_by_target.items():
+                if tgt not in new_targets:
+                    db.delete(r)
+                    report.removed += 1
+
+            now = _utcnow()
+            for tgt, edge in valid.items():
+                r = existing_by_target.get(tgt)
+                attrs_json = self._validate_attributes(edge.attributes)
+                if r is not None:
+                    r.confidence = self._validate_confidence(edge.confidence)
+                    r.rank = edge.rank
+                    r.attributes_json = attrs_json
+                    r.status = "active"
+                    r.updated_at = now
+                    report.kept += 1
+                else:
+                    db.add(
+                        MemoryRelationshipModel(
+                            id=str(uuid.uuid4()),
+                            scope=scope,
+                            scope_id=sentinel,
+                            source_key=src,
+                            target_key=tgt,
+                            type=type,
+                            origin=origin,
+                            status="active",
+                            confidence=self._validate_confidence(edge.confidence),
+                            rank=edge.rank,
+                            attributes_json=attrs_json,
+                            source_updated_at=None,
+                        )
+                    )
+                    report.added += 1
+            db.commit()
+        # Content-free summary audit for the bulk producer write (reviewer F2):
+        # replace_set is the highest-volume path (compiler/lint every compile),
+        # so it must leave a forensic trail. Counts + endpoints/origin/type only,
+        # never a memory body/prompt (NFR-1.7).
+        self._audit_replace_set(scope, sentinel, src, origin, type, report)
+        return report
+
+    def _audit_replace_set(
+        self,
+        scope: str,
+        sentinel: str,
+        src: str,
+        origin: str,
+        type_: str,
+        report: "ReplaceReport",
+    ) -> None:
+        try:
+            from cli_agent_orchestrator.services.audit_log import write_audit_nowait
+
+            write_audit_nowait(
+                AUDIT_EVENT,
+                f"relationship replace_set ({origin}/{type_})",
+                action="replace_set",
+                scope=scope,
+                scope_id=str(sentinel),
+                source_key=src,
+                origin=origin,
+                type=type_,
+                added=str(report.added),
+                kept=str(report.kept),
+                removed=str(report.removed),
+                rejected=str(len(report.rejected)),
+            )
+        except Exception as e:  # pragma: no cover - audit must never break a write
+            logger.debug(f"replace_set audit emit failed: {e}")
+
+    def _get_row(self, db: Any, id: str) -> Any:
+        row = db.query(MemoryRelationshipModel).filter(MemoryRelationshipModel.id == id).first()
+        if row is None:
+            raise ValueError(f"relationship not found: {id!r}")
+        return row
+
+    def patch(
+        self,
+        id: str,
+        *,
+        status: Optional[str] = None,
+        confidence: Optional[float] = None,
+        rank: Optional[int] = None,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> RelationshipDTO:
+        """Partial update of mutable fields (status/confidence/rank/attributes).
+        Endpoints/type/origin/scope are immutable. A field left as ``None`` is
+        unchanged (to clear confidence/attributes, pass an explicit sentinel via
+        a future dedicated call; #511 has no clear-to-null API requirement)."""
+        if status is not None:
+            self._validate_status(status)
+        with SessionLocal() as db:
+            row = self._get_row(db, id)
+            if status is not None:
+                row.status = status
+            if confidence is not None:
+                row.confidence = self._validate_confidence(confidence)
+            if rank is not None:
+                row.rank = rank
+            if attributes is not None:
+                row.attributes_json = self._validate_attributes(attributes)
+            row.updated_at = _utcnow()
+            db.commit()
+            db.refresh(row)
+            self._audit("patch", row)
+            return self._to_dto(row)
+
+    def promote(self, id: str) -> RelationshipDTO:
+        """proposal -> active (FR-2.2)."""
+        with SessionLocal() as db:
+            row = self._get_row(db, id)
+            if row.status in ("rejected", "deleted"):
+                raise ValueError(f"cannot promote a {row.status} relationship; re-create it")
+            row.status = "active"
+            row.updated_at = _utcnow()
+            db.commit()
+            db.refresh(row)
+            self._audit("promote", row)
+            return self._to_dto(row)
+
+    def reject(self, id: str) -> RelationshipDTO:
+        """-> rejected (FR-2.2)."""
+        with SessionLocal() as db:
+            row = self._get_row(db, id)
+            row.status = "rejected"
+            row.updated_at = _utcnow()
+            db.commit()
+            db.refresh(row)
+            self._audit("reject", row)
+            return self._to_dto(row)
+
+    def soft_delete(self, id: str) -> RelationshipDTO:
+        """-> deleted (auditable soft-delete; row retained, FR-2.4)."""
+        with SessionLocal() as db:
+            row = self._get_row(db, id)
+            row.status = "deleted"
+            row.updated_at = _utcnow()
+            db.commit()
+            db.refresh(row)
+            self._audit("soft_delete", row)
+            return self._to_dto(row)
+
+    # ------------------------------------------------------------------ #
+    # read operations
+    # ------------------------------------------------------------------ #
+    def _source_updated_map(
+        self, db: Any, scope: str, scope_id: Optional[str], source_keys: set
+    ) -> Dict[str, datetime]:
+        """Batch-load source memories' updated_at for staleness (avoid N+1)."""
+        if not source_keys:
+            return {}
+        q = db.query(MemoryMetadataModel).filter(
+            MemoryMetadataModel.scope == scope,
+            MemoryMetadataModel.key.in_(list(source_keys)),
+        )
+        if scope_id is not None:
+            q = q.filter(MemoryMetadataModel.scope_id == scope_id)
+        else:
+            q = q.filter(MemoryMetadataModel.scope_id.is_(None))
+        return {m.key: m.updated_at for m in q.all() if m.updated_at is not None}
+
+    def list_relationships(
+        self,
+        scope: str,
+        scope_id: Optional[str] = None,
+        source_key: Optional[str] = None,
+        *,
+        status: Optional[Any] = None,
+        types: Optional[List[str]] = None,
+        stale_only: bool = False,
+        include_non_active: bool = False,
+    ) -> List[RelationshipDTO]:
+        """Query relationships. Default returns ACTIVE only (FR-4.3); an explicit
+        ``status`` or ``include_non_active`` widens. Computes the derived
+        ``stale`` flag; ``stale_only`` filters to stale rows."""
+        sentinel = self._to_sentinel(scope_id)
+        with SessionLocal() as db:
+            q = db.query(MemoryRelationshipModel).filter(
+                MemoryRelationshipModel.scope == scope,
+                MemoryRelationshipModel.scope_id == sentinel,
+            )
+            if source_key is not None:
+                q = q.filter(MemoryRelationshipModel.source_key == self._sanitize_key(source_key))
+            if status is not None:
+                if isinstance(status, (list, tuple, set)):
+                    q = q.filter(MemoryRelationshipModel.status.in_(list(status)))
+                else:
+                    q = q.filter(MemoryRelationshipModel.status == status)
+            elif not include_non_active:
+                q = q.filter(MemoryRelationshipModel.status == "active")
+            if types:
+                q = q.filter(MemoryRelationshipModel.type.in_(list(types)))
+            rows = q.all()
+            src_map = self._source_updated_map(db, scope, scope_id, {r.source_key for r in rows})
+            dtos = [self._to_dto(r, src_map.get(r.source_key)) for r in rows]
+        if stale_only:
+            dtos = [d for d in dtos if d.stale]
+        return dtos
+
+    def get(self, id: str) -> Optional[RelationshipDTO]:
+        with SessionLocal() as db:
+            row = db.query(MemoryRelationshipModel).filter(MemoryRelationshipModel.id == id).first()
+            if row is None:
+                return None
+            src_map = self._source_updated_map(
+                db, row.scope, self._from_sentinel(row.scope_id), {row.source_key}
+            )
+            return self._to_dto(row, src_map.get(row.source_key))
+
+    def active_targets(
+        self,
+        scope: str,
+        scope_id: Optional[str],
+        source_key: str,
+        type: str = "relates_to",
+    ) -> List[str]:
+        """Active edge targets of ``type`` from the source, in (rank, created_at)
+        order — the See-Also / recall projection helper (FR-4.1/4.2)."""
+        sentinel = self._to_sentinel(scope_id)
+        with SessionLocal() as db:
+            rows = (
+                db.query(MemoryRelationshipModel)
+                .filter(
+                    MemoryRelationshipModel.scope == scope,
+                    MemoryRelationshipModel.scope_id == sentinel,
+                    MemoryRelationshipModel.source_key == self._sanitize_key(source_key),
+                    MemoryRelationshipModel.type == type,
+                    MemoryRelationshipModel.status == "active",
+                )
+                .all()
+            )
+        rows.sort(
+            key=lambda r: (
+                r.rank if r.rank is not None else 1_000_000,
+                r.created_at or datetime.min,
+            )
+        )
+        return [r.target_key for r in rows]
+
+    def is_superseded(self, scope: str, scope_id: Optional[str], key: str) -> bool:
+        """True iff an ACTIVE ``supersedes`` edge TARGETS ``key`` (FR-4.6 ranking
+        input): some memory supersedes this one, so it must not outrank active
+        guidance."""
+        sentinel = self._to_sentinel(scope_id)
+        with SessionLocal() as db:
+            hit = (
+                db.query(MemoryRelationshipModel)
+                .filter(
+                    MemoryRelationshipModel.scope == scope,
+                    MemoryRelationshipModel.scope_id == sentinel,
+                    MemoryRelationshipModel.target_key == self._sanitize_key(key),
+                    MemoryRelationshipModel.type == "supersedes",
+                    MemoryRelationshipModel.status == "active",
+                )
+                .first()
+            )
+        return hit is not None
+
+    def superseded_targets(self, scope: str, scope_id: Optional[str], keys: List[str]) -> set:
+        """BATCH form of is_superseded (FR-4.6): given many candidate keys in one
+        (scope, scope_id), return the subset that are the TARGET of an ACTIVE
+        supersedes edge — in ONE query (avoids the N-query loop in a large recall
+        ranking pass)."""
+        if not keys:
+            return set()
+        sentinel = self._to_sentinel(scope_id)
+        sanitized = {self._sanitize_key(k): k for k in keys}
+        with SessionLocal() as db:
+            rows = (
+                db.query(MemoryRelationshipModel.target_key)
+                .filter(
+                    MemoryRelationshipModel.scope == scope,
+                    MemoryRelationshipModel.scope_id == sentinel,
+                    MemoryRelationshipModel.type == "supersedes",
+                    MemoryRelationshipModel.status == "active",
+                    MemoryRelationshipModel.target_key.in_(list(sanitized.keys())),
+                )
+                .all()
+            )
+        # Map sanitized targets back to the caller's original key strings.
+        return {sanitized[r[0]] for r in rows if r[0] in sanitized}
+
+    def contradictions_for(
+        self, scope: str, scope_id: Optional[str], key: str
+    ) -> List[RelationshipDTO]:
+        """Active contradictions touching ``key`` from EITHER endpoint (FR-4.5
+        symmetric visibility, reconstructed at QUERY time — the store holds one
+        directed row, never a reciprocal duplicate)."""
+        from sqlalchemy import or_
+
+        sentinel = self._to_sentinel(scope_id)
+        sk = self._sanitize_key(key)
+        with SessionLocal() as db:
+            rows = (
+                db.query(MemoryRelationshipModel)
+                .filter(
+                    MemoryRelationshipModel.scope == scope,
+                    MemoryRelationshipModel.scope_id == sentinel,
+                    MemoryRelationshipModel.type == "contradiction",
+                    MemoryRelationshipModel.status == "active",
+                    or_(
+                        MemoryRelationshipModel.source_key == sk,
+                        MemoryRelationshipModel.target_key == sk,
+                    ),
+                )
+                .all()
+            )
+            return [self._to_dto(r) for r in rows]

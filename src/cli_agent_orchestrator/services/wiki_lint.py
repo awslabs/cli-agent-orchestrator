@@ -1150,4 +1150,55 @@ async def run_lint(
     except Exception as e:
         logger.debug(f"audit_log lint write failed: {e}")
 
+    # Persist contradiction findings through the single relationship service
+    # (issue #511, FR-3.2) so they are inspectable durable rows (origin=wiki_lint,
+    # type=contradiction) rather than only projection-time findings. Grouped per
+    # source and written with producer-scoped replace_set so a re-run RETRACTS
+    # contradictions no longer detected while preserving human-authored ones
+    # (BR-LP6). Best-effort: a failure logs and never breaks lint.
+    try:
+        _persist_contradictions(issues, scope)
+    except Exception as e:  # noqa: BLE001 — non-blocking
+        logger.debug(f"contradiction persistence skipped: {e}")
+
     return issues
+
+
+def _persist_contradictions(issues: list, scope: Optional[str]) -> None:
+    """Route wiki_lint contradiction findings into the relationship store.
+
+    One directed row per (source, target) contradiction (origin=wiki_lint); the
+    symmetric view is reconstructed at read time by the service, so no reciprocal
+    row is written. Uses producer-scoped replace_set per source key so stale
+    contradictions are retracted on re-lint while human/other-origin edges are
+    untouched (principle 6). Endpoints that no longer resolve in-scope are
+    rejected by the service (fail-closed) and simply dropped from the report.
+    """
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        EdgeInput,
+        MemoryRelationshipService,
+    )
+
+    # Group detected contradictions by (scope, scope_id, source_key).
+    grouped: dict = {}
+    for issue in issues:
+        if issue.issue_type != "contradiction" or issue.related_key is None:
+            continue
+        desc = (issue.description or "")[:512]
+        grouped.setdefault((issue.scope_id, issue.key), []).append((issue.related_key, desc))
+    if not grouped:
+        return
+
+    rel_svc = MemoryRelationshipService()
+    for (scope_id, source_key), targets in grouped.items():
+        eff_scope = scope or "global"
+        edges = [
+            EdgeInput(target_key=tgt, attributes={"summary": desc} if desc else None)
+            for tgt, desc in targets
+        ]
+        try:
+            rel_svc.replace_set(
+                eff_scope, scope_id, source_key, "wiki_lint", "contradiction", edges
+            )
+        except Exception as e:  # noqa: BLE001 — per-source best-effort
+            logger.debug(f"contradiction replace_set failed for {source_key}: {e}")

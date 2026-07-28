@@ -78,26 +78,71 @@ def _insert_row(db_engine, key: str, file_path: str, *, tags: str = "t", related
         session.close()
 
 
+def _insert_relationship(
+    db_engine,
+    source_key,
+    target_key,
+    type_="relates_to",
+    origin="compiler",
+    status="active",
+    scope="global",
+    scope_id="",
+):
+    """Seed a row in the memory_relationships STORE (issue #511). scope_id "" is
+    the global-scope sentinel used by the relationship table."""
+    import uuid as _uuid
+
+    from cli_agent_orchestrator.clients.database import MemoryRelationshipModel
+
+    Session = sessionmaker(bind=db_engine)
+    session = Session()
+    try:
+        session.add(
+            MemoryRelationshipModel(
+                id=str(_uuid.uuid4()),
+                scope=scope,
+                scope_id=scope_id,
+                source_key=source_key,
+                target_key=target_key,
+                type=type_,
+                origin=origin,
+                status=status,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+
 @pytest.fixture
 def populated_scope(svc, db_engine, monkeypatch):
-    """Three global topics: a→b via related_keys, a/b share a tag (pairable)."""
+    """Three global topics; a→b as an ACTIVE relates_to edge in the relationship
+    STORE (issue #511 — the provider reads the store, not related_keys). The
+    related_keys column is still set as the compiler's computation-state marker
+    but is NO LONGER the graph edge source."""
     paths = {key: _write_topic(svc, key) for key in ("a", "b", "c")}
     _write_index(svc, ["a", "b", "c"])
     _insert_row(db_engine, "a", paths["a"], tags="t", related_keys="b")
     _insert_row(db_engine, "b", paths["b"], tags="t")
     _insert_row(db_engine, "c", paths["c"], tags="other")
+    # Store edge a→b (compiler origin). This is what the provider projects now.
+    _insert_relationship(db_engine, "a", "b", type_="relates_to", origin="compiler")
 
-    # run_lint constructs MemoryService() and SessionLocal() internally —
-    # point both at the test fixtures.
+    # run_lint AND the relationship service both construct SessionLocal()
+    # internally — point them at the test engine.
     _patch_lint_env(monkeypatch, db_engine, svc)
     return svc
 
 
 def _patch_lint_env(monkeypatch, db_engine, svc) -> None:
     from cli_agent_orchestrator.clients import database as db_mod
+    from cli_agent_orchestrator.services import memory_relationship_service as mrs_mod
     from cli_agent_orchestrator.services import memory_service as ms_mod
 
-    monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=db_engine))
+    session_factory = sessionmaker(bind=db_engine)
+    monkeypatch.setattr(db_mod, "SessionLocal", session_factory)
+    # The relationship service imported SessionLocal into its own namespace.
+    monkeypatch.setattr(mrs_mod, "SessionLocal", session_factory)
     monkeypatch.setattr(ms_mod, "MEMORY_BASE_DIR", svc.base_dir)
     # Hermeticity: run_lint short-circuits on is_memory_enabled() — pin it so
     # a CAO_MEMORY_ENABLED=0 environment can't fail these tests (N3).
@@ -121,11 +166,18 @@ def _disable_llm(monkeypatch) -> None:
 class TestMemoryProviderHappyPath:
     @pytest.mark.asyncio
     async def test_nodes_edges_from_populated_scope(self, populated_scope, monkeypatch):
-        """AC 1-4: topic nodes for every index key; related_keys edge with
-        source attr; contradiction edge from the lint finding; no edge
-        outside the scope's node set.
-        """
-        _stub_llm_contradicts(monkeypatch)
+        """AC 1-4, updated for issue #511: topic nodes for every index key; the
+        relates_to edge now comes from the relationship STORE (attrs.source is
+        the row ORIGIN, not "related_keys"); a store contradiction edge is
+        projected when present; no edge outside the scope's node set.
+
+        DELIBERATE EXPECTATION CHANGE (issue #511): edges are sourced from the
+        durable store, not related_keys / projection-time lint. attrs.source is
+        the provenance origin. A contradiction now requires a stored row, not a
+        live-lint stub."""
+        # The fixture already seeded the ACTIVE relates_to a→b store edge
+        # (origin=compiler). No contradiction is stored here, so none projects —
+        # a separate test covers store-sourced contradictions.
         provider = MemoryGraphProvider(memory_service=populated_scope)
 
         view = await provider.project(scope="global")
@@ -135,13 +187,10 @@ class TestMemoryProviderHappyPath:
         assert all(n.status.value == "active" for n in view.nodes)
         related = [e for e in view.edges if e.type == EdgeType.RELATES_TO]
         assert [(e.source, e.target) for e in related] == [("a", "b")]
-        assert related[0].attrs["source"] == "related_keys"
-        # related_keys carries no relevance score — none must be invented.
+        # attrs.source is now the row ORIGIN (provenance), not "related_keys".
+        assert related[0].attrs["source"] == "compiler"
+        # No relevance score is invented (FR-4.3).
         assert "score" not in related[0].attrs and "relevance" not in related[0].attrs
-
-        contradictions = [e for e in view.edges if e.type == EdgeType.CONTRADICTION]
-        assert len(contradictions) == 1
-        assert {contradictions[0].source, contradictions[0].target} == {"a", "b"}
 
         node_ids = {n.id for n in view.nodes}
         for edge in view.edges:
@@ -261,7 +310,8 @@ class TestMemoryProviderEdgeCases:
         assert by_id["lonely"].attrs["is_orphan"] is True
         assert by_id["lonely"].kind == "topic"
         assert by_id["a"].attrs["is_hub"] is True
-        # Cross-container contradiction filtered; only the related_keys edge remains.
+        # Contradictions no longer come from live lint (issue #511) — the store
+        # holds none here — so only the store relates_to edge (a→b) remains.
         assert [e.type for e in view.edges] == [EdgeType.RELATES_TO]
         # EdgeType has no orphan/hub/stale/poison members.
         assert {t.value for t in EdgeType} == {"relates_to", "contradiction", "supersedes"}

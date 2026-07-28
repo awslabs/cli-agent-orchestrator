@@ -1134,10 +1134,45 @@ class MemoryService:
                 provider_hint=provider_hint,
             )
             if related_result.used_llm:
+                # Marker write FIRST (ADR-4 / reviewer Finding 4): related_keys
+                # stays the compiler's computation-state marker.
                 related_keys_value = ",".join(related_result.related_keys)
-                if related_result.related_keys:
+                # Route the compiler's relationship set through the single service
+                # (FR-3.1), best-effort and AFTER the marker so a service failure
+                # never loses the marker. Producer-scoped: replaces only this
+                # source's (origin=compiler, type=relates_to) edges — human/lint/
+                # legacy edges are preserved (principle 6). Passes the FULL set.
+                see_also_targets = list(related_result.related_keys)
+                try:
+                    from cli_agent_orchestrator.services.memory_relationship_service import (
+                        EdgeInput,
+                        MemoryRelationshipService,
+                    )
+
+                    rel_svc = MemoryRelationshipService()
+                    rel_svc.replace_set(
+                        scope,
+                        scope_id,
+                        key,
+                        "compiler",
+                        "relates_to",
+                        [EdgeInput(target_key=t) for t in related_result.related_keys],
+                    )
+                    # ## See Also is a pure projection of ACTIVE relates_to edges
+                    # (FR-4.1) — so it reflects human-authored edges too, not just
+                    # the compiler's set. Fall back to the compiler set if the
+                    # store read fails.
+                    try:
+                        see_also_targets = rel_svc.active_targets(
+                            scope, scope_id, key, type="relates_to"
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                except Exception as e:  # noqa: BLE001 — non-blocking; marker already written
+                    logger.warning(f"relationship replace_set (compiler) failed, ignoring: {e}")
+                if see_also_targets:
                     see_also = self._render_see_also(
-                        related_result.related_keys,
+                        see_also_targets,
                         topic_scope=scope,
                         topic_scope_id=scope_id,
                     )
@@ -1525,6 +1560,34 @@ class MemoryService:
                 return None
         return None
 
+    def _superseded_keys(self, memories: list) -> set:
+        """Return {(scope, key)} for memories that are the target of an active
+        supersedes edge (FR-4.6 ranking input). BATCHED per (scope, scope_id) —
+        one query per scope group, not one per memory (avoids N queries on a
+        large recall). Best-effort; empty on failure."""
+        if not memories:
+            return set()
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            rel_svc = MemoryRelationshipService()
+        except Exception:  # pragma: no cover - import guard
+            return set()
+        groups: dict = {}
+        for m in memories:
+            groups.setdefault((m.scope, self._effective_scope_id(m)), []).append(m.key)
+        out: set = set()
+        for (g_scope, g_scope_id), keys in groups.items():
+            try:
+                hits = rel_svc.superseded_targets(g_scope, g_scope_id, keys)
+            except Exception:  # noqa: BLE001 — non-blocking
+                continue
+            for k in hits:
+                out.add((g_scope, k))
+        return out
+
     def _expand_related(self, primaries: list) -> list:
         """One-level cross-reference traversal for ``recall(include_related=True)``.
 
@@ -1537,20 +1600,58 @@ class MemoryService:
             return primaries
         visited: set = {m.key for m in primaries}
         extras: list = []
-        # Group primaries by (scope, scope_id) so each SQLite lookup is
-        # batched per scope rather than per row.
+        # One-level expansion follows ACTIVE relates_to edges from the
+        # relationship STORE (issue #511, FR-4.2 — the store is authoritative for
+        # typed edges: only active relates_to is traversed; proposal/rejected/
+        # superseded/deleted and contradiction/supersedes are NOT expansion edges).
+        # UNION with the legacy ``related_keys`` marker for any primary the store
+        # returns nothing for, so a related_keys value written by a route OTHER
+        # than an LLM compile (a direct write, an import, a restore, or a row that
+        # predates the one-time backfill and was modified after) is still
+        # traversable during the compatibility window S6 protects — retirement of
+        # related_keys stays gated on the loss-free proof (ADR-4/FR-7.2). Both
+        # sources dedupe against ``visited``. Best-effort throughout.
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            rel_svc: Any = MemoryRelationshipService()
+        except Exception as e:  # pragma: no cover - import guard
+            logger.debug(f"related expansion service import failed: {e}")
+            rel_svc = None
+        # Batch-load the legacy related_keys marker per (scope, scope_id) so the
+        # fallback is not N+1 (mirrors the pre-#511 grouping).
         groups: dict = {}
         for m in primaries:
             groups.setdefault((m.scope, self._effective_scope_id(m)), []).append(m)
-        lookups: dict = {}
+        legacy_lookups: dict = {}
         for (g_scope, g_scope_id), members in groups.items():
-            lookups[(g_scope, g_scope_id)] = self._related_keys_lookup(
-                [m.key for m in members], g_scope, g_scope_id
-            )
+            try:
+                legacy_lookups[(g_scope, g_scope_id)] = self._related_keys_lookup(
+                    [m.key for m in members], g_scope, g_scope_id
+                )
+            except Exception as e:  # noqa: BLE001 — non-blocking
+                logger.debug(f"related_keys lookup failed for {g_scope}: {e}")
+                legacy_lookups[(g_scope, g_scope_id)] = {}
+
         for primary in primaries:
             primary_scope_id = self._effective_scope_id(primary)
-            raw = lookups.get((primary.scope, primary_scope_id), {}).get(primary.key)
-            for rk in self._parse_related_keys(raw, scope=primary.scope):
+            targets: list = []
+            if rel_svc is not None:
+                try:
+                    targets = rel_svc.active_targets(
+                        primary.scope, primary_scope_id, primary.key, type="relates_to"
+                    )
+                except Exception as e:  # noqa: BLE001 — non-blocking
+                    logger.debug(f"active_targets failed for {primary.key}: {e}")
+                    targets = []
+            # Legacy fallback: only when the store yielded nothing for this
+            # primary (the store is authoritative when it has edges).
+            if not targets:
+                raw = legacy_lookups.get((primary.scope, primary_scope_id), {}).get(primary.key)
+                targets = self._parse_related_keys(raw, scope=primary.scope)
+            for rk in targets:
                 if rk in visited:
                     continue
                 visited.add(rk)
@@ -1872,6 +1973,19 @@ class MemoryService:
                         m.key,
                     )
                 )
+                # FR-4.6: a memory that is the TARGET of an active supersedes edge
+                # must not outrank active guidance merely by textual similarity.
+                # Apply a stable demotion — superseded memories sink below
+                # non-superseded ones while preserving the composite order within
+                # each group. Best-effort; a store read failure leaves the order
+                # unchanged. NULL confidence is NOT used here (never treated as
+                # zero — NFR-2.3); this demotion is purely lifecycle-based.
+                try:
+                    superseded = self._superseded_keys(results)
+                    if superseded:
+                        results.sort(key=lambda m: 1 if (m.scope, m.key) in superseded else 0)
+                except Exception as e:  # noqa: BLE001 — non-blocking
+                    logger.debug(f"superseded demotion skipped: {e}")
             if not scope:
                 # Stable scope-precedence sort AFTER score/usage preserves
                 # within-scope ordering while enforcing scope dominance.
