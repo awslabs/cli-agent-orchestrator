@@ -21,8 +21,10 @@ Lane A live results reconciled in round 9 (D1 paced menus, D2 no `/model`
 reasoning selector on 0.29.2, D3 mid-turn steer forms, L1 Home/End, F1
 pin scope, OD2/OD5 resolved live); cond-0031 steer-state plan added in
 round 10 (§4.2: state-aware activation, no blind replay, truthful
-outcomes); implementation NOT green-lit — a fresh
-Fable-5/Ultracode exact-head delta approval is the required next gate)
+outcomes); declared-command outcome two-close rule pinned in round 11
+(F16, Sol/high PR #48 review: accepted only with execution evidence) —
+implementation NOT green-lit; Lane A's PR #48 correction requires a fresh
+Fable lead delta gate at the amended head first)
 
 Task ID: `native-tui-console/spec-initial-v1`
 
@@ -737,10 +739,27 @@ live-verified, never guessed (rule 4).
    records transport acceptance plus the deployed `submission_observed`
    vocabulary at most (`submitted` = the composer was seen to give up the
    text). **Provider command execution is a pane-observable fact and is
-   never inferred from transport or submission.** When execution is not
-   observed, the honest terminal state is the existing `ambiguous` class
-   with manual reconciliation by exact-id query and operator judgment —
-   never a forced `completed`. Crash and response-loss behavior is the
+   never inferred from transport or submission.** The close rule for
+   declared commands is therefore exactly two-shaped (r11, blocking):
+   - **Execution observed** — the per-provider+build **command-execution
+     observation** (pinned below) proves the command's own UI/effect
+     within a bounded window → `accepted`, journaled with the execution
+     evidence reference attached. `accepted` for this class means
+     "delivered *and* the execution signal observed" — never provider-task
+     completion (the provider may still refuse or error inside the
+     command's own UI, which is itself the observed answer, e.g.
+     `⎿ Not enough messages to compact.`).
+   - **Execution unproven** within the bound → **`ambiguous` with the
+     deployed `submission-unproven` reason** (bound to `AMBIGUOUS`,
+     `control_input_contract.py:157`, terminal for automation and never
+     upgraded by a later observation), with a command-class detail string
+     naming the unobserved signal. Exact-id reconcile replays the
+     journaled record; the operator judges the pane. **No retry licence
+     is created** — `ambiguous` is never reattemptable, and the declared
+     command is never blindly resent.
+   `mark_delivered` without the execution observation attached is a
+   contract violation (the PR #48 defect class), not a shortcut.
+   Crash and response-loss behavior is the
    deployed discipline, unchanged: a lost response is resolved by exactly
    one exact-id `GET` (never a resend), and a dead owner mid-write sweeps
    to `ambiguous/owner-lost-mid-write` (pre-write:
@@ -757,6 +776,21 @@ live-verified, never guessed (rule 4).
    conductor-tooling gap for the supervisor to route (the conductor's own
    schema evolution adding a `posted → partial-ambiguous` edge); the CAO
    wire vocabulary already carries `ambiguous` and needs no change.
+
+   **Command-execution observation (r11 pin).** Beside the
+   composer-emptiness determination, each command-capable provider+build
+   carries a pinned **execution observation**: a bounded post-write pane
+   observation (same `capture_pane_screen` primitive) matching the
+   command's own UI/effect — kimi 0.29.2: the compaction notice/UI or the
+   context-percentage transition the command drives; claude 2.1.220: the
+   command echo plus its response region (distinct from an ordinary
+   prompt echo). The window is bounded and fits the write deadline; the
+   evidence (capture ref) is journaled with the `accepted` record. A
+   provider/build **without** an execution pin refuses declared commands
+   `provider-unsupported` pre-write — declared commands require both the
+   emptiness pin and the execution pin, never one alone. This is additive
+   to the wire (existing outcomes, reasons, and fields; no new outcome
+   vocabulary).
 4. **Advertisement and compatibility.** Additive capability block
    `"command_controls": { "composer_nonempty_guard": true }` alongside
    `provider_controls`, and `4` joins `request_schema_versions`, when Lane
@@ -926,7 +960,9 @@ text     := '"' JSON-string '"'                 # JSON escaping exactly; , + / \
 named    := [a-z][a-z0-9-]*                     # enter escape up down left right home end
                                                 # page-up page-down delete insert tab backspace
 chord    := 'ctrl+' [a-z]                       # ctrl+c ctrl+s … (D7 mapping)
-repeat   := (named|chord) '*' [1-9][0-9]*       # up*3; expansion counts toward the 32-event cap
+repeat   := (named|chord) '*' [1-9][0-9]*       # up*3; expansion counts toward the 32-event cap;
+                                                # any over-budget count (incl. integer-overflow
+                                                # magnitude) is a parse error with offset, never a 500
 ```
 
 - Notation names map to wire names: `enter→Enter`, `escape→Escape`,
@@ -1593,7 +1629,22 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
   is sorted and non-normative, §3.2); the golden-diff for every other
   capability key stays exact.
 - Notation parser: golden vectors shared with the TS parser (checked into
-  `test/fixtures/notation_vectors.json`, consumed by both suites).
+  `test/fixtures/notation_vectors.json`, consumed by both suites). **Every
+  malformed repeat is an offset-bearing 422, never a 500** (r11 P2): a
+  repeat lexeme whose count cannot fit the remaining event budget —
+  including an integer-overflow-sized count such as `up*` + 5000 nines —
+  is rejected before integer conversion (or the conversion error is
+  caught) and returns the normal `{errors:[{offset,message}]}` shape at
+  both parser and endpoint layers.
+- **Declared-command close rule (§4.1, r11):** with the execution
+  observation proven, a declared command closes `accepted` **with the
+  evidence reference journaled**; with the observation unproven, it closes
+  `ambiguous`/`submission-unproven` (terminal, exact-id reconcile replays
+  the record, never resent); a provider/build without an execution pin
+  refuses declared commands `provider-unsupported` **pre-write**; no code
+  path may `mark_delivered` a declared command without the observation
+  attached (regression test against the PR #48 shape: accepted with
+  `submission_observed: null` is forbidden).
 - **Command-class guard (§4.1):** schema v4 digests under its own domain
   with `payload_class` in the pinned preimage order (golden vector; v3
   digest bytes unchanged); a **declared** command-class sequence against a
@@ -1693,7 +1744,10 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
   against a server without the `command_controls` block sends no v4 field
   and shows the guard-absent statement; old client against the new server
   is unchanged). Keep the Kimi/Claude live command acceptance (declared
-  Compact against an empty composer executes).
+  Compact against an empty composer executes) — with the r11 close rule
+  asserting the record carries the execution evidence reference, and the
+  artifacts (`lane-a-10.3` case-08/case-12 shapes re-run) showing
+  `accepted` **with** evidence rather than `submission_observed: null`.
 - **Live execution record (Lane A, head `d79785f`, 2026-07-28):** this
   acceptance ran on this host against kimi 0.29.2 and claude 2.1.220 (15
   cases; 14 pass + 1 red-by-design that caught and corrected the F1
@@ -2009,6 +2063,17 @@ jobs with the two projects of §10.5.
   replay, truthful `submitted`/`unsubmitted`/`unknown` outcomes, and
   focused acceptance. The v1/v2 path carries no turn-state gate (§1.2), so
   selection is caller discipline plus the pinned future steer-observation.
+- **F16 (P1, blocking PR #48; corrected in r11):** the declared-command
+  path closed records `accepted`/`delivered` with
+  `submission_observed: null` — execution unobserved, read as success
+  (Sol/high review of `d79785f`, reproduced against case-08/case-12
+  artifacts). §4.1 rule 3 now pins the two-shaped close (accepted only
+  with journaled execution evidence; `ambiguous`/`submission-unproven`
+  otherwise; `provider-unsupported` without an execution pin) and the
+  command-execution observation as a required per-build pin beside the
+  emptiness determination. Same root theme as F15 (unobserved effect
+  recorded as success) but a distinct path — v4 declared commands, not
+  the v2 steer surface; cond-0031 is not duplicated.
 
 ## 15. Challenges applied (per track mandate)
 
