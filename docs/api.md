@@ -38,7 +38,21 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 
 ### Profiles, providers, and settings
 
-- `/agents/profiles*` lists, reads, and installs profiles.
+- `GET /agents/profiles` and `GET /agents/profiles/{name}` list and inspect
+  installed profiles.
+- `GET /agents/profiles/search` ranks installed, loadable profiles by capability
+  using the same service as `cao profile find`.
+- `GET /agents/profiles/templates` lists public template metadata (`name` and
+  `description` only); internal template filesystem paths are never returned.
+- `GET /agents/profiles/templates/{category}/{name}/schema` returns a template's
+  JSON-Schema.
+- `POST /agents/profiles/templates/validate` validates a config object against
+  a template's JSON-Schema without writing a profile.
+- `POST /agents/profiles/templates/preview` validates and renders a template to
+  Markdown without writing a profile.
+- `POST /agents/profiles/install` installs a profile.
+- Template validation and preview require the selected template to include a
+  `schema.json` file.
 - `/agents/providers` reports provider availability.
 - `/settings/*` exposes supported agent-directory, skill-directory, and memory
   settings.

@@ -2,8 +2,8 @@
 
 Covers ``/agents/profiles/search``, the scaffold template routes, and the two
 non-mutating ``validate`` / ``preview`` routes. These endpoints exist so the Web
-UI, ``cao tui`` and any other client consume the same ranking and validation
-paths as the CLI instead of reimplementing them.
+Future UI, TUI, and external clients can consume the same ranking and
+validation paths as the CLI instead of reimplementing them.
 """
 
 from unittest.mock import patch
@@ -111,12 +111,23 @@ class TestSearchAgentProfilesEndpoint:
         assert response.status_code == 200
         assert mock_search.called
 
+    def test_maps_search_service_failure_to_500(self, client) -> None:
+        """Unexpected search-service failures should use the API error envelope."""
+        with patch(
+            "cli_agent_orchestrator.services.profile_search.search_profiles",
+            side_effect=RuntimeError("search unavailable"),
+        ):
+            response = client.get("/agents/profiles/search", params={"q": "anything"})
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Failed to search agent profiles: search unavailable"
+
 
 class TestListProfileTemplatesEndpoint:
     """Tests for GET /agents/profiles/templates."""
 
-    def test_returns_templates_from_scaffold_service(self, client) -> None:
-        """The endpoint should return the scaffold service's template list."""
+    def test_returns_only_public_template_metadata(self, client) -> None:
+        """Internal template paths must not cross the public HTTP boundary."""
         templates = [
             {"name": "aws/stepfunction", "description": "Step Functions agent", "path": "/t/sf"}
         ]
@@ -128,7 +139,10 @@ class TestListProfileTemplatesEndpoint:
             response = client.get("/agents/profiles/templates")
 
         assert response.status_code == 200
-        assert response.json() == templates
+        assert response.json() == [
+            {"name": "aws/stepfunction", "description": "Step Functions agent"}
+        ]
+        assert "path" not in response.json()[0]
 
     def test_templates_is_not_captured_as_a_profile_name(self, client) -> None:
         """Pins route ordering for the ``/templates`` static path."""
@@ -140,6 +154,17 @@ class TestListProfileTemplatesEndpoint:
 
         assert response.status_code == 200
         assert mock_list.called
+
+    def test_maps_template_service_failure_to_500(self, client) -> None:
+        """Unexpected catalog failures should use the API error envelope."""
+        with patch(
+            "cli_agent_orchestrator.services.agent_scaffold.list_templates",
+            side_effect=RuntimeError("catalog unavailable"),
+        ):
+            response = client.get("/agents/profiles/templates")
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Failed to list profile templates: catalog unavailable"
 
 
 class TestGetProfileTemplateSchemaEndpoint:
@@ -170,18 +195,17 @@ class TestGetProfileTemplateSchemaEndpoint:
         assert response.status_code == 404
         assert "No schema found" in response.json()["detail"]
 
-    def test_rejects_traversal_in_path_segments(self, client) -> None:
-        """Dot segments must be rejected by the allowlist before the service runs.
+    def test_rejects_invalid_path_segment_before_services(self, client) -> None:
+        """An invalid segment must reach the handler and fail its allowlist check."""
+        with (
+            patch("cli_agent_orchestrator.services.agent_scaffold.list_templates") as mock_list,
+            patch("cli_agent_orchestrator.services.agent_scaffold.get_template_schema") as mock_get,
+        ):
+            response = client.get("/agents/profiles/templates/aws/b@d/schema")
 
-        The scaffold service also enforces containment, so this is defence in
-        depth rather than the only control.
-        """
-        with patch(
-            "cli_agent_orchestrator.services.agent_scaffold.get_template_schema"
-        ) as mock_get:
-            response = client.get("/agents/profiles/templates/aws/../schema")
-
-        assert response.status_code in (400, 404)
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid template name: aws/b@d"
+        assert not mock_list.called
         assert not mock_get.called
 
     def test_surfaces_containment_failure_as_400(self, client) -> None:
@@ -197,7 +221,7 @@ class TestGetProfileTemplateSchemaEndpoint:
 
 
 class TestValidateProfileTemplateConfigEndpoint:
-    """Tests for POST /agents/profiles/validate."""
+    """Tests for POST /agents/profiles/templates/validate."""
 
     def test_valid_config_reports_no_errors(self, client) -> None:
         """An empty error list from the service means the config is valid."""
@@ -206,7 +230,7 @@ class TestValidateProfileTemplateConfigEndpoint:
             return_value=[],
         ) as mock_validate:
             response = client.post(
-                "/agents/profiles/validate",
+                "/agents/profiles/templates/validate",
                 json={"template": "aws/stepfunction", "config": {"queue_url": "https://q"}},
             )
 
@@ -221,7 +245,7 @@ class TestValidateProfileTemplateConfigEndpoint:
             return_value=["queue_url: 'x' is not a 'uri'"],
         ):
             response = client.post(
-                "/agents/profiles/validate",
+                "/agents/profiles/templates/validate",
                 json={"template": "aws/stepfunction", "config": {"queue_url": "x"}},
             )
 
@@ -235,7 +259,7 @@ class TestValidateProfileTemplateConfigEndpoint:
             "cli_agent_orchestrator.services.agent_scaffold.validate_config"
         ) as mock_validate:
             response = client.post(
-                "/agents/profiles/validate",
+                "/agents/profiles/templates/validate",
                 json={"template": "../../etc/passwd", "config": {}},
             )
 
@@ -245,7 +269,7 @@ class TestValidateProfileTemplateConfigEndpoint:
     def test_rejects_single_segment_template_name(self, client) -> None:
         """Template identifiers are ``category/name``; a bare name is invalid."""
         response = client.post(
-            "/agents/profiles/validate",
+            "/agents/profiles/templates/validate",
             json={"template": "stepfunction", "config": {}},
         )
 
@@ -257,7 +281,7 @@ class TestValidateProfileTemplateConfigEndpoint:
             "cli_agent_orchestrator.services.agent_scaffold.validate_config"
         ) as mock_validate:
             response = client.post(
-                "/agents/profiles/validate",
+                "/agents/profiles/templates/validate",
                 json={"template": "aws/not-in-catalog", "config": {}},
             )
 
@@ -272,7 +296,7 @@ class TestValidateProfileTemplateConfigEndpoint:
             return_value=["queue_url: 'queue_url' is a required property"],
         ) as mock_validate:
             response = client.post(
-                "/agents/profiles/validate", json={"template": "aws/stepfunction"}
+                "/agents/profiles/templates/validate", json={"template": "aws/stepfunction"}
             )
 
         assert response.status_code == 200
@@ -280,7 +304,7 @@ class TestValidateProfileTemplateConfigEndpoint:
 
 
 class TestPreviewProfileTemplateEndpoint:
-    """Tests for POST /agents/profiles/preview."""
+    """Tests for POST /agents/profiles/templates/preview."""
 
     def test_returns_rendered_content(self, client) -> None:
         """A successful render should return the markdown and echo the template."""
@@ -289,7 +313,7 @@ class TestPreviewProfileTemplateEndpoint:
             return_value="---\nname: sf\n---\nBody",
         ) as mock_render:
             response = client.post(
-                "/agents/profiles/preview",
+                "/agents/profiles/templates/preview",
                 json={"template": "aws/stepfunction", "config": {"queue_url": "https://q"}},
             )
 
@@ -307,7 +331,7 @@ class TestPreviewProfileTemplateEndpoint:
             side_effect=ValueError("Config validation failed for 'aws/stepfunction'"),
         ):
             response = client.post(
-                "/agents/profiles/preview",
+                "/agents/profiles/templates/preview",
                 json={"template": "aws/stepfunction", "config": {}},
             )
 
@@ -321,7 +345,7 @@ class TestPreviewProfileTemplateEndpoint:
             side_effect=FileNotFoundError("Template 'aws/nope' not found"),
         ):
             response = client.post(
-                "/agents/profiles/preview",
+                "/agents/profiles/templates/preview",
                 json={"template": "aws/nope", "config": {}},
             )
 
@@ -332,7 +356,7 @@ class TestPreviewProfileTemplateEndpoint:
         """Traversal in the body field must not reach the render service."""
         with patch("cli_agent_orchestrator.services.agent_scaffold.render_template") as mock_render:
             response = client.post(
-                "/agents/profiles/preview",
+                "/agents/profiles/templates/preview",
                 json={"template": "aws/../../etc", "config": {}},
             )
 

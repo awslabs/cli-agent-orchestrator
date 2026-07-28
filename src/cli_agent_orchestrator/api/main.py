@@ -499,6 +499,13 @@ class TemplateConfigRequest(BaseModel):
     )
 
 
+class TemplateSummary(BaseModel):
+    """Public template metadata. Excludes the internal filesystem path."""
+
+    name: str
+    description: str
+
+
 class ValidateTemplateConfigResponse(BaseModel):
     """Outcome of validating a config against a template's JSON-Schema."""
 
@@ -1581,12 +1588,18 @@ async def search_agent_profiles_endpoint(
 
 
 @app.get("/agents/profiles/templates")
-async def list_profile_templates_endpoint() -> List[Dict]:
-    """List the scaffold templates available for profile creation."""
+async def list_profile_templates_endpoint() -> List[TemplateSummary]:
+    """List public scaffold-template metadata for profile creation."""
     from cli_agent_orchestrator.services.agent_scaffold import list_templates
 
     try:
-        return list_templates()
+        return [
+            TemplateSummary(
+                name=template["name"],
+                description=template.get("description", ""),
+            )
+            for template in list_templates()
+        ]
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1626,7 +1639,7 @@ async def get_profile_template_schema_endpoint(category: str, name: str) -> Dict
     return schema
 
 
-@app.post("/agents/profiles/validate")
+@app.post("/agents/profiles/templates/validate")
 async def validate_profile_template_config_endpoint(
     request: TemplateConfigRequest,
 ) -> ValidateTemplateConfigResponse:
@@ -1648,13 +1661,13 @@ async def validate_profile_template_config_endpoint(
     return ValidateTemplateConfigResponse(valid=not errors, errors=errors)
 
 
-@app.post("/agents/profiles/preview")
+@app.post("/agents/profiles/templates/preview")
 async def preview_profile_template_endpoint(
     request: TemplateConfigRequest,
 ) -> PreviewTemplateResponse:
     """Render a template to markdown and return it. Writes nothing.
 
-    Same non-mutating rationale as ``/validate``: rendering is a pure function of
+    Same non-mutating rationale as template validation: rendering is a pure function of
     the template and the supplied config. ``render_template`` validates the
     config first, so an invalid config returns 400 rather than partial output.
     """
