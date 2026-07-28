@@ -3,7 +3,9 @@
 Status: canonical execution specification (supersedes the initial design
 brief, reconciled against the deployed source on 2026-07-28; scope addendum
 integrated per steers `root-image-composer-addendum-steer-001` and
-`root-image-screenshot-path-steer-001`)
+`root-image-screenshot-path-steer-001`; kimi staged-path image delivery
+revised from live proof on pinned 0.29.2 in round
+`native-tui-console/spec-kimi-staged-path-r3`)
 
 Task ID: `native-tui-console/spec-initial-v1`
 
@@ -338,7 +340,8 @@ reopen settled ground by accident.
   only faithful delivery mechanism available to a tmux-keystroke server is a
   validated file staged on disk whose path is delivered as text per the
   provider's documented contract (§8.4). A provider/build without evidence
-  for an image mechanism is refused honestly (kimi 0.29.x, §8.4).
+  for an image mechanism is refused honestly; the pinned kimi 0.29.2
+  staged-path mechanism is live-proven (§8.2, §8.4, §10.6).
 
 ## 3. The versioned shared event contract
 
@@ -873,10 +876,16 @@ draft will use (§8.5). Control-input is **not** enlarged (D11).
   with its tools. Anthropic API limits: JPEG/PNG/GIF/WebP, ≤ 5 MB per image,
   ≤ 8000×8000 px (Appendix A.9). No CLI-level format/size documentation —
   CAO pins its own limits (§8.3).
-- **kimi_cli (pinned 0.29.x): no image support exists.** Image input was
-  added upstream in kimi-cli 0.43 ("Support image input if the LLM model
-  supports it", Appendix A.10) — after the pinned range. Image attachments
-  for kimi must be refused with that exact explanation (OD7). Long/multi-line
+- **kimi_cli (pinned 0.29.x): staged-path image delivery is live-proven on
+  0.29.2.** A disposable native Kimi Code 0.29.2 session, handed ordinary
+  composer text naming an absolute staged PNG path, invoked the provider's
+  own `ReadMediaFile` tool on that exact file and reported the known visual
+  fact correctly (round-3 acceptance, §10.6). The earlier inference that
+  pinned kimi has no image support came from the *predecessor* kimi-cli
+  changelog's 0.43 clipboard-paste entry (Appendix A.10) — paste-UI history,
+  not this build's staged-path capability — and is superseded by the live
+  evidence. Clipboard image *paste* into the kimi TUI remains unproven and
+  refused; non-PNG formats remain unproven and refused (F9). Long/multi-line
   *text* messages remain deliverable via the adapter's build-proven composer
   newline plan (§1.4).
 - **codex:** no native-TUI managed path exists on this base (§1.4), so codex
@@ -936,7 +945,7 @@ same discipline as control-input, different operation:
 | Provider (pinned build) | Long/multi-line text | Image attachments |
 |---|---|---|
 | `claude_code` 2.1.220 | adapter composer plan (proven C-j newline) | staged path inserted as text per documented flow; live acceptance required (§10.6) |
-| `kimi_cli` 0.29.x | adapter composer plan (proven C-j newline) | **refused — `attachment-type-unsupported` / `provider-unsupported`** with "pinned kimi 0.29.x has no image input (added upstream in 0.43)" (OD7) |
+| `kimi_cli` 0.29.x | adapter composer plan (proven C-j newline) | **supported — staged-path-text via provider `ReadMediaFile`**: staged absolute path inserted at the token position; PNG proven by live acceptance on pinned 0.29.2 (§10.6); other formats refused as unproven (F9) |
 | all others | refused `provider-unsupported` | refused `provider-unsupported` |
 
 ### 8.5 Composer routing rule (the honest-UX half of F8)
@@ -948,8 +957,9 @@ One composer, two explicitly-labeled operations — never implicit magic:
 - Draft has **attachments, is multi-line, or is > 512 bytes** → Send uses
   the operator-message path (§8.3). If the provider does not advertise
   `operator_message`, Send is disabled with the reason. If attachments are
-  present for an image-unsupported provider, the inline error names the
-  provider limitation (e.g., kimi 0.29.x, OD7).
+  present for an image-unsupported provider (any provider without a registry
+  `image` block, or a format outside the advertised `image.formats` — e.g.
+  non-PNG for kimi), the inline error names the provider limitation.
 - The status line always names the path the current draft will take
   ("control input — short command" / "operator message — 1.2 KB, 1 image" /
   "operator message unavailable for this provider"), with a live byte
@@ -968,8 +978,12 @@ One composer, two explicitly-labeled operations — never implicit magic:
 ```
 
 kimi_cli advertises `"operator_message": {…, "multiline": true}` with
-`"image": { "supported": false, "reason": "pinned kimi 0.29.x has no image
-input (added upstream in 0.43)" }`. Absent blocks (old server) → the
+`"image": { "supported": true, "formats": ["png"], "max_bytes": 5242880,
+"max_width": 8000, "max_height": 8000, "mechanism": "staged-path-text",
+"reference_template": "{path}", "evidence": "live acceptance on pinned
+0.29.2 (§10.6)" }` — PNG only, because PNG is the format the live proof
+covers; every other format is refused as unproven rather than assumed (F9).
+Absent blocks (old server) → the
 dashboard hides the attachment button and routes over-limit drafts to a
 disabled Send with explanation (D9).
 
@@ -1011,12 +1025,13 @@ disabled Send with explanation (D9).
   refusal, lease contention with a concurrent control-input write
   (`pane-busy`), never-resend after a lost response.
 - Component (vitest): chip strip states, token/chip linkage, routing-rule
-  status line, paste and picker flows, kimi refusal messaging, old-server
-  degradation (hidden button).
+  status line, paste and picker flows, unproven-format refusal messaging
+  (e.g. non-PNG for kimi), old-server degradation (hidden button).
 - Live provider (installed, §10.6): claude_code native session receives a
-  staged PNG reference and the model can read the file; kimi pinned build
-  refuses attachments with the pinned message and still accepts a >512-byte
-  text-only message via the plan.
+  staged PNG reference and the model can read the file; kimi native session
+  receives a staged PNG reference via the operator-message path (upstream
+  capability already proven, §10.6) and refuses non-PNG formats with the
+  unproven-format explanation.
 - Browser/visual QA (Playwright, §10.5): desktop 1280×800 and mobile
   390×844 against the §0 baseline — chip strip, wrap behavior, terminal
   height rule, streaming-off/on scrolling unaffected; screenshots in the PR.
@@ -1153,9 +1168,21 @@ zero serious violations.
 - Disposable **Claude** native-TUI session: staged PNG submitted via the
   operator-message path; transcript observation confirms the path reference
   reached the composer and the provider can read the staged file.
-- Disposable **Kimi** native-TUI session (pinned 0.29.x): attachment submit
-  refused with the pinned explanation; a >512-byte multi-line text-only
-  message delivered via the proven composer plan.
+- Disposable **Kimi** native-TUI session (pinned 0.29.x): staged PNG
+  submitted via the operator-message path; transcript observation confirms
+  the path reference reached the composer and the provider's `ReadMediaFile`
+  reads the staged file correctly. **Upstream capability already proven
+  (2026-07-28, round 3):** a disposable native Kimi Code 0.29.2 session
+  (session `session_4eea95f9-2873-4be9-920c-24566f6e37f6`, model K3) was
+  handed ordinary composer text naming the absolute staged fixture path
+  (120×80 PNG, 213 B, sha256 `02f597dc…bdd49`, left half red / right half
+  blue by construction); the transcript shows `Used ReadMediaFile
+  (…/.conductor/reports/r3/stripe-fixture.png) · image (image/png, 213 B)`
+  and the correct observation "red on the left half and blue on the right
+  half" (artifacts: `.conductor/reports/r3/transcript-initial.txt`,
+  `transcript-final.txt`, fixture `stripe-fixture.png`). What remains for
+  Lane C is the *server-path* acceptance above (operator-message operation +
+  token substitution), not the upstream capability.
 - At-most-once drill: killed response mid-submit → reconcile by
   `operation_id` → no duplicate provider submission.
 
@@ -1210,7 +1237,8 @@ jobs with the two projects of §10.5.
   state the browser/terminal/provider cannot distinguish; shell-script
   macros; cloud sync of macros; hard-coded dashboard copies of provider
   menus; clipboard-injection image delivery (impossible by construction,
-  §8.2); kimi image support on pinned 0.29.x (upstream feature gap, OD7).
+  §8.2); kimi clipboard-paste image delivery and non-PNG kimi formats
+  (unproven on the pinned build — refused, F9).
 
 ## 13. Unresolved decisions (flagged for product/supervisor)
 
@@ -1246,12 +1274,15 @@ jobs with the two projects of §10.5.
   than a third journal. If review prefers a dedicated operator-message
   journal mirroring `control_input_journal`, that is a contained Lane C
   change — flagged so the choice is conscious.
-- **OD7 — kimi 0.29.x image refusal.** The pinned kimi builds predate
-  upstream image input (0.43, Appendix A.10), so Lane C refuses image
-  attachments for kimi with that explanation. Delivering kimi images would
-  require a provider-version re-pin with fresh composer evidence — a
-  separate track. **Confirm** this refusal is the desired product behavior
-  for the current pins.
+- **OD7 — RESOLVED by live evidence (round 3, 2026-07-28).** The earlier
+  refusal plan rested on an inference from the predecessor kimi-cli
+  changelog's 0.43 clipboard-paste entry. The pinned Kimi Code 0.29.2 build
+  in fact delivers staged-path images: a disposable native session invoked
+  the provider's own `ReadMediaFile` on a staged absolute PNG path and
+  observed the known visual fact correctly (§8.2, §10.6). The spec therefore
+  supports pinned kimi staged-path image delivery (PNG only). Retained
+  honesty: clipboard-paste delivery stays unproven/refused, non-PNG formats
+  stay refused (F9), and any future build drift re-verified by §10.6.
 - **OD8 — Message text limit.** 8192 bytes is a spec pin, not a measured
   provider limit (no provider documents one). Lane C live acceptance may
   lower it per evidence; raising it requires re-review.
@@ -1318,7 +1349,8 @@ jobs with the two projects of §10.5.
 A reviewer can verify this spec by: (1) checking §0 pins against the repo;
 (2) spot-checking §1 file:line claims (all verified at the base SHA);
 (3) confirming §3.2's byte claims and §8.2's provider claims against
-Appendix A primary sources; (4) walking one P1 sequence (`text("/model")
+Appendix A primary sources plus the round-3 live kimi artifacts referenced
+in §10.6; (4) walking one P1 sequence (`text("/model")
 enter up*3 enter`) and one Lane C submission (PNG + 1 KB text to claude)
 through §3/§4/§8/§10 end-to-end; (5) confirming no section introduces a
 write path outside §1.2's and §8.3's routes. The decisions most likely to
@@ -1338,5 +1370,5 @@ alternative and rejection reason.
 - **A.7 Accessibility:** [WCAG 2.2](https://www.w3.org/TR/WCAG22/) — SC 2.5.8 Target Size (Minimum) 24×24 CSS px; SC 1.4.3 Contrast (Minimum) 4.5:1. Apple HIG 44×44 pt touch target as the design goal.
 - **A.8 Kimi arrow-key menus (supporting):** [Kimi CLI slash commands](https://moonshotai.github.io/kimi-cli/en/reference/slash-commands.html) — "Use arrow keys to select …, press Enter to confirm" (session selector; model/reasoning selectors verified live in §10.3).
 - **A.9 Claude Code images:** [Claude Code common workflows — Work with images](https://code.claude.com/docs/en/common-workflows) — "Drag and drop an image … paste it into the CLI with Ctrl+V … Provide an image path to Claude. E.g., 'Analyze this image: /path/to/your/image.png'"; [interactive mode](https://code.claude.com/docs/en/interactive-mode) — paste "Inserts an `[Image #N]` chip at the cursor". Limits: [Anthropic vision docs](https://docs.claude.com/en/docs/build-with-claude/vision) — "JPEG, PNG, GIF, or WebP", "Maximum 5MB per image", larger than 8000×8000 rejected (API-level; no CLI-level limits documented). App-side clipboard capture corroborated by [anthropics/claude-code#43942](https://github.com/anthropics/claude-code/issues/43942).
-- **A.10 Kimi image support by version:** [kimi-cli changelog](https://moonshotai.github.io/kimi-cli/en/release-notes/changelog.html) — 0.43 "Support image input if the LLM model supports it" (first image entry; **pinned 0.29.x predates it**), 0.83 `ReadMediaFile` tool, 0.85 "Cache pasted images to disk", 1.41.0 xclip/wl-paste headless fallback; [interaction guide](https://moonshotai.github.io/kimi-cli/en/guides/interaction.html) — "`Ctrl-V` to paste text, images, or video files … cached to disk and displayed as an `[image:…]` placeholder". No format/size limits documented.
+- **A.10 Kimi image support by version:** [kimi-cli changelog](https://moonshotai.github.io/kimi-cli/en/release-notes/changelog.html) — 0.43 "Support image input if the LLM model supports it" (first *clipboard-paste* entry), 0.83 `ReadMediaFile` tool, 0.85 "Cache pasted images to disk", 1.41.0 xclip/wl-paste headless fallback; [interaction guide](https://moonshotai.github.io/kimi-cli/en/guides/interaction.html) — "`Ctrl-V` to paste text, images, or video files … cached to disk and displayed as an `[image:…]` placeholder". No format/size limits documented. **Note (round 3):** these entries describe the predecessor kimi-cli's paste UI; they do not bound the pinned Kimi Code 0.29.2 build, whose staged-path image capability is proven live in §10.6 — the round-1 inference from this changelog was superseded by that evidence.
 - **A.11 Codex images (recorded for the future codex track):** [Codex CLI docs](https://developers.openai.com/codex/cli/) — "`codex --image` … or paste an image into the interactive composer"; [CLI reference](https://developers.openai.com/codex/cli/reference) — "`--image, -i | path[,path...]`"; composer renders `[Image #N]` placeholders and auto-attaches pasted image paths (source: `chat_composer.rs`, paste-handler only — typed paths unverified). Codex has no managed native-TUI path on this base (§1.4).
