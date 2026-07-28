@@ -1323,6 +1323,38 @@ class TestCommandClassOverTheWire:
         assert looked_up["outcome"] == AMBIGUOUS
         assert looked_up["reason_code"] == "submission-unproven"
 
+    def test_a_late_signal_closes_ambiguous_over_the_wire_with_no_second_write(
+        self, client, monkeypatch
+    ):
+        """The steer-041 boundary over HTTP: a submitted observation that
+        completes after the write deadline is unproven evidence — the
+        close is the terminal ambiguity, and the exact-id replay never
+        writes again."""
+        import time as _time
+
+        from cli_agent_orchestrator.services.control_input_contract import SUBMISSION_SUBMITTED
+
+        monkeypatch.setattr(service, "WRITE_DEADLINE_SECONDS", 0.2)
+
+        def _late_submitted(*args, **kwargs):
+            _time.sleep(0.4)
+            return (SUBMISSION_SUBMITTED, "capture-pane:%17:late:sha256:1afe")
+
+        tmux_client, adapter = self._wire_managed_kimi(monkeypatch, empty=True)
+        monkeypatch.setattr(native_pane_input, "observe_command_execution", _late_submitted)
+        events = [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
+        response = _post(client, text=None, events=events, payload_class="command")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["outcome"] == AMBIGUOUS
+        assert body["reason_code"] == "submission-unproven"
+        # No accepted record carries the after-deadline evidence.
+        assert body["outcome"] != ACCEPTED
+        looked_up = client.get(f"/control-input/{CONTROL}").json()
+        assert looked_up["outcome"] == AMBIGUOUS
+        assert looked_up["reason_code"] == "submission-unproven"
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+
     def test_a_declared_compact_against_a_nonempty_composer_is_the_typed_refusal(
         self, client, monkeypatch
     ):

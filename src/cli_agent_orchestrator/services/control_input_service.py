@@ -3760,6 +3760,13 @@ def _send_sequence_through_native_adapter(
             baseline_rows=baseline_rows,
             deadline_monotonic=deadline_monotonic,
         )
+        if observed == SUBMISSION_SUBMITTED and time.monotonic() > deadline_monotonic:
+            # Defence at the one place acceptance is decided: the bounded
+            # window has closed, so a signal from a capture that completed
+            # after it is unproven evidence, whatever the helper returned —
+            # no future helper can leak a late signal into an accepted
+            # close on this path.
+            observed, evidence_ref = SUBMISSION_UNKNOWN, None
         if observed != SUBMISSION_SUBMITTED:
             return _ambiguous(
                 f"the declared command {command_text!r} was written, but its execution "
@@ -4114,6 +4121,13 @@ def _send_sequence_through_literal_sink(
             baseline_rows=baseline_rows,
             deadline_monotonic=deadline_monotonic,
         )
+        if observed == SUBMISSION_SUBMITTED and time.monotonic() > deadline_monotonic:
+            # Defence at the one place acceptance is decided: the bounded
+            # window has closed, so a signal from a capture that completed
+            # after it is unproven evidence, whatever the helper returned —
+            # no future helper can leak a late signal into an accepted
+            # close on this path.
+            observed, evidence_ref = SUBMISSION_UNKNOWN, None
         if observed != SUBMISSION_SUBMITTED:
             return _ambiguous(
                 f"the declared command {command_text!r} was written, but its execution "

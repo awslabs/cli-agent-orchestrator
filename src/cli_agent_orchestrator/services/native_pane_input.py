@@ -1140,7 +1140,15 @@ def observe_command_execution(
                 rows = None
         if rows is not None:
             last_rows = rows
-            if _execution_signal_count(pin, rows, command_text) > baseline_count:
+            # The deadline boundary is authoritative *after* the capture
+            # returns: the capture timeout is floored, so a capture begun
+            # just before expiry can complete after it, and a signal seen
+            # only then was never proven inside the bounded window.  Only
+            # an on-time capture may close ``submitted``; a late one can
+            # still inform the resting-text check below, which never
+            # licenses acceptance.
+            on_time = deadline_monotonic is None or time.monotonic() <= deadline_monotonic
+            if on_time and _execution_signal_count(pin, rows, command_text) > baseline_count:
                 return (SUBMISSION_SUBMITTED, submission_evidence_ref(pane_id, rows))
         if deadline_monotonic is None or time.monotonic() >= deadline_monotonic:
             break

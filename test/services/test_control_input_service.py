@@ -3108,6 +3108,41 @@ class TestCommandTwoClose:
         assert looked_up.submission_observed == "submitted"
         assert looked_up.submission_evidence_ref == "capture-pane:%17:t3:sha256:d00d"
 
+    def test_a_late_signal_never_closes_accepted_on_the_send_path(self, monkeypatch, journal):
+        """The caller-side deadline defense (steer-041): the helper hands
+        back a submitted observation *after* the write deadline — a
+        capture that completed late — and the close is still the terminal
+        ambiguity, never an accepted record carrying after-deadline
+        evidence.  Replaying by exact id writes nothing further."""
+        import time as _time
+
+        monkeypatch.setattr(service, "WRITE_DEADLINE_SECONDS", 0.2)
+
+        def _late_submitted(*args, **kwargs):
+            _time.sleep(0.4)
+            return (SUBMISSION_SUBMITTED, "capture-pane:%17:late:sha256:1afe")
+
+        harness = TestCommandClassGuard()
+        resolved = _seq_resolved(provider_version="0.29.2")
+        adapter = _FakeSequenceAdapter()
+        harness._wire(monkeypatch, resolved, adapter, {0: {"lines": ["/compact"]}}, empty=True)
+        monkeypatch.setattr(native_pane_input, "observe_command_execution", _late_submitted)
+        result = _deliver_declared(journal)
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        assert result.submission_observed == "unknown"
+        # No accepted record exists: the journal never reached delivered,
+        # so nothing carries the after-deadline evidence ref.
+        record = journal.find(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        assert record.submission_evidence_ref != "capture-pane:%17:late:sha256:1afe"
+        looked_up = service.lookup_control_input(CONTROL, journal=journal)
+        assert looked_up.outcome == AMBIGUOUS
+        assert looked_up.reason_code == "submission-unproven"
+        # One composer plan execution total — the exact-id reconcile
+        # answered from the record and never wrote again.
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+
 
 class TestPaneBusyDetailDiscriminators:
     """The three pane-busy detail strings, verbatim and pairwise-disjoint

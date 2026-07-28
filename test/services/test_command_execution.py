@@ -230,3 +230,88 @@ class TestObserveCommandExecution:
         )
         assert observed == SUBMISSION_SUBMITTED
         assert ref
+
+
+class TestTheDeadlineBoundaryIsAuthoritative:
+    """The r11 bounded window: a capture completing after the deadline
+    proves nothing, and its signal can never close accepted — even when
+    it shows a brand-new occurrence."""
+
+    def test_a_late_capture_with_a_new_signal_never_closes_submitted(self):
+        import time
+
+        pin = npi.command_execution_pin_for("kimi_cli", "0.29.2")
+        composer = npi.composer_emptiness_pin_for("kimi_cli", "0.29.2")
+        deadline = time.monotonic() + 0.05
+
+        def late_capture():
+            # The floored capture timeout lets a capture begun just before
+            # expiry return after it; the boundary must reject the signal.
+            time.sleep(0.15)
+            return _kimi_screen([_KIMI_NOTICE])
+
+        observed, ref = npi.observe_command_execution(
+            "%1",
+            pin,
+            command_text="/compact",
+            composer_pin=composer,
+            baseline_rows=_kimi_screen([]),
+            deadline_monotonic=deadline,
+            screen=late_capture,
+        )
+        assert observed != SUBMISSION_SUBMITTED
+
+    def test_a_signal_seen_only_after_expiry_closes_unknown(self):
+        import time
+
+        pin = npi.command_execution_pin_for("kimi_cli", "0.29.2")
+        composer = npi.composer_emptiness_pin_for("kimi_cli", "0.29.2")
+        deadline = time.monotonic() + 0.05
+
+        def late_capture():
+            time.sleep(0.15)
+            return _kimi_screen([_KIMI_NOTICE])
+
+        observed, ref = npi.observe_command_execution(
+            "%1",
+            pin,
+            command_text="/compact",
+            composer_pin=composer,
+            baseline_rows=_kimi_screen([]),
+            deadline_monotonic=deadline,
+            screen=late_capture,
+        )
+        # The composer is empty in the late capture (no resting text), so
+        # the close is unknown — never the late signal, and no evidence.
+        assert observed == SUBMISSION_UNKNOWN
+        assert ref is None
+
+    def test_a_late_capture_still_informs_the_resting_text_check(self):
+        """A late capture never accepts, but the resting-text fact it
+        carries may still be recorded honestly as unsubmitted (an
+        ambiguous close either way — it licenses nothing)."""
+        import time
+
+        pin = npi.command_execution_pin_for("kimi_cli", "0.29.2")
+        composer = npi.composer_emptiness_pin_for("kimi_cli", "0.29.2")
+        deadline = time.monotonic() + 0.05
+
+        def late_capture():
+            time.sleep(0.15)
+            rows = _kimi_screen([_KIMI_NOTICE])
+            rows[4] = (
+                " │ > /compact                                                                                     │"
+            )
+            return rows
+
+        observed, ref = npi.observe_command_execution(
+            "%1",
+            pin,
+            command_text="/compact",
+            composer_pin=composer,
+            baseline_rows=_kimi_screen([]),
+            deadline_monotonic=deadline,
+            screen=late_capture,
+        )
+        assert observed == SUBMISSION_UNSUBMITTED
+        assert ref is not None
