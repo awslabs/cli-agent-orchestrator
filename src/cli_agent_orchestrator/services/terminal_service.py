@@ -63,6 +63,7 @@ from cli_agent_orchestrator.services.session_env import (
     set_session_env,
 )
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
@@ -73,6 +74,15 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Upper bound (bytes) on a single offset-ranged read of a terminal log
+# (U5 / #504, BR-2). ``read_output_range`` clamps its ``length`` to this so a
+# caller (playback fetching output around a selected event) can never trigger
+# an unbounded read of a large log file. 1 MiB is a defensible ceiling: it is
+# far larger than any realistic per-event output window (the rolling
+# STATE_BUFFER_MAX is only 8 KiB) yet bounds the worst-case allocation and
+# response size to a fixed, predictable amount regardless of on-disk log size.
+TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
 
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
@@ -1250,6 +1260,91 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     except Exception as e:
         logger.error(f"Failed to get output from terminal {terminal_id}: {e}")
         raise
+
+
+def read_output_range(terminal_id: str, offset: int, length: int) -> str:
+    """Read a byte range from a terminal's append-only on-disk log (U5 / #504).
+
+    This is a SEPARATE read path from ``get_output``: that function returns the
+    bounded rolling buffer / tmux tail, whereas this reads an exact byte window
+    from ``TERMINAL_LOG_DIR / f"{terminal_id}.log"`` — the append-only,
+    monotonic file LogWriter maintains (BR-1). Playback (FR-4.3 / FR-7.3) uses
+    the ``terminal_offset_start`` / ``terminal_offset_len`` an event carries to
+    fetch exactly the output produced around that event, without copying the
+    log into the journal (BR-3).
+
+    Args:
+        terminal_id: The terminal whose log to read. Validated against the
+            workflow name/id charset before it is joined into the log path, so
+            a value containing ``/`` / ``..`` / a NUL can never escape
+            ``TERMINAL_LOG_DIR`` (path-traversal defense; reuses
+            ``_validate_key_part``).
+        offset: Byte offset to seek to. Must be ``>= 0``. An offset at or beyond
+            EOF is not an error — the read simply returns the available tail
+            (empty string when nothing follows the offset) so playback degrades
+            gracefully (BR-4).
+        length: Maximum number of bytes to read. Clamped to
+            ``TERMINAL_RANGE_MAX_LENGTH`` (BR-2) to bound the read.
+
+    Returns:
+        The decoded slice, ``bytes.decode("utf-8", errors="replace")`` so a
+        range that starts or ends mid-multibyte-sequence never raises (BR-5,
+        matching LogWriter's write encoding). Returns ``""`` for a valid
+        terminal whose log does not exist yet (nothing has been logged) — a
+        missing log is NOT a playback-breaking error (BR-4).
+
+    Raises:
+        ValueError: ``terminal_id`` fails id validation, or ``offset`` is
+            negative. Translated to a 400 at the request boundary.
+        OSError: A genuine file I/O failure (e.g. a permission error, or the
+            path exists but is unreadable). Surfaced to the caller, NOT
+            swallowed into an empty string — "nothing logged yet" (return "")
+            and "the read failed" (raise) are deliberately distinct outcomes
+            (BR-4 / construction error-handling guardrail).
+    """
+    # Path-traversal defense: reject any id that is not a plain key BEFORE it is
+    # joined into the log path. Reuses the workflow key/id validator so the
+    # charset rule is defined once (rejects "/", "..", ".", NUL, whitespace).
+    _validate_key_part(terminal_id, "terminal_id")
+
+    if offset < 0:
+        raise ValueError(f"offset must be >= 0, got {offset}")
+
+    # Clamp the read window (BR-2). A non-positive length reads nothing rather
+    # than raising — the route enforces length >= 1, so this is defense in depth.
+    capped_length = max(0, min(length, TERMINAL_RANGE_MAX_LENGTH))
+
+    log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(offset)  # seeking past EOF is legal; the read below yields b""
+            data = f.read(capped_length)
+    except FileNotFoundError:
+        # Valid terminal that has not logged anything yet (or whose log has been
+        # cleaned up): an empty range, never an error (BR-4).
+        logger.debug(
+            "read_output_range: no log file for terminal %s (offset=%d, length=%d) — "
+            "returning empty range",
+            terminal_id,
+            offset,
+            capped_length,
+        )
+        return ""
+    except OSError as e:
+        # A genuine I/O failure (permission, etc.) is NOT the same as "nothing
+        # logged" — surface it rather than masking a real fault as empty output.
+        logger.error(
+            "read_output_range: I/O error reading log for terminal %s "
+            "(offset=%d, length=%d): %s",
+            terminal_id,
+            offset,
+            capped_length,
+            e,
+        )
+        raise
+
+    return data.decode("utf-8", errors="replace")
 
 
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
