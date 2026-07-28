@@ -1,0 +1,55 @@
+{
+  "chord": null,
+  "chord_attempted": null,
+  "chord_sent": null,
+  "chunks_sent": null,
+  "control_id": "ctl-8d268f3814",
+  "detail": "the composer holds content; a declared command submitted now would concatenate with the queued prefill and deliver as ordinary prompt text. Zero command bytes were written and the prefill is untouched \u2014 submit or clear it as the operator, then retry the command",
+  "enter_attempted": null,
+  "enter_sent": false,
+  "events": [
+    {
+      "ordinal": 0,
+      "outcome": "refused",
+      "text": "/compact",
+      "type": "text"
+    },
+    {
+      "key": "Enter",
+      "ordinal": 1,
+      "outcome": "refused",
+      "type": "key"
+    }
+  ],
+  "in_flight": false,
+  "outcome": "refused",
+  "protocol": "cao-control-input-v1",
+  "reason_code": "composer-nonempty",
+  "reattemptable": true,
+  "request_digest": "945dc6591d28343d4d013c9d3e9392bf0582f027d1b28fc280a119349d671605",
+  "request_schema_version": 4,
+  "resolved_identity": {
+    "execution_mode": "native_tui",
+    "native_session_id": "session_45bade86-9308-4196-a166-d3e19ca6740c",
+    "pane": {
+      "bound_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "dead": false,
+      "observed_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "pane_id": "%2",
+      "pane_pid": 27613,
+      "window_id": "@2"
+    },
+    "pane_birth_id": "%2",
+    "provider": "kimi_cli",
+    "provider_process_id": "27613@Tue Jul 28 13:10:52 2026",
+    "session_name": "cao-a103-kimi-507f32",
+    "terminal_generation": "9955f723-ab02-440f-9ae8-78e0b28ca41d",
+    "terminal_id": "321548ff",
+    "terminal_incarnation": null
+  },
+  "state": "refused",
+  "submission_evidence_ref": null,
+  "submission_observed": null,
+  "terminal_id": "321548ff",
+  "text_sent": false
+}

@@ -119,6 +119,7 @@ from cli_agent_orchestrator.services import (
     companion_receipts,
     control_input_service,
     flow_service,
+    macro_notation,
     managed_launch,
     managed_launch_v2,
     secret_gate,
@@ -506,6 +507,15 @@ class ControlInputRequest(BaseModel):
     # parser must never silently drop a v3 payload and deliver the request
     # as something else.  Never combined with the v1/v2 fields.
     events: Optional[List[Dict[str, Any]]] = None
+    # v4 only: the optional command-class declaration carrier
+    # (``payload_class: "command"``).  Declared as ``Any`` on purpose: a
+    # non-string value must reach the service, which answers with the
+    # *typed* zero-write ``malformed-command-declaration`` refusal, rather
+    # than dying as an untyped pydantic 422.  An explicit null is the
+    # absent declaration (prose), exactly as ``chord`` treats null.  Never
+    # combined with the v1/v2 fields; command-class is declared only by
+    # this field, never derived from payload shape.
+    payload_class: Optional[Any] = None
     # Bounded on purpose.  An unbounded wait converts a truthful
     # "the pane is busy, nothing was written, try again" into a request
     # that may never answer.
@@ -2844,9 +2854,44 @@ async def get_terminal_control_identity(
     # The discovery block (§3): a conductor that needs v2 reads this before
     # sending a chord, so a v2 request against a v1-only server fails closed
     # with typed ``unsupported`` and zero bytes rather than silently
-    # delivering text without the chord.
-    body["control_input"] = control_input_service.control_input_capability_block()
+    # delivering text without the chord.  The resolved identity is passed so
+    # the block carries this terminal's build-exact provider controls (the
+    # §3.5 send authority) and its composer-guard availability (§4.1).
+    body["control_input"] = control_input_service.control_input_capability_block(resolved)
     return body
+
+
+class ParseNotationRequest(BaseModel):
+    """One macro notation string to resolve through the pinned grammar."""
+
+    notation: str
+
+
+@app.post("/macros/parse-notation")
+async def parse_macro_notation(
+    body: ParseNotationRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """The server-authoritative macro-notation parse (§5.3).
+
+    The one authority for the notation grammar — Lane B's TypeScript
+    preview is tested against the same golden vectors so the two cannot
+    drift into spelling the same macro two ways.  Answers the resolved v3
+    event array and its canonical preview, or ``422`` with the parse
+    errors (each carrying a 0-based offset and a message).  This route
+    only parses: it persists nothing and writes nothing to any pane.
+    """
+    result = macro_notation.parse_notation(body.notation)
+    if result.errors:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "errors": [
+                    {"offset": error.offset, "message": error.message} for error in result.errors
+                ]
+            },
+        )
+    return JSONResponse(content={"events": result.events, "preview": result.preview})
 
 
 def _stated_enter(body: ControlInputRequest) -> Any:
@@ -2895,6 +2940,7 @@ async def send_terminal_control_input(
                 protocol=body.protocol,
                 chord=body.chord,
                 events=body.events,
+                payload_class=body.payload_class,
                 lease_timeout=body.lease_timeout,
             )
         )
@@ -3903,6 +3949,37 @@ def _web_terminal_input_bytes(
     return data.encode()
 
 
+# The resize frame is accepted viewer geometry, not pane input (§6.6): it
+# reflows the bound TUI and carries no keystroke content.  Dimensions are
+# clamped to a sane bound (positive, at most 500 columns by 200 rows) so a
+# wild value cannot balloon the pty, and a non-integer dimension rejects
+# the frame with a typed close reason instead of tearing the viewer
+# websocket down on a struct.pack TypeError.
+_WS_RESIZE_MAX_COLS = 500
+_WS_RESIZE_MAX_ROWS = 200
+_WS_CLOSE_RESIZE_MALFORMED = 4000
+
+
+def _web_resize_dimensions(payload: dict[str, Any]) -> tuple[int, int] | None:
+    """The clamped ``(rows, cols)`` of one resize frame, or None if malformed.
+
+    Absent dimensions keep the deployed defaults (24×80); a stated
+    dimension must be an integer (booleans are rejected: ``True`` is not
+    a size), and integers are clamped into the bound rather than
+    rejected, because an over-large viewer is a reasonable thing to
+    satisfy at the bound.
+    """
+    rows = payload.get("rows", 24)
+    cols = payload.get("cols", 80)
+    for dimension in (rows, cols):
+        if isinstance(dimension, bool) or not isinstance(dimension, int):
+            return None
+    return (
+        max(1, min(rows, _WS_RESIZE_MAX_ROWS)),
+        max(1, min(cols, _WS_RESIZE_MAX_COLS)),
+    )
+
+
 @app.websocket("/terminals/{terminal_id}/ws")
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
@@ -4104,8 +4181,17 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                         if i + chunk_size < len(raw):
                             await asyncio.sleep(0.01)
                 elif payload.get("type") == "resize":
-                    rows = payload.get("rows", 24)
-                    cols = payload.get("cols", 80)
+                    dimensions = _web_resize_dimensions(payload)
+                    if dimensions is None:
+                        # Fail closed with a typed reason: a malformed
+                        # resize is a client bug the operator should see,
+                        # not an untyped teardown.
+                        await websocket.close(
+                            code=_WS_CLOSE_RESIZE_MALFORMED,
+                            reason="resize-malformed: rows/cols must be integers",
+                        )
+                        return
+                    rows, cols = dimensions
                     winsize_data = struct.pack("HHHH", rows, cols, 0, 0)
                     fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize_data)
                     # Explicitly notify tmux of the size change —

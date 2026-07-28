@@ -1,0 +1,12 @@
+- evidence root: <HOME>/Projects/cli-agent-orchestrator-worktrees/native-tui-console-lane-a/docs/issues/native-tui-interaction-console/evidence/lane-a-10.3
+- tmux socket: <TMUX_SOCKDIR>/server.sock
+- CAO_STATE_ROOT: <STATE_ROOT>
+- server $HOME: real operator $HOME (provider auth), CAO state isolated
+- evidence root: <HOME>/Projects/cli-agent-orchestrator-worktrees/native-tui-console-lane-a/docs/issues/native-tui-interaction-console/evidence/lane-a-10.3
+- tmux socket: <TMUX_SOCKDIR>/server.sock
+- CAO_STATE_ROOT: <STATE_ROOT>
+- server $HOME: real operator $HOME (provider auth), CAO state isolated
+- evidence root: <HOME>/Projects/cli-agent-orchestrator-worktrees/native-tui-console-lane-a/docs/issues/native-tui-interaction-console/evidence/lane-a-10.3
+- tmux socket: <TMUX_SOCKDIR>/server.sock
+- CAO_STATE_ROOT: <STATE_ROOT>
+- server $HOME: real operator $HOME (provider auth), CAO state isolated

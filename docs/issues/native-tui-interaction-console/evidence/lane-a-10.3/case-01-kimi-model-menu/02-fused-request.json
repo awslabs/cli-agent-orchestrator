@@ -1,0 +1,29 @@
+{
+  "control_id": "ctl-d0c8aa14dc",
+  "events": [
+    {
+      "text": "/model",
+      "type": "text"
+    },
+    {
+      "key": "Enter",
+      "type": "key"
+    },
+    {
+      "key": "Up",
+      "type": "key"
+    },
+    {
+      "key": "Up",
+      "type": "key"
+    },
+    {
+      "key": "Up",
+      "type": "key"
+    },
+    {
+      "key": "Enter",
+      "type": "key"
+    }
+  ]
+}

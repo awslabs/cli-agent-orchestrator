@@ -1,0 +1,158 @@
+{
+  "bracketed_paste": false,
+  "command_controls": {
+    "composer_nonempty_guard": true
+  },
+  "control_id_pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+  "digest_domain": "cao-control-input-request-v1",
+  "enter_required": true,
+  "execution_modes": [
+    "native_tui"
+  ],
+  "identity_fields": [
+    "terminal_id",
+    "terminal_incarnation",
+    "terminal_generation",
+    "pane_birth_id",
+    "provider_process_id",
+    "provider",
+    "native_session_id",
+    "execution_mode",
+    "session_name"
+  ],
+  "literal_write": true,
+  "max_text_bytes": 512,
+  "outcomes": [
+    "accepted",
+    "ambiguous",
+    "refused",
+    "unsupported"
+  ],
+  "protocol": "cao-control-input-v1",
+  "provider_controls": {
+    "claude_code": {
+      "compact": {
+        "events": [
+          {
+            "text": "/compact",
+            "type": "text"
+          },
+          {
+            "key": "Enter",
+            "type": "key"
+          }
+        ]
+      },
+      "steer_chords": [],
+      "stop": {
+        "events": [
+          {
+            "key": "Escape",
+            "type": "key"
+          }
+        ]
+      }
+    },
+    "kimi_cli": {
+      "compact": {
+        "events": [
+          {
+            "text": "/compact",
+            "type": "text"
+          },
+          {
+            "key": "Enter",
+            "type": "key"
+          }
+        ]
+      },
+      "dispatch_grace_ms": 5000,
+      "steer_chords": [
+        "C-s"
+      ],
+      "stop": {
+        "events": [
+          {
+            "key": "Escape",
+            "type": "key"
+          }
+        ]
+      }
+    }
+  },
+  "reason_codes": [
+    "composer-nonempty",
+    "control-route-absent",
+    "copy-mode-active",
+    "identity-mismatch",
+    "illegal-control-bytes",
+    "lineage-unproven",
+    "malformed-command-declaration",
+    "managed-acp-pane",
+    "multiline-rejected",
+    "owner-lost-before-write",
+    "owner-lost-mid-write",
+    "pane-busy",
+    "pane-dead",
+    "protocol-mismatch",
+    "provider-unsupported",
+    "request-rebound",
+    "response-lost",
+    "server-identity-mismatch",
+    "server-identity-unbound",
+    "server-identity-unreadable",
+    "stale-generation",
+    "submission-unproven",
+    "unknown-terminal",
+    "unrepresentable-event",
+    "unsupported-chord",
+    "unsupported-key",
+    "write-deadline",
+    "write-incomplete"
+  ],
+  "request_schema_version": 1,
+  "request_schema_versions": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "sequence": {
+    "event_types": [
+      "chord",
+      "key",
+      "text"
+    ],
+    "keys": [
+      "Backspace",
+      "C-c",
+      "C-s",
+      "Delete",
+      "Down",
+      "End",
+      "Enter",
+      "Escape",
+      "Home",
+      "Insert",
+      "Left",
+      "PageDown",
+      "PageUp",
+      "Right",
+      "Tab",
+      "Up"
+    ],
+    "max_events": 32,
+    "max_text_bytes": 512
+  },
+  "server_identity_bound": true,
+  "steer_chords": {
+    "kimi_cli": [
+      "C-s"
+    ]
+  },
+  "streaming": {
+    "coalesce_window_ms": 200,
+    "max_in_flight": 1,
+    "supported": true
+  }
+}

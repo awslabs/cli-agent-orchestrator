@@ -1,0 +1,17 @@
+test/e2e/test_native_tui_provider_acceptance.py::TestCodexAdvertisement::test_codex_has_no_provider_controls_entry PASSED [  6%]
+test/e2e/test_native_tui_provider_acceptance.py::TestKimiIdentitySurface::test_control_identity_is_build_exact PASSED [ 13%]
+test/e2e/test_native_tui_provider_acceptance.py::TestKimiModelMenu::test_01_fused_model_menu_sequence PASSED [ 20%]
+test/e2e/test_native_tui_provider_acceptance.py::TestKimiModelMenu::test_02_reasoning_level_navigation PASSED [ 26%]
+test/e2e/test_native_tui_provider_acceptance.py::TestKimiModelMenu::test_03_home_end_against_model_menu PASSED [ 33%]
+test/e2e/test_native_tui_provider_acceptance.py::TestKimiStreamingCadence::test_04_human_cadence_batches_and_dispatch_grace PASSED [ 40%]
+test/e2e/test_native_tui_provider_acceptance.py::TestKimiSteerAndInterrupt::test_05_steer_mid_turn PASSED [ 46%]
+test/e2e/test_native_tui_provider_acceptance.py::TestKimiSteerAndInterrupt::test_06_escape_interrupts_streaming PASSED [ 53%]
+test/e2e/test_native_tui_provider_acceptance.py::TestKimiCommandGuard::test_07_declared_compact_refused_with_prefill PASSED [ 60%]
+test/e2e/test_native_tui_provider_acceptance.py::TestKimiCommandGuard::test_08_declared_compact_executes_on_empty_composer FAILED [ 66%]
+test/e2e/test_native_tui_provider_acceptance.py::TestKimiCommandGuard::test_09_undeclared_slash_text_is_prose PASSED [ 73%]
+test/e2e/test_native_tui_provider_acceptance.py::TestClaudeIdentitySurface::test_control_identity_is_build_exact PASSED [ 80%]
+test/e2e/test_native_tui_provider_acceptance.py::TestClaudeCommandGuard::test_01_declared_compact_refused_with_prefill PASSED [ 86%]
+test/e2e/test_native_tui_provider_acceptance.py::TestClaudeCommandGuard::test_02_declared_compact_executes_on_empty_composer PASSED [ 93%]
+test/e2e/test_native_tui_provider_acceptance.py::TestClaudeCommandGuard::test_03_escape_interrupts_active_turn PASSED [100%]
+FAILED test/e2e/test_native_tui_provider_acceptance.py::TestKimiCommandGuard::test_08_declared_compact_executes_on_empty_composer
+=================== 1 failed, 14 passed in 133.40s (0:02:13) ===================

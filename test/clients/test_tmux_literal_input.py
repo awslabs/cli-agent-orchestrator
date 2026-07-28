@@ -18,12 +18,14 @@ from unittest.mock import call, patch
 
 import pytest
 
+from cli_agent_orchestrator.clients import tmux as tmux_module
 from cli_agent_orchestrator.clients.tmux import (
     TMUX_CALL_TIMEOUT_SECONDS,
     TmuxClient,
     TmuxLiteralSendError,
     TmuxServerIdentityError,
 )
+from cli_agent_orchestrator.services import control_input_contract
 from cli_agent_orchestrator.services.control_input_contract import (
     REASON_SERVER_IDENTITY_MISMATCH,
     REASON_SERVER_IDENTITY_UNBOUND,
@@ -935,12 +937,67 @@ class TestSendSequenceKey:
             [TMUX, "send-keys", "-t", "%263", name] for name in names
         ]
 
+    @pytest.mark.parametrize(
+        "name,tmux_arg",
+        [
+            ("Escape", "Escape"),
+            ("C-c", "C-c"),
+            ("C-s", "C-s"),
+            ("Enter", "Enter"),
+            ("Backspace", "BSpace"),
+            ("Up", "Up"),
+            ("Down", "Down"),
+            ("Left", "Left"),
+            ("Right", "Right"),
+            ("Home", "Home"),
+            ("End", "End"),
+            ("PageUp", "PageUp"),
+            ("PageDown", "PageDown"),
+            ("Delete", "Delete"),
+            ("Insert", "Insert"),
+            ("Tab", "Tab"),
+        ],
+    )
+    def test_every_wire_name_reaches_tmux_as_its_table_entry(
+        self, client, mock_subprocess, name, tmux_arg
+    ):
+        client.send_sequence_key("%263", name, expected_server_identity=SOCKET)
+
+        # The tmux argument is exactly the table entry: the canonical
+        # primary names PageUp/PageDown/Delete/Insert pass as themselves,
+        # never the tmux aliases PPage/NPage/DC/IC, and only Backspace is
+        # renamed (to BSpace).  This is pinned per name, not sampled,
+        # because send-keys without -l never errors on a name it does not
+        # know — it sends the argument as literal bytes — so a near-miss
+        # spelling would type itself into the composer.
+        assert _write_argv(mock_subprocess) == [[TMUX, "send-keys", "-t", "%263", tmux_arg]]
+
+    def test_the_translation_table_covers_exactly_the_contract_set(self):
+        # Totality is already enforced by an assert at module import; this
+        # test makes the intent explicit, because an import-time assert
+        # reads like a build detail when it is in fact the guard against
+        # the sink property: send-keys without -l turns an unvetted name
+        # into literal bytes, so the contract set and the sink table may
+        # never drift apart in either direction — a contract name without
+        # a table entry would fail at the argv build, and a stale entry
+        # would admit a name the contract no longer permits.
+        assert set(tmux_module._TMUX_SEQUENCE_KEY_NAMES) == set(
+            control_input_contract.SEQUENCE_KEY_NAMES
+        )
+        assert len(control_input_contract.SEQUENCE_KEY_NAMES) == 16
+        for name in control_input_contract.SEQUENCE_KEY_NAMES:
+            assert tmux_module._TMUX_SEQUENCE_KEY_NAMES[name]
+
     def test_a_name_outside_the_set_is_refused_with_no_write(self, client, mock_subprocess):
         # "BSpace" is tmux's name, not the wire's — the sink takes wire
-        # names only and translation is its own internal step.  Any name
-        # outside the pinned set is refused before a subprocess exists,
-        # because tmux would type an unrecognized name as literal bytes.
-        for bad in ["BSpace", "backspace", "Tab", "C-foo", "Backspace ", ""]:
+        # names only and translation is its own internal step.  The rest
+        # are names still outside the pinned 16-name set: "Tab" joined
+        # the set with the v3 navigation keys, while the shifted-tab
+        # chord, function keys, and modified arrows stay the §10.1
+        # unsupported-key class.  Each is refused before a subprocess
+        # exists, because tmux would type an unrecognized name as
+        # literal bytes.
+        for bad in ["BSpace", "backspace", "BTab", "F1", "C-Up", "C-foo", "Backspace ", ""]:
             with pytest.raises(ValueError):
                 client.send_sequence_key("%263", bad, expected_server_identity=SOCKET)
             assert _write_argv(mock_subprocess) == []

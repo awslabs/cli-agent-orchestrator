@@ -1,0 +1,4 @@
+grace refusal recorded: reason='pane-busy' detail='a preceding Enter was sent to this exact Kimi pane generation inside its dispatch grace; the ready-looking frame may be stale, so nothing was written'; zero bytes (all events refused).
+PASS: grace refusal + 3 accepted nav batches + accepted Enter. Post-Enter status lines: ['Saved K2.7 Coding with thinking max as default.', 'Switched to K2.7 Coding Highspeed with thinking max.'].
+grace refusal recorded: reason='pane-busy' detail='a preceding Enter was sent to this exact Kimi pane generation inside its dispatch grace; the ready-looking frame may be stale, so nothing was written'; zero bytes (all events refused).
+PASS: grace refusal + 3 accepted nav batches + accepted Enter. Post-Enter status lines: ['Saved K2.7 Coding with thinking max as default.', 'Switched to K2.7 Coding Highspeed with thinking max.'].
