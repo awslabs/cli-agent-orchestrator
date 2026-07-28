@@ -22,20 +22,18 @@ GRAY = f"{ESC}[38;2;136;136;136m"
 
 
 def _kimi_rows(content_rows):
-    """A Kimi Code TUI screen: conversation, input box, status bar."""
+    """A Kimi Code 0.29.2 screen: conversation, the rounded composer box
+    (live-verified form: untitled '╭─╮' … '╰─╯', '│ > ' prompt rows), and
+    the status bar."""
     return [
-        "╭──────────────────────────────╮",
-        "│  Welcome to Kimi Code CLI!   │",
-        "╰──────────────────────────────╯",
-        "✨ What is 17*23?",
+        " ✨ What is 17*23?",
+        "   Interrupted by user",
         "",
-        "• 391.",
-        "",
-        "── input ─────────────────────────────────",
+        " ╭────────────────────────────────────────────────────────────────────────────────────────────────╮",
         *content_rows,
-        "──────────────────────────────────────────",
-        "yolo  agent (Kimi-k2.6 ●)  /tmp/x  ctrl-o: editor",
-        "context: 4.0% (10.4k/262.1k)",
+        " ╰────────────────────────────────────────────────────────────────────────────────────────────────╯",
+        " K2.7 Coding Highspeed thinking  /tmp/work  master",
+        "                                                                               context: 0% (0/256k)",
     ]
 
 
@@ -52,15 +50,21 @@ def _claude_rows(prompt_row):
 
 
 class TestEmptinessPins:
-    def test_the_pinned_builds_are_exactly_the_supported_ones(self):
-        for version in ("0.29.0", "0.29.1", "0.29.2"):
-            pin = npi.composer_emptiness_pin_for("kimi_cli", version)
-            assert pin is not None and pin.rule == "kimi-input-box" and not pin.styled
+    def test_the_pinned_builds_are_exactly_the_live_verified_ones(self):
+        pin = npi.composer_emptiness_pin_for("kimi_cli", "0.29.2")
+        assert pin is not None and pin.rule == "kimi-composer-box" and not pin.styled
         pin = npi.composer_emptiness_pin_for("claude_code", "2.1.220")
         assert pin is not None and pin.rule == "claude-prompt-box" and pin.styled
 
+    def test_kimi_0290_and_0291_are_honestly_unpinned(self):
+        """Only 0.29.2's composer is live-verified (§10.3): the older
+        accepted builds refuse provider-unsupported rather than borrow a
+        determination nobody has read on them."""
+        assert npi.composer_emptiness_pin_for("kimi_cli", "0.29.0") is None
+        assert npi.composer_emptiness_pin_for("kimi_cli", "0.29.1") is None
+
     def test_version_banners_normalize_like_the_adapter_pins(self):
-        assert npi.composer_emptiness_pin_for("kimi_cli", "kimi 0.29.1") is not None
+        assert npi.composer_emptiness_pin_for("kimi_cli", "kimi 0.29.2") is not None
         assert npi.composer_emptiness_pin_for("claude_code", "2.1.220 (Claude Code)")
 
     def test_an_unpinned_build_or_provider_has_no_pin(self):
@@ -75,30 +79,99 @@ class TestEmptinessPins:
             assert pin.evidence and "§10.3" in pin.evidence
 
 
-class TestKimiInputBox:
-    def test_an_empty_box_is_proven_empty(self):
-        assert npi._kimi_composer_empty(_kimi_rows(["", ""])) is True
+class TestKimiComposerBox:
+    """The live-verified 0.29.2 form: an untitled rounded box with a '> '
+    prompt and no placeholder (§10.3 evidence lane-a-10.3 cases 07/08)."""
 
-    def test_any_content_row_is_prefill(self):
-        assert npi._kimi_composer_empty(_kimi_rows(["queued draft", ""])) is False
-        # Whitespace-only rows are not content.
-        assert npi._kimi_composer_empty(_kimi_rows(["   ", "\t"])) is True
+    def test_an_empty_box_is_proven_empty(self):
+        assert (
+            npi._kimi_composer_empty(
+                _kimi_rows(
+                    [
+                        " │ >                                                                                              │"
+                    ]
+                )
+            )
+            is True
+        )
+
+    def test_any_content_after_the_prompt_is_prefill(self):
+        assert (
+            npi._kimi_composer_empty(
+                _kimi_rows(
+                    [
+                        " │ > queued draft                                                                                 │"
+                    ]
+                )
+            )
+            is False
+        )
+        # Whitespace-only content is not prefill.
+        assert (
+            npi._kimi_composer_empty(
+                _kimi_rows(
+                    [
+                        " │ > \t                                                                                │"
+                    ]
+                )
+            )
+            is True
+        )
+
+    def test_a_wrapped_prefill_row_is_content(self):
+        assert (
+            npi._kimi_composer_empty(
+                _kimi_rows(
+                    [
+                        " │ > a long draft that wrapped                                                            │",
+                        " │   onto a second row                                                                    │",
+                    ]
+                )
+            )
+            is False
+        )
+
+    def test_a_box_without_the_prompt_glyph_is_unproven(self):
+        """A rounded box that is not the composer (a menu, a dialog) must
+        never read as an empty composer."""
+        assert (
+            npi._kimi_composer_empty(
+                _kimi_rows(
+                    [
+                        " │ Select a model                                                                       │"
+                    ]
+                )
+            )
+            is None
+        )
 
     def test_a_missing_box_is_unproven_never_empty(self):
         assert npi._kimi_composer_empty(["some", "random", "rows"]) is None
-        # The input rule without its closing rule is not a box.
-        assert npi._kimi_composer_empty(["── input ────────", "", "status"]) is None
+        # A top rule without its bottom rule is not a box.
+        assert npi._kimi_composer_empty([" ╭───╮", " │ > ", "status"]) is None
 
     def test_the_status_bar_below_the_box_is_not_content(self):
-        # The status bar carries text that must never read as prefill.
-        assert npi._kimi_composer_empty(_kimi_rows([""])) is True
+        assert (
+            npi._kimi_composer_empty(
+                _kimi_rows(
+                    [
+                        " │ >                                                                                              │"
+                    ]
+                )
+            )
+            is True
+        )
 
-    def test_the_last_input_box_wins_over_stale_chrome(self):
+    def test_the_last_rounded_box_wins(self):
         rows = [
-            "── input ─────────────────────────────────",
-            "stale transcript rule, not a live composer",
-            "──────────────────────────────────────────",
-        ] + _kimi_rows([""])
+            " ╭──────────────────────────────╮",
+            " │  Welcome to Kimi Code CLI!   │",
+            " ╰──────────────────────────────╯",
+        ] + _kimi_rows(
+            [
+                " │ >                                                                                              │"
+            ]
+        )
         assert npi._kimi_composer_empty(rows) is True
 
 
@@ -147,7 +220,11 @@ class TestObserveComposerEmpty:
 
         def screen():
             seen["called"] = True
-            return _kimi_rows([""])
+            return _kimi_rows(
+                [
+                    " │ >                                                                                              │"
+                ]
+            )
 
         assert npi.observe_composer_empty("%1", pin, screen=screen) is True
         assert seen == {"called": True}

@@ -659,7 +659,7 @@ def observe_submission(
 # The pins are live-verified per build in §10.3.  Blind clearing is
 # prohibited: nothing here ever sends a keystroke.
 
-_RULE_KIMI_INPUT_BOX = "kimi-input-box"
+_RULE_KIMI_COMPOSER_BOX = "kimi-composer-box"
 _RULE_CLAUDE_PROMPT_BOX = "claude-prompt-box"
 
 
@@ -681,36 +681,43 @@ class ComposerEmptinessPin:
 
 
 _KIMI_EMPTY_EVIDENCE = (
-    "composer layout read from real Kimi Code TUI captures (in-tree "
-    "fixtures, test_kimi_cli_unit.py NEW_TUI_*): the input box is a "
-    "'── input ──' rule, blank content rows, a closing rule, then the "
-    "status bar — an empty composer renders no placeholder, so any content "
-    "row is prefill; emptiness determination live-verified per §10.3"
+    "composer layout live-verified on the installed Kimi Code 0.29.2 "
+    "(§10.3, 2026-07-28, evidence lane-a-10.3 cases 07/08): the composer is "
+    "an untitled rounded box — '╭─╮', content rows framed by '│', a '> ' "
+    "prompt, '╰─╯' — and an empty composer renders no placeholder (only the "
+    "inverse-cursor cell after the prompt), so any content row is prefill; "
+    "the installed bundle (sha256 2ee6e2f1…) contains no '── input ──' "
+    "rendering — an earlier pin read from older in-tree fixtures was "
+    "corrected by this live evidence, never approximated"
 )
 
 _CLAUDE_EMPTY_EVIDENCE = (
     "composer layout read from the Claude Code 2.1.220 composer (in-tree "
-    "fixtures, test_claude_code_unit.py): the prompt box is two '─' rules "
-    "framing a '❯' prompt row; an empty composer shows only a dim-styled "
-    "placeholder (SGR 2; the cursor cell inverse), so placeholder cells are "
-    "told from prefill by styling, never by matching the rotating "
-    "placeholder text; emptiness determination live-verified per §10.3"
+    "fixtures, test_claude_code_unit.py) and live-verified on the installed "
+    "build (§10.3, 2026-07-28, evidence lane-a-10.3 cases 11/12): the prompt "
+    "box is two '─' rules framing a '❯' prompt row; an empty composer shows "
+    "only a dim-styled placeholder (SGR 2; the cursor cell inverse), so "
+    "placeholder cells are told from prefill by styling, never by matching "
+    "the rotating placeholder text; prefill was observed to survive one "
+    "Escape on this build (the r5 evidence generalizes)"
 )
 
 
 #: The per-provider+build emptiness pins, keyed by normalized version.
 #: A build appears here only when its composer layout was read; an
 #: unpinned build refuses command-class controls ``provider-unsupported``
-#: rather than guessing at a region.
+#: rather than guessing at a region.  kimi 0.29.0/0.29.1 are deliberately
+#: absent: the only live-verified Kimi composer is 0.29.2's, and pinning
+#: their region from anything less would be the approximation this table
+#: exists to prevent (§4.1 — they refuse honestly until live-verified).
 _COMPOSER_EMPTINESS_PINS: dict[str, dict[str, ComposerEmptinessPin]] = {
     "kimi_cli": {
-        version: ComposerEmptinessPin(
+        "0.29.2": ComposerEmptinessPin(
             provider="kimi_cli",
-            rule=_RULE_KIMI_INPUT_BOX,
+            rule=_RULE_KIMI_COMPOSER_BOX,
             styled=False,
             evidence=_KIMI_EMPTY_EVIDENCE,
-        )
-        for version in ("0.29.0", "0.29.1", "0.29.2")
+        ),
     },
     "claude_code": {
         "2.1.220": ComposerEmptinessPin(
@@ -743,39 +750,62 @@ def composer_emptiness_pin_for(
     )
 
 
-# The Kimi Code composer's own frame: a "── input ──" rule, the content
-# rows, and a closing rule.  The status bar below the closing rule is
-# never composer content, so the region stops there.
-_KIMI_INPUT_RULE = re.compile(r"^\s*─+\s*input\s*─+\s*$")
-_KIMI_BOX_RULE = re.compile(r"^\s*─{3,}\s*$")
+# The Kimi Code composer's own frame (live-verified 0.29.2): an untitled
+# rounded box — a '╭─╮' top rule, content rows framed by '│', a '> '
+# prompt, and a '╰─╯' bottom rule.  The composer is always the LAST such
+# box on screen; the status bar below it is not boxed.  Menu and dialog
+# boxes share the frame, so the prompt glyph is what makes the box a
+# composer: without it the region proves nothing.
+_KIMI_COMPOSER_BOX_TOP = re.compile(r"^\s*╭─+╮\s*$")
+_KIMI_COMPOSER_BOX_BOTTOM = re.compile(r"^\s*╰─+╯\s*$")
+_KIMI_COMPOSER_BOX_CONTENT = re.compile(r"^\s*│(.*)│\s*$")
 
 
-def _kimi_input_box_rows(rows: Sequence[str]) -> Optional[List[str]]:
-    """The content rows of the Kimi input box, or None when not found."""
-    top = None
+def _kimi_composer_box_rows(rows: Sequence[str]) -> Optional[List[str]]:
+    """The inner text rows of the last rounded composer box, or None."""
+    bottom = None
     for index in range(len(rows) - 1, -1, -1):
-        if _KIMI_INPUT_RULE.match(rows[index]):
+        if _KIMI_COMPOSER_BOX_BOTTOM.match(rows[index]):
+            bottom = index
+            break
+    if bottom is None:
+        return None
+    top = None
+    for index in range(bottom - 1, -1, -1):
+        if _KIMI_COMPOSER_BOX_TOP.match(rows[index]):
             top = index
             break
     if top is None:
         return None
-    for index in range(top + 1, len(rows)):
-        if _KIMI_BOX_RULE.match(rows[index]):
-            return list(rows[top + 1 : index])
-    return None
+    content: List[str] = []
+    for row in rows[top + 1 : bottom]:
+        match = _KIMI_COMPOSER_BOX_CONTENT.match(row)
+        if match is None:
+            return None
+        content.append(match.group(1))
+    return content
 
 
 def _kimi_composer_empty(rows: Sequence[str]) -> Optional[bool]:
-    """Empty iff every input-box content row is blank.
+    """Empty iff the composer's content after the '>' prompt is blank.
 
-    The pinned builds render no placeholder in an empty box (the real
-    captures show blank rows), so any non-blank content row is prefill.
-    An unlocatable box is unproven, never "probably empty".
+    The pinned build renders no placeholder in an empty composer (the
+    live capture shows only the cursor cell after the prompt), so any
+    non-blank content row is prefill.  The first content row must carry
+    the '>' prompt glyph — a rounded box without it is a menu or dialog,
+    and an unidentified box is unproven, never "probably empty".
     """
-    content = _kimi_input_box_rows(rows)
-    if content is None:
+    content = _kimi_composer_box_rows(rows)
+    if not content:
         return None
-    return all(not row.strip() for row in content)
+    first = content[0].lstrip()
+    if not first.startswith(">"):
+        return None
+    for index, row in enumerate(content):
+        text = row.lstrip()[1:] if index == 0 else row
+        if text.strip():
+            return False
+    return True
 
 
 # The Claude composer's frame: two horizontal rules framing the '❯'
@@ -910,7 +940,7 @@ def observe_composer_empty(
         rows = capture_pane_screen_styled(pane_id, timeout=timeout)
     else:
         rows = capture_pane_screen(pane_id, timeout=timeout)
-    if pin.rule == _RULE_KIMI_INPUT_BOX:
+    if pin.rule == _RULE_KIMI_COMPOSER_BOX:
         return _kimi_composer_empty(rows)
     if pin.rule == _RULE_CLAUDE_PROMPT_BOX:
         return _claude_composer_empty(rows)

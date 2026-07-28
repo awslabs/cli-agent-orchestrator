@@ -1,0 +1,14 @@
+{
+  "control_id": "ctl-d41438b099",
+  "events": [
+    {
+      "text": "/compact",
+      "type": "text"
+    },
+    {
+      "key": "Enter",
+      "type": "key"
+    }
+  ],
+  "payload_class": "command"
+}

@@ -1,0 +1,90 @@
+{
+  "control_input": {
+    "chords": {
+      "kimi_cli": [
+        "C-s"
+      ]
+    },
+    "command_controls": {
+      "composer_nonempty_guard": true
+    },
+    "provider_controls": {
+      "kimi_cli": {
+        "compact": {
+          "events": [
+            {
+              "text": "/compact",
+              "type": "text"
+            },
+            {
+              "key": "Enter",
+              "type": "key"
+            }
+          ]
+        },
+        "dispatch_grace_ms": 5000,
+        "steer_chords": [
+          "C-s"
+        ],
+        "stop": {
+          "events": [
+            {
+              "key": "Escape",
+              "type": "key"
+            }
+          ]
+        }
+      }
+    },
+    "schema_versions": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "sequence": {
+      "event_types": [
+        "chord",
+        "key",
+        "text"
+      ],
+      "keys": [
+        "Backspace",
+        "C-c",
+        "C-s",
+        "Delete",
+        "Down",
+        "End",
+        "Enter",
+        "Escape",
+        "Home",
+        "Insert",
+        "Left",
+        "PageDown",
+        "PageUp",
+        "Right",
+        "Tab",
+        "Up"
+      ],
+      "max_events": 32,
+      "max_text_bytes": 512
+    }
+  },
+  "execution_mode": "native_tui",
+  "native_session_id": "session_45bade86-9308-4196-a166-d3e19ca6740c",
+  "pane": {
+    "bound_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+    "dead": false,
+    "observed_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+    "pane_id": "%2",
+    "pane_pid": 27613,
+    "window_id": "@2"
+  },
+  "pane_birth_id": "%2",
+  "provider": "kimi_cli",
+  "provider_process_id": "27613@Tue Jul 28 13:10:52 2026",
+  "session_name": "cao-a103-kimi-507f32",
+  "terminal_generation": "9955f723-ab02-440f-9ae8-78e0b28ca41d",
+  "terminal_id": "321548ff",
+  "terminal_incarnation": null
+}

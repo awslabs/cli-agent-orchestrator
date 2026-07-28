@@ -1,0 +1,3 @@
+Round 2 (2026-07-28, corrected kimi emptiness pin): 15 passed in 139.69s
+Full -q summary line: "15 passed in 139.69s (0:02:19)"
+Round 1 summary preserved in round-1/pytest-summary.txt.

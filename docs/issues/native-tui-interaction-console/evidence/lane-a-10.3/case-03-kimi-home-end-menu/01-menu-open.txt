@@ -1,0 +1,30 @@
+│  Session:   session_45bade86-9308-4196-a166-d3e19ca6740c                                       │
+ │  Model:     K2.7 Coding                                                                        │
+ │  Version:   0.29.2                                                                             │
+ │                                                                                                │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Use Kimi K3 with High thinking effort - for the best balance between token spend and capability
+   Run /model to switch to K3 and set thinking effort to High
+
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to
+ ~/.tmux.conf and restart tmux.
+   Saved K2.7 Coding with thinking max as default.
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+  Select a model  (type to search)
+  Tab toggle provider · ↑↓ navigate · Enter select · Alt+S session-only · Esc cancel
+
+   All   Kimi Code
+
+   ❯ K2.7 Coding            Kimi Code ← current
+     K2.7 Coding Highspeed  Kimi Code
+     K3                     Kimi Code
+     K3-256k                Kimi Code
+
+  Thinking
+   [ On ]   Off (Unsupported)
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+ K2.7 Coding thinking  …/pytest-508/cao_scratch_1030/worktree-kimi  master     /model: switch model
+                                                                               context: 0% (0/256k)

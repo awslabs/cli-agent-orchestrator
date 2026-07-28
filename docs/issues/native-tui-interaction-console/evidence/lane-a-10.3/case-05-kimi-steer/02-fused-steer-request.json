@@ -1,0 +1,13 @@
+{
+  "control_id": "ctl-ba61893bf2",
+  "events": [
+    {
+      "text": "Please reconsider this path",
+      "type": "text"
+    },
+    {
+      "chord": "C-s",
+      "type": "chord"
+    }
+  ]
+}

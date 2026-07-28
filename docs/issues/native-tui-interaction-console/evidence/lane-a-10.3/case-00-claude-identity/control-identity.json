@@ -1,0 +1,87 @@
+{
+  "control_input": {
+    "chords": {
+      "kimi_cli": [
+        "C-s"
+      ]
+    },
+    "command_controls": {
+      "composer_nonempty_guard": true
+    },
+    "provider_controls": {
+      "claude_code": {
+        "compact": {
+          "events": [
+            {
+              "text": "/compact",
+              "type": "text"
+            },
+            {
+              "key": "Enter",
+              "type": "key"
+            }
+          ]
+        },
+        "steer_chords": [],
+        "stop": {
+          "events": [
+            {
+              "key": "Escape",
+              "type": "key"
+            }
+          ]
+        }
+      }
+    },
+    "schema_versions": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "sequence": {
+      "event_types": [
+        "chord",
+        "key",
+        "text"
+      ],
+      "keys": [
+        "Backspace",
+        "C-c",
+        "C-s",
+        "Delete",
+        "Down",
+        "End",
+        "Enter",
+        "Escape",
+        "Home",
+        "Insert",
+        "Left",
+        "PageDown",
+        "PageUp",
+        "Right",
+        "Tab",
+        "Up"
+      ],
+      "max_events": 32,
+      "max_text_bytes": 512
+    }
+  },
+  "execution_mode": "native_tui",
+  "native_session_id": "a155a5c3-679a-421d-80a7-8aedad0efb4c",
+  "pane": {
+    "bound_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+    "dead": false,
+    "observed_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+    "pane_id": "%4",
+    "pane_pid": 30162,
+    "window_id": "@4"
+  },
+  "pane_birth_id": "%4",
+  "provider": "claude_code",
+  "provider_process_id": "30162@Tue Jul 28 13:12:57 2026",
+  "session_name": "cao-a103-claude-d1a278",
+  "terminal_generation": "b19b64bb-2f01-4d4e-be89-ab71d632846b",
+  "terminal_id": "47f32838",
+  "terminal_incarnation": null
+}

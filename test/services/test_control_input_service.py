@@ -2798,7 +2798,9 @@ class TestCommandClassGuard:
         return _observe
 
     def _declared(self, journal, monkeypatch, *, empty, resolved=None, **overrides):
-        resolved = resolved or _seq_resolved()
+        # 0.29.2 is the live-verified emptiness pin; an unpinned build is
+        # the provider-unsupported case, pinned separately below.
+        resolved = resolved or _seq_resolved(provider_version="0.29.2")
         adapter = _FakeSequenceAdapter()
         plans = {0: {"lines": ["/compact"]}}
         wired = self._wire(monkeypatch, resolved, adapter, plans, empty=empty)
@@ -2844,7 +2846,7 @@ class TestCommandClassGuard:
         assert [event["outcome"] for event in result.events] == ["sent"] * 2
         # The observation ran under the lease against the bound pane.
         assert observations == [
-            (PANE, native_pane_input.composer_emptiness_pin_for("kimi_cli", "0.29.0"))
+            (PANE, native_pane_input.composer_emptiness_pin_for("kimi_cli", "0.29.2"))
         ]
 
     def test_a_provider_build_without_a_pin_is_provider_unsupported(self, monkeypatch, journal):
