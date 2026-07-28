@@ -20,6 +20,7 @@ from unittest import mock
 import pytest
 
 from cli_agent_orchestrator.tui.command_catalog import (
+    _SELF_COMMAND,
     CatalogError,
     Command,
     CommandCatalog,
@@ -110,6 +111,26 @@ Options:
   --help  Show this message and exit.
 """
 
+# Root help that includes the TUI's OWN entry, as the real `cao --help` does.
+# `tui` is a leaf (no subcommands), so without the self-exclusion filter the
+# navigator would offer it as runnable and Enter would spawn `cao tui` nested
+# inside the running `cao tui` over inherited stdio.
+ROOT_HELP_WITH_TUI = """\
+Usage: cao [OPTIONS] COMMAND [ARGS]...
+
+  CLI Agent Orchestrator.
+
+Options:
+  -V, --version  Show the version and exit.
+  --help         Show this message and exit.
+
+Commands:
+  launch   Launch cao session with specified agent profile.
+  session  Manage CAO sessions.
+  tui      Launch the cao terminal UI front door.
+  memory   Manage CAO memories.
+"""
+
 
 def _fake_run(help_by_path: Dict[tuple, str]):
     """Build a ``subprocess.run`` replacement keyed by the command-path tuple.
@@ -153,6 +174,25 @@ def test_groups_parses_command_section() -> None:
         CommandGroup("session", "Manage CAO sessions."),
         CommandGroup("memory", "Manage CAO memories."),
     ]
+
+
+def test_groups_excludes_the_tui_self_entry() -> None:
+    """The TUI never offers itself: `tui` is filtered out of `groups()`.
+
+    `cao --help` lists `tui` like any other entry and it is a LEAF, so offering
+    it would let Enter-Enter run `cao tui` nested inside the running `cao tui`
+    over inherited stdio. Its siblings must still come through untouched.
+    """
+
+    runner = _fake_run({(): ROOT_HELP_WITH_TUI})
+    with mock.patch("subprocess.run", runner):
+        groups = CommandCatalog().groups()
+
+    names = [group.name for group in groups]
+    assert _SELF_COMMAND == "tui"  # the constant is what's filtered, not a literal
+    assert _SELF_COMMAND not in names
+    # The siblings around the removed entry survive, in help order.
+    assert names == ["launch", "session", "memory"]
 
 
 def test_commands_parses_subcommands_with_path() -> None:

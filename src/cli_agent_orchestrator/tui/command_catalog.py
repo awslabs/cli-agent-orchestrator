@@ -118,6 +118,18 @@ _COLUMN_GAP = re.compile(r"\s{2,}")
 # A bracketed choice metavar, e.g. "[global|project|session]".
 _BRACKET_CHOICE = re.compile(r"^\[(.+)\]$")
 
+# The TUI's own ``cao`` subcommand, excluded from the catalog it presents.
+#
+# ``cao --help`` lists ``tui`` like any other top-level entry, and it is a *leaf*
+# (``commands("tui") == []``), so the navigator would offer it as a runnable
+# command. Running it would spawn ``cao tui`` as a child of the running ``cao
+# tui`` over INHERITED stdio: two full-screen prompt_toolkit applications
+# fighting over the same terminal, with the outer one still holding the
+# alternate screen. Excluding it at the single ``groups()`` output gate is the
+# narrowest fix — ``commands()``/``params()`` stay faithful to ``cao --help``,
+# since introspecting ``cao tui`` is harmless; only *offering* it is the hazard.
+_SELF_COMMAND = "tui"
+
 
 def _collapse_ws(text: str) -> str:
     """Collapse runs of whitespace to single spaces and strip the ends."""
@@ -404,12 +416,18 @@ class CommandCatalog:
     # -- public API ---------------------------------------------------------- #
 
     def groups(self) -> List[CommandGroup]:
-        """Return the top-level command groups parsed from ``cao --help`` (W-1)."""
+        """Return the top-level command groups parsed from ``cao --help`` (W-1).
+
+        The TUI's own ``tui`` entry is excluded (:data:`_SELF_COMMAND`): it is a
+        leaf, so offering it would let Enter run ``cao tui`` nested inside the
+        running ``cao tui`` over inherited stdio.
+        """
 
         text = self._help_text([])
         return [
             CommandGroup(name=name, summary=summary)
             for name, summary in _parse_command_entries(text)
+            if name != _SELF_COMMAND
         ]
 
     def commands(self, group: str) -> List[Command]:

@@ -18,6 +18,7 @@ from unittest import mock
 import requests
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.bindings.focus import focus_next, focus_previous
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.output import DummyOutput
 
@@ -37,7 +38,12 @@ from cli_agent_orchestrator.tui.command_catalog import (
     Param,
 )
 from cli_agent_orchestrator.tui.completion import ArgCompleter
-from cli_agent_orchestrator.tui.navigation import NavigationModel
+from cli_agent_orchestrator.tui.navigation import (
+    LEVEL_COMMANDS,
+    LEVEL_GROUPS,
+    NavigationModel,
+)
+from cli_agent_orchestrator.tui.path_input import PathInputError
 from cli_agent_orchestrator.tui.profiles_view import ProfilesBrowser
 from cli_agent_orchestrator.tui.provider_preflight import ProviderPreflight
 from cli_agent_orchestrator.tui.runner import CommandRunner
@@ -837,3 +843,398 @@ def test_build_catalog_fatal_view_renders_message_and_quit() -> None:
 
     layout = build_catalog_fatal_view("`cao` executable not found")
     assert isinstance(layout, Layout)
+
+
+# =========================================================================== #
+# REAL-KEY tests (P1 review round). These drive the app the way an operator     #
+# does — by piping actual escape sequences through `create_pipe_input` — and     #
+# assert the MODEL moved.                                                       #
+#                                                                               #
+# Why this style is mandatory here: the pre-existing suite drove selection by    #
+# calling `app.navigation.move()` directly (see `_select_group`/`_select_command`#
+# above) and piped only "q", "\r" and "\x03" as real keys. That is exactly why   #
+# 191 tests stayed green while `NavigationModel.move()` had ZERO production call #
+# sites and `back()` was never bound. A test that calls the model method it is   #
+# meant to prove is wired CANNOT detect an unwired binding.                      #
+# =========================================================================== #
+
+# Raw terminal byte sequences, as a real terminal sends them.
+KEY_DOWN = "\x1b[B"
+KEY_UP = "\x1b[A"
+KEY_ESC = "\x1b"
+KEY_ENTER = "\r"
+
+
+def _run_keys(app: App, *keys: str) -> int:
+    """Pipe raw key sequences through a headless loop and return the exit code.
+
+    Terminates with Ctrl-C rather than "q" so the helper is safe for tests that
+    leave the input overlay open — while the overlay holds focus, "q" is a literal
+    character typed into the buffer, not the quit key. Every assertion in these
+    tests is made on the app's model state after `run()` returns; use
+    :data:`EXIT_SIGINT` when asserting this helper's exit code, or drive the loop
+    directly when the exit code itself is the subject.
+    """
+
+    with create_pipe_input() as pipe:
+        pipe.send_text("".join(keys) + "\x03")
+        return app.run(input=pipe, output=DummyOutput())
+
+
+def _key_app(**kwargs: object) -> App:
+    """An App on the fake catalog with a spy runner (no shell-out, no network)."""
+
+    app = App(
+        liveness_probe=lambda _url: True,
+        catalog=_fake_catalog(),
+        **kwargs,  # type: ignore[arg-type]
+    )
+    app.runner = _SpyRunner()
+    return app
+
+
+# -- FR-1: arrows move the SELECTION, Esc goes back -------------------------
+
+
+def test_down_arrow_key_moves_the_selection() -> None:
+    """A real Down keypress advances `selected_index` (it did nothing before)."""
+
+    app = _key_app()
+    assert app.navigation.selected_index == 0
+
+    _run_keys(app, KEY_DOWN)
+
+    assert app.navigation.selected_index == 1
+
+
+def test_up_arrow_key_moves_the_selection_back_and_clamps_at_top() -> None:
+    """Real Up keypresses walk back up the list and clamp at the first row."""
+
+    app = _key_app()
+
+    _run_keys(app, KEY_DOWN, KEY_DOWN, KEY_UP)
+    assert app.navigation.selected_index == 1
+
+    # Edge: more Ups than rows above must clamp at 0, never go negative.
+    _run_keys(app, KEY_UP, KEY_UP, KEY_UP)
+    assert app.navigation.selected_index == 0
+
+
+def test_arrow_keys_reach_a_row_that_direct_focus_movement_never_could() -> None:
+    """The reviewer's scenario, asserted positively.
+
+    Down x3 then Enter must open the FOURTH entry. Before the fix, Down was bound
+    to prompt_toolkit's `focus_next`, so five Downs left `selected_index == 0` and
+    Enter always drilled the FIRST entry — every later row was unreachable.
+    """
+
+    app = _key_app()
+    names = [group.name for group in app.navigation.visible_groups()]
+    assert names == ["launch", "session", "workflow", "memory"]
+
+    _run_keys(app, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER)
+
+    # Landed on "memory" (index 3), NOT "launch" (index 0).
+    assert app.navigation.selected_index == 3
+    assert app.navigation.active_command is not None
+    assert app.navigation.active_command.path == ["memory"]
+
+
+def test_escape_key_returns_from_commands_to_groups() -> None:
+    """A real Esc keypress calls `back()`, which had no binding at all before."""
+
+    app = _key_app()
+
+    # Down to "session" (index 1) and Enter to drill into its commands.
+    _run_keys(app, KEY_DOWN, KEY_ENTER)
+    assert app.navigation.level == LEVEL_COMMANDS
+    assert app.navigation.active_group == "session"
+
+    _run_keys(app, KEY_ESC)
+
+    assert app.navigation.level == LEVEL_GROUPS
+    assert app.navigation.active_group is None
+
+
+def test_vertical_arrows_are_not_bound_to_focus_movement() -> None:
+    """Regression guard: Up/Down must drive the model, not the focus ring.
+
+    This is the shape of the original defect. If someone rebinds the vertical
+    arrows to `focus_next`/`focus_previous` again, the selection silently stops
+    moving — so assert the handlers are the App's own, not prompt_toolkit's.
+    """
+
+    app = _key_app()
+    handlers = {}
+    for binding in app.build_keybindings().bindings:
+        for key in binding.keys:
+            handlers.setdefault(str(getattr(key, "value", key)), []).append(binding.handler)
+
+    assert focus_next not in handlers["down"]
+    assert focus_previous not in handlers["up"]
+    # Tab/S-Tab keep the focus ring (FR-1.3) — they are NOT part of the fix.
+    # prompt_toolkit normalises Tab to its control-code name, "c-i".
+    assert focus_next in handlers["c-i"]
+    assert focus_previous in handlers["s-tab"]
+    # Esc is bound at all — it had no binding whatsoever before this fix.
+    assert "escape" in handlers
+
+
+# -- FR-2: render-time CatalogError is triaged, never raised ----------------
+
+
+def test_first_paint_catalog_failure_shows_fatal_screen_instead_of_raising() -> None:
+    """A missing `cao` discovered at FIRST PAINT exits non-zero, not with a traceback.
+
+    The nav text provider is called by prompt_toolkit at every repaint, and its
+    read shells out to `cao --help`. Before the fix this raised straight through
+    `Application.run()`: no keystroke was ever needed to trigger it, so the
+    guarded `activate()` path never got a chance to classify it.
+    """
+
+    catalog = mock.MagicMock(spec=CommandCatalog)
+    catalog.groups.side_effect = _missing_binary_catalog_error(["cao", "--help"])
+    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+
+    # No key is piped except the quit key: the failure must surface from PAINT.
+    with create_pipe_input() as pipe:
+        pipe.send_text("q")
+        code = app.run(input=pipe, output=DummyOutput())
+
+    assert app.state.screen == "catalog_fatal"
+    assert app.fatal_message is not None
+    assert code == EXIT_CATALOG_FATAL
+
+
+def test_first_paint_fatal_renders_the_fatal_layout_before_exiting() -> None:
+    """The operator actually SEES the fatal screen, not just a terse nav string.
+
+    The frame that discovers the failure was already laid out for S-main (the
+    layout is chosen before the nav text provider runs), so the guard must swap in
+    the fatal view before exiting. Asserting only the exit code would miss this:
+    the app would exit correctly while never showing the guidance that tells the
+    operator `cao` is missing from PATH.
+    """
+
+    catalog = mock.MagicMock(spec=CommandCatalog)
+    catalog.groups.side_effect = _missing_binary_catalog_error(["cao", "--help"])
+    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+
+    with create_pipe_input() as pipe:
+        pipe.send_text("q")
+        code = app.run(input=pipe, output=DummyOutput())
+
+    assert code == EXIT_CATALOG_FATAL
+    # The live layout is the fatal view, whose body carries the PATH guidance.
+    rendered = "".join(
+        fragment[1]
+        for window in app.application.layout.find_all_windows()
+        for fragment in window.content.create_content(200, 100).get_line(0)
+    )
+    assert "FATAL" in rendered or "cao not found" in rendered
+    fatal_body = "\n".join(
+        "".join(f[1] for f in window.content.create_content(200, 100).get_line(row))
+        for window in app.application.layout.find_all_windows()
+        for row in range(min(window.content.create_content(200, 100).line_count, 20))
+    )
+    assert "PATH" in fatal_body
+
+
+def test_first_paint_transient_catalog_failure_stays_on_main() -> None:
+    """A timeout at first paint is a notice on S-main, not a fatal screen."""
+
+    catalog = mock.MagicMock(spec=CommandCatalog)
+    catalog.groups.side_effect = _timeout_catalog_error(["cao", "--help"])
+    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+
+    code = _run_keys(app)
+
+    assert app.state.screen == "main"
+    assert app.catalog_notice is not None
+    assert "timed out" in app.catalog_notice
+    assert code == EXIT_SIGINT  # _run_keys exits via Ctrl-C, not [q]
+
+
+def test_first_paint_nonzero_exit_catalog_failure_stays_on_main() -> None:
+    """A non-zero `cao --help` exit at first paint is also transient, not fatal."""
+
+    catalog = mock.MagicMock(spec=CommandCatalog)
+    catalog.groups.side_effect = _nonzero_exit_catalog_error(["cao", "--help"])
+    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+
+    code = _run_keys(app)
+
+    assert app.state.screen == "main"
+    assert app.catalog_notice is not None
+    assert code == EXIT_SIGINT  # _run_keys exits via Ctrl-C, not [q]
+
+
+def test_nav_text_returns_renderable_text_when_the_catalog_fails() -> None:
+    """The in-flight frame still gets text — the provider never propagates."""
+
+    catalog = mock.MagicMock(spec=CommandCatalog)
+    catalog.groups.side_effect = _timeout_catalog_error(["cao", "--help"])
+    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+
+    text = app._nav_text()
+
+    assert isinstance(text, str)
+    assert text  # non-empty: something is drawn, not an exception
+
+
+# -- FR-3: the input overlay captures real typed characters -----------------
+
+
+def test_slash_key_then_typed_characters_filter_the_list() -> None:
+    """`[/]` opens a live input; typed characters reach `apply_search`."""
+
+    app = _key_app()
+
+    _run_keys(app, "/", "sess", KEY_ENTER)
+
+    assert app.navigation.filter_text == "sess"
+    assert [g.name for g in app.navigation.visible_groups()] == ["session"]
+    assert app.input_mode is None  # committed and closed
+
+
+def test_search_narrows_incrementally_while_typing() -> None:
+    """The list narrows as characters arrive, before Enter is pressed.
+
+    Note the exit key here is Ctrl-C, not "q": while the overlay holds focus "q"
+    is a literal character that goes INTO the buffer (which is the point of the
+    fix), so it cannot double as the quit key.
+    """
+
+    app = _key_app()
+
+    with create_pipe_input() as pipe:
+        pipe.send_text("/work")
+        pipe.send_text("\x03")  # Ctrl-C still exits from inside the overlay
+        app.run(input=pipe, output=DummyOutput())
+
+    # Filtered while typing — no Enter was ever sent, and the overlay is still open.
+    assert app.input_mode == "search"
+    assert app.navigation.filter_text == "work"
+    assert [g.name for g in app.navigation.visible_groups()] == ["workflow"]
+
+
+def test_escape_cancels_a_search_without_applying_it() -> None:
+    """Esc dismisses the overlay and restores the unfiltered list."""
+
+    app = _key_app()
+
+    _run_keys(app, "/", "sess", KEY_ESC)
+
+    assert app.input_mode is None
+    assert app.navigation.filter_text == ""
+    assert len(app.navigation.visible_groups()) == 4
+
+
+def test_edit_key_then_typed_value_reaches_the_builder() -> None:
+    """`[e]` captures a real typed value and commits it through `set_arg`."""
+
+    app = _key_app()
+
+    # Open the `launch` leaf (index 0) so its `--agents` param is editable.
+    _run_keys(app, KEY_ENTER)
+    assert app.navigation.active_command is not None
+    assert app.navigation.active_command.path == ["launch"]
+
+    _run_keys(app, "e", "backend-dev", KEY_ENTER)
+
+    assert app.builder.state.args.get("--agents") == "backend-dev"
+    assert app.arg_error is None
+    assert app.input_mode is None
+
+
+def test_edit_overlay_cancel_leaves_the_argument_unset() -> None:
+    """Esc during an edit discards the typed value."""
+
+    app = _key_app()
+    _run_keys(app, KEY_ENTER)  # open `launch`
+
+    _run_keys(app, "e", "discarded", KEY_ESC)
+
+    assert app.builder.state.args.get("--agents") is None
+    assert app.input_mode is None
+
+
+def test_input_buffer_has_the_arg_completer_attached() -> None:
+    """FR-3.4: the completer is wired to a LIVE buffer, not merely constructed.
+
+    `ArgCompleter` was built in the composition root and attached to nothing, so
+    completion could never fire in the UI no matter how correct the completer was.
+    """
+
+    app = _key_app()
+
+    assert app.input_buffer.completer is app.completer
+    assert isinstance(app.completer, ArgCompleter)
+
+
+def test_edit_overlay_prompt_names_the_targeted_param() -> None:
+    """The overlay labels which field is being edited (TEXT only, NFR-6)."""
+
+    app = _key_app()
+    _run_keys(app, KEY_ENTER)  # open `launch`
+    app.begin_edit()
+
+    assert app.input_active is True
+    assert app.input_prompt() == "--agents: "
+
+
+def test_edit_key_is_inert_when_no_command_is_open() -> None:
+    """Edge: `[e]` with nothing open must not open an overlay with no target."""
+
+    app = _key_app()
+
+    _run_keys(app, "e")
+
+    assert app.input_mode is None
+    assert app.input_param is None
+
+
+def test_rejected_path_value_surfaces_arg_error_without_crashing() -> None:
+    """Edge: a validator rejection is shown inline, never raised (FR-8.1)."""
+
+    app = _key_app()
+    _run_keys(app, KEY_ENTER)  # open `launch`
+
+    with mock.patch.object(app.builder, "set_arg", side_effect=PathInputError("no such directory")):
+        app.set_arg("--agents", "/nope")
+
+    assert app.arg_error == "no such directory"
+
+
+# -- NFR-3: real-key coverage for bindings the fixes did not strictly need ---
+
+
+def test_copy_key_copies_the_preview_through_a_real_keypress() -> None:
+    """`[c]` driven by a real key, not a direct `copy_current()` call."""
+
+    app = _key_app()
+    _run_keys(app, KEY_ENTER)  # open `launch` so there is a preview
+
+    _run_keys(app, "c")
+
+    assert app.last_copied == app.builder.preview_string()
+    assert app.last_copied is not None
+    assert app.last_copied.startswith("cao launch")
+
+
+def test_retry_key_reprobes_and_swaps_screen_through_a_real_keypress() -> None:
+    """`[r]` driven by a real key: S-unreachable -> S-main when the probe flips."""
+
+    calls = {"n": 0}
+
+    def flaky(_url: str) -> bool:
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    app = App(liveness_probe=flaky, catalog=_fake_catalog())
+    assert app.state.screen == "unreachable"
+
+    _run_keys(app, "r")
+
+    assert app.state.screen == "main"
+    assert calls["n"] >= 2

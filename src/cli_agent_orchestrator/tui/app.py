@@ -24,6 +24,8 @@ from __future__ import annotations
 from typing import Callable, List, Optional
 
 from prompt_toolkit.application import Application
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.bindings.focus import focus_next, focus_previous
@@ -154,6 +156,26 @@ class App:
         # Fatal "cao not found" message (S-catalog-fatal); ``None`` unless the
         # catalog reported the ``cao`` executable itself is missing/not runnable.
         self.fatal_message: Optional[str] = None
+        # Whether the S-catalog-fatal layout has been swapped in by the
+        # render-time guard (so it swaps once, then exits on the next frame).
+        self._fatal_screen_applied = False
+
+        # -- input overlay (P1-3) ------------------------------------------- #
+        # Which capture is active: ``None`` (closed), ``"edit"``, or ``"search"``.
+        # ``[e]``/``[/]`` open it; Enter commits, Esc cancels.
+        self.input_mode: Optional[str] = None
+        # The param an ``"edit"`` capture will commit into on Enter.
+        self.input_param: Optional[str] = None
+        # The live buffer the overlay reads. ``ArgCompleter`` is attached HERE —
+        # this is what makes the completer built above a live UI object rather
+        # than an unreachable one. ``on_text_changed`` gives search its
+        # incremental narrowing as characters arrive.
+        self.input_buffer: Buffer = Buffer(
+            completer=self.completer,
+            complete_while_typing=True,
+            multiline=False,
+            on_text_changed=self._on_input_changed,
+        )
 
         # Run the startup liveness probe (W-1) to pick the initial screen.
         self.state.reachable = self._run_probe()
@@ -208,6 +230,9 @@ class App:
             build_text=self._build_text,
             preview_text=self.preview_text,
             preflight_text=self._preflight_text,
+            input_buffer=self.input_buffer,
+            input_prompt=self.input_prompt,
+            input_visible=Condition(lambda: self.input_active),
         )
 
     def _apply_screen(self) -> None:
@@ -340,16 +365,103 @@ class App:
             return None
 
     def begin_edit(self) -> None:
-        """Start an argument edit (the ``[e]`` key): clear any stale field error.
+        """Open the argument-edit overlay (the ``[e]`` key).
 
-        The interactive field capture (an input overlay that reads the typed
-        value) is a UI concern outside this P1 wiring fix; the committed,
-        value-bearing behaviour is :meth:`set_arg`, which a field editor calls on
-        commit. This entry point resets :attr:`arg_error` so a prior rejection
-        does not linger while the operator re-enters a value.
+        Clears any stale field error, targets the first unset param of the open
+        command (or the first param when all are set), and opens the live input
+        row. The typed value is committed to :meth:`set_arg` on Enter and
+        discarded on Esc (:meth:`cancel_input`).
         """
 
         self.arg_error = None
+        params = self.builder.params
+        if not params:
+            # Nothing to edit (no command open, or a command with no arguments).
+            return
+        unset = [p for p in params if self.builder.state.args.get(p.name) is None]
+        target = unset[0] if unset else params[0]
+        self.input_param = target.name
+        self.input_mode = "edit"
+        self.input_buffer.reset()
+
+    def _focus_input(self, event: KeyPressEvent) -> None:
+        """Move keyboard focus to the overlay's buffer once it is open.
+
+        The overlay row only exists in the layout while it is visible, so focus is
+        moved AFTER :meth:`_apply_screen` has rebuilt the layout. A focus failure
+        must never crash the shell — if the control cannot be focused the overlay
+        is closed again so the operator is not stranded in a mode with no input.
+        """
+
+        if not self.input_active:
+            return
+        try:
+            event.app.layout.focus(self.input_buffer)
+        except Exception:
+            self._close_input()
+            self._apply_screen()
+
+    def commit_input(self) -> None:
+        """Commit the overlay's typed text (Enter) and close it.
+
+        In ``"edit"`` mode the text goes through :meth:`set_arg` (so a rejected
+        path lands in :attr:`arg_error` rather than raising); in ``"search"`` mode
+        it goes through :meth:`apply_search`. Either way the overlay closes and
+        focus returns to the nav pane.
+        """
+
+        text = self.input_buffer.text
+        mode, param = self.input_mode, self.input_param
+        self._close_input()
+        if mode == "edit" and param is not None:
+            self.set_arg(param, text)
+        elif mode == "search":
+            self.apply_search(text)
+
+    def cancel_input(self) -> None:
+        """Dismiss the overlay without applying (Esc while it holds focus).
+
+        A cancelled *search* also restores the unfiltered list, since
+        :meth:`begin_search` cleared the filter on open and search narrows
+        incrementally as characters arrive.
+        """
+
+        mode = self.input_mode
+        self._close_input()
+        if mode == "search":
+            self.apply_search("")
+
+    def _close_input(self) -> None:
+        """Reset the overlay to its closed state (shared by commit and cancel)."""
+
+        self.input_mode = None
+        self.input_param = None
+        self.input_buffer.reset()
+
+    def _on_input_changed(self, _buffer: Buffer) -> None:
+        """Narrow the list as search characters arrive (incremental filtering).
+
+        Only ``"search"`` mode filters while typing; an ``"edit"`` value must not
+        touch navigation state until it is committed.
+        """
+
+        if self.input_mode == "search":
+            self.navigation.set_filter(self.input_buffer.text)
+
+    @property
+    def input_active(self) -> bool:
+        """Whether the input overlay is open (drives its visibility + key filters)."""
+
+        return self.input_mode is not None
+
+    def input_prompt(self) -> str:
+        """The overlay's prompt label, rendered as TEXT (NFR-6)."""
+
+        if self.input_mode == "search":
+            return "search: "
+        if self.input_mode == "edit":
+            return f"{self.input_param}: "
+        return ""
 
     def apply_search(self, text: str) -> None:
         """Apply a ``[/]`` search string to the navigator's client-side filter.
@@ -361,14 +473,18 @@ class App:
         self.navigation.set_filter(text)
 
     def begin_search(self) -> None:
-        """Start a ``[/]`` search (the ``[/]`` key): reset the filter to empty.
+        """Open the search overlay (the ``[/]`` key).
 
-        Clears any active filter so the full list is shown as the operator
-        begins a fresh search; :meth:`apply_search` commits the typed substring.
-        The interactive character capture is a UI concern outside this fix.
+        Clears any active filter so the full list is shown as the operator begins
+        a fresh search, then opens the live input row. Typing narrows the list
+        incrementally (:meth:`_on_input_changed`); Enter commits the substring and
+        Esc restores the unfiltered list.
         """
 
         self.apply_search("")
+        self.input_param = None
+        self.input_mode = "search"
+        self.input_buffer.reset()
 
     def preview_text(self) -> str:
         """The exact ``cao ...`` command preview (empty until one is selected).
@@ -431,6 +547,14 @@ class App:
         A ``>`` marks the highlighted row (keyboard-only, TEXT marker — never
         colour alone, NFR-6). An empty list (e.g. a filter that matches nothing,
         or a leaf group) shows guiding copy, not an error.
+
+        This provider is invoked by ``views`` at every repaint, and the read it
+        performs (``visible_names`` -> ``visible_groups`` -> ``catalog.groups``)
+        shells out to ``cao --help`` on the FIRST PAINT — before any keystroke
+        reaches the guarded :meth:`activate` path. So the same
+        :class:`CatalogError` triage must apply here, or a missing ``cao`` binary
+        crashes the draw loop with a raw traceback instead of showing the
+        S-catalog-fatal screen (P1-3).
         """
 
         # A transient catalog notice (a group/command whose `--help` timed out or
@@ -438,7 +562,18 @@ class App:
         # pick another entry or retry; it is not an error state (FR-9.1-style).
         notice_lines = [f"notice: {self.catalog_notice}", ""] if self.catalog_notice else []
 
-        names = self.navigation.visible_names()
+        try:
+            names = self.navigation.visible_names()
+        except CatalogError as exc:
+            # Classify exactly as the selection path does: a missing `cao` is
+            # fatal (swap to S-catalog-fatal, and the run loop exits non-zero via
+            # _catalog_fatal_guard); a timeout / non-zero exit is transient.
+            self._handle_catalog_error(exc)
+            if self.state.screen == "catalog_fatal":
+                # The in-flight frame still needs text; the screen swap and the
+                # non-zero exit are driven by the render-time guard.
+                return "(cao could not be run)"
+            return "\n".join([f"notice: {self.catalog_notice}", "", "(catalog unavailable)"])
         if not names:
             if self.navigation.filter_text:
                 return "\n".join(notice_lines + ["(no matches — press [/] to change the filter)"])
@@ -509,24 +644,89 @@ class App:
     def build_keybindings(self) -> KeyBindings:
         """Install the global key map (W-2).
 
-        Bound: arrows/Tab move focus, Enter activates the focused row (drill /
-        open / run), ``[c]`` copy, ``[e]`` edit, ``[q]`` quit, ``[/]`` search,
-        ``[r]`` retry, plus Ctrl-C for a clean SIGINT exit. ``[s]`` is
-        deliberately NOT bound (RD-e=A: no status pane / no status key). Every
-        binding is a thin adapter that calls a handler method then re-renders.
+        Bound: Up/Down move the *selection* through
+        :meth:`NavigationModel.move`, Esc goes *back* a level through
+        :meth:`NavigationModel.back`, Tab/S-Tab (and Left/Right) move pane focus,
+        Enter activates the focused row (drill / open / run), ``[c]`` copy,
+        ``[e]`` edit, ``[q]`` quit, ``[/]`` search, ``[r]`` retry, plus Ctrl-C for
+        a clean SIGINT exit. ``[s]`` is deliberately NOT bound (RD-e=A: no status
+        pane / no status key).
+
+        The selection keys are the P1 fix: they were previously bound to
+        prompt_toolkit's ``focus_next``/``focus_previous``, which move the *focus
+        ring* between panes and never touch the navigation model — so
+        ``move()``/``back()`` had zero production call sites and the highlighted
+        row could not be changed by the keyboard at all.
+
+        Every binding is a thin adapter that calls a handler method then
+        re-renders. Bindings are scoped by filter so the input overlay owns the
+        keys it needs while open (typed characters, Enter to commit, Esc to
+        cancel) and the navigation keys do not fire underneath it.
         """
 
         kb = KeyBindings()
 
-        # Focus movement (keyboard-only — NFR-6).
-        kb.add("tab")(focus_next)
-        kb.add("s-tab")(focus_previous)
-        kb.add("down")(focus_next)
-        kb.add("right")(focus_next)
-        kb.add("up")(focus_previous)
-        kb.add("left")(focus_previous)
+        # The overlay owns the keyboard while it is open; navigation keys are
+        # suppressed so a typed value cannot move the selection underneath it.
+        editing = Condition(lambda: self.input_active)
+        navigating = Condition(lambda: not self.input_active)
 
-        @kb.add("enter")
+        # Pane focus movement (keyboard-only — NFR-6). Tab/S-Tab and the
+        # horizontal arrows stay on the focus ring; the VERTICAL arrows now drive
+        # the selection instead (see below).
+        kb.add("tab", filter=navigating)(focus_next)
+        kb.add("s-tab", filter=navigating)(focus_previous)
+        kb.add("right", filter=navigating)(focus_next)
+        kb.add("left", filter=navigating)(focus_previous)
+
+        @kb.add("down", filter=navigating)
+        def _next_row(event: KeyPressEvent) -> None:
+            """Move the selection one row down (the P1 key -> model wiring)."""
+
+            self.navigation.move(1)
+            self._apply_screen()
+
+        @kb.add("up", filter=navigating)
+        def _prev_row(event: KeyPressEvent) -> None:
+            """Move the selection one row up (clamped at the top of the list)."""
+
+            self.navigation.move(-1)
+            self._apply_screen()
+
+        @kb.add("escape", filter=navigating, eager=True)
+        def _back(event: KeyPressEvent) -> None:
+            """Return from a group's command list to the top-level group list.
+
+            ``eager=True`` so a bare Esc acts immediately instead of waiting to
+            see whether it is the start of an escape SEQUENCE (arrow keys arrive
+            as ``\\x1b[A``/``\\x1b[B``). Without it, prompt_toolkit holds the bare
+            Esc back for its input timeout and ``back()`` feels broken.
+            """
+
+            self.navigation.back()
+            self._apply_screen()
+
+        @kb.add("enter", filter=editing)
+        def _commit_input(event: KeyPressEvent) -> None:
+            """Commit the overlay's typed text (set_arg / apply_search) and close."""
+
+            self.commit_input()
+            self._apply_screen()
+
+        @kb.add("escape", filter=editing, eager=True)
+        def _cancel_input(event: KeyPressEvent) -> None:
+            """Dismiss the overlay without applying the typed text."""
+
+            self.cancel_input()
+            self._apply_screen()
+
+        @kb.add("c-c", filter=editing)
+        def _sigint_editing(event: KeyPressEvent) -> None:
+            """Ctrl-C still exits cleanly from inside the overlay."""
+
+            event.app.exit(result=EXIT_SIGINT)
+
+        @kb.add("enter", filter=navigating)
         def _activate(event: KeyPressEvent) -> None:
             """Activate the focused row: drill a group, open a command, or run.
 
@@ -542,34 +742,36 @@ class App:
                 return
             self._apply_screen()
 
-        @kb.add("c")
+        @kb.add("c", filter=navigating)
         def _copy(event: KeyPressEvent) -> None:
             """Copy the current preview / start command to the clipboard (FR-3.2)."""
 
             self.copy_current()
 
-        @kb.add("e")
+        @kb.add("e", filter=navigating)
         def _edit(event: KeyPressEvent) -> None:
-            """Begin editing the focused argument field (commit via set_arg)."""
+            """Open the argument-edit overlay (commit via set_arg)."""
 
             self.begin_edit()
             self._apply_screen()
+            self._focus_input(event)
 
-        @kb.add("/")
+        @kb.add("/", filter=navigating)
         def _search(event: KeyPressEvent) -> None:
-            """Begin a client-side search over the visible group/command names."""
+            """Open the search overlay over the visible group/command names."""
 
             self.begin_search()
             self._apply_screen()
+            self._focus_input(event)
 
-        @kb.add("r")
+        @kb.add("r", filter=navigating)
         def _retry(event: KeyPressEvent) -> None:
             """Re-probe the server and swap screens (S-unreachable → S-main)."""
 
             self.retry()
             self._apply_screen()
 
-        @kb.add("q")
+        @kb.add("q", filter=navigating)
         def _quit(event: KeyPressEvent) -> None:
             """Quit the TUI with a normal exit code."""
 
@@ -597,7 +799,7 @@ class App:
         input + ``DummyOutput``) can drive the loop without a real terminal.
         """
 
-        return Application(
+        application: Application = Application(
             layout=self._select_layout(),  # type: ignore[arg-type]
             key_bindings=self.key_bindings,
             full_screen=True,
@@ -605,6 +807,40 @@ class App:
             input=input,
             output=output,
         )
+        # A fatal catalog failure found at PAINT time (not on a keystroke) has no
+        # key handler to swap the screen and exit for it, so without this hook the
+        # app would sit on the main layout forever. The hook renders the fatal
+        # screen and then exits non-zero (see _catalog_fatal_guard).
+        application.after_render += self._catalog_fatal_guard
+        return application
+
+    def _catalog_fatal_guard(self, _sender: object) -> None:
+        """Swap to the S-catalog-fatal screen, then exit the run loop non-zero.
+
+        Registered on ``Application.after_render``. The frame that DISCOVERED the
+        failure was already laid out for S-main (the layout was chosen before
+        ``_nav_text`` ran), so this swaps in :func:`views.build_catalog_fatal_view`
+        first — otherwise the operator would only ever see the terse
+        ``"(cao could not be run)"`` in the nav pane and never the fatal screen's
+        actual guidance. Mirrors what the Enter-key fatal path does.
+
+        Idempotent on both halves: the screen check keeps it inert on every normal
+        frame, ``_screen_applied_for_fatal`` stops the swap from re-entering on the
+        frame it schedules, and exiting an already-exiting application is a no-op.
+        """
+
+        if self.state.screen != "catalog_fatal":
+            return
+        if not self._fatal_screen_applied:
+            # Swap the layout to the fatal view. Done BEFORE exiting (and in the
+            # same callback) so the exit cannot be pre-empted by a keystroke that
+            # is already queued — waiting for a second frame would let a pending
+            # `[q]` quit with EXIT_OK and lose the fatal code.
+            self._fatal_screen_applied = True
+            self._apply_screen()
+        application = self.application
+        if application.is_running and not application.is_done:
+            application.exit(result=EXIT_CATALOG_FATAL)
 
     def run(
         self,

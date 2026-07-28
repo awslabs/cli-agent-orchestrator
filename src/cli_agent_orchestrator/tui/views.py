@@ -17,8 +17,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.filters import FilterOrBool
 from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
-from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.containers import ConditionalContainer
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.widgets import Frame
 
@@ -36,9 +39,13 @@ TextProvider = Callable[[], str]
 SERVER_START_COMMAND = "cao-server"
 
 # Global key map, shown in the footer. ``[s]`` is intentionally absent
-# (RD-e=A: no status pane / no status key).
+# (RD-e=A: no status pane / no status key). Up/Down move the SELECTION and Esc
+# goes back a level; Tab/S-Tab move pane focus. The hint must keep naming only
+# affordances that actually work — before the P1 fix it advertised ``[e]``/``[/]``
+# while neither captured any input.
 KEY_MAP_HINT = (
-    "arrows/Tab: focus  |  Enter: activate  |  [c] copy  |  [e] edit  " "|  [/] search  |  [q] quit"
+    "arrows: select  |  Tab: pane  |  Enter: activate  |  Esc: back  "
+    "|  [c] copy  |  [e] edit  |  [/] search  |  [q] quit"
 )
 
 # First-open guiding copy for the main body (S-main empty variant). Reinforces
@@ -136,6 +143,9 @@ def build_layout(
     build_text: Optional[TextProvider] = None,
     preview_text: Optional[TextProvider] = None,
     preflight_text: Optional[TextProvider] = None,
+    input_buffer: Optional[Buffer] = None,
+    input_prompt: Optional[TextProvider] = None,
+    input_visible: FilterOrBool = False,
 ) -> Layout:
     """Assemble the main three-region shell, wiring live text providers.
 
@@ -155,6 +165,14 @@ def build_layout(
         preview_text: Provider for the preview pane (default: empty).
         preflight_text: Provider for the footer pre-flight line (default: guiding
             copy).
+        input_buffer: The live :class:`~prompt_toolkit.buffer.Buffer` the ``[e]``
+            edit / ``[/]`` search overlay reads. The App owns it (and attaches its
+            completer); ``views`` only renders it. ``None`` omits the overlay row
+            entirely, which keeps the pre-overlay call signature working.
+        input_prompt: Provider for the overlay's prompt label (e.g. ``"search: "``).
+        input_visible: Filter deciding whether the overlay row is shown — the App
+            passes a condition over its own capture state, so ``views`` still
+            imports no model.
     """
 
     nav_provider = nav_text or _default_nav_text
@@ -214,7 +232,34 @@ def build_layout(
     )
     foot = HSplit([preflight_line, keymap_line])
 
-    root = HSplit([header, body, foot])
+    # The ``[e]`` edit / ``[/]`` search capture row: a single line between the
+    # body and the footer, shown only while a capture is active. Keeping it inline
+    # (rather than swapping screens) means the operator watches the list narrow as
+    # they type. The buffer belongs to the App — this is the LIVE input surface
+    # that makes ``set_arg``/``apply_search`` reachable by keyboard, and whose
+    # completer is the App's ``ArgCompleter``.
+    rows = [header, body]
+    if input_buffer is not None:
+        prompt_provider = input_prompt or (lambda: "> ")
+        rows.append(
+            ConditionalContainer(
+                content=VSplit(
+                    [
+                        Window(
+                            content=FormattedTextControl(text=lambda: prompt_provider()),
+                            height=1,
+                            dont_extend_width=True,
+                            style="reverse",
+                        ),
+                        Window(content=BufferControl(buffer=input_buffer), height=1),
+                    ]
+                ),
+                filter=input_visible,
+            )
+        )
+    rows.append(foot)
+
+    root = HSplit(rows)
     # Focus the nav frame's inner window first (keyboard-only entry point).
     return Layout(root, focused_element=nav.body)
 
