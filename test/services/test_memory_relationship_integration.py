@@ -70,7 +70,7 @@ def _seed_memory(db_engine, key, scope="global", scope_id=None, body=None, body_
 
     This signature deliberately refuses to accept-and-discard a body. An earlier
     version took ``body="body"`` and silently dropped it, which made every
-    "the secret must not leak" assertion pass vacuously — the secret had never
+    "the body must not leak" assertion pass vacuously — the body had never
     been written anywhere. If you pass ``body`` you MUST pass ``body_dir``.
     """
     if body is not None and body_dir is None:
@@ -495,29 +495,29 @@ def test_s1_composed_path_and_content_free(bound, db_engine, tmp_path):
     projectable and every read surface (list DTO, active_targets) exposes only
     content-free fields — no body/body_hash/prompt.
 
-    The secret is written to the seeded memories' real FILES, and those files are
+    The canary body is written to the seeded memories' real FILES, and those files are
     reachable from the store's own rows (``memory_metadata.file_path``). That is
     what gives this assertion a genuine failure mode: a projection that resolved
     an endpoint's ``file_path`` and inlined its content — the plausible way this
     boundary would actually leak — turns the test RED.
 
-    Guarding the guard: the test asserts the secret IS retrievable through the
+    Guarding the guard: the test asserts the canary IS retrievable through the
     row before asserting the DTO omits it. Without that first assertion the
     whole check passes vacuously whenever the content was never stored, which is
     precisely the defect this test previously had (it passed a ``body`` argument
     that ``_seed_memory`` silently discarded).
     """
-    secret = "SECRET BODY TEXT that must never leak"
+    canary_body = "CANARY-MARKER-4f2a memory body text that must never leak"
     for k in ("a", "b"):
-        _seed_memory(db_engine, k, body=secret, body_dir=tmp_path / "wiki")
-    # PRE-ASSERTION: the secret is genuinely stored and reachable from the row,
+        _seed_memory(db_engine, k, body=canary_body, body_dir=tmp_path / "wiki")
+    # PRE-ASSERTION: the canary body is genuinely stored and reachable from the row,
     # so "not in the DTO" is a real claim about the projection.
     Session = sessionmaker(bind=db_engine)
     s = Session()
     try:
         row = s.query(MemoryMetadataModel).filter(MemoryMetadataModel.key == "a").first()
         assert row is not None and row.file_path
-        assert secret in Path(row.file_path).read_text(
+        assert canary_body in Path(row.file_path).read_text(
             encoding="utf-8"
         ), "content must actually exist behind the row, or the leak check is vacuous"
     finally:
@@ -528,12 +528,12 @@ def test_s1_composed_path_and_content_free(bound, db_engine, tmp_path):
     # active_targets is the See-Also/recall projection helper
     targets = svc.active_targets("global", None, "a")
     assert targets == ["b"]
-    assert secret not in str(targets), "active_targets must project keys only, never content"
+    assert canary_body not in str(targets), "active_targets must project keys only, never content"
     dto = svc.list_relationships("global", None, "a")[0]
     d = dto.to_dict()
     for forbidden in ("body", "body_hash", "prompt", "content", "file_path"):
         assert forbidden not in d, f"DTO must be content-free ({forbidden})"
-    assert secret not in str(d), "no memory body may leak into the DTO"
+    assert canary_body not in str(d), "no memory body may leak into the DTO"
 
 
 def test_secs12_audit_written_and_content_free(bound, db_engine, tmp_path, monkeypatch):
