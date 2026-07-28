@@ -850,18 +850,16 @@ def test_superseded_keys_does_not_cross_project_scope_ids(bound, db_engine, monk
     p1_mem, p2_mem = _mem("guide", "p1"), _mem("guide", "p2")
     hits = svc._superseded_keys([p1_mem, p2_mem])
 
-    # BEHAVIOURAL assertion: the demotion predicate recall actually applies must
-    # mark p1's copy and spare p2's. Expressed exactly as the recall sort does,
-    # so this fails for a set keyed too loosely REGARDLESS of tuple arity.
-    def _is_demoted(m):
-        return (m.scope, svc._effective_scope_id(m), m.key) in hits or (
-            m.scope,
-            m.key,
-        ) in hits
-
-    assert _is_demoted(p1_mem), "p1's superseded copy must be demoted"
-    assert not _is_demoted(
-        p2_mem
+    # BEHAVIOURAL assertion driving the PRODUCTION predicate (``_is_superseded``,
+    # which recall's demotion sort key calls) — NOT a local re-expression of it.
+    # An earlier version of this test defined its own ``_is_demoted`` that OR-ed
+    # in the loose ``(scope, key)`` form; that made it pass even when the real
+    # sort key was mutated back to the cross-project-demoting comparison, so it
+    # proved only that ``_superseded_keys`` was well-formed. Calling the shipped
+    # predicate is what gives this test a genuine failure mode.
+    assert svc._is_superseded(p1_mem, hits), "p1's superseded copy must be demoted"
+    assert not svc._is_superseded(
+        p2_mem, hits
     ), "p2's untouched copy must NOT be demoted — a (scope, key) set cross-project-demotes it"
     # And the identity stored is the full 3-tuple.
     assert ("project", "p1", "guide") in hits

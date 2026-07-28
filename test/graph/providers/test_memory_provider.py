@@ -273,6 +273,48 @@ class TestMemoryProviderEdgeCases:
         assert view.edges == [], "an edge whose target is outside the node set must be dropped"
 
     @pytest.mark.asyncio
+    async def test_relationship_read_is_bounded_to_the_node_set(
+        self, populated_scope, db_engine, monkeypatch
+    ):
+        """FR-2.3a (efficiency): the provider must push the node-set filter INTO
+        the query, not fetch every active row and discard the surplus in Python.
+
+        This is an over-read, so a correctness test cannot catch it: filtering
+        in Python yields exactly the same graph, just after reading the whole
+        (scope, scope_id). The guard therefore asserts on the CALL at the
+        service boundary — that ``source_keys`` is passed and carries this
+        projection's node set. ``list_relationships`` accepting the parameter is
+        a different (already covered) claim; nothing else proved the provider
+        actually uses it.
+        """
+        from cli_agent_orchestrator.services import memory_relationship_service as _mrs
+
+        seen = {}
+        real = _mrs.MemoryRelationshipService.list_relationships
+
+        def _recording(self, scope, scope_id, **kw):
+            seen["source_keys"] = kw.get("source_keys", "MISSING")
+            return real(self, scope, scope_id, **kw)
+
+        monkeypatch.setattr(_mrs.MemoryRelationshipService, "list_relationships", _recording)
+        _disable_llm(monkeypatch)
+        provider = MemoryGraphProvider(memory_service=populated_scope)
+
+        view = await provider.project(scope="global")
+
+        assert seen.get("source_keys") not in (
+            "MISSING",
+            None,
+        ), "the relationship read must be bounded by source_keys, not load the whole scope"
+        assert set(seen["source_keys"]) == {
+            "a",
+            "b",
+            "c",
+        }, f"source_keys must carry this projection's node set, got {seen['source_keys']}"
+        # And the bound must not have cost us the real edge.
+        assert [(e.source, e.target) for e in view.edges] == [("a", "b")]
+
+    @pytest.mark.asyncio
     async def test_session_scope_id_filters_shared_index(self, svc, db_engine, monkeypatch):
         """FR-9(c): session/agent entries live in the shared global index
         with scope_id embedded in the entry path; projecting one session

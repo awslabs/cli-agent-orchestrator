@@ -1601,6 +1601,20 @@ class MemoryService:
                 out.add((g_scope, g_scope_id, k))
         return out
 
+    def _is_superseded(self, m, superseded: set) -> bool:
+        """The demotion predicate recall's sort key applies to ONE memory.
+
+        Extracted so the cross-project regression test can drive the REAL
+        predicate. A test that re-expresses this comparison locally cannot fail
+        when the production sort key is keyed too loosely — it proves only that
+        ``_superseded_keys`` is well-formed, which is a different claim.
+
+        Identity is the FULL ``(scope, scope_id, key)`` 3-tuple: a ``(scope,
+        key)`` comparison lets one project's supersedes edge demote a
+        same-named memory in a DIFFERENT project's scope_id.
+        """
+        return (m.scope, self._effective_scope_id(m), m.key) in superseded
+
     def _expand_related(self, primaries: list) -> list:
         """One-level cross-reference traversal for ``recall(include_related=True)``.
 
@@ -2012,13 +2026,7 @@ class MemoryService:
                         # Full (scope, scope_id, key) identity — see
                         # _superseded_keys. A (scope, key) comparison would
                         # cross-project-demote a same-named memory.
-                        results.sort(
-                            key=lambda m: (
-                                1
-                                if (m.scope, self._effective_scope_id(m), m.key) in superseded
-                                else 0
-                            )
-                        )
+                        results.sort(key=lambda m: 1 if self._is_superseded(m, superseded) else 0)
                 except Exception as e:  # noqa: BLE001 — non-blocking
                     logger.debug(f"superseded demotion skipped: {e}")
             if not scope:
