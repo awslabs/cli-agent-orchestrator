@@ -19,7 +19,9 @@ v4, never shape-derived); Lane B session-card header composition pinned in
 round 8 (selectable metadata + dedicated chevron toggle, owner-approved);
 Lane A live results reconciled in round 9 (D1 paced menus, D2 no `/model`
 reasoning selector on 0.29.2, D3 mid-turn steer forms, L1 Home/End, F1
-pin scope, OD2/OD5 resolved live); implementation NOT green-lit — a fresh
+pin scope, OD2/OD5 resolved live); cond-0031 steer-state plan added in
+round 10 (§4.2: state-aware activation, no blind replay, truthful
+outcomes); implementation NOT green-lit — a fresh
 Fable-5/Ultracode exact-head delta approval is the required next gate)
 
 Task ID: `native-tui-console/spec-initial-v1`
@@ -783,6 +785,80 @@ do not trip on it, and the wire-consistency fix is §17 backlog.
 
 The registry Compact built-in (§5.5) is command-class and gains this
 guard; the stop built-in (a bare key) is unaffected.
+
+### 4.2 State-aware steer activation — the cond-0031 plan (r10)
+
+Origin: existing P1 **cond-0031** (cross-ref **cond-0072** — a delivered
+row can remain outside the model turn), live evidence 2026-07-28: v2
+text+C-s controls `root-lane-a-native-status-024` (terminal `0e803ed3`)
+and `root-lane-b-native-status-023` (terminal `2e267118`) posted into
+**idle** Kimi composers and parked (steer envelopes record schema v2,
+chord `C-s`, text+key posted, `resolution: null`); after an exact
+identity/capability recheck, separate fresh schema-v3 key-only Enter
+controls activated each exactly once — with **no** original-text replay.
+This section is the docs-only plan for that issue; it does not file a
+duplicate and does not broaden Lane A/B/C scope.
+
+1. **The steer effect is state-dependent (grounded).** The deployed v2
+   path treats the chord as "the … submit/steer effect … the chord presses
+   the provider-pinned key that submits or steers it"
+   (`control_input_service.py:2995-3034`). Live evidence proves that on
+   Kimi the effect is steer-only: `C-s` steers an **active turn** and is
+   ineffective against an **idle** receiver — the text rests in the
+   composer unsubmitted. The v1/v2 path has **no turn-state readiness
+   gate** (§1.2 gate scope), so choosing the correct activation form is
+   the *caller's* obligation, and `accepted` + `chord_sent` must never be
+   read as "entered the turn".
+2. **State-aware selection rule (caller discipline, pinned):** classify
+   the receiver through the deployed turn-state observation (the readiness
+   gate's own detector) immediately before choosing the form:
+   - **Active turn** → steer forms: v2 control (`text`+`chord`,
+     `enter:false`) for steer-with-text, or bare v3 `[chord C-s]` (pure
+     interrupt-class) for chord-only — both live-proven (§10.3 D3).
+   - **Idle/completed** → the same operator intent is an ordinary
+     message: composer-class submission (text+Enter, v1 or v3), which is
+     readiness-gated and submits. **Never** a steer chord against an idle
+     receiver.
+   - **Unknown/unobservable state** → no chord: use the composer-class
+     form (the gate arbitrates busy-ness honestly) or refuse and ask.
+     Never a blind steer chord.
+3. **Identity/lease binding (unchanged).** Every form rides the same
+   9-field identity, pane-input lease, journal intent/claim, exact-id
+   reconcile. An activation after a park is a **separate fresh control** —
+   new `control_id`, fresh `expected_identity`, its own lease and journal
+   intent — never a continuation, replay, or re-use of the parked
+   control's id.
+4. **No blind replay (park recovery discipline):** (a) reconcile the
+   parked control by exact id — the durable record is the truth of what
+   posted; (b) re-prove identity and capability fresh; (c) observe the
+   composer holds exactly the expected parked text (pane capture, the
+   §4.1 observation primitive); (d) only then send a fresh key-only Enter
+   (v3 `[key Enter]`), activating the existing text exactly once — an
+   ordinary message submission, not a steer; (e) if the composer does not
+   hold the expected text → stop and report; the operator decides. The
+   original payload is **never** retyped automatically — retyping into a
+   composer that already holds it doubles the text.
+5. **Truthful outcomes.** A control's record distinguishes transport
+   acceptance from turn entry, using the deployed submission vocabulary:
+   `submitted` (the composer/turn provably took the text), `unsubmitted`
+   (the text provably rests in the composer — the park signature),
+   `unknown` (unobserved → ambiguous class, manual reconcile). **A posted
+   input plus an ineffective chord remains unresolved** — never recorded
+   as entered or completed, and `unsubmitted`/`unknown` never upgrade
+   later. Server-side pin for the steer path (future Lane-A-adjacent work,
+   **not** PR #48 scope): a v2 steer result on kimi includes the
+   post-chord composer observation where provable (text left the composer
+   vs. still present) instead of today's unobserved null.
+6. **Focused acceptance (§10.3).** Installed Kimi, **idle** target: v2
+   text+C-s posts and parks (record carries `unsubmitted`); a fresh v3
+   key-only Enter after identity/capability recheck submits **exactly
+   once** (transcript shows one submission, no doubled text). **Active**
+   target: v2 steer accepted with the steer observable mid-stream.
+   **State-transition race:** the turn completes between selection and
+   delivery → the control lands unresolved (`unsubmitted`), the
+   activation Enter activates it once, and the record never claims
+   entered-before-activation. No replay anywhere: a second activation is
+   never sent without the fresh identity+content proof.
 
 ## 5. Durable operator macro persistence (Lane B)
 
@@ -1630,6 +1706,15 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
   (composer-emptiness pin scope, §4.1). The §6.4 grace pause behavior was
   verified live end-to-end (post-Enter batch refused `pane-busy`, paced
   navigation accepted after the grace).
+- **Steer-state acceptance (cond-0031, §4.2):** installed Kimi — idle
+  target: v2 `text`+`C-s` (`enter:false`) posts and parks, the record
+  carries `unsubmitted`, and a fresh v3 key-only Enter after
+  identity/capability recheck submits exactly once (transcript shows one
+  submission, no doubled text); active target: v2 steer lands mid-stream;
+  race: a turn completing between selection and delivery leaves the
+  control unresolved (never "entered"), activated once by the Enter
+  discipline; no second activation without the fresh identity+content
+  proof.
 
 ### 10.4 Web unit + component (Lane B; vitest)
 
@@ -1913,6 +1998,17 @@ jobs with the two projects of §10.5.
   schema v4 (own digest domain, v2-chord amendment pattern); command-class
   is never shape-derived, so streamed prose beginning `/` can never trip
   the guard.
+- **F15 (P1, planned in r10):** cond-0031 (cross-ref cond-0072) — a v2
+  text+C-s steer control against an **idle** Kimi receiver parks the text
+  (the chord steers only an active turn), while `accepted`+`chord_sent`
+  reads as if it entered. Live evidence: steer envelopes
+  `root-lane-a-native-status-024` / `root-lane-b-native-status-023`
+  (posted, `resolution: null`), each activated exactly once afterward by a
+  fresh v3 key-only Enter with no text replay. The §4.2 plan pins
+  state-aware selection, separate-fresh-control activation, no blind
+  replay, truthful `submitted`/`unsubmitted`/`unknown` outcomes, and
+  focused acceptance. The v1/v2 path carries no turn-state gate (§1.2), so
+  selection is caller discipline plus the pinned future steer-observation.
 
 ## 15. Challenges applied (per track mandate)
 
