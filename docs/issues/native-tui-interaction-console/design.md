@@ -17,7 +17,9 @@ typed sub-reason); command declaration carrier added in round 7
 (P1-Δ2, root-confirmed: optional `payload_class: "command"` under schema
 v4, never shape-derived); Lane B session-card header composition pinned in
 round 8 (selectable metadata + dedicated chevron toggle, owner-approved);
-implementation NOT green-lit — a fresh
+Lane A live results reconciled in round 9 (D1 paced menus, D2 no `/model`
+reasoning selector on 0.29.2, D3 mid-turn steer forms, L1 Home/End, F1
+pin scope, OD2/OD5 resolved live); implementation NOT green-lit — a fresh
 Fable-5/Ultracode exact-head delta approval is the required next gate)
 
 Task ID: `native-tui-console/spec-initial-v1`
@@ -434,8 +436,8 @@ A.1-A.3):
 | Wire name | tmux `send-keys` arg | Bytes the pane receives | Mode dependence | Gate class |
 |---|---|---|---|---|
 | `Up`/`Down`/`Right`/`Left` | same | `ESC[A/B/C/D` | tmux emits `ESC O A/B/C/D` (SS3) when the pane application set DECCKM application-cursor mode; correct for both readline-style and fullscreen TUIs — tmux performs the translation, the spec does not | composer |
-| `Home` | `Home` | `ESC[1~` | **not** DECCKM-switched by tmux (hard-coded, Appendix A.3); live acceptance must confirm the pinned provider menus accept it (F4) | composer |
-| `End` | `End` | `ESC[4~` | same caveat | composer |
+| `Home` | `Home` | `ESC[1~` | **not** DECCKM-switched by tmux (hard-coded, Appendix A.3); live answer (L1, r9): byte-exact delivery proven, but kimi 0.29.2's `/model` menu does not consume it — transport guaranteed, menu effect not promised | composer |
+| `End` | `End` | `ESC[4~` | same live answer (works in the composer line editor) | composer |
 | `PageUp` | `PageUp` (alias `PPage`) | `ESC[5~` | none | composer |
 | `PageDown` | `PageDown` (alias `NPage`) | `ESC[6~` | none | composer |
 | `Delete` | `Delete` (alias `DC`) | `ESC[3~` | none | composer |
@@ -689,7 +691,21 @@ value, a non-string value, or a declared command whose events do not match
 the grammar — is a typed refusal **`malformed-command-declaration`** (new
 reason, bound to `REFUSED`: decided before any write, zero bytes,
 reattemptable). It is never approximated into prose and never executed
-partially.
+partially. (Implementation note, accepted r9: this refusal is answered
+**pre-identity and ephemerally** — like the deployed `request-rebound`
+refusal it is not journaled; a re-attempt re-refuses identically, and the
+journaled `composer-nonempty` refusal remains the durable, exact-id
+reconcilable one.)
+
+**Live-verified pin scope (r9, from Lane A evidence):** composer-emptiness
+determinations exist for exactly **kimi 0.29.2** (the rounded composer box
+`╭─╮ / │ > … │ / ╰─╯` on the escape-free capture — the older
+`── input ──` fixture rule did not match the installed bundle, and the
+guard failed closed until the pin was corrected from live evidence) and
+**claude 2.1.220** (prompt-box on a styled capture distinguishing the dim
+placeholder from normal-video prefill). **kimi 0.29.0/0.29.1 are honestly
+unpinned** — declared commands there refuse `provider-unsupported` until
+live-verified, never guessed (rule 4).
 
 **Rules.**
 
@@ -742,7 +758,13 @@ partially.
 4. **Advertisement and compatibility.** Additive capability block
    `"command_controls": { "composer_nonempty_guard": true }` alongside
    `provider_controls`, and `4` joins `request_schema_versions`, when Lane
-   A lands the carrier. **The client sends `payload_class` only when the
+   A lands the carrier. The top-level block is discovery; the
+   **per-terminal** block on `control-identity` is the honest per-build
+   signal — it reports `"composer_nonempty_guard": false` when the
+   terminal's provider build has no emptiness pin (accepted r9 deviation:
+   emitted explicitly rather than omitted), and Lane B greys/hides
+   command controls accordingly. **The client sends `payload_class` only
+   when the
    block is advertised** — never earlier, never as a shape probe. An old
    server without the block offers no guard and receives no v4 field: the
    client must say so where a command control is offered
@@ -751,6 +773,13 @@ partially.
    byte-identical). A provider/build without a proven emptiness
    determination refuses command-class controls `provider-unsupported`
    rather than guessing. No guessing based on payload shape, ever.
+
+**Known limitation (accepted r9; no safety impact):** the journal schema
+is unchanged (§11) and stores no `payload_class`, so a v4 record replayed
+via `GET /control-input/{id}` reports `request_schema_version: 3` while
+the direct answer reports 4. The digest still binds the declaration
+(rebound protection intact); the discrepancy is documented here so clients
+do not trip on it, and the wire-consistency fix is §17 backlog.
 
 The registry Compact built-in (§5.5) is command-class and gains this
 guard; the stop built-in (a bare key) is unaffected.
@@ -1524,22 +1553,41 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
 ### 10.3 Installed provider acceptance (Lane A + supervisor-run;
 `require_kimi` / `require_claude` fixtures, real `cao_server`)
 
-- Disposable **Kimi** native-TUI session (pinned 0.29.x):
-  `text("/model") enter up*3 enter` changes the model selection
-  deterministically; `text("/model") enter left*2 right enter` changes the
-  reasoning level (over-navigate-to-edge sequences from the brief);
-  `text("Please reconsider this path") ctrl+s` steers mid-turn; `escape`
-  interrupts streaming output (OD2 verification — if the pinned build's menu
-  or interrupt behavior differs, the registry is corrected and the deviation
-  recorded here before Lane A closes).
+- Disposable **Kimi** native-TUI session (pinned 0.29.x): `/model` menu
+  navigation changes the model selection deterministically **when paced**
+  (separate requests at human cadence — live D1: an all-at-once fused
+  `text("/model") enter up*3 enter` is delivered byte-exact but races the
+  picker mount; the fused form remains a valid *transport* acceptance, the
+  deterministic *menu outcome* acceptance is the paced form; the
+  text+Enter fusion contract is untouched). **Reasoning/effort is not a
+  `/model` Left/Right selector on 0.29.2** (live D2: the model row renders
+  a single `Thinking [ On ]` segment and Left/Right are no-ops; effort
+  changes ride the separate `/effort` command — the brief's
+  `left*2 right enter` example does not exist on this build and is
+  corrected, not approximated). **Mid-turn steer (live D3):** a fused v3
+  `[text, chord]` batch is composer-gated and refused `pane-busy` mid-turn
+  by design (§3.2); the supported mid-turn forms are the deployed **v2
+  steer control** (`text`+`chord`, `enter:false` — live-proven,
+  `chord_sent: true`) and a bare v3 `[chord C-s]` sequence (pure
+  interrupt-class). Lane B implication (called out, no contract change): a
+  text+chord favorite/macro delivers only when the receiver is
+  idle/completed — an honest gate refusal, not a bypass; true mid-turn
+  steer-with-text rides the deployed v2 path, which a later registry row
+  may expose as a product decision. `escape`
+  interrupts streaming output — **OD2 verified live**: kimi shows
+  `Interrupted by user`; claude's spinner disappears (2.1.220 leaves no
+  textual marker; spinner-gone is the observable).
 - Disposable **Claude** native-TUI session: built-in Compact executes;
-  `escape` interrupts ("esc to interrupt").
+  `escape` interrupts (spinner-gone observable, above).
 - Codex: no native-TUI path exists (§1.4); acceptance asserts the registry
   advertises no codex entry and the dashboard hides the built-ins with the
   stated reason (OD3).
-- Home/End against both providers' menus (F4): if a pinned build requires
-  SS3 Home/End, record the limitation, restrict the registry, and refuse
-  honestly rather than approximating.
+- **Home/End live answer (L1; closes F4/OD5):** delivery is byte-exact
+  (`ESC[1~`/`ESC[4~`, proven in §10.2 — tmux's non-DECCKM-switched
+  encoding is *not* a defect); kimi 0.29.2's `/model` menu simply does not
+  consume Home/End (selection unmoved), while the composer line editor
+  does. Keyboard transport guarantees stand; no menu effect is promised
+  and no registry restriction is needed (none was pinned).
 - **Streaming-cadence acceptance (new, the §3.2 gate-class verification):**
   against a disposable Kimi native-TUI session, stream (as separate batches,
   not one fused request) `text("/model") enter`, then several `Up`/`Down`
@@ -1570,6 +1618,18 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
   and shows the guard-absent statement; old client against the new server
   is unchanged). Keep the Kimi/Claude live command acceptance (declared
   Compact against an empty composer executes).
+- **Live execution record (Lane A, head `d79785f`, 2026-07-28):** this
+  acceptance ran on this host against kimi 0.29.2 and claude 2.1.220 (15
+  cases; 14 pass + 1 red-by-design that caught and corrected the F1
+  composer pin). Evidence:
+  `docs/issues/native-tui-interaction-console/evidence/lane-a-10.3/` (on
+  `feature/native-tui-console-lane-a`, per-case directories with sanitized
+  captures and exact request/response JSON). Outcomes folded into this
+  spec: D1 (paced menu delivery), D2 (no `/model` reasoning selector on
+  0.29.2), D3 (mid-turn steer forms), L1 (Home/End), OD2 observables, F1
+  (composer-emptiness pin scope, §4.1). The §6.4 grace pause behavior was
+  verified live end-to-end (post-Enter batch refused `pane-busy`, paced
+  navigation accepted after the grace).
 
 ### 10.4 Web unit + component (Lane B; vitest)
 
@@ -1734,10 +1794,11 @@ jobs with the two projects of §10.5.
   **Needs product sign-off** that "supported multi-modifier chords" is
   satisfied by "the registry mechanism + refusal honesty, zero admitted
   chords today".
-- **OD2 — Kimi Stop key.** Escape per the official keyboard reference
-  (Appendix A.6); Ctrl+C also documented. Spec picks Escape (single key,
-  consistent with Claude/Codex hints). §10.3 live acceptance is the
-  verification; failure corrects the registry.
+- **OD2 — RESOLVED live (r9, Lane A case-06/13).** Kimi Stop = Escape
+  verified: kimi 0.29.2 shows `Interrupted by user` on Escape mid-turn;
+  claude 2.1.220's spinner disappears (this build leaves no textual
+  marker — spinner-gone is the pinned observable). Registry Stop entries
+  stand as pinned.
 - **OD3 — Codex built-ins.** No codex native control adapter or native-TUI
   launch binder exists on this base (§1.4), so codex Compact/Stop cannot be
   delivered through the managed path. The brief's "as supported" phrasing is
@@ -1747,10 +1808,13 @@ jobs with the two projects of §10.5.
 - **OD4 — Coalesce defaults.** 200 ms quiet window / 48-char text flush are
   starting values, server-advertised (§3.5) so they can be tuned without a
   client release.
-- **OD5 — Home/End encoding.** tmux injects `ESC[1~`/`ESC[4~` regardless of
-  the pane's DECCKM mode (Appendix A.3, source-observed, not
-  man-page-documented). Live acceptance (§10.3) verifies the pinned provider
-  menus accept it; the fallback is registry restriction, never approximation.
+- **OD5 — RESOLVED live (r9, L1).** tmux injects `ESC[1~`/`ESC[4~`
+  regardless of the pane's DECCKM mode (Appendix A.3, source-observed, not
+  man-page-documented). Live §10.2/§10.3 prove the bytes arrive exactly
+  as pinned; kimi 0.29.2's `/model` menu does not consume Home/End (its
+  own binding gap, not an encoding defect), while the composer line
+  editor consumes them. Keyboard transport guarantees stand; no menu
+  effect is promised anywhere; no registry restriction was needed.
 - **OD6 — Operator-message at-most-once store.** §8.3 pins the provider
   adapter's operation store (deployed, journaled, reconcile-ready) rather
   than a third journal. Review noted the trade (Fable B2): one
@@ -1936,6 +2000,21 @@ Technical backlog (recorded; each names its trigger for promotion):
 - **B9 — §5 macro validation must also run the service-layer key/chord
   membership screens** (contract normalization deliberately skips
   membership), so an unsendable macro cannot be saved.
+- **B10 — v4 GET replay wire consistency:** the journal stores no
+  `payload_class`, so a replayed v4 record reports `request_schema_version:
+  3` (§4.1 known limitation, accepted r9). A later journal-schema revision
+  may persist the declaration; the digest binding already protects
+  rebound, so this is consistency, not safety.
+- **B11 — Macro pacing directive (D1 product decision):** menu-navigation
+  macros sent as one fused sequence race picker mounts (kimi live D1);
+  deterministic menu automation today uses paced sends (streaming or
+  separate requests). Whether the macro player gains an explicit pacing
+  directive (e.g. a per-macro paced-send flag splitting one macro into
+  timed batches) is an owner product decision, not pinned here.
+- **B12 — kimi 0.29.0/0.29.1 composer-emptiness pins:** declared commands
+  refuse `provider-unsupported` on those builds until their composer
+  regions are live-verified (§4.1 pin scope); the verification is a small
+  future live pass, not a guess.
 
 Deferred P3/P4 (noted by review; no action this round): wheel-filter
 shape-only matching; `CAO_HOME_DIR/tmp/{terminal_id}.*` as an additional
