@@ -45,6 +45,7 @@ source disagreed, the source won and the divergence is named in §13
 | `origin` remote | `https://github.com/colindmurray/cli-agent-orchestrator.git` |
 | `upstream` remote | AWS Labs repository (read-only reference) |
 | PR target | `origin/main` via the integration branch (§9) |
+| Integration head (r13) | `ada0d1982cb00dbef5492bc4a1c0d0ed2debfc3e` on `origin/feature/native-tui-interaction-console` — Lane A (PR #48), r9-r12 docs, and Lane B (PR #47, seamed at `6fc348e`, merged 2026-07-28) are all integrated; supersedes the r12 row below |
 | Integration head (r12) | `8687af27ee0bcd5d7f37b46f0bee2061260762bf` on `origin/feature/native-tui-interaction-console` (Lane A merged, PR #48); Lane B (PR #47, `8c2d4a0`) serializes next per §9's seam |
 | Canonical document | this file, on the design branch |
 | Visual baseline for Lane C | `docs/issues/native-tui-interaction-console/baseline-dashboard.png` (operator screenshot of the deployed dashboard, 2026-07-27; **predates the cond-0175 recorder row** — the deployed bundle renders that row whenever the native composer is visible, so the current render has one more control row than the image shows. The image remains authoritative for the compact single-composer footprint; §10.5 visual acceptance measures the current deployed render — F13) |
@@ -1603,6 +1604,21 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
 
 ### Integration status and the Lane B seam (r12, verified topology)
 
+- **r13 update — integration complete through Lane B:** canonical head
+  `ada0d1982cb00dbef5492bc4a1c0d0ed2debfc3e` (merge of PR #47,
+  2026-07-28) contains Lane A (PR #48), the r9-r12 docs merge
+  (`b796043`), and the Lane B seam (`6fc348e`): duplicate
+  `macro_notation.py`/`macro_builtins.py` removed, the approved repeat
+  fix ported onto Lane A's canonical parser (pre-conversion >2-digit
+  rejection, offset-422 never-500), `macro_store.py` synthesized from
+  `services/provider_controls.py`, Lane A's parse-notation route kept,
+  `/macros` CRUD additive, golden vectors carrying the `up*100`/30-digit
+  cases byte-identical across TS/Python. **Lane C is not implemented at
+  this head** (only the future-facing `provider_controls` docstring
+  exists; no attachment/operator-message routes, branch, or PR) — the
+  Lane C image/operator-message PR starts next as its own isolated lane
+  per §9, and upload checks belong to its acceptance, not to the current
+  A+B QA checkpoint.
 - **Lane A merged** into the integration branch at
   `8687af27ee0bcd5d7f37b46f0bee2061260762bf` (PR #48, final exact-head
   Sol/high review at `7b3674f44f0289aedb9cfca67638fd951396b1d6`; includes
