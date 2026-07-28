@@ -15,7 +15,9 @@ adjudicated per steer `root-r6-p2-cheap-015` — gate-retry interval is a
 client-pinned constant, no protocol growth; discriminators pinned, no
 typed sub-reason); command declaration carrier added in round 7
 (P1-Δ2, root-confirmed: optional `payload_class: "command"` under schema
-v4, never shape-derived); implementation NOT green-lit — a fresh
+v4, never shape-derived); Lane B session-card header composition pinned in
+round 8 (selectable metadata + dedicated chevron toggle, owner-approved);
+implementation NOT green-lit — a fresh
 Fable-5/Ultracode exact-head delta approval is the required next gate)
 
 Task ID: `native-tui-console/spec-initial-v1`
@@ -1150,6 +1152,29 @@ Global: [Compact] [Stop]   Kimi: [Steer] [Model K2.7]   This agent: [Max effort]
 - Honor `prefers-reduced-motion` for the streaming indicator animation.
 - Lane C additions in §8.7 item 8.
 
+### 7.6 Session-card header (Lane B dashboard composition, r8 owner-approved)
+
+Ground truth: the deployed session card (`DashboardHome.tsx:392-412`) makes
+the **entire header one toggle `<button>`** wrapping the chevron, session
+name, agent count, type badges, status summary, and timestamps — so header
+text cannot be selected without toggling the card. Lane B re-composes it:
+
+- The header is a plain container (no button role). **All displayed
+  metadata — name, badges, counts, status summary, timestamps — is
+  selectable/copyable text** (`user-select: text`, default cursor).
+  Clicking, double-clicking, or drag-selecting any metadata **must not**
+  expand/collapse the card (no click handler on the container or metadata).
+- Expand/collapse belongs **exclusively** to a dedicated chevron
+  `<button>`: accessible name including the session name (e.g.
+  `aria-label="Expand session cao-fleet"` / `"Collapse session cao-fleet"`
+  — state-speakable), `aria-expanded` bound to card state, `aria-controls`
+  naming the terminals region's `id`, keyboard activation (Enter and
+  Space — native button semantics, no custom keymap), a visible focus ring,
+  and a ≥ 44×44 px touch target consistent with §7.5. The chevron must not
+  intercept or swallow selection gestures on adjacent metadata.
+- Existing separate controls (delete-session, per-terminal actions) are
+  unaffected; no nested interactive elements inside the chevron button.
+
 ## 8. Lane C — image-capable operator-message composer (scope addendum)
 
 Origin: `.conductor/tasks/native-tui-console-image-composer-addendum.md`
@@ -1572,6 +1597,14 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
 - **Built-in ID stability:** synthesized built-ins always carry
   `builtin:<provider>:compact` / `builtin:<provider>:stop`; user records
   cannot claim the `builtin:` prefix; duplicate-by-id round-trips.
+- **Session-card header (§7.6):** click/double-click/drag-select on name,
+  badges, counts, and timestamps leaves `aria-expanded` and card state
+  unchanged (selection intent, including via `window.getSelection()`);
+  chevron pointer click and Enter/Space keydown toggle exactly once and
+  update `aria-expanded`; chevron has an accessible name containing the
+  session name and `aria-controls` resolves to the terminals region; tab
+  order reaches the chevron before the terminals region with a visible
+  focus ring; metadata has `user-select: text` and no click handler.
 
 ### 10.5 Browser + mobile evidence (Lanes B and C; new Playwright suite in
 `web/`)
@@ -1585,7 +1618,11 @@ list→editor navigation; Lane C chip strip, picker, paste, and wrap behavior
 against the §0 visual baseline; wheel scrolling works with streaming off and
 on (synthetic wheel events); screenshots checked into the PRs as evidence.
 Accessibility: axe-core scan of header/strip/modal/streaming/chip surfaces,
-zero serious violations.
+zero serious violations. **Session-card header (§7.6, both projects):** at
+1280×800 and 390×844 — drag-select the session name and a timestamp, then
+copy, with the card state unchanged throughout; chevron tap/click and
+keyboard activation toggle and update `aria-expanded`; chevron touch target
+≥ 44×44 px; metadata does not show pointer/press affordances.
 
 ### 10.6 Lane C installed live-provider acceptance
 
