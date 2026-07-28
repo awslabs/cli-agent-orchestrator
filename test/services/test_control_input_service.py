@@ -3143,6 +3143,57 @@ class TestCommandTwoClose:
         # answered from the record and never wrote again.
         assert adapter.calls == [({"lines": ["/compact"]}, True)]
 
+    def test_a_late_signal_never_closes_accepted_on_the_literal_sink(self, monkeypatch, journal):
+        """The literal-sink twin (steer-043): the unmanaged send path has
+        its own caller defense, and it holds the same boundary — a helper
+        returning submitted only after the write deadline closes the
+        declared command terminally ambiguous with no accepted record and
+        no after-deadline evidence anywhere."""
+        import time as _time
+
+        monkeypatch.setattr(service, "WRITE_DEADLINE_SECONDS", 0.2)
+
+        def _late_submitted(*args, **kwargs):
+            _time.sleep(0.4)
+            return (SUBMISSION_SUBMITTED, "capture-pane:%17:late:sha256:1afe")
+
+        # The literal sink serves an unmanaged pane: same provider+build
+        # pins, no managed adapter preflight.
+        resolved = _seq_resolved(provider_version="0.29.2", managed=False)
+        monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
+        client = FakeTmux(
+            identities=[
+                FakePaneIdentity(
+                    pane_id=resolved.pane_id,
+                    window_id=resolved.window_id,
+                    pane_pid=resolved.pane_pid,
+                )
+            ]
+        )
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        monkeypatch.setattr(native_pane_input, "observe_composer_empty", lambda *a, **k: True)
+        monkeypatch.setattr(native_pane_input, "capture_execution_rows", lambda *a, **k: [])
+        monkeypatch.setattr(native_pane_input, "observe_command_execution", _late_submitted)
+
+        result = _deliver_declared(journal)
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        assert result.submission_observed == "unknown"
+        # Null evidence in the response AND in the journal row — nothing
+        # may carry the after-deadline ref.
+        assert result.submission_evidence_ref is None
+        record = journal.find(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        assert record.submission_evidence_ref is None
+        # The one fused text+Enter write happened exactly once; the
+        # exact-id replay adds zero writes.
+        writes_before = len(client.writes)
+        assert writes_before == 1
+        looked_up = service.lookup_control_input(CONTROL, journal=journal)
+        assert looked_up.outcome == AMBIGUOUS
+        assert looked_up.reason_code == "submission-unproven"
+        assert len(client.writes) == writes_before
+
 
 class TestPaneBusyDetailDiscriminators:
     """The three pane-busy detail strings, verbatim and pairwise-disjoint
