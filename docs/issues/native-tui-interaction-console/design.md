@@ -13,7 +13,9 @@ with steers `root-r4-attachment-speed-guard-008` and
 remnant fixed in round 6 (P1-Δ1 stale never-retry parenthetical; P2-Δ1..Δ3
 adjudicated per steer `root-r6-p2-cheap-015` — gate-retry interval is a
 client-pinned constant, no protocol growth; discriminators pinned, no
-typed sub-reason); implementation NOT green-lit — a fresh
+typed sub-reason); command declaration carrier added in round 7
+(P1-Δ2, root-confirmed: optional `payload_class: "command"` under schema
+v4, never shape-derived); implementation NOT green-lit — a fresh
 Fable-5/Ultracode exact-head delta approval is the required next gate)
 
 Task ID: `native-tui-console/spec-initial-v1`
@@ -567,7 +569,9 @@ ignore unknown keys):
   the toggle is disabled with "server predates streaming"; `provider_controls`
   absent → built-ins hidden, user macros still available if `sequence` v3 is
   advertised; `/macros` 404 → the library UI is hidden behind a notice, never
-  a fallback to local storage as the authoritative store.
+  a fallback to local storage as the authoritative store; `command_controls`
+  absent → built-in Compact is offered only with the §4.1 guard-absent
+  notice and no `payload_class` field is ever sent.
 - A client never sends a key/chord the server did not advertise; the server's
   typed refusal is the backstop for buggy clients, not the mechanism.
 - Lane C's `operator_message` and `image` capability blocks (§8.6) follow
@@ -582,6 +586,10 @@ ignore unknown keys):
 4. The notation parse endpoint of §5.3 (server-authoritative) plus the
    pinned grammar of §5.3 for live client preview.
 5. Reconciliation rules of §3.4.
+6. The §4.1 command declaration (`payload_class: "command"`) — consumed
+   **only** by registry built-in sends and supervisor/provider command
+   controls, only after the `command_controls` block is advertised;
+   streaming, macros, and prose never set it.
 
 ## 4. Provider-control registry (Lane A)
 
@@ -645,11 +653,41 @@ posting (HTTP 200, `accepted`) and honestly records
 execution, and this contract never treats transport acceptance as command
 execution.
 
-**Definition.** A control is **command-class** when its payload is a
-provider command — leading-`/` text (the registry Compact built-in;
-supervisor `/agents`-class commands). Command-class is a property of the
-payload, declared by the caller and re-derived by the server from the
-events; ordinary prose and key/chord sequences are unaffected.
+**Definition and the declaration carrier (r7 P1-Δ2).** A control is
+**command-class** only when the caller *declares* it: the request schema
+gains one optional additive field, `payload_class`, whose sole defined
+value is `"command"`; absent means **prose**. Command-class is **never
+derived from payload shape** — a batch whose text happens to begin with
+`/` (e.g. a streamed utterance split so a batch starts `/tmp/x`) is
+undeclared prose and never enters the composer guard; declaration is the
+only trigger. Only two callers declare: the registry **Compact** built-in
+send and supervisor/provider command controls (`/agents`-class). Streaming
+capture, ordinary macros (including user macros whose text begins `/`),
+and the prose composer **never declare**.
+
+Wire shape, following the contract's own v2-chord amendment pattern:
+request **schema version 4** = v3 + optional `payload_class`, digesting
+under its own domain `cao-control-input-request-v4` with preimage order
+`("domain","schema_version","control_id","events","payload_class",
+"expected_identity")` — the field participates for the same reason `chord`
+does: a request that declares command-class is a different request from
+one that does not, and a non-participating field would digest a declared
+and undeclared request of the same id and events alike (rebound
+blindness). v1/v2/v3 requests and their domains are byte-unchanged; a v4
+request with `payload_class` absent is valid and means prose. (The r6
+no-wire-growth steers 014/015 were scoped to the streaming-retry P2s;
+this P1 requires the additive carrier, and it takes the additive
+capability-gated form those steers protect.)
+
+**Declaration validity.** A declared command is valid only for the command
+grammar: exactly one `text` event whose text begins with `/`, optionally
+followed by one `key:Enter` (the fused submitting Enter — the registry
+Compact shape). Any malformed declaration — an unknown `payload_class`
+value, a non-string value, or a declared command whose events do not match
+the grammar — is a typed refusal **`malformed-command-declaration`** (new
+reason, bound to `REFUSED`: decided before any write, zero bytes,
+reattemptable). It is never approximated into prose and never executed
+partially.
 
 **Rules.**
 
@@ -664,13 +702,14 @@ events; ordinary prose and key/chord sequences are unaffected.
    non-empty — or whose emptiness cannot be proven — is a typed refusal
    **`composer-nonempty`** (new refusal reason, bound to `REFUSED`:
    decided before any write, zero command bytes, reattemptable, prefill
-   untouched). The only permitted alternative is a separately proven,
+   untouched). The guard applies **only** to declared command-class
+   requests. The only permitted alternative is a separately proven,
    per-provider+build-pinned **atomic clear/replace** after which exactly
    the command is submitted; none is pinned today. **Blind
    Escape/Enter/key-count clearing is prohibited** — the r5 evidence shows
    prefill surviving Escape, so no keystroke-count ritual may be specified
    as a clear.
-2. **Same arbiter, same record.** Command-class rides the v3
+2. **Same arbiter, same record.** Command-class rides the v3/v4
    control-input route unchanged: 9-field identity, pane-input lease,
    journal intent/claim, exact-id reconcile. No raw websocket, no
    unmanaged write path, no second operation kind (D2).
@@ -700,12 +739,16 @@ events; ordinary prose and key/chord sequences are unaffected.
    wire vocabulary already carries `ambiguous` and needs no change.
 4. **Advertisement and compatibility.** Additive capability block
    `"command_controls": { "composer_nonempty_guard": true }` alongside
-   `provider_controls` when Lane A lands it. An old server without the
-   block offers no guard: the client must say so where a command control
-   is offered ("prefill-concatenation guard unavailable on this server"),
-   never imply it. A provider/build without a proven emptiness
+   `provider_controls`, and `4` joins `request_schema_versions`, when Lane
+   A lands the carrier. **The client sends `payload_class` only when the
+   block is advertised** — never earlier, never as a shape probe. An old
+   server without the block offers no guard and receives no v4 field: the
+   client must say so where a command control is offered
+   ("prefill-concatenation guard unavailable on this server"), never imply
+   it. An old client against a new server is unchanged (v1-v3 paths
+   byte-identical). A provider/build without a proven emptiness
    determination refuses command-class controls `provider-unsupported`
-   rather than guessing.
+   rather than guessing. No guessing based on payload shape, ever.
 
 The registry Compact built-in (§5.5) is command-class and gains this
 guard; the stop built-in (a bare key) is unaffected.
@@ -1421,12 +1464,19 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
   capability key stays exact.
 - Notation parser: golden vectors shared with the TS parser (checked into
   `test/fixtures/notation_vectors.json`, consumed by both suites).
-- **Command-class guard (§4.1):** a leading-`/` text sequence against a
+- **Command-class guard (§4.1):** schema v4 digests under its own domain
+  with `payload_class` in the pinned preimage order (golden vector; v3
+  digest bytes unchanged); a **declared** command-class sequence against a
   composer observed non-empty is refused `composer-nonempty` with **zero**
   tmux calls and the prefill untouched; an unobservable composer fails
   closed identically; an observed-empty composer delivers exactly the
-  command; the new reason is bound to `REFUSED` in `REASON_OUTCOMES`
-  (import-time assert covers it); non-command payloads never trigger the
+  command; both new reasons are bound to `REFUSED` in `REASON_OUTCOMES`
+  (import-time assert covers them); a malformed declaration (unknown value,
+  non-string, non-grammar events) is the typed zero-write
+  `malformed-command-declaration`; **undeclared payloads — including a
+  batch whose text begins `/` — never trigger the guard** (the streamed
+  `see /tmp/x` split case sails through as prose); non-command payloads
+  never trigger the
   guard; the `command_controls` capability block is additive-only.
 - **Pane-busy detail discriminators (§6.4 routing note):** the three
   deployed detail strings are contract-tested verbatim — dispatch grace
@@ -1475,19 +1525,26 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
   (withhold → one scheduled re-attempt with a fresh id → accepted), not by
   disarm. If the menu does not read idle, the deviation is recorded here
   and §3.2/§6.4 corrected before Lane A closes.
-- **Command-class guard acceptance (r5, §4.1):** on disposable Kimi and
-  Claude native-TUI sessions, seed the composer with queued text, press
-  Escape (the r5 evidence shows prefill may survive it — that is the point
-  of the case), then issue a command-class control (`/compact` built-in;
-  `/agents`-class): prove the typed `composer-nonempty` refusal with zero
+- **Command-class guard acceptance (r5, §4.1; r7 carrier):** on disposable
+  Kimi and Claude native-TUI sessions, seed the composer with queued text,
+  press Escape (the r5 evidence shows prefill may survive it — that is the
+  point
+  of the case), then issue a **declared** command-class control (`/compact`
+  built-in; `/agents`-class — both declare `payload_class: "command"`):
+  prove the typed `composer-nonempty` refusal with zero
   command bytes delivered and the prefill byte-identical, **or** — only if
   a proven atomic clear/replace has since been pinned — standalone command
   execution with zero concatenation (pane transcript shows the command's
-  own UI, not an ordinary prompt echo). Cover response loss (exact-id
+  own UI, not an ordinary prompt echo). Prove the r7 carrier case: an
+  **undeclared** streamed utterance `see /tmp/x`, split at the quiet-timer
+  or cap boundary so a batch begins `/tmp/x`, is delivered as prose with
+  no guard refusal and no disarm. Cover response loss (exact-id
   reconcile answers from the journal; never resend), crash windows
   (dead-owner sweep outcomes), and old/new compatibility (new client
-  against a server without the `command_controls` block shows the
-  guard-absent statement; old client against the new server is unchanged).
+  against a server without the `command_controls` block sends no v4 field
+  and shows the guard-absent statement; old client against the new server
+  is unchanged). Keep the Kimi/Claude live command acceptance (declared
+  Compact against an empty composer executes).
 
 ### 10.4 Web unit + component (Lane B; vitest)
 
@@ -1750,6 +1807,11 @@ jobs with the two projects of §10.5.
   blind clearing, honest ambiguity with manual reconcile, guard
   capability advertisement) + §10.1/§10.3 acceptance. The conductor-side
   schema edge is a supervisor-routed coordination item, not edited here.
+  The r7 follow-up (Fable P1-Δ2, root-confirmed) added the missing
+  declaration carrier: optional `payload_class: "command"` under request
+  schema v4 (own digest domain, v2-chord amendment pattern); command-class
+  is never shape-derived, so streamed prose beginning `/` can never trip
+  the guard.
 
 ## 15. Challenges applied (per track mandate)
 
