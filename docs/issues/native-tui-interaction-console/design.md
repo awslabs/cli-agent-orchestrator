@@ -45,6 +45,7 @@ source disagreed, the source won and the divergence is named in §13
 | `origin` remote | `https://github.com/colindmurray/cli-agent-orchestrator.git` |
 | `upstream` remote | AWS Labs repository (read-only reference) |
 | PR target | `origin/main` via the integration branch (§9) |
+| Integration head (r12) | `8687af27ee0bcd5d7f37b46f0bee2061260762bf` on `origin/feature/native-tui-interaction-console` (Lane A merged, PR #48); Lane B (PR #47, `8c2d4a0`) serializes next per §9's seam |
 | Canonical document | this file, on the design branch |
 | Visual baseline for Lane C | `docs/issues/native-tui-interaction-console/baseline-dashboard.png` (operator screenshot of the deployed dashboard, 2026-07-27; **predates the cond-0175 recorder row** — the deployed bundle renders that row whenever the native composer is visible, so the current render has one more control row than the image shows. The image remains authoritative for the compact single-composer footprint; §10.5 visual acceptance measures the current deployed render — F13) |
 | Kimi staged-path proof | `docs/issues/native-tui-interaction-console/evidence/kimi-0.29.2/` (sanitized transcript excerpts + fixture, committed at r4; full artifacts remain under `.conductor/reports/r3/`) |
@@ -1599,6 +1600,47 @@ identity primitives only (per the addendum's isolation requirement).
 Suggested branches (one PR per lane, serialized into the integration
 branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
 `feature/native-tui-interaction-console` → `main` as one reviewed PR.
+
+### Integration status and the Lane B seam (r12, verified topology)
+
+- **Lane A merged** into the integration branch at
+  `8687af27ee0bcd5d7f37b46f0bee2061260762bf` (PR #48, final exact-head
+  Sol/high review at `7b3674f44f0289aedb9cfca67638fd951396b1d6`; includes
+  the r11 two-close repair). Canonical services now merged:
+  `services/provider_controls.py`, `services/macro_notation.py`,
+  `POST /macros/parse-notation`, `test/fixtures/notation_vectors.json`,
+  the §10.3 evidence bundle, and the resize hardening.
+- **Canonical spec docs** r9-r11 live on the retained design branch
+  (`c612b1e`, `6fdb633`, `a51191f`) based on `a624c69`. The integration
+  branch's copy of this file is **byte-unchanged since `a624c69`**
+  (verified zero-diff), so a plain non-force merge of the design branch
+  into the integration branch is conflict-free for this document and
+  preserves both Lane A code/evidence and the r9-r11 docs. Sequence
+  (supervisor-executed, no force, no GitHub alteration by the writer):
+  merge design branch → integration branch, push; then Lane B serializes
+  onto that head (PR #47 at `8c2d4a0c7f091c420c96a584cd40ae23c4c2fec5`,
+  currently CONFLICTING against it, as expected — it was based on the
+  older integration base).
+- **Lane B seam (minimal, pinned):** (a) delete Lane B's temporary
+  duplicate `services/macro_notation.py` and keep Lane A's canonical,
+  **porting the approved macro-repeat fix onto it** (pre-conversion
+  >2-digit rejection at the token offset, display-bounded token, parser +
+  endpoint offset-422 regressions — PR #47's `8c2d4a0` content applied to
+  the canonical file, which still carries the unguarded conversion);
+  (b) delete the temporary `services/macro_builtins.py` and repoint
+  `macro_store.py`'s built-in synthesis to `services/provider_controls.py`
+  (D6 — the merged registry is the single authority); (c) keep Lane A's
+  `/macros/parse-notation` route registration; Lane B's `/macros` CRUD
+  routes are additive; (d) the shared golden vectors gain the `up*100` /
+  30-digit repeat cases and must stay byte-identical between the TS
+  preview and the canonical Python authority; (e) the CI-trigger hunk is
+  identical on both branches by design.
+- **Explicitly outside the seam** (owner pin): the deferred PR #47 P2s
+  and the editable-token product decision are not taken here — no product
+  drift.
+- **Rollback:** the docs integration is an ordinary merge commit (revert
+  it; Lane A's merge is untouched; the design branch retains the docs
+  regardless). Lane B's seam is a normal PR — revert it independently.
 
 ## 10. Test matrix and acceptance
 
