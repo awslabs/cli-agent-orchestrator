@@ -126,6 +126,26 @@ class TerminalIdentityMismatchError(TerminalInputBlockedError):
     """
 
 
+class TerminalInputRefusedError(TerminalInputBlockedError):
+    """A v1 pane write was refused before any payload byte, with a typed reason.
+
+    Raised only on the zero-byte side of the copy-mode-safe write boundary
+    (cond-0178): the pane lease was busy, the identity re-proof under the
+    lease failed, or the copy-mode guard could not prove the exact pane out
+    of copy mode.  ``reason_code`` is the control-input contract's closed
+    vocabulary (``copy-mode-active`` for the guard's own refusals), so the
+    API boundary keeps its existing ``TerminalInputBlockedError`` → HTTP 409
+    mapping and an inbox caller can tell "proven nothing was written,
+    reattemptable" apart from a payload write whose ending is ambiguous —
+    which keeps the ordinary failure mapping and is never re-typed.
+    """
+
+    def __init__(self, reason_code: str, detail: str) -> None:
+        self.reason_code = reason_code
+        self.detail = detail
+        super().__init__(f"{reason_code}: {detail}")
+
+
 LIFECYCLE_LIVE = "live"
 LIFECYCLE_SUPERSEDED = "superseded"
 LIFECYCLE_DEAD = "dead"
@@ -185,11 +205,23 @@ class VerifiedPaneTarget(NamedTuple):
     taken. Read paths that can only address a name use these, so they read
     the pane that was verified rather than whatever currently occupies the
     recorded name.
+
+    ``window_id``/``pane_pid``/``server_socket_path`` are the rest of the
+    proven canonical identity, carried so a writer that re-proves the pane
+    under the pane-input lease (the copy-mode-safe write boundary,
+    cond-0178) binds to the identity this proof actually compared — which
+    may come from a just-upgraded row the caller's own metadata snapshot
+    does not yet reflect.  They default to empty only so older positional
+    constructions keep compiling; a target produced by the proof always
+    carries them.
     """
 
     pane_id: str
     session_name: str
     window_name: str
+    window_id: str = ""
+    pane_pid: int = 0
+    server_socket_path: str = ""
 
 
 class IncarnationRegistrationRefused(Exception):
@@ -557,7 +589,17 @@ def verified_pane_target(
             )
         except Exception as exc:  # pragma: no cover - a stale label is not fatal
             logger.warning("Could not refresh window labels for %s: %s", terminal_id, exc)
-    return VerifiedPaneTarget(recorded_pane, session_name, window_name)
+    return VerifiedPaneTarget(
+        recorded_pane,
+        session_name,
+        window_name,
+        # The identity fields as just proven — read from the (possibly
+        # upgrade-completed) metadata this function verified, so a caller
+        # holding a pre-upgrade snapshot still binds to the proven values.
+        window_id=str(metadata["window_id"]),
+        pane_pid=int(metadata["pane_pid"]),
+        server_socket_path=str(metadata["server_socket_path"]),
+    )
 
 
 def _successor_of(terminal_id: str, observed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2300,6 +2342,130 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         raise
 
 
+def _send_keys_copy_mode_guarded(
+    terminal_id: str,
+    metadata: Dict[str, Any],
+    verified: VerifiedPaneTarget,
+    message: str,
+    *,
+    enter_count: int,
+    submit_delay: float,
+) -> None:
+    """Write one v1 payload to a proven pane through the pane-arbiter boundary.
+
+    The legacy/v1 ordinary delivery write, held to the same boundary the
+    control-input path established (cond-0178).  Everything from the
+    under-lease identity re-proof to the payload's trailing Enter happens
+    while holding the exact pane's input lease, so no other writer can
+    interleave between the copy-mode guard's proof and the payload:
+
+    1. re-prove the bound identity live (the guard's first read is also the
+       pane-dead / identity-mismatch / server-identity re-proof),
+    2. read ``pane_in_mode`` on that exact pane,
+    3. only on a proven ``1``, send the one non-payload keystroke
+       (``send-keys -X cancel``) to that exact pane,
+    4. re-prove the identity and ``pane_in_mode=0``,
+    5. only then arm status detection, clear the buffer, and write the
+       original payload exactly once, inside the same lease.
+
+    A dashboard wheel-scroll can leave the pane in copy mode, where the
+    payload's Enter is consumed by the mode and the text rests unsubmitted
+    while every transport fact reads success.  Detection that cannot be
+    proven is a zero-byte refusal, never a speculative cancel and never a
+    delivery claim; the cancel is never sent speculatively either.
+
+    Raises:
+        TerminalInputRefusedError: the pane lease was busy or the copy-mode
+            guard refused.  Both are proven zero-payload-byte outcomes
+            raised BEFORE the status arm and buffer clear, so a refused
+            write leaves detection exactly as it found it and may be
+            re-attempted.  ``reason_code`` uses the control-input
+            contract's closed vocabulary (``copy-mode-active`` for the
+            guard's own refusals, ``pane-busy`` for the lease).
+        Exception: anything the payload write itself raises propagates
+            unchanged — bytes may have landed, so the write is ambiguous
+            and is never silently re-typed.
+    """
+    # Call-site-local imports, matching this file's managed_launch pattern:
+    # the v2 control-input module's import graph stays untouched, and the
+    # guard itself is reused rather than duplicated.
+    import hashlib
+
+    from cli_agent_orchestrator.services import control_input_service
+    from cli_agent_orchestrator.services.control_input_contract import REASON_PANE_BUSY
+    from cli_agent_orchestrator.services.control_input_journal import ControlInputBinding
+    from cli_agent_orchestrator.services.pane_input_arbiter import (
+        PaneBusyError,
+        pane_input_lease,
+    )
+
+    # A verified target exists only when the backend declared pane-identity
+    # support, which only the tmux backend does, so under it this client is
+    # never None.  A non-tmux backend has no tmux copy mode to guard
+    # against; the lease still serializes the write there.
+    client = control_input_service._tmux_client()
+    binding = ControlInputBinding(
+        request_id=f"send-input:{terminal_id}",
+        terminal_id=terminal_id,
+        pane_id=verified.pane_id,
+        window_id=verified.window_id,
+        pane_pid=verified.pane_pid,
+        request_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        generation=metadata.get("generation") or None,
+        server_socket_path=verified.server_socket_path or None,
+    )
+    try:
+        with pane_input_lease(verified.pane_id, holder=f"send-input:{terminal_id}", timeout=0.0):
+            if client is not None:
+                refusal = control_input_service._copy_mode_guard_refusal(
+                    client,
+                    binding,
+                    deadline_monotonic=time.monotonic()
+                    + control_input_service.WRITE_DEADLINE_SECONDS,
+                )
+                if refusal is not None:
+                    raise TerminalInputRefusedError(refusal[0], refusal[1])
+
+            # Arm the StatusMonitor stickiness gate so that the next provider-
+            # detected PROCESSING transition is honored (overriding the latched
+            # IDLE/COMPLETED). Without this, sticky ready-status would block
+            # the genuine PROCESSING signal that arrives once the agent starts
+            # working on the new message.
+            status_monitor.notify_input_sent(terminal_id)
+
+            # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
+            # prompts from BEFORE the input can't trigger a false COMPLETED
+            # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
+            # buffer, which combined with input_received=True would return COMPLETED
+            # within seconds of send_input). Clearing here — not after send_keys —
+            # avoids a race: send_keys includes a submit-delay sleep during which
+            # the agent can begin emitting output; a post-send_keys clear would wipe
+            # that newly-emitted first chunk of the turn (lost from
+            # GET /terminals/{id}/output?mode=full and from early detection). This
+            # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
+            # arm set by notify_input_sent above; reset_buffer would wipe the arm and
+            # latch-block the IDLE→PROCESSING transition for the whole turn.
+            status_monitor.clear_rolling_buffer(terminal_id)
+
+            # Target the verified pane id, not the recorded names. The proof
+            # above and the write below are then about the same pane with no
+            # name resolution in between for a later window to answer.
+            get_backend().send_keys(
+                verified.session_name,
+                verified.window_name,
+                message,
+                enter_count=enter_count,
+                force_bracketed_paste=True,
+                submit_delay=submit_delay,
+                pane_id=verified.pane_id,
+            )
+    except PaneBusyError as exc:
+        raise TerminalInputRefusedError(
+            REASON_PANE_BUSY,
+            f"another writer holds pane {verified.pane_id}: {exc}; nothing was typed",
+        ) from exc
+
+
 def send_input(
     terminal_id: str,
     message: str,
@@ -2380,43 +2546,53 @@ def send_input(
 
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1
+        submit_delay = provider.paste_submit_delay if provider else 0.3
 
-        # Arm the StatusMonitor stickiness gate so that the next provider-
-        # detected PROCESSING transition is honored (overriding the latched
-        # IDLE/COMPLETED). Without this, sticky ready-status would block
-        # the genuine PROCESSING signal that arrives once the agent starts
-        # working on the new message.
-        status_monitor.notify_input_sent(terminal_id)
-
-        # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
-        # prompts from BEFORE the input can't trigger a false COMPLETED
-        # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
-        # buffer, which combined with input_received=True would return COMPLETED
-        # within seconds of send_input). Clearing here — not after send_keys —
-        # avoids a race: send_keys includes a submit-delay sleep during which
-        # the agent can begin emitting output; a post-send_keys clear would wipe
-        # that newly-emitted first chunk of the turn (lost from
-        # GET /terminals/{id}/output?mode=full and from early detection). This
-        # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
-        # arm set by notify_input_sent above; reset_buffer would wipe the arm and
-        # latch-block the IDLE→PROCESSING transition for the whole turn.
-        status_monitor.clear_rolling_buffer(terminal_id)
-
-        # Target the verified pane id, not the recorded names. The proof
-        # above and the write below are then about the same pane with no
-        # name resolution in between for a later window to answer.
-        send_kwargs: Dict[str, Any] = {}
         if verified is not None:
-            send_kwargs["pane_id"] = verified.pane_id
-        get_backend().send_keys(
-            verified.session_name if verified else metadata["tmux_session"],
-            verified.window_name if verified else metadata["tmux_window"],
-            message,
-            enter_count=enter_count,
-            force_bracketed_paste=True,
-            submit_delay=provider.paste_submit_delay if provider else 0.3,
-            **send_kwargs,
-        )
+            # The identity-bound path writes through the same pane-arbiter
+            # boundary the control-input write uses (cond-0178): the pane
+            # lease, the under-lease identity re-proof, and the copy-mode
+            # guard run BEFORE the status arm and buffer clear below, so a
+            # refused write leaves detection exactly as it found it — and
+            # the payload write itself stays inside the same lease.
+            _send_keys_copy_mode_guarded(
+                terminal_id,
+                metadata,
+                verified,
+                message,
+                enter_count=enter_count,
+                submit_delay=submit_delay,
+            )
+        else:
+            # Arm the StatusMonitor stickiness gate so that the next provider-
+            # detected PROCESSING transition is honored (overriding the latched
+            # IDLE/COMPLETED). Without this, sticky ready-status would block
+            # the genuine PROCESSING signal that arrives once the agent starts
+            # working on the new message.
+            status_monitor.notify_input_sent(terminal_id)
+
+            # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
+            # prompts from BEFORE the input can't trigger a false COMPLETED
+            # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
+            # buffer, which combined with input_received=True would return COMPLETED
+            # within seconds of send_input). Clearing here — not after send_keys —
+            # avoids a race: send_keys includes a submit-delay sleep during which
+            # the agent can begin emitting output; a post-send_keys clear would wipe
+            # that newly-emitted first chunk of the turn (lost from
+            # GET /terminals/{id}/output?mode=full and from early detection). This
+            # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
+            # arm set by notify_input_sent above; reset_buffer would wipe the arm and
+            # latch-block the IDLE→PROCESSING transition for the whole turn.
+            status_monitor.clear_rolling_buffer(terminal_id)
+
+            get_backend().send_keys(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                message,
+                enter_count=enter_count,
+                force_bracketed_paste=True,
+                submit_delay=submit_delay,
+            )
 
         # Notify the provider that external input was received.
         # This allows providers to adjust status
