@@ -9,8 +9,11 @@ revised from live proof on pinned 0.29.2 in round
 applied in round 4 — Sol/xhigh and Fable-5/Ultracode findings F10-F13,
 with steers `root-r4-attachment-speed-guard-008` and
 `root-r4-fable-delta-gate-009`; command-class guard added in round 5
-(F14, live prefilled-composer command-drift evidence); implementation NOT
-green-lit — a fresh
+(F14, live prefilled-composer command-drift evidence); Fable delta-gate
+remnant fixed in round 6 (P1-Δ1 stale never-retry parenthetical; P2-Δ1..Δ3
+adjudicated per steer `root-r6-p2-cheap-015` — gate-retry interval is a
+client-pinned constant, no protocol growth; discriminators pinned, no
+typed sub-reason); implementation NOT green-lit — a fresh
 Fable-5/Ultracode exact-head delta approval is the required next gate)
 
 Task ID: `native-tui-console/spec-initial-v1`
@@ -497,8 +500,8 @@ Rules:
   by exactly one `GET /control-input/{control_id}`; the journaled record is
   the answer. **A batch is never re-sent.** Only a `refused` outcome may be
   followed by a fresh attempt with a **new** `control_id`, and the streaming
-  disarm policy (§6.4) decides whether that attempt is automatic (never, in
-  streaming) or operator-initiated.
+  disarm policy (§6.4) decides whether that attempt is automatic (only in
+  §6.4's two pause cases) or operator-initiated.
 - Server-side same-`control_id` semantics (exact, deployed — §1.2): the
   `GET` lookup is always zero-I/O; an identical POST replays a stored
   `delivered`/`ambiguous` terminal answer with zero new I/O; an identical
@@ -932,10 +935,14 @@ state is settled by the journal, never by resending.
   (dispatch grace)"; one automatic re-attempt with a fresh `control_id` is
   scheduled for when the advertised `dispatch_grace_ms` window expires; if
   that re-attempt is also refused, disarm with the reason.
-- **Pause — readiness gate:** `refused/pane-busy` whose reason detail is
-  the turn-state gate ("the receiver is …, not idle") → the trace shows
+- **Pause — readiness gate:** `refused/pane-busy` whose reason detail
+  matches the pinned turn-state-gate discriminator (§6.4 routing note
+  below) → the trace shows
   "provider busy"; one automatic re-attempt with a fresh `control_id`
-  after a server-advertised poll interval (1 s); if also refused, disarm
+  after the **client-pinned** `STREAMING_GATE_RETRY_MS = 1000` constant
+  (a client-side streaming constant, deliberately **not** a server
+  capability — no protocol growth; it is not advertised anywhere); if also
+  refused, disarm
   with the reason. This is the mid-menu/mid-turn behavior for the §3.2
   composer-class keys: navigation during an open menu passes the gate only
   when the receiver reads IDLE/COMPLETED — live-verified in §10.3's
@@ -946,9 +953,11 @@ state is settled by the journal, never by resending.
   operator decides whether to re-arm).
 - **Disarm — every other non-accepted outcome:** `refused` with any other
   reason (`stale-generation`, `identity-mismatch`, `pane-dead`,
-  `copy-mode-active`, `unsupported-key`, `write-deadline` after its single
-  scheduled re-attempt, …), `ambiguous` (any reason), `unsupported`, and
-  any unknown typed outcome (fail closed).
+  `copy-mode-active`, `unsupported-key`, `write-deadline`, …), `ambiguous`
+  (any reason), `unsupported`, and
+  any unknown typed outcome (fail closed). `write-deadline` is
+  infrastructure, not provider busy-ness — it is plain disarm with the
+  reason; the operator re-arms.
 - **Disarm — environment:** reconciliation query fails; identity refetch
   shows a changed generation/pane; capabilities/identity fetch fails at
   arm (streaming does not arm); output websocket closes while armed;
@@ -962,6 +971,19 @@ after the point of disarm is ever sent), only trace metadata is retained,
 and exact-ID reconciliation for the already in-flight batch continues to
 completion. A component test proves input arriving during a refused
 in-flight batch produces no second POST (§10.4).
+
+**Pause-vs-disarm routing note (pinned discriminators, no new wire
+shape):** the three `pane-busy` flavors share one deployed reason code and
+are distinguished by the reason **detail** string. Routing keys on these
+pinned discriminator substrings — dispatch grace: `"inside its dispatch
+grace"` (deployed at `control_input_service.py:3204-3206`); turn-state
+gate: `"not idle"` (`:3225-3231`); arbiter contention: `"input lease is
+held by"` (`pane_input_arbiter.py:160`, `:213-215`). A `pane-busy` whose
+detail matches none of the three is **disarm** (fail closed) — never
+guessed into a pause. §10.1 contract-tests the three deployed detail
+strings against these discriminators so a server wording change fails
+loudly instead of silently re-routing a pause into a disarm (or
+contention into a pause). No typed sub-reason is added to the wire.
 
 On disarm the surface shows the reason and the terminal trace, offers
 **Re-arm**, and — on any identity refusal — refetches identity so the
@@ -1406,6 +1428,14 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
   command; the new reason is bound to `REFUSED` in `REASON_OUTCOMES`
   (import-time assert covers it); non-command payloads never trigger the
   guard; the `command_controls` capability block is additive-only.
+- **Pane-busy detail discriminators (§6.4 routing note):** the three
+  deployed detail strings are contract-tested verbatim — dispatch grace
+  (`control_input_service.py:3204-3206` contains `"inside its dispatch
+  grace"`), turn-state gate (`:3225-3231` contains `"not idle"`), arbiter
+  contention (`pane_input_arbiter.py:160`, `:213-215` contains `"input
+  lease is held by"`) — and the three discriminators are asserted
+  pairwise-disjoint, so a server wording tweak fails the suite loudly
+  rather than silently changing streaming's pause/disarm routing.
 
 ### 10.2 Live tmux (Lane A; `pytest -m e2e`, isolated server fixtures)
 
