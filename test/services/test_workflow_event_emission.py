@@ -420,3 +420,59 @@ async def test_rebuild_reseed_degrades_to_zero_on_unreadable_seq_tables(monkeypa
     record = ws._rebuild_record_from_journal("runReseed")
     assert record is not None
     assert record.event_seq == 0
+
+
+# ---------------------------------------------------------------------------
+# PR 526 review — SHOULD-FIX: severity on the two best-effort writes.
+#
+# Severity was inverted: losing an actual EVENT (journal content — punches a hole
+# a reader must declare as a gap) logged at DEBUG, i.e. invisible at default log
+# levels, while losing the far less consequential high-water logged WARNING.
+# Both are now WARNING, and losing an event must never be quieter.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_lost_event_append_is_logged_at_warning(monkeypatch, caplog):
+    """A swallowed append_event must surface at WARNING, not DEBUG.
+
+    Goes RED if the append's except-arm is downgraded back to logger.debug.
+    """
+    import logging
+
+    def _boom(*a, **k):
+        raise sqlite3.OperationalError("event table gone")
+
+    monkeypatch.setattr(workflow_journal, "append_event", _boom)
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+
+    with caplog.at_level(logging.DEBUG, logger="cli_agent_orchestrator.services.workflow_service"):
+        await ws.start_run(_spec(), {}, "runSev")
+
+    append_failures = [r for r in caplog.records if "append_event" in r.getMessage()]
+    assert append_failures, "the swallowed append was not logged at all"
+    # Every append-loss record is at least WARNING — never DEBUG/INFO.
+    for rec in append_failures:
+        assert (
+            rec.levelno >= logging.WARNING
+        ), f"losing a journal event logged at {rec.levelname}; it must be >= WARNING"
+
+
+@pytest.mark.asyncio
+async def test_losing_an_event_is_never_quieter_than_losing_the_high_water(monkeypatch, caplog):
+    """The relative-severity invariant: the event append is the MORE consequential
+    of the two best-effort writes, so its level must be >= the high-water's."""
+    import logging
+
+    def _boom(*a, **k):
+        raise sqlite3.OperationalError("db down")
+
+    monkeypatch.setattr(workflow_journal, "append_event", _boom)
+    monkeypatch.setattr(workflow_journal, "persist_high_water", _boom)
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+
+    with caplog.at_level(logging.DEBUG, logger="cli_agent_orchestrator.services.workflow_service"):
+        await ws.start_run(_spec(), {}, "runSev2")
+
+    append_levels = [r.levelno for r in caplog.records if "append_event" in r.getMessage()]
+    hw_levels = [r.levelno for r in caplog.records if "high-water" in r.getMessage()]
+    assert append_levels and hw_levels, "expected both failure paths to log"
+    assert min(append_levels) >= min(hw_levels)

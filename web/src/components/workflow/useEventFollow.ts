@@ -24,6 +24,10 @@ export interface EventFollowHandlers {
   onEvent: (event: WorkflowEvent) => void
   onGap: (gap: GapMarker) => void
   onConnectedChange?: (connected: boolean) => void
+  // The server declared the run absent (never existed, or deleted / swept).
+  // Terminal: the follow loop STOPS reconnecting when this fires, because no
+  // amount of retrying can make a deleted run reappear.
+  onAbsent?: (runId: string) => void
 }
 
 interface ParsedFrame {
@@ -58,16 +62,28 @@ export function parseSseFrame(block: string): ParsedFrame | null {
   return { event, data: dataLines.join('\n'), id }
 }
 
+/** Sentinel returned by dispatchFrame for the terminal `run_absent` frame. */
+export const RUN_ABSENT = Symbol('run_absent')
+
 /**
  * Route one parsed frame to the appropriate handler. Exported for direct unit
- * testing of the gap-vs-event dispatch without a live stream.
+ * testing of the gap-vs-event dispatch without a live stream. Returns the seq
+ * to advance the reconnect cursor to, `null` for a frame that owns no seq, or
+ * `RUN_ABSENT` to tell the follow loop to stop permanently.
  */
-export function dispatchFrame(frame: ParsedFrame, handlers: EventFollowHandlers): number | null {
+export function dispatchFrame(
+  frame: ParsedFrame,
+  handlers: EventFollowHandlers,
+): number | null | typeof RUN_ABSENT {
   let jsonData: unknown
   try {
     jsonData = JSON.parse(frame.data)
   } catch {
     return null // a non-JSON frame (e.g. a keep-alive) is ignored, never crashes
+  }
+  if (frame.event === 'run_absent') {
+    handlers.onAbsent?.((jsonData as { run_id?: string })?.run_id ?? '')
+    return RUN_ABSENT
   }
   if (frame.event === 'gap') {
     handlers.onGap(jsonData as GapMarker)
@@ -138,6 +154,14 @@ export function useEventFollow(
             const frame = parseSseFrame(block)
             if (frame && !closed) {
               const seq = dispatchFrame(frame, handlersRef.current)
+              if (seq === RUN_ABSENT) {
+                // The run is gone for good. Suppress the reconnect (the
+                // `finally` below checks `closed`) so we do not re-open the
+                // stream every 1.5s against an id that can never come back.
+                closed = true
+                controller?.abort()
+                return
+              }
               if (seq != null) lastSeq = seq
             }
           }

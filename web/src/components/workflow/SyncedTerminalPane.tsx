@@ -86,17 +86,13 @@ export function SyncedTerminalPane({ event }: SyncedTerminalPaneProps) {
       >
         <div className="flex items-center gap-2 text-sm text-gray-400">
           <Clock size={16} className="text-gray-500 shrink-0" aria-hidden="true" />
+          {/* No issue link here: this pane previously linked to
+              github.com/anthropics/cli-agent-orchestrator/issues/769 — the wrong
+              org (the repo is awslabs/) and not a real issue number. Rather than
+              guess a replacement, state the condition plainly. */}
           <span>
-            Terminal output sync pending — offsets not yet captured (
-            <a
-              href="https://github.com/anthropics/cli-agent-orchestrator/issues/769"
-              className="underline hover:text-gray-200"
-              target="_blank"
-              rel="noreferrer"
-            >
-              #769
-            </a>
-            ).
+            Terminal output sync pending — this run's events carry no terminal byte
+            offsets yet, so there is no range to display.
           </span>
         </div>
         <p className="mt-2 text-xs text-gray-500">

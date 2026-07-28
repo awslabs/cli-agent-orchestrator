@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
-import { parseSseFrame, dispatchFrame } from '../components/workflow/useEventFollow'
+import { renderHook, waitFor } from '@testing-library/react'
+import { parseSseFrame, dispatchFrame, RUN_ABSENT, useEventFollow } from '../components/workflow/useEventFollow'
 import type { WorkflowEvent, GapMarker } from '../api'
 
 describe('parseSseFrame', () => {
@@ -82,5 +83,82 @@ describe('dispatchFrame', () => {
     const h = handlers()
     const seq = dispatchFrame({ event: 'step.started', data: '{"seq":9}' }, h)
     expect(seq).toBe(9)
+  })
+})
+
+// ── PR 526 review: run_absent must STOP the follow loop ────────────────────
+// The server now declares an absent run (never existed, or deleted/swept) with a
+// terminal `event: run_absent` frame instead of leaving the follower polling
+// forever. The client must treat it as terminal and NOT reconnect.
+describe('dispatchFrame — run_absent (#526)', () => {
+  it('routes run_absent to onAbsent and returns the RUN_ABSENT sentinel', () => {
+    const onAbsent = vi.fn()
+    const h = {
+      onEvent: vi.fn() as (e: WorkflowEvent) => void,
+      onGap: vi.fn() as (g: GapMarker) => void,
+      onAbsent,
+    }
+    const out = dispatchFrame({ event: 'run_absent', data: '{"run_id":"ghost"}' }, h)
+    expect(out).toBe(RUN_ABSENT)
+    expect(onAbsent).toHaveBeenCalledWith('ghost')
+    // It is not an event and owns no seq, so it never advances the cursor.
+    expect(h.onEvent).not.toHaveBeenCalled()
+    expect(h.onGap).not.toHaveBeenCalled()
+  })
+
+  it('does not confuse run_absent with a normal event frame', () => {
+    const h = {
+      onEvent: vi.fn() as (e: WorkflowEvent) => void,
+      onGap: vi.fn() as (g: GapMarker) => void,
+      onAbsent: vi.fn(),
+    }
+    expect(dispatchFrame({ event: 'step.started', data: '{"seq":4}' }, h)).toBe(4)
+    expect(h.onAbsent).not.toHaveBeenCalled()
+  })
+})
+
+describe('useEventFollow — stops reconnecting after run_absent (#526)', () => {
+  it('opens the stream once and never reconnects once the run is declared absent', async () => {
+    // A stream that emits run_absent then ends. Before the fix the `finally` arm
+    // rescheduled connect() every 1.5s forever against a run that cannot return.
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      body: {
+        getReader: () => {
+          let sent = false
+          return {
+            read: async () => {
+              if (sent) return { value: undefined, done: true }
+              sent = true
+              return {
+                value: new TextEncoder().encode(
+                  'event: run_absent\ndata: {"run_id":"ghost"}\n\n',
+                ),
+                done: false,
+              }
+            },
+          }
+        },
+      },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      const onAbsent = vi.fn()
+      const { unmount } = renderHook(() =>
+        useEventFollow('ghost', { onEvent: vi.fn(), onGap: vi.fn(), onAbsent }),
+      )
+      await waitFor(() => expect(onAbsent).toHaveBeenCalledWith('ghost'))
+      const callsAfterAbsent = fetchMock.mock.calls.length
+
+      // Push well past several reconnect intervals; no further fetch may fire.
+      await vi.advanceTimersByTimeAsync(1500 * 6)
+      expect(fetchMock.mock.calls.length).toBe(callsAfterAbsent)
+      unmount()
+    } finally {
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    }
   })
 })

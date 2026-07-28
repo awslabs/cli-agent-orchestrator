@@ -89,6 +89,24 @@ def _seed_terminal_run(run_id: str = "r1", state: str = "completed") -> None:
     workflow_journal.update_run_state(run_id, state, "2026-07-27T00:00:05Z")
 
 
+def _seed_running_run(run_id: str = "r1") -> None:
+    """Insert a NON-terminal ``workflow_run`` row so the follow enters live-follow.
+
+    Required because an ABSENT run row is no longer a path into the live loop: a
+    run that does not exist can never go terminal, so the generator declares it
+    absent and closes rather than polling forever. A test that wants the live
+    loop must seed a real running run.
+    """
+    workflow_journal.insert_run(
+        run_id=run_id,
+        workflow_name="wf",
+        spec_snapshot="{}",
+        inputs_json="{}",
+        state="running",
+        started_at="2026-07-27T00:00:00Z",
+    )
+
+
 def _parse_sse(text: str) -> List[Dict]:
     """Parse an SSE body into a list of ``{event, data?, id?}`` frames."""
     frames: List[Dict] = []
@@ -308,7 +326,8 @@ async def test_live_follow_delivers_a_newly_appended_event():
     connect is delivered within a bounded number of polls. Driven directly
     against the generator with ``asyncio.wait_for`` hard timeouts so the infinite
     live loop can never hang the test (the generator is explicitly closed)."""
-    _append("r1", 1)  # replayable event; no run row -> non-terminal -> live loop
+    _seed_running_run("r1")  # a REAL non-terminal run -> live loop
+    _append("r1", 1)  # replayable event
 
     gen = _follow_run_events("r1", None)
     try:
@@ -378,3 +397,78 @@ def test_batch_json_path_with_explicit_application_json_accept(client):
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("application/json")
     assert [e["seq"] for e in resp.json()["events"]] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# PR 526 review — MUST-FIX 2: an ABSENT run must terminate the stream.
+#
+# Before the fix the Phase-2 guard read `run is not None and state in TERMINAL`,
+# so `get_run() -> None` skipped it entirely and Phase 3 entered an unbounded
+# `while True` poll. A typo'd id or a deleted run pinned a connection and a poll
+# cycle forever. These drive the generator directly with hard timeouts, so a
+# regression HANGS-then-fails rather than passing.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_follow_closes_for_a_run_id_that_never_existed():
+    """An unknown id declares `run_absent` and STOPS — never enters live-follow."""
+    gen = _follow_run_events("no-such-run", None)
+    try:
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=_STREAM_TIMEOUT_S)
+        assert "event: run_absent" in frame
+        assert '"run_id": "no-such-run"' in frame
+        # And the stream ENDS — it does not fall through to the poll loop.
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(gen.__anext__(), timeout=_STREAM_TIMEOUT_S)
+    finally:
+        await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_follow_closes_for_a_deleted_run_with_orphan_events():
+    """Events present but the run row gone (deleted / retention-swept): replay
+    what is durable, then declare absent and close rather than polling forever."""
+    _append("r1", 1)  # an orphan event row, no run row
+    gen = _follow_run_events("r1", None)
+    try:
+        frame1 = await asyncio.wait_for(gen.__anext__(), timeout=_STREAM_TIMEOUT_S)
+        assert "id: 1" in frame1  # Phase 1 replay still serves durable rows
+        frame2 = await asyncio.wait_for(gen.__anext__(), timeout=_STREAM_TIMEOUT_S)
+        assert "event: run_absent" in frame2
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(gen.__anext__(), timeout=_STREAM_TIMEOUT_S)
+    finally:
+        await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_follow_closes_when_the_run_is_deleted_mid_follow():
+    """The Phase-3 arm of the same hole: a run that VANISHES while being followed
+    (DELETE endpoint or retention sweep) must close, not poll forever."""
+    _seed_running_run("r1")
+    _append("r1", 1)
+
+    gen = _follow_run_events("r1", None)
+    try:
+        frame1 = await asyncio.wait_for(gen.__anext__(), timeout=_STREAM_TIMEOUT_S)
+        assert "id: 1" in frame1
+
+        # Delete the run out from under the live follower.
+        workflow_journal.delete_run("r1")
+        frame2 = await asyncio.wait_for(gen.__anext__(), timeout=_STREAM_TIMEOUT_S)
+        assert "event: run_absent" in frame2
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(gen.__anext__(), timeout=_STREAM_TIMEOUT_S)
+    finally:
+        await gen.aclose()
+
+
+def test_absent_run_stream_over_http_terminates(client):
+    """End-to-end through the route: the SSE arm for an unknown id returns a
+    COMPLETE body (the absent frame) instead of hanging the request."""
+    resp = _get_with_timeout(
+        client, "/workflows/runs/ghost/events", {"Accept": "text/event-stream"}
+    )
+    assert resp.status_code == 200
+    frames = _parse_sse(resp.text)
+    assert [f["event"] for f in frames] == ["run_absent"]
+    assert frames[0]["data"]["run_id"] == "ghost"

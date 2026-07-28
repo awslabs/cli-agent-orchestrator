@@ -326,3 +326,126 @@ def test_event_migrator_runs_at_most_once(monkeypatch: pytest.MonkeyPatch):
     # The whole point of the memoized _connect_event: the migrator fires at most
     # once regardless of how many events are appended. FAILS if it runs per append.
     assert calls["n"] <= 1
+
+
+# ---------------------------------------------------------------------------
+# PR 526 review — SHOULD-FIX: a TRAILING swallowed append must be declared.
+#
+# The adjacency scan only finds holes BETWEEN stored rows, so a hole at the END
+# of the sequence (the last append(s) before a crash were swallowed) had no
+# successor row to compare against and was invisible — exactly the forward-fault
+# shape the two-term high-water design exists to catch. The durable high-water is
+# the last seq ever ALLOCATED (persisted BEFORE each fallible append), so
+# high_water > last-stored-seq is a real hole.
+#
+# Declared for TERMINAL runs only: a live run legitimately sits one seq ahead for
+# the duration of every in-flight append.
+# ---------------------------------------------------------------------------
+def _seed_run_state(run_id: str, state: str) -> None:
+    workflow_journal.insert_run(
+        run_id=run_id,
+        workflow_name="wf",
+        spec_snapshot="{}",
+        inputs_json="{}",
+        state=state,
+        started_at="2026-07-27T00:00:00Z",
+    )
+
+
+def test_trailing_gap_declared_when_last_append_was_swallowed():
+    """Events 1,2 landed; seq 3 was allocated (high-water) but its append was
+    lost, and the run then ended. The hole at the END must be declared."""
+    for seq in (1, 2):
+        workflow_journal.append_event(
+            "r1", seq, "step.started", event_schema_version=1, ts="2026-07-27T00:00:00Z"
+        )
+    workflow_journal.persist_high_water("r1", 3)  # allocated, never landed
+    _seed_run_state("r1", "completed")
+
+    rows, gaps = workflow_journal.read_events_with_gaps("r1")
+    assert [r.seq for r in rows] == [1, 2]
+    assert len(gaps) == 1
+    gap = gaps[0]
+    assert gap.after_seq == 2
+    assert gap.missing_count == 1
+    assert gap.reason == "append_failed_trailing"
+    # missing_count arithmetic stays identical to an interior gap.
+    assert gap.missing_count == gap.before_seq - gap.after_seq - 1
+
+
+def test_trailing_gap_counts_multiple_lost_trailing_appends():
+    workflow_journal.append_event(
+        "r1", 1, "step.started", event_schema_version=1, ts="2026-07-27T00:00:00Z"
+    )
+    workflow_journal.persist_high_water("r1", 4)  # 2,3,4 allocated, none landed
+    _seed_run_state("r1", "failed")
+
+    _, gaps = workflow_journal.read_events_with_gaps("r1")
+    assert len(gaps) == 1
+    assert (gaps[0].after_seq, gaps[0].missing_count) == (1, 3)
+    assert gaps[0].reason == "append_failed_trailing"
+
+
+def test_no_trailing_gap_when_high_water_matches_the_last_stored_event():
+    """The healthy case: every allocated seq landed -> no trailing gap."""
+    for seq in (1, 2, 3):
+        workflow_journal.append_event(
+            "r1", seq, "step.started", event_schema_version=1, ts="2026-07-27T00:00:00Z"
+        )
+    workflow_journal.persist_high_water("r1", 3)
+    _seed_run_state("r1", "completed")
+
+    rows, gaps = workflow_journal.read_events_with_gaps("r1")
+    assert [r.seq for r in rows] == [1, 2, 3]
+    assert gaps == []
+
+
+def test_no_trailing_gap_for_a_still_running_run():
+    """A LIVE run is legitimately one ahead mid-append (high-water is persisted
+    BEFORE the append), so declaring there would emit a phantom gap on every
+    poll of every running run. Must stay silent until the run is terminal."""
+    for seq in (1, 2):
+        workflow_journal.append_event(
+            "r1", seq, "step.started", event_schema_version=1, ts="2026-07-27T00:00:00Z"
+        )
+    workflow_journal.persist_high_water("r1", 3)  # in-flight append
+    _seed_run_state("r1", "running")
+
+    _, gaps = workflow_journal.read_events_with_gaps("r1")
+    assert gaps == []
+
+    # ...and the moment it goes terminal, the same state DOES declare the hole.
+    workflow_journal.update_run_state("r1", "completed", "2026-07-27T00:00:05Z")
+    _, gaps_after = workflow_journal.read_events_with_gaps("r1")
+    assert [g.reason for g in gaps_after] == ["append_failed_trailing"]
+
+
+def test_trailing_gap_declared_against_the_cursor_on_a_caught_up_page():
+    """A follower already at seq 2 reading a terminal run whose seq 3 was lost
+    gets an EMPTY page that still declares the trailing hole."""
+    for seq in (1, 2):
+        workflow_journal.append_event(
+            "r1", seq, "step.started", event_schema_version=1, ts="2026-07-27T00:00:00Z"
+        )
+    workflow_journal.persist_high_water("r1", 3)
+    _seed_run_state("r1", "completed")
+
+    rows, gaps = workflow_journal.read_events_with_gaps("r1", after_seq=2)
+    assert rows == []
+    assert len(gaps) == 1
+    assert (gaps[0].after_seq, gaps[0].missing_count) == (2, 1)
+
+
+def test_interior_and_trailing_gaps_are_both_declared():
+    """Both mechanisms coexist: a hole in the middle AND one at the end."""
+    for seq in (1, 3):  # seq 2 lost (interior)
+        workflow_journal.append_event(
+            "r1", seq, "step.started", event_schema_version=1, ts="2026-07-27T00:00:00Z"
+        )
+    workflow_journal.persist_high_water("r1", 5)  # 4,5 lost (trailing)
+    _seed_run_state("r1", "completed")
+
+    _, gaps = workflow_journal.read_events_with_gaps("r1")
+    assert [g.reason for g in gaps] == ["append_failed", "append_failed_trailing"]
+    assert (gaps[0].after_seq, gaps[0].missing_count) == (1, 1)
+    assert (gaps[1].after_seq, gaps[1].missing_count) == (3, 2)

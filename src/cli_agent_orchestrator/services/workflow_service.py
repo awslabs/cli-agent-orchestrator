@@ -381,7 +381,8 @@ async def _journal_event(
     rebuild resumes strictly above it, BR-3). Both writes go off the loop through
     the sequential ``_ajournal(asyncio.to_thread)`` path so per-run event order
     matches transition order (BR-3). Each write is wrapped best-effort: a raise is
-    logged (WARNING for the high-water, DEBUG for the append) and NEVER propagated
+    logged (WARNING for both — losing the append loses journal CONTENT and is the
+    more consequential of the two) and NEVER propagated
     into ``_drive`` (FR-3.2 / BR-2), matching the swallow posture of the
     ``_journal_*`` write-through helpers. ``iteration`` / ``which_guard_fired`` are
     left unset (NULL, reserved, FR-1.5).
@@ -413,7 +414,11 @@ async def _journal_event(
     except (
         Exception
     ) as e:  # noqa: BLE001 — event append is best-effort; a lost event leaves a declared gap, never raises (BR-2)
-        logger.debug(
+        # WARNING, not DEBUG: losing an actual event is the more consequential
+        # loss of the two best-effort writes on this path (the high-water write
+        # below degrades durability metadata; this loses journal CONTENT and
+        # punches a hole the reader must declare as a gap).
+        logger.warning(
             "journal: append_event '%s' seq %d (%s) failed: %s",
             record.run_id,
             seq,
@@ -802,18 +807,23 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
         # U2 emission: a validated/collected output was received (validation_result
         # distinguishes valid from invalid); then the step settled.
         if st.output is not None:
-            # U7 opt-in output capture (issue #504, NFR-SEC-2/4/6): retain the step's
-            # output text ON THE EVENT only through the capture gate. resolve_captured_output
-            # returns None when capture is disabled (the default — metadata-only, no free-text
-            # retained) or the text is None, and the sanitized+size-capped text when capture is
-            # explicitly enabled (funneled through audit_log's cap-and-mark idiom — the SINGLE
-            # redaction path, no second policy). The captured text rides the event's free-text
-            # ``output_ref`` column, which is NULL by default (so the compare-diagnostics
-            # reference contract holds unless capture is opted in). Imported lazily inside the
-            # function to match the module's other in-function imports and avoid an import cycle.
+            # ``output_ref`` carries a REFERENCE to the step's output, never the
+            # output itself: the compare diff (a_refs/b_refs) and the diagnostic
+            # bundle's references.artifacts are both documented as
+            # reference-level. output_reference() returns a content digest
+            # (``sha256:<16 hex>``) — stable, so compare still detects "this step
+            # produced something different", but revealing nothing and fixed-size
+            # regardless of output size.
+            #
+            # The output TEXT is NOT stored here. It reaches an operator only
+            # through the diagnostic bundle's capture-gated ``excerpts`` section,
+            # which re-reads the capture setting at export time — so turning
+            # capture off actually stops payloads from shipping, instead of
+            # leaving previously-written ones embedded in a "references" field.
+            # Imported lazily inside the function to match the module's other
+            # in-function imports and avoid an import cycle.
             from cli_agent_orchestrator.services import workflow_retention
 
-            captured = workflow_retention.resolve_captured_output(_output_json(st.output))
             await _journal_event(
                 record,
                 "step.output.received",
@@ -821,7 +831,7 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                 attempt=attempt,
                 validation_result="valid" if st.output.validated else "invalid",
                 terminal_id=st.terminal_id,
-                output_ref=captured,
+                output_ref=workflow_retention.output_reference(_output_json(st.output)),
             )
         await _journal_event(
             record,

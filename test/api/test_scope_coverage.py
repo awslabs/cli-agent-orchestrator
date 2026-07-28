@@ -109,3 +109,36 @@ def test_admin_token_admitted_on_admin_route(client, auth_on):
     app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_ADMIN])
     resp = client.delete("/memory/some-key")
     assert resp.status_code != 403
+
+
+# ---------------------------------------------------------------------------
+# PR 526 review — SHOULD-FIX: the diagnostics bundle must be scope-gated.
+#
+# GET /workflows/runs/{id}/diagnostics returns the run's `inputs` (its raw
+# inputs_json, passed through sanitize_output — which is transport hygiene, NOT
+# secret redaction, so a credential passed as a workflow input comes back
+# verbatim) plus capture-gated output excerpts. It had NO require_any_scope
+# dependency, so with auth enabled ANY valid token could export it.
+# ---------------------------------------------------------------------------
+def test_diagnostics_route_is_scope_gated():
+    """The wiring guard: the diagnostics route carries a require_any_scope dep."""
+    routes = [
+        r for r in app.routes if getattr(r, "path", None) == "/workflows/runs/{run_id}/diagnostics"
+    ]
+    assert routes, "diagnostics route not found in the route table"
+    for route in routes:
+        assert _has_scope_dependency(route), "diagnostics route lost its scope gate"
+
+
+def test_unscoped_token_forbidden_on_diagnostics(client, auth_on):
+    """A token carrying NO recognized scope is 403'd on the diagnostics export."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([])
+    resp = client.get("/workflows/runs/r1/diagnostics")
+    assert resp.status_code == 403
+
+
+def test_read_token_admitted_on_diagnostics(client, auth_on):
+    """A cao:read token passes the dependency (404 for an unknown run, not 403)."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    resp = client.get("/workflows/runs/r1/diagnostics")
+    assert resp.status_code != 403

@@ -6,19 +6,30 @@ six binding Q3 security rules (NFR-SEC-1..6) and backing the FR-11 per-run delet
 - **Metadata-only default (NFR-SEC-1/2).** Output capture is OFF by default. With
   capture off, only always-on execution metadata (events, timings, states,
   structured error kinds, terminal + artifact references) is journaled — never
-  prompt text or full step output. The emission path (``workflow_service``) already
-  routes NO prompt/free-text output into the journal, so this posture holds by
-  construction; this module owns the gate a future capture-enabling feature calls.
+  prompt text or full step output. The event log holds no step output text at ALL:
+  the emission path stores only a content-digest REFERENCE
+  (``output_reference``) in the event's ``output_ref`` column, regardless of the
+  capture setting. Captured output text reaches an operator solely through the
+  diagnostic bundle's ``excerpts`` section, which re-reads the capture gate at
+  export time — so turning capture off actually stops payloads from shipping.
 - **Bounded, sanitized capture (NFR-SEC-4/6).** When capture is explicitly enabled,
   retained free-text funnels through ``sanitize_output`` — which REUSES the
   ``audit_log`` cap-and-mark idiom (``audit_log._sanitize_for_log`` + the
   ``_sanitize_field_value``-style byte-cap + the ``"[…truncated]"`` marker). There is
-  NO second/parallel redaction policy (NFR-SEC-6, the deciding rule): the audit_log
-  choke point is the single redaction path.
+  NO second/parallel sanitization policy (NFR-SEC-6, the deciding rule): the
+  audit_log choke point is the single path.
+
+  ``sanitize_output`` is size-limiting + control-character hygiene, NOT secret
+  redaction — it does not detect or remove credentials, and a token in the text
+  passes through verbatim. Surfaces that expose it are protected by a scope gate
+  instead; do not describe its output as "redacted".
 - **Age + run-count retention (NFR-SEC-3).** ``sweep_runs`` prunes runs older than an
   age default AND beyond a most-recent run-count default (whichever bound is hit
   first prunes); both are settings-overridable. Each pruned run is removed via U1's
   ``workflow_journal.delete_run`` cascade — this module does NOT reimplement it.
+  Scheduled from the API lifespan at startup
+  (``api.main._sweep_workflow_runs_at_startup``); without that call site the sweep
+  is dead code and the journal grows unbounded.
 
 Config provenance (BR-1/BR-2):
 
@@ -38,6 +49,7 @@ Settings are read through ``settings_service.get_memory_settings().get(<key>,
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -126,10 +138,10 @@ def retention_count() -> int:
 
 
 def sanitize_output(text: str) -> str:
-    """Redact + size-limit retained free-text through the audit_log idiom (NFR-SEC-6).
+    """Size-limit + neutralize retained free-text through the audit_log idiom.
 
-    The SINGLE redaction path. Mirrors ``audit_log._sanitize_field_value`` exactly,
-    at U7's own ``output_cap_bytes()`` cap:
+    The SINGLE sanitization path. Mirrors ``audit_log._sanitize_field_value``
+    exactly, at U7's own ``output_cap_bytes()`` cap:
 
     1. Base clean via ``audit_log._sanitize_for_log`` — strips ANSI / C0 controls,
        escapes newlines, drops Unicode line separators (the shared choke point).
@@ -137,8 +149,15 @@ def sanitize_output(text: str) -> str:
        ``audit_log._sanitize_for_log`` proves the funnel (BR-SEC-6).
     2. Byte-cap + the SAME ``"[…truncated]"`` marker on the encoded result.
 
-    There is NO parallel truncation/redaction implementation — a second policy would
+    There is NO parallel truncation implementation — a second policy would
     fail NFR-SEC-6 (and the BR-SEC-6 test, which spies this funnel).
+
+    NOT SECRET REDACTION. This is transport/log hygiene: it makes text safe to
+    write on one line and bounds its size. It does NOT detect or remove
+    credentials — a token or API key in the input passes through verbatim (only
+    escaped and possibly truncated). Callers must not describe its output as
+    "redacted"; treat anything funnelled through it as still-sensitive and gate
+    the surface that exposes it on a scope instead.
     """
     cap = output_cap_bytes()
     # (1) Base cap-and-mark clean — the audit_log choke point (attribute access so a
@@ -162,14 +181,44 @@ def resolve_captured_output(text: Optional[str]) -> Optional[str]:
     - capture ON -> the sanitized, size-limited text (``sanitize_output``, NFR-SEC-4/6).
 
     This module owns the gate so the drive-loop emission sequence (SEAM #1) is never
-    restructured to add capture logic. The current default-off posture already retains
-    no free-text (the emission path journals only metadata + a NULL ``output_ref``),
-    so no emission-site call is required today; this helper is the designated,
-    fully-tested extension point a future capture-enabling feature calls.
+    restructured to add capture logic.
+
+    Returns the output TEXT. Callers must therefore NOT store the result in the
+    event's ``output_ref`` column: that column is a REFERENCE (compare's
+    ``a_refs``/``b_refs`` and the diagnostic bundle's ``references.artifacts`` are
+    documented as reference-level, never payloads). Use
+    ``output_reference(text)`` for the column and let the payload travel only
+    through the capture-gated ``excerpts`` section.
     """
     if text is None or not capture_enabled():
         return None
     return sanitize_output(text)
+
+
+def output_reference(text: Optional[str]) -> Optional[str]:
+    """A stable, non-revealing REFERENCE to a step output, for ``output_ref``.
+
+    ``output_ref`` feeds the reference-level surfaces — compare's per-step
+    ``a_refs``/``b_refs`` diff and ``BundleReferences.artifacts`` — whose
+    contract is "references, not payloads". Storing the captured text there
+    exported full payloads through fields documented as references, and did so
+    even when the bundle's own ``capture_enabled`` flag read false (the flag is
+    re-read at export time, so a payload written while capture was ON still
+    shipped after it was turned OFF).
+
+    So the column gets a content digest instead: ``sha256:<16 hex>``. It is
+    stable (equal outputs produce equal refs, so the compare diff still detects
+    "this step produced something different"), reveals nothing about the
+    content, and is a fixed 23 characters regardless of output size. ``None``
+    for ``None`` — an absent output has no reference.
+
+    Deliberately NOT capture-gated: a digest is not free-text retention, so the
+    reference surfaces stay useful with capture off (which is the default).
+    """
+    if text is None:
+        return None
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+    return f"sha256:{digest[:16]}"
 
 
 # -----------------------------------------------------------------------------

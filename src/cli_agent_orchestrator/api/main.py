@@ -804,6 +804,24 @@ def _seed_default_skills_at_startup() -> None:
         )
 
 
+def _sweep_workflow_runs_at_startup() -> None:
+    """Run the workflow run-journal retention sweep once at startup (NFR-SEC-3).
+
+    ``sweep_runs`` is already best-effort internally (enumeration failures return
+    0, a per-run delete failure is logged and the sweep continues), so this only
+    adds a defensive outer guard: a maintenance sweep must never prevent the
+    server from starting.
+    """
+    from cli_agent_orchestrator.services import workflow_retention
+
+    try:
+        pruned = workflow_retention.sweep_runs()
+        if pruned:
+            logger.info("workflow retention: pruned %d run(s) at startup", pruned)
+    except Exception as e:  # noqa: BLE001 — never block startup on a maintenance sweep
+        logger.warning("workflow retention sweep failed at startup: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -830,6 +848,12 @@ async def lifespan(app: FastAPI):
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
     asyncio.create_task(cleanup_expired_memories())
+    # Workflow run-journal retention (#504, NFR-SEC-3). Without this the sweep
+    # had NO production caller and the advertised age/run-count retention never
+    # ran, so the event log grew without bound. Startup-time and best-effort,
+    # matching cleanup_old_data above: sweep_runs never raises (read failures
+    # degrade to a 0-run no-op) and bounds are read from settings.
+    asyncio.create_task(asyncio.to_thread(_sweep_workflow_runs_at_startup))
 
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
@@ -3018,6 +3042,19 @@ def _gap_sse_frame(gap: GapMarker) -> str:
     return f"event: gap\ndata: {json.dumps(asdict(gap))}\n\n"
 
 
+def _run_absent_sse_frame(run_id: str) -> str:
+    """Serialize the terminal 'this run does not exist' frame for the SSE arm.
+
+    Emitted when ``get_run`` returns ``None`` — an id that never existed, or one
+    removed by the DELETE endpoint or the retention sweep. Such a run can never
+    reach a terminal state, so without this the follower would poll forever
+    (an unbounded connection + poll cycle per typo'd id). Carries no ``id:``: it
+    is synthesized at read time and owns no seq, so a reconnect cursor is
+    unaffected.
+    """
+    return f"event: run_absent\ndata: {json.dumps({'run_id': run_id})}\n\n"
+
+
 def _merge_ordered_sse_frames(events: List[EventRow], gaps: List[GapMarker]) -> List[str]:
     """Interleave event + gap frames in seq/position order (business-logic-model).
 
@@ -3078,7 +3115,18 @@ async def _follow_run_events(run_id: str, after_seq: Optional[int]) -> AsyncIter
     # event itself (run.completed / run.failed / run.cancelled) is the final frame
     # already delivered in Phase 1 when its append succeeded; here we simply stop.
     run = await asyncio.to_thread(workflow_journal.get_run, run_id)
-    if run is not None and run.state in _TERMINAL_RUN_STATES:
+    if run is None:
+        # ABSENT run: an id that never existed (a typo from curl or an agent), or
+        # one the retention sweep / DELETE removed. There is no run that can ever
+        # go terminal, so entering live-follow would pin this connection and a
+        # poll cycle FOREVER. Declare the absence as a terminal frame and close,
+        # so a follower learns why the stream ended instead of hanging. (The
+        # batch arm answers the same case with an empty page; a stream cannot,
+        # having already committed to 200 + text/event-stream in the response
+        # header, so `event: run_absent` is the in-band equivalent.)
+        yield _run_absent_sse_frame(run_id)
+        return
+    if run.state in _TERMINAL_RUN_STATES:
         return
 
     # Phase 3 — live-follow: tail the durable table until the run goes terminal
@@ -3094,7 +3142,13 @@ async def _follow_run_events(run_id: str, after_seq: Optional[int]) -> AsyncIter
             if events:
                 cursor = events[-1].seq
             run = await asyncio.to_thread(workflow_journal.get_run, run_id)
-            if run is not None and run.state in _TERMINAL_RUN_STATES:
+            if run is None:
+                # The run VANISHED mid-follow (DELETE endpoint or retention
+                # sweep). Same reasoning as the Phase 2 absent guard: nothing
+                # can ever go terminal now, so close instead of polling forever.
+                yield _run_absent_sse_frame(run_id)
+                return
+            if run.state in _TERMINAL_RUN_STATES:
                 # Drain any events appended between this poll's read and the
                 # terminal projection landing, then close (BR-5).
                 events, gaps = await asyncio.to_thread(
@@ -3383,7 +3437,10 @@ async def compare_workflow_runs_endpoint(
 
 
 @app.get("/workflows/runs/{run_id}/diagnostics", response_model=DiagnosticBundle)
-async def get_workflow_run_diagnostics_endpoint(run_id: str) -> DiagnosticBundle:
+async def get_workflow_run_diagnostics_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> DiagnosticBundle:
     """Export a run's troubleshooting bundle (FR-9, business-logic-model Algorithm 2).
 
     Assembles EVERY FR-9.1 section (BR-3) from the DURABLE journal alone — no
@@ -3397,8 +3454,11 @@ async def get_workflow_run_diagnostics_endpoint(run_id: str) -> DiagnosticBundle
     - ``inputs`` = the run's ``inputs_json`` passed through U7's
       ``workflow_retention.sanitize_output`` (NFR-SEC-6 / BR-4). Inputs are durable
       run-row metadata (written at ``insert_run`` regardless of capture) so the
-      section is always present, redacted — the capture gate below applies only to
-      step-OUTPUT excerpts.
+      section is always present — the capture gate below applies only to
+      step-OUTPUT excerpts. NOTE: ``sanitize_output`` is size-limiting + control
+      character hygiene, NOT secret redaction — a credential passed as a workflow
+      input is returned verbatim here. That is why this route is scope-gated;
+      do not describe this section as redacted.
     - ``events`` + ``gaps`` = the ordered event timeline with declared gaps
       (``read_events_with_gaps``); ``step_outcomes`` = per-step state + structured
       ``error_kind`` (always-on metadata, NFR-SEC-1, no free-text).
@@ -3518,13 +3578,35 @@ async def delete_workflow_run_endpoint(
     single-segment ``/workflows/{name}`` catch-all regardless of registration order
     (FR-6.5), and pinned by ``test_workflow_route_ordering``. Idempotent: deleting an
     unknown run id is a well-defined no-op (``delete_run`` guarantees this, BR-3) and
-    still returns 204 — a delete is never an error that faults other reads. The
+    still returns 204 — a delete is never an error that faults other reads. A run
+    that is still live (a known run in a non-terminal state) is REJECTED with 409:
+    deleting it would leave the drive loop running with no way to cancel it and its
+    later appends orphaned. Cancel first, then delete. The
     blocking sqlite cascade runs off the event loop (``to_thread``) so a slow DB op
     bounds its blast radius to this one request. ``run_id`` binds through
     parameterized SQL in the DAL (no injection surface), matching the pass-through
     posture of the sibling inspect/events/cancel/resume run routes.
     """
     from cli_agent_orchestrator.services import workflow_journal, workflow_service
+
+    # Refuse to delete a run that is still LIVE (409). Deleting one removes the
+    # run row and evicts the registry entry, but the drive loop keeps executing
+    # with nothing left to reach it: cancel can no longer find the run, and the
+    # loop's subsequent appends land as orphan event rows keyed off a run row
+    # that no longer exists — unreachable by every read path AND by the
+    # retention sweep, which both join through that row. So the delete would
+    # create an uncancellable zombie plus unreclaimable storage. Cancel first,
+    # then delete. Absent (None) stays a 204 no-op: idempotency is preserved
+    # (BR-3), and only a KNOWN non-terminal run is rejected.
+    run = await asyncio.to_thread(workflow_journal.get_run, run_id)
+    if run is not None and run.state not in _TERMINAL_RUN_STATES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"run '{run_id}' is still {run.state}; cancel it before deleting "
+                "(deleting a live run orphans its events and leaves it uncancellable)"
+            ),
+        )
 
     try:
         await asyncio.to_thread(workflow_journal.delete_run, run_id)

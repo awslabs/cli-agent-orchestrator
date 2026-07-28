@@ -5,6 +5,7 @@
 // RunComparison, and the diagnostics/delete actions. Live-follows the SSE
 // stream while the run is non-terminal.
 
+import { useEffect, useState } from 'react'
 import { Loader2, Radio } from 'lucide-react'
 import type { RunInspection, RunSummaryRow } from '../../api'
 import { useStore } from '../../store'
@@ -37,16 +38,32 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
 
   // Live-follow only while the run has not gone terminal (a finished run has a
   // complete durable timeline already loaded; no stream to open).
-  const isTerminal = TERMINAL_RUN_STATES.has(run.state)
+  //
+  // `run` is the inspection snapshot taken when the run was SELECTED and is
+  // never reassigned, so on its own `run.state` can never observe the run
+  // finishing — the follow loop would reconnect every 1.5s forever after
+  // completion. The run LIST is polled every 10s, so we take the freshest state
+  // from there and fall back to the snapshot when the row is absent.
+  const liveRow = allRuns.find(r => r.run_id === run.run_id)
+  const effectiveState = liveRow?.state ?? run.state
+  // A run that vanished from the journal (deleted or retention-swept) is also
+  // terminal for follow purposes; the server declares it via `event: run_absent`
+  // and this latches so the stream is not re-opened.
+  const [absent, setAbsent] = useState(false)
+  const isTerminal = TERMINAL_RUN_STATES.has(effectiveState) || absent
   useEventFollow(
     isTerminal ? null : run.run_id,
     {
       onEvent: appendWorkflowEvent,
       onGap: addWorkflowGap,
       onConnectedChange: setFollowConnected,
+      onAbsent: () => setAbsent(true),
     },
     { enabled: !isTerminal },
   )
+
+  // Reset the absent latch when the selection changes to a different run.
+  useEffect(() => setAbsent(false), [run.run_id])
 
   const cue = runCue(run.state)
   const selectedEvent = events[selectedIndex] ?? null

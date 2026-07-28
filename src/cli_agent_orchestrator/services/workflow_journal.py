@@ -641,6 +641,28 @@ def read_events(run_id: str, after_seq: Optional[int] = None) -> List[EventRow]:
     return [_event_row(r) for r in rows]
 
 
+_TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
+
+
+def _is_terminal_run(run_id: str) -> bool:
+    """Whether the run has durably ended — the gate for declaring a trailing gap.
+
+    A missing/unreadable run row answers ``False`` (declare nothing) rather than
+    raising into the read path: a gap is an assertion about lost data, so the
+    quiet answer is the safe default when the run's state cannot be established.
+    """
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM workflow_run WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+    except sqlite3.Error as e:
+        logger.debug(f"trailing-gap state read failed for run '{run_id}': {e}")
+        return False
+    return row is not None and str(row[0]) in _TERMINAL_RUN_STATES
+
+
 def read_events_with_gaps(
     run_id: str, after_seq: Optional[int] = None
 ) -> Tuple[List[EventRow], List[GapMarker]]:
@@ -651,6 +673,30 @@ def read_events_with_gaps(
     one, a ``GapMarker`` is synthesized spanning the missing range. The sequence
     is never renumbered to hide the gap — the marker lets a client tell "nothing
     happened" from "an event was lost" (FR-3.3). Returns ``(rows, gaps)``.
+
+    A hole between two stored rows is found by the adjacency scan below. A
+    TRAILING hole — the last append(s) before a crash were swallowed, so the
+    missing seqs sit past the final stored row with no successor to compare
+    against — is invisible to that scan, and is exactly the forward-fault shape
+    the two-term design exists to catch. It is recovered from the durable
+    high-water: the counter is advanced and persisted BEFORE each fallible
+    append, so ``persisted_high_water`` is the last seq ever ALLOCATED while the
+    last stored row is the last seq that actually LANDED. When the former
+    exceeds the latter, the difference is a real declared hole at the end.
+
+    The trailing marker uses ``before_seq = high_water + 1`` — one past the last
+    allocated seq — because no stored event bounds it on the right. That is a
+    deliberate sentinel: it keeps ``missing_count == before_seq - after_seq - 1``
+    arithmetic identical to an interior gap, and it never collides with a real
+    event's seq (nothing has been allocated at ``high_water + 1`` yet).
+
+    A trailing gap is declared ONLY for a run in a terminal state. Because the
+    high-water is persisted BEFORE its append, a RUNNING run legitimately sits
+    one seq ahead for the duration of every in-flight append — declaring on that
+    window would emit a phantom gap on essentially every poll of every live run.
+    Once the run is terminal no further append can land, so the excess is a real,
+    permanent hole. This makes the check quiet by construction rather than
+    relying on a timing tolerance.
     """
     rows = read_events(run_id, after_seq)
     gaps: List[GapMarker] = []
@@ -669,6 +715,23 @@ def read_events_with_gaps(
                 )
             )
         prev = row.seq
+
+    # Trailing hole: allocated past the last row that landed. `prev` is the last
+    # delivered seq (or the cursor when this page is empty); a read failure in
+    # persisted_high_water degrades to 0, which simply declares no trailing gap.
+    # Terminal-only (see the docstring): a live run is legitimately one ahead
+    # mid-append, so checking it there would emit a phantom gap every poll.
+    if prev is not None and _is_terminal_run(run_id):
+        high_water = persisted_high_water(run_id)
+        if high_water > prev:
+            gaps.append(
+                GapMarker(
+                    after_seq=prev,
+                    before_seq=high_water + 1,
+                    missing_count=high_water - prev,
+                    reason="append_failed_trailing",
+                )
+            )
     return rows, gaps
 
 

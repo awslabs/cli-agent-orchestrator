@@ -5,6 +5,7 @@ import { WorkflowTimeline } from '../components/workflow/WorkflowTimeline'
 import { SyncedTerminalPane, hasTerminalOffsets } from '../components/workflow/SyncedTerminalPane'
 import { DeleteRunButton } from '../components/workflow/DeleteRunButton'
 import { WorkflowsPanel } from '../components/WorkflowsPanel'
+import { RunDetail } from '../components/workflow/RunDetail'
 import { api } from '../api'
 import { useStore } from '../store'
 import type { RunSummaryRow, WorkflowEvent, GapMarker } from '../api'
@@ -88,7 +89,7 @@ describe('WorkflowTimeline', () => {
   })
 })
 
-describe('SyncedTerminalPane — the #769 graceful-degrade seam (mutation guard)', () => {
+describe('SyncedTerminalPane — null-offset graceful-degrade seam (mutation guard)', () => {
   const withOffsets: WorkflowEvent = {
     run_id: 'r', seq: 3, event_type: 'step.output.received', event_schema_version: 1, ts: '',
     step_id: 'a', terminal_id: 't1', terminal_offset_start: 10, terminal_offset_len: 40,
@@ -115,11 +116,13 @@ describe('SyncedTerminalPane — the #769 graceful-degrade seam (mutation guard)
     expect(screen.queryByText(/sync pending/i)).not.toBeInTheDocument()
   })
 
-  it('BRANCH 2 — NULL offsets: shows the documented #769 degrade state, never crashes/blanks, never fetches', () => {
+  it('BRANCH 2 — NULL offsets: shows the degrade state, never crashes/blanks, never fetches', () => {
     const spy = vi.spyOn(api, 'getTerminalOutputRange')
     render(<SyncedTerminalPane event={nullOffsets} />)
     expect(screen.getByText(/sync pending/i)).toBeInTheDocument()
-    expect(screen.getByText('#769')).toBeInTheDocument()
+    // No issue link: the pane used to cite a fabricated issue URL (wrong org,
+    // non-existent number), so the degrade state is now plain prose.
+    expect(screen.queryByRole('link')).toBeNull()
     // The range API is NOT called when offsets are null.
     expect(spy).not.toHaveBeenCalled()
   })
@@ -239,5 +242,74 @@ describe('WorkflowsPanel — inline error is genuinely reachable', () => {
     await expect(useStore.getState().fetchWorkflowRuns()).resolves.toBe('boom')
     vi.spyOn(api, 'listWorkflowRuns').mockResolvedValue([])
     await expect(useStore.getState().fetchWorkflowRuns()).resolves.toBeNull()
+  })
+})
+
+// ── PR 526 review: RunDetail must observe the run going terminal ───────────
+// `run` is the inspection snapshot taken at SELECTION time and is never
+// reassigned, and the panel polls the run LIST (not the selected run) — so
+// deriving isTerminal from `run.state` alone could never observe completion and
+// the SSE follow reconnected every 1.5s forever. The fresh state comes from the
+// polled `allRuns` row.
+describe('RunDetail — terminal state is observed from the polled run list (#526)', () => {
+  const inspection = {
+    run_id: 'run-abc-123',
+    workflow_name: 'my-workflow',
+    state: 'running', // stale snapshot: captured while the run was live
+    started_at: '2026-07-27T00:00:00Z',
+    finished_at: null,
+    tier: 'yaml',
+    steps: [],
+  } as any
+
+  const listRow = (state: string): RunSummaryRow => ({ ...sampleRun, state })
+
+  beforeEach(() => {
+    useStore.setState({ workflowRuns: [], selectedRun: null, wfEvents: [], wfGaps: [], snackbar: null })
+  })
+
+  it('does NOT open the follow stream when the list says the run finished', async () => {
+    const fetchMock = vi.fn(async (_url: string) => {
+      throw new Error('no stream expected')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      // Snapshot says running; the polled list says completed. The list wins.
+      render(<RunDetail run={inspection} allRuns={[listRow('completed')]} />)
+      await new Promise(r => setTimeout(r, 50))
+      const sseCalls = fetchMock.mock.calls.filter(c => String(c[0]).includes('/events'))
+      expect(sseCalls).toHaveLength(0)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('DOES open the follow stream while the list still says the run is live', async () => {
+    const fetchMock = vi.fn(async (_url: string) => ({ ok: false, status: 500, body: null }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      render(<RunDetail run={inspection} allRuns={[listRow('running')]} />)
+      await waitFor(() => {
+        const sseCalls = fetchMock.mock.calls.filter(c => String(c[0]).includes('/events'))
+        expect(sseCalls.length).toBeGreaterThan(0)
+      })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('falls back to the snapshot state when the run has no list row yet', async () => {
+    const fetchMock = vi.fn(async (_url: string) => ({ ok: false, status: 500, body: null }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      // Empty list -> fall back to `run.state` ('running') -> follow opens.
+      render(<RunDetail run={inspection} allRuns={[]} />)
+      await waitFor(() => {
+        const sseCalls = fetchMock.mock.calls.filter(c => String(c[0]).includes('/events'))
+        expect(sseCalls.length).toBeGreaterThan(0)
+      })
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 })

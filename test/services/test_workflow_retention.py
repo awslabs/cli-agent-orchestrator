@@ -334,14 +334,13 @@ async def test_br_sec_2_step_output_received_output_ref_null_when_capture_off(
 ):
     """MUTATION GUARD: capture OFF -> the fired ``step.output.received`` retains NO output.
 
-    A schema step produces a real output (sentinel), so the event FIRES. With capture
-    off (default), the emission MUST route the payload through
-    ``resolve_captured_output`` — which returns ``None`` — so the event's ``output_ref``
-    is NULL and the sentinel appears in no stored cell.
+    A schema step produces a real output (sentinel), so the event FIRES. The event's
+    ``output_ref`` is a REFERENCE — a ``sha256:`` content digest — so the sentinel
+    appears in no stored cell of the event log regardless of the capture setting.
 
-    This goes RED if the emission site bypasses the gate: writing the raw output
-    unconditionally (``output_ref=_output_json(st.output)``), or writing it even when
-    capture is off, makes ``output_ref`` non-NULL and leaks the sentinel here.
+    This goes RED if the emission site writes the output TEXT into ``output_ref``
+    (``output_ref=_output_json(st.output)``, or routing it through
+    ``resolve_captured_output``, which returns the text): either leaks the sentinel here.
     """
     settings["workflow_journal_capture_output"] = False
     monkeypatch.setattr(
@@ -354,8 +353,10 @@ async def test_br_sec_2_step_output_received_output_ref_null_when_capture_off(
     events = {e.event_type: e for e in workflow_journal.read_events("runCapOff")}
     # The event FIRED (a real output was collected) — this test is not vacuous.
     assert "step.output.received" in events
-    # ... but the gate retained nothing: output_ref is NULL.
-    assert events["step.output.received"].output_ref is None
+    # ... and output_ref is a non-revealing digest REFERENCE, never the payload.
+    ref = events["step.output.received"].output_ref
+    assert ref is not None and ref.startswith("sha256:")
+    assert "SENTINEL_OUTPUT_OFF" not in ref
     # Defense in depth: the sentinel leaked into no stored cell of the EVENT LOG (the
     # diagnostic record NFR-SEC-2 governs). The scan is deliberately scoped to
     # ``workflow_run_event`` and NOT ``workflow_run_step``: the step row's
@@ -373,19 +374,19 @@ async def test_br_sec_2_step_output_received_output_ref_null_when_capture_off(
 
 
 @pytest.mark.asyncio
-async def test_br_sec_2_step_output_received_carries_sanitized_output_when_capture_on(
-    settings, monkeypatch
-):
-    """MUTATION GUARD: capture ON -> the event carries the SANITIZED, capped output.
+async def test_br_sec_2_step_output_received_never_carries_the_payload(settings, monkeypatch):
+    """MUTATION GUARD: even with capture ON, ``output_ref`` is a REFERENCE.
 
-    With capture enabled and a small cap, the retained ``output_ref`` MUST be the
-    sentinel output funneled through ``resolve_captured_output`` -> ``sanitize_output``
-    (the audit_log cap-and-mark idiom), NOT the raw output. Asserting the exact
-    ``"[…truncated]"`` marker + byte cap proves the funnel fired.
+    ``output_ref`` feeds the reference-level surfaces (compare's a_refs/b_refs and
+    the bundle's ``references.artifacts``), whose contract is "references, not
+    payloads". So the emission site stores a ``sha256:`` content digest and the
+    output TEXT never lands in the event row — with capture on OR off. The payload
+    reaches an operator only via the bundle's capture-gated ``excerpts`` section,
+    which re-reads the setting at export time.
 
-    This goes RED if the emission site bypasses ``resolve_captured_output`` and writes
-    the raw output (``output_ref=_output_json(st.output)``): the raw JSON is not
-    truncated, so the marker assertion fails.
+    This goes RED if the emission site writes the text: either raw
+    (``output_ref=_output_json(st.output)``) or via ``resolve_captured_output``
+    (which returns the sanitized TEXT) — both leak the sentinel into output_ref.
     """
     settings["workflow_journal_capture_output"] = True
     settings["workflow_journal_output_cap_bytes"] = 64
@@ -399,20 +400,47 @@ async def test_br_sec_2_step_output_received_carries_sanitized_output_when_captu
 
     events = {e.event_type: e for e in workflow_journal.read_events("runCapOn")}
     received = events["step.output.received"]
-    # The gate retained the output (capture is on) ...
+    # The event FIRED with a reference — this test is not vacuous.
     assert received.output_ref is not None
-    assert "SENTINEL_OUTPUT_ON" in received.output_ref
-    # ... funneled through sanitize_output: over-cap, so it carries the audit_log
-    # cap-and-mark marker and the retained prefix is byte-capped (NOT the raw output).
-    assert received.output_ref.endswith("[…truncated]")
-    prefix = received.output_ref[: -len("[…truncated]")]
-    assert len(prefix.encode("utf-8")) <= 64
-    # Single-path proof: byte-identical to the retention module's own funnel of the
-    # SAME serialized output — the emission site added no second redaction policy.
+    assert received.output_ref.startswith("sha256:")
+    # The payload is NOT in the reference, even with capture ON.
+    assert "SENTINEL_OUTPUT_ON" not in received.output_ref
+    # A digest is fixed-size regardless of the (500+ byte) output.
+    assert len(received.output_ref) == len("sha256:") + 16
+    # Byte-identical to the retention module's own reference helper for the SAME
+    # serialized output — the emission site added no second policy.
     import json
 
-    expected = workflow_retention.resolve_captured_output(json.dumps({"secret": big}))
+    expected = workflow_retention.output_reference(json.dumps({"secret": big}))
     assert received.output_ref == expected
+    # Defense in depth: the sentinel is in NO cell of the event log.
+    with sqlite3.connect(str(workflow_journal_db())) as conn:
+        rows = conn.execute(
+            "SELECT * FROM workflow_run_event WHERE run_id = ?", ("runCapOn",)
+        ).fetchall()
+        for row in rows:
+            for cell in row:
+                if isinstance(cell, str):
+                    assert "SENTINEL_OUTPUT_ON" not in cell
+
+
+def test_output_reference_is_stable_and_distinguishing():
+    """The digest must be usable by the compare diff: equal outputs -> equal refs,
+    different outputs -> different refs (that is the whole point of a reference)."""
+    assert workflow_retention.output_reference(None) is None
+    a = workflow_retention.output_reference('{"x": 1}')
+    again = workflow_retention.output_reference('{"x": 1}')
+    b = workflow_retention.output_reference('{"x": 2}')
+    assert a == again  # stable
+    assert a != b  # distinguishing
+    assert a is not None and a.startswith("sha256:")
+
+
+def test_output_reference_is_not_capture_gated(settings):
+    """A digest is not free-text retention, so the reference surfaces stay useful
+    with capture OFF (the default) — otherwise compare would go blind by default."""
+    settings["workflow_journal_capture_output"] = False
+    assert workflow_retention.output_reference('{"x": 1}') is not None
 
 
 def test_capture_gate_off_returns_none_even_for_nonempty_text(settings):
@@ -593,3 +621,81 @@ def test_none_output_is_not_captured_regardless_of_gate(settings):
     """resolve_captured_output(None) is None even with capture ON (nothing to retain)."""
     settings["workflow_journal_capture_output"] = True
     assert workflow_retention.resolve_captured_output(None) is None
+
+
+# ===========================================================================
+# PR 526 review — SHOULD-FIX: the retention sweep must actually be SCHEDULED.
+#
+# sweep_runs had no production caller (`grep -rn sweep_runs src/` returned only
+# its definition and docstrings), so the advertised age/run-count retention never
+# ran and the event log grew unbounded. It is now invoked at startup via the
+# lifespan's `_sweep_workflow_runs_at_startup` helper.
+# ===========================================================================
+def test_sweep_has_a_production_caller_in_the_api_module():
+    """The wiring guard: a source-level check that the sweep is reachable from
+    production code, not just tests. Goes RED if the call site is removed —
+    which is exactly how this defect shipped (a tested function nobody called).
+    """
+    import inspect
+
+    from cli_agent_orchestrator.api import main as api_main
+
+    # The startup helper exists and calls the sweep.
+    assert hasattr(api_main, "_sweep_workflow_runs_at_startup")
+    assert "sweep_runs" in inspect.getsource(api_main._sweep_workflow_runs_at_startup)
+    # ...and the lifespan schedules that helper.
+    assert "_sweep_workflow_runs_at_startup" in inspect.getsource(api_main.lifespan)
+
+
+def test_startup_sweep_helper_invokes_sweep_runs(monkeypatch):
+    """Behavioral: the helper delegates to workflow_retention.sweep_runs."""
+    from cli_agent_orchestrator.api import main as api_main
+
+    calls: List[int] = []
+    monkeypatch.setattr(workflow_retention, "sweep_runs", lambda: calls.append(1) or 3)
+    api_main._sweep_workflow_runs_at_startup()
+    assert calls == [1]
+
+
+def test_startup_sweep_never_raises_into_startup(monkeypatch):
+    """A maintenance sweep must never prevent the server from starting."""
+    from cli_agent_orchestrator.api import main as api_main
+
+    def _boom():
+        raise RuntimeError("sweep exploded")
+
+    monkeypatch.setattr(workflow_retention, "sweep_runs", _boom)
+    api_main._sweep_workflow_runs_at_startup()  # must not raise
+
+
+def test_startup_sweep_actually_prunes_over_the_real_journal(settings, monkeypatch):
+    """End-to-end: seed an over-age run, run the startup helper, and prove the
+    run is GONE — the sweep is wired to real data, not just called."""
+    settings["workflow_journal_retention_days"] = 7
+    _seed_run("old", started_at=_iso(90))
+    _seed_run("fresh", started_at=_iso(1))
+    assert workflow_journal.get_run("old") is not None
+
+    from cli_agent_orchestrator.api import main as api_main
+
+    api_main._sweep_workflow_runs_at_startup()
+
+    assert workflow_journal.get_run("old") is None
+    assert workflow_journal.get_run("fresh") is not None
+
+
+# ===========================================================================
+# PR 526 review — SHOULD-FIX: sanitize_output is NOT secret redaction.
+# ===========================================================================
+def test_sanitize_output_does_not_remove_secrets(settings):
+    """Pins the honest contract: sanitize_output is transport hygiene (ANSI/C0
+    stripping, newline escaping, size cap) and passes credentials through
+    VERBATIM. This is why the diagnostics route is scope-gated rather than
+    described as redacted — a test that documents the real behavior so nobody
+    re-adds a "redacted" claim on the strength of this funnel.
+    """
+    settings["workflow_journal_capture_output"] = True
+    settings["workflow_journal_output_cap_bytes"] = 4096
+    token = "AKIAIOSFODNN7EXAMPLE"
+    out = workflow_retention.sanitize_output(f'{{"aws_key": "{token}"}}')
+    assert token in out  # NOT redacted — hygiene only
