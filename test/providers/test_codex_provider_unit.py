@@ -11,6 +11,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
     CodexProvider,
     ProviderError,
+    _has_startup_idle_composer,
     _toml_override,
     _toml_scalar,
 )
@@ -1658,6 +1659,146 @@ class TestCodexProviderMisc:
 
 class TestCodexProviderTrustPrompt:
     """Tests for Codex workspace trust prompt handling."""
+
+    @pytest.mark.parametrize(
+        "placeholder",
+        [
+            "Explain this codebase",
+            "Summarize recent commits",
+            "Implement {feature}",
+            "Find and fix a bug in @filename",
+            "Write tests for @filename",
+            "Improve documentation in @filename",
+            "Run /review on my current changes",
+            "Use /skills to list available skills",
+        ],
+    )
+    def test_v0145_idle_composer_placeholders(self, placeholder):
+        output = (
+            f"OpenAI Codex (v0.145.0)\n› {placeholder}\n"
+            "  gpt-5.6-sol medium · Context 100% left\n"
+        )
+
+        assert _has_startup_idle_composer(output) is True
+
+    @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.providers.codex.time.time",
+        side_effect=[0.0, 0.0, 20.0],
+    )
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_returns_on_v0145_idle_composer(
+        self, mock_backend, mock_error, mock_sleep, _mock_time
+    ):
+        """Codex 0.145's placeholder composer is a ready state, not a timeout."""
+        mock_backend.return_value.get_history.return_value = load_fixture(
+            "codex_v0145_idle_output.txt"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=20.0)
+
+        mock_backend.return_value.get_history.assert_called_once()
+        mock_sleep.assert_not_awaited()
+        mock_error.assert_not_called()
+        mock_backend.return_value.send_keys.assert_not_called()
+        mock_backend.return_value.send_special_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.providers.codex.time.time",
+        side_effect=[0.0, 0.0, 1.0, 2.0, 20.0],
+    )
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_waits_for_complete_v0145_composer_frame(
+        self, mock_backend, mock_error, mock_sleep, _mock_time
+    ):
+        """Chunked redraws are not ready until composer and footer are both visible."""
+        fixture = load_fixture("codex_v0145_idle_output.txt")
+        mock_backend.return_value.get_history.side_effect = [
+            "OpenAI Codex (v0.145.0)\n",
+            "OpenAI Codex (v0.145.0)\n› Write tests for @filename\n",
+            fixture,
+            "timeout tail",
+        ]
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=20.0)
+
+        assert mock_backend.return_value.get_history.call_count == 3
+        assert mock_sleep.await_count == 2
+        mock_error.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "output",
+        [
+            (
+                "› Fix the failing tests\n"
+                "• Working (2s • esc to interrupt)\n"
+                "› Write tests for @filename\n"
+                "  gpt-5.6-sol medium · Context 100% left\n"
+            ),
+            (
+                "› Fix the failing tests\n"
+                "• Working\n"
+                "› Write tests for @filename\n"
+                "  gpt-5.6-sol medium · Context 100% left\n"
+            ),
+            (
+                "Approve this command? [y/n]\n"
+                "› Write tests for @filename\n"
+                "  gpt-5.6-sol medium · Context 100% left\n"
+            ),
+            (
+                "› Write tests for @filename\n"
+                "  gpt-5.6-sol medium · Context 100% left\n"
+                "╭─ Command Approval Required ─╮\n"
+                "│ [a] Accept  [d] Decline     │\n"
+                "╰─────────────────────────────╯\n"
+            ),
+            ("› fix the failing tests\n" "  gpt-5.6-sol medium · Context 100% left\n"),
+            "OpenAI Codex (v0.145.0)\nLoading project instructions\n",
+            (
+                "The docs show › Write tests for @filename as an example.\n"
+                "This is not a Codex footer: Context 100% left\n"
+            ),
+            "› \nold output\n\nstill running\n\nlatest output\n",
+        ],
+        ids=[
+            "working",
+            "partial-working-frame",
+            "approval",
+            "boxed-approval",
+            "typed-draft",
+            "ordinary-output",
+            "similar-strings",
+            "stale-legacy-prompt",
+        ],
+    )
+    @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.providers.codex.time.time",
+        side_effect=[0.0, 0.0, 20.0],
+    )
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.logger.error")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_does_not_treat_non_ready_output_as_idle(
+        self, mock_backend, mock_error, mock_sleep, _mock_time, output
+    ):
+        mock_backend.return_value.get_history.return_value = output
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        await provider._handle_trust_prompt(timeout=20.0)
+
+        mock_sleep.assert_awaited_once_with(1.0)
+        mock_error.assert_called_once()
+        mock_backend.return_value.send_keys.assert_not_called()
+        mock_backend.return_value.send_special_key.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
