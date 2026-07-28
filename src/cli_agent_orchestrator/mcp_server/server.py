@@ -1,5 +1,6 @@
 """CLI Agent Orchestrator MCP Server implementation."""
 
+import asyncio
 import logging
 import os
 import re
@@ -13,6 +14,10 @@ from pydantic import Field
 from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     DEFAULT_PROVIDER,
+    WORKFLOW_EVENTS_CONNECT_TIMEOUT,
+    WORKFLOW_EVENTS_MCP_MAX_EVENTS,
+    WORKFLOW_EVENTS_READ_TIMEOUT,
+    WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
@@ -29,6 +34,7 @@ from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.terminal import generate_session_name
+from cli_agent_orchestrator.utils.workflow_events import parse_sse_frames
 
 logger = logging.getLogger(__name__)
 
@@ -2005,17 +2011,46 @@ async def workflow_run(
     inputs: Optional[Dict[str, Any]] = Field(
         default=None, description="Run inputs, validated against the spec's declared inputs"
     ),
+    run_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional explicit run id (matches WORKFLOW_NAME_RE); the server mints "
+            "one if omitted. Validation and the uniqueness/admission gate are "
+            "server-side — a collision surfaces as the ok=False error envelope."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Run a workflow to completion and return the aggregated result (issue #312, N5).
+
+    Prefer ``workflow_start`` for long-running work (issue #505, FR-5.2): it submits
+    the run asynchronously and returns immediately with a ``run_id`` + ``status_url``,
+    so a long multi-step run does not hold this tool call open for its whole duration.
+    Reach for the blocking ``workflow_run`` only for a quick run whose result you want
+    inline in one turn; use ``workflow_status`` / ``workflow_wait`` / ``workflow_result``
+    to observe a submitted run.
 
     A thin HTTP client over ``POST /workflows/runs`` (single seam, B3-BR-15): the
     engine runs the spec in-process in the server and this tool blocks on the HTTP
     request until the run finishes (Q1=A, mirrors handoff). Returns a structured
     envelope on EVERY path — it never raises into the agent loop. ``ok=False``
     carries the server error detail (unknown workflow, invalid inputs, a reserved
-    mode that is not built yet, etc.).
+    mode that is not built yet, a colliding ``run_id``, etc.).
+
+    ``run_id`` (U3, FR-1.1/FR-1.2) is forwarded on the wire ONLY when supplied; the
+    ``POST /workflows/runs`` route already accepts it via ``WorkflowRunRequest``.
+    When omitted, the payload is byte-identical to today's (the server mints the
+    id). No client-side validation is added — admission is the server's
+    (``_check_run_id_available``, 409 on collision), surfaced through the envelope.
+    The tool stays blocking (FR-5.2); the async ``:submit`` spine is a separate seam.
     """
     payload: Dict[str, Any] = {"name_or_path": name_or_path, "inputs": inputs or {}}
+    # Forward the id ONLY when a real value was supplied. ``isinstance(..., str)``
+    # (not ``is not None``) so the omitted case is byte-identical to today whether
+    # the tool is invoked through FastMCP (which resolves the Field default to
+    # None) or called directly (where the unset default is the ``FieldInfo``
+    # sentinel, which is not a str) — FR-1.2.
+    if isinstance(run_id, str):
+        payload["run_id"] = run_id
     try:
         # The server awaits the WHOLE run inline (Q1=A), so this blocks for the full
         # run duration — use the worst-case-covering run timeout, NOT the short
@@ -2101,6 +2136,358 @@ async def workflow_cancel(
         return {"ok": False, "error": detail}
 
     return {"ok": True, "run_id": run_id}
+
+
+# ---------------------------------------------------------------------------
+# Async lifecycle tools (issue #505, U6). Five thin, dict-envelope-never-raises
+# HTTP clients over the REST hub — the async counterparts of the blocking
+# ``workflow_run`` above. Each returns a structured dict on success, a server
+# error, AND a transport error (EV-1); none raises into the agent loop. Every
+# call uses the normal per-call ``_mcp_timeout()`` (TR-1) — NEVER the long
+# blocking ``WORKFLOW_RUN_REQUEST_TIMEOUT`` (that ceiling belongs to the inline
+# blocking path only). ``workflow_wait`` bounds only its OVERALL wait long.
+# ---------------------------------------------------------------------------
+@mcp.tool()
+async def workflow_start(
+    name_or_path: str = Field(description="Workflow name (indexed) or path to a spec YAML file"),
+    inputs: Optional[Dict[str, Any]] = Field(
+        default=None, description="Run inputs, validated against the spec's declared inputs"
+    ),
+    run_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional explicit run id (matches WORKFLOW_NAME_RE); the server mints "
+            "one if omitted. A collision surfaces as the ok=False error envelope."
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Submit a workflow run ASYNCHRONOUSLY and return its handle immediately (issue #505, U6).
+
+    The preferred tool for long-running work: a thin HTTP client over ``POST
+    /workflows/runs:submit`` that acks the instant the run is durably journaled
+    (202) and drives it in the background, so this call does NOT block for the run
+    duration. Returns ``{ok, run_id, state, status_url}`` — report the ``run_id`` /
+    ``status_url`` and then observe progress with ``workflow_status`` /
+    ``workflow_wait``, or fetch the retained result with ``workflow_result``.
+
+    Returns a structured envelope on EVERY path — never raises into the agent loop
+    (EV-1). ``run_id`` is forwarded on the wire ONLY when supplied (mirrors the
+    blocking tool); admission (uniqueness) is the server's and a collision surfaces
+    as ``ok=False``.
+    """
+    payload: Dict[str, Any] = {"name_or_path": name_or_path, "inputs": inputs or {}}
+    # Forward the id ONLY when a real value was supplied — ``isinstance(..., str)``
+    # (not ``is not None``) so the omitted case is byte-identical whether invoked
+    # through FastMCP (Field default -> None) or called directly (FieldInfo sentinel).
+    if isinstance(run_id, str):
+        payload["run_id"] = run_id
+    try:
+        # Async submit — the normal per-call timeout, NOT the long blocking one (TR-1).
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/runs:submit",
+            json=payload,
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+    if response.status_code != 202:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {"ok": False, "error": detail}
+
+    data = response.json()
+    links = data.get("links") or {}
+    return {
+        "ok": True,
+        "run_id": data.get("run_id"),
+        "state": data.get("state"),
+        "status_url": links.get("status"),
+    }
+
+
+@mcp.tool()
+async def workflow_status(
+    run_id: str = Field(description="The run id to snapshot (from workflow_start / workflow_run)"),
+) -> Dict[str, Any]:
+    """Return a point-in-time status snapshot for a run (issue #505, U6).
+
+    A thin HTTP client over ``GET /workflows/runs/{run_id}``. Returns
+    ``{ok, run_id, state, current_step_id, steps}`` on success. Returns a
+    structured envelope on EVERY path — never raises into the agent loop (EV-1).
+    """
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+    if response.status_code != 200:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {"ok": False, "error": detail}
+
+    data = response.json()
+    return {
+        "ok": True,
+        "run_id": data.get("run_id"),
+        "state": data.get("state"),
+        "current_step_id": data.get("current_step_id"),
+        "steps": data.get("steps", []),
+    }
+
+
+@mcp.tool()
+async def workflow_result(
+    run_id: str = Field(description="The run id whose retained result to fetch"),
+) -> Dict[str, Any]:
+    """Return the complete retained result for a run (issue #505, U6; FR-7.2).
+
+    A thin HTTP client over ``GET /workflows/runs/{run_id}/result``. Journal-
+    authoritative: answerable even for a detached or post-restart run. On success
+    returns ``{ok: True, **the retained result}`` (``run_id``, ``workflow_name``,
+    ``state``, ``steps``, ``kind``, ``output`` — plus a ``failure_envelope`` for a
+    terminal-failed/cancelled run, U9/FR-7.1, spread through verbatim from the body).
+    Returns a structured envelope on EVERY path — never raises into the agent loop
+    (EV-1).
+    """
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/result",
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+    if response.status_code != 200:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {"ok": False, "error": detail}
+
+    return {"ok": True, **response.json()}
+
+
+@mcp.tool()
+async def workflow_list(
+    state: Optional[str] = Field(
+        default=None, description="Filter by run state (e.g. running, completed, failed, cancelled)"
+    ),
+    limit: int = Field(default=50, description="Max rows to return (server clamps to [1, 500])"),
+) -> Dict[str, Any]:
+    """List journaled workflow runs newest-first (issue #505, U6; FR-3.5).
+
+    A thin HTTP client over ``GET /workflows/runs``. Returns ``{ok: True, runs:
+    [...]}`` — an empty ``runs`` array is a valid success (MR-3). Returns a
+    structured envelope on EVERY path — never raises into the agent loop (EV-1).
+    """
+    params: Dict[str, Any] = {"limit": limit}
+    if isinstance(state, str):
+        params["state"] = state
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/workflows/runs",
+            params=params,
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+    if response.status_code != 200:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {"ok": False, "error": detail}
+
+    return {"ok": True, "runs": response.json()}
+
+
+@mcp.tool()
+async def workflow_wait(
+    run_id: str = Field(description="The run id to follow until it reaches a terminal state"),
+) -> Dict[str, Any]:
+    """Follow a submitted run to a terminal state, then return its result (issue #505, U6).
+
+    Polls ``GET /workflows/runs/{run_id}`` (ADR-4 Option A — the snapshot route, not
+    the events stream) until the run is ``completed`` / ``failed`` / ``cancelled``,
+    then fetches the retained result and returns ``{ok, run_id, state, kind, steps,
+    output}`` (MR-2). Each poll uses the normal per-call ``_mcp_timeout()`` (TR-1),
+    sleeping ``WORKFLOW_POLL_INTERVAL_SECONDS`` between polls; the OVERALL wait is
+    bounded by ``WORKFLOW_RUN_REQUEST_TIMEOUT`` so a never-terminating run cannot pin
+    the tool open forever. Returns a structured envelope on EVERY path — a poll
+    transport error, a result-fetch error, or the overall-wait ceiling all yield an
+    ``{ok: False, error}`` envelope; it never raises into the agent loop (EV-1).
+    """
+    deadline = time.monotonic() + WORKFLOW_RUN_REQUEST_TIMEOUT
+    while True:
+        try:
+            response = requests.get(
+                f"{API_BASE_URL}/workflows/runs/{run_id}",
+                timeout=_mcp_timeout(),
+            )
+        except requests.RequestException as e:
+            return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+        if response.status_code != 200:
+            detail = _extract_error_detail(response, f"status {response.status_code}")
+            return {"ok": False, "error": detail}
+
+        snapshot = response.json()
+        state = snapshot.get("state")
+        if state in ("completed", "failed", "cancelled"):
+            break
+        if time.monotonic() >= deadline:
+            return {
+                "ok": False,
+                "error": f"timed out waiting for run '{run_id}' to reach a terminal state",
+                "run_id": run_id,
+                "state": state,
+            }
+        await asyncio.sleep(WORKFLOW_POLL_INTERVAL_SECONDS)
+
+    # Terminal — fetch the retained result for the full envelope (MR-2).
+    try:
+        result_response = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/result",
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+    if result_response.status_code != 200:
+        detail = _extract_error_detail(result_response, f"status {result_response.status_code}")
+        return {"ok": False, "error": detail}
+
+    result = result_response.json()
+    envelope: Dict[str, Any] = {
+        "ok": True,
+        "run_id": result.get("run_id", run_id),
+        "state": result.get("state", state),
+        "kind": result.get("kind"),
+        "steps": result.get("steps", []),
+        "output": result.get("output"),
+    }
+    # U9 (FR-7.1): a failed/cancelled run's result body carries a failure envelope;
+    # surface it in the dict so an agent gets the failing step / attempt / error kind
+    # / next-command hint. Completed runs carry none, so the key is simply absent.
+    failure_envelope = result.get("failure_envelope")
+    if failure_envelope is not None:
+        envelope["failure_envelope"] = failure_envelope
+    return envelope
+
+
+@mcp.tool()
+async def workflow_events(
+    run_id: str = Field(description="The run id whose live event stream to follow"),
+    after_seq: Optional[int] = Field(
+        default=None,
+        description=(
+            "Resume strictly after this per-run seq (exact, dedupe-free). Omit to "
+            "read from the start of the run's event stream."
+        ),
+    ),
+    max_events: Optional[int] = Field(
+        default=None,
+        description=(
+            "Stop after draining this many events (an MCP call cannot stream "
+            "indefinitely). Defaults to a bounded ceiling; the follower also stops "
+            "at a terminal state, whichever comes first."
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Follow a run's live event stream, BOUNDED, and return a dict envelope (issue #505, U10).
+
+    A thin, CONSUMER-ONLY HTTP client over #504's events-follow SSE route
+    (``GET /workflows/runs/{run_id}/events`` with ``Accept: text/event-stream``).
+    An MCP tool call cannot stream forever, so this drains frames only up to a
+    terminal state OR ``max_events`` (whichever first), then returns
+    ``{ok, run_id, state, events: [...], gaps: [...]}``:
+
+    * ``events`` — the normal frames rendered in per-run ``seq`` order, each
+      ``{seq, event_type, step_id, state, ts}``.
+    * ``gaps`` — the SERVER-DECLARED ``event: gap`` frames, verbatim
+      (``{after_seq, before_seq, missing_count, reason}``). Gaps are DATA the
+      server sends; this never computes one from ``seq`` arithmetic (GD-1).
+    * ``state`` — the terminal RUN state if a terminal ``run.*`` frame arrived
+      within the bound, else ``None`` (a step's ``state`` is never mistaken for
+      the run's; the caller reads ``workflow_status`` for a mid-run snapshot).
+
+    Returns a structured envelope on EVERY path — a server error, a transport
+    error, and a mid-stream read failure all yield ``{ok: False, error}``; it
+    never raises into the agent loop (dict-envelope-never-raises, EV-1). Imports
+    NO engine / journal / event DAL (FR-7.4 — the follower is a pure route
+    consumer). The reconnect/resume logic proper (``?after_seq`` re-open on a
+    dropped socket) is the CLI follower's; the bounded MCP tool reads a single
+    stream and returns what it drained.
+    """
+    limit = max_events if isinstance(max_events, int) else WORKFLOW_EVENTS_MCP_MAX_EVENTS
+    if limit <= 0:
+        limit = WORKFLOW_EVENTS_MCP_MAX_EVENTS
+
+    params: Dict[str, Any] = {}
+    if isinstance(after_seq, int):
+        params["after_seq"] = after_seq
+    headers = {"Accept": "text/event-stream"}
+
+    events: List[Dict[str, Any]] = []
+    gaps: List[Dict[str, Any]] = []
+    state: Optional[str] = None
+
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/events",
+            params=params,
+            headers=headers,
+            stream=True,
+            timeout=(WORKFLOW_EVENTS_CONNECT_TIMEOUT, WORKFLOW_EVENTS_READ_TIMEOUT),
+        )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+    if response.status_code != 200:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {"ok": False, "error": detail}
+
+    try:
+        for frame in parse_sse_frames(response.iter_lines(decode_unicode=True)):
+            if frame.is_gap:
+                d = frame.data
+                gaps.append(
+                    {
+                        "after_seq": d.get("after_seq"),
+                        "before_seq": d.get("before_seq"),
+                        "missing_count": d.get("missing_count"),
+                        "reason": d.get("reason"),
+                    }
+                )
+                continue
+            events.append(
+                {
+                    "seq": frame.seq(),
+                    "event_type": frame.event,
+                    "step_id": frame.data.get("step_id"),
+                    "state": frame.data.get("state"),
+                    "ts": frame.data.get("ts"),
+                }
+            )
+            if frame.is_terminal:
+                # Only a RUN-level terminal frame settles ``state`` (a step's
+                # ``state: completed`` is not the run's — see SseFrame.terminal_state).
+                state = frame.terminal_state
+                break
+            if len(events) >= limit:
+                break
+    except requests.RequestException as e:
+        # A mid-stream read failure is surfaced as an envelope, never raised — but
+        # keep whatever was drained so the caller still sees partial progress.
+        return {
+            "ok": False,
+            "error": f"stream read failed after {len(events)} event(s): {e}",
+            "run_id": run_id,
+            "state": state,
+            "events": events,
+            "gaps": gaps,
+        }
+    finally:
+        response.close()
+
+    return {"ok": True, "run_id": run_id, "state": state, "events": events, "gaps": gaps}
 
 
 # The MCP Apps surface — tools (render_dashboard / render_agent_view /

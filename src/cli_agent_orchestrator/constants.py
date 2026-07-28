@@ -595,6 +595,17 @@ WORKFLOW_STEP_TIMEOUT = 600.0
 # running near the 100-step ceiling can raise it via the env override if needed.
 WORKFLOW_RUN_REQUEST_TIMEOUT = (WORKFLOW_STEP_TIMEOUT + 120.0) * 12 + 180.0  # = 8820.0s (~2.45h)
 
+# Poll interval (seconds) for the async-run FOLLOWERS: ``cao workflow run`` (bare
+# follow-to-terminal + ``wait``) and the ``workflow_wait`` MCP tool (issue #505,
+# U5/U6). ADR-4 chose a poll loop over the snapshot route (Option A) rather than
+# consuming the events stream (that live follower is U10); the value itself was
+# delegated to functional design and pinned here (U5-FP-5). Named — not a magic
+# literal — so both the CLI follower and the MCP poll tool reference one constant.
+# Each poll's HTTP call uses the normal per-call timeout (MCP_REQUEST_TIMEOUT /
+# ``_mcp_timeout()``), NOT the long blocking WORKFLOW_RUN_REQUEST_TIMEOUT — the
+# long ceiling bounds only the OVERALL wait, never a single snapshot read.
+WORKFLOW_POLL_INTERVAL_SECONDS = 1.0
+
 # Script-linter rule inputs (Bolt 2, U1/C2, FR-1.3 / U1-BR-8). Import prefixes
 # whose first dotted segment marks a CAO-internal import — scripts reach CAO
 # over HTTP only (C-1). The ``cao_workflow`` shim (U6, ADR-6) is the sanctioned
@@ -638,6 +649,25 @@ WORKFLOW_ENV_VALUE_MAX_LEN = 256
 # id across all nine providers, including OpenCode's "vendor/model" form.
 MODEL_ID_RE = r"^[A-Za-z0-9._:/-]+$"
 MODEL_ID_MAX_LEN = 128
+
+# Live-event follower (issue #505, U10). The CLI ``cao workflow events --follow``
+# and the MCP ``workflow_events`` open #504's events-follow SSE route
+# (``GET /workflows/runs/{id}/events`` with ``Accept: text/event-stream``) as thin
+# HTTP clients. A ``(connect, read)`` timeout tuple bounds the streamed GET — the
+# read leg must comfortably exceed #504's SSE heartbeat/poll cadence (250ms tail),
+# mirroring the AG-UI stream reader's 10s/60s split so a quiet run does not trip a
+# spurious read timeout between frames. The reconnect budget bounds how many times
+# a dropped connection is re-opened (resuming exactly via ``?after_seq=<last_seq>``,
+# RS-1/RS-3) before the follower gives up and does a final terminal status check —
+# so a flapping stream can never spin forever.
+WORKFLOW_EVENTS_CONNECT_TIMEOUT = 10.0
+WORKFLOW_EVENTS_READ_TIMEOUT = 60.0
+WORKFLOW_EVENTS_MAX_RECONNECTS = 5
+
+# Bound on frames the bounded MCP ``workflow_events`` follower drains before it
+# returns (an MCP tool call cannot stream indefinitely). The follower stops at a
+# terminal state OR this many events, whichever comes first (U10 MCP bound).
+WORKFLOW_EVENTS_MCP_MAX_EVENTS = 500
 
 # Script-runner subprocess lifecycle (Bolt 3, U4/C1). Wall-clock bound + grace,
 # output ring-buffer cap, engine-owned scratch root for resume materialization.

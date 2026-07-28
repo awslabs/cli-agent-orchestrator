@@ -49,11 +49,13 @@ from cli_agent_orchestrator.services.script_runner import (
     _RingBuffer,
     _scan_sentinel,
     _step_call_fingerprint,
+    build_env,
     cancel_script_run,
     make_step_terminal_recorder,
     record_step_completion,
     resume_script_run,
     run_script_workflow,
+    run_script_workflow_prepared,
 )
 from cli_agent_orchestrator.services.workflow_service import (
     ResumeCorruptError,
@@ -1161,3 +1163,94 @@ def _seed_script_run(run_id: str, *, state: str = "running", generation: str = "
         tier="script",
         generation=generation,
     )
+
+
+# ---------------------------------------------------------------------------
+# U2 (issue #505) — public build_env seam + run_script_workflow_prepared (ADR-3)
+# ---------------------------------------------------------------------------
+def test_build_env_public_alias_is_same_function():
+    """ADR-3 F-2: the public seam and the pre-U2 private name are the SAME function
+    (single-homed 6-key contract) — no behavior forked by the rename."""
+    assert build_env is script_runner._build_env
+    assert build_env is script_runner.build_env
+
+
+def test_public_build_env_exact_six_keys_and_resume_flag():
+    """T12: the public seam returns exactly the 6 keys; ``resume=True`` adds the
+    7th (guards the rename did not change behavior)."""
+    env = build_env("run-x", "1", {"a": 1})
+    assert set(env) == {
+        "CAO_WORKFLOW_RUN_ID",
+        "CAO_WORKFLOW_GENERATION",
+        "CAO_API_BASE_URL",
+        "CAO_WORKFLOW_INPUTS",
+        "PATH",
+        "HOME",
+    }
+    assert env["CAO_WORKFLOW_INPUTS"] == '{"a":1}'
+    assert "CAO_WORKFLOW_RESUME" not in env
+    resumed = build_env("run-x", "4", {"a": 1}, resume=True)
+    assert resumed["CAO_WORKFLOW_RESUME"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_run_script_workflow_prepared_drives_without_reinsert(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """DR-1/DR-2 + CR-2: the script prepared entry drives an already-journaled,
+    already-registered record via ``_drive_process`` WITHOUT re-linting or
+    re-inserting the run row. It must not call ``lint_script`` or ``insert_run``."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    # C1 already journaled + registered the run before scheduling the drive — seed
+    # the real row FIRST, then wire the "must not be called again" guards.
+    _seed_script_run("run-prep-script")
+
+    def _fail_lint(*a, **k):
+        raise AssertionError("run_script_workflow_prepared must not lint")
+
+    def _fail_insert(*a, **k):
+        raise AssertionError("run_script_workflow_prepared must not insert_run")
+
+    monkeypatch.setattr(script_runner, "lint_script", _fail_lint)
+    monkeypatch.setattr(workflow_journal, "insert_run", _fail_insert)
+
+    proc = _FakeProcess(exit_rc=0, stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n')
+    _install_fake_spawn(monkeypatch, proc)
+
+    record = _make_record("run-prep-script", process=None, generation="1")
+    workflow_service.run_registry["run-prep-script"] = record
+
+    env = build_env("run-prep-script", "1", {})
+    result = await run_script_workflow_prepared(record, "/tmp/wf.py", env)
+
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"ok": True}
+    # DR-2: liveness mark cleared on exit.
+    assert "run-prep-script" not in workflow_service._active_drives
+
+
+@pytest.mark.asyncio
+async def test_run_script_workflow_prepared_marks_then_clears_active_drive(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The run is live in ``_active_drives`` while ``_drive_process`` runs and
+    absent after (finally discard) — the liveness truth crash-remnant logic uses."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    observed = {"live": None}
+
+    async def _fake_drive(record, script_path, env):
+        observed["live"] = record.run_id in workflow_service._active_drives
+        return WorkflowRunResult(
+            run_id=record.run_id,
+            workflow_name="wf",
+            state=RunState.COMPLETED,
+            started_at=record.started_at,
+        )
+
+    monkeypatch.setattr(script_runner, "_drive_process", _fake_drive)
+    record = _make_record("run-prep-live", process=None, generation="1")
+    await run_script_workflow_prepared(record, "/tmp/wf.py", build_env("run-prep-live", "1", {}))
+    assert observed["live"] is True
+    assert "run-prep-live" not in workflow_service._active_drives
