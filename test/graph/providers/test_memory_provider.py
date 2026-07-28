@@ -273,6 +273,42 @@ class TestMemoryProviderEdgeCases:
         assert view.edges == [], "an edge whose target is outside the node set must be dropped"
 
     @pytest.mark.asyncio
+    async def test_edge_written_by_run_lint_is_visible_in_the_same_projection(
+        self, populated_scope, db_engine, monkeypatch
+    ):
+        """Human review (PR #524): the relationship read must happen AFTER
+        run_lint, because run_lint persists its contradiction findings into the
+        same store.
+
+        Reading first made a contradiction detected during THIS projection absent
+        from the graph it produced — invisible for a full cache window, then
+        appearing later with no apparent cause. Here a stubbed run_lint writes a
+        real store row for a pair already in the node set; the returned view must
+        contain that edge.
+        """
+        written = {"n": 0}
+
+        async def _lint_that_writes(project_hash, scope=None, **kw):
+            # Stands in for _persist_contradictions: a real row, written while
+            # run_lint is executing.
+            _insert_relationship(db_engine, "b", "c", type_="contradiction", origin="wiki_lint")
+            written["n"] += 1
+            return []
+
+        monkeypatch.setattr(wiki_lint, "run_lint", _lint_that_writes)
+        _disable_llm(monkeypatch)
+        provider = MemoryGraphProvider(memory_service=populated_scope)
+
+        view = await provider.project(scope="global")
+
+        assert written["n"] == 1, "run_lint must have run"
+        contra = [(e.source, e.target) for e in view.edges if e.type == EdgeType.CONTRADICTION]
+        assert contra == [("b", "c")], (
+            "an edge run_lint wrote during this projection must appear in it; "
+            f"got contradiction edges {contra}"
+        )
+
+    @pytest.mark.asyncio
     async def test_relationship_read_is_bounded_to_the_node_set(
         self, populated_scope, db_engine, monkeypatch
     ):

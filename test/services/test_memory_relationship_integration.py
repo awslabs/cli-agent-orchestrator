@@ -593,6 +593,93 @@ def test_replace_set_soft_rejects_bad_edge_not_whole_batch(bound, db_engine):
     assert svc.active_targets("global", None, "s") == ["good"]
 
 
+def test_replace_set_does_not_resurrect_a_human_rejected_edge(bound, db_engine):
+    """Human review (PR #524): an operator's ``relationships reject`` verdict must
+    survive the next producer recompute.
+
+    ``replace_set``'s existing-row query is deliberately status-agnostic (it owns
+    every row of its producer tuple), so a rejected row lands in
+    ``existing_by_target``. The keep-branch used to force ``status = "active"``
+    unconditionally, so the very next compile silently resurrected an edge a human
+    had explicitly rejected — no report entry, nothing in the output. That defeats
+    the curation surface (``cao memory relationships reject``) this store ships.
+
+    Drives the REAL path: reject via the service, then recompute through
+    ``replace_set`` with the target STILL in the producer's set.
+    """
+    for k in ("s", "keepme"):
+        _seed_memory(db_engine, k)
+    svc = _svc()
+    dto = svc.create("global", None, "s", "keepme", "relates_to", "compiler")
+    assert svc.reject(dto.id).status == "rejected"
+
+    # The producer recomputes and STILL reports the edge.
+    report = svc.replace_set("global", None, "s", "compiler", "relates_to", [EdgeInput("keepme")])
+
+    row = svc.get(dto.id)
+    assert row.status == "rejected", (
+        "a producer recompute must NOT reactivate a human-rejected edge; "
+        f"got status={row.status}"
+    )
+    # The refusal is visible, not silent.
+    assert {"target": "keepme", "status": "rejected"} in report.preserved
+    assert report.kept == 0, "a preserved row is not a kept row"
+    # And it stays out of the active projection.
+    assert svc.active_targets("global", None, "s") == []
+
+
+def test_replace_set_does_not_delete_a_rejected_edge_dropped_by_the_producer(bound, db_engine):
+    """The other half of the same guarantee: DROPPING the target from the
+    producer's set must not delete the operator's verdict either.
+
+    Deleting the row would discard the rejection just as surely as reactivating
+    it — and worse, the next recompute that re-reports the target would insert a
+    fresh ``active`` row with the rejection gone. So the delete-branch must skip
+    curation-terminal rows too.
+    """
+    for k in ("s", "dropme", "other"):
+        _seed_memory(db_engine, k)
+    svc = _svc()
+    dto = svc.create("global", None, "s", "dropme", "relates_to", "compiler")
+    svc.reject(dto.id)
+
+    # Recompute WITHOUT "dropme" — the producer no longer reports it.
+    report = svc.replace_set("global", None, "s", "compiler", "relates_to", [EdgeInput("other")])
+
+    assert (
+        svc.get(dto.id).status == "rejected"
+    ), "dropping the target must not delete the rejection row"
+    assert {"target": "dropme", "status": "rejected"} in report.preserved
+    assert report.removed == 0, "a preserved row must not count as removed"
+
+    # The rejection still suppresses a later recompute that re-reports it.
+    svc.replace_set("global", None, "s", "compiler", "relates_to", [EdgeInput("dropme")])
+    assert (
+        svc.active_targets("global", None, "s") == []
+    ), "a re-reported rejected target must not come back as active"
+
+
+def test_replace_set_still_reactivates_a_superseded_edge(bound, db_engine):
+    """Scoping control for the fix: ``superseded`` is NOT curation-terminal.
+
+    It is lifecycle-DERIVED rather than operator-authored, so a producer that
+    still reports the edge is legitimate evidence the supersession no longer
+    holds. This pins the boundary — a fix that over-broadly froze every
+    non-active status would turn this test RED.
+    """
+    for k in ("s", "t"):
+        _seed_memory(db_engine, k)
+    svc = _svc()
+    dto = svc.create("global", None, "s", "t", "relates_to", "compiler")
+    svc.patch(dto.id, status="superseded")
+
+    report = svc.replace_set("global", None, "s", "compiler", "relates_to", [EdgeInput("t")])
+
+    assert svc.get(dto.id).status == "active", "a superseded edge is reactivated by its producer"
+    assert report.kept == 1
+    assert report.preserved == []
+
+
 def test_replace_set_emits_audit(bound, db_engine, monkeypatch):
     """reviewer F2: replace_set (bulk producer path) emits a content-free summary
     audit event, so producer writes are not forensically silent."""
@@ -965,3 +1052,191 @@ def test_list_relationships_source_keys_drops_unsanitizable_key(bound, db_engine
     svc.create("global", None, "good", "t", "relates_to", "human")
     dtos = svc.list_relationships("global", None, source_keys=["good", "...", "___"])
     assert [d.source_key for d in dtos] == ["good"], "the valid key's edge must survive"
+
+
+def test_forget_purges_relationships_and_slug_reuse_inherits_nothing(
+    bound, db_engine, tmp_path, monkeypatch
+):
+    """Human review (PR #524): ``forget()`` must purge the key's relationship rows.
+
+    forget() removed the wiki file, the index entry and the memory_metadata row
+    but left memory_relationships rows behind, still ``active``. Two consequences:
+    every read path had to tolerate endpoints that no longer resolve, and a later
+    memory created with the SAME slug silently INHERITED the dead memory's edges.
+
+    Drives the real composed path: store -> edge -> forget -> re-store same slug.
+    """
+    import asyncio
+
+    from cli_agent_orchestrator.clients import database as db_mod
+    from cli_agent_orchestrator.services import memory_service as ms_mod
+
+    svc = ms_mod.MemoryService(base_dir=tmp_path, db_engine=db_engine)
+    monkeypatch.setattr(ms_mod, "MEMORY_BASE_DIR", tmp_path)
+    Session = sessionmaker(bind=db_engine)
+    monkeypatch.setattr(db_mod, "SessionLocal", Session)
+
+    async def _setup():
+        for k in ("doomed", "survivor"):
+            await svc.store(content=f"# {k}\nbody", key=k, memory_type="project", scope="global")
+
+    asyncio.run(_setup())
+
+    rel = _svc()
+    # An edge in EACH direction — both are dangling once "doomed" is gone.
+    rel.create("global", None, "doomed", "survivor", "relates_to", "compiler")
+    rel.create("global", None, "survivor", "doomed", "relates_to", "compiler")
+    assert len(rel.list_relationships("global", None, "doomed")) == 1
+    assert len(rel.list_relationships("global", None, "survivor")) == 1
+
+    assert asyncio.run(svc.forget("doomed", scope="global", scope_id=None)) is True
+
+    # Both directions are gone...
+    assert rel.list_relationships("global", None, "doomed") == []
+    assert (
+        rel.list_relationships("global", None, "survivor") == []
+    ), "an edge INTO the forgotten key is equally dangling and must also be purged"
+
+    # ...and a NEW memory reusing the slug inherits nothing.
+    asyncio.run(
+        svc.store(
+            content="# doomed\nreused slug", key="doomed", memory_type="project", scope="global"
+        )
+    )
+    assert (
+        rel.active_targets("global", None, "doomed") == []
+    ), "a same-slug memory must not inherit the forgotten memory's edges"
+
+
+def test_forget_purges_relationships_when_the_file_already_vanished(
+    bound, db_engine, tmp_path, monkeypatch
+):
+    """The other forget() exit path: the wiki file is already gone (removed
+    out-of-band), so forget() returns False early. The relationship rows are just
+    as stale on that path and must be purged too — otherwise the cleanup depends
+    on which branch happened to run."""
+    import asyncio
+
+    from cli_agent_orchestrator.clients import database as db_mod
+    from cli_agent_orchestrator.services import memory_service as ms_mod
+
+    svc = ms_mod.MemoryService(base_dir=tmp_path, db_engine=db_engine)
+    monkeypatch.setattr(ms_mod, "MEMORY_BASE_DIR", tmp_path)
+    Session = sessionmaker(bind=db_engine)
+    monkeypatch.setattr(db_mod, "SessionLocal", Session)
+
+    async def _setup():
+        for k in ("ghost", "other"):
+            await svc.store(content=f"# {k}\nbody", key=k, memory_type="project", scope="global")
+
+    asyncio.run(_setup())
+    rel = _svc()
+    rel.create("global", None, "ghost", "other", "relates_to", "compiler")
+
+    # Remove the file out-of-band so forget() takes the not-exists branch.
+    svc.get_wiki_path("global", None, "ghost").unlink()
+
+    assert asyncio.run(svc.forget("ghost", scope="global", scope_id=None)) is False
+    assert (
+        rel.list_relationships("global", None, "ghost") == []
+    ), "the vanished-file path must purge relationships too"
+
+
+def test_stale_flag_is_live_after_the_source_is_edited(bound, db_engine):
+    """Human review (PR #524): the ``stale`` flag was INERT.
+
+    Staleness is derived from ``row.source_updated_at``, but NO production caller
+    ever wrote that column — so the DTO field, the CLI's ``--stale`` and the REST
+    ``?stale=true`` could only ever report False. ``replace_set`` now stamps the
+    source memory's ``updated_at`` at write time, which makes the whole advertised
+    surface real.
+
+    Timeline: write the edge, THEN advance the source memory's updated_at. The
+    edge was computed against the older body, so it is stale.
+    """
+    from datetime import timedelta
+
+    for k in ("s", "t"):
+        _seed_memory(db_engine, k)
+    Session = sessionmaker(bind=db_engine)
+
+    t0 = datetime.now(timezone.utc) - timedelta(hours=2)
+    s = Session()
+    try:
+        row = s.query(MemoryMetadataModel).filter(MemoryMetadataModel.key == "s").first()
+        row.updated_at = t0
+        s.commit()
+    finally:
+        s.close()
+
+    svc = _svc()
+    svc.replace_set("global", None, "s", "compiler", "relates_to", [EdgeInput("t")])
+
+    # Fresh right after the write — the stamp equals the source's updated_at.
+    assert svc.list_relationships("global", None, "s")[0].stale is False
+
+    # The source memory is edited AFTER the edge was computed.
+    s = Session()
+    try:
+        row = s.query(MemoryMetadataModel).filter(MemoryMetadataModel.key == "s").first()
+        row.updated_at = t0 + timedelta(hours=1)
+        s.commit()
+    finally:
+        s.close()
+
+    dto = svc.list_relationships("global", None, "s")[0]
+    assert dto.stale is True, (
+        "an edge computed before the source memory was edited must read stale; "
+        "without a source_updated_at writer this can never be True"
+    )
+    # And the advertised filter surfaces it.
+    assert [d.target_key for d in svc.list_relationships("global", None, "s", stale_only=True)] == [
+        "t"
+    ]
+
+
+def test_concurrent_create_of_same_tuple_does_not_raise_integrityerror(
+    bound, db_engine, monkeypatch
+):
+    """Human review (PR #524): the dedup race must not surface as a 500.
+
+    ``create()`` is a read-then-insert with no transactional protection, so two
+    concurrent creates of the same dedup tuple both miss the existence check and
+    both insert. The loser hit the UNIQUE index and raised ``IntegrityError`` —
+    not ``ValueError`` — which escaped every REST handler's ValueError->400
+    mapping as an unhandled 500.
+
+    Simulates the interleaving deterministically by making the LOSER's existence
+    probe return None while a committed row already exists — exactly the state
+    the losing thread observes. The probe is blinded via a one-shot flag on the
+    service's own query helper rather than a string match on the SQL, so this
+    test genuinely exercises the IntegrityError path: removing the handler turns
+    it RED (verified by mutation).
+    """
+    for k in ("s", "t"):
+        _seed_memory(db_engine, k)
+    svc = _svc()
+    first = svc.create("global", None, "s", "t", "relates_to", "human")
+    assert first is not None
+
+    # Blind exactly the next existence probe. ``_find_existing`` is the seam
+    # create() uses to decide insert-vs-upsert; returning None there puts us on
+    # the insert branch with the row already committed => UNIQUE violation.
+    real_find = mrs_mod.MemoryRelationshipService._find_existing
+    state = {"blinded": False}
+
+    def _blind_once(self, db, scope, sentinel, src, tgt, type_, origin):
+        if not state["blinded"]:
+            state["blinded"] = True
+            return None
+        return real_find(self, db, scope, sentinel, src, tgt, type_, origin)
+
+    monkeypatch.setattr(mrs_mod.MemoryRelationshipService, "_find_existing", _blind_once)
+
+    # Must NOT raise IntegrityError; converges on the winning row.
+    second = svc.create("global", None, "s", "t", "relates_to", "human")
+
+    assert state["blinded"], "the probe must actually have been blinded"
+    assert second.id == first.id, "the racing create must converge on the winning row"
+    rows = svc.list_relationships("global", None, "s")
+    assert len([r for r in rows if r.target_key == "t"]) == 1, "no duplicate row may land"

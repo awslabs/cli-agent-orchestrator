@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy.exc import IntegrityError
+
 from cli_agent_orchestrator.clients.database import (
     RELATIONSHIP_SCOPE_ID_SENTINEL,
     MemoryMetadataModel,
@@ -44,6 +46,12 @@ logger = logging.getLogger(__name__)
 # Closed taxonomies (reuse the graph EdgeType string values, ADR-5).
 VALID_TYPES = frozenset({"relates_to", "contradiction", "supersedes"})
 VALID_STATUSES = frozenset({"active", "proposal", "rejected", "superseded", "deleted"})
+# Statuses an OPERATOR reached through an explicit command (`relationships
+# reject` / `relationships delete`). A producer recompute must never overwrite
+# one: re-creation is the documented way back, exactly as ``promote()`` refuses
+# these two. ``superseded`` is excluded on purpose — it is lifecycle-derived, not
+# operator-authored.
+CURATION_TERMINAL_STATUSES = frozenset({"rejected", "deleted"})
 VALID_ORIGINS = frozenset(
     {"compiler", "wiki_lint", "human", "legacy_related_keys", "external_import"}
 )
@@ -51,11 +59,6 @@ VALID_ORIGINS = frozenset(
 # Bounds (NFR-1.6). Final numeric values.
 MAX_EDGES_PER_MUTATION = 64
 MAX_ATTRIBUTES_BYTES = 2048
-
-# Types that recall one-level expansion follows (FR-4.2). contradiction is
-# symmetric evidence (not a traversal edge); supersedes affects ranking, not
-# expansion.
-RECALL_EDGE_TYPES = frozenset({"relates_to"})
 
 # The content-free audit event for relationship mutations (NFR-1.7). MUST be
 # registered in NOWAIT_AUDIT_EVENTS or audit_log drops it silently.
@@ -116,6 +119,11 @@ class ReplaceReport:
     kept: int = 0
     removed: int = 0
     rejected: List[Dict[str, str]] = field(default_factory=list)
+    # Rows left untouched because they carry a curation-terminal status (an
+    # operator's reject/delete verdict). Reported so a producer recompute that
+    # declines to overwrite a human decision is VISIBLE rather than silent —
+    # content-free, like every other field here: target key + status only.
+    preserved: List[Dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -371,18 +379,7 @@ class MemoryRelationshipService:
         with SessionLocal() as db:
             self._assert_endpoint_exists(db, scope, scope_id, src)
             self._assert_endpoint_exists(db, scope, scope_id, tgt)
-            existing = (
-                db.query(MemoryRelationshipModel)
-                .filter(
-                    MemoryRelationshipModel.scope == scope,
-                    MemoryRelationshipModel.scope_id == sentinel,
-                    MemoryRelationshipModel.source_key == src,
-                    MemoryRelationshipModel.target_key == tgt,
-                    MemoryRelationshipModel.type == type,
-                    MemoryRelationshipModel.origin == origin,
-                )
-                .first()
-            )
+            existing = self._find_existing(db, scope, sentinel, src, tgt, type, origin)
             if existing is not None:
                 existing.status = status
                 existing.confidence = conf
@@ -410,10 +407,66 @@ class MemoryRelationshipService:
                 source_updated_at=source_updated_at,
             )
             db.add(row)
-            db.commit()
+            # The existence check above is a read-then-insert with no
+            # transactional protection, so two concurrent creates of the same
+            # dedup tuple both miss and both insert. The loser hit the UNIQUE
+            # index and raised IntegrityError — NOT a ValueError — so it escaped
+            # every REST handler's ValueError->400 mapping as an unhandled 500
+            # (human review, PR #524).
+            #
+            # The dedup index makes the winning row indistinguishable from the
+            # one this call intended to write, so converge on it instead of
+            # failing: that matches create()'s documented upsert contract, where
+            # a same-tuple create returns the existing row. Any OTHER
+            # IntegrityError (a genuine constraint violation) is re-raised as a
+            # ValueError so the boundary policy stays uniform — the service
+            # raises ValueError for caller-fixable input, and the API maps it.
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                winner = self._find_existing(db, scope, sentinel, src, tgt, type, origin)
+                if winner is None:
+                    raise ValueError(
+                        "relationship create conflicted and the conflicting row "
+                        "could not be resolved"
+                    )
+                self._audit("create", winner)
+                return self._to_dto(winner)
             db.refresh(row)
             self._audit("create", row)
             return self._to_dto(row)
+
+    def _find_existing(
+        self,
+        db: Any,
+        scope: str,
+        sentinel: str,
+        src: str,
+        tgt: str,
+        type_: str,
+        origin: str,
+    ) -> Any:
+        """Resolve the row matching ``create()``'s dedup tuple, or None.
+
+        Extracted as the named seam ``create()`` uses to choose upsert-vs-insert,
+        and reused to re-resolve the winner after an ``IntegrityError``. Having
+        one named probe (rather than two inline copies of the same filter) is
+        what lets the concurrency test blind exactly this step and drive the
+        real conflict path.
+        """
+        return (
+            db.query(MemoryRelationshipModel)
+            .filter(
+                MemoryRelationshipModel.scope == scope,
+                MemoryRelationshipModel.scope_id == sentinel,
+                MemoryRelationshipModel.source_key == src,
+                MemoryRelationshipModel.target_key == tgt,
+                MemoryRelationshipModel.type == type_,
+                MemoryRelationshipModel.origin == origin,
+            )
+            .first()
+        )
 
     def replace_set(
         self,
@@ -432,6 +485,13 @@ class MemoryRelationshipService:
         upserted. Rows of ANY OTHER origin or type — human, wiki_lint, legacy,
         supersedes, contradiction — are structurally outside the WHERE clause and
         are never touched. Producers MUST pass their FULL current set.
+
+        Within this producer's own rows, a CURATION-TERMINAL status
+        (``rejected``/``deleted`` — see ``CURATION_TERMINAL_STATUSES``) is
+        preserved on BOTH branches: such a row is neither reactivated when the
+        producer still reports the target nor deleted when it drops it. Each is
+        listed in ``report.preserved`` so the refusal is observable. Without
+        this, a recompile silently undid an operator's ``relationships reject``.
         """
         self._validate_type(type)
         self._validate_origin(origin)
@@ -487,20 +547,53 @@ class MemoryRelationshipService:
             new_targets = set(valid.keys())
 
             # Delete this producer's rows whose target is not in the new set.
+            # A curation-terminal row is RETAINED even when the producer drops
+            # the target: deleting it would discard the operator's verdict just
+            # as surely as reactivating it, and would let the next recompute
+            # re-add the edge as a fresh "active" row with the rejection gone.
             for tgt, r in existing_by_target.items():
                 if tgt not in new_targets:
+                    if r.status in CURATION_TERMINAL_STATUSES:
+                        report.preserved.append({"target": tgt, "status": r.status})
+                        continue
                     db.delete(r)
                     report.removed += 1
 
             now = _utcnow()
+            # Stamp the source memory's updated_at on every row this producer
+            # writes. Without a writer the ``stale`` flag was INERT — it is
+            # derived from ``source_updated_at``, which no production caller ever
+            # set, so the DTO field, the CLI's --stale and the REST ?stale=true
+            # could only ever report False (human review, PR #524). One batched
+            # lookup for the whole set; None when the source has no updated_at,
+            # which simply leaves staleness unknown as before.
+            src_updated = self._source_updated_map(db, scope, scope_id, {src}).get(src)
             for tgt, edge in valid.items():
                 r = existing_by_target.get(tgt)
                 attrs_json = self._validate_attributes(edge.attributes)
                 if r is not None:
+                    # A CURATION-TERMINAL status is a human decision and must
+                    # survive a producer recompute. Forcing "active" here let a
+                    # recompile silently resurrect an edge an operator had
+                    # explicitly rejected via `cao memory relationships reject`,
+                    # with nothing in the report to show it happened — which
+                    # defeats the curation surface this store ships.
+                    #
+                    # The set mirrors ``promote()``'s refusal list: rejected and
+                    # deleted are operator verdicts reached through an explicit
+                    # command, and re-creation (not recompute) is the documented
+                    # way back. ``superseded`` is deliberately NOT terminal here:
+                    # it is lifecycle-DERIVED rather than operator-authored, so a
+                    # producer that still reports the edge is legitimate evidence
+                    # the supersession no longer holds.
+                    if r.status in CURATION_TERMINAL_STATUSES:
+                        report.preserved.append({"target": tgt, "status": r.status})
+                        continue
                     r.confidence = self._validate_confidence(edge.confidence)
                     r.rank = edge.rank
                     r.attributes_json = attrs_json
                     r.status = "active"
+                    r.source_updated_at = src_updated
                     r.updated_at = now
                     report.kept += 1
                 else:
@@ -517,7 +610,7 @@ class MemoryRelationshipService:
                             confidence=self._validate_confidence(edge.confidence),
                             rank=edge.rank,
                             attributes_json=attrs_json,
-                            source_updated_at=None,
+                            source_updated_at=src_updated,
                         )
                     )
                     report.added += 1
@@ -557,6 +650,28 @@ class MemoryRelationshipService:
             )
         except Exception as e:  # pragma: no cover - audit must never break a write
             logger.debug(f"replace_set audit emit failed: {e}")
+
+    def _audit_purge(self, scope: str, sentinel: str, key: str, removed: int) -> None:
+        """Content-free audit for a forget()-driven purge.
+
+        Reuses ``AUDIT_EVENT`` (``relationship_mutation``), which is already in
+        audit_log's closed NOWAIT whitelist — a fresh event type would be dropped
+        silently.
+        """
+        try:
+            from cli_agent_orchestrator.services.audit_log import write_audit_nowait
+
+            write_audit_nowait(
+                AUDIT_EVENT,
+                "relationship purge (memory forgotten)",
+                action="purge_for_key",
+                scope=scope,
+                scope_id=str(sentinel),
+                source_key=key,
+                removed=str(removed),
+            )
+        except Exception as e:  # pragma: no cover - audit must never break a write
+            logger.debug(f"purge audit emit failed: {e}")
 
     def _get_row(self, db: Any, id: str) -> Any:
         row = db.query(MemoryRelationshipModel).filter(MemoryRelationshipModel.id == id).first()
@@ -629,6 +744,52 @@ class MemoryRelationshipService:
             db.refresh(row)
             self._audit("soft_delete", row)
             return self._to_dto(row)
+
+    def purge_for_key(self, scope: str, scope_id: Optional[str], key: str) -> int:
+        """HARD-delete every row touching ``key`` in either direction.
+
+        Called when the underlying memory is FORGOTTEN (human review, PR #524).
+        ``forget()`` removes the wiki file, the index entry and the
+        memory_metadata row, but used to leave these rows behind still ``active``
+        — so a later memory created with the SAME slug silently inherited the
+        dead memory's edges, and every read path had to tolerate endpoints that
+        no longer resolve.
+
+        This is a HARD delete, not the ``soft_delete`` status transition: a
+        soft-deleted row is a curation record ABOUT a live memory, whereas here
+        the endpoint itself is gone and the row can never become meaningful
+        again. Retaining it is what causes the slug-reuse inheritance bug.
+        Deliberately status-agnostic for the same reason — a rejected or
+        proposal row pointing at a deleted memory is equally meaningless.
+
+        Returns the number of rows removed; content-free audit on a non-zero
+        purge. Both directions are covered: an edge INTO the forgotten key is
+        just as dangling as one out of it.
+        """
+        from sqlalchemy import or_
+
+        k = self._sanitize_key(key)
+        sentinel = self._to_sentinel(scope_id)
+        with SessionLocal() as db:
+            rows = (
+                db.query(MemoryRelationshipModel)
+                .filter(
+                    MemoryRelationshipModel.scope == scope,
+                    MemoryRelationshipModel.scope_id == sentinel,
+                    or_(
+                        MemoryRelationshipModel.source_key == k,
+                        MemoryRelationshipModel.target_key == k,
+                    ),
+                )
+                .all()
+            )
+            if not rows:
+                return 0
+            for r in rows:
+                db.delete(r)
+            db.commit()
+        self._audit_purge(scope, sentinel, k, len(rows))
+        return len(rows)
 
     # ------------------------------------------------------------------ #
     # read operations
@@ -849,7 +1010,15 @@ class MemoryRelationshipService:
     ) -> List[RelationshipDTO]:
         """Active contradictions touching ``key`` from EITHER endpoint (FR-4.5
         symmetric visibility, reconstructed at QUERY time — the store holds one
-        directed row, never a reciprocal duplicate)."""
+        directed row, never a reciprocal duplicate).
+
+        NO PRODUCTION CALLER YET (human review, PR #524). Retained rather than
+        deleted because it is the only implementation of FR-4.5's symmetric read
+        and is covered by tests: the graph provider projects each directed row
+        as-is, so the "contradictions touching this key" question has no other
+        answer in the codebase. Kept as the intended entry point for the
+        contradiction-review surface; delete it if that surface is dropped rather
+        than letting a second copy of this query appear elsewhere."""
         from sqlalchemy import or_
 
         sentinel = self._to_sentinel(scope_id)

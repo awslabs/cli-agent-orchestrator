@@ -88,6 +88,10 @@ See [Workflows](workflows.md).
 
 - `/settings/memory` reports memory enablement (including `learning_enabled`).
 - `/memory*` lists, reads, exports, and deletes memories.
+- `/memory/relationships*` lists, creates, patches, promotes, rejects, and
+  soft-deletes typed relationships between memories. `GET` is read-scoped and
+  capped by `limit` (default 50, max 100); the mutating routes are write-scoped.
+  `DELETE` is a soft-delete — the row is retained with `status=deleted`.
 - `/graph/{provider}*` projects and exports graph views.
 - `/outcomes` records (`POST`, write-scope) and lists (`GET`) workflow
   outcomes for the self-learning loop. Both return 404 while

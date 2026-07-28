@@ -3526,11 +3526,17 @@ async def list_relationships_endpoint(
     source_key: Optional[str] = None,
     status_filter: Optional[str] = Query(default=None, alias="status"),
     stale: bool = False,
+    limit: int = Query(default=50, ge=1, le=100),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ):
     """List relationships (read scope). Default returns ACTIVE only; ``status``
     widens; ``stale=true`` filters to stale edges. Each row is a content-free
-    RelationshipDTO exposing provenance/status/timestamps (FR-5.4, AC-7)."""
+    RelationshipDTO exposing provenance/status/timestamps (FR-5.4, AC-7).
+
+    ``limit`` bounds the response, matching ``GET /memory``'s precedent
+    (default 50, max 100). This route previously returned every row in the
+    scope, so a large scope could emit an unbounded payload where every sibling
+    memory list route was already capped (human review, PR #524)."""
     _require_memory_enabled()
     svc = _relationship_service()
     dtos = svc.list_relationships(
@@ -3541,7 +3547,7 @@ async def list_relationships_endpoint(
         stale_only=stale,
         include_non_active=status_filter is not None,
     )
-    return [d.to_dict() for d in dtos]
+    return [d.to_dict() for d in dtos[:limit]]
 
 
 @app.post("/memory/relationships")
@@ -3632,7 +3638,17 @@ async def delete_relationship_endpoint(
     relationship_id: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ):
-    """Soft-delete (write scope): status -> deleted, row retained (auditable)."""
+    """Soft-delete (write scope): status -> deleted, row retained (auditable).
+
+    WRITE, not ADMIN, is DELIBERATE (human review, PR #524). The ADMIN-gated
+    memory routes destroy user content irreversibly (a memory's file and its
+    metadata row); this one only transitions a derived annotation's status and
+    retains the row, so it is recoverable and forensically intact — the same
+    authority already needed to CREATE the edge via POST, and no more. Gating it
+    ADMIN would also make ordinary curation (rejecting a bad compiler edge)
+    require an admin token while writing one did not, which is the wrong
+    asymmetry. Note this is the SOFT delete; the hard purge is not exposed over
+    HTTP at all — it is driven internally by ``forget()``."""
     _require_memory_enabled()
     svc = _relationship_service()
     try:

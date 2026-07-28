@@ -494,6 +494,21 @@ def _migrate_memory_relationships() -> None:
             )
             # Dedup UNIQUE index — total because scope_id is NOT NULL (sentinel),
             # so ON CONFLICT fires for all scopes including global.
+            #
+            # ACCEPTED REDUNDANCY on a FRESH db (human review, PR #524): there,
+            # create_all() has already satisfied the model's UniqueConstraint via
+            # an unnamed sqlite_autoindex, so this statement adds a SECOND index
+            # over identical columns (the name matches the constraint, but SQLite
+            # does not treat a table-level UNIQUE as a named index, so
+            # IF NOT EXISTS does not suppress it). Kept deliberately: this
+            # migrator must remain zero-arg and idempotent for EXISTING dbs,
+            # where CREATE TABLE IF NOT EXISTS is a no-op and this is the ONLY
+            # thing that establishes the dedup index that replace_set/create rely
+            # on. Making it fresh-db-aware would mean probing pragma index_list
+            # and branching — more moving parts in a path whose failure mode is
+            # silent duplicate edges. The cost is one extra index on new
+            # installs: some write amplification and disk, no correctness or
+            # query-plan impact.
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_rel ON memory_relationships "
                 "(scope, scope_id, source_key, target_key, type, origin)"

@@ -136,6 +136,30 @@ class MemoryGraphProvider(GraphProvider):
             "contradiction": EdgeType.CONTRADICTION,
             "supersedes": EdgeType.SUPERSEDES,
         }
+
+        issues = []
+        if lint_enabled:
+            # Lint findings may run expensive detectors. A failure degrades to
+            # a lint-free graph rather than a 500.
+            try:
+                # project_hash arg is only used for run_lint's audit log, not
+                # lookup — `project()` has no cwd/terminal_context to resolve
+                # the real project id (resolve_project_id), so this is a
+                # placeholder.
+                issues = await wiki_lint.run_lint(scope_id or scope, scope=scope)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("memory graph provider: run_lint failed: %r", e, exc_info=True)
+                meta["lint_error"] = type(e).__name__
+
+        # ORDERING (human review, PR #524): the relationship read MUST come after
+        # run_lint. run_lint persists its contradiction findings into this same
+        # store (wiki_lint._persist_contradictions), so reading first meant a
+        # contradiction detected during THIS projection was absent from the graph
+        # it produced — invisible for a full cache window, and reappearing later
+        # with no apparent cause. Reading after makes the projection reflect the
+        # lint run it just performed.
         try:
             from cli_agent_orchestrator.services.memory_relationship_service import (
                 MemoryRelationshipService,
@@ -175,22 +199,6 @@ class MemoryGraphProvider(GraphProvider):
                     attrs={"source": rel.origin},
                 )
             )
-
-        issues = []
-        if lint_enabled:
-            # Lint findings may run expensive detectors. A failure degrades to
-            # a lint-free graph rather than a 500.
-            try:
-                # project_hash arg is only used for run_lint's audit log, not
-                # lookup — `project()` has no cwd/terminal_context to resolve
-                # the real project id (resolve_project_id), so this is a
-                # placeholder.
-                issues = await wiki_lint.run_lint(scope_id or scope, scope=scope)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.warning("memory graph provider: run_lint failed: %r", e, exc_info=True)
-                meta["lint_error"] = type(e).__name__
 
         for issue in issues:
             if issue.issue_type == "orphan_page":

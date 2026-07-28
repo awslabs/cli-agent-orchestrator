@@ -2685,6 +2685,10 @@ class MemoryService:
                 self._delete_metadata(key, scope, scope_id)
             except Exception as e:
                 logger.warning(f"Memory metadata SQLite delete failed (key={key}): {e}")
+            # The relationship rows are just as stale as the metadata row was —
+            # purge them on this path too, else a file that vanished out-of-band
+            # leaves edges that a same-slug memory would later inherit.
+            self._purge_relationships(key, scope, scope_id)
             return False
 
         # Delete the wiki file
@@ -2703,7 +2707,35 @@ class MemoryService:
         except Exception as e:
             logger.warning(f"Memory metadata SQLite delete failed (key={key}): {e}")
 
+        # Drop the typed relationship rows too (issue #511 / PR #524 review):
+        # the file, the index entry and the metadata row are all gone, so any
+        # edge touching this key is dangling.
+        self._purge_relationships(key, scope, scope_id)
+
         return True
+
+    def _purge_relationships(self, key: str, scope: str, scope_id: Optional[str]) -> None:
+        """Hard-delete relationship rows for a FORGOTTEN memory. Best-effort.
+
+        Without this, ``forget()`` left ``active`` rows pointing at a key that no
+        longer resolves, and a later memory created with the SAME slug silently
+        inherited the dead memory's edges. Non-blocking: a store failure must not
+        turn a successful forget into an exception, since the file and metadata
+        row are already gone by this point.
+        """
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            # ``scope_id`` here is already the resolved LOGICAL value (forget()
+            # resolves it before use); the store maps None to its own NOT-NULL
+            # sentinel internally, so it must NOT be pre-mapped here.
+            removed = MemoryRelationshipService().purge_for_key(scope, scope_id, key)
+            if removed:
+                logger.info(f"Purged {removed} relationship row(s) for forgotten memory: {key}")
+        except Exception as e:  # noqa: BLE001 — never fail a completed forget
+            logger.warning(f"Relationship purge failed (key={key}): {e}")
 
     # -------------------------------------------------------------------------
     # Context for terminal injection
