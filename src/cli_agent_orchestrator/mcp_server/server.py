@@ -181,29 +181,24 @@ def _create_terminal(
     Args:
         agent_profile: Agent profile for the terminal
         working_directory: Optional working directory for the terminal
-        defer_init: If True and creating within an existing session, tell
+        defer_init: If True, tell
             cao-server to skip the ``provider.initialize()`` wait and return
             as soon as the tmux window and DB record exist. Provider init
             (and, when ``initial_message`` is set, delivery of that message)
             runs as a background task on cao-server. The tool-call round-trip
             drops from tens of seconds to <2s, keeping it well under
             kiro-cli 2.11's ~60s per-tool client timeout.
-        initial_message: If ``defer_init=True``, this message is delivered
-            to the newly created worker once its provider finishes
-            initializing. Ignored otherwise.
+        initial_message: This message is delivered to the newly created worker
+            once its provider finishes initializing. For a new session, the
+            message selects deferred initialization automatically; for an
+            existing session, ``defer_init=True`` is required.
         initial_message_orchestration_type: Passed through to send_input for
             plugin event emission (assign/handoff).
         engine: Explicit Kiro engine for the child terminal.
         model: Explicit per-call model override for the new terminal, applied
             ahead of the agent profile's own static model field (where the
-            resolved provider supports it). Only honored on the
-            existing-session branch below (``POST /sessions/{name}/
-            terminals``) -- the new-session branch (``POST /sessions``, used
-            only when this tool is called with no current CAO_TERMINAL_ID)
-            goes through a different server-side route that does not accept
-            it; handoff/assign both already require an existing terminal
-            (see their own CAO_TERMINAL_ID checks), so this branch is the one
-            that matters for both callers in practice.
+            resolved provider supports it). Honored by both the existing-
+            session and new-session branches.
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -263,7 +258,7 @@ def _create_terminal(
             params["allowed_tools"] = child_allowed_tools
         if engine is not None:
             params["engine"] = engine
-        if model:
+        if model is not None:
             params["model"] = model
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
@@ -291,16 +286,14 @@ def _create_terminal(
         terminal = response.json()
     else:
         # Create new session with terminal.
-        # The new-session endpoint (POST /sessions) has no deferred-init support,
-        # so defer_init/initial_message CANNOT be honored here. Raise rather than
-        # silently create a worker and drop the task (the caller — _assign_impl —
-        # already fails fast when CAO_TERMINAL_ID is unset, so this is a
-        # belt-and-suspenders guard the docstring promised).
-        if defer_init:
+        # POST /sessions automatically uses deferred init when an initial
+        # message is present. A bare defer_init flag still cannot be represented
+        # on that endpoint, so reject that narrower shape rather than silently
+        # changing it to synchronous initialization.
+        if defer_init and initial_message is None:
             raise ValueError(
-                "defer_init/initial_message is not supported when creating a new "
-                "session (no current CAO_TERMINAL_ID); refusing to create a worker "
-                "whose task would never be delivered."
+                "defer_init requires initial_message when creating a new session "
+                "(no current CAO_TERMINAL_ID)"
             )
         session_name = generate_session_name()
         provider = resolve_provider(agent_profile, fallback_provider=provider)
@@ -313,8 +306,25 @@ def _create_terminal(
             params["working_directory"] = working_directory
         if engine is not None:
             params["engine"] = engine
+        if model is not None:
+            params["model"] = model
 
-        response = requests.post(f"{API_BASE_URL}/sessions", params=params, timeout=_mcp_timeout())
+        json_body = None
+        if initial_message is not None:
+            json_body = {"initial_message": initial_message}
+            if initial_message_orchestration_type is not None:
+                json_body["initial_message_orchestration_type"] = (
+                    initial_message_orchestration_type.value
+                    if isinstance(initial_message_orchestration_type, OrchestrationType)
+                    else str(initial_message_orchestration_type)
+                )
+
+        response = requests.post(
+            f"{API_BASE_URL}/sessions",
+            params=params,
+            json=json_body,
+            timeout=_mcp_timeout(),
+        )
         response.raise_for_status()
         terminal = response.json()
 

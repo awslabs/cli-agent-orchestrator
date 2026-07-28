@@ -186,6 +186,53 @@ async def test_omitted_engine_launches_as_explicitly_pinned_v2():
 
 
 @pytest.mark.asyncio
+async def test_explicit_model_override_is_probed_even_when_profile_has_none():
+    """An override reaching --model must first be probed for the model capability.
+
+    The launch path resolves `model or profile.model`; probing only the profile
+    snapshot would launch a flag the wrapper was never verified to support.
+    """
+    probe = Mock(
+        return_value=KiroCapabilities(
+            version="2.13.0",
+            flags=frozenset({"--agent-engine", "--agent", "--trust-all-tools", "--model"}),
+        )
+    )
+    provider = MagicMock()
+    provider.initialize = AsyncMock(return_value=True)
+    provider.shell_baseline = None
+
+    with (
+        patch(
+            f"{_MODULE}.load_agent_profile",
+            return_value=AgentProfile(name="developer", description="Developer"),
+        ),
+        patch(f"{_MODULE}.get_backend") as backend,
+        patch(f"{_MODULE}.db_create_terminal"),
+        patch(f"{_MODULE}.fifo_manager"),
+        patch(f"{_MODULE}.provider_manager") as providers,
+        patch(f"{_MODULE}.generate_terminal_id", return_value="test1234"),
+        patch(f"{_MODULE}.generate_session_name", return_value="session"),
+        patch(f"{_MODULE}.generate_window_name", return_value="developer-window"),
+        patch(f"{_MODULE}.get_herdr_inbox_service", return_value=None),
+    ):
+        backend.return_value.session_exists.return_value = False
+        backend.return_value.supports_event_inbox.return_value = True
+        providers.create_provider.return_value = provider
+
+        await create_terminal(
+            provider="kiro_cli",
+            agent_profile="developer",
+            new_session=True,
+            model="claude-sonnet-5",
+            kiro_capability_probe=probe,
+        )
+
+    assert "model" in probe.call_args.args[1]
+    assert providers.create_provider.call_args.kwargs["model"] == "claude-sonnet-5"
+
+
+@pytest.mark.asyncio
 async def test_non_yolo_v2_missing_legacy_ui_rejects_before_allocation():
     """The optional fallback flag is probed before any v2 lifecycle allocation."""
 

@@ -278,6 +278,38 @@ class TestTerminalCreationWithWorkingDirectory:
             assert response.status_code == 400
             mock_svc.create_terminal.assert_not_called()
 
+    def test_create_terminal_kas_refusal_maps_to_400_not_404(self, client):
+        """A KAS refusal is a bad request, not a missing resource.
+
+        KiroPhase0KASError subclasses ValueError, and this endpoint's generic
+        ValueError arm means "session/window not found" -- so without a narrower
+        arm ordered first, an engine rejection reports 404. POST /sessions
+        already returns 400 for the identical failure.
+        """
+        from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=KiroPhase0KASError(profile_has_v2_policy=False)
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "engine": "kas",
+                },
+            )
+
+        assert response.status_code == 400
+
     def test_create_terminal_rejects_malformed_caller_id(self, client):
         """caller_id is validated against the TerminalId pattern — IDs arrive
         from agent input and must not be persisted unvalidated."""

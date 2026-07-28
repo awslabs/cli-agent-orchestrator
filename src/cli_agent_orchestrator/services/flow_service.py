@@ -30,6 +30,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS
 from cli_agent_orchestrator.models.flow import Flow
+from cli_agent_orchestrator.models.kiro_engine import parse_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
@@ -215,7 +216,13 @@ async def execute_flow(name: str) -> bool:
 
         # Read flow file
         file_path = Path(flow.file_path)
-        _, prompt_template = _parse_flow_file(file_path)
+        metadata, prompt_template = _parse_flow_file(file_path)
+
+        # get_flow degrades an invalid engine to None so one bad file cannot
+        # break listing. Executing on that None would silently launch v2, so
+        # re-validate the raw value here: at the execution boundary a rejected
+        # engine must fail rather than fall back to the default.
+        parse_kiro_engine(metadata.get("engine"))
 
         # If no script, always execute with empty output
         if not flow.script:

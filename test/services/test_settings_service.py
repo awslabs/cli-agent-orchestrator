@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.settings_service import (
     _DEFAULTS,
     _load,
@@ -21,8 +22,21 @@ from cli_agent_orchestrator.services.settings_service import (
 
 @pytest.fixture
 def settings_file(tmp_path):
-    """Patch SETTINGS_FILE and CAO_HOME_DIR to use a temp directory."""
+    """Patch SETTINGS_FILE and CAO_HOME_DIR to use a temp directory.
+
+    Also resets get_server_settings()'s module-global cache
+    (_server_settings_cache/_server_settings_mtime_ns), which is keyed only
+    on SETTINGS_FILE's st_mtime_ns. Without this reset, back-to-back tests
+    that each write their own tmp_path/settings.json can collide on a
+    coarse-clock filesystem (two writes to DIFFERENT files landing on the
+    same st_mtime_ns tick) and a test would silently read the PRIOR test's
+    cached settings instead of its own -- flaky (~3-4 failures per run on
+    WSL2), not reproducible on every host, and each failing test passes in
+    isolation, which is exactly what a stale-cache bug looks like.
+    """
     fake_settings = tmp_path / "settings.json"
+    settings_service._server_settings_cache = None
+    settings_service._server_settings_mtime_ns = -1
     with (
         patch(
             "cli_agent_orchestrator.services.settings_service.SETTINGS_FILE",
@@ -34,6 +48,8 @@ def settings_file(tmp_path):
         ),
     ):
         yield fake_settings
+    settings_service._server_settings_cache = None
+    settings_service._server_settings_mtime_ns = -1
 
 
 class TestLoad:
@@ -289,6 +305,7 @@ class TestGetServerSettings:
             "event_bus_max_queue_size": 1024,
             "provider_init_timeout": 60,
             "startup_prompt_handler_timeout": 20,
+            "state_buffer_max": 32768,
         }
 
     def test_reads_custom_values(self, settings_file):
@@ -327,3 +344,86 @@ class TestGetServerSettings:
         _save({"server": {"provider_init_timeout": -5}})
         result = get_server_settings()
         assert result["provider_init_timeout"] == 60
+
+    def test_state_buffer_max_reads_custom_value(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 65536}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 65536
+
+    def test_state_buffer_max_is_int(self, settings_file):
+        """A settings.json float (e.g. 32768.0) must come back as int -- it's
+        used as a slice bound (``buffer[-state_buffer_max:]``), which raises
+        TypeError on a float."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 65536.0}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 65536
+        assert isinstance(result["state_buffer_max"], int)
+
+    def test_state_buffer_max_zero_falls_back_to_default(self, settings_file):
+        """0 must not silently disable truncation: ``buffer[-0:]`` is the
+        whole buffer (``-0 == 0``, and ``s[0:]`` is everything), not an empty
+        slice -- unbounded per-terminal memory from a config typo."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 0}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+    def test_state_buffer_max_negative_falls_back_to_default(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": -1}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+    def test_state_buffer_max_fractional_below_one_falls_back_to_default(self, settings_file):
+        """0.5 passes the naive ``val <= 0`` check (0.5 > 0) but truncates to
+        0 once coerced to int for the slice bound -- ``buffer[-0:]`` is the
+        same unbounded-buffer failure mode as the zero case above, just
+        reached through the float door instead. The guard must check
+        ``int(val) <= 0``, not ``val <= 0``."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 0.5}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+    def test_state_buffer_max_invalid_type_falls_back_to_default(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": "not_a_number"}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+    def test_state_buffer_max_env_override(self, settings_file, monkeypatch):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        # Write the (empty) file so SETTINGS_FILE.exists() is True and this
+        # test's mtime is distinct from a prior test's -- get_server_settings()
+        # caches purely on file mtime, and a nonexistent file always hashes to
+        # mtime_ns=-1, so two tests that never call _save() could otherwise
+        # collide on the cache and silently return a stale prior result.
+        _save({})
+        monkeypatch.setenv("CAO_STATE_BUFFER_MAX", "65536")
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 65536
+
+    def test_state_buffer_max_env_override_beats_settings_file(self, settings_file, monkeypatch):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 16384}})
+        monkeypatch.setenv("CAO_STATE_BUFFER_MAX", "65536")
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 65536
+
+    def test_state_buffer_max_env_zero_falls_back_to_default(self, settings_file, monkeypatch):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({})  # see test_state_buffer_max_env_override for why
+        monkeypatch.setenv("CAO_STATE_BUFFER_MAX", "0")
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768

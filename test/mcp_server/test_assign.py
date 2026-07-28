@@ -135,11 +135,14 @@ class TestCreateTerminalProviderResolution:
                 defer_init=True,
                 initial_message="Analyze the sensitive logs at /secret/path",
                 initial_message_orchestration_type=OrchestrationType.ASSIGN,
+                model="",
             )
 
         _, kwargs = mock_requests.post.call_args
         # Routing flag stays in params; message payload is in the body.
         assert kwargs["params"].get("defer_init") == "true"
+        # Even an invalid empty override reaches the API validation boundary.
+        assert kwargs["params"]["model"] == ""
         assert "initial_message" not in kwargs["params"]
         assert kwargs["json"]["initial_message"] == "Analyze the sensitive logs at /secret/path"
         assert kwargs["json"]["initial_message_orchestration_type"] == "assign"
@@ -180,24 +183,99 @@ class TestCreateTerminalProviderResolution:
 
         assert mock_requests.post.call_args.kwargs["params"]["engine"] == "v2"
 
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.generate_session_name",
+        return_value="cao-new-session",
+    )
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.resolve_provider",
+        return_value="codex",
+    )
     @patch("cli_agent_orchestrator.mcp_server.server.requests")
-    def test_defer_init_on_new_session_branch_raises(self, mock_requests):
-        """PR #390 must-fix #2: the new-session branch can't honor defer_init
-        (POST /sessions has no deferred-init support), so _create_terminal must
-        raise rather than silently create a worker whose task is never
-        delivered. This is the branch taken when CAO_TERMINAL_ID is unset."""
+    def test_new_session_forwards_model_and_initial_message(
+        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+    ):
+        """The no-current-terminal branch no longer drops either launch field."""
         from cli_agent_orchestrator.mcp_server.server import _create_terminal
         from cli_agent_orchestrator.models.inbox import OrchestrationType
 
-        with patch.dict(os.environ, {}, clear=True):  # no CAO_TERMINAL_ID
-            with pytest.raises(ValueError, match="not supported when creating a new session"):
-                _create_terminal(
-                    "reviewer",
-                    defer_init=True,
-                    initial_message="do work",
-                    initial_message_orchestration_type=OrchestrationType.ASSIGN,
-                )
-        # Must raise BEFORE creating anything.
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "codex"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            terminal_id, provider = _create_terminal(
+                "reviewer",
+                defer_init=True,
+                initial_message="Review the current change",
+                initial_message_orchestration_type=OrchestrationType.ASSIGN,
+                model="gpt-5.1-codex",
+            )
+
+        assert terminal_id == "worker-1"
+        assert provider == "codex"
+        mock_requests.post.assert_called_once_with(
+            f"{API_BASE_URL}/sessions",
+            params={
+                "provider": "codex",
+                "agent_profile": "reviewer",
+                "session_name": "cao-new-session",
+                "model": "gpt-5.1-codex",
+            },
+            json={
+                "initial_message": "Review the current change",
+                "initial_message_orchestration_type": "assign",
+            },
+            timeout=_mcp_timeout(),
+        )
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.generate_session_name",
+        return_value="cao-new-session",
+    )
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.resolve_provider",
+        return_value="codex",
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_new_session_initial_message_is_forwarded_without_defer_flag(
+        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+    ):
+        """An initial message cannot be dropped when defer_init keeps its default."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "codex"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            _create_terminal(
+                "reviewer",
+                initial_message="Review the current change",
+            )
+
+        mock_requests.post.assert_called_once_with(
+            f"{API_BASE_URL}/sessions",
+            params={
+                "provider": "codex",
+                "agent_profile": "reviewer",
+                "session_name": "cao-new-session",
+            },
+            json={"initial_message": "Review the current change"},
+            timeout=_mcp_timeout(),
+        )
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_defer_init_without_message_on_new_session_raises(self, mock_requests):
+        """A bare defer flag still fails rather than changing semantics silently."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            with pytest.raises(ValueError, match="defer_init requires initial_message"):
+                _create_terminal("reviewer", defer_init=True)
+
         mock_requests.post.assert_not_called()
 
 
@@ -278,9 +356,10 @@ class TestAssignSenderIdInjection:
     The tool-call itself returns as soon as the tmux window/DB row exist.
     """
 
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_appends_sender_id_when_injection_enabled(self, mock_create):
+    def test_assign_appends_sender_id_when_injection_enabled(self, mock_create, _nudge):
         """When injection is enabled, assign should pass a message with the
         sender ID suffix as ``initial_message`` to _create_terminal."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
@@ -303,9 +382,10 @@ class TestAssignSenderIdInjection:
 
         assert kwargs["initial_message_orchestration_type"] == OrchestrationType.ASSIGN
 
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_no_suffix_when_injection_disabled(self, mock_create):
+    def test_assign_no_suffix_when_injection_disabled(self, mock_create, _nudge):
         """When injection is disabled, assign should pass the message unchanged."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
@@ -368,9 +448,10 @@ class TestAssignSenderIdInjection:
         assert result["terminal_id"] is None
         assert "Assignment failed" in result["message"]
 
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_suffix_is_appended_not_prepended(self, mock_create):
+    def test_assign_suffix_is_appended_not_prepended(self, mock_create, _nudge):
         """The sender ID should be a suffix, not a prefix."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
@@ -385,9 +466,10 @@ class TestAssignSenderIdInjection:
         assert sent_message.startswith(original)
         assert sent_message.index("[Assigned by terminal") > len(original)
 
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_returns_fast_success_message(self, mock_create):
+    def test_assign_returns_fast_success_message(self, mock_create, _nudge):
         """Regression: assign() should tell the LLM the worker is initializing
         in the background, not claim the message has been delivered."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl

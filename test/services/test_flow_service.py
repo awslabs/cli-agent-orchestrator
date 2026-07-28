@@ -474,6 +474,53 @@ class TestExecuteFlow:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    async def test_execute_flow_rejects_invalid_engine_instead_of_running_v2(
+        self,
+        mock_db_get,
+        mock_update_times,
+        mock_get_backend,
+        mock_create_terminal,
+        mock_send_input,
+    ):
+        """A flow file hand-edited to an invalid engine fails rather than
+        silently degrading to the v2 default (listing stays tolerant)."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write("""---
+name: bad-engine-flow
+schedule: "* * * * *"
+agent_profile: developer
+engine: kasx
+---
+
+Prompt body.
+""")
+            f.flush()
+            flow_path = f.name
+
+        mock_db_get.return_value = Flow(
+            name="bad-engine-flow",
+            file_path=flow_path,
+            schedule="* * * * *",
+            agent_profile="developer",
+            provider="kiro_cli",
+            script="",
+            enabled=True,
+            next_run=datetime.now(),
+        )
+        mock_get_backend.return_value.session_exists.return_value = False
+
+        with pytest.raises(ValueError, match="Invalid Kiro engine"):
+            await execute_flow("bad-engine-flow")
+
+        mock_create_terminal.assert_not_called()
+        mock_send_input.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.flow_service.send_input")
+    @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")

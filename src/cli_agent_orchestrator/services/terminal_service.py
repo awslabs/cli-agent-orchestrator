@@ -254,9 +254,12 @@ async def create_terminal(
             # Kiro runs headlessly, so current CAO behavior always bypasses its
             # interactive approval prompt. Profile/MCP policy remains enforced
             # by CAO, while unrestricted profiles additionally force legacy UI.
+            # Mirror the launch-time precedence (`model or profile.model`, see
+            # _get_profile_model): probing the profile snapshot alone would let an
+            # explicit override launch --model on a wrapper never probed for it.
             requested = requested_kiro_capabilities(
                 resolved_engine,
-                model=profile.model if profile else None,
+                model=model or (profile.model if profile else None),
                 yolo=True,
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
@@ -1160,8 +1163,9 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 
     ``FULL`` mode returns the StatusMonitor rolling buffer (the streamed output
     accumulated from the FIFO pipeline), which is bounded to the most recent
-    ``STATE_BUFFER_MAX`` bytes (8KB); it falls back to a tmux history capture
-    only when that buffer is empty. This is a deliberate trade-off in the
+    ``state_buffer_max`` bytes (server setting, see settings_service.py; 32KB
+    default); it falls back to a tmux history capture only when that buffer
+    is empty. This is a deliberate trade-off in the
     event-driven architecture (instant, no tmux call) — it is *not* unbounded
     scrollback, so very long sessions are truncated to the tail. Use the
     on-disk ``{id}.log`` (LogWriter) or the delete-time ``{id}.scrollback``

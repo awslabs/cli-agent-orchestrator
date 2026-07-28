@@ -58,6 +58,11 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 - `/sessions/{session_name}/terminals*` creates and lists session terminals.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
+- `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
+  rolling buffer (most recent `state_buffer_max` bytes of streamed output —
+  server setting, 32KB by default, see [Configuration](configuration.md)),
+  not unbounded scrollback. Long sessions are truncated to the tail; use the
+  on-disk terminal log for complete history.
 
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.

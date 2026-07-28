@@ -216,6 +216,26 @@ class AntigravityCliProvider(BaseProvider):
         """
         return True
 
+    @property
+    def paste_submit_delay(self) -> float:
+        """Gemini 3.x ``agy`` needs longer than the 0.3s base default to settle
+        the bracketed-paste end marker. An Enter sent that soon is consumed as a
+        literal newline inside the input box, so the pasted task is left
+        UNSUBMITTED and the agent sits at "ready for my first task" forever --
+        silently breaking scheduled flows and supervisor assign/handoff on the
+        antigravity provider. 1.5s lets the paste settle so the Enter submits
+        (tune 1.2-2.0 empirically).
+        """
+        return 1.5
+
+    @property
+    def paste_enter_count(self) -> int:
+        """``agy`` submits on a single Enter once the bracketed paste has settled
+        (see ``paste_submit_delay``). The base default of 2 is tuned for Claude
+        Code's multi-line input mode and does not apply here.
+        """
+        return 1
+
     # ------------------------------------------------------------------ #
     # Launch
     # ------------------------------------------------------------------ #

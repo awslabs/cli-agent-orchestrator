@@ -4,6 +4,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.services.session_service import (
     create_session,
     delete_session,
@@ -31,7 +32,11 @@ class TestCreateSession:
         await create_session(provider=None, agent_profile="my_agent")
 
         mock_resolve.assert_called_once_with("my_agent", fallback_provider="kiro_cli")
-        assert mock_create_terminal.call_args.kwargs["provider"] == "claude_code"
+        call_kwargs = mock_create_terminal.call_args.kwargs
+        assert call_kwargs["provider"] == "claude_code"
+        assert call_kwargs["defer_init"] is False
+        assert call_kwargs["initial_message"] is None
+        assert call_kwargs["model"] is None
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
@@ -49,6 +54,64 @@ class TestCreateSession:
 
         mock_resolve.assert_not_called()
         assert mock_create_terminal.call_args.kwargs["provider"] == "kiro_cli"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_create_session_forwards_launch_payload(
+        self, mock_create_terminal, mock_dispatch
+    ):
+        """A first task selects the existing deferred-init path and reaches
+        terminal creation alongside the model override."""
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        await create_session(
+            provider="codex",
+            agent_profile="my_agent",
+            session_name="cao-test",
+            initial_message="Review the current change",
+            initial_message_orchestration_type=OrchestrationType.SEND_MESSAGE,
+            model="gpt-5.1-codex",
+        )
+
+        call_kwargs = mock_create_terminal.call_args.kwargs
+        assert call_kwargs["new_session"] is True
+        assert call_kwargs["defer_init"] is True
+        assert call_kwargs["initial_message"] == "Review the current change"
+        assert call_kwargs["initial_message_orchestration_type"] == OrchestrationType.SEND_MESSAGE
+        assert call_kwargs["model"] == "gpt-5.1-codex"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_create_session_rejects_orchestration_type_without_message(
+        self, mock_create_terminal
+    ):
+        """An incomplete initial-message payload fails instead of being dropped."""
+        with pytest.raises(
+            ValueError, match="initial_message_orchestration_type requires initial_message"
+        ):
+            await create_session(
+                provider="codex",
+                agent_profile="my_agent",
+                initial_message_orchestration_type=OrchestrationType.SEND_MESSAGE,
+            )
+
+        mock_create_terminal.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_create_session_rejects_empty_initial_message(self, mock_create_terminal):
+        """Direct callers cannot turn an empty first task into deferred initialization."""
+        with pytest.raises(ValueError, match="initial_message must not be empty"):
+            await create_session(
+                provider="codex",
+                agent_profile="my_agent",
+                initial_message="",
+            )
+
+        mock_create_terminal.assert_not_called()
 
 
 class TestListSessions:

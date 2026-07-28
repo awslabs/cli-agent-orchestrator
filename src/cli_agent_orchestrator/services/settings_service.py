@@ -16,9 +16,9 @@ SETTINGS_FILE = CAO_HOME_DIR / "settings.json"
 # Default agent directories per provider
 _DEFAULTS = {
     "kiro_cli": str(Path.home() / ".kiro" / "agents"),
-    "claude_code": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
-    "codex": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
-    "cao_installed": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-context"),
+    "claude_code": str(CAO_HOME_DIR / "agent-store"),
+    "codex": str(CAO_HOME_DIR / "agent-store"),
+    "cao_installed": str(CAO_HOME_DIR / "agent-context"),
 }
 
 _BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -169,6 +169,20 @@ _SERVER_DEFAULTS = {
     "event_bus_max_queue_size": 1024,
     "provider_init_timeout": 60,
     "startup_prompt_handler_timeout": 20,
+    # Rolling per-terminal raw-output buffer StatusMonitor keeps for raw-path
+    # status detection and GET /terminals/{id}/output (mode=full) — see
+    # StatusMonitor._process_chunk. The old fixed 8192 was measured too small
+    # against the pyte screen geometry this buffer has to outlive: a single
+    # full-screen repaint of a 220x50 viewport is already ~11,000 visible
+    # characters before per-line/per-cell ANSI escapes are added on top, so
+    # one repaint alone could exceed the old cap. A long, chatty session with
+    # several such repaints (status-bar refreshes, spinner frames, full menu
+    # redraws) could evict a still-pending prompt from the buffer before it
+    # was ever read back. 32KB covers several trailing repaints instead of a
+    # fraction of one, while staying a deliberately bounded trade-off (not
+    # unbounded scrollback) — configurable rather than a second blind guess,
+    # since the "safe" size is provider/workload-dependent, not one constant.
+    "state_buffer_max": 32768,
 }
 
 # Env-var overrides for server settings. Precedence: env var > settings.json > default.
@@ -177,6 +191,7 @@ _SERVER_ENV_VARS = {
     "event_bus_max_queue_size": "CAO_EVENT_BUS_MAX_QUEUE_SIZE",
     "provider_init_timeout": "CAO_PROVIDER_INIT_TIMEOUT",
     "startup_prompt_handler_timeout": "CAO_STARTUP_PROMPT_HANDLER_TIMEOUT",
+    "state_buffer_max": "CAO_STATE_BUFFER_MAX",
 }
 
 
@@ -200,6 +215,9 @@ def get_server_settings() -> Dict[str, Any]:
         prompt; it stops once no new prompt appears for this many seconds (so a
         dialog a cold/containerized start renders late is still handled). Total
         time is bounded by provider_init_timeout.
+      - state_buffer_max (32768): Bytes of raw terminal output StatusMonitor
+        keeps per terminal for raw-path status detection and
+        GET /terminals/{id}/output (mode=full)
 
     Values can be set via CAO_* environment variables or in
     ~/.aws/cli-agent-orchestrator/settings.json under the "server" key:
@@ -209,7 +227,8 @@ def get_server_settings() -> Dict[str, Any]:
             "mcp_request_timeout": 120,
             "event_bus_max_queue_size": 8192,
             "provider_init_timeout": 90,
-            "startup_prompt_handler_timeout": 5
+            "startup_prompt_handler_timeout": 5,
+            "state_buffer_max": 65536
           }
         }
     """
@@ -245,10 +264,21 @@ def get_server_settings() -> Dict[str, Any]:
     # Validate types and ranges; coerce to int for queue size
     for key, default in _SERVER_DEFAULTS.items():
         val = result[key]
-        if isinstance(val, bool) or not isinstance(val, (int, float)) or val <= 0:
+        # int(val), not val <= 0: a float in (0, 1) (e.g. a settings.json
+        # value of 0.5) passes val <= 0 but truncates to 0 once coerced to
+        # int below (state_buffer_max) or by Queue(maxsize=...)
+        # (event_bus_max_queue_size), reintroducing the same
+        # unbounded-buffer/unbounded-queue failure mode this validation
+        # exists to prevent. isinstance(val, (int, float)) above guarantees
+        # int(val) cannot itself raise here.
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or int(val) <= 0:
             logger.warning(f"Invalid server setting {key}={val!r}, using default {default}")
             result[key] = default
     result["event_bus_max_queue_size"] = int(result["event_bus_max_queue_size"])
+    # buffer[-state_buffer_max:] requires an int -- a float survives the
+    # generic isinstance(val, (int, float)) check above (e.g. a settings.json
+    # value of 32768.0), and a float slice bound raises TypeError.
+    result["state_buffer_max"] = int(result["state_buffer_max"])
     _server_settings_cache = result
     _server_settings_mtime_ns = mtime_ns
     return dict(result)
