@@ -31,10 +31,14 @@ def load_fixture(name: str) -> str:
 
 
 def make_provider(
-    agent_profile=None, allowed_tools=None, model=None, skill_prompt=None
+    terminal_id="test-tid",
+    agent_profile=None,
+    allowed_tools=None,
+    model=None,
+    skill_prompt=None,
 ) -> AntigravityCliProvider:
     return AntigravityCliProvider(
-        terminal_id="test-tid",
+        terminal_id=terminal_id,
         session_name="test-session",
         window_name="window-0",
         agent_profile=agent_profile,
@@ -270,13 +274,14 @@ def test_mcp_registration_writes_config(tmp_path, monkeypatch):
         import json
 
         data = json.loads(cfg.read_text())
-        assert "cao-mcp-server" in data["mcpServers"]
+        # Key is per-terminal: "{server_name}-{terminal_id}"
+        assert "cao-mcp-server-test-tid" in data["mcpServers"]
         # CAO_TERMINAL_ID forwarded so cao-mcp-server can resolve the terminal.
-        assert data["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
+        assert data["mcpServers"]["cao-mcp-server-test-tid"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
         # cleanup removes our entry without clobbering the file.
         p.cleanup()
         data2 = json.loads(cfg.read_text())
-        assert "cao-mcp-server" not in data2.get("mcpServers", {})
+        assert "cao-mcp-server-test-tid" not in data2.get("mcpServers", {})
 
 
 def test_mcp_registration_resolves_bundled_command(tmp_path, monkeypatch):
@@ -311,7 +316,7 @@ def test_mcp_registration_resolves_bundled_command(tmp_path, monkeypatch):
         p._build_agy_command()
         import json
 
-        entry = json.loads(cfg.read_text())["mcpServers"]["cao-mcp-server"]
+        entry = json.loads(cfg.read_text())["mcpServers"]["cao-mcp-server-test-tid"]
         # persisted=True prefers the stable PATH launcher, not the bare command
         # or the versioned sibling.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
@@ -440,7 +445,7 @@ def test_mcp_registration_accepts_pydantic_mcpserver(tmp_path):
     ):
         p._build_agy_command()
     data = json.loads(cfg.read_text())
-    assert data["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
+    assert data["mcpServers"]["cao-mcp-server-test-tid"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
     assert data["mcpServers"]["other"]["command"] == "keep"  # untouched
 
 
@@ -470,7 +475,7 @@ def test_mcp_registration_recovers_from_corrupt_config(tmp_path):
     ):
         p._build_agy_command()  # should not raise; starts fresh
     data = json.loads(cfg.read_text())
-    assert "cao-mcp-server" in data["mcpServers"]
+    assert "cao-mcp-server-test-tid" in data["mcpServers"]
 
 
 @pytest.mark.parametrize("payload", ["[1, 2, 3]", '"just a string"', "42"])
@@ -504,7 +509,7 @@ def test_mcp_registration_recovers_from_non_dict_config(tmp_path, payload):
         p._build_agy_command()  # must not raise
     data = json.loads(cfg.read_text())
     assert isinstance(data, dict)
-    assert "cao-mcp-server" in data["mcpServers"]
+    assert "cao-mcp-server-test-tid" in data["mcpServers"]
 
 
 def test_mcp_registration_replaces_non_dict_mcpservers(tmp_path):
@@ -535,7 +540,7 @@ def test_mcp_registration_replaces_non_dict_mcpservers(tmp_path):
         p._build_agy_command()  # must not raise
     data = json.loads(cfg.read_text())
     assert isinstance(data["mcpServers"], dict)
-    assert "cao-mcp-server" in data["mcpServers"]
+    assert "cao-mcp-server-test-tid" in data["mcpServers"]
 
 
 def test_unregister_noop_when_nothing_registered():
@@ -547,7 +552,7 @@ def test_unregister_noop_when_nothing_registered():
 
 def test_unregister_handles_missing_file(tmp_path):
     p = make_provider()
-    p._mcp_server_names = ["cao-mcp-server"]
+    p._mcp_server_names = ["cao-mcp-server-test-tid"]
     missing = tmp_path / "does_not_exist.json"
     with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=missing):
         p.cleanup()  # file gone -> just resets state
@@ -640,7 +645,7 @@ def test_unregister_warns_on_corrupt_config(tmp_path):
     cfg = tmp_path / "mcp_config.json"
     cfg.write_text("{ not valid json")
     p = make_provider()
-    p._mcp_server_names = ["cao-mcp-server"]
+    p._mcp_server_names = ["cao-mcp-server-test-tid"]
     with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
         p.cleanup()  # corrupt file -> logged warning, state reset, no raise
     assert p._mcp_server_names == []
@@ -653,7 +658,7 @@ def test_unregister_handles_non_dict_config(tmp_path, payload):
     cfg = tmp_path / "mcp_config.json"
     cfg.write_text(payload)
     p = make_provider()
-    p._mcp_server_names = ["cao-mcp-server"]
+    p._mcp_server_names = ["cao-mcp-server-test-tid"]
     with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
         p.cleanup()  # non-dict config -> no raise, state reset
     assert p._mcp_server_names == []
@@ -664,29 +669,84 @@ def test_unregister_skips_entry_owned_by_different_terminal(tmp_path):
     env.CAO_TERMINAL_ID matches this terminal — entries re-registered by
     a newer terminal under the same server name must survive."""
     cfg = tmp_path / "mcp_config.json"
-    cfg.write_text(json.dumps({
-        "mcpServers": {
-            "cao-mcp-server": {
-                "command": "cao-mcp-server",
-                "args": [],
-                "env": {"CAO_TERMINAL_ID": "new-terminal-99"},
-            },
-            "cao-ops-mcp-server": {
-                "command": "cao-ops-mcp-server",
-                "args": [],
-                "env": {"CAO_TERMINAL_ID": "test-tid"},
-            },
-        }
-    }))
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "cao-mcp-server-test-tid": {
+                        "command": "cao-mcp-server",
+                        "args": [],
+                        "env": {"CAO_TERMINAL_ID": "new-terminal-99"},
+                    },
+                    "cao-ops-mcp-server-test-tid": {
+                        "command": "cao-ops-mcp-server",
+                        "args": [],
+                        "env": {"CAO_TERMINAL_ID": "test-tid"},
+                    },
+                }
+            }
+        )
+    )
     p = make_provider()  # terminal_id="test-tid"
-    p._mcp_server_names = ["cao-mcp-server", "cao-ops-mcp-server"]
+    p._mcp_server_names = ["cao-mcp-server-test-tid", "cao-ops-mcp-server-test-tid"]
     with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
         p._unregister_mcp_servers()
     result = json.loads(cfg.read_text())
-    # "cao-mcp-server" belongs to new-terminal-99 -> must survive
-    assert "cao-mcp-server" in result["mcpServers"]
-    # "cao-ops-mcp-server" belongs to test-tid -> must be removed
-    assert "cao-ops-mcp-server" not in result["mcpServers"]
+    # "cao-mcp-server-test-tid" belongs to new-terminal-99 -> must survive
+    assert "cao-mcp-server-test-tid" in result["mcpServers"]
+    # "cao-ops-mcp-server-test-tid" belongs to test-tid -> must be removed
+    assert "cao-ops-mcp-server-test-tid" not in result["mcpServers"]
+
+
+# --------------------------------------------------------------------------- #
+# Concurrent initialization — regression test for MCP config cross-wiring
+# --------------------------------------------------------------------------- #
+
+
+def test_concurrent_inits_get_distinct_mcp_keys(tmp_path):
+    """Two providers initializing concurrently must each write their own
+    per-terminal key into mcp_config.json, never overwriting the other's
+    entry. Regression test for the race where a shared static key caused
+    terminal B's write to clobber terminal A's entry before A's agy process
+    read the config."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    profile = AgentProfile(
+        name="dev_gemini",
+        description="Dev",
+        system_prompt="You develop.",
+        mcpServers={"cao-mcp-server": {"command": "uvx", "args": ["cao-mcp-server"]}},
+    )
+    p_a = make_provider(terminal_id="terminal-A", agent_profile="dev_gemini")
+    p_b = make_provider(terminal_id="terminal-B", agent_profile="dev_gemini")
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+    ):
+        p_a._build_agy_command()
+        p_b._build_agy_command()
+
+        data = json.loads(cfg.read_text())
+        servers = data["mcpServers"]
+        # Each terminal has its own key
+        assert "cao-mcp-server-terminal-A" in servers
+        assert "cao-mcp-server-terminal-B" in servers
+        # Each key carries the correct CAO_TERMINAL_ID
+        assert servers["cao-mcp-server-terminal-A"]["env"]["CAO_TERMINAL_ID"] == "terminal-A"
+        assert servers["cao-mcp-server-terminal-B"]["env"]["CAO_TERMINAL_ID"] == "terminal-B"
+        # Cleanup of A doesn't touch B
+        p_a._unregister_mcp_servers()
+        data2 = json.loads(cfg.read_text())
+        assert "cao-mcp-server-terminal-A" not in data2["mcpServers"]
+        assert "cao-mcp-server-terminal-B" in data2["mcpServers"]
 
 
 # --------------------------------------------------------------------------- #

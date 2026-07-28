@@ -328,6 +328,10 @@ class AntigravityCliProvider(BaseProvider):
         non-CAO servers), forwarding ``CAO_TERMINAL_ID`` into each server's env
         so cao-mcp-server can resolve the current terminal for handoff / assign.
 
+        Each entry is keyed as ``{server_name}-{terminal_id}`` so concurrent
+        inits write to distinct keys and an earlier terminal's entry cannot be
+        overwritten before its agy process reads the config at startup.
+
         Concurrency: the file is shared across terminals. issue #494:
         ``_build_agy_command`` (the sole caller, via initialize()) now runs
         inside ``asyncio.to_thread``, so N concurrent inits can enter this
@@ -390,8 +394,11 @@ class AntigravityCliProvider(BaseProvider):
                 env = dict(cfg.get("env", {}))
                 env["CAO_TERMINAL_ID"] = self.terminal_id
                 entry["env"] = env
-                servers[server_name] = entry
-                self._mcp_server_names.append(server_name)
+                # Use a per-terminal key so concurrent inits don't overwrite
+                # each other's entry before agy reads the config at startup.
+                unique_key = f"{server_name}-{self.terminal_id}"
+                servers[unique_key] = entry
+                self._mcp_server_names.append(unique_key)
 
             tmp_path = path.with_suffix(".json.tmp")
             with open(tmp_path, "w") as f:
@@ -430,7 +437,10 @@ class AntigravityCliProvider(BaseProvider):
                 if isinstance(servers, dict):
                     for name in self._mcp_server_names:
                         entry = servers.get(name)
-                        if isinstance(entry, dict) and entry.get("env", {}).get("CAO_TERMINAL_ID") != self.terminal_id:
+                        if (
+                            isinstance(entry, dict)
+                            and entry.get("env", {}).get("CAO_TERMINAL_ID") != self.terminal_id
+                        ):
                             continue  # belongs to a different terminal — leave it
                         servers.pop(name, None)
                     tmp_path = path.with_suffix(".json.tmp")
