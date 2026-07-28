@@ -137,3 +137,88 @@ def test_run_paths_are_not_captured_by_the_catch_all(path: str, expected_name: s
     assert route is not None
     assert route.name == expected_name
     assert route.name != "get_workflow_endpoint"
+
+
+# ---------------------------------------------------------------------------
+# PR 526 review — the SINGLE-segment sibling, and why the asymmetry exists.
+#
+# Verified empirically (and independently by the #511 peer with a 2-route probe
+# app): an unconstrained single-segment ``/workflows/{name}`` SWALLOWS a
+# one-segment sibling like ``/workflows/runs`` when registered first, but CANNOT
+# shadow a two-segment path like ``/workflows/runs/{run_id}``. That is the whole
+# explanation for this branch's asymmetry — every deep run route resolves fine
+# while the run LIST 404s as {"detail": "unknown workflow 'runs'"}.
+#
+# So the ordering requirement is narrow and specific: the LIST route must be
+# registered BEFORE ``/workflows/{name}``. This branch (#504) does not define the
+# list — sibling #505 owns it at main.py:2364, correctly ahead of its own
+# ``/workflows/{name}`` at 2410. These tests exist so that ordering is PINNED HERE
+# and cannot be silently lost in whichever rebase merges the two PRs together.
+# ---------------------------------------------------------------------------
+def _list_route_index() -> int | None:
+    """Registration index of an exact ``GET /workflows/runs`` route, or None."""
+    for i, route in enumerate(app.router.routes):
+        if getattr(route, "path", None) == "/workflows/runs" and "GET" in (
+            getattr(route, "methods", None) or set()
+        ):
+            return i
+    return None
+
+
+def _catch_all_index() -> int | None:
+    """Registration index of the single-segment ``GET /workflows/{name}`` route."""
+    for i, route in enumerate(app.router.routes):
+        if getattr(route, "path", None) == "/workflows/{name}" and "GET" in (
+            getattr(route, "methods", None) or set()
+        ):
+            return i
+    return None
+
+
+def test_single_segment_catch_all_is_present_and_locatable():
+    """Guards the premise of the ordering test below: if the catch-all is renamed
+    or removed, these pins must be revisited rather than silently passing."""
+    assert _catch_all_index() is not None, "GET /workflows/{name} not found"
+
+
+def test_run_list_route_precedes_the_catch_all_when_present():
+    """THE ordering pin. Skips on #504 alone (no list route here) and BITES the
+    moment the list lands via the #505 merge — which is exactly when a rebase
+    could reorder it after the catch-all and silently kill the Workflows tab.
+    """
+    list_idx = _list_route_index()
+    if list_idx is None:
+        pytest.skip(
+            "GET /workflows/runs is owned by sibling #505; this pin activates "
+            "when the two PRs are merged together"
+        )
+    catch_all_idx = _catch_all_index()
+    assert catch_all_idx is not None
+    assert list_idx < catch_all_idx, (
+        "GET /workflows/runs must be registered BEFORE GET /workflows/{name}; "
+        "otherwise the catch-all captures 'runs' as a workflow name and the run "
+        "list 404s with \"unknown workflow 'runs'\""
+    )
+
+
+def test_run_list_path_does_not_resolve_to_the_catch_all():
+    """The 404-SHAPE case the peer asked for: assert on RESOLUTION, not just
+    ordering, because resolution is the symptom a future reorder reproduces.
+
+    On #504 alone the list route is absent, so ``/workflows/runs`` legitimately
+    falls to the catch-all — that IS the known cross-PR gap, asserted here as the
+    documented current state so the test is honest rather than skipped. Once the
+    list route exists, the same path MUST resolve to the list handler.
+    """
+    route = _resolve("GET", "/workflows/runs")
+    assert route is not None
+    if _list_route_index() is None:
+        # Documented pre-merge state: captured by the catch-all -> 404
+        # {"detail": "unknown workflow 'runs'"}. Verified empirically against a
+        # booted app. Fixed by merging #505 (which owns the list route).
+        assert route.name == "get_workflow_endpoint"
+    else:
+        assert route.name != "get_workflow_endpoint", (
+            "GET /workflows/runs resolved to the /workflows/{name} catch-all; "
+            "the list route is registered too late"
+        )
