@@ -252,6 +252,18 @@
       "message": "repeat 'up*40' expands past the 32-event cap"
     },
     {
+      "name": "three-digit repeat fails before conversion with the cap message",
+      "notation": "up*100",
+      "offset": 0,
+      "message": "repeat 'up*100' expands past the 32-event cap"
+    },
+    {
+      "name": "absurdly long repeat count fails before conversion, token bounded",
+      "notation": "up*999999999999999999999999999999",
+      "offset": 0,
+      "message": "repeat 'up*99999999999999999999…' expands past the 32-event cap"
+    },
+    {
       "name": "lone surrogate is not UTF-8-encodable",
       "notation": "\"\\ud800\"",
       "offset": 0,

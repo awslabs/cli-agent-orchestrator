@@ -127,8 +127,20 @@ def _scan_json_string(notation: str, start: int) -> Tuple[str, int]:
     return value, k + 1
 
 
+def _display_token(token: str) -> str:
+    """A repeat token as embedded in an error message, bounded in length."""
+    return token if len(token) <= 24 else f"{token[:23]}…"
+
+
 def _split_repeat(token: str, start: int) -> Tuple[str, Optional[int]]:
-    """Split ``base[*N]``; the repeat count obeys [1-9][0-9]* exactly."""
+    """Split ``base[*N]``; the repeat count obeys [1-9][0-9]* exactly.
+
+    A count with more than two digits is ≥ 100, which can never fit the
+    32-event budget even in an empty sequence — so it fails *before* the
+    integer conversion (CPython refuses over-long digit strings with a bare
+    ValueError from its int-max-str-digits guard; that conversion is never
+    reached, and the failure keeps the ordinary offset-bearing shape).
+    """
     if "*" not in token:
         return token, None
     base, _, count_text = token.partition("*")
@@ -136,6 +148,12 @@ def _split_repeat(token: str, start: int) -> Tuple[str, Optional[int]]:
         raise NotationError(
             start + len(base),
             f"invalid repeat count '*{count_text}': expected '*' followed by a " "positive integer",
+        )
+    if len(count_text) > 2:
+        raise NotationError(
+            start,
+            f"repeat '{_display_token(token)}' expands past the "
+            f"{MAX_SEQUENCE_EVENTS}-event cap",
         )
     return base, int(count_text)
 
@@ -224,7 +242,8 @@ def parse_notation(notation: str) -> List[Dict[str, Any]]:
                 if len(events) + count > MAX_SEQUENCE_EVENTS:
                     raise NotationError(
                         start,
-                        f"repeat '{token}' expands past the " f"{MAX_SEQUENCE_EVENTS}-event cap",
+                        f"repeat '{_display_token(token)}' expands past the "
+                        f"{MAX_SEQUENCE_EVENTS}-event cap",
                     )
                 events.extend(dict(event) for _ in range(count))
         else:

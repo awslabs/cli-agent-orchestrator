@@ -110,6 +110,11 @@ function scanJsonString(notation: string, start: number): [string, number] {
   return [value, k + 1]
 }
 
+/** A repeat token as embedded in an error message, bounded in length. */
+function displayToken(token: string): string {
+  return token.length <= 24 ? token : `${token.slice(0, 23)}…`
+}
+
 function splitRepeat(token: string, start: number): [string, number | null] {
   const star = token.indexOf('*')
   if (star === -1) return [token, null]
@@ -119,6 +124,17 @@ function splitRepeat(token: string, start: number): [string, number | null] {
     throw new NotationParseError(
       start + base.length,
       `invalid repeat count '*${countText}': expected '*' followed by a positive integer`,
+    )
+  }
+  // A count with more than two digits is ≥ 100, which can never fit the
+  // 32-event budget even in an empty sequence — fail before the numeric
+  // conversion (huge digit strings lose precision/overflow to Infinity;
+  // the failure keeps the ordinary offset-bearing shape). Mirrors the
+  // Python authority exactly.
+  if (countText.length > 2) {
+    throw new NotationParseError(
+      start,
+      `repeat '${displayToken(token)}' expands past the ${MAX_SEQUENCE_EVENTS}-event cap`,
     )
   }
   return [base, Number(countText)]
@@ -203,7 +219,7 @@ export function parseNotation(notation: string): SequenceEvent[] {
         if (events.length + count > MAX_SEQUENCE_EVENTS) {
           throw new NotationParseError(
             start,
-            `repeat '${token}' expands past the ${MAX_SEQUENCE_EVENTS}-event cap`,
+            `repeat '${displayToken(token)}' expands past the ${MAX_SEQUENCE_EVENTS}-event cap`,
           )
         }
         for (let k = 0; k < count; k += 1) events.push({ ...event })

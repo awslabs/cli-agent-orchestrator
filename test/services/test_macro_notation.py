@@ -93,6 +93,40 @@ class TestCaps:
         assert events == [{"type": "text", "text": "x" * MAX_SEQUENCE_TEXT_BYTES}]
 
 
+class TestRepeatConversionSafety:
+    """r11 repair: a repeat count that can never fit the 32-event budget
+    fails BEFORE the integer conversion, with the ordinary offset-bearing
+    cap error — never a bare conversion ValueError (CPython's
+    int-max-str-digits guard) and never an HTTP 500."""
+
+    def test_thousands_of_digits_repeat_is_a_cap_error(self):
+        with pytest.raises(NotationError) as excinfo:
+            parse_notation("up*" + "9" * 5000)
+        assert excinfo.value.offset == 0
+        assert excinfo.value.message.endswith("expands past the 32-event cap")
+        assert "int" not in excinfo.value.message.lower() or "digit" not in excinfo.value.message
+
+    def test_long_count_token_is_bounded_in_the_message(self):
+        with pytest.raises(NotationError) as excinfo:
+            parse_notation("up*" + "9" * 5000)
+        # The embedded token is display-bounded even for absurd inputs.
+        assert len(excinfo.value.message) < 100
+
+    def test_three_digit_count_fails_before_conversion(self):
+        with pytest.raises(NotationError) as excinfo:
+            parse_notation("up*100")
+        assert excinfo.value.offset == 0
+        assert excinfo.value.message == "repeat 'up*100' expands past the 32-event cap"
+
+    def test_two_digit_count_still_converts_and_checks_the_budget(self):
+        with pytest.raises(NotationError) as excinfo:
+            parse_notation("up*99")
+        assert excinfo.value.offset == 0
+        assert excinfo.value.message == "repeat 'up*99' expands past the 32-event cap"
+        # And exactly at the budget it parses.
+        assert len(parse_notation("up*32")) == 32
+
+
 class TestContractBoundary:
     def test_parse_results_are_valid_wire_sequences(self):
         events = parse_notation('"/compact" enter up*2 ctrl+s ctrl+c')

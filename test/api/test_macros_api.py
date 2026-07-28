@@ -226,6 +226,34 @@ class TestParseNotationEndpoint:
         assert response.status_code == 422
         assert response.json()["errors"][0]["message"] == "'notation' is required"
 
+    def test_absurd_repeat_count_is_the_ordinary_offset_422_not_500(self, client, store):
+        """r11 regression: the over-budget repeat fails before the integer
+        conversion, so the endpoint answers the ordinary offset-bearing
+        422 shape — never HTTP 500, never offset null with a leaked
+        conversion message."""
+        response = client.post("/macros/parse-notation", json={"notation": "up*" + "9" * 5000})
+        assert response.status_code == 422
+        errors = response.json()["errors"]
+        assert errors[0]["offset"] == 0
+        assert errors[0]["message"].endswith("expands past the 32-event cap")
+        assert "sys.set_int_max_str_digits" not in errors[0]["message"]
+
+
+class TestCreateRepeatRegression:
+    def test_create_with_absurd_repeat_is_the_ordinary_422(self, client, store):
+        response = client.post(
+            "/macros",
+            json={
+                "name": "x",
+                "scope": {"kind": "global"},
+                "notation": "up*" + "9" * 5000,
+            },
+        )
+        assert response.status_code == 422
+        errors = response.json()["errors"]
+        assert errors[0]["offset"] == 0
+        assert errors[0]["message"].endswith("expands past the 32-event cap")
+
 
 class TestScopeGating:
     """Scope discipline: the H4 guard (test_scope_coverage.py) mechanically
