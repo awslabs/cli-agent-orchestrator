@@ -21,10 +21,14 @@ goes through :class:`~cli_agent_orchestrator.tui.server_client.ServerClient`
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional
+import logging
+from contextlib import contextmanager
+from typing import Callable, Iterator, List, Optional
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.clipboard import Clipboard
+from prompt_toolkit.clipboard.pyperclip import PyperclipClipboard
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
@@ -46,6 +50,7 @@ from cli_agent_orchestrator.tui.profiles_view import ProfilesBrowser
 from cli_agent_orchestrator.tui.provider_preflight import ProviderPreflight
 from cli_agent_orchestrator.tui.runner import CommandRunner
 from cli_agent_orchestrator.tui.server_client import (
+    ServerAuthRequired,
     ServerClient,
     ServerClientError,
     ServerUnavailable,
@@ -63,6 +68,11 @@ EXIT_CATALOG_FATAL = 1
 # Type of the injectable liveness probe: given the API base URL, return whether
 # cao-server is reachable.
 LivenessProbe = Callable[[str], bool]
+
+# The logger tree every ``tui`` module logs under (each uses ``__name__``, so all
+# of them are descendants of this). Named explicitly rather than derived from
+# ``__name__`` so it stays correct if this module moves.
+_TUI_LOGGER_NAME = "cli_agent_orchestrator.tui"
 
 
 def probe_server_reachable(base_url: str = API_BASE_URL) -> bool:
@@ -109,6 +119,7 @@ class App:
         *,
         catalog: Optional[CommandCatalog] = None,
         client: Optional[ServerClient] = None,
+        clipboard: Optional[Clipboard] = None,
     ) -> None:
         """Compose the collaborators, run the startup probe, and build the app.
 
@@ -124,9 +135,16 @@ class App:
                 :class:`ServerClient`. A single instance is shared across the
                 pre-flight and profiles collaborators so live reads share one
                 seam.
+            clipboard: Optional prompt_toolkit clipboard. Defaults to a
+                :class:`~prompt_toolkit.clipboard.pyperclip.PyperclipClipboard`
+                so ``[c]`` reaches the real OS clipboard (FR-5.1). Injectable so a
+                test can pass a double (including one that raises) without
+                touching the machine's clipboard.
         """
 
         self._probe: LivenessProbe = liveness_probe or probe_server_reachable
+        # FR-5.1: the real OS clipboard, not prompt_toolkit's process-local default.
+        self._clipboard: Clipboard = clipboard if clipboard is not None else PyperclipClipboard()
 
         # -- compose the eight collaborators (all intra-tui) ----------------- #
         # ONE builder + ONE client are shared so preview/run/launch see the
@@ -159,6 +177,20 @@ class App:
         # Whether the S-catalog-fatal layout has been swapped in by the
         # render-time guard (so it swaps once, then exits on the next frame).
         self._fatal_screen_applied = False
+        # Transient one-line status notice rendered in the build panel (OQ-2: one
+        # shared line). This is the *in-UI* channel for feedback that must never
+        # be written to the terminal the full-screen UI owns — the ``[c]`` copy
+        # confirmation and its clipboard-unavailable fallback (FR-5.3), and any
+        # other transient acknowledgement. ``None`` == nothing to show.
+        self.status_notice: Optional[str] = None
+        # The param ``[e]`` will target next, as an index into
+        # ``builder.params``. ``None`` means "no cycle started yet", so the first
+        # press lands on the first unset param (the pre-existing behaviour) and
+        # subsequent presses advance through EVERY param, wrapping (FR-4.1).
+        self._edit_index: Optional[int] = None
+        # The command path the edit cycle belongs to. Opening a different command
+        # must restart the cycle rather than inherit a stale index.
+        self._edit_cycle_path: Optional[List[str]] = None
 
         # -- input overlay (P1-3) ------------------------------------------- #
         # Which capture is active: ``None`` (closed), ``"edit"``, or ``"search"``.
@@ -222,8 +254,15 @@ class App:
 
         if self.state.screen == "catalog_fatal":
             return views.build_catalog_fatal_view(self.fatal_message or "")
+        if self.state.screen == "profiles":
+            return views.build_profiles_view(
+                self.state,
+                profiles_text=self._profiles_text,
+                detail_text=self._profile_detail_text,
+                notice_text=self._status_notice_text,
+            )
         if self.state.screen == "unreachable":
-            return views.build_unreachable_view(self.state)
+            return views.build_unreachable_view(self.state, notice_text=self._status_notice_text)
         return views.build_layout(
             self.state,
             nav_text=self._nav_text,
@@ -283,6 +322,9 @@ class App:
         # Any prior transient notice is cleared the moment a fresh selection is
         # attempted — a stale "timed out" note must not linger over a good read.
         self.catalog_notice = None
+        # The shared status line is transient for the same reason (OQ-2): a copy
+        # confirmation must not sit beside an unrelated command's preview.
+        self._clear_status_notice()
 
         try:
             if nav.level == LEVEL_GROUPS:
@@ -312,6 +354,56 @@ class App:
                 nav.open_command(command)
         except CatalogError as exc:
             self._handle_catalog_error(exc)
+
+    def move_selection(self, delta: int) -> None:
+        """Move the highlighted row by ``delta``, routing catalog failures (FR-1.1).
+
+        This is the MUST-FIX. :meth:`NavigationModel.move` clamps against the
+        visible list, and computing that list reads the catalog — which shells out
+        to ``cao --help`` and can raise
+        :class:`~cli_agent_orchestrator.tui.command_catalog.CatalogError`. The arrow
+        key handlers called ``move()`` **unguarded**, so one transient catalog
+        failure turned the next arrow keypress into a raw traceback painted over the
+        interface followed by prompt_toolkit's unrecoverable "Press ENTER to
+        continue…", and the event loop died.
+
+        Routing through :meth:`_handle_catalog_error` — the same classifier every
+        other catalog call site already uses — inherits the fatal-vs-transient split
+        and the clean non-zero exit for free. That matters specifically because
+        :meth:`_catalog_fatal_guard` is registered on ``after_render`` and the arrow
+        handlers raised *before* any render callback ran, so the only route to a
+        clean ``EXIT_CATALOG_FATAL`` never fired on this path.
+
+        On the profiles screen the arrows move that list instead; it is served from
+        already-loaded summaries and touches no catalog.
+
+        Args:
+            delta: Rows to move (``+1`` down, ``-1`` up).
+        """
+
+        # A selection move is the other place a stale transient notice must expire
+        # (OQ-2), matching what :meth:`activate` does for ``catalog_notice``.
+        self._clear_status_notice()
+        if self.state.screen == "profiles":
+            self.move_profile_selection(delta)
+            return
+        try:
+            self.navigation.move(delta)
+        except CatalogError as exc:
+            self._handle_catalog_error(exc)
+
+    def _exit_if_catalog_fatal(self, event: KeyPressEvent) -> None:
+        """Exit the run loop non-zero when the current screen turned catalog-fatal.
+
+        Mirrors what the Enter binding does. The layout swap itself is left to the
+        caller's :meth:`_apply_screen` (and to :meth:`_catalog_fatal_guard`), so the
+        operator sees the fatal screen's guidance rather than a bare exit.
+        """
+
+        if self.state.screen != "catalog_fatal":
+            return
+        self._apply_screen()
+        event.app.exit(result=EXIT_CATALOG_FATAL)
 
     def _handle_catalog_error(self, exc: CatalogError) -> None:
         """Classify a selection-path :class:`CatalogError` — fatal vs transient (Q1=A).
@@ -364,25 +456,99 @@ class App:
             self.arg_error = str(exc)
             return None
 
-    def begin_edit(self) -> None:
-        """Open the argument-edit overlay (the ``[e]`` key).
+    def _reset_edit_cycle_if_command_changed(self) -> None:
+        """Restart the ``[e]`` cycle when a different command has been opened.
 
-        Clears any stale field error, targets the first unset param of the open
-        command (or the first param when all are set), and opens the live input
-        row. The typed value is committed to :meth:`set_arg` on Enter and
+        The cycle index is an offset into *this* command's params; carrying it over
+        to a different command would target an unrelated (or out-of-range) param.
+        """
+
+        path = self._current_command_path()
+        if path != self._edit_cycle_path:
+            self._edit_cycle_path = path
+            self._edit_index = None
+
+    def edit_target(self) -> Optional[str]:
+        """The param name ``[e]`` currently targets, or ``None`` when there is none.
+
+        Exposed so the clear key (``[x]``) and the overlay prompt agree with the
+        cycle on a single source of truth.
+        """
+
+        self._reset_edit_cycle_if_command_changed()
+        params = self.builder.params
+        if not params:
+            return None
+        if self._edit_index is None:
+            return None
+        return params[self._edit_index % len(params)].name
+
+    def begin_edit(self) -> None:
+        """Open the argument-edit overlay, CYCLING the target (the ``[e]`` key, FR-4.1).
+
+        Clears any stale field error, advances the edit target, and opens the live
+        input row. The typed value is committed to :meth:`set_arg` on Enter and
         discarded on Esc (:meth:`cancel_input`).
+
+        Targeting (FR-4.1): the FIRST press lands on the first *unset* param (or
+        param 1 when all are set) — the previous behaviour, preserved so the common
+        "fill in what is missing" flow is unchanged. Every subsequent press advances
+        one param and **wraps** at the end, so the cycle reaches EVERY param, set or
+        unset. Before this, the target was recomputed from scratch on each press and
+        so was pinned to the first unset param: an operator could not correct a value
+        they had already entered. The overlay prompt (:meth:`input_prompt`) names the
+        cycled target, because it reads :attr:`input_param`.
         """
 
         self.arg_error = None
+        self._reset_edit_cycle_if_command_changed()
         params = self.builder.params
         if not params:
             # Nothing to edit (no command open, or a command with no arguments).
             return
-        unset = [p for p in params if self.builder.state.args.get(p.name) is None]
-        target = unset[0] if unset else params[0]
-        self.input_param = target.name
+
+        if self._edit_index is None:
+            unset = [
+                index
+                for index, param in enumerate(params)
+                if self.builder.state.args.get(param.name) is None
+            ]
+            self._edit_index = unset[0] if unset else 0
+        else:
+            # Wrap: the cycle must reach every param, then return to the first.
+            self._edit_index = (self._edit_index + 1) % len(params)
+
+        self.input_param = params[self._edit_index].name
         self.input_mode = "edit"
         self.input_buffer.reset()
+
+    def clear_current_arg(self) -> Optional[str]:
+        """Clear the currently-targeted param's value (the ``[x]`` key, FR-4.2).
+
+        Routes through :meth:`CommandBuilder.clear_arg` — which had zero call sites
+        anywhere in ``src/`` before this, so a mis-entered argument could not be
+        removed from the build at all, only overwritten. The cleared param renders as
+        ``(unset)`` in the build panel and disappears from the preview/copy string,
+        because both are pure functions of the builder state.
+
+        The target is the one ``[e]`` is cycled to; when no cycle has started yet it
+        is the first param, so ``[x]`` is useful without pressing ``[e]`` first.
+
+        Returns:
+            The name of the param cleared, or ``None`` when there was nothing to
+            clear (no command open, or a command with no params).
+        """
+
+        self.arg_error = None
+        target = self.edit_target()
+        if target is None:
+            params = self.builder.params
+            if not params:
+                return None
+            target = params[0].name
+        self.builder.clear_arg(target)
+        self.status_notice = f"cleared {target}"
+        return target
 
     def _focus_input(self, event: KeyPressEvent) -> None:
         """Move keyboard focus to the overlay's buffer once it is open.
@@ -522,21 +688,33 @@ class App:
         return self.builder.preview_string()
 
     def copy_current(self) -> str:
-        """Copy the current screen's text and record it (the ``[c]`` behaviour).
+        """Copy the current screen's text and confirm it in-UI (the ``[c]`` behaviour).
 
-        Places :meth:`copy_text` on the clipboard via
-        :meth:`CommandRunner.copy` (which never raises — it falls back to stdout)
-        and records it in :attr:`last_copied`, byte-identical to the preview so
-        the copied command is exactly what the preview shows and what a run would
-        execute (FR-3.1 / FR-3.2).
+        Places :meth:`copy_text` on the clipboard via :meth:`CommandRunner.copy`
+        (which never raises) and records it in :attr:`last_copied`, byte-identical to
+        the preview so the copied command is exactly what the preview shows and what
+        a run would execute (FR-3.1 / FR-3.2).
+
+        Sets :attr:`status_notice` on BOTH outcomes (FR-5.3) — there was previously
+        no feedback at all, so a successful copy and a silently-failed one looked
+        identical. On the live-app path the fallback notice is the *only* channel:
+        ``copy`` writes nothing to stdout there, because that stream is the terminal
+        the UI has taken over (FR-5.2 ⇄ FR-11.1).
 
         Returns:
             The text placed on the clipboard.
         """
 
         text = self.copy_text()
-        self.runner.copy(text)
+        copied = self.runner.copy(text)
         self.last_copied = text
+        if copied:
+            self.status_notice = "copied to clipboard"
+        else:
+            self.status_notice = (
+                "clipboard unavailable — the command is shown in the preview pane; "
+                "select it with your terminal to copy"
+            )
         return text
 
     # -- live text providers (invoked by views at render time) --------------
@@ -585,6 +763,31 @@ class App:
             lines.append(f"{marker}{name}")
         return "\n".join(lines)
 
+    def _status_notice_text(self) -> str:
+        """The shared transient status line (OQ-2), or ``""`` when there is none.
+
+        The single provider every screen that can *set* a notice renders it through:
+        S-main splices it into :meth:`_build_text`, S-unreachable and S-profiles take
+        it as ``notice_text=``. Before this it existed only inside ``_build_text``,
+        which ``views.build_layout`` alone consumes — so ``[c]`` on S-unreachable
+        (that screen's first advertised action) and ``[x]`` on S-profiles both set a
+        confirmation no region could draw (FR-5.3).
+        """
+
+        return self.status_notice or ""
+
+    def _clear_status_notice(self) -> None:
+        """Expire the transient status line (OQ-2: *transient*, not sticky).
+
+        Called from the same places :attr:`catalog_notice` is cleared — a fresh
+        selection attempt (:meth:`activate`) and a selection move
+        (:meth:`move_selection`). Without this the notice persisted across arbitrary
+        later navigation, so a stale ``status: clipboard unavailable …`` sat beside an
+        unrelated command's preview forever.
+        """
+
+        self.status_notice = None
+
     def _build_text(self) -> str:
         """Render the build panel: the open command, its params, and any error.
 
@@ -594,11 +797,16 @@ class App:
         advisory soft warnings — none of which ever block the run/copy path.
         """
 
+        # The shared in-UI status line (OQ-2). It is the ONLY channel for
+        # feedback like the copy confirmation: the full-screen UI owns the
+        # terminal, so a print()/stderr write would land on top of the interface.
+        notice_lines = [f"status: {self.status_notice}", ""] if self.status_notice else []
+
         command = self.navigation.active_command
         if command is None:
-            return views.MAIN_BODY_HINT
+            return "\n".join(notice_lines + [views.MAIN_BODY_HINT])
 
-        lines = [f"command: {' '.join(['cao', *command.path])}", ""]
+        lines = notice_lines + [f"command: {' '.join(['cao', *command.path])}", ""]
         params = self.builder.params
         if params:
             lines.append("params:")
@@ -631,6 +839,14 @@ class App:
 
         try:
             rows = self.preflight.rows()
+        except ServerAuthRequired:
+            # Narrower than ServerUnavailable (its superclass), so this branch MUST
+            # come first: the server IS up, it just wants credentials. Reporting
+            # "not reachable" here sent operators after the wrong problem (FR-7.1).
+            # Message distinction only — the TUI plumbs no token (OOS-2).
+            return (
+                "providers: cao-server requires authentication (this TUI cannot authenticate yet)"
+            )
         except ServerUnavailable:
             return "providers: server not reachable (reads resume when it is up)"
         except ServerClientError:
@@ -639,18 +855,112 @@ class App:
             return "providers: none reported"
         return "providers  " + "   ".join(f"{row.name}: {row.installed_text}" for row in rows)
 
+    # -- profiles screen (FR-3) ---------------------------------------------
+
+    def open_profiles(self) -> None:
+        """Swap to the S-profiles screen and load the list (the ``[p]`` key, FR-3.1).
+
+        Makes :class:`ProfilesBrowser` — constructed in the composition root but
+        previously referenced nowhere else in ``src/`` — actually reachable from the
+        running UI. The read goes through the browser, which already turns a
+        server-down or malformed-payload read into its own ``unavailable`` *state*
+        rather than an exception (FR-3.2), so no read failure can escape here.
+        Because :class:`ServerAuthRequired` subclasses :class:`ServerUnavailable`, a
+        401 degrades through that same path instead of rendering a traceback on a
+        screen this method makes reachable for the first time (FR-7.2).
+        """
+
+        # Only from the main screen: profiles are a live read, so offering them on
+        # S-unreachable would guarantee the unavailable notice, and the
+        # S-unreachable key map deliberately advertises only keys that work there
+        # (FR-10.1). S-catalog-fatal is a terminal state.
+        if self.state.screen != "main":
+            return
+        self.profiles_browser.load()
+        self.state.screen = "profiles"
+
+    def close_profiles(self) -> None:
+        """Return from S-profiles to the screen the operator came from (Esc).
+
+        Mirrors the existing Esc-goes-back model. Which screen to return to is
+        decided by the last probe result, exactly as :meth:`retry` does, so an
+        unreachable server does not land the operator on a main screen whose live
+        reads cannot work.
+        """
+
+        if self.state.screen != "profiles":
+            return
+        self.state.screen = "main" if self.state.reachable else "unreachable"
+
+    def move_profile_selection(self, delta: int) -> None:
+        """Move the S-profiles highlight and refresh the detail pane."""
+
+        self.profiles_browser.move(delta)
+
+    def _profiles_text(self) -> str:
+        """Render the profile list with the selection marked (TEXT only, NFR-6).
+
+        A ``>`` marks the highlighted row, matching the nav pane's marker. When a
+        read failed the browser is in its ``unavailable`` state and
+        :meth:`ProfilesBrowser.list_text` already returns the degradation notice —
+        so a server-down, an auth-required 401, or a malformed payload all render
+        as a notice here, never a traceback (FR-3.2).
+        """
+
+        browser = self.profiles_browser
+        if browser.unavailable or browser.is_empty():
+            return browser.list_text()
+        selected = browser.selected_index
+        return "\n".join(
+            f"{'> ' if index == selected else '  '}{name}"
+            for index, name in enumerate(browser.names())
+        )
+
+    def _profile_detail_text(self) -> str:
+        """Render the highlighted profile's summary detail without a second read.
+
+        Deliberately sourced from the ALREADY-LOADED list summary rather than
+        issuing ``GET /agents/profiles/{name}`` — this provider runs on every
+        repaint, and a per-repaint HTTP read is the exact defect FR-6 forbids.
+        Falls back to the browser's own copy when the list is unavailable or empty.
+        """
+
+        browser = self.profiles_browser
+        if browser.unavailable or browser.is_empty():
+            return browser.list_text()
+        summary = browser.selected_profile()
+        if summary is None:
+            return "Select a profile to preview its detail."
+        capabilities = ", ".join(summary.capabilities) if summary.capabilities else "(none listed)"
+        return "\n".join(
+            [
+                f"profile:     {summary.name}",
+                "",
+                f"source:      {summary.source or '(unknown)'}",
+                f"role:        {summary.role or '(none)'}",
+                f"tools:       {capabilities}",
+                f"description: {summary.description or '(none)'}",
+                f"loadable:    {'yes' if summary.loadable else 'no'}",
+            ]
+        )
+
     # -- key bindings -------------------------------------------------------
 
     def build_keybindings(self) -> KeyBindings:
         """Install the global key map (W-2).
 
-        Bound: Up/Down move the *selection* through
-        :meth:`NavigationModel.move`, Esc goes *back* a level through
-        :meth:`NavigationModel.back`, Tab/S-Tab (and Left/Right) move pane focus,
-        Enter activates the focused row (drill / open / run), ``[c]`` copy,
-        ``[e]`` edit, ``[q]`` quit, ``[/]`` search, ``[r]`` retry, plus Ctrl-C for
-        a clean SIGINT exit. ``[s]`` is deliberately NOT bound (RD-e=A: no status
-        pane / no status key).
+        Bound: Up/Down move the *selection* through :meth:`move_selection`, Esc goes
+        *back* (leaving the profiles screen, else up one navigation level), Tab/S-Tab
+        (and Left/Right) move pane focus, Enter activates the focused row (drill /
+        open / run), ``[c]`` copy, ``[e]`` edit (cycling the target), ``[x]`` clear
+        the targeted argument, ``[p]`` open Profiles, ``[/]`` search, ``[r]`` retry,
+        ``[q]`` quit, plus Ctrl-C for a clean SIGINT exit. ``[s]`` is deliberately
+        NOT bound (RD-e=A: no status pane / no status key).
+
+        ``[p]`` and ``[x]`` are the two keys added here; both were verified free
+        against the full bound set, and both are registered under ``navigating``
+        ONLY — so while the input overlay holds the keyboard they are ordinary typed
+        characters, not commands.
 
         The selection keys are the P1 fix: they were previously bound to
         prompt_toolkit's ``focus_next``/``focus_previous``, which move the *focus
@@ -683,19 +993,21 @@ class App:
         def _next_row(event: KeyPressEvent) -> None:
             """Move the selection one row down (the P1 key -> model wiring)."""
 
-            self.navigation.move(1)
+            self.move_selection(1)
+            self._exit_if_catalog_fatal(event)
             self._apply_screen()
 
         @kb.add("up", filter=navigating)
         def _prev_row(event: KeyPressEvent) -> None:
             """Move the selection one row up (clamped at the top of the list)."""
 
-            self.navigation.move(-1)
+            self.move_selection(-1)
+            self._exit_if_catalog_fatal(event)
             self._apply_screen()
 
         @kb.add("escape", filter=navigating, eager=True)
         def _back(event: KeyPressEvent) -> None:
-            """Return from a group's command list to the top-level group list.
+            """Go back: leave the profiles screen, or up one navigation level.
 
             ``eager=True`` so a bare Esc acts immediately instead of waiting to
             see whether it is the start of an escape SEQUENCE (arrow keys arrive
@@ -703,7 +1015,10 @@ class App:
             Esc back for its input timeout and ``back()`` feels broken.
             """
 
-            self.navigation.back()
+            if self.state.screen == "profiles":
+                self.close_profiles()
+            else:
+                self.navigation.back()
             self._apply_screen()
 
         @kb.add("enter", filter=editing)
@@ -744,9 +1059,17 @@ class App:
 
         @kb.add("c", filter=navigating)
         def _copy(event: KeyPressEvent) -> None:
-            """Copy the current preview / start command to the clipboard (FR-3.2)."""
+            """Copy the current preview / start command to the clipboard (FR-3.2).
+
+            Re-renders so the FR-5.3 confirmation (or the clipboard-unavailable
+            fallback notice) is actually visible. Without the repaint the notice sits
+            in model state until some other key happens to trigger a frame — and on
+            the live-app path the in-UI notice is the ONLY channel, because nothing
+            may be written to the terminal the UI owns.
+            """
 
             self.copy_current()
+            self._apply_screen()
 
         @kb.add("e", filter=navigating)
         def _edit(event: KeyPressEvent) -> None:
@@ -763,6 +1086,28 @@ class App:
             self.begin_search()
             self._apply_screen()
             self._focus_input(event)
+
+        @kb.add("x", filter=navigating)
+        def _clear_arg(event: KeyPressEvent) -> None:
+            """Clear the currently-targeted argument (FR-4.2).
+
+            ``[x]`` was verified unbound before this. Registered under
+            ``navigating`` only, so a literal ``x`` typed into the overlay is text.
+            """
+
+            self.clear_current_arg()
+            self._apply_screen()
+
+        @kb.add("p", filter=navigating)
+        def _profiles(event: KeyPressEvent) -> None:
+            """Open the Profiles screen (FR-3.1).
+
+            ``[p]`` was verified unbound before this. Registered under ``navigating``
+            only, so a literal ``p`` typed into the overlay is text.
+            """
+
+            self.open_profiles()
+            self._apply_screen()
 
         @kb.add("r", filter=navigating)
         def _retry(event: KeyPressEvent) -> None:
@@ -804,6 +1149,12 @@ class App:
             key_bindings=self.key_bindings,
             full_screen=True,
             mouse_support=False,  # keyboard-only (NFR-6)
+            # FR-5.1: without this, prompt_toolkit defaults to an
+            # ``InMemoryClipboard`` — a process-local buffer discarded on exit, so
+            # the advertised ``[c] copy`` reached nothing the operator could paste.
+            # ``pyperclip`` is reached only THROUGH this prompt_toolkit class; no
+            # module under ``tui/`` imports it, so the thin-shell boundary holds.
+            clipboard=self._clipboard,
             input=input,
             output=output,
         )
@@ -842,6 +1193,39 @@ class App:
         if application.is_running and not application.is_done:
             application.exit(result=EXIT_CATALOG_FATAL)
 
+    @contextmanager
+    def _quiet_tui_logging(self) -> Iterator[None]:
+        """Suppress ``logging.lastResort`` for the TUI tree while the UI runs (FR-11.2).
+
+        The writer this guards against is **not** a configured handler.
+        ``setup_logging()`` is called only from ``api/main.py`` — never from
+        ``cli/main.py`` and never from here — so under a live ``cao tui`` the
+        ``cli_agent_orchestrator.tui`` logger tree has *no* handler at all, and
+        Python falls back to :data:`logging.lastResort`: a ``_StderrHandler`` at
+        level WARNING that writes the record straight to ``stderr``. That stream is
+        the terminal the full-screen UI has taken over, so a ``cao`` spawn failure
+        painted its log line on top of the interface.
+
+        Attaching a :class:`logging.NullHandler` gives the tree a handler, which is
+        precisely the condition under which ``lastResort`` is skipped. The log
+        **record is still emitted** — this suppresses only the stream write. That
+        distinction matters: ``test_runner.py`` asserts via ``caplog`` that a spawn
+        failure IS logged at ERROR, and that assertion is retained deliberately
+        (emitting the record is not the defect; the record reaching the owned
+        terminal's stream is).
+
+        The handler is removed on exit — including on an exception — so importing the
+        TUI never permanently mutes the package's logging for a host process.
+        """
+
+        tui_logger = logging.getLogger(_TUI_LOGGER_NAME)
+        handler = logging.NullHandler()
+        tui_logger.addHandler(handler)
+        try:
+            yield
+        finally:
+            tui_logger.removeHandler(handler)
+
     def run(
         self,
         *,
@@ -849,6 +1233,9 @@ class App:
         output: Optional[Output] = None,
     ) -> int:
         """Enter the event loop until ``[q]`` / Ctrl-C and return an exit code.
+
+        The loop runs inside :meth:`_quiet_tui_logging`, so nothing the TUI logs can
+        reach the terminal the UI owns while it owns it (FR-11.1/FR-11.2).
 
         Args:
             input: Optional prompt_toolkit input (for headless tests).
@@ -862,7 +1249,8 @@ class App:
         if input is not None or output is not None:
             self.application = self._build_application(input=input, output=output)
 
-        result = self.application.run()
+        with self._quiet_tui_logging():
+            result = self.application.run()
         return result if isinstance(result, int) else EXIT_OK
 
 

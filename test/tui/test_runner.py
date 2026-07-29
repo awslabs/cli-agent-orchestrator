@@ -5,8 +5,8 @@ SC-1 / BR-2 (argv is executed verbatim as a subprocess, and NO HTTP is ever
 constructed), BR-3 (non-zero exit is a normal ``RunResult``, not an exception),
 BR-7 (a spawn failure raises ``RunnerError``), the O-2 interactive path (the
 prompt_toolkit app is suspended via ``run_in_terminal`` and ``cao`` runs with
-inherited stdio — no capture), and FR-3.2 (copy sets the clipboard, falling back
-to stdout, never raising).
+inherited stdio — no capture), and FR-3.2 / FR-5.2 (copy sets the clipboard and
+never raises; the stdout fallback survives only on the NON-live path).
 """
 
 from __future__ import annotations
@@ -266,36 +266,73 @@ def test_run_makes_no_http_call() -> None:
 
 
 def test_copy_sets_clipboard_when_app_present() -> None:
-    """copy() places text on the running app's clipboard (FR-3.2, no new dep)."""
+    """copy() places text on the running app's clipboard and reports success.
+
+    The App now constructs its ``Application`` with a ``PyperclipClipboard``
+    (FR-5.1), so this reaches the real OS clipboard rather than prompt_toolkit's
+    process-local ``InMemoryClipboard`` — the ADR-013 reversal recorded in the
+    module docstring.
+    """
 
     runner = CommandRunner()
     app = mock.Mock()
     with mock.patch("cli_agent_orchestrator.tui.runner.get_app_or_none", return_value=app):
-        runner.copy("cao launch --provider kiro_cli backend-dev")
+        reached_clipboard = runner.copy("cao launch --provider kiro_cli backend-dev")
 
     app.clipboard.set_text.assert_called_once_with("cao launch --provider kiro_cli backend-dev")
+    # FR-5.2/FR-5.3: the caller renders its notice off this return value.
+    assert reached_clipboard is True
 
 
 def test_copy_falls_back_to_stdout_when_no_app(capsys) -> None:
-    """With no running app (no clipboard), copy() prints to stdout as a fallback."""
+    """NON-live path: with no running app, the stdout fallback SURVIVES.
+
+    FR-11.1 is scoped to the live-app path — here no terminal has been taken over,
+    so printing still hands the user the text to paste. This is the surviving half
+    of the FR-5.2 ⇄ FR-11.1 resolution and must not be weakened.
+    """
 
     runner = CommandRunner()
     with mock.patch("cli_agent_orchestrator.tui.runner.get_app_or_none", return_value=None):
-        runner.copy("cao session list")
+        reached_clipboard = runner.copy("cao session list")
 
     assert capsys.readouterr().out.strip() == "cao session list"
+    # No clipboard was reached — the text was printed, so the caller must not claim
+    # a successful copy.
+    assert reached_clipboard is False
 
 
 def test_copy_falls_back_to_stdout_when_clipboard_raises(capsys) -> None:
-    """If the clipboard raises, copy() still succeeds by printing — never raises."""
+    """A raising clipboard on the LIVE-APP path: returns False, writes ZERO bytes.
+
+    This test's original premise — that the failure fell back to
+    ``print(text, file=sys.stdout)`` — is deliberately invalidated by the recorded
+    FR-5.2 ⇄ FR-11.1 resolution. Those two requirements contended for one
+    mechanism: the only fallback was a direct write into the terminal the TUI has
+    already taken over, which is exactly the defect class FR-11.1 forbids. The
+    resolution removes the stdout write **from the live-app path only** and replaces
+    it with the App's in-UI notice, keyed off this method's ``bool`` return.
+
+    The stdout fallback survives on the NON-live path, where no terminal has been
+    taken over; that is pinned by ``test_copy_falls_back_to_stdout_when_no_app`` and
+    ``test_copy_never_raises_even_with_broken_stdout`` below, which are unchanged.
+
+    Mutation target: ``runner.py``'s ``if app is not None: return False`` guard.
+    Deleting it lets the ``print`` below it run on the live-app path again and the
+    zero-bytes assertions RED.
+    """
 
     runner = CommandRunner()
     app = mock.Mock()
     app.clipboard.set_text.side_effect = RuntimeError("no clipboard backend")
+    capsys.readouterr()  # discard anything emitted before this point
     with mock.patch("cli_agent_orchestrator.tui.runner.get_app_or_none", return_value=app):
-        runner.copy("cao memory list")  # must not raise
+        reached_clipboard = runner.copy("cao memory list")  # must not raise
+    captured = capsys.readouterr()
 
-    assert capsys.readouterr().out.strip() == "cao memory list"
+    assert reached_clipboard is False, "a failed clipboard must report False to the caller"
+    assert captured.out == "", f"wrote to stdout over the live UI: {captured.out!r}"
+    assert captured.err == "", f"wrote to stderr over the live UI: {captured.err!r}"
 
 
 def test_copy_never_raises_even_with_broken_stdout() -> None:

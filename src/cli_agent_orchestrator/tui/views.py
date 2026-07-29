@@ -18,11 +18,12 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.filters import FilterOrBool
+from prompt_toolkit.filters import FilterOrBool, to_filter
 from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
-from prompt_toolkit.layout.containers import ConditionalContainer
+from prompt_toolkit.layout.containers import ConditionalContainer, Float, FloatContainer
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.widgets import Frame
 
 from cli_agent_orchestrator.constants import API_BASE_URL
@@ -38,15 +39,73 @@ TextProvider = Callable[[], str]
 # the server process, so there is deliberately NO auto-start control.
 SERVER_START_COMMAND = "cao-server"
 
-# Global key map, shown in the footer. ``[s]`` is intentionally absent
-# (RD-e=A: no status pane / no status key). Up/Down move the SELECTION and Esc
-# goes back a level; Tab/S-Tab move pane focus. The hint must keep naming only
-# affordances that actually work — before the P1 fix it advertised ``[e]``/``[/]``
-# while neither captured any input.
-KEY_MAP_HINT = (
-    "arrows: select  |  Tab: pane  |  Enter: activate  |  Esc: back  "
-    "|  [c] copy  |  [e] edit  |  [/] search  |  [q] quit"
-)
+# How many completions the floating menu shows at once. Bounded so a command with
+# many flags cannot let the float cover the whole build/preview pane.
+COMPLETIONS_MENU_MAX_HEIGHT = 8
+
+# The hard budget the footer must fit. The key-map line lives in a
+# ``Window(height=1)`` with ``wrap_lines=False``, so anything past the terminal
+# width is silently TRUNCATED — the operator simply never learns those keys exist.
+# 80 columns is the floor we support (FR-10.2).
+KEY_MAP_MAX_WIDTH = 80
+
+# Context-sensitive key maps (FR-10.1). One variant per screen/mode, so a screen
+# never advertises a key that does nothing there. Every variant MUST stay within
+# :data:`KEY_MAP_MAX_WIDTH`.
+#
+# The MAIN variant is additionally ABBREVIATED (FR-10.2, the recorded bounded
+# extension). Context-sensitivity alone cannot help there: in navigating mode on
+# the main screen every one of the 11 keys is valid, so nothing can be dropped —
+# the readable label style extended to all 11 groups is 161 characters, and
+# moderate shortening still lands at 86. Only the main variant is abbreviated; the
+# other variants advertise few enough keys to keep the readable style.
+KEY_MAP_MAIN = "arw:sel Tab:pane Ent:go Esc:up c:copy e:edit x:clr p:prof /:find r:retry q:quit"
+
+# The overlay owns the keyboard while open: the navigation keys are suppressed by
+# the ``editing`` filter, so advertising them would be a lie.
+KEY_MAP_EDITING = "type a value  |  Enter: commit  |  Esc: cancel  |  Ctrl-C: quit"
+
+# S-unreachable: the only meaningful actions are copying the start command,
+# re-probing, and quitting.
+KEY_MAP_UNREACHABLE = "[c] copy start command  |  [r] retry connection  |  [q] quit"
+
+# S-catalog-fatal: `cao` is not runnable, so nothing can be navigated, built,
+# copied or retried. Advertising anything else would be false — this is the exact
+# defect the nit reported (the fatal screen offered keys that do nothing).
+KEY_MAP_CATALOG_FATAL = "[q] quit  |  Ctrl-C: quit"
+
+# S-profiles: a read-only browse list; Esc returns to main.
+KEY_MAP_PROFILES = "arrows: select  |  Esc: back to commands  |  [q] quit"
+
+# Every variant, keyed by the string a caller passes to :func:`key_map_hint`.
+KEY_MAPS = {
+    "main": KEY_MAP_MAIN,
+    "editing": KEY_MAP_EDITING,
+    "unreachable": KEY_MAP_UNREACHABLE,
+    "catalog_fatal": KEY_MAP_CATALOG_FATAL,
+    "profiles": KEY_MAP_PROFILES,
+}
+
+
+def key_map_hint(screen: str, *, editing: bool = False) -> str:
+    """The key-map line for ``screen`` (FR-10.1), never wider than 80 columns.
+
+    Args:
+        screen: The active screen (``"main"``, ``"unreachable"``,
+            ``"catalog_fatal"``, ``"profiles"``). An unknown screen falls back to
+            the main variant rather than rendering nothing.
+        editing: ``True`` while the input overlay holds the keyboard — the overlay
+            variant then wins over the screen variant, because the navigation keys
+            are suppressed by the ``editing`` key filter while it is open.
+
+    Returns:
+        The key-map string for that context, guaranteed ``<= 80`` characters.
+    """
+
+    if editing:
+        return KEY_MAP_EDITING
+    return KEY_MAPS.get(screen, KEY_MAP_MAIN)
+
 
 # First-open guiding copy for the main body (S-main empty variant). Reinforces
 # NFR-4 / TC-3: the CLI stays fully usable on its own.
@@ -225,8 +284,12 @@ def build_layout(
         height=1,
         style="reverse",
     )
+    # The key map is context-sensitive (FR-10.1) and re-read at every repaint, so
+    # opening the overlay swaps it to the overlay variant live. ``input_visible`` is
+    # the App's own capture condition, so ``views`` still imports no model.
+    keymap_filter = to_filter(input_visible)
     keymap_line = Window(
-        content=FormattedTextControl(text=KEY_MAP_HINT),
+        content=FormattedTextControl(text=lambda: key_map_hint("main", editing=keymap_filter())),
         height=1,
         style="reverse",
     )
@@ -259,20 +322,51 @@ def build_layout(
         )
     rows.append(foot)
 
-    root = HSplit(rows)
+    # The root is a FloatContainer so the overlay's completions can be DRAWN
+    # (FR-2.1). A ``CompletionsMenu`` is not a container the app can nest in an
+    # HSplit — prompt_toolkit renders it only as a float, anchored to the cursor
+    # position of the focused ``BufferControl``. Before this, the ``ArgCompleter``
+    # attached to the overlay's buffer computed completions that had nowhere to
+    # appear, so no completion could ever be seen or accepted.
+    root = FloatContainer(
+        content=HSplit(rows),
+        floats=[
+            Float(
+                xcursor=True,
+                ycursor=True,
+                content=CompletionsMenu(max_height=COMPLETIONS_MENU_MAX_HEIGHT, scroll_offset=1),
+            )
+        ],
+    )
     # Focus the nav frame's inner window first (keyboard-only entry point).
     return Layout(root, focused_element=nav.body)
 
 
-def build_unreachable_view(state: ScreenState | None = None) -> Layout:
+def build_unreachable_view(
+    state: ScreenState | None = None,
+    *,
+    notice_text: Optional[TextProvider] = None,
+) -> Layout:
     """Assemble the S-unreachable screen (RD-c=A).
 
     A single alert region replaces the body: it explains that command-building
     and copy still work, shows the exact ``cao-server`` start command with a
     copy affordance ``[c]`` and a ``[r]`` retry key. No auto-start control.
+
+    Args:
+        state: The view state (drives the header reachability label).
+        notice_text: Provider for the shared transient status line (OQ-2) — the
+            ``[c]`` copy confirmation and its clipboard-unavailable fallback
+            (FR-5.3). This screen NEEDS it: ``[c] copy start command`` is the first
+            action :data:`KEY_MAP_UNREACHABLE` advertises, and before this the
+            notice was spliced only into :func:`build_layout`'s build panel — so a
+            copy here set a confirmation that no region could draw and the operator
+            saw nothing. Read at every repaint, so it appears and clears live.
+            Returning an empty string (or omitting the provider) renders no line.
     """
 
     state = state or ScreenState(reachable=False, screen="unreachable")
+    notice_provider = notice_text or (lambda: "")
 
     header = Window(
         content=FormattedTextControl(text=lambda: header_text(state)),
@@ -280,15 +374,20 @@ def build_unreachable_view(state: ScreenState | None = None) -> Layout:
         style="reverse",
     )
 
+    def alert_body() -> str:
+        notice = notice_provider()
+        prefix = f"status: {notice}\n\n" if notice else ""
+        return prefix + unreachable_text()
+
     alert = Frame(
         title="server unreachable",
         body=Window(
-            content=FormattedTextControl(text=unreachable_text(), focusable=True),
+            content=FormattedTextControl(text=lambda: alert_body(), focusable=True),
         ),
     )
 
     foot = Window(
-        content=FormattedTextControl(text=KEY_MAP_HINT),
+        content=FormattedTextControl(text=key_map_hint("unreachable")),
         height=1,
         style="reverse",
     )
@@ -338,10 +437,81 @@ def build_catalog_fatal_view(message: str) -> Layout:
     )
 
     foot = Window(
-        content=FormattedTextControl(text=KEY_MAP_HINT),
+        content=FormattedTextControl(text=key_map_hint("catalog_fatal")),
         height=1,
         style="reverse",
     )
 
     root = HSplit([header, alert, foot])
     return Layout(root, focused_element=alert.body)
+
+
+def build_profiles_view(
+    state: ScreenState,
+    *,
+    profiles_text: Optional[TextProvider] = None,
+    detail_text: Optional[TextProvider] = None,
+    notice_text: Optional[TextProvider] = None,
+) -> Layout:
+    """Assemble the S-profiles screen (FR-3.1) — the browse surface for Profiles.
+
+    Follows the existing screen-swap pattern (``main`` / ``unreachable`` /
+    ``catalog_fatal``): a header over a body VSplit — the selectable profile list
+    on the left, the selected profile's detail on the right — over the
+    profiles-specific key map. Esc returns to the main screen (the App owns the
+    binding).
+
+    Both regions are filled by zero-arg providers the App passes in (reading its
+    ``ProfilesBrowser``), so ``views`` still imports no model and the thin-shell
+    boundary is unaffected. A failed read is the browser's own *state* and comes
+    through these providers as rendered notice text — never a traceback (FR-3.2).
+
+    Args:
+        state: The view state (drives the header reachability label).
+        profiles_text: Provider for the list pane.
+        detail_text: Provider for the detail pane.
+        notice_text: Provider for the shared transient status line (OQ-2). Needed
+            because ``[x]`` (clear argument) is filtered only on the input overlay,
+            not on the screen, so it fires here and sets a notice; before this the
+            notice was spliced only into :func:`build_layout`, so it was invisible.
+            Rendered above the detail pane. Empty string / omitted renders no line.
+    """
+
+    list_provider = profiles_text or (lambda: "(profiles load here)")
+    detail_provider = detail_text or (lambda: "")
+    notice_provider = notice_text or (lambda: "")
+
+    def detail_body() -> str:
+        notice = notice_provider()
+        prefix = f"status: {notice}\n\n" if notice else ""
+        return prefix + detail_provider()
+
+    header = Window(
+        content=FormattedTextControl(text=lambda: header_text(state)),
+        height=1,
+        style="reverse",
+    )
+
+    listing = Frame(
+        title="profiles",
+        body=Window(
+            content=FormattedTextControl(text=lambda: list_provider(), focusable=True),
+            width=Dimension(min=18, preferred=28),
+        ),
+    )
+
+    detail = Frame(
+        title="profile detail",
+        body=Window(
+            content=FormattedTextControl(text=lambda: detail_body(), focusable=True),
+        ),
+    )
+
+    foot = Window(
+        content=FormattedTextControl(text=key_map_hint("profiles")),
+        height=1,
+        style="reverse",
+    )
+
+    root = HSplit([header, VSplit([listing, detail]), foot])
+    return Layout(root, focused_element=listing.body)

@@ -103,6 +103,8 @@ provider override while keeping the same sequence.
   CLI, operations MCP server, or plugins.
 - [Web UI](docs/web-ui.md) and [MCP Apps](docs/mcp-apps.md): browser and
   host-rendered fleet interfaces.
+- [Terminal UI](docs/tui.md): `cao tui`, a guided terminal front door that builds,
+  previews, and runs exact `cao` commands.
 - [Flows](docs/flows.md) and [workflows](docs/workflows.md): scheduled runs and
   multi-step pipelines.
 - [Skills](docs/skills.md): install, scope, and author reusable agent guidance.

@@ -28,6 +28,7 @@ from cli_agent_orchestrator.tui.server_client import (
     ProfileNotFound,
     ProfileSummary,
     ProviderStatus,
+    ServerAuthRequired,
     ServerClient,
     ServerClientError,
     ServerUnavailable,
@@ -441,3 +442,119 @@ def test_empty_list_response_returns_empty(method_name: str, call: Any) -> None:
     fake = _mock_requests(FakeResponse([]))
     with mock.patch.object(sc, "requests", fake):
         assert call(ServerClient()) == []
+
+
+# --------------------------------------------------------------------------- #
+# FR-7.1 / FR-7.2 — 401/403 classify to ServerAuthRequired, a SUBCLASS of       #
+# ServerUnavailable. Six pre-existing catch sites depend on the subclassing, so  #
+# the relationship is asserted directly and not merely implied by a raise test.  #
+# --------------------------------------------------------------------------- #
+
+
+def test_server_auth_required_subclasses_server_unavailable() -> None:
+    """FR-7.2: the narrower seam MUST be a subclass, not a sibling.
+
+    Six ``except ServerUnavailable`` sites already exist (``app.py`` twice,
+    ``navigation.py`` once, ``profiles_view.py`` three times). A sibling exception
+    would escape five of them — including all three on the profiles screen FR-3.1
+    makes reachable — so this relationship is load-bearing, not stylistic.
+    """
+
+    assert issubclass(ServerAuthRequired, ServerUnavailable)
+    # And an instance is catchable by the broad handler those six sites use.
+    try:
+        raise ServerAuthRequired("needs auth")
+    except ServerUnavailable as exc:
+        assert isinstance(exc, ServerAuthRequired)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_status_raises_server_auth_required(status: int) -> None:
+    """FR-7.1: a stubbed 401/403 raises the auth-distinguishing seam, not a bare one."""
+
+    fake = _mock_requests(FakeResponse(None, status_code=status))
+    with mock.patch.object(sc, "requests", fake):
+        with pytest.raises(ServerAuthRequired) as exc_info:
+            ServerClient().providers()
+
+    # The message names authentication and preserves the status code.
+    assert "requires authentication" in str(exc_info.value)
+    assert str(status) in str(exc_info.value)
+
+
+def test_connection_error_still_raises_plain_server_unavailable() -> None:
+    """The counterpart: a connection error must NOT be reported as auth-required.
+
+    Without this, an implementation that classified everything as
+    ``ServerAuthRequired`` would pass the 401 test above.
+    """
+
+    fake = mock.MagicMock(name="requests")
+    fake.exceptions = requests.exceptions
+    fake.get.side_effect = requests.exceptions.ConnectionError("refused")
+    with mock.patch.object(sc, "requests", fake):
+        with pytest.raises(ServerUnavailable) as exc_info:
+            ServerClient().providers()
+
+    assert not isinstance(exc_info.value, ServerAuthRequired)
+
+
+def test_non_auth_error_status_still_raises_plain_server_unavailable() -> None:
+    """A 500 keeps the pre-existing generic mapping and message shape (BR-5)."""
+
+    fake = _mock_requests(FakeResponse(None, status_code=500))
+    with mock.patch.object(sc, "requests", fake):
+        with pytest.raises(ServerUnavailable) as exc_info:
+            ServerClient().sessions()
+
+    assert not isinstance(exc_info.value, ServerAuthRequired)
+    assert "cao-server error for" in str(exc_info.value)
+
+
+def test_auth_status_on_profile_detail_path_also_classifies() -> None:
+    """``profile(name)`` has its OWN raise_for_status block — it must classify too.
+
+    ``profile()`` does not go through ``_get_json``; it duplicates the status
+    handling (``server_client.py:499-502``). A fix applied only to ``_get_json``
+    would leave the profiles-detail read reporting "not reachable" for a 401.
+    """
+
+    fake = _mock_requests(FakeResponse(None, status_code=401))
+    with mock.patch.object(sc, "requests", fake):
+        with pytest.raises(ServerAuthRequired):
+            ServerClient().profile("architect")
+
+
+# --------------------------------------------------------------------------- #
+# FR-6.2 — bounded_timeout narrows the per-request timeout and restores it.      #
+# --------------------------------------------------------------------------- #
+
+
+def test_bounded_timeout_narrows_then_restores_the_timeout() -> None:
+    """The context manager tightens ``timeout`` for the block and restores after."""
+
+    client = ServerClient()
+    assert client.timeout == sc.DEFAULT_TIMEOUT
+
+    fake = _mock_requests(FakeResponse(PROVIDERS_PAYLOAD))
+    with mock.patch.object(sc, "requests", fake):
+        with client.bounded_timeout(2.0):
+            client.providers()
+            assert client.timeout == 2.0
+        assert fake.get.call_args.kwargs["timeout"] == 2.0
+
+        # Restored: a read after the block carries the original timeout again.
+        client.providers()
+        assert fake.get.call_args.kwargs["timeout"] == sc.DEFAULT_TIMEOUT
+
+
+def test_bounded_timeout_restores_on_exception() -> None:
+    """An exception inside the block must not leave the client permanently narrowed."""
+
+    client = ServerClient()
+    with pytest.raises(RuntimeError):
+        with client.bounded_timeout(0.5):
+            assert client.timeout == 0.5
+            raise RuntimeError("boom")
+
+    assert client.timeout == sc.DEFAULT_TIMEOUT

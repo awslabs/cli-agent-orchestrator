@@ -32,8 +32,9 @@ block the TUI event loop indefinitely.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, NoReturn, Optional
 from urllib.parse import quote
 
 import requests
@@ -58,6 +59,23 @@ class ServerUnavailable(Exception):
     Raised for any ``requests.exceptions.RequestException`` — the App maps this
     to the server-unreachable screen (S-unreachable). Command building and copy
     keep working while the server is down (FR-9.1).
+    """
+
+
+class ServerAuthRequired(ServerUnavailable):
+    """The server answered ``401``/``403`` — it is up, but requires authentication.
+
+    A **subclass** of :class:`ServerUnavailable`, deliberately and not stylistically
+    (FR-7.2). Six call sites already catch ``ServerUnavailable``
+    (``app.py`` twice, ``navigation.py`` once, ``profiles_view.py`` three times); a
+    sibling exception would escape five of them and a 401 raised while browsing
+    Profiles would render a raw traceback. Subclassing means every existing catch
+    keeps degrading exactly as before, and only the narrower branch — currently
+    :meth:`App._preflight_text` — distinguishes *requires authentication* from
+    *not reachable*.
+
+    Bounded scope: this PR delivers the **message distinction only**. No token
+    plumbing and no credential discovery — the TUI reads no auth variable.
     """
 
 
@@ -204,6 +222,32 @@ def _require(item: Dict[str, Any], key: str, context: str) -> Any:
     return item[key]
 
 
+def _raise_status_error(resp: requests.Response, label: str, exc: BaseException) -> NoReturn:
+    """Convert a non-2xx ``raise_for_status`` failure into the right exception.
+
+    A ``401``/``403`` means the server *is* up but demands credentials, so it maps
+    to :class:`ServerAuthRequired` (FR-7.1) — the narrower type callers may branch
+    on. Because ``ServerAuthRequired`` subclasses :class:`ServerUnavailable`, every
+    existing ``except ServerUnavailable`` keeps degrading unchanged (FR-7.2).
+    Anything else keeps the pre-existing generic mapping and message shape.
+
+    Args:
+        resp: The response whose status was rejected.
+        label: The path/context used in the message (message shape preserved).
+        exc: The originating ``RequestException``, chained as ``__cause__``.
+
+    Raises:
+        ServerAuthRequired: On ``401``/``403``.
+        ServerUnavailable: On any other non-2xx status.
+    """
+
+    if resp.status_code in (401, 403):
+        raise ServerAuthRequired(
+            f"cao-server at {label} requires authentication (HTTP {resp.status_code})"
+        ) from exc
+    raise ServerUnavailable(f"cao-server error for {label}: {exc}") from exc
+
+
 def _as_str_list(value: object) -> List[str]:
     """Coerce a value to a list of strings (tolerant of a missing/None field)."""
 
@@ -244,6 +288,38 @@ class ServerClient:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
 
+    @property
+    def timeout(self) -> float:
+        """The per-request timeout currently in force (seconds, BR-7)."""
+
+        return self._timeout
+
+    @contextmanager
+    def bounded_timeout(self, seconds: float) -> Iterator["ServerClient"]:
+        """Temporarily tighten this client's per-request timeout (FR-6.2).
+
+        The App shares ONE :class:`ServerClient` across the pre-flight and the
+        profiles browser, so a caller on the repaint path cannot be given its own
+        client without splitting that seam. This context manager narrows the
+        timeout for the duration of the block and restores the previous value on
+        exit (including on an exception), so a read on the repaint path can be
+        bounded far below :data:`DEFAULT_TIMEOUT` without affecting the
+        off-repaint reads that share the client.
+
+        Args:
+            seconds: The timeout to apply inside the block.
+
+        Yields:
+            This same client, for convenience.
+        """
+
+        previous = self._timeout
+        self._timeout = seconds
+        try:
+            yield self
+        finally:
+            self._timeout = previous
+
     # -- low-level GET ------------------------------------------------------ #
 
     def _get(self, path: str, *, params: Optional[Dict[str, Any]] = None) -> requests.Response:
@@ -265,8 +341,9 @@ class ServerClient:
         """GET, raise_for_status, and parse JSON.
 
         A non-2xx status (via ``raise_for_status``) is a ``RequestException`` →
-        :class:`ServerUnavailable` (BR-5). A non-JSON body →
-        :class:`ServerClientError` (BR-6).
+        :class:`ServerUnavailable` (BR-5), except ``401``/``403`` which classify to
+        the narrower :class:`ServerAuthRequired` subclass first (FR-7.1). A
+        non-JSON body → :class:`ServerClientError` (BR-6).
         """
 
         resp = self._get(path, params=params)
@@ -274,7 +351,7 @@ class ServerClient:
             resp.raise_for_status()
         except requests.exceptions.RequestException as exc:
             logger.debug("cao-server GET %s returned an error status: %s", path, exc)
-            raise ServerUnavailable(f"cao-server error for {path}: {exc}") from exc
+            _raise_status_error(resp, path, exc)
         try:
             return resp.json()
         except ValueError as exc:
@@ -422,7 +499,7 @@ class ServerClient:
             resp.raise_for_status()
         except requests.exceptions.RequestException as exc:
             logger.debug("cao-server GET %s returned an error status: %s", path, exc)
-            raise ServerUnavailable(f"cao-server error for {context}: {exc}") from exc
+            _raise_status_error(resp, context, exc)
         try:
             body = resp.json()
         except ValueError as exc:

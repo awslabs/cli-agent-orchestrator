@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import List
 from unittest import mock
 
+import pytest
+import requests
+
 from cli_agent_orchestrator.tui import provider_preflight as pp
 from cli_agent_orchestrator.tui.provider_preflight import PreflightRow, ProviderPreflight
 from cli_agent_orchestrator.tui.server_client import ProviderStatus
@@ -138,3 +141,162 @@ def test_module_source_does_not_reference_forbidden_provider_lists() -> None:
     assert "FALLBACK_PROVIDERS" not in body
     for banned in EXCLUDED_NAMES:
         assert banned not in body, f"{banned} referenced in module code"
+
+
+# --------------------------------------------------------------------------- #
+# FR-6.1 / NFR-8 — the read is memoised behind a TTL, driven by an injected      #
+# clock so the test is deterministic (no sleep).                                 #
+# --------------------------------------------------------------------------- #
+
+
+class _FakeClock:
+    """A monotonic clock double the test advances explicitly."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_repeated_rows_inside_the_ttl_window_issue_exactly_one_read() -> None:
+    """FR-6.1: N repaints inside PREFLIGHT_TTL_SECONDS perform ONE read, then no I/O.
+
+    ``_preflight_text`` runs on every repaint, so an uncached ``rows()`` meant a
+    blocking HTTP GET per keystroke. The memo must collapse a burst into one
+    round-trip.
+    """
+
+    client = mock.MagicMock()
+    client.providers.return_value = REAL_NINE
+    clock = _FakeClock()
+    preflight = ProviderPreflight(client=client, clock=clock)
+
+    first = preflight.rows()
+    for _ in range(9):
+        # Advance, but stay strictly inside the window.
+        clock.advance(pp.PREFLIGHT_TTL_SECONDS / 20)
+        assert [r.name for r in preflight.rows()] == [r.name for r in first]
+
+    assert client.providers.call_count == 1, "a repaint inside the TTL window must do NO I/O"
+
+
+def test_rows_re_reads_after_the_ttl_window_elapses() -> None:
+    """FR-6.1: once the window elapses the next call re-reads (the line stays live)."""
+
+    client = mock.MagicMock()
+    client.providers.return_value = REAL_NINE
+    clock = _FakeClock()
+    preflight = ProviderPreflight(client=client, clock=clock)
+
+    preflight.rows()
+    assert client.providers.call_count == 1
+
+    clock.advance(pp.PREFLIGHT_TTL_SECONDS + 0.01)
+    preflight.rows()
+    assert client.providers.call_count == 2
+
+
+def test_a_failed_read_is_not_cached_and_is_retried() -> None:
+    """Edge: only SUCCESSFUL reads are memoised — a raising client is retried.
+
+    Caching a failure would pin the "server not reachable" footer for the whole
+    TTL window even after the server came back.
+    """
+
+    from cli_agent_orchestrator.tui.server_client import ServerUnavailable
+
+    client = mock.MagicMock()
+    client.providers.side_effect = ServerUnavailable("down")
+    clock = _FakeClock()
+    preflight = ProviderPreflight(client=client, clock=clock)
+
+    for _ in range(3):
+        with pytest.raises(ServerUnavailable):
+            preflight.rows()
+    assert client.providers.call_count == 3
+
+    # And once it recovers (inside what would have been the failure's TTL), the
+    # next call sees the real rows.
+    client.providers.side_effect = None
+    client.providers.return_value = REAL_NINE
+    assert [r.name for r in preflight.rows()] == [p.name for p in REAL_NINE]
+
+
+def test_invalidate_drops_the_memo() -> None:
+    """``invalidate()`` forces the next call to re-read inside the TTL window."""
+
+    client = mock.MagicMock()
+    client.providers.return_value = REAL_NINE
+    clock = _FakeClock()
+    preflight = ProviderPreflight(client=client, clock=clock)
+
+    preflight.rows()
+    preflight.rows()
+    assert client.providers.call_count == 1
+
+    preflight.invalidate()
+    preflight.rows()
+    assert client.providers.call_count == 2
+
+
+def test_cached_rows_cannot_be_mutated_by_a_caller() -> None:
+    """Edge: the memo hands out a copy, so a caller cannot corrupt the cache."""
+
+    client = mock.MagicMock()
+    client.providers.return_value = REAL_NINE
+    preflight = ProviderPreflight(client=client, clock=_FakeClock())
+
+    rows = preflight.rows()
+    rows.clear()
+    assert len(preflight.rows()) == len(REAL_NINE)
+
+
+def test_the_default_clock_is_monotonic_not_wall_clock() -> None:
+    """The default clock is ``time.monotonic`` — a wall clock can jump backwards."""
+
+    import time
+
+    preflight = ProviderPreflight(client=mock.MagicMock())
+    assert preflight._clock is time.monotonic
+
+
+# --------------------------------------------------------------------------- #
+# FR-6.2 — the pre-flight read carries PREFLIGHT_TIMEOUT_SECONDS, asserted        #
+# against the CONSTANT (never a literal) and never DEFAULT_TIMEOUT.               #
+# --------------------------------------------------------------------------- #
+
+
+def test_preflight_read_carries_the_bounded_timeout_not_the_default() -> None:
+    """FR-6.2: the GET on the repaint path is issued with the bounded timeout.
+
+    Driven through a REAL :class:`ServerClient` (only the module's ``requests``
+    symbol is faked) so the assertion is against the timeout that actually reaches
+    the HTTP layer, not against a mock's recorded argument.
+    """
+
+    from cli_agent_orchestrator.tui import server_client as sc
+
+    fake = mock.MagicMock(name="requests")
+    fake.exceptions = requests.exceptions
+    response = mock.MagicMock()
+    response.status_code = 200
+    response.raise_for_status.return_value = None
+    response.json.return_value = [
+        {"name": p.name, "binary": p.binary, "installed": p.installed} for p in REAL_NINE
+    ]
+    fake.get.return_value = response
+
+    client = sc.ServerClient()
+    with mock.patch.object(sc, "requests", fake):
+        rows = ProviderPreflight(client=client).rows()
+
+    assert [r.name for r in rows] == [p.name for p in REAL_NINE]
+    assert fake.get.call_args.kwargs["timeout"] == pp.PREFLIGHT_TIMEOUT_SECONDS
+    assert pp.PREFLIGHT_TIMEOUT_SECONDS != sc.DEFAULT_TIMEOUT  # the point of FR-6.2
+    # And the client is restored afterwards, so the off-repaint reads it shares
+    # are unaffected.
+    assert client.timeout == sc.DEFAULT_TIMEOUT

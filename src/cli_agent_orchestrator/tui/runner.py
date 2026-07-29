@@ -24,8 +24,28 @@ dependency is introduced — stdlib :mod:`subprocess` + the existing
 Error policy (BR-3 / BR-7): a non-zero ``cao`` exit is a **normal**
 :class:`RunResult` (verbatim stdout/stderr/code — U3 does not interpret CLI
 errors, SC-2); only a *spawn* failure (``FileNotFoundError`` / ``OSError``)
-raises :class:`RunnerError`. Copy (FR-3.2) uses the prompt_toolkit clipboard
-with a stdout fallback and never raises.
+raises :class:`RunnerError`. Copy (FR-3.2) uses the prompt_toolkit clipboard and
+never raises.
+
+**ADR-013 is REVERSED (recorded here, at the point it was cited).** ADR-013 chose
+"no ``pyperclip`` / no new dependency", so :meth:`CommandRunner.copy` wrote into
+whatever clipboard the ``Application`` happened to carry. Because the App passed
+no ``clipboard=``, that was prompt_toolkit's default ``InMemoryClipboard`` — a
+process-local buffer discarded on exit. The advertised ``[c] copy`` therefore
+never reached the OS clipboard: the operator pressed it, saw nothing, and had
+nothing to paste. A copy affordance that copies nowhere is worse than no
+affordance, so the App now constructs its ``Application`` with a
+``PyperclipClipboard`` and ``pyperclip`` is declared as a real dependency in
+``pyproject.toml`` (it was previously present only transitively, via ``fastmcp``,
+which is not a contract anything may rely on). ``pyperclip`` is reached *through*
+prompt_toolkit's ``PyperclipClipboard`` — no module under ``tui/`` imports it
+directly, so the thin-shell import boundary is unchanged.
+
+Alternative rejected: shell out to ``pbcopy``/``xclip``/``wl-copy``. That keeps
+the dependency count but adds a per-platform binary-detection matrix and a second
+process spawn on a keystroke, for behaviour ``PyperclipClipboard`` already
+provides. Consequence accepted: one more unconditional runtime dependency for
+every install, disclosed in the PR body alongside ``prompt_toolkit``.
 
 Import rule (thin shell, enforced by ``test/tui/test_thin_shell_boundary.py``):
 only the standard library, ``prompt_toolkit`` and the ``tui`` package's own
@@ -200,19 +220,39 @@ class CommandRunner:
 
     # -- W-5: copy (FR-3.2) ------------------------------------------------- #
 
-    def copy(self, text: str) -> None:
-        """Place ``text`` on the clipboard, falling back to stdout — never raises (W-5).
+    def copy(self, text: str) -> bool:
+        """Place ``text`` on the clipboard — never raises (W-5 / FR-5.2).
 
-        Uses the running prompt_toolkit application's clipboard when available
-        (ADR-013: no ``pyperclip`` / new dependency). If there is no app, no
-        clipboard, or the clipboard raises, the text is printed to stdout so the
-        user still gets the command to paste. This method never propagates an
-        exception (BR-5 / BR-7 fallback-not-swallow: the fallback is itself the
-        surfaced behaviour).
+        Uses the running prompt_toolkit application's clipboard when available. The
+        App now constructs the ``Application`` with a ``PyperclipClipboard``, so this
+        reaches the real OS clipboard rather than the process-local
+        ``InMemoryClipboard`` whose contents were discarded on exit (FR-5.1). This
+        **reverses ADR-013** ("no ``pyperclip`` / no new dependency"); see the
+        module docstring for the rationale.
+
+        Fallback policy (the recorded FR-5.2 ⇄ FR-11.1 resolution). Whether the
+        text may be printed depends on whether a full-screen application owns the
+        terminal:
+
+        * **Live-app path** (``get_app_or_none()`` is not ``None``) — NOTHING is
+          written to ``stdout``/``stderr``. A ``print()`` here lands directly on top
+          of the interface the UI is drawing, which is exactly the defect class
+          FR-11.1 forbids. The caller reports the outcome through the UI's own notice
+          line using this method's return value.
+        * **Non-live path** (no running application) — no terminal has been taken
+          over, so the stdout fallback survives and still hands the user the text.
+
+        Never logs ``text`` itself: a copied command can carry a path or a value the
+        operator would not expect in a log (NFR-9).
 
         Args:
             text: The preview string to copy (from
                 :meth:`CommandBuilder.preview_string`).
+
+        Returns:
+            ``True`` when the text reached a clipboard; ``False`` when it did not
+            (no clipboard, or the clipboard raised), so the caller can render the
+            fallback notice. Never raises either way.
         """
 
         app = get_app_or_none()
@@ -220,12 +260,18 @@ class CommandRunner:
         if clipboard is not None:
             try:
                 clipboard.set_text(text)
-                return
+                return True
             except Exception:  # noqa: BLE001 - clipboard is best-effort
-                logger.warning("clipboard set_text failed; falling back to stdout")
+                logger.warning("clipboard set_text failed")
 
-        # Fallback: print so the user can copy it manually. Never raises.
+        if app is not None:
+            # A live full-screen app owns the terminal — the caller surfaces this
+            # through the UI notice path instead (FR-5.2 / FR-11.1).
+            return False
+
+        # No app owns the terminal: print so the user can copy it manually.
         print(text, file=sys.stdout)
+        return False
 
 
 __all__: List[str] = ["CommandRunner", "RunResult", "RunnerError"]

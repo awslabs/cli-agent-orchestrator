@@ -50,6 +50,7 @@ from cli_agent_orchestrator.tui.runner import CommandRunner
 from cli_agent_orchestrator.tui.server_client import (
     ProfileSummary,
     ProviderStatus,
+    ServerAuthRequired,
     ServerClient,
 )
 from cli_agent_orchestrator.tui.views import (
@@ -84,7 +85,7 @@ def test_main_is_importable_and_returns_int() -> None:
     assert callable(main)
     assert inspect.signature(main).return_annotation in ("int", int)
 
-    app = App(liveness_probe=lambda _url: True)
+    app = _headless_app(liveness_probe=lambda _url: True)
     with create_pipe_input() as pipe:
         pipe.send_text("q")
         code = app.run(input=pipe, output=DummyOutput())
@@ -105,7 +106,7 @@ def test_build_layout_returns_a_layout() -> None:
 def test_keymap_binds_q_and_c_but_not_s() -> None:
     """[q] and [c] are bound; [s] is deliberately unbound (RD-e=A)."""
 
-    keys = _bound_keys(App(liveness_probe=lambda _url: True).build_keybindings())
+    keys = _bound_keys(_headless_app(liveness_probe=lambda _url: True).build_keybindings())
     assert "q" in keys
     assert "c" in keys
     assert "s" not in keys
@@ -114,7 +115,7 @@ def test_keymap_binds_q_and_c_but_not_s() -> None:
 def test_keymap_binds_expected_action_keys() -> None:
     """The full U1 key map (minus [s]) is present."""
 
-    keys = _bound_keys(App(liveness_probe=lambda _url: True).build_keybindings())
+    keys = _bound_keys(_headless_app(liveness_probe=lambda _url: True).build_keybindings())
     for expected in ("c", "e", "q", "r", "/"):
         assert expected in keys, f"expected key {expected!r} to be bound"
 
@@ -140,7 +141,7 @@ def test_unreachable_view_shows_copyable_start_command() -> None:
 def test_copy_text_returns_start_command_when_unreachable() -> None:
     """``[c]`` on the unreachable screen copies the start command (RD-c=A)."""
 
-    app = App(liveness_probe=lambda _url: False)
+    app = _headless_app(liveness_probe=lambda _url: False)
     assert app.state.screen == "unreachable"
     assert app.copy_text() == SERVER_START_COMMAND
 
@@ -151,7 +152,7 @@ def test_copy_text_returns_start_command_when_unreachable() -> None:
 def test_unreachable_probe_selects_unreachable_screen() -> None:
     """Edge: a probe returning False starts the app on S-unreachable."""
 
-    app = App(liveness_probe=lambda _url: False)
+    app = _headless_app(liveness_probe=lambda _url: False)
     assert app.state.reachable is False
     assert app.state.screen == "unreachable"
 
@@ -162,7 +163,7 @@ def test_probe_exception_is_treated_as_unreachable() -> None:
     def boom(_url: str) -> bool:
         raise ConnectionError("server down")
 
-    app = App(liveness_probe=boom)
+    app = _headless_app(liveness_probe=boom)
     assert app.state.reachable is False
     assert app.state.screen == "unreachable"
 
@@ -176,7 +177,7 @@ def test_retry_transitions_unreachable_to_main() -> None:
         calls["n"] += 1
         return calls["n"] > 1  # first probe fails, retry succeeds
 
-    app = App(liveness_probe=flaky)
+    app = _headless_app(liveness_probe=flaky)
     assert app.state.screen == "unreachable"
     reachable = app.retry()
     assert reachable is True
@@ -186,7 +187,7 @@ def test_retry_transitions_unreachable_to_main() -> None:
 def test_ctrl_c_exits_with_sigint_code() -> None:
     """Edge: Ctrl-C drives a clean exit with the conventional 130 code."""
 
-    app = App(liveness_probe=lambda _url: True)
+    app = _headless_app(liveness_probe=lambda _url: True)
     with create_pipe_input() as pipe:
         pipe.send_text("\x03")  # Ctrl-C
         code = app.run(input=pipe, output=DummyOutput())
@@ -249,6 +250,64 @@ def _fake_catalog() -> mock.MagicMock:
     return catalog
 
 
+def _fake_client() -> mock.MagicMock:
+    """A ServerClient double (no real HTTP — NFR-4).
+
+    Every live read the App can reach at repaint goes through this one client:
+    the provider pre-flight footer (``GET /agents/providers``) and the profiles
+    browser (``GET /agents/profiles``). Before this, 21 tests constructed an App
+    with no ``client=``, so the footer's pre-flight read issued a REAL GET to
+    ``127.0.0.1:9889`` on the first repaint — passing only because
+    connection-refused is caught into footer text, and latent for up to 10s each
+    against a black-holing host (A-5).
+    """
+
+    client = mock.MagicMock(spec=ServerClient)
+    client.providers.return_value = []
+    client.profiles.return_value = []
+    return client
+
+
+class _FakeClipboard:
+    """A prompt_toolkit-shaped clipboard double.
+
+    Mandatory, not optional: ``App`` defaults ``clipboard=`` to a
+    ``PyperclipClipboard`` (FR-5.1), so a test that omits it would write to the
+    developer's REAL OS clipboard when ``[c]`` is pressed.
+    """
+
+    def __init__(self) -> None:
+        self.texts: List[str] = []
+
+    def set_text(self, text: str) -> None:
+        self.texts.append(text)
+
+    def set_data(self, data: object) -> None:  # pragma: no cover - unused by copy()
+        pass
+
+    def get_data(self) -> object:  # pragma: no cover - unused by copy()
+        raise NotImplementedError
+
+    def rotate(self) -> None:  # pragma: no cover - unused by copy()
+        pass
+
+
+def _headless_app(**kwargs: object) -> App:
+    """Construct an App with every external seam replaced by a double (NFR-3/NFR-4).
+
+    Defaults ``catalog=`` (no ``cao --help`` shell-out — which is why the two
+    subprocess tests were red without ``cao`` on PATH), ``client=`` (no HTTP GET),
+    and ``clipboard=`` (never the machine's real clipboard). A caller that needs a
+    specific double passes it and it wins. Test-only: no production signature
+    changed (C-2).
+    """
+
+    kwargs.setdefault("catalog", _fake_catalog())
+    kwargs.setdefault("client", _fake_client())
+    kwargs.setdefault("clipboard", _FakeClipboard())
+    return App(**kwargs)  # type: ignore[arg-type]
+
+
 class _SpyRunner(CommandRunner):
     """A CommandRunner that records what it was asked to run / copy (never shells out)."""
 
@@ -287,7 +346,7 @@ def test_app_composes_all_eight_collaborators() -> None:
 
     catalog = _fake_catalog()
     client = mock.MagicMock(spec=ServerClient)
-    app = App(liveness_probe=lambda _url: True, catalog=catalog, client=client)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog, client=client)
 
     # Injected doubles are used verbatim.
     assert app.catalog is catalog
@@ -320,7 +379,7 @@ def test_build_preview_copy_run_are_byte_identical_through_the_app() -> None:
     not fed the preview argv), this fails.
     """
 
-    app = App(liveness_probe=lambda _url: True, catalog=_fake_catalog())
+    app = _headless_app(liveness_probe=lambda _url: True)
     spy = _SpyRunner()
     app.runner = spy
 
@@ -370,7 +429,7 @@ def test_app_launch_leaf_flow_builds_launch_with_agents() -> None:
     drill), set ``--agents``, and the preview is ``cao launch --agents <p>``.
     """
 
-    app = App(liveness_probe=lambda _url: True, catalog=_fake_catalog())
+    app = _headless_app(liveness_probe=lambda _url: True)
 
     _select_group(app, "launch")  # a leaf: Enter opens it directly
     assert app.navigation.active_command is not None
@@ -403,7 +462,7 @@ def test_profiles_and_preflight_are_reachable_from_the_app() -> None:
         ProviderStatus(name="kiro_cli", binary="kiro", installed=False),
     ]
 
-    app = App(liveness_probe=lambda _url: True, catalog=_fake_catalog(), client=client)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=_fake_catalog(), client=client)
 
     # Profiles surface.
     assert app.profiles_browser.load() == client.profiles.return_value
@@ -430,13 +489,33 @@ def test_preflight_text_degrades_when_server_unreachable() -> None:
     client = mock.MagicMock(spec=ServerClient)
     client.providers.side_effect = ServerUnavailable("cao-server down")
 
-    app = App(liveness_probe=lambda _url: True, catalog=_fake_catalog(), client=client)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=_fake_catalog(), client=client)
 
     text = app._preflight_text()
     assert "not reachable" in text.lower()
 
 
 # -- (e) the FAILING real probe — the test that would have caught the defect --
+
+
+def test_preflight_text_names_authentication_for_a_401(monkeypatch) -> None:
+    """FR-7.1: a 401 renders *requires authentication*, not "not reachable".
+
+    The auth branch MUST be ordered before the ``except ServerUnavailable`` branch
+    (``ServerAuthRequired`` is its subclass); reversing the two branch orders makes
+    this RED while the connection-error test below stays green.
+    """
+
+    client = mock.MagicMock(spec=ServerClient)
+    client.providers.side_effect = ServerAuthRequired(
+        "cao-server at /agents/providers requires authentication (HTTP 401)"
+    )
+
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=_fake_catalog(), client=client)
+
+    text = app._preflight_text()
+    assert "authentication" in text.lower()
+    assert "not reachable" not in text.lower()
 
 
 def test_default_probe_starts_unreachable_when_health_get_raises() -> None:
@@ -452,7 +531,7 @@ def test_default_probe_starts_unreachable_when_health_get_raises() -> None:
         "cli_agent_orchestrator.tui.server_client.requests.get",
         side_effect=requests.exceptions.ConnectionError("connection refused"),
     ):
-        app = App(catalog=_fake_catalog())
+        app = _headless_app()
 
     assert app.state.reachable is False
     assert app.state.screen == "unreachable"
@@ -474,7 +553,7 @@ def test_default_probe_starts_main_when_health_get_succeeds() -> None:
         "cli_agent_orchestrator.tui.server_client.requests.get",
         return_value=healthy,
     ):
-        app = App(catalog=_fake_catalog())
+        app = _headless_app()
 
     assert app.state.reachable is True
     assert app.state.screen == "main"
@@ -491,7 +570,7 @@ def test_apply_search_routes_to_navigation_filter() -> None:
     re-fetch beyond the cached groups.
     """
 
-    app = App(liveness_probe=lambda _url: True, catalog=_fake_catalog())
+    app = _headless_app(liveness_probe=lambda _url: True)
 
     app.apply_search("work")
     assert app.navigation.visible_names() == ["workflow"]
@@ -521,7 +600,7 @@ def test_set_arg_surfaces_path_error_inline_without_crashing() -> None:
             help="",
         )
     ]
-    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog)
     app.builder.select(["session", "status"])
 
     stored = app.set_arg("--working-directory", "/no/such/dir/really-not-here-42")
@@ -544,7 +623,7 @@ def test_enter_on_already_open_command_runs_it() -> None:
     runs it with the exact preview argv (FR-3.1) — not a second open.
     """
 
-    app = App(liveness_probe=lambda _url: True, catalog=_fake_catalog())
+    app = _headless_app(liveness_probe=lambda _url: True)
     spy = _SpyRunner()
     app.runner = spy
 
@@ -561,7 +640,7 @@ def test_enter_on_already_open_command_runs_it() -> None:
 def test_enter_on_already_open_top_level_leaf_runs_it() -> None:
     """At group level, Enter on an already-open leaf top-level command runs it."""
 
-    app = App(liveness_probe=lambda _url: True, catalog=_fake_catalog())
+    app = _headless_app(liveness_probe=lambda _url: True)
     spy = _SpyRunner()
     app.runner = spy
 
@@ -582,7 +661,7 @@ def test_completer_path_tracks_the_open_command() -> None:
     ``session status`` it is that path.
     """
 
-    app = App(liveness_probe=lambda _url: True, catalog=_fake_catalog())
+    app = _headless_app(liveness_probe=lambda _url: True)
 
     assert app._current_command_path() == []
 
@@ -597,7 +676,7 @@ def test_completer_path_tracks_the_open_command() -> None:
 def test_nav_text_marks_the_selected_row() -> None:
     """The nav-text provider renders the visible list with the selection marked."""
 
-    app = App(liveness_probe=lambda _url: True, catalog=_fake_catalog())
+    app = _headless_app(liveness_probe=lambda _url: True)
 
     text = app._nav_text()
     lines = text.splitlines()
@@ -611,7 +690,7 @@ def test_nav_text_marks_the_selected_row() -> None:
 def test_nav_text_empty_filter_shows_guiding_copy() -> None:
     """A filter that matches nothing shows guiding copy, not a crash/blank."""
 
-    app = App(liveness_probe=lambda _url: True, catalog=_fake_catalog())
+    app = _headless_app(liveness_probe=lambda _url: True)
     app.apply_search("zzz-nope")
 
     assert app._nav_text() == "(no matches — press [/] to change the filter)"
@@ -620,7 +699,7 @@ def test_nav_text_empty_filter_shows_guiding_copy() -> None:
 def test_build_text_lists_open_command_params_and_error() -> None:
     """The build-text provider renders the open command, its params, and errors."""
 
-    app = App(liveness_probe=lambda _url: True, catalog=_fake_catalog())
+    app = _headless_app(liveness_probe=lambda _url: True)
 
     # Before any selection: the first-open guiding copy.
     from cli_agent_orchestrator.tui.views import MAIN_BODY_HINT
@@ -648,7 +727,7 @@ def test_preview_text_bare_before_selection_then_exact_after() -> None:
     the real behaviour rather than a hand-massaged expectation.)
     """
 
-    app = App(liveness_probe=lambda _url: True, catalog=_fake_catalog())
+    app = _headless_app(liveness_probe=lambda _url: True)
     assert app.preview_text() == "cao"
 
     _select_group(app, "launch")
@@ -717,7 +796,7 @@ def test_transient_catalog_error_on_group_select_stays_on_main_with_notice() -> 
     """
 
     catalog = _catalog_raising_on_commands(_timeout_catalog_error(["cao", "workflow", "--help"]))
-    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog)
 
     # Enter on the highlighted 'workflow' group — commands() raises a timeout.
     app.activate()
@@ -744,7 +823,7 @@ def test_nonzero_exit_catalog_error_is_transient_not_fatal() -> None:
     catalog = _catalog_raising_on_commands(
         _nonzero_exit_catalog_error(["cao", "workflow", "--help"])
     )
-    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog)
 
     app.activate()
 
@@ -758,7 +837,7 @@ def test_transient_catalog_error_notice_clears_on_next_good_selection() -> None:
 
     # First: a catalog that times out; then swap in a healthy one and re-select.
     catalog = _catalog_raising_on_commands(_timeout_catalog_error(["cao", "workflow", "--help"]))
-    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog)
     app.activate()
     assert app.catalog_notice is not None
 
@@ -780,7 +859,7 @@ def test_fatal_catalog_error_on_group_select_swaps_to_fatal_screen() -> None:
     catalog = _catalog_raising_on_commands(
         _missing_binary_catalog_error(["cao", "workflow", "--help"])
     )
-    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog)
 
     app.activate()
 
@@ -806,7 +885,7 @@ def test_fatal_catalog_error_on_command_open_swaps_to_fatal_screen() -> None:
         raise _missing_binary_catalog_error(["cao", "session", "status", "--help"])
 
     catalog.params.side_effect = _params_raise
-    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog)
 
     _select_group(app, "session")  # drill OK (commands() does not raise)
     assert app.state.screen == "main"
@@ -828,7 +907,7 @@ def test_enter_binding_exits_nonzero_on_fatal_catalog_error() -> None:
     catalog = _catalog_raising_on_commands(
         _missing_binary_catalog_error(["cao", "workflow", "--help"])
     )
-    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog)
 
     with create_pipe_input() as pipe:
         pipe.send_text("\r")  # Enter
@@ -884,10 +963,9 @@ def _run_keys(app: App, *keys: str) -> int:
 def _key_app(**kwargs: object) -> App:
     """An App on the fake catalog with a spy runner (no shell-out, no network)."""
 
-    app = App(
+    app = _headless_app(
         liveness_probe=lambda _url: True,
-        catalog=_fake_catalog(),
-        **kwargs,  # type: ignore[arg-type]
+        **kwargs,
     )
     app.runner = _SpyRunner()
     return app
@@ -994,7 +1072,7 @@ def test_first_paint_catalog_failure_shows_fatal_screen_instead_of_raising() -> 
 
     catalog = mock.MagicMock(spec=CommandCatalog)
     catalog.groups.side_effect = _missing_binary_catalog_error(["cao", "--help"])
-    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog)
 
     # No key is piped except the quit key: the failure must surface from PAINT.
     with create_pipe_input() as pipe:
@@ -1018,7 +1096,7 @@ def test_first_paint_fatal_renders_the_fatal_layout_before_exiting() -> None:
 
     catalog = mock.MagicMock(spec=CommandCatalog)
     catalog.groups.side_effect = _missing_binary_catalog_error(["cao", "--help"])
-    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog)
 
     with create_pipe_input() as pipe:
         pipe.send_text("q")
@@ -1045,7 +1123,7 @@ def test_first_paint_transient_catalog_failure_stays_on_main() -> None:
 
     catalog = mock.MagicMock(spec=CommandCatalog)
     catalog.groups.side_effect = _timeout_catalog_error(["cao", "--help"])
-    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog)
 
     code = _run_keys(app)
 
@@ -1060,7 +1138,7 @@ def test_first_paint_nonzero_exit_catalog_failure_stays_on_main() -> None:
 
     catalog = mock.MagicMock(spec=CommandCatalog)
     catalog.groups.side_effect = _nonzero_exit_catalog_error(["cao", "--help"])
-    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog)
 
     code = _run_keys(app)
 
@@ -1074,7 +1152,7 @@ def test_nav_text_returns_renderable_text_when_the_catalog_fails() -> None:
 
     catalog = mock.MagicMock(spec=CommandCatalog)
     catalog.groups.side_effect = _timeout_catalog_error(["cao", "--help"])
-    app = App(liveness_probe=lambda _url: True, catalog=catalog)
+    app = _headless_app(liveness_probe=lambda _url: True, catalog=catalog)
 
     text = app._nav_text()
 
@@ -1231,7 +1309,7 @@ def test_retry_key_reprobes_and_swaps_screen_through_a_real_keypress() -> None:
         calls["n"] += 1
         return calls["n"] > 1
 
-    app = App(liveness_probe=flaky, catalog=_fake_catalog())
+    app = _headless_app(liveness_probe=flaky)
     assert app.state.screen == "unreachable"
 
     _run_keys(app, "r")

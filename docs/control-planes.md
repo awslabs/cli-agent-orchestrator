@@ -1,6 +1,6 @@
 # Control Planes
 
-CAO has three inbound management surfaces and one outbound extension surface.
+CAO has four inbound management surfaces and one outbound extension surface.
 The right choice depends on who initiates the action and which transport that
 caller can use.
 
@@ -9,6 +9,7 @@ caller can use.
 | Surface | Direction | Caller | Transport | Best for |
 |---|---|---|---|---|
 | [Web UI](web-ui.md) | Inbound | Human operator | HTTP and WebSocket | Interactive browser management |
+| [Terminal UI](tui.md) (`cao tui`) | Inbound | Human operator | Shell to HTTP | Guided interactive command building in a terminal |
 | `cao session` and the [session-management skill](../skills/cao-session-management/SKILL.md) | Inbound | Human, script, CI job, or shell-capable agent | Shell to HTTP | Portable automation and one-off commands |
 | `cao-ops-mcp` | Inbound | External MCP-capable agent | MCP stdio to HTTP | Typed fleet-management tools |
 | [Plugins](plugins.md) | Outbound | `cao-server` | Python hooks to an external destination | Notifications, audit records, and observability |
@@ -22,7 +23,8 @@ and the guide to
 
 ## Inbound and outbound traffic
 
-The Web UI, shell CLI, and `cao-ops-mcp` send management requests into CAO.
+The Web UI, Terminal UI, shell CLI, and `cao-ops-mcp` send management requests
+into CAO.
 Plugins receive events from CAO and send them outward. A bidirectional
 integration therefore needs both an inbound command path and an outbound
 plugin.
@@ -36,6 +38,20 @@ HTTP operations.
 The browser dashboard is bundled with `cao-server` and is the simplest surface
 for interactively inspecting sessions and terminals. Its setup, remote-access,
 and frontend-development details live in the [Web UI guide](web-ui.md).
+
+## Terminal UI
+
+`cao tui` is a guided front door over the `cao` CLI for operators who work in a
+terminal. It lists the commands that exist, helps fill in their arguments with
+completion, and shows the exact `argv` before running or copying it — so it is a
+discovery aid over the shell CLI, not a separate control path. Everything it builds
+is a plain `cao` invocation.
+
+Choose it over the Web UI when you are already in a terminal and do not want a
+browser; choose the plain CLI when the caller is a script rather than a person. It
+needs `cao-server` only for its live reads (provider pre-flight and the Profiles
+browser); command building works with the server down. Setup, the full key map, and
+two recorded limitations are in the [Terminal UI guide](tui.md).
 
 ## Shell CLI
 
@@ -96,6 +112,7 @@ Choose the surface by caller:
 | Caller | Preferred surface |
 |---|---|
 | Human in a browser | Web UI |
+| Human at a terminal, exploring interactively | `cao tui` |
 | Shell script, CI step, or cron job | `cao session` |
 | External MCP-capable agent | `cao-ops-mcp` |
 | Agent that can execute shell but not MCP | `cao session` through the skill |
@@ -116,6 +133,7 @@ scaffolding.
 ## Related reading
 
 - [Web UI](web-ui.md)
+- [Terminal UI](tui.md)
 - [HTTP API and PTY WebSocket](api.md)
 - [Plugin guide](plugins.md)
 - [Session-management commands](../skills/cao-session-management/SKILL.md#commands)

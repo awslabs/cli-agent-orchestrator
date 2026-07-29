@@ -32,6 +32,7 @@ from cli_agent_orchestrator.tui.server_client import (
     ProfileDetail,
     ProfileNotFound,
     ProfileSummary,
+    ServerAuthRequired,
     ServerClientError,
     ServerUnavailable,
 )
@@ -495,3 +496,57 @@ def test_package_exports_no_status_symbol() -> None:
         tree = ast.parse(module_path.read_text(encoding="utf-8"))
         top_level = [node.name for node in tree.body if isinstance(node, ast.ClassDef)]
         assert not any("Status" in name for name in top_level)
+
+
+# --------------------------------------------------------------------------- #
+# FR-7.2 — a 401 raised while listing profiles degrades to a NOTICE.             #
+#                                                                                #
+# This is the mutation target for the subclass constraint: ``load()`` catches      #
+# ``(ServerUnavailable, ServerClientError)``. Make ``ServerAuthRequired`` a        #
+# SIBLING of ``ServerUnavailable`` instead of a subclass and this test REDs,       #
+# because the 401 escapes ``load()`` uncaught — onto the very screen FR-3.1 makes  #
+# reachable for the first time.                                                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_auth_required_on_load_degrades_to_a_notice_not_a_traceback() -> None:
+    """FR-7.2 / FR-3.2: a 401 while listing profiles renders a notice, never raises."""
+
+    client = mock.MagicMock()
+    client.profiles.side_effect = ServerAuthRequired(
+        "cao-server at /agents/profiles requires authentication (HTTP 401)"
+    )
+    browser = ProfilesBrowser(client=client, builder=mock.MagicMock(), preflight=mock.MagicMock())
+
+    result = browser.load()  # must NOT raise
+
+    assert result == []
+    assert browser.unavailable is True
+    assert "unavailable" in browser.list_text().lower()
+
+
+def test_auth_required_on_detail_read_degrades_to_a_notice() -> None:
+    """FR-7.2: the same holds for the detail read (``open_detail``'s catch site)."""
+
+    client = mock.MagicMock()
+    client.profiles.return_value = PROFILE_SUMMARIES
+    client.profile.side_effect = ServerAuthRequired("requires authentication (HTTP 401)")
+    browser = ProfilesBrowser(client=client, builder=mock.MagicMock(), preflight=mock.MagicMock())
+
+    browser.load()
+    detail = browser.open_detail("backend-dev")  # must NOT raise
+
+    assert detail is None
+    assert browser.unavailable is True
+
+
+def test_auth_required_on_provider_readiness_degrades_to_text() -> None:
+    """FR-7.2: and for the third catch site, provider readiness."""
+
+    preflight = mock.MagicMock()
+    preflight.rows.side_effect = ServerAuthRequired("requires authentication (HTTP 401)")
+    browser = _browser(preflight=preflight)
+
+    text = browser.provider_readiness("claude_code")  # must NOT raise
+
+    assert "unavailable" in text.lower()
