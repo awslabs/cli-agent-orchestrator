@@ -970,9 +970,7 @@ def submit_operator_message(
                 any later ambiguity keeps the binding — the honest post-claim
                 state, never a rollback that could race the write."""
                 try:
-                    image_attachments.bind_for_submit(
-                        terminal_id, operation_id, attachment_ids
-                    )
+                    image_attachments.bind_for_submit(terminal_id, operation_id, attachment_ids)
                 except image_attachments.AttachmentBindingError as exc:
                     reason = (
                         adapter.REFUSED_IMAGE_UNKNOWN

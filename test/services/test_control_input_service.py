@@ -2876,9 +2876,7 @@ class TestInteractiveDeclaration:
         assert result.request_schema_version == 4
         assert client.writes == []
 
-    def test_interactive_on_an_unproven_build_fails_closed_pre_write(
-        self, monkeypatch, journal
-    ):
+    def test_interactive_on_an_unproven_build_fails_closed_pre_write(self, monkeypatch, journal):
         resolved = _seq_resolved(provider_version="9.9.9")
         client = self._wire(
             monkeypatch,
@@ -2944,9 +2942,7 @@ class TestInteractiveDeclaration:
         # Fail closed: no exit control and no payload bytes.
         assert client.writes == []
 
-    def test_undeclared_keeps_the_legacy_copy_mode_exit_and_deliver(
-        self, monkeypatch, journal
-    ):
+    def test_undeclared_keeps_the_legacy_copy_mode_exit_and_deliver(self, monkeypatch, journal):
         """The legacy undeclared behavior is preserved exactly: a proven
         copy mode is exited once and the payload delivered exactly once."""
         resolved = _seq_resolved()
@@ -2957,9 +2953,7 @@ class TestInteractiveDeclaration:
             {0: {"lines": ["queued mid-turn"]}},
         )
         in_mode = {"value": True}
-        monkeypatch.setattr(
-            client, "pane_in_copy_mode", lambda pane_id, **kwargs: in_mode["value"]
-        )
+        monkeypatch.setattr(client, "pane_in_copy_mode", lambda pane_id, **kwargs: in_mode["value"])
         original_cancel = client.send_copy_mode_cancel
 
         def _cancel(pane_id, **kwargs):
@@ -2972,9 +2966,7 @@ class TestInteractiveDeclaration:
         assert client.writes[0]["copy_mode_cancel"] is True
         assert any(write.get("text") == "queued mid-turn" for write in client.writes)
 
-    def test_a_divergent_declaration_on_a_reused_id_is_request_rebound(
-        self, monkeypatch, journal
-    ):
+    def test_a_divergent_declaration_on_a_reused_id_is_request_rebound(self, monkeypatch, journal):
         resolved = _seq_resolved()
         self._wire(
             monkeypatch,
@@ -2990,9 +2982,7 @@ class TestInteractiveDeclaration:
         assert undeclared.outcome == REFUSED
         assert undeclared.reason_code == REASON_REQUEST_REBOUND
 
-    def test_interactive_legal_payload_is_the_v3_sequence_grammar(
-        self, monkeypatch, journal
-    ):
+    def test_interactive_legal_payload_is_the_v3_sequence_grammar(self, monkeypatch, journal):
         """Prose text, ordinary keys, and chords ride a declaration that
         never enters the command grammar — even slash-led prose."""
         resolved = _seq_resolved()

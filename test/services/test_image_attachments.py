@@ -120,10 +120,7 @@ def png_truncated_idat():
     """The IDAT's zlib stream is cut short; the chunk itself is CRC-sound."""
     payload = zlib.compress(_valid_raw())[:5]
     return (
-        b"\x89PNG\r\n\x1a\n"
-        + _png_ihdr()
-        + _png_chunk(b"IDAT", payload)
-        + _png_chunk(b"IEND", b"")
+        b"\x89PNG\r\n\x1a\n" + _png_ihdr() + _png_chunk(b"IDAT", payload) + _png_chunk(b"IEND", b"")
     )
 
 
@@ -494,9 +491,7 @@ class TestRemovalRace:
             allowed_formats=ALLOWED_PNG_ONLY,
         )
 
-    def test_remove_starting_first_still_conflicts_after_a_bind_commits(
-        self, store, monkeypatch
-    ):
+    def test_remove_starting_first_still_conflicts_after_a_bind_commits(self, store, monkeypatch):
         record = self._stage_one()
         staged = image_attachments.staged_absolute_path(record)
         real_mutate = image_attachments._mutate
@@ -536,9 +531,7 @@ class TestRemovalRace:
         assert final["bound_operation_id"] == "op-race"
         assert staged.exists()
 
-    def test_bind_starting_first_is_not_ready_after_a_remove_commits(
-        self, store, monkeypatch
-    ):
+    def test_bind_starting_first_is_not_ready_after_a_remove_commits(self, store, monkeypatch):
         record = self._stage_one()
         staged = image_attachments.staged_absolute_path(record)
         real_mutate = image_attachments._mutate

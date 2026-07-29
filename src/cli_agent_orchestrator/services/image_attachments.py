@@ -360,12 +360,7 @@ def _decode_png(data: bytes) -> Tuple[int, int]:
     if offset != len(data):
         raise ValueError("not a PNG: bytes follow IEND")
     width, height, bit_depth, color_type, interlace = ihdr
-    if (
-        width < 1
-        or height < 1
-        or width > MAX_IMAGE_WIDTH
-        or height > MAX_IMAGE_HEIGHT
-    ):
+    if width < 1 or height < 1 or width > MAX_IMAGE_WIDTH or height > MAX_IMAGE_HEIGHT:
         # The caller's size gate refuses these; proving the data stream of
         # an out-of-envelope image is not worth its (still bounded) cost.
         return width, height

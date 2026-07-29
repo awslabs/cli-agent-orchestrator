@@ -291,9 +291,7 @@ class TestLaneCBlocks:
     def test_only_the_image_proven_kimi_build_advertises_image(self):
         assert "image" not in provider_controls.controls_block_for(KIMI, "0.29.0")
         assert "image" not in provider_controls.controls_block_for(KIMI, "0.29.1")
-        assert (
-            provider_controls.controls_block_for(KIMI, "0.29.2")["image"] == KIMI_IMAGE_BLOCK
-        )
+        assert provider_controls.controls_block_for(KIMI, "0.29.2")["image"] == KIMI_IMAGE_BLOCK
 
     def test_operator_message_limits_are_the_spec_pins(self):
         block = provider_controls.controls_block_for(CLAUDE, "2.1.220")

@@ -249,9 +249,7 @@ class TestKimiOperatorMessage:
         busy = knc.turn_observation(
             active_turn_id="turn_1", observed_at="2026-07-29T00:00:01Z", observer="test"
         )
-        record = _kimi_message(
-            Recorder(), observation=busy, pre_write=lambda: calls.append("hook")
-        )
+        record = _kimi_message(Recorder(), observation=busy, pre_write=lambda: calls.append("hook"))
         assert record["state"] == "refused"
         assert record["refusal_reason"] == "active_turn_in_progress"
         assert calls == []

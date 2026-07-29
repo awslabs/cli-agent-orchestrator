@@ -327,9 +327,7 @@ class TestAttachmentBindingAndSubstitution:
         checks pass; ``bind_for_submit`` is stubbed because the pre-write
         hook would otherwise hit the real manifest.
         """
-        by_id = {
-            record["attachment_id"]: {"state": "ready", **record} for record in records
-        }
+        by_id = {record["attachment_id"]: {"state": "ready", **record} for record in records}
         monkeypatch.setattr(
             oms.image_attachments,
             "get_attachment",

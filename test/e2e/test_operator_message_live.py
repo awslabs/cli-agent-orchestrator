@@ -111,6 +111,7 @@ def _harvest_account_display_names(home_path: Path) -> List[str]:
                     names.append(parts[0])
     return sorted(set(names), key=len, reverse=True)
 
+
 _SCRUB_EXACT = {
     "CAO_TERMINAL_ID",
     "CAO_ALLOWED_HOSTS",

@@ -282,7 +282,9 @@ def _await_journal_terminal(harness: Harness, control_id: str, timeout: float = 
 class TestKimiInteractiveStreaming:
     """§6.7 on the pinned kimi 0.29.2 build, turn active."""
 
-    def test_01_capability_and_undeclared_gate(self, harness: Harness, kimi_session: ProviderSession):
+    def test_01_capability_and_undeclared_gate(
+        self, harness: Harness, kimi_session: ProviderSession
+    ):
         case = "r15-kimi-01-capability-and-gate"
         block = _identity_block(harness, kimi_session, "kimi_cli")
         assert block["interactive_streaming"] == {"supported": True}
@@ -298,7 +300,9 @@ class TestKimiInteractiveStreaming:
         harness.evidence.write_json(case, "undeclared-response.json", response)
         assert response["outcome"] == "refused", response
         assert response["reason_code"] == "pane-busy", response
-        harness.evidence.write(case, "10-transcript-active-turn.txt", _capture(harness, kimi_session))
+        harness.evidence.write(
+            case, "10-transcript-active-turn.txt", _capture(harness, kimi_session)
+        )
         _stop_turn(harness, kimi_session)
 
     def test_02_interactive_text_queues_and_enters_mid_turn(
@@ -344,7 +348,9 @@ class TestKimiInteractiveStreaming:
             "arrows": [{"type": "key", "key": "Down"}, {"type": "key", "key": "Up"}],
             "escape": [{"type": "key", "key": "Escape"}],
         }.items():
-            request, response = _post_events(harness, kimi_session, events, payload_class="interactive")
+            request, response = _post_events(
+                harness, kimi_session, events, payload_class="interactive"
+            )
             harness.evidence.write_json(case, f"{name}-request.json", request)
             harness.evidence.write_json(case, f"{name}-response.json", response)
             assert response["outcome"] == "accepted", (name, response)
@@ -378,9 +384,7 @@ class TestKimiInteractiveStreaming:
         pane = kimi_session.pane_id
         lock_dir = Path(harness.state_root) / "pane-input-locks"
         lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        descriptor = os.open(
-            str(lock_dir / f"pane-{pane[1:]}.lock"), os.O_CREAT | os.O_RDWR, 0o600
-        )
+        descriptor = os.open(str(lock_dir / f"pane-{pane[1:]}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         try:
             request, response = _post_events(
@@ -441,15 +445,16 @@ class TestKimiInteractiveStreaming:
         harness.tmux.out("copy-mode", "-t", kimi_session.pane_id)
         try:
             request, response = _post_events(
-                harness, kimi_session, [{"type": "text", "text": marker}], payload_class="interactive"
+                harness,
+                kimi_session,
+                [{"type": "text", "text": marker}],
+                payload_class="interactive",
             )
             still_in_mode = harness.tmux.out(
                 "display-message", "-p", "-t", kimi_session.pane_id, "#{pane_in_mode}"
             )
         finally:
-            harness.tmux.run(
-                "send-keys", "-t", kimi_session.pane_id, "-X", "cancel", check=False
-            )
+            harness.tmux.run("send-keys", "-t", kimi_session.pane_id, "-X", "cancel", check=False)
         harness.evidence.write_json(case, "copy-mode-request.json", request)
         harness.evidence.write_json(case, "copy-mode-response.json", response)
         harness.evidence.note(case, f"pane_in_mode after the refused POST: {still_in_mode}")
@@ -488,7 +493,9 @@ class TestKimiInteractiveStreaming:
         # Settle proven on local journal evidence, then exactly one
         # exact-id reconcile — never a resend, never GET polling.
         state = _await_journal_terminal(harness, control_id)
-        harness.evidence.note(case, f"journal reached terminal state {state!r} before the one reconcile")
+        harness.evidence.note(
+            case, f"journal reached terminal state {state!r} before the one reconcile"
+        )
         reconcile = requests.get(f"{harness.server.url}/control-input/{control_id}", timeout=30)
         assert reconcile.status_code == 200
         outcome = reconcile.json()
@@ -548,7 +555,9 @@ class TestClaudeInteractiveStreaming:
             "arrows": [{"type": "key", "key": "Down"}, {"type": "key", "key": "Up"}],
             "escape": [{"type": "key", "key": "Escape"}],
         }.items():
-            request, response = _post_events(harness, claude_session, events, payload_class="interactive")
+            request, response = _post_events(
+                harness, claude_session, events, payload_class="interactive"
+            )
             harness.evidence.write_json(case, f"{name}-request.json", request)
             harness.evidence.write_json(case, f"{name}-response.json", response)
             assert response["outcome"] == "accepted", (name, response)
@@ -585,15 +594,16 @@ class TestClaudeInteractiveStreaming:
         harness.tmux.out("copy-mode", "-t", claude_session.pane_id)
         try:
             request, response = _post_events(
-                harness, claude_session, [{"type": "text", "text": marker}], payload_class="interactive"
+                harness,
+                claude_session,
+                [{"type": "text", "text": marker}],
+                payload_class="interactive",
             )
             still_in_mode = harness.tmux.out(
                 "display-message", "-p", "-t", claude_session.pane_id, "#{pane_in_mode}"
             )
         finally:
-            harness.tmux.run(
-                "send-keys", "-t", claude_session.pane_id, "-X", "cancel", check=False
-            )
+            harness.tmux.run("send-keys", "-t", claude_session.pane_id, "-X", "cancel", check=False)
         harness.evidence.write_json(case, "copy-mode-request.json", request)
         harness.evidence.write_json(case, "copy-mode-response.json", response)
         harness.evidence.note(case, f"pane_in_mode after the refused POST: {still_in_mode}")
@@ -630,7 +640,9 @@ class TestClaudeInteractiveStreaming:
         ), "the killed-response interactive batch never reached the provider"
 
         state = _await_journal_terminal(harness, control_id)
-        harness.evidence.note(case, f"journal reached terminal state {state!r} before the one reconcile")
+        harness.evidence.note(
+            case, f"journal reached terminal state {state!r} before the one reconcile"
+        )
         reconcile = requests.get(f"{harness.server.url}/control-input/{control_id}", timeout=30)
         assert reconcile.status_code == 200
         outcome = reconcile.json()
