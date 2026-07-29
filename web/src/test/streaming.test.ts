@@ -29,7 +29,11 @@ interface Harness {
   resolveNext: (result: SendResult) => Promise<void>
 }
 
-function makeHarness(options?: { dispatchGraceMs?: number; chords?: ReadonlySet<string> }): Harness {
+function makeHarness(options?: {
+  dispatchGraceMs?: number
+  chords?: ReadonlySet<string>
+  declareInteractive?: boolean
+}): Harness {
   const sent: Harness['sent'] = []
   const deferreds: Harness['deferreds'] = []
   const disarmReasons: Harness['disarmReasons'] = []
@@ -53,6 +57,7 @@ function makeHarness(options?: { dispatchGraceMs?: number; chords?: ReadonlySet<
     {
       coalesceWindowMs: 200,
       dispatchGraceMs: options?.dispatchGraceMs,
+      declareInteractive: options?.declareInteractive,
       advertisedChords: options?.chords ?? KIMI_CHORDS,
       mintId: () => `control-${(idCounter += 1)}`,
     },
@@ -237,6 +242,20 @@ describe('streaming grace pacing (§6.3 step 3, §10.4)', () => {
     vi.advanceTimersByTime(200)
     expect(h.sent).toHaveLength(2)
     expect(h.sent[1].events).toEqual([{ type: 'key', key: 'Escape' }])
+  })
+
+  it('sends the next declared-interactive composer batch immediately after an accepted Enter (§6.7)', async () => {
+    const h = makeHarness({ dispatchGraceMs: 5000, declareInteractive: true })
+    typeText(h.engine, 'hi')
+    h.engine.handleKey(plain('Enter'))
+    await h.resolveNext(accepted)
+    typeText(h.engine, 'next')
+    vi.advanceTimersByTime(200) // quiet timer seals the batch
+    // The server no longer refuses declared batches on the dispatch grace,
+    // so no grace is armed and the composer-class batch sends immediately
+    // instead of waiting out the 5000 ms window.
+    expect(h.sent).toHaveLength(2)
+    expect(h.sent[1].events).toEqual([{ type: 'text', text: 'next' }])
   })
 })
 

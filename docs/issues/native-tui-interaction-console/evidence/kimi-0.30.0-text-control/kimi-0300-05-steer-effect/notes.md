@@ -1,0 +1,1 @@
+steer effect proven on 0.30.0: the exact ACK line 'STEER-ACK-0655b6623f' appears as its own fresh provider-output row (1x); it cannot be the instruction row, a wrapped queue/composer echo, or pre-steer content, so the provider consumed the queued C-s steer and acted on it

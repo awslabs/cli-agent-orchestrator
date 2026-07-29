@@ -1,0 +1,49 @@
+{
+  "chord": null,
+  "chord_attempted": null,
+  "chord_sent": null,
+  "chunks_sent": null,
+  "control_id": "ctl-450e57a141",
+  "detail": "the receiver is processing, not idle; a composer-class sequence is readiness-gated and nothing was written",
+  "enter_attempted": null,
+  "enter_sent": false,
+  "events": [
+    {
+      "ordinal": 0,
+      "outcome": "refused",
+      "text": "automation prose",
+      "type": "text"
+    }
+  ],
+  "in_flight": false,
+  "outcome": "refused",
+  "protocol": "cao-control-input-v1",
+  "reason_code": "pane-busy",
+  "reattemptable": true,
+  "request_digest": "deb35c08a8e76c80103d31e1218ac14430ddbbccfe69a50aa1bcfb6b25e4baf8",
+  "request_schema_version": 3,
+  "resolved_identity": {
+    "execution_mode": "native_tui",
+    "native_session_id": "session_e56dc1aa-76bb-4800-97c2-485209fa9465",
+    "pane": {
+      "bound_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "dead": false,
+      "observed_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "pane_id": "%2",
+      "pane_pid": 98591,
+      "window_id": "@2"
+    },
+    "pane_birth_id": "%2",
+    "provider": "kimi_cli",
+    "provider_process_id": "98591@Wed Jul 29 05:20:26 2026",
+    "session_name": "cao-a103-kimi-0300-2f1c81",
+    "terminal_generation": "3aaa4b12-4603-4d77-83c1-948925747c48",
+    "terminal_id": "7821ef85",
+    "terminal_incarnation": null
+  },
+  "state": "refused",
+  "submission_evidence_ref": null,
+  "submission_observed": null,
+  "terminal_id": "7821ef85",
+  "text_sent": false
+}

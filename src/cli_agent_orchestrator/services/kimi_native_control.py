@@ -291,6 +291,29 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
             "(three-way bundle comparison)"
         ),
     },
+    # 0.30.0 is likewise a *separate* proven entry, not a range widening:
+    # read from the installed 0.30.0 bundle (main.mjs sha256
+    # 49ad0553cff0b5f60f83ba85df56bb5ccdbcb908158c80d9363d0e5a529ea51c),
+    # which declares the same composer facts as the 0.29.x line — the
+    # ['shift+enter', 'ctrl+j'] newLine defaultKeys, the
+    # expandPasteMarkers(lines.join("\n")) submit computation, and
+    # PASTE_ENTER_SUPPRESS_WINDOW_MS = 120.  Same proven behaviour, so the
+    # same normalization identifier; no behavioral drift is claimed.
+    "0.30.0": {
+        "keystroke": "C-j",
+        "burst_reset_keystroke": "End",
+        "submit_settle_seconds": 0.25,
+        "normalization": NORMALIZATION_JOIN_LF_THEN_TRIM,
+        "evidence": (
+            "installed 0.30.0 dist/main.mjs (sha256 49ad0553cff0b5f60f83ba"
+            "85df56bb5ccdbcb908158c80d9363d0e5a529ea51c) declares the "
+            "['shift+enter', 'ctrl+j'] newLine defaultKeys and computes "
+            "expandPasteMarkers(this.state.lines.join('\\n')) on submit; "
+            "PASTE_ENTER_SUPPRESS_WINDOW_MS = 120 "
+            "— the same composer facts as the 0.29.x line (bundle read; "
+            "live acceptance per cond-0198)"
+        ),
+    },
 }
 
 #: The steer chords proven for each pinned Kimi build.  Distinct from
@@ -307,6 +330,10 @@ _PROVEN_STEER_CHORDS: dict[str, frozenset[str]] = {
     # Key.ctrl("s") exists in the 0.29.2 bundle exactly as in 0.29.0/0.29.1
     # (three-way comparison; sha256 keyed in _PROVEN_COMPOSER_NEWLINE).
     "0.29.2": frozenset({"C-s"}),
+    # ctrl("s") exists in the installed 0.30.0 bundle exactly as in the
+    # 0.29.x line (bundle read; sha256 keyed in _PROVEN_COMPOSER_NEWLINE;
+    # live acceptance per cond-0198).
+    "0.30.0": frozenset({"C-s"}),
 }
 
 

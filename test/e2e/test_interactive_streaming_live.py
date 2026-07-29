@@ -19,9 +19,11 @@ CAO_STATE_ROOT, real $HOME for provider auth):
   and the evidence claims bytes delivered / a queued command only, never
   menu execution or cancellation (a future build that opens a real menu
   here fails loudly for re-pinning);
-* the kimi steer effect (Fable r15 P2): queued mid-turn instruction text +
-  declared C-s — the pending queue empties into the turn context and the
-  provider visibly acts on the instruction;
+* the kimi steer effect (Fable r15 P2, Sol r16 P1.2): queued mid-turn
+  instruction text + declared C-s — the pending queue empties into the
+  turn context and FRESH provider-output rows carry the unique requested
+  suffix (numeric lines only; instruction/queue echoes and pre-steer
+  capture excluded by the shape predicate);
 * true pane-input lease contention refuses truthfully with the §6.4
   discriminator detail (never a bypass of a real lease owner);
 * stale identity and copy mode are zero-byte refusals for declared
@@ -659,15 +661,27 @@ class TestKimiInteractiveStreaming:
     def test_10_declared_steer_consumes_the_queued_text(
         self, harness: Harness, kimi_session: ProviderSession
     ):
-        """Fable r15 P2: queue a unique instruction mid-turn through the
-        declared path, send declared C-s, and prove the provider consumed
-        the queued text — the pending queue empties into the turn context
-        and the provider visibly acts on the instruction.  A bare accepted
-        chord is not the claim."""
+        """Fable r15 P2 + Sol r16 P1.2: queue a unique instruction mid-turn
+        through the declared path, send declared C-s, and prove the steer
+        EFFECT — newly generated provider-output rows carrying the unique
+        requested suffix.  The pass predicate never inspects the user
+        instruction, the queue/context echo, or pre-steer capture: bare
+        accepted chords and echoed instruction text cannot satisfy it."""
         case = "r15-kimi-10-steer-effect"
         _start_long_turn(harness, kimi_session)
+        # Let the turn reach steady number production before the steer, so
+        # the requested format change would be visible promptly after it.
+        assert _await(
+            lambda: _turn_progress(_capture(harness, kimi_session)) >= 3,
+            timeout=120.0,
+            poll=1.0,
+        ), "the counting turn never started producing numbers"
         marker = f"STEERME-{uuid.uuid4().hex[:8]}"
-        instruction = f"{marker}: end every subsequent line with the token ZQX9."
+        token = f"ZQ{uuid.uuid4().hex[:6]}"
+        instruction = (
+            f"{marker}: from now on, write each number on its own line "
+            f"followed by the token {token}."
+        )
         request, response = _post_events(
             harness,
             kimi_session,
@@ -679,7 +693,16 @@ class TestKimiInteractiveStreaming:
         assert _await(
             lambda: marker in _bottom_rows(_capture(harness, kimi_session), 10), timeout=30.0
         ), "the instruction never appeared in the mid-turn queue"
-        harness.evidence.write(case, "10-queued.txt", _capture(harness, kimi_session))
+        pre_steer = _capture(harness, kimi_session)
+        harness.evidence.write(case, "10-queued.txt", pre_steer)
+
+        # The requested effect has one auditable shape: a numeric line
+        # carrying the unique suffix.  The instruction row, its echo, and
+        # anything pre-steer can never match it.
+        effect_pattern = re.compile(rf"(?m)^\s*\d{{1,3}}\s+{re.escape(token)}(?:[\s.,]|$)")
+        assert not effect_pattern.search(
+            pre_steer
+        ), "the requested effect shape already existed before the steer"
 
         request, response = _post_events(
             harness, kimi_session, [{"type": "chord", "chord": "C-s"}], payload_class="interactive"
@@ -687,8 +710,8 @@ class TestKimiInteractiveStreaming:
         harness.evidence.write_json(case, "20-steer-response.json", response)
         assert response["outcome"] == "accepted", response
 
-        # Consumed: the pending queue no longer holds the instruction, and
-        # it moved into the provider's turn context above the queue zone.
+        # Consumption (secondary evidence): the pending queue no longer
+        # holds the instruction, and it moved into the turn context.
         assert _await(
             lambda: marker not in _bottom_rows(_capture(harness, kimi_session), 10),
             timeout=30.0,
@@ -699,14 +722,37 @@ class TestKimiInteractiveStreaming:
         assert marker in "\n".join(
             consumed.splitlines()[:-10]
         ), "the steered instruction never entered the provider's turn context"
-        acted = _await(lambda: "ZQX9" in _capture(harness, kimi_session), timeout=120.0, poll=2.0)
+
+        # The pass condition: FRESH provider output carries the requested
+        # suffix — rows generated after the steer, in the requested shape.
+        # The settled capture is written either way so a non-delivery is
+        # auditable from the bundle, never inferred.
+        delivered = _await(
+            lambda: effect_pattern.search(_capture(harness, kimi_session)),
+            timeout=240.0,
+            poll=2.0,
+        )
+        acted = _capture(harness, kimi_session)
+        harness.evidence.write(case, "40-provider-acted.txt", acted)
+        if not delivered:
+            harness.evidence.note(
+                case,
+                "EFFECT NOT DELIVERED: no freshly generated provider output carried the "
+                "requested suffix within the window; the settled capture is in "
+                "40-provider-acted.txt for adjudication",
+            )
+        assert delivered, "no freshly generated provider output carried the requested suffix"
+        effect_rows = [row.strip() for row in acted.splitlines() if effect_pattern.search(row)]
+        assert effect_rows, "no fresh provider-output rows carry the requested suffix"
+        assert not any(
+            row in pre_steer for row in effect_rows
+        ), "the effect rows predate the steer — echo, not effect"
         harness.evidence.note(
             case,
-            "queue consumed into the turn context; provider visibly acted on the "
-            f"steered instruction (ZQX9 observed in output): {acted}",
+            f"steer effect proven: {len(effect_rows)} fresh provider-output row(s) carry "
+            f"the requested suffix, e.g. {effect_rows[:3]!r}; instruction/queue echoes "
+            "and pre-steer capture excluded by the shape predicate",
         )
-        harness.evidence.write(case, "40-provider-acted.txt", _capture(harness, kimi_session))
-        assert acted, "the provider never visibly acted on the steered instruction"
         _stop_turn(harness, kimi_session)
 
 

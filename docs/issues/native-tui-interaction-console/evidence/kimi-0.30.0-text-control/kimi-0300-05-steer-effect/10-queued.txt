@@ -1,4 +1,8 @@
-5
+● 1
+   2
+   3
+   4
+   5
    6
    7
    8
@@ -17,14 +21,10 @@
    21
    22
    23
-   24
-   25
-   26
 
-  ⠇ working... · Tip: ctrl-s to add guidance without waiting for the turn to finish
+  ⠴ working... · Tip: @: mention files
  ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
- │ > STEERME-042928ee: from now on, write each number on its own line followed by the token       │
- │   ZQe4598a.                                                                                    │
+ │ > STEERME-5e394dff: reply with exactly the line STEER-ACK-0655b6623f and nothing else.         │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
- K2.7 Coding thinking  …/pytest-650/cao_scratch_r150/worktree-r15-kimi  master
-                                                                               context: 0% (0/256k)
+ K2.7 Coding thinking  …/pytest-659/cao_scratch_03000/worktree-kimi-0300  master
+                                                                           context: 9% (21.9k/256k)

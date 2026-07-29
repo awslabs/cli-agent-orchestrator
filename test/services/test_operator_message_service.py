@@ -764,6 +764,34 @@ class TestUnderLeaseGuards:
 
 
 class TestReplayAndResponseLoss:
+    def test_an_unreadable_store_on_submit_fails_closed_with_zero_io(self, wire, monkeypatch):
+        """r16 Sol P1.1: a store that cannot be read is not a store without
+        the record.  Absence is unprovable, so the submit answers the
+        honest unknown — never a fresh send — before any identity,
+        attachment, lease, or adapter I/O."""
+        monkeypatch.setattr(
+            oms,
+            "_find_operation",
+            lambda operation_id: (None, ["kimi_native_control: database is locked"]),
+        )
+        monkeypatch.setattr(
+            cis,
+            "resolve_control_identity",
+            lambda tid: pytest.fail("fail-closed must not touch identity resolution"),
+        )
+        monkeypatch.setattr(
+            oms.image_attachments,
+            "get_attachment",
+            lambda *a: pytest.fail("fail-closed must not touch attachment I/O"),
+        )
+        adapter = _FakeAdapter(record=_record(OP))
+        result = _submit(text="see [Image #1]", attachments=["att-1"], token_map={"1": "att-1"})
+        assert result.outcome == "ambiguous"
+        assert result.reason_code == "response-lost"
+        assert "could not be read" in result.detail
+        assert "never resend" in result.detail
+        assert adapter.calls == []
+
     def test_an_identical_replay_answers_from_the_store_with_zero_io(self, wire, monkeypatch):
         digest = oms._request_digest(TERMINAL, "hello operator", [], {})
         stored = _record(OP, digest=digest)

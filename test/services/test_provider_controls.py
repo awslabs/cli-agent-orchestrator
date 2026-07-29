@@ -24,7 +24,7 @@ CLAUDE = provider_contracts.PROVIDER_CLAUDE_CODE
 COMPACT_EVENTS = [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
 STOP_EVENTS = [{"type": "key", "key": "Escape"}]
 
-KIMI_PINNED_BUILDS = ("0.29.0", "0.29.1", "0.29.2")
+KIMI_PINNED_BUILDS = ("0.29.0", "0.29.1", "0.29.2", "0.30.0")
 
 # The §8.6 Lane C blocks, restated exactly (a test may pin a literal;
 # production code may not).
@@ -292,6 +292,20 @@ class TestLaneCBlocks:
         assert "image" not in provider_controls.controls_block_for(KIMI, "0.29.0")
         assert "image" not in provider_controls.controls_block_for(KIMI, "0.29.1")
         assert provider_controls.controls_block_for(KIMI, "0.29.2")["image"] == KIMI_IMAGE_BLOCK
+
+    def test_0300_advertises_text_and_interactive_but_never_image(self):
+        """cond-0198: the proven 0.30.0 build advertises the text/control
+        blocks and the §6.7 interactive block with its steer chords — but
+        image delivery authority stays pinned to 0.29.2 alone."""
+        block = provider_controls.controls_block_for(KIMI, "0.30.0")
+        assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
+        assert block["interactive_streaming"] == {"supported": True}
+        assert block["steer_chords"] == ["C-s"]
+        assert "image" not in block
+        entry = provider_controls.controls_for(KIMI, "0.30.0")
+        assert entry["operator_message"] is not None
+        assert entry["interactive_streaming"] is not None
+        assert entry["image"] is None
 
     def test_operator_message_limits_are_the_spec_pins(self):
         block = provider_controls.controls_block_for(CLAUDE, "2.1.220")

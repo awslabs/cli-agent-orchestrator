@@ -904,6 +904,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         {
           coalesceWindowMs: liveCapabilities.streaming.coalesce_window_ms ?? 200,
           dispatchGraceMs: graceMs,
+          declareInteractive: interactiveAdvertised,
           advertisedChords: chords,
         },
         {

@@ -104,6 +104,11 @@ export interface StreamingConfig {
   coalesceWindowMs: number
   /** Advertised kimi dispatch grace (§3.5); absent → no grace pacing. */
   dispatchGraceMs?: number
+  /** §6.7 (r15): batches declare `payload_class: "interactive"` through the
+   * armed surface, so the server no longer refuses them on the dispatch
+   * grace — the legacy client grace withhold is skipped for this engine.
+   * Absent/false (the old-server fallback) keeps the §6.3 pacing exactly. */
+  declareInteractive?: boolean
   /** The per-terminal advertised chord set held at arm time (§3.5, D9). */
   advertisedChords: ReadonlySet<string>
   now?: () => number
@@ -151,6 +156,7 @@ export class StreamingEngine {
     this.config = {
       coalesceWindowMs: config.coalesceWindowMs,
       dispatchGraceMs: config.dispatchGraceMs,
+      declareInteractive: config.declareInteractive ?? false,
       advertisedChords: config.advertisedChords,
       now: config.now ?? (() => Date.now()),
       mintId: config.mintId ?? (() => crypto.randomUUID()),
@@ -332,11 +338,14 @@ export class StreamingEngine {
     const head = this.queue[0]
     if (
       this.config.dispatchGraceMs !== undefined &&
+      !this.config.declareInteractive &&
       now < this.graceUntil &&
       isComposerClass(head)
     ) {
       // §6.3 step 3: withhold composer-class batches while the advertised
-      // dispatch grace runs; pacing prevents the server refusal.
+      // dispatch grace runs; pacing prevents the server refusal.  Skipped
+      // for declared interactive batches (§6.7 — no server grace refusal
+      // exists for them, so graceUntil is never armed either).
       this.scheduleWithhold(this.graceUntil - now)
       return
     }
@@ -386,8 +395,12 @@ export class StreamingEngine {
     if (outcome.outcome === 'accepted') {
       if (
         this.config.dispatchGraceMs !== undefined &&
+        !this.config.declareInteractive &&
         flight.events.some(event => event.type === 'key' && event.key === 'Enter')
       ) {
+        // §6.3 grace pacing applies to undeclared batches only (§6.7): the
+        // server no longer issues the grace refusal to declared interactive
+        // batches, so withholding them here would be pure delay.
         this.graceUntil = this.config.now() + this.config.dispatchGraceMs
       }
       this.trySend()

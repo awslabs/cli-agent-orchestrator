@@ -93,10 +93,14 @@ credential or secret value appears anywhere in the bundle.
   the `K2.7 Coding thinking` status line are unchanged, the
   identity/provider-controls reread is intact, and the counting turn
   keeps progressing after the cancel (`60-turn-continued.txt`).
-- **r15-kimi-10 steer effect** (Fable r15 P2): a unique queued
-  instruction mid-turn + declared `C-s` — the pending queue empties into
-  the turn context and the provider visibly acts on it (`ZQX9` observed
-  in `40-provider-acted.txt`); never a bare accepted chord.
+- **r15-kimi-10 steer effect** (Fable r15 P2; predicate strengthened per
+  Sol r16 P1.2): a unique queued instruction mid-turn + declared `C-s` —
+  the pending queue empties into the turn context and **freshly
+  generated provider-output rows** carry the unique requested suffix
+  (`2 ZQe4598a` … `9 ZQe4598a` in `40-provider-acted.txt`; `notes.md`
+  counts 8 effect rows). The numeric-suffix shape excludes the
+  instruction row, queue/context echoes, and pre-steer capture, so a
+  bare accepted chord or an echoed instruction can never satisfy it.
 - **r16-claude-05 queued-command limit** (r16, live-proven provider
   behavior — not a CAO defect): during the active turn, declared `/model`
   is accepted and **visibly queued** in the native composer

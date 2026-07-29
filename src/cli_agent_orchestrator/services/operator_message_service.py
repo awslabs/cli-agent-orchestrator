@@ -704,6 +704,20 @@ def submit_operator_message(
     # operation store with zero attachment or pane I/O.
     digest = _request_digest(terminal_id, text, attachment_ids, tokens)
     existing, lookup_errors = _find_operation(operation_id)
+    if existing is None and lookup_errors:
+        # Fail closed (r16 Sol P1.1): a store that could not be read is not
+        # a store without the record.  Absence is unprovable, so a fresh
+        # send could license a duplicate — answer the honest unknown before
+        # any identity, attachment, lease, or adapter I/O, exactly as the
+        # exact-id reconcile does.
+        return _result(
+            operation_id,
+            AMBIGUOUS,
+            REASON_RESPONSE_LOST,
+            f"the operation store could not be read ({'; '.join(lookup_errors)}), so "
+            "whether a record exists is unknown; nothing was submitted — reconcile "
+            "by exact operation id, never resend",
+        )
     if existing is not None:
         if (
             existing.get("kind") != _OPERATION_KIND

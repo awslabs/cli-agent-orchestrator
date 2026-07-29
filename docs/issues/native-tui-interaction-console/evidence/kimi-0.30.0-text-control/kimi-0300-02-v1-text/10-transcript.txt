@@ -1,0 +1,26 @@
+╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                │
+ │  ▐█████▌  Send /help for help information.                                                     │
+ │                                                                                                │
+ │  Directory: <HOST_TMP>/pytest-of-<USER>/pytest-65…│
+ │  Session:   session_e56dc1aa-76bb-4800-97c2-485209fa9465                                       │
+ │  Model:     K2.7 Coding                                                                        │
+ │  Version:   0.30.0                                                                             │
+ │                                                                                                │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Use Kimi K3 with High thinking effort - for the best balance between token spend and capability
+   Run /model to switch to K3 and set thinking effort to High
+
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to
+ ~/.tmux.conf and restart tmux.
+
+ ✨ Reply with exactly the marker V1TEXT-34563bc8 and nothing else.
+
+  🌑 · Tip: /goal for multi-step work with a clear finish line
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                              │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+ K2.7 Coding thinking  …/pytest-659/cao_scratch_03000/worktree-kimi-0300  master
+                                                                               context: 0% (0/256k)

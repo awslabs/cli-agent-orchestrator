@@ -1,0 +1,35 @@
+{
+  "compact": {
+    "events": [
+      {
+        "text": "/compact",
+        "type": "text"
+      },
+      {
+        "key": "Enter",
+        "type": "key"
+      }
+    ]
+  },
+  "dispatch_grace_ms": 5000,
+  "interactive_streaming": {
+    "supported": true
+  },
+  "operator_message": {
+    "max_attachments": 4,
+    "max_text_bytes": 8192,
+    "multiline": true,
+    "supported": true
+  },
+  "steer_chords": [
+    "C-s"
+  ],
+  "stop": {
+    "events": [
+      {
+        "key": "Escape",
+        "type": "key"
+      }
+    ]
+  }
+}
