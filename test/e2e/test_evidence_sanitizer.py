@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-
 from test.e2e.test_native_tui_provider_acceptance import Evidence
 from test.e2e.test_operator_message_live import _harvest_account_display_names
 
