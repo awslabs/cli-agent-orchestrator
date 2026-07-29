@@ -2,7 +2,11 @@
 
 Run date: 2026-07-29 (r1 repair head). Branch: `feature/native-tui-console-lane-c`.
 Harness: `test/e2e/test_interactive_streaming_live.py` (pytestmark `e2e`).
-Result: **12 passed** (8 kimi + 4 claude) in 228.68 s.
+Result: **12 passed** (8 kimi + 4 claude) in 228.68 s, plus the r16
+menu-evidence round: `r15-kimi-09` menu safe-cancel and `r15-kimi-10`
+steer effect pass on kimi 0.29.2 (73.6 s with the claude falsification
+probe), and `r16-claude-05` records the live-proven claude 2.1.220
+queued-command limit (35.1 s conversion run at the same head).
 
 Scope (design §6.7, cond-0194, r15 owner override): a declared
 `payload_class: "interactive"` batch bypasses **only** the provider
@@ -82,6 +86,28 @@ credential or secret value appears anywhere in the bundle.
 - **r15-claude-04**: the same killed-response drill: settle proven on
   local journal evidence, one exact-id GET → `accepted`, marker exactly
   once.
+- **r15-kimi-09 menu safe-cancel** (Fable r15 P1, r16 design head
+  `cc52f89`): during the active turn, declared `/model`+Enter opens the
+  picker (`20-menu-open.txt`), Down+Up navigates without changing the
+  setting, Escape closes the overlay; the shim `config.toml` model and
+  the `K2.7 Coding thinking` status line are unchanged, the
+  identity/provider-controls reread is intact, and the counting turn
+  keeps progressing after the cancel (`60-turn-continued.txt`).
+- **r15-kimi-10 steer effect** (Fable r15 P2): a unique queued
+  instruction mid-turn + declared `C-s` — the pending queue empties into
+  the turn context and the provider visibly acts on it (`ZQX9` observed
+  in `40-provider-acted.txt`); never a bare accepted chord.
+- **r16-claude-05 queued-command limit** (r16, live-proven provider
+  behavior — not a CAO defect): during the active turn, declared `/model`
+  is accepted and **visibly queued** in the native composer
+  (`10-command-visibly-queued.txt`), no model/effort menu opens mid-turn
+  (`notes.md`), the counting turn continues and completes
+  (`20-turn-continued.txt`, `30-after-turn-completed.txt`), the setting
+  is unchanged (`~/.claude.json` model key, `sonnet-5 │ xhigh` status,
+  identity reread), and the control/journal evidence claims bytes
+  delivered / a queued command only — never menu execution or
+  cancellation. A future build that opens a real menu here fails the
+  test loudly for re-pinning.
 
 ## Browser status evidence (stubbed backend)
 

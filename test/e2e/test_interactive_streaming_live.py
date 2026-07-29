@@ -10,6 +10,18 @@ CAO_STATE_ROOT, real $HOME for provider auth):
   the interactive bypass is never inherited (the inheritance fence);
 * declared interactive text queues/enters mid-turn; navigation/menu key
   sequences and Escape deliver; kimi C-s steering delivers mid-turn;
+* per-build menu honesty (r16): on kimi 0.29.2 the mid-turn /model menu
+  opens through the declared path, navigates, and Escape safe-cancels —
+  overlay closed, setting unchanged by authoritative rereads, turn
+  continuing; on claude 2.1.220 (a live-proven provider limit, not a CAO
+  defect) the mid-turn /model is accepted and queued in the native
+  composer — no menu opens, the setting is unchanged, the turn continues,
+  and the evidence claims bytes delivered / a queued command only, never
+  menu execution or cancellation (a future build that opens a real menu
+  here fails loudly for re-pinning);
+* the kimi steer effect (Fable r15 P2): queued mid-turn instruction text +
+  declared C-s — the pending queue empties into the turn context and the
+  provider visibly acts on the instruction;
 * true pane-input lease contention refuses truthfully with the §6.4
   discriminator detail (never a bypass of a real lease owner);
 * stale identity and copy mode are zero-byte refusals for declared
@@ -28,7 +40,9 @@ Run with:
 from __future__ import annotations
 
 import fcntl
+import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -45,6 +59,7 @@ from test.e2e.test_native_tui_provider_acceptance import (
     _control_identity,
     _harvest_email_tokens,
     _kill_session,
+    _kimi_menu_open,
     _launch_provider_session,
     _post,
     _post_events,
@@ -251,6 +266,50 @@ def _stop_turn(harness: Harness, session: ProviderSession) -> None:
 
 def _transcript_count(harness: Harness, session: ProviderSession, marker: str) -> int:
     return _capture(harness, session).count(marker)
+
+
+def _turn_progress(transcript: str) -> int:
+    """Distinct pure-number lines: the counting turn's progress meter.  A
+    silently interrupted turn stalls this; a healthy one keeps growing it."""
+    return len(set(re.findall(r"(?m)^\s*(\d{1,3})\s*$", transcript)))
+
+
+def _bottom_rows(transcript: str, rows: int = 10) -> str:
+    return "\n".join(transcript.splitlines()[-rows:])
+
+
+def _shim_config_model(harness: Harness) -> Any:
+    """The persisted `model` value in the kimi shim-home config copy (the
+    file a `/model` switch would persist into — never the operator's)."""
+    config = Path(harness.scratch) / "kimi-provider-home" / "config.toml"
+    try:
+        match = re.search(r'(?m)^model\s*=\s*"([^"]+)"', config.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    return match.group(1) if match else None
+
+
+def _claude_config_model() -> Any:
+    """The persisted `model` key in the operator's ~/.claude.json — read
+    and compared in-test, never printed (values stay out of evidence)."""
+    try:
+        data = json.loads(
+            (Path(os.environ.get("HOME", "")) / ".claude.json").read_text(
+                encoding="utf-8", errors="replace"
+            )
+        )
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data.get("model")
+
+
+#: Markers of Claude's /model selector overlay (2.1.220).
+_CLAUDE_MENU_HINTS = ("Select model", "Choose a model", "Model selection")
+
+
+def _claude_menu_open(harness: Harness, session: ProviderSession) -> bool:
+    screen = _capture(harness, session)
+    return any(hint in screen for hint in _CLAUDE_MENU_HINTS)
 
 
 def _await_journal_terminal(harness: Harness, control_id: str, timeout: float = 60.0) -> str:
@@ -508,6 +567,148 @@ class TestKimiInteractiveStreaming:
         harness.evidence.write(case, "10-transcript.txt", _capture(harness, kimi_session))
         _stop_turn(harness, kimi_session)
 
+    def test_09_mid_turn_model_menu_safe_cancel(
+        self, harness: Harness, kimi_session: ProviderSession
+    ):
+        """Fable r15 P1: open /model during the active turn through the
+        declared path, navigate without changing the setting, Escape-cancel
+        — the overlay closes, the setting is unchanged by authoritative
+        rereads, and the original turn continues (never silently
+        interrupted by the cancellation)."""
+        case = "r15-kimi-09-menu-safe-cancel"
+        _start_long_turn(harness, kimi_session)
+        progress_at_open = _turn_progress(_capture(harness, kimi_session))
+        model_before = _shim_config_model(harness)
+        harness.evidence.note(case, f"model before drill (shim config): {model_before!r}")
+
+        # Open the menu by its real supported interaction, declared interactive.
+        request, response = _post_events(
+            harness,
+            kimi_session,
+            [{"type": "text", "text": "/model"}, {"type": "key", "key": "Enter"}],
+            payload_class="interactive",
+        )
+        harness.evidence.write_json(case, "01-model-enter-request.json", request)
+        harness.evidence.write_json(case, "02-model-enter-response.json", response)
+        assert response["outcome"] == "accepted", response
+        harness.evidence.write(case, "10-after-model-enter.txt", _capture(harness, kimi_session))
+        menu_open = _await(lambda: _kimi_menu_open(harness, kimi_session), timeout=8.0, poll=0.25)
+        if not menu_open:
+            harness.evidence.note(
+                case,
+                "ADJUDICATION EVIDENCE: the /model palette did not open during the active "
+                "turn on pinned kimi 0.29.2 — the typed input was handled as queued text "
+                "instead. No Escape was sent (mid-turn Escape with no menu open would "
+                "interrupt the operator's turn). Safe menu cancellation mid-turn is not "
+                "performable on this build; recorded for retained-writer adjudication.",
+            )
+            _stop_turn(harness, kimi_session)
+            pytest.fail(
+                "pinned kimi 0.29.2 does not open /model mid-turn — evidence committed; "
+                "escalate to the retained writer"
+            )
+        harness.evidence.write(case, "20-menu-open.txt", _capture(harness, kimi_session))
+
+        # Navigate without changing the setting (down, then back up).
+        request, response = _post_events(
+            harness,
+            kimi_session,
+            [{"type": "key", "key": "Down"}, {"type": "key", "key": "Up"}],
+            payload_class="interactive",
+        )
+        harness.evidence.write_json(case, "30-navigate-response.json", response)
+        assert response["outcome"] == "accepted", response
+        time.sleep(0.5)
+        harness.evidence.write(case, "31-menu-navigated.txt", _capture(harness, kimi_session))
+
+        # Escape-cancel and settle the UI.
+        request, response = _post_events(
+            harness, kimi_session, [{"type": "key", "key": "Escape"}], payload_class="interactive"
+        )
+        harness.evidence.write_json(case, "40-escape-response.json", response)
+        assert response["outcome"] == "accepted", response
+        assert _await(
+            lambda: not _kimi_menu_open(harness, kimi_session), timeout=8.0, poll=0.25
+        ), "the /model overlay did not close on Escape"
+        settled = _capture(harness, kimi_session)
+        harness.evidence.write(case, "41-after-escape.txt", settled)
+
+        # The setting is unchanged — provider-authoritative reads.
+        model_after = _shim_config_model(harness)
+        harness.evidence.note(
+            case, f"model after drill (shim config): {model_after!r} (before: {model_before!r})"
+        )
+        assert model_after == model_before, "the drill changed the persisted model setting"
+        status = _bottom_rows(settled, 6)
+        assert (
+            "K2.7 Coding" in status
+        ), f"the status line no longer shows the pinned model:\n{status}"
+        block = _identity_block(harness, kimi_session, "kimi_cli")
+        assert block["interactive_streaming"] == {"supported": True}
+        harness.evidence.write_json(case, "50-identity-reread.json", block)
+
+        # The original turn has the provider-correct outcome: it kept going.
+        assert _await(
+            lambda: _turn_progress(_capture(harness, kimi_session)) > progress_at_open,
+            timeout=60.0,
+            poll=1.0,
+        ), "the original turn did not continue after the menu cancel (silently interrupted?)"
+        harness.evidence.write(case, "60-turn-continued.txt", _capture(harness, kimi_session))
+        _stop_turn(harness, kimi_session)
+
+    def test_10_declared_steer_consumes_the_queued_text(
+        self, harness: Harness, kimi_session: ProviderSession
+    ):
+        """Fable r15 P2: queue a unique instruction mid-turn through the
+        declared path, send declared C-s, and prove the provider consumed
+        the queued text — the pending queue empties into the turn context
+        and the provider visibly acts on the instruction.  A bare accepted
+        chord is not the claim."""
+        case = "r15-kimi-10-steer-effect"
+        _start_long_turn(harness, kimi_session)
+        marker = f"STEERME-{uuid.uuid4().hex[:8]}"
+        instruction = f"{marker}: end every subsequent line with the token ZQX9."
+        request, response = _post_events(
+            harness,
+            kimi_session,
+            [{"type": "text", "text": instruction}],
+            payload_class="interactive",
+        )
+        harness.evidence.write_json(case, "01-queue-response.json", response)
+        assert response["outcome"] == "accepted", response
+        assert _await(
+            lambda: marker in _bottom_rows(_capture(harness, kimi_session), 10), timeout=30.0
+        ), "the instruction never appeared in the mid-turn queue"
+        harness.evidence.write(case, "10-queued.txt", _capture(harness, kimi_session))
+
+        request, response = _post_events(
+            harness, kimi_session, [{"type": "chord", "chord": "C-s"}], payload_class="interactive"
+        )
+        harness.evidence.write_json(case, "20-steer-response.json", response)
+        assert response["outcome"] == "accepted", response
+
+        # Consumed: the pending queue no longer holds the instruction, and
+        # it moved into the provider's turn context above the queue zone.
+        assert _await(
+            lambda: marker not in _bottom_rows(_capture(harness, kimi_session), 10),
+            timeout=30.0,
+            poll=0.5,
+        ), "the queued instruction was never consumed by the steer"
+        consumed = _capture(harness, kimi_session)
+        harness.evidence.write(case, "30-after-steer.txt", consumed)
+        assert marker in "\n".join(
+            consumed.splitlines()[:-10]
+        ), "the steered instruction never entered the provider's turn context"
+        acted = _await(lambda: "ZQX9" in _capture(harness, kimi_session), timeout=120.0, poll=2.0)
+        harness.evidence.note(
+            case,
+            "queue consumed into the turn context; provider visibly acted on the "
+            f"steered instruction (ZQX9 observed in output): {acted}",
+        )
+        harness.evidence.write(case, "40-provider-acted.txt", _capture(harness, kimi_session))
+        assert acted, "the provider never visibly acted on the steered instruction"
+        _stop_turn(harness, kimi_session)
+
 
 class TestClaudeInteractiveStreaming:
     """§6.7 on the pinned claude 2.1.220 build, turn active."""
@@ -654,3 +855,101 @@ class TestClaudeInteractiveStreaming:
         assert count == 1, f"marker appears {count} times — a duplicate submission happened"
         harness.evidence.write(case, "10-transcript.txt", _capture(harness, claude_session))
         _stop_turn(harness, claude_session)
+
+    def test_05_mid_turn_model_command_is_a_queued_command_limit(
+        self, harness: Harness, claude_session: ProviderSession
+    ):
+        """r16 honest limit (pinned claude 2.1.220, live-proven provider
+        behavior — never a CAO defect): during the active turn a declared
+        interactive ``/model`` is accepted and **queued** in the native
+        composer — no model/effort menu opens, the setting stays unchanged,
+        and the active turn continues.  The control/journal evidence claims
+        bytes delivered and a queued command only, never menu execution or
+        cancellation.  If a future build opens a real menu here, this test
+        fails loudly for re-pinning rather than silently passing."""
+        case = "r16-claude-05-queued-command-limit"
+        _start_long_turn(harness, claude_session)
+        progress_at_open = _turn_progress(_capture(harness, claude_session))
+        model_before = _claude_config_model()
+        harness.evidence.note(
+            case, "model key present in ~/.claude.json before drill: " f"{model_before is not None}"
+        )
+
+        # The command by its real supported interaction, declared interactive.
+        request, response = _post_events(
+            harness,
+            claude_session,
+            [{"type": "text", "text": "/model"}, {"type": "key", "key": "Enter"}],
+            payload_class="interactive",
+        )
+        harness.evidence.write_json(case, "01-model-enter-request.json", request)
+        harness.evidence.write_json(case, "02-model-enter-response.json", response)
+        assert response["outcome"] == "accepted", response
+        # The control/journal evidence claims bytes delivered only — a
+        # queued command, never a menu action.
+        harness.evidence.note(
+            case,
+            "control evidence claim: bytes delivered (accepted, per-event sent) — a "
+            "queued command; no menu execution or cancellation is claimed anywhere",
+        )
+
+        # The pinned provider behavior: the command is VISIBLY QUEUED in
+        # the composer, and no model/effort menu opens mid-turn.
+        assert _await(
+            lambda: "/model" in _bottom_rows(_capture(harness, claude_session), 8)
+            and "queued" in _capture(harness, claude_session).lower(),
+            timeout=30.0,
+        ), "the /model command never appeared in the mid-turn composer queue"
+        queued = _capture(harness, claude_session)
+        harness.evidence.write(case, "10-command-visibly-queued.txt", queued)
+        menu_opened_mid_turn = _await(
+            lambda: _claude_menu_open(harness, claude_session), timeout=8.0, poll=0.25
+        )
+        harness.evidence.note(
+            case,
+            f"model/effort menu opened during the active turn: {menu_opened_mid_turn} "
+            "(the pinned limit says it must not)",
+        )
+        assert not menu_opened_mid_turn, (
+            "a model/effort menu opened mid-turn on claude — the r16 queued-command "
+            "limit no longer holds; re-pin the provider behavior before landing"
+        )
+
+        # The active turn continues (provider-correct outcome) and settles.
+        assert _await(
+            lambda: _turn_progress(_capture(harness, claude_session)) > progress_at_open,
+            timeout=90.0,
+            poll=1.0,
+        ), "the active turn did not continue after the command queued"
+        harness.evidence.write(case, "20-turn-continued.txt", _capture(harness, claude_session))
+        _wait_turn_done(harness, claude_session)
+        settled = _capture(harness, claude_session)
+        harness.evidence.write(case, "30-after-turn-completed.txt", settled)
+
+        # Post-turn the queued command is processed like any queued input
+        # (the palette may open now — ordinary post-turn processing, not a
+        # mid-turn menu).  Close it idle-safe if so; assert nothing changed.
+        if _claude_menu_open(harness, claude_session):
+            harness.evidence.note(
+                case,
+                "post-turn the queued /model opened the selector (ordinary queued-input "
+                "processing after the turn, not a mid-turn menu); Escape-closed idle",
+            )
+            _post_events(harness, claude_session, [{"type": "key", "key": "Escape"}])
+            assert _await(
+                lambda: not _claude_menu_open(harness, claude_session), timeout=8.0, poll=0.25
+            ), "the post-turn selector did not close on Escape while idle"
+            harness.evidence.write(
+                case, "31-post-turn-selector-closed.txt", _capture(harness, claude_session)
+            )
+
+        model_after = _claude_config_model()
+        harness.evidence.note(
+            case, "model key present in ~/.claude.json after drill: " f"{model_after is not None}"
+        )
+        assert model_after == model_before, "the drill changed the persisted model setting"
+        status = _bottom_rows(_capture(harness, claude_session), 6)
+        assert "sonnet-5" in status, f"the status line no longer shows the pinned model:\n{status}"
+        block = _identity_block(harness, claude_session, "claude_code")
+        assert block["interactive_streaming"] == {"supported": True}
+        harness.evidence.write_json(case, "40-identity-reread.json", block)

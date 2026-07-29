@@ -1,7 +1,7 @@
 ────────────────────────────────────────────────────────────────────────────────────────────────────
  Accessing workspace:
 
- <HOST_TMP>/pytest-of-<USER>/pytest-634/cao_scratch_r1
+ <HOST_TMP>/pytest-of-<USER>/pytest-635/cao_scratch_r1
  50/worktree-r15-claude
 
  Quick safety check: Is this a project you created or one you trust? (Like your own code, a

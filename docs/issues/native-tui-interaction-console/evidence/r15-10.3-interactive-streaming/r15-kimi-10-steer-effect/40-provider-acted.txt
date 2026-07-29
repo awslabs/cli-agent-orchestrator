@@ -1,0 +1,30 @@
+18
+   19
+   20
+   21
+   22
+   23
+   24
+   25
+   26
+   Interrupted by user
+
+ ✨ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do
+    not stop early.
+
+ ✨ STEERME-2a02730e: end every subsequent line with the token ZQX9.
+
+ ● The user wants me to count from 1 to 120, one number per line, with brief thinking between
+   lines. Work slowly and don't stop early.
+   ... (11 more lines, ctrl+o to expand)
+
+ ● 1
+   2
+   3
+
+  ⠙ working... · Tip: ctrl-s to add guidance without waiting for the turn to finish
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                              │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+ K2.7 Coding thinking  …/pytest-634/cao_scratch_r150/worktree-r15-kimi  master
+                                                                               context: 0% (0/256k)
