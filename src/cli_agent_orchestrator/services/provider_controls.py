@@ -45,14 +45,19 @@ class ProviderControls(TypedDict):
     the source pointers behind every fact, so a reviewer can check the
     entry without re-walking the tree.
 
-    Lane C adds ``operator_message`` and ``image`` blocks to this shape
-    (§8.6) when it lands; they are absent until then.
+    Lane C's ``operator_message`` and ``image`` blocks (§8.6) follow the
+    same build-exact rule as ``steer_chords``: present for builds the
+    evidence covers (``SUPPORTED_VERSIONS``), ``None`` otherwise — an
+    unpinned build advertises no message/image capability rather than
+    inheriting another build's proof.
     """
 
     compact: Optional[List[Dict[str, Any]]]
     stop: Optional[List[Dict[str, Any]]]
     steer_chords: tuple
     dispatch_grace_ms: Optional[int]
+    operator_message: Optional[Dict[str, Any]]
+    image: Optional[Dict[str, Any]]
     evidence: Dict[str, Any]
 
 
@@ -62,6 +67,43 @@ def _text(value: str) -> Dict[str, Any]:
 
 def _key(name: str) -> Dict[str, Any]:
     return {"type": "key", "key": name}
+
+
+#: §8.3 pinned operation limits.  8192 is a spec pin (OD8: not a measured
+#: provider limit — Lane C live acceptance may lower it per evidence;
+#: raising it requires re-review).
+OPERATOR_MESSAGE_MAX_TEXT_BYTES = 8192
+OPERATOR_MESSAGE_MAX_ATTACHMENTS = 4
+
+#: §8.4 staging limits (the tightest documented downstream limit, Appendix
+#: A.9); consumed by the image-attachment store and advertised here.
+IMAGE_MAX_BYTES = 5 * 1024 * 1024
+IMAGE_MAX_WIDTH = 8000
+IMAGE_MAX_HEIGHT = 8000
+
+#: Kimi's pinned reference template (§8.6): the explicit ``ReadMediaFile``
+#: directive form, because that is the trigger form the pinned 0.29.2 live
+#: acceptance exercised (§10.6, round 3).  Bare-path substitution is
+#: unproven for kimi and is not claimed.
+KIMI_IMAGE_REFERENCE_TEMPLATE = (
+    "Use the ReadMediaFile tool to read the image file at {path} and "
+    "analyze it in the context of this message."
+)
+
+#: Claude's reference template: the documented path-in-prompt flow
+#: ("Provide an image path to Claude", Appendix A.9) — the path itself,
+#: inserted at the token position.
+CLAUDE_IMAGE_REFERENCE_TEMPLATE = "{path}"
+
+
+def _operator_message_block() -> Dict[str, Any]:
+    """The §8.6 operator-message advertisement (same limits for both)."""
+    return {
+        "supported": True,
+        "max_text_bytes": OPERATOR_MESSAGE_MAX_TEXT_BYTES,
+        "multiline": True,
+        "max_attachments": OPERATOR_MESSAGE_MAX_ATTACHMENTS,
+    }
 
 
 def _kimi_entry() -> ProviderControls:
@@ -83,6 +125,20 @@ def _kimi_entry() -> ProviderControls:
         # by advertised_provider_controls; never restated here.
         steer_chords=(),
         dispatch_grace_ms=int(control_input_service.NATIVE_KIMI_DISPATCH_GRACE_SECONDS * 1000),
+        operator_message=_operator_message_block(),
+        image={
+            "supported": True,
+            # PNG only: the pinned live proof (§10.6, round 3) covers PNG;
+            # every other format is refused as unproven rather than assumed
+            # (F9).
+            "formats": ["png"],
+            "max_bytes": IMAGE_MAX_BYTES,
+            "max_width": IMAGE_MAX_WIDTH,
+            "max_height": IMAGE_MAX_HEIGHT,
+            "mechanism": "staged-path-text",
+            "reference_template": KIMI_IMAGE_REFERENCE_TEMPLATE,
+            "evidence": "live acceptance on pinned 0.29.2 (§10.6)",
+        },
         evidence={
             "compact": "kimi_native_control.CONTROL_COMPACT (adapter pin, imported)",
             "stop": (
@@ -92,6 +148,15 @@ def _kimi_entry() -> ProviderControls:
             ),
             "steer_chords": "kimi_native_control._PROVEN_STEER_CHORDS (consumed, not copied)",
             "dispatch_grace_ms": "control_input_service.NATIVE_KIMI_DISPATCH_GRACE_SECONDS",
+            "operator_message": (
+                "adapter composer-newline plan, build-pinned for 0.29.0-0.29.2 "
+                "(kimi_native_control._PROVEN_COMPOSER_NEWLINE, consumed)"
+            ),
+            "image": (
+                "staged-path PNG via the provider's own ReadMediaFile, proven by "
+                "live acceptance on pinned 0.29.2 (design §10.6, round 3); the "
+                "reference template is the proven directive phrasing (§8.6)"
+            ),
         },
     )
 
@@ -105,10 +170,32 @@ def _claude_entry() -> ProviderControls:
         stop=[_key("Escape")],
         steer_chords=(),
         dispatch_grace_ms=None,
+        operator_message=_operator_message_block(),
+        image={
+            "supported": True,
+            # The documented set (Anthropic vision limits, Appendix A.9).
+            "formats": ["png", "jpeg", "gif", "webp"],
+            "max_bytes": IMAGE_MAX_BYTES,
+            "max_width": IMAGE_MAX_WIDTH,
+            "max_height": IMAGE_MAX_HEIGHT,
+            "mechanism": "staged-path-text",
+            "reference_template": CLAUDE_IMAGE_REFERENCE_TEMPLATE,
+            "evidence": (
+                "documented path-in-prompt flow (design Appendix A.9); " "live acceptance per §10.6"
+            ),
+        },
         evidence={
             "compact": "claude_native_control.CONTROL_COMPACT (adapter pin, imported)",
             "stop": 'providers/claude_code.py: the TUI shows "esc to interrupt"',
             "steer_chords": "no steer chord is pinned for any claude_code build",
+            "operator_message": (
+                "adapter composer-newline plan, build-pinned for 2.1.220 "
+                "(claude_native_control._PROVEN_COMPOSER_NEWLINE, consumed)"
+            ),
+            "image": (
+                "documented image-via-path flow (design Appendix A.9); CAO-side "
+                "limits pinned per F9; live acceptance per §10.6"
+            ),
         },
     )
 
@@ -143,6 +230,8 @@ def _wire_shape(entry: ProviderControls) -> Dict[str, Any]:
     grow per-control facts without reshaping; keys whose value is absent
     for the provider (no dispatch grace, no compact) are omitted rather
     than nulled, matching the deployed additive-advertisement discipline.
+    Lane C's ``operator_message``/``image`` blocks (§8.6) follow the same
+    rule: present only when the entry carries them for this build.
     """
     block: Dict[str, Any] = {}
     if entry["compact"] is not None:
@@ -152,7 +241,48 @@ def _wire_shape(entry: ProviderControls) -> Dict[str, Any]:
     block["steer_chords"] = list(entry["steer_chords"])
     if entry["dispatch_grace_ms"] is not None:
         block["dispatch_grace_ms"] = entry["dispatch_grace_ms"]
+    if entry["operator_message"] is not None:
+        block["operator_message"] = dict(entry["operator_message"])
+    if entry["image"] is not None:
+        block["image"] = dict(entry["image"])
     return block
+
+
+#: Wire key → recovery-capability short name, for the SUPPORTED_VERSIONS
+#: lookup only.  The two namespaces are deliberately not merged
+#: (provider_contracts.py); the reverse map lives there as
+#: ``_WIRE_FOR_RECOVERY_NAME``.
+_SHORT_NAME_FOR_WIRE = {
+    provider_contracts.PROVIDER_KIMI_CLI: provider_contracts.PROVIDER_KIMI,
+    provider_contracts.PROVIDER_CLAUDE_CODE: provider_contracts.PROVIDER_CLAUDE,
+}
+
+
+def _build_supports_operator_message(provider: str, provider_version: Optional[str]) -> bool:
+    """Whether Lane C's message/image blocks are proven for this exact build.
+
+    Same fail-closed rule as steer chords: the evidence lives on pinned
+    builds, so an unpinned (or unresolved) build advertises no
+    ``operator_message``/``image`` blocks at all rather than inheriting a
+    build it never proved.  The §8.4 delivery matrix scopes kimi's image
+    support to the 0.29.x line — exactly ``SUPPORTED_VERSIONS``.
+
+    ``SUPPORTED_VERSIONS`` is keyed by the recovery-capability short names
+    (``kimi``/``claude``) while this registry speaks the canonical wire
+    keys (``kimi_cli``/``claude_code``); the crossing is written down once
+    here, mirroring ``_WIRE_FOR_RECOVERY_NAME``'s warning about the two
+    namespaces.
+    """
+    if provider_version is None:
+        return False
+    short = _SHORT_NAME_FOR_WIRE.get(provider)
+    if short is None:
+        return False
+    try:
+        normalized = provider_contracts.normalized_version(provider_version)
+    except Exception:
+        return False
+    return normalized in provider_contracts.SUPPORTED_VERSIONS.get(short, ())
 
 
 def controls_for(provider: str, provider_version: Optional[str]) -> Optional[ProviderControls]:
@@ -172,6 +302,9 @@ def controls_for(provider: str, provider_version: Optional[str]) -> Optional[Pro
     # into it here cannot leak a per-build set into a later call.
     entry = builder()
     entry["steer_chords"] = _adapter_steer_chords(provider, provider_version)
+    if not _build_supports_operator_message(provider, provider_version):
+        entry["operator_message"] = None
+        entry["image"] = None
     return entry
 
 

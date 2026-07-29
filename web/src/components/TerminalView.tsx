@@ -1,12 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ClipboardEvent } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
-import { X, Terminal as TermIcon } from 'lucide-react'
+import { X, Terminal as TermIcon, Paperclip, RotateCcw } from 'lucide-react'
 import {
   api,
   type ApiError,
+  type AttachmentRefusalBody,
   type ControlInputCapabilities,
+  type ImageAttachmentRecord,
   type MacroRecord,
 } from '../api'
 import { type SequenceEvent } from '../lib/sequenceRecorder'
@@ -59,6 +61,38 @@ const EXPECTED_IDENTITY_FIELDS = [
 // Refusal reasons that mean the pinned identity drifted; on these the
 // disarm explanation refetches identity so it names the new generation (§6.4).
 const IDENTITY_REFUSAL_CODES = new Set(['stale-generation', 'identity-mismatch', 'pane-dead'])
+
+// ── Lane C: image attachments (§8.4/§8.7) ─────────────────────────────
+
+// The editable draft token, per §8.4: `[Image #N]` is plain text the
+// operator can place, edit, or delete; the chip with the same N is its
+// visual twin.
+const IMAGE_TOKEN_PATTERN = /\[Image #(\d+)\]/g
+
+// One attachment in the composer draft: the server record once staged,
+// the local File for the thumbnail and for retrying a failed upload.
+interface DraftAttachment {
+  localId: string
+  token: number
+  file: File
+  previewUrl: string
+  state: 'staging' | 'ready' | 'failed'
+  record?: ImageAttachmentRecord
+  error?: string
+}
+
+const MIME_TO_FORMAT: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpeg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
 
 function isWheelMouseReport(data: string): boolean {
   const sgr = /^\x1b\[<(\d+);\d+;\d+[Mm]$/.exec(data)
@@ -158,6 +192,24 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   const engineRef = useRef<StreamingEngine | null>(null)
   const macrosButtonRef = useRef<HTMLButtonElement>(null)
   const streamingWsCloseRef = useRef<() => void>(() => {})
+
+  // ── Lane C: composer image attachments (§8.4/§8.7) ───────────────────
+  const [attachments, setAttachments] = useState<DraftAttachment[]>([])
+  // Announced via the visually-hidden aria-live region (§8.7 item 8).
+  const [attachmentNotice, setAttachmentNotice] = useState('')
+  const nextTokenRef = useRef(1)
+  const attachmentsRef = useRef<DraftAttachment[]>([])
+  attachmentsRef.current = attachments
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const composerInputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    // Object URLs are the only thing to release; records live server-side.
+    const current = attachmentsRef
+    return () => {
+      current.current.forEach(attachment => URL.revokeObjectURL(attachment.previewUrl))
+    }
+  }, [])
 
   useEffect(() => {
     managedRef.current = null
@@ -385,6 +437,220 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       } catch {
         setControlStatus(
           `${label}: response unavailable; control ${controlId} retained for reconciliation`,
+        )
+      }
+    } finally {
+      setControlBusy(false)
+    }
+  }
+
+  // ── Lane C: attachment staging and the operator-message send (§8.3-8.5) ──
+
+  const updateAttachment = (localId: string, patch: Partial<DraftAttachment>) => {
+    setAttachments(prev =>
+      prev.map(attachment =>
+        attachment.localId === localId ? { ...attachment, ...patch } : attachment,
+      ),
+    )
+  }
+
+  /** Insert `[Image #N]` at the caret and focus the composer. */
+  const insertTokenAtCaret = (token: number) => {
+    const marker = `[Image #${token}]`
+    const input = composerInputRef.current
+    const start = input && document.activeElement === input ? (input.selectionStart ?? message.length) : message.length
+    const end = input && document.activeElement === input ? (input.selectionEnd ?? message.length) : message.length
+    const next = message.slice(0, start) + marker + message.slice(end)
+    setMessage(next)
+    requestAnimationFrame(() => {
+      if (composerInputRef.current) {
+        composerInputRef.current.focus()
+        composerInputRef.current.selectionStart = start + marker.length
+        composerInputRef.current.selectionEnd = start + marker.length
+      }
+    })
+  }
+
+  const uploadAttachment = async (localId: string, file: File) => {
+    try {
+      const { attachment } = await api.uploadAttachment(terminalId, file)
+      // The token may have been deleted while the upload was in flight:
+      // stage it, then delete the orphaned record so nothing lingers.
+      if (!attachmentsRef.current.some(candidate => candidate.localId === localId)) {
+        void api.deleteAttachment(terminalId, attachment.attachment_id).catch(() => {})
+        return
+      }
+      updateAttachment(localId, { state: 'ready', record: attachment, error: undefined })
+      setAttachmentNotice(
+        `Image #${attachmentsRef.current.find(c => c.localId === localId)?.token}: ` +
+        `${attachment.display_filename}, ${formatBytes(attachment.size_bytes)}, ready`,
+      )
+    } catch (error) {
+      const apiError = error as ApiError
+      const body = apiError.body as AttachmentRefusalBody | undefined
+      const detail = body?.detail || apiError.detail || 'the upload failed'
+      updateAttachment(localId, {
+        state: 'failed',
+        record: body?.attachment,
+        error: detail,
+      })
+      setAttachmentNotice(`Image upload failed — ${detail}`)
+    }
+  }
+
+  const stageFiles = (files: File[]) => {
+    const advertised = imageBlock?.formats ?? []
+    for (const file of files) {
+      if (attachmentsRef.current.length >= maxAttachments) {
+        setControlStatus(
+          `at most ${maxAttachments} images ride one operator message; remove one first`,
+        )
+        break
+      }
+      const token = nextTokenRef.current++
+      const localId = crypto.randomUUID()
+      const format = MIME_TO_FORMAT[file.type]
+      const draft: DraftAttachment = {
+        localId,
+        token,
+        file,
+        previewUrl: URL.createObjectURL(file),
+        state: format && advertised.includes(format) ? 'staging' : 'failed',
+        error:
+          format && advertised.includes(format)
+            ? undefined
+            : `${file.type || 'this content type'} is not advertised by this provider ` +
+              `(${advertised.join(', ') || 'none'}); unproven formats are refused, not converted`,
+      }
+      insertTokenAtCaret(token)
+      setAttachments(prev => [...prev, draft])
+      if (draft.state === 'staging') {
+        setAttachmentNotice(`Image #${token} uploading…`)
+        void uploadAttachment(localId, file)
+      } else {
+        setAttachmentNotice(`Image #${token} refused — ${draft.error}`)
+      }
+    }
+  }
+
+  /** Remove the chip and its token; the server record is deleted best-effort. */
+  const removeAttachment = (target: DraftAttachment) => {
+    setMessage(prev => prev.replace(`[Image #${target.token}]`, ''))
+    if (target.record) {
+      void api.deleteAttachment(terminalId, target.record.attachment_id).catch(() => {})
+    }
+    URL.revokeObjectURL(target.previewUrl)
+    setAttachments(prev => prev.filter(attachment => attachment.localId !== target.localId))
+    setAttachmentNotice(`Image #${target.token} removed`)
+    composerInputRef.current?.focus()
+  }
+
+  const retryAttachment = (target: DraftAttachment) => {
+    if (target.record) {
+      void api.deleteAttachment(terminalId, target.record.attachment_id).catch(() => {})
+    }
+    updateAttachment(target.localId, { state: 'staging', record: undefined, error: undefined })
+    setAttachmentNotice(`Image #${target.token} uploading…`)
+    void uploadAttachment(target.localId, target.file)
+  }
+
+  /** Message edits detach any attachment whose token was deleted (§8.7.4). */
+  const handleMessageChange = (value: string) => {
+    setMessage(value)
+    const present = new Set(
+      [...value.matchAll(IMAGE_TOKEN_PATTERN)].map(match => Number(match[1])),
+    )
+    for (const attachment of attachmentsRef.current) {
+      if (!present.has(attachment.token)) {
+        if (attachment.record) {
+          void api.deleteAttachment(terminalId, attachment.record.attachment_id).catch(() => {})
+        }
+        URL.revokeObjectURL(attachment.previewUrl)
+        setAttachments(prev =>
+          prev.filter(candidate => candidate.localId !== attachment.localId),
+        )
+        setAttachmentNotice(`Image #${attachment.token} detached`)
+      }
+    }
+  }
+
+  const handleComposerPaste = (event: ClipboardEvent<HTMLInputElement>) => {
+    const files = Array.from(event.clipboardData?.files ?? [])
+    if (files.length === 0) return // plain-text paste: ordinary text paste
+    event.preventDefault()
+    if (!imageAttachAvailable) {
+      setControlStatus('image attachments are unavailable for this provider')
+      return
+    }
+    stageFiles(files)
+  }
+
+  /** The §8.3 send: one typed operation, one reconcile, never a resend. */
+  const runOperatorMessage = async () => {
+    const operationId = crypto.randomUUID()
+    const text = message
+    const tokenMap: Record<string, string> = {}
+    const attachmentIds: string[] = []
+    for (const attachment of attachmentsRef.current) {
+      if (attachment.record) {
+        tokenMap[String(attachment.token)] = attachment.record.attachment_id
+        attachmentIds.push(attachment.record.attachment_id)
+      }
+    }
+    setControlBusy(true)
+    setControlStatus(`operator message: submitting… (${operationId})`)
+    try {
+      const identity = await api.getControlIdentity(terminalId)
+      const response = await api.submitOperatorMessage(terminalId, {
+        operation_id: operationId,
+        text,
+        attachments: attachmentIds,
+        token_map: tokenMap,
+        expected_identity: pickExpectedIdentity(identity),
+      })
+      const outcome = String(response.outcome || 'unknown')
+      const reason = response.reason_code || response.reason_detail
+      setControlStatus(
+        `operator message: ${outcome} (${operationId})${reason ? ` — ${String(reason)}` : ''}`,
+      )
+      if (outcome === 'accepted') {
+        attachmentsRef.current.forEach(attachment => URL.revokeObjectURL(attachment.previewUrl))
+        setAttachments([])
+        nextTokenRef.current = 1
+        setMessage('')
+      }
+    } catch (error) {
+      const apiError = error as ApiError
+      if (apiError.status && CONTROL_UNSUPPORTED_STATUSES.has(apiError.status)) {
+        setControlStatus(
+          `operator message: unsupported (HTTP ${apiError.status})`
+          + (apiError.detail ? ` — ${apiError.detail}` : ''),
+        )
+        return
+      }
+      if (
+        apiError.status
+        && !CONTROL_AMBIGUOUS_STATUSES.has(apiError.status)
+        && apiError.status >= 400
+        && apiError.status < 500
+      ) {
+        setControlStatus(
+          `operator message: refused (HTTP ${apiError.status})`
+          + (apiError.detail ? ` — ${apiError.detail}` : ''),
+        )
+        return
+      }
+      // Lost response: exactly one exact-id reconcile, never a resend (§8.3).
+      try {
+        const response = await api.reconcileOperatorMessage(operationId)
+        const outcome = String(response.outcome || 'unknown')
+        const reason = response.reason_code || response.reason_detail
+        setControlStatus(
+          `operator message: ${outcome} (${operationId})${reason ? ` — ${String(reason)}` : ''}`,
+        )
+      } catch {
+        setControlStatus(
+          `operator message: response unavailable; operation ${operationId} retained for reconciliation`,
         )
       }
     } finally {
@@ -831,6 +1097,35 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       : null
   const composerBytes = new TextEncoder().encode(message).length
 
+  // ── Lane C composer routing (§8.5): one composer, two explicitly named
+  // operations — never silent truncation, never a surprise 422. A text-only
+  // single-line draft ≤ 512 bytes rides the deployed control-input path
+  // byte-identically; anything else uses the operator-message path when the
+  // provider advertises it, or disables Send with the reason when not (D9:
+  // the advertised capability, never a probe).
+  const operatorMessageBlock = providerControlEntry?.operator_message
+  const imageBlock = providerControlEntry?.image
+  const operatorMessageAvailable = operatorMessageBlock?.supported === true
+  const imageAttachAvailable = operatorMessageAvailable && imageBlock?.supported === true
+  const maxMessageBytes = operatorMessageBlock?.max_text_bytes ?? 8192
+  const maxAttachments = operatorMessageBlock?.max_attachments ?? 4
+  const hasAttachments = attachments.length > 0
+  const needsOperatorMessage =
+    hasAttachments || message.includes('\n') || composerBytes > MAX_COMPOSER_BYTES
+  const unresolvedAttachments = attachments.filter(attachment => attachment.state !== 'ready')
+  const overMessageLimit = needsOperatorMessage && composerBytes > maxMessageBytes
+  const hasContent = message.trim().length > 0 || hasAttachments
+  const canSend =
+    !controlBusy
+    && hasContent
+    && !(needsOperatorMessage && !operatorMessageAvailable)
+    && unresolvedAttachments.length === 0
+    && !overMessageLimit
+  const sendDraft = () => {
+    if (needsOperatorMessage) void runOperatorMessage()
+    else void runNativeControl(message.trim(), 'send')
+  }
+
   return (
     // marginTop: 0 — DashboardHome lays this view out as a later sibling
     // inside a `space-y-6` container, whose `> * + *` rule would otherwise
@@ -884,12 +1179,44 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
             />
           ) : (
             <div data-testid="composer-row" className="flex flex-wrap items-center gap-2">
+              {imageAttachAvailable && (
+                <>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept={imageBlock?.formats.map(format => `image/${format}`).join(',')}
+                    multiple
+                    className="hidden"
+                    aria-hidden="true"
+                    tabIndex={-1}
+                    data-testid="attachment-file-input"
+                    onChange={event => {
+                      const files = Array.from(event.target.files ?? [])
+                      if (files.length > 0) stageFiles(files)
+                      // Reset so picking the same file twice still fires.
+                      event.target.value = ''
+                    }}
+                  />
+                  <button
+                    type="button"
+                    aria-label="Attach an image"
+                    title={`Attach an image (${(imageBlock?.formats ?? []).join(', ')})`}
+                    disabled={controlBusy}
+                    onClick={() => fileInputRef.current?.click()}
+                    className="flex min-h-[36px] min-w-[36px] items-center justify-center rounded bg-gray-800 px-2 py-1.5 text-gray-200 transition-colors hover:bg-gray-700 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  >
+                    <Paperclip size={15} />
+                  </button>
+                </>
+              )}
               <input
+                ref={composerInputRef}
                 value={message}
-                onChange={event => setMessage(event.target.value)}
+                onChange={event => handleMessageChange(event.target.value)}
+                onPaste={handleComposerPaste}
                 onKeyDown={event => {
-                  if (event.key === 'Enter' && message.trim() && !controlBusy) {
-                    void runNativeControl(message.trim(), 'send')
+                  if (event.key === 'Enter' && canSend) {
+                    sendDraft()
                   }
                 }}
                 placeholder="Send a message to the native composer…"
@@ -897,8 +1224,8 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
                 className="min-w-0 flex-1 rounded border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none"
               />
               <button
-                disabled={controlBusy || !message.trim()}
-                onClick={() => void runNativeControl(message.trim(), 'send')}
+                disabled={!canSend}
+                onClick={sendDraft}
                 className="min-h-[36px] rounded bg-emerald-700 px-3 py-1.5 text-xs text-white transition-colors hover:bg-emerald-600 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
               >
                 Send
@@ -933,6 +1260,76 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
                 </button>
               )}
             </div>
+          )}
+          {!streamingArmed && attachments.length > 0 && (
+            <ul
+              role="list"
+              aria-label="Image attachments"
+              data-testid="attachment-strip"
+              className="flex max-h-14 items-stretch gap-2 overflow-x-auto"
+            >
+              {attachments.map(attachment => (
+                <li
+                  key={attachment.localId}
+                  className="flex items-center gap-1.5 rounded border border-gray-700 bg-gray-900 p-1"
+                >
+                  <span className="relative shrink-0">
+                    <img
+                      src={attachment.previewUrl}
+                      alt={
+                        `Image #${attachment.token}: ` +
+                        `${attachment.record?.display_filename ?? attachment.file.name}, ` +
+                        `${formatBytes(attachment.record?.size_bytes ?? attachment.file.size)}, ` +
+                        `${attachment.state === 'staging' ? 'uploading' : attachment.state}`
+                      }
+                      className="h-9 w-9 rounded object-cover"
+                    />
+                    <span
+                      aria-hidden="true"
+                      className="absolute -left-1 -top-1 rounded bg-emerald-800 px-1 text-[9px] font-semibold text-emerald-100"
+                    >
+                      {attachment.token}
+                    </span>
+                  </span>
+                  <span className="flex min-w-0 flex-col justify-center">
+                    <span className="max-w-28 truncate text-[10px] text-gray-300">
+                      {attachment.record?.display_filename ?? attachment.file.name}
+                    </span>
+                    {attachment.state === 'staging' && (
+                      <span className="text-[9px] text-gray-500">uploading…</span>
+                    )}
+                    {attachment.state === 'ready' && (
+                      <span className="text-[9px] text-emerald-400">ready</span>
+                    )}
+                    {attachment.state === 'failed' && (
+                      <span className="max-w-40 truncate text-[9px] text-amber-300" title={attachment.error}>
+                        {attachment.error ?? 'upload failed'}
+                      </span>
+                    )}
+                  </span>
+                  {attachment.state === 'failed' && (
+                    <button
+                      type="button"
+                      aria-label={`Retry image #${attachment.token} upload`}
+                      disabled={controlBusy}
+                      onClick={() => retryAttachment(attachment)}
+                      className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded text-gray-400 transition-colors hover:text-white disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    >
+                      <RotateCcw size={14} />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    aria-label={`Remove image #${attachment.token}`}
+                    disabled={controlBusy}
+                    onClick={() => removeAttachment(attachment)}
+                    className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded text-gray-500 transition-colors hover:text-white disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  >
+                    <X size={14} />
+                  </button>
+                </li>
+              ))}
+            </ul>
           )}
           {disarmInfo && !streamingArmed && (
             <div
@@ -988,15 +1385,37 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
             <span>Cancel, route, effort, and resume controls are unavailable for native TUI sessions.</span>
             <span className="min-w-0 truncate">{controlStatus}</span>
           </div>
-          <div className="text-[10px] text-gray-400">
-            delivers as control input · {composerBytes}/{MAX_COMPOSER_BYTES} B
-            {composerBytes > MAX_COMPOSER_BYTES && (
+          <div className="text-[10px] text-gray-400" data-testid="composer-route-status">
+            {needsOperatorMessage ? (
+              operatorMessageAvailable ? (
+                <>
+                  operator message — {formatBytes(composerBytes)}
+                  {hasAttachments &&
+                    `, ${attachments.length} image${attachments.length > 1 ? 's' : ''}`}
+                  {unresolvedAttachments.length > 0 && (
+                    <span className="text-amber-300"> — waiting on image uploads</span>
+                  )}
+                </>
+              ) : (
+                <span className="text-amber-300">
+                  operator message unavailable for this provider — this draft needs the
+                  operator-message path (&gt;{MAX_COMPOSER_BYTES} bytes, multiline, or an
+                  image), which this provider does not advertise
+                </span>
+              )
+            ) : (
+              <>delivers as control input · {composerBytes}/{MAX_COMPOSER_BYTES} B</>
+            )}
+            {overMessageLimit && (
               <span className="text-amber-300">
                 {' '}
-                — over the {MAX_COMPOSER_BYTES}-byte control-input limit; this draft will be
-                refused (a control input is a command or one short line, not a document)
+                — over the {maxMessageBytes}-byte operator-message limit; trim the draft
+                (it is refused whole, never silently truncated)
               </span>
             )}
+          </div>
+          <div aria-live="polite" className="sr-only" data-testid="attachment-notice">
+            {attachmentNotice}
           </div>
           {nativeControlResolved && !sequenceSupported && (
             <div className="text-[10px] text-gray-600">

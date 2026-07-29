@@ -26,6 +26,40 @@ STOP_EVENTS = [{"type": "key", "key": "Escape"}]
 
 KIMI_PINNED_BUILDS = ("0.29.0", "0.29.1", "0.29.2")
 
+# The §8.6 Lane C blocks, restated exactly (a test may pin a literal;
+# production code may not).
+OPERATOR_MESSAGE_BLOCK = {
+    "supported": True,
+    "max_text_bytes": 8192,
+    "multiline": True,
+    "max_attachments": 4,
+}
+KIMI_IMAGE_BLOCK = {
+    "supported": True,
+    "formats": ["png"],
+    "max_bytes": 5242880,
+    "max_width": 8000,
+    "max_height": 8000,
+    "mechanism": "staged-path-text",
+    "reference_template": (
+        "Use the ReadMediaFile tool to read the image file at {path} and "
+        "analyze it in the context of this message."
+    ),
+    "evidence": "live acceptance on pinned 0.29.2 (§10.6)",
+}
+CLAUDE_IMAGE_BLOCK = {
+    "supported": True,
+    "formats": ["png", "jpeg", "gif", "webp"],
+    "max_bytes": 5242880,
+    "max_width": 8000,
+    "max_height": 8000,
+    "mechanism": "staged-path-text",
+    "reference_template": "{path}",
+    "evidence": (
+        "documented path-in-prompt flow (design Appendix A.9); " "live acceptance per §10.6"
+    ),
+}
+
 
 class TestSendAuthority:
     """``controls_for`` resolves a provider at an exact build."""
@@ -123,11 +157,15 @@ class TestDiscoveryWireShape:
                 "stop": {"events": STOP_EVENTS},
                 "steer_chords": ["C-s"],
                 "dispatch_grace_ms": 5000,
+                "operator_message": OPERATOR_MESSAGE_BLOCK,
+                "image": KIMI_IMAGE_BLOCK,
             },
             CLAUDE: {
                 "compact": {"events": COMPACT_EVENTS},
                 "stop": {"events": STOP_EVENTS},
                 "steer_chords": [],
+                "operator_message": OPERATOR_MESSAGE_BLOCK,
+                "image": CLAUDE_IMAGE_BLOCK,
             },
         }
 
@@ -159,6 +197,8 @@ class TestPerTerminalBlock:
             "stop": {"events": STOP_EVENTS},
             "steer_chords": ["C-s"],
             "dispatch_grace_ms": 5000,
+            "operator_message": OPERATOR_MESSAGE_BLOCK,
+            "image": KIMI_IMAGE_BLOCK,
         }
 
     def test_an_unpinned_build_advertises_no_chords(self):
@@ -204,3 +244,61 @@ class TestEvidence:
         assert evidence["steer_chords"] == "no steer chord is pinned for any claude_code build"
         # No dispatch grace exists for claude, so no evidence names one.
         assert "dispatch_grace_ms" not in evidence
+
+
+class TestLaneCBlocks:
+    """The §8.6 additive capability blocks: build-exact like steer chords,
+    absent entirely where unproven (never nulled on the wire)."""
+
+    def test_kimi_image_is_png_only_with_the_proven_template(self):
+        block = provider_controls.controls_block_for(KIMI, "0.29.2")
+        assert block["image"] == KIMI_IMAGE_BLOCK
+        # The pinned directive phrasing, because that is the trigger form
+        # the pinned 0.29.2 live acceptance exercised (§8.6): bare-path
+        # substitution is unproven for kimi and is not claimed.
+        assert "{path}" in block["image"]["reference_template"]
+        assert block["image"]["reference_template"].startswith("Use the ReadMediaFile tool")
+
+    def test_claude_image_advertises_the_documented_formats(self):
+        block = provider_controls.controls_block_for(CLAUDE, "2.1.220")
+        assert block["image"] == CLAUDE_IMAGE_BLOCK
+        assert block["image"]["reference_template"] == "{path}"
+
+    @pytest.mark.parametrize("build", KIMI_PINNED_BUILDS)
+    def test_every_supported_kimi_build_advertises_message_and_image(self, build):
+        block = provider_controls.controls_block_for(KIMI, build)
+        assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
+        assert block["image"] == KIMI_IMAGE_BLOCK
+
+    def test_operator_message_limits_are_the_spec_pins(self):
+        block = provider_controls.controls_block_for(CLAUDE, "2.1.220")
+        assert block["operator_message"]["max_text_bytes"] == 8192
+        assert block["operator_message"]["multiline"] is True
+        assert block["operator_message"]["max_attachments"] == 4
+
+    def test_an_unpinned_build_omits_the_blocks_entirely(self):
+        """Fail closed like steer chords: no proof for this build, so no
+        advertisement — and the wire omits the keys rather than nulling."""
+        entry = provider_controls.controls_for(KIMI, "9.9.9")
+        assert entry["operator_message"] is None
+        assert entry["image"] is None
+        block = provider_controls.controls_block_for(KIMI, "9.9.9")
+        assert "operator_message" not in block
+        assert "image" not in block
+
+    def test_an_unknown_version_omits_the_blocks(self):
+        block = provider_controls.controls_block_for(KIMI, None)
+        assert "operator_message" not in block
+        assert "image" not in block
+
+    def test_a_provider_without_an_entry_advertises_no_blocks(self):
+        assert provider_controls.controls_block_for("codex", "0.145.0") is None
+
+    def test_the_entries_name_their_lane_c_evidence(self):
+        kimi_evidence = provider_controls.controls_for(KIMI, "0.29.2")["evidence"]
+        assert "ReadMediaFile" in kimi_evidence["image"]
+        assert "0.29.2" in kimi_evidence["image"]
+        assert "_PROVEN_COMPOSER_NEWLINE" in kimi_evidence["operator_message"]
+        claude_evidence = provider_controls.controls_for(CLAUDE, "2.1.220")["evidence"]
+        assert "Appendix A.9" in claude_evidence["image"]
+        assert "_PROVEN_COMPOSER_NEWLINE" in claude_evidence["operator_message"]

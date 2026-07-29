@@ -62,7 +62,11 @@ KEYSTROKE_PLAN_SCHEMA = "cao-claude-native-keystroke-plan-v1"
 KIND_QUEUE = "queue"
 KIND_STEER = "steer"
 KIND_CONTROL = "control"
-KINDS = (KIND_QUEUE, KIND_STEER, KIND_CONTROL)
+#: Lane C (design §8.3): one text+image operator message, journaled and
+#: gated exactly like a queue operation but replaying on the caller's
+#: whole-request digest.
+KIND_OPERATOR_MESSAGE = "operator-message"
+KINDS = (KIND_QUEUE, KIND_STEER, KIND_CONTROL, KIND_OPERATOR_MESSAGE)
 
 INTENDED = "intended"
 POSTED = "posted"
@@ -974,6 +978,84 @@ def queue(
                 REFUSED_ACTIVE_TURN,
                 f"turn {observed['active_turn_id']} is active; ordinary follow-up waits for "
                 f"idle. A deliberate mid-turn message is a steer, requested explicitly",
+            )
+    except _Refusal as refusal:
+        return _refuse(binding["operation_id"], refusal)
+
+    return _post(operation_id=binding["operation_id"], plan=plan, transport=transport)
+
+
+def operator_message(
+    *,
+    operation_id: str,
+    native_session_id: str,
+    terminal_id: str,
+    generation: str,
+    execution_mode: str,
+    text: str,
+    payload_sha256: str,
+    observation: Mapping[str, Any],
+    transport: NativeControlTransport,
+    provider_version: Optional[str] = None,
+) -> dict[str, Any]:
+    """Submit one operator message (long text, multi-line, image references).
+
+    Lane C's typed operation (design §8.3): the same journaling, gating,
+    and at-most-once discipline as :func:`queue`, with two deliberate
+    differences:
+
+    - ``payload_sha256`` is supplied by the caller and digests the *whole
+      request* (draft text + attachment ids + token map), not just the
+      provider-bound text.  The replay identity of an operator message is
+      everything the operator sent, so a same-id request whose attachments
+      changed is a conflict, not a replay.
+    - ``text`` arrives already reference-substituted by the
+      operator-message service (staged image paths per the registry's
+      ``reference_template``).  This adapter types what it is given; which
+      bytes name an image is the service's contract.
+
+    The caller (operator-message service) holds the pane-input lease, has
+    already re-proven identity under it, and gates idle itself; the
+    observed-idle assertion here is the same defense in depth queue keeps.
+    """
+    binding = _validate_binding(
+        operation_id=operation_id,
+        native_session_id=native_session_id,
+        terminal_id=terminal_id,
+        generation=generation,
+        execution_mode=execution_mode,
+    )
+    plan = plan_composer_keystrokes(text, provider_version=provider_version, field="text")
+    observed = _validated_turn_observation(observation)
+
+    record, is_new = _open(
+        kind=KIND_OPERATOR_MESSAGE,
+        binding=binding,
+        turn_id=None,
+        payload_sha256=payload_sha256,
+        observation=observed,
+        keystroke_plan=plan,
+    )
+    if not is_new:
+        return record
+
+    try:
+        _assert_session_unblocked(
+            native_session_id=binding["native_session_id"],
+            operation_id=binding["operation_id"],
+        )
+        _assert_attachment_owner(
+            native_session_id=binding["native_session_id"],
+            terminal_id=binding["terminal_id"],
+            generation=binding["generation"],
+            execution_mode=binding["execution_mode"],
+        )
+        _assert_deliverable(plan)
+        if observed["active_turn_id"] is not None:
+            raise _Refusal(
+                REFUSED_ACTIVE_TURN,
+                f"turn {observed['active_turn_id']} is active; an operator message waits "
+                "for idle, exactly as the control-input readiness gate requires",
             )
     except _Refusal as refusal:
         return _refuse(binding["operation_id"], refusal)

@@ -86,9 +86,38 @@ export interface ControlInputPost {
   expected_identity?: Record<string, unknown>;
 }
 
+export interface OperatorMessagePost {
+  operation_id: string;
+  text: string;
+  attachments: string[];
+  token_map: Record<string, string>;
+  expected_identity?: Record<string, unknown>;
+}
+
+export interface StubAttachment {
+  attachment_id: string;
+  terminal_id: string;
+  state: string;
+  format: string;
+  width: number;
+  height: number;
+  size_bytes: number;
+  display_filename: string;
+  bound_operation_id: string | null;
+  error: null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface StubHarness {
   /** Every POST body the app sent to /terminals/{id}/control-input. */
   controlInputPosts: ControlInputPost[];
+  /** Every POST body the app sent to /terminals/{id}/operator-message (§8.3). */
+  operatorMessagePosts: OperatorMessagePost[];
+  /** Every attachment upload the app POSTed (multipart bodies; §8.4). */
+  attachmentUploads: Array<{ size: number }>;
+  /** The in-memory attachment records behind the §8.4 routes. */
+  attachments: StubAttachment[];
   /** In-memory macro library behind /macros (mutations work). */
   macros: StubMacro[];
 }
@@ -121,9 +150,15 @@ function json(route: Route, body: unknown, status = 200): Promise<void> {
 
 export async function stubBackend(page: Page, options?: {
   macros?: StubMacro[];
+  /** §8.6: omit the operator_message/image blocks (old-server degradation). */
+  laneC?: boolean;
 }): Promise<StubHarness> {
+  const laneC = options?.laneC ?? true;
   const harness: StubHarness = {
     controlInputPosts: [],
+    operatorMessagePosts: [],
+    attachmentUploads: [],
+    attachments: [],
     macros: options?.macros ?? [
       builtin("compact"),
       builtin("stop"),
@@ -218,6 +253,27 @@ export async function stubBackend(page: Page, options?: {
             stop: { events: KIMI_STOP_EVENTS },
             steer_chords: ["C-s"],
             dispatch_grace_ms: 5000,
+            // §8.6 additive Lane C blocks (absent on old servers).
+            ...(laneC
+              ? {
+                  operator_message: {
+                    supported: true,
+                    max_text_bytes: 8192,
+                    multiline: true,
+                    max_attachments: 4,
+                  },
+                  image: {
+                    supported: true,
+                    formats: ["png"],
+                    max_bytes: 5242880,
+                    max_width: 8000,
+                    max_height: 8000,
+                    mechanism: "staged-path-text",
+                    reference_template:
+                      "Use the ReadMediaFile tool to read the image file at {path} and analyze it in the context of this message.",
+                  },
+                }
+              : {}),
           },
         },
         command_controls: { composer_nonempty_guard: true },
@@ -238,9 +294,92 @@ export async function stubBackend(page: Page, options?: {
           schema_versions: [1, 2, 3, 4],
           sequence: { keys: FULL_KEYS, max_events: 32, max_text_bytes: 512 },
           provider_controls: {
-            kimi_cli: { steer_chords: ["C-s"], dispatch_grace_ms: 5000 },
+            kimi_cli: {
+              steer_chords: ["C-s"],
+              dispatch_grace_ms: 5000,
+              ...(laneC
+                ? {
+                    operator_message: {
+                      supported: true,
+                      max_text_bytes: 8192,
+                      multiline: true,
+                      max_attachments: 4,
+                    },
+                    image: {
+                      supported: true,
+                      formats: ["png"],
+                      max_bytes: 5242880,
+                      max_width: 8000,
+                      max_height: 8000,
+                      mechanism: "staged-path-text",
+                    },
+                  }
+                : {}),
+            },
           },
         },
+      });
+    }
+    // Lane C routes (§8.3/§8.4). On an old server they 404 — the dashboard
+    // must degrade by hiding the affordances, never by retrying.
+    if (!laneC && (path.endsWith("/attachments") || path.includes("/attachments/")
+      || path.endsWith("/operator-message") || path.startsWith("/operator-message/"))) {
+      return json(route, { detail: "not found" }, 404);
+    }
+    if (path === "/terminals/t-native/attachments" && method === "POST") {
+      const raw = request.postDataBuffer() ?? Buffer.alloc(0);
+      harness.attachmentUploads.push({ size: raw.length });
+      const record: StubAttachment = {
+        attachment_id: `att-${harness.attachments.length + 1}`,
+        terminal_id: "t-native",
+        state: "ready",
+        format: "png",
+        width: 120,
+        height: 80,
+        size_bytes: 213,
+        display_filename: "shot.png",
+        bound_operation_id: null,
+        error: null,
+        created_at: "2026-07-29T00:00:00Z",
+        updated_at: "2026-07-29T00:00:00Z",
+      };
+      harness.attachments.push(record);
+      return json(route, { attachment: record }, 201);
+    }
+    if (path === "/terminals/t-native/attachments" && method === "GET") {
+      return json(route, {
+        attachments: harness.attachments.filter((a) => a.state !== "removed"),
+      });
+    }
+    const attachmentMatch = /^\/terminals\/t-native\/attachments\/(.+)$/.exec(path);
+    if (attachmentMatch && method === "DELETE") {
+      const record = harness.attachments.find((a) => a.attachment_id === attachmentMatch[1]);
+      if (!record) return json(route, { detail: "no image attachment" }, 404);
+      record.state = "removed";
+      return json(route, { deleted: true, attachment: record });
+    }
+    if (path === "/terminals/t-native/operator-message" && method === "POST") {
+      const body = request.postDataJSON() as OperatorMessagePost;
+      harness.operatorMessagePosts.push(body);
+      for (const attachment of harness.attachments) {
+        if (body.attachments?.includes(attachment.attachment_id)) {
+          attachment.state = "submitted";
+          attachment.bound_operation_id = body.operation_id;
+        }
+      }
+      return json(route, {
+        operation_id: body.operation_id,
+        outcome: "accepted",
+        reason_code: "delivered",
+        record_state: "posted",
+        replayed: false,
+      });
+    }
+    if (path.startsWith("/operator-message/")) {
+      return json(route, {
+        outcome: "ambiguous",
+        reason_code: "response-lost",
+        detail: "the operation was journaled but no transport record exists",
       });
     }
     if (path === "/terminals/t-native/control-input" && method === "POST") {
