@@ -102,7 +102,7 @@ class TestSendAuthority:
 
     @pytest.mark.parametrize(
         "provider,version",
-        [(provider_contracts.PROVIDER_CODEX, "0.145.0"), ("no_such_provider", "1.0")],
+        [(provider_contracts.PROVIDER_CODEX, "0.146.0"), ("no_such_provider", "1.0")],
     )
     def test_a_provider_without_a_native_adapter_has_no_entry(self, provider, version):
         """No adapter and no launch binder means no Compact/Stop/Steer is
@@ -222,7 +222,7 @@ class TestPerTerminalBlock:
 
     def test_a_provider_without_an_entry_has_no_block(self):
         codex = provider_contracts.PROVIDER_CODEX
-        assert provider_controls.controls_block_for(codex, "0.145.0") is None
+        assert provider_controls.controls_block_for(codex, "0.146.0") is None
 
 
 class TestEvidence:
@@ -329,7 +329,7 @@ class TestLaneCBlocks:
         assert "image" not in block
 
     def test_a_provider_without_an_entry_advertises_no_blocks(self):
-        assert provider_controls.controls_block_for("codex", "0.145.0") is None
+        assert provider_controls.controls_block_for("codex", "0.146.0") is None
 
     def test_the_entries_name_their_lane_c_evidence(self):
         kimi_evidence = provider_controls.controls_for(KIMI, "0.29.2")["evidence"]

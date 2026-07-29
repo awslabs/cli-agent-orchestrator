@@ -16,7 +16,7 @@ from cli_agent_orchestrator.providers.codex import (
     render_trusted_project_override,
 )
 
-SUPPORTED_CODEX_VERSION = "codex-cli 0.145.0"
+SUPPORTED_CODEX_VERSION = "codex-cli 0.146.0"
 PROBE_VERSION = "codex-trust-route-v1"
 
 

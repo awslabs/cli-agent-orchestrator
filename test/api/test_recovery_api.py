@@ -383,7 +383,7 @@ def _write_codex_route_receipt(home, generation, digest, **changes):
         "protocol": "app-server/1",
         "event_sequence": 1,
         "model_input_digest": digest,
-        "provider_version": "codex 0.145.0",
+        "provider_version": "codex 0.146.0",
     }
     args.update(changes)
     return route_receipts.write_route_receipt(**args)
@@ -400,7 +400,7 @@ def test_recovery_capabilities_consumes_provider_route_receipts(
     monkeypatch.setattr(
         api_main,
         "_provider_version_output",
-        lambda binary: "codex 0.145.0" if binary == "codex" else None,
+        lambda binary: "codex 0.146.0" if binary == "codex" else None,
     )
     _write_codex_route_receipt(home, generation, digest)
 
@@ -428,7 +428,7 @@ def test_recovery_capabilities_rejects_drifted_or_unjournaled_route_evidence(
     monkeypatch.setattr(
         api_main,
         "_provider_version_output",
-        lambda binary: "codex 0.145.0" if binary == "codex" else None,
+        lambda binary: "codex 0.146.0" if binary == "codex" else None,
     )
     # An authenticated receipt whose model input was never journaled for
     # this generation is not authority.

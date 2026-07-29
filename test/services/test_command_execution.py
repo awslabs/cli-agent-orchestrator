@@ -64,7 +64,7 @@ class TestExecutionPins:
         assert npi.command_execution_pin_for("kimi_cli", "0.29.0") is None
         assert npi.command_execution_pin_for("kimi_cli", "0.29.1") is None
         assert npi.command_execution_pin_for("claude_code", "2.1.218") is None
-        assert npi.command_execution_pin_for("codex", "0.145.0") is None
+        assert npi.command_execution_pin_for("codex", "0.146.0") is None
         assert npi.command_execution_pin_for(None, "0.29.2") is None
 
     def test_version_banners_normalize(self):

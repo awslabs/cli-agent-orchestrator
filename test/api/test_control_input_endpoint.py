@@ -1239,7 +1239,7 @@ class TestAdditiveCapabilities:
         monkeypatch.setattr(
             service,
             "resolve_control_identity",
-            lambda tid: _kimi_resolved(provider="codex", provider_version="0.145.0"),
+            lambda tid: _kimi_resolved(provider="codex", provider_version="0.146.0"),
         )
         block = client.get(f"/terminals/{TERMINAL}/control-identity").json()["control_input"]
         assert "provider_controls" not in block

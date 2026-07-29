@@ -51,7 +51,7 @@ PROVIDER_CLAUDE_CODE = "claude_code"
 #: more specific fact.  ``SUPPORTED_VERSIONS`` below is the acceptance
 #: authority; this map is the representative head of each accepted tuple.
 PINNED_VERSIONS = {
-    PROVIDER_CODEX: "0.145.0",
+    PROVIDER_CODEX: "0.146.0",
     PROVIDER_KIMI: "0.30.0",
     PROVIDER_CLAUDE: "2.1.220",
 }
@@ -78,8 +78,14 @@ PINNED_VERSIONS = {
 #: has ever been minted, so there is no existing receipt that retaining it
 #: would keep valid — it would only assert that a build nobody has read
 #: the composer behaviour of is acceptable.
+#:
+#: Codex accepts only ``0.146.0``.  Its generated app-server schemas were
+#: compared with ``0.145.0`` for every method CAO uses: ``initialize``,
+#: ``config/read``, ``thread/start``, ``turn/start``, and ``turn/interrupt``.
+#: Their required request and consumed response fields are unchanged; the
+#: observed differences are property ordering or additive optional fields.
 SUPPORTED_VERSIONS: dict[str, tuple[str, ...]] = {
-    PROVIDER_CODEX: ("0.145.0",),
+    PROVIDER_CODEX: ("0.146.0",),
     PROVIDER_KIMI: ("0.30.0", "0.29.2", "0.29.1", "0.29.0"),
     PROVIDER_CLAUDE: ("2.1.220",),
 }
@@ -323,7 +329,7 @@ class ResumeFormRefused(ProviderContractError):
 def normalized_version(installed_version: str) -> str:
     """The first semver-shaped token in a ``<name> <version> ...`` banner.
 
-    ``"codex 0.145.0"``, ``"2.1.220 (Claude Code)"``, ``"kimi 0.29.1"`` all
+    ``"codex 0.146.0"``, ``"2.1.220 (Claude Code)"``, ``"kimi 0.29.1"`` all
     yield the bare version; an absent one yields ``""``.  Exposed so a
     caller can record the *actual* validated version rather than a pin
     constant that may name the wrong one of several accepted builds.

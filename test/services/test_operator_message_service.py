@@ -285,7 +285,7 @@ class TestIdentityAndCapabilityGates:
         monkeypatch.setattr(
             cis,
             "resolve_control_identity",
-            lambda tid: _resolved(provider="codex", provider_version="0.145.0"),
+            lambda tid: _resolved(provider="codex", provider_version="0.146.0"),
         )
         expected = {**EXPECTED, "provider": "codex"}
         result = _submit(expected_identity=expected)
@@ -894,7 +894,7 @@ class TestUploadGating:
         monkeypatch.setattr(
             cis,
             "resolve_control_identity",
-            lambda tid: _resolved(provider="codex", provider_version="0.145.0"),
+            lambda tid: _resolved(provider="codex", provider_version="0.146.0"),
         )
         with pytest.raises(oms.AttachmentRefusal) as excinfo:
             oms.upload_attachment(TERMINAL, display_filename="a.png", content=b"x")

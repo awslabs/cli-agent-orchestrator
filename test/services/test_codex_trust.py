@@ -16,12 +16,12 @@ from cli_agent_orchestrator.services.codex_trust import (
 )
 
 
-def test_supported_codex_version_is_exactly_0145_0():
+def test_supported_codex_version_is_exactly_0146_0():
     # The fail-closed gate pins exactly one codex-cli banner — currently
-    # 0.145.0 — never a range, minimum, or wildcard. Move the constant and
+    # 0.146.0 — never a range, minimum, or wildcard. Move the constant and
     # this test together, and only after a version-specific app-server
     # protocol audit of the methods the bridge and trust probe use.
-    assert codex_trust.SUPPORTED_CODEX_VERSION == "codex-cli 0.145.0"
+    assert codex_trust.SUPPORTED_CODEX_VERSION == "codex-cli 0.146.0"
 
 
 def _app_server_stdout(root: str) -> str:
@@ -77,7 +77,7 @@ def test_probe_verifies_config_origin_route_and_zero_turn(tmp_path, monkeypatch)
 
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
-        return SimpleNamespace(returncode=0, stdout="codex-cli 0.145.0\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="codex-cli 0.146.0\n", stderr="")
 
     def fake_app_server(argv, requests, timeout):
         calls.append((argv, {"requests": requests, "timeout": timeout}))
@@ -118,7 +118,7 @@ def test_probe_fails_closed_on_version_drift(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout="codex-cli 0.145.1\n", stderr=""
+            returncode=0, stdout="codex-cli 0.146.1\n", stderr=""
         ),
     )
     with pytest.raises(CodexTrustProbeError, match="unsupported Codex version"):
@@ -130,8 +130,8 @@ def test_probe_fails_closed_on_version_drift(tmp_path, monkeypatch):
         )
 
 
-def test_probe_fails_closed_on_previous_pin_0144_6(tmp_path, monkeypatch):
-    # The previously pinned banner (0.144.6) must fail closed once the pin
+def test_probe_fails_closed_on_previous_pin_0145_0(tmp_path, monkeypatch):
+    # The previously pinned banner (0.145.0) must fail closed once the pin
     # has moved: the gate is an exact-version check, never a range or a
     # minimum.
     target = tmp_path / "worktree"
@@ -139,12 +139,12 @@ def test_probe_fails_closed_on_previous_pin_0144_6(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout="codex-cli 0.144.6\n", stderr=""
+            returncode=0, stdout="codex-cli 0.145.0\n", stderr=""
         ),
     )
     with pytest.raises(
         CodexTrustProbeError,
-        match=r"unsupported Codex version 'codex-cli 0\.144\.6'; expected 'codex-cli 0\.145\.0'",
+        match=r"unsupported Codex version 'codex-cli 0\.145\.0'; expected 'codex-cli 0\.146\.0'",
     ):
         attest_trusted_project(
             str(target.resolve()),

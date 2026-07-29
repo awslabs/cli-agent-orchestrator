@@ -116,7 +116,7 @@ def test_codex_readiness_and_submission_share_exact_provider_process(tmp_path, m
     monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
     monkeypatch.setattr(bridge, "_RpcProcess", fake_rpc)
     monkeypatch.setattr(bridge, "_contains_session_flags", lambda _: True)
-    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "codex-cli 0.145.0")
+    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "codex-cli 0.146.0")
     monkeypatch.setattr(bridge, "_file_digest_or_absent", lambda _: "d" * 64)
 
     session = bridge._ProviderSession(request)
@@ -147,17 +147,20 @@ def _fake_codex_executable(tmp_path, request, banner: str):
     return executable
 
 
-def test_codex_version_gate_accepts_exact_0145_0(tmp_path, monkeypatch):
+def test_codex_version_gate_accepts_exact_0146_0(tmp_path, monkeypatch):
     # The real fail-closed gate (no _version stub) accepts the pinned
-    # codex-cli 0.145.0 banner exactly.
+    # codex-cli 0.146.0 banner exactly.
     request = _request(tmp_path)
-    executable = _fake_codex_executable(tmp_path, request, "codex-cli 0.145.0")
+    executable = _fake_codex_executable(tmp_path, request, "codex-cli 0.146.0")
     monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
     session = bridge._ProviderSession(request)
-    assert session._version(str(executable), bridge.SUPPORTED_CODEX_VERSION) == "codex-cli 0.145.0"
+    assert session._version(str(executable), bridge.SUPPORTED_CODEX_VERSION) == "codex-cli 0.146.0"
 
 
-@pytest.mark.parametrize("banner", ["codex-cli 0.144.6", "codex-cli 0.145.1", "codex 0.145.0"])
+@pytest.mark.parametrize(
+    "banner",
+    ["codex-cli 0.145.0", "codex-cli 0.146.1", "codex 0.146.0"],
+)
 def test_codex_version_gate_fails_closed_off_pin(tmp_path, monkeypatch, banner):
     # The retired pin, an adjacent patch, and a renamed banner all fail
     # closed — the gate is exact, never a range, minimum, or prefix match.
@@ -304,7 +307,7 @@ def _codex_session(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
     monkeypatch.setattr(bridge, "_RpcProcess", _CodexRpc)
     monkeypatch.setattr(bridge, "_contains_session_flags", lambda _: True)
-    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "codex-cli 0.145.0")
+    monkeypatch.setattr(bridge._ProviderSession, "_version", lambda *_: "codex-cli 0.146.0")
     monkeypatch.setattr(bridge, "_file_digest_or_absent", lambda _: "d" * 64)
     session = bridge._ProviderSession(request)
     session.initialize()
@@ -564,7 +567,7 @@ def _v2_session(tmp_path, monkeypatch):
     session.provider = request["provider"]
     session.rpc = object()
     session.provider_session_id = "thread_provider_opaque"
-    session.readiness = {"provider_version": "0.145.0"}
+    session.readiness = {"provider_version": "0.146.0"}
     session.current_model = request["model"]
     session.current_effort = request["effort"]
     session._current_turn_id = None

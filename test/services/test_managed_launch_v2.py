@@ -80,7 +80,7 @@ def _ready_bridge_state(record, monkeypatch):
         "provider_session_id": "thr_0192a7b4",
         "provider_receipt_kind": "codex-thread-start",
         "provider_transcript_sha256": "a" * 64,
-        "provider_version": "0.145.0",
+        "provider_version": "0.146.0",
         "model_input_ready": True,
         "reservation_id": record["reservation_id"],
         "terminal_id": record["terminal_id"],
