@@ -28,7 +28,10 @@ Fable lead delta gate at the amended head first; cond-0194 interactive
 streaming added in round 15 (§6.7, owner override: `payload_class:
 "interactive"` under schema v4 bypasses only the turn gate and dispatch
 grace — a focused Fable P1 delta gate is required before that amended
-contract merges)
+contract merges; r16 keeps its acceptance honest per build — Claude
+2.1.220 queues `/model`-class commands mid-turn rather than opening a
+menu (pinned provider limit, live-proven; Kimi's full menu/steer
+acceptance passes))
 
 Task ID: `native-tui-console/spec-initial-v1`
 
@@ -1232,7 +1235,10 @@ menus, issue Stop, and use supported steering. The previously observed
 `pane-busy` disarm of an armed streaming session in those states is a P1
 defect. Automated delivery (inbox, prose composer sends, macros, Lane C
 messages) remains separately readiness-gated and must never silently
-inherit this bypass.
+inherit this bypass. (Per-build menu honesty, r16: where a pinned build
+queues a `/model`-class command instead of opening a menu mid-turn —
+Claude 2.1.220, live-proven — the override means "the command queues and
+the turn continues", never a claimed menu action; §10.3.)
 
 - **Carrier (minimal, deployed-compatible):** a second defined value of
   the r7 v4 declaration field — `payload_class: "interactive"` under the
@@ -1295,9 +1301,25 @@ inherit this bypass.
 
 **Acceptance (§10.3):** active-turn disposable Kimi **and** Claude
 sessions: manual printable text lands (queued per provider semantics with
-an honest submission observation); navigation/menu sequences deliver;
-safe menu/model/effort cancellation works; Stop interrupts; kimi C-s
-steers mid-turn. True concurrent lease contention refuses and disarms.
+an honest submission observation); Stop interrupts. Menu behavior is
+**per-provider/build-pinned and honest** (r16, root-r15-claude-limit-125):
+
+- **Kimi 0.29.2 (live-proven):** active-turn menu navigation delivers and
+  `Escape` safe-cancels the menu; queued text followed by a declared
+  `C-s` is consumed (the steer effect). This is required acceptance and
+  it passes.
+- **Claude 2.1.220 (live-proven provider limit, not a CAO defect):** an
+  active-turn `/model` (or effort command) is **accepted and queued in
+  the native composer** — it does **not** open a model/effort menu. The
+  acceptance proves the command is queued, claims **no** menu open,
+  setting change, or menu cancellation, and shows the active turn
+  continuing unchanged. This is pinned provider behavior for this build;
+  it is never classified as a product P1 and never reported as a menu
+  success. Dashboard/provider-status honesty follows: where the pinned
+  build queues a command, UI and evidence say **"queued command"**, never
+  a menu action.
+
+True concurrent lease contention refuses and disarms.
 Stale identity and copy mode refuse with zero bytes. Response loss
 resolves by exact id, never resend. Managed websocket input stays
 wheel-only (resize is geometry). Old/new capability combinations behave
@@ -1954,12 +1976,23 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
   control unresolved (never "entered"), activated once by the Enter
   discipline; no second activation without the fresh identity+content
   proof.
-- **Interactive-streaming acceptance (cond-0194, §6.7):** active-turn
+- **Interactive-streaming acceptance (cond-0194, §6.7; menu behavior
+  per-provider-pinned per r16):** active-turn
   disposable Kimi **and** Claude sessions — manual printable text lands
   and is visibly queued per provider semantics (honest submission
-  observation, no inference); navigation/menu sequences deliver; safe
-  menu/model/effort cancellation works; Stop interrupts; kimi C-s steers
-  mid-turn. True concurrent lease contention refuses `pane-busy` and
+  observation, no inference); Stop interrupts.
+  **Kimi 0.29.2 (required, passes live):** active-turn menu navigation
+  delivers and `Escape` safe-cancels; queued text followed by declared
+  `C-s` is consumed (steer effect proven).
+  **Claude 2.1.220 (required honest-limit proof):** an active-turn
+  `/model` (or effort command) is accepted and **queued in the native
+  composer** — the acceptance proves the command queued, claims no menu
+  open, no setting change, and no menu cancellation, and shows the active
+  turn continuing unchanged. This is pinned provider behavior for this
+  build (root-r15-claude-limit-125), not a CAO identity/lease/interactive
+  failure; it is never classified as a product P1 and UI/evidence says
+  **"queued command"**, never a menu action. True concurrent lease
+  contention refuses `pane-busy` and
   disarms. Stale identity and copy mode refuse with zero bytes. Response
   loss resolves by exact id, never resend. Managed websocket input stays
   wheel-only (resize is geometry). Old/new capability combinations behave
@@ -2281,7 +2314,12 @@ jobs with the two projects of §10.5.
   a declared `payload_class: "interactive"` under existing schema v4
   bypasses **only** the turn-state gate and dispatch grace, with every
   other guard preserved and automation fenced out by declarer
-  discipline. Automated delivery remains readiness-gated.
+  discipline. Automated delivery remains readiness-gated. The r16
+  follow-up keeps acceptance honest per build: Kimi 0.29.2 active-turn
+  menu navigation + Escape cancel + queued-text→C-s steer passes live;
+  Claude 2.1.220 queues `/model`-class commands mid-turn without opening
+  a menu (pinned provider limit, not a CAO defect, never reported as a
+  menu success — UI/evidence says "queued command").
 
 ## 15. Challenges applied (per track mandate)
 
