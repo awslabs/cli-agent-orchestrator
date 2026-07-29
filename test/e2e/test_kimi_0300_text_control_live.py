@@ -252,6 +252,20 @@ def _start_long_count(harness: Harness, session: ProviderSession, target: int = 
     ), "the long counting turn never became observably active"
 
 
+def _ack_rows(transcript: str, ack: str) -> list:
+    """Fresh provider-output rows proving the steer effect (Sol r17).
+
+    Only the exact provider-output origin counts: kimi renders its answers
+    with the ``● `` response bullet, so the proof row is exactly
+    ``● {ack}``.  A BARE ``{ack}`` continuation row is NOT accepted — the
+    queued instruction can wrap so the ACK token lands alone on a
+    continuation row, and that echo shape must never satisfy the
+    predicate.  The ✨-marked instruction row and any wrapped echo carry
+    the ACK inline or bare, never bulleted with exact content.
+    """
+    return [row.strip() for row in transcript.splitlines() if row.strip() == f"● {ack}"]
+
+
 class TestKimi0300TextControl:
     """cond-0198: the exact 0.30.0 build accepts and executes the pinned
     text/control flow with truthful outcomes — image stays 0.29.2-only."""
@@ -362,13 +376,15 @@ class TestKimi0300TextControl:
     def test_05_declared_c_s_steer_effect_in_fresh_output(
         self, harness: Harness, kimi_0300_session: ProviderSession
     ):
-        """cond-0198 (steers 134/136): the declared C-s steer on 0.30.0
-        must prove the requested EFFECT — the provider consumes the queued
-        steer and acts on it, shown by the unique exact ACK line appearing
-        as its own fresh provider-output row.  The exact-line predicate can
-        never be satisfied by the instruction row, a wrapped queue/composer
-        echo, or the pre-steer capture; no second prompt carries the token,
-        so causality is the steer alone."""
+        """cond-0198 (steers 134/136; predicate hardened per Sol r17): the
+        declared C-s steer on 0.30.0 must prove the requested EFFECT — the
+        provider consumes the queued steer and acts on it, shown by the
+        unique exact ACK line appearing as its own fresh PROVIDER-BULLETED
+        output row (``● {ack}``).  A bare ACK continuation row is rejected:
+        the queued instruction can wrap its token onto one, and neither it,
+        the ✨ instruction row, nor pre-steer content may ever satisfy the
+        predicate; no second prompt carries the token, so causality is the
+        steer alone."""
         case = "kimi-0300-05-steer-effect"
         _start_long_count(harness, kimi_0300_session, target=500)
         assert _await(
@@ -393,17 +409,7 @@ class TestKimi0300TextControl:
         pre_steer = _capture(harness, kimi_0300_session)
         harness.evidence.write(case, "10-queued.txt", pre_steer)
 
-        def _ack_rows(transcript: str) -> list:
-            # The exact ACK as its OWN provider-output row.  Kimi renders
-            # its answers with the `● ` response bullet, so the proof row is
-            # `● {ack}` (or a bare `{ack}`); the ✨-marked instruction row
-            # and any wrapped echo carry the ACK inline within longer text,
-            # so they can never satisfy an exact-content row match.
-            return [
-                row.strip() for row in transcript.splitlines() if row.strip() in (ack, f"● {ack}")
-            ]
-
-        assert not _ack_rows(pre_steer), "the exact ACK line already existed before the steer"
+        assert not _ack_rows(pre_steer, ack), "the exact ACK line already existed before the steer"
         # The steer must land MID-TURN: if production already ended, the
         # drill proves nothing about a mid-turn steer (the first run's
         # timing artifact).  Fail the drill, not the provider, in that case.
@@ -422,13 +428,13 @@ class TestKimi0300TextControl:
         assert response["outcome"] == "accepted", response
 
         delivered = _await(
-            lambda: _ack_rows(_capture(harness, kimi_0300_session)),
+            lambda: _ack_rows(_capture(harness, kimi_0300_session), ack),
             timeout=300.0,
             poll=2.0,
         )
         acted = _capture(harness, kimi_0300_session)
         harness.evidence.write(case, "30-provider-acted.txt", acted)
-        effect_rows = _ack_rows(acted)
+        effect_rows = _ack_rows(acted, ack)
         if not effect_rows:
             harness.evidence.note(
                 case,
@@ -445,9 +451,10 @@ class TestKimi0300TextControl:
         harness.evidence.note(
             case,
             f"steer effect proven on 0.30.0: the exact ACK line {ack!r} appears as its "
-            f"own fresh provider-output row ({len(effect_rows)}x); it cannot be the "
-            "instruction row, a wrapped queue/composer echo, or pre-steer content, so "
-            "the provider consumed the queued C-s steer and acted on it",
+            f"own fresh PROVIDER-BULLETED output row ({len(effect_rows)}x, `● {ack}`); "
+            "a bare ACK continuation row, the instruction row, a wrapped "
+            "queue/composer echo, or pre-steer content can never satisfy the "
+            "predicate, so the provider consumed the queued C-s steer and acted on it",
         )
         _stop_turn(harness, kimi_0300_session)
 
