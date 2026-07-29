@@ -15,8 +15,12 @@ temp CAO_STATE_ROOT, real $HOME for provider auth):
   build-proven composer plan.
 * at-most-once: an identical same-id re-POST replays the journaled answer
   with zero new bytes (the marker appears exactly once in the transcript),
-  and a divergent same-id POST is request-rebound — the response-loss
-  drill's live half (the killed-response mapping itself is unit-covered).
+  and a divergent same-id POST is request-rebound.
+* killed response (§10.6, r1): the submit POST is sent over a raw socket
+  that closes without reading — the response is provably lost mid-submit
+  while the server completes the write — then one exact-id GET reconciles
+  to the journaled accepted answer and the transcript proves exactly one
+  provider write.
 * claude: a staged PNG reference reaches the composer and the provider
   can read the staged file.
 * kimi: a non-PNG upload is refused 422 attachment-type-unsupported.
@@ -31,9 +35,11 @@ Run with:
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import struct
+import tempfile
 import time
 import uuid
 import zlib
@@ -53,7 +59,7 @@ from test.e2e.test_native_tui_provider_acceptance import (
 )
 from test.fixtures.cao_server import _pick_free_port, _start_cao_server
 from test.fixtures.tmux_server import TmuxServer, isolated_tmux_server
-from typing import Dict, Iterator
+from typing import Dict, Iterator, List
 
 import pytest
 import requests
@@ -80,6 +86,30 @@ possible — one short sentence when you can.
 """
 
 EVIDENCE_ENV = "CAO_LANE_C_EVIDENCE_DIR"
+
+
+def _harvest_account_display_names(home_path: Path) -> List[str]:
+    """Account display-name tokens to redact from provider welcome banners,
+    read but never printed (the same harvest discipline as the email
+    tokens).  Covers the full display name and its first token, which is
+    the form the Claude banner renders."""
+    names: List[str] = []
+    try:
+        data = json.loads(
+            (home_path / ".claude.json").read_text(encoding="utf-8", errors="replace")
+        )
+    except (OSError, json.JSONDecodeError):
+        return []
+    account = data.get("oauthAccount")
+    if isinstance(account, dict):
+        for key in ("displayName", "organizationName"):
+            value = account.get(key)
+            if isinstance(value, str) and value.strip():
+                names.append(value.strip())
+                parts = value.strip().split()
+                if parts:
+                    names.append(parts[0])
+    return sorted(set(names), key=len, reverse=True)
 
 _SCRUB_EXACT = {
     "CAO_TERMINAL_ID",
@@ -178,9 +208,19 @@ def harness(tmp_path_factory: pytest.TempPathFactory, tmux_server: TmuxServer) -
     evidence.redact(str(state_root), "<STATE_ROOT>")
     evidence.redact(str(tmux_server.owned_root), "<TMUX_SOCKDIR>")
     evidence.redact(os.environ.get("USER", ""), "<USER>")
+    # The machine temp root itself (r1, cond steers 109/112): transcripts
+    # render box-truncated paths the exact scratch strings never match, so
+    # the tmp-root prefix is redacted wholesale — in BOTH the raw
+    # (/var/folders/...) and resolved (/private/var/folders/...) forms,
+    # because macOS symlinks /var and transcripts show the resolved one.
+    # A rerun cannot reintroduce raw tmp paths.
+    evidence.redact(tempfile.gettempdir(), "<HOST_TMP>")
+    evidence.redact(os.path.realpath(tempfile.gettempdir()), "<HOST_TMP>")
     for token in _harvest_email_tokens(
         [home_path / ".kimi-code" / "config.toml", home_path / ".claude.json"]
     ):
+        evidence.redact(token, "<ACCOUNT>")
+    for token in _harvest_account_display_names(home_path):
         evidence.redact(token, "<ACCOUNT>")
 
     assert tmux_server.owned_root is not None
@@ -336,6 +376,33 @@ def _wait_turn_done(
 def _marker_count(harness: Harness, session: ProviderSession, marker: str) -> int:
     screen = harness.tmux.out("capture-pane", "-p", "-S-400", "-t", session.pane_id)
     return screen.count(marker)
+
+
+def _post_killing_response(harness: Harness, path: str, body: Dict[str, object]) -> str:
+    """POST over a raw socket and close without reading: the response is
+    provably lost mid-submit while the server completes the write.
+
+    ``HTTPConnection.request`` blocks until every byte is written to the
+    socket, so the request is fully delivered; closing before any read
+    means the client can never see the answer (the server's response write
+    fails harmlessly after the submit completed).  This is the §10.6
+    killed-response drill — not a replay, not a short read timeout.
+    """
+    import http.client
+    import json as jsonlib
+    from urllib.parse import urlparse
+
+    url = urlparse(harness.server.url)
+    payload = jsonlib.dumps(body).encode()
+    connection = http.client.HTTPConnection(url.hostname, url.port, timeout=15)
+    connection.request(
+        "POST",
+        path,
+        body=payload,
+        headers={"Content-Type": "application/json", "Content-Length": str(len(payload))},
+    )
+    connection.close()
+    return "connection closed without reading the response (response killed mid-submit)"
 
 
 class TestKimiOperatorMessage:
@@ -511,6 +578,63 @@ class TestKimiOperatorMessage:
 
         # Exactly one submission of the marker ever reached the provider.
         assert _await(lambda: _marker_count(harness, kimi_session, marker) >= 1, timeout=60.0)
+        count = _marker_count(harness, kimi_session, marker)
+        harness.evidence.note(case, f"marker occurrences in transcript: {count}")
+        assert count == 1, f"marker appears {count} times — a duplicate submission happened"
+        harness.evidence.write(
+            case,
+            "10-transcript.txt",
+            harness.tmux.out("capture-pane", "-p", "-S-400", "-t", kimi_session.pane_id),
+        )
+        _wait_turn_done(harness, kimi_session)
+
+    def test_06_killed_response_mid_submit_reconciles_to_exactly_one_write(
+        self, harness: Harness, kimi_session: ProviderSession
+    ):
+        """§10.6 r1: response killed mid-submit → exact-id reconcile →
+        exactly one provider write (never an ordinary replay)."""
+        case = "kimi-06-killed-response"
+        _wait_turn_done(harness, kimi_session)
+        marker = f"KILLED-{uuid.uuid4().hex[:8]}"
+        operation_id = str(uuid.uuid4())
+        body: Dict[str, object] = {
+            "operation_id": operation_id,
+            "text": f"Reply with exactly the marker {marker} and nothing else.",
+            "attachments": [],
+            "token_map": {},
+            "expected_identity": _expected_identity(harness, kimi_session),
+        }
+        harness.evidence.write_json(
+            case,
+            "submit-killed-request.json",
+            {k: (v if k != "expected_identity" else "<9 fields bound>") for k, v in body.items()},
+        )
+
+        # The kill: the request is fully written, the connection closes
+        # before any read — the client provably never saw the answer.
+        note = _post_killing_response(
+            harness, f"/terminals/{kimi_session.terminal_id}/operator-message", body
+        )
+        harness.evidence.note(case, note)
+
+        # The submit continued server-side: the write reached the provider
+        # even though the response died.
+        assert _await(
+            lambda: _marker_count(harness, kimi_session, marker) >= 1,
+            timeout=TURN_TIMEOUT,
+            poll=2.0,
+        ), "the killed-response submit never reached the provider"
+
+        # Exactly one exact-id reconcile: the journaled accepted answer.
+        reconcile = requests.get(
+            f"{harness.server.url}/operator-message/{operation_id}", timeout=30
+        )
+        assert reconcile.status_code == 200
+        outcome = reconcile.json()
+        harness.evidence.write_json(case, "reconcile-response.json", outcome)
+        assert outcome["outcome"] == "accepted", outcome
+
+        # The marker count proves exactly one provider write happened.
         count = _marker_count(harness, kimi_session, marker)
         harness.evidence.note(case, f"marker occurrences in transcript: {count}")
         assert count == 1, f"marker appears {count} times — a duplicate submission happened"

@@ -362,11 +362,15 @@ export const api = {
       // v3 structured sequences: the request carries events OR the v1/v2
       // fields, never both.
       events?: WireEvent[]
-      // §4.1 command-class declaration: sent ONLY by the registry Compact
-      // built-in send (and supervisor/provider command controls), and only
-      // after the server advertises the command_controls block. Streaming,
-      // macros, and the prose composer never set it.
-      payload_class?: 'command'
+      // v4 declaration carrier. "command" (§4.1): sent ONLY by the registry
+      // Compact built-in send (and supervisor/provider command controls),
+      // and only after the server advertises the command_controls block.
+      // "interactive" (§6.7, r15): sent ONLY by the armed manual streaming
+      // capture, and only after the per-terminal, build-exact
+      // interactive_streaming block advertises support. Macros, favorites,
+      // the prose composer, operator messages, and inbox/automation never
+      // set either.
+      payload_class?: 'command' | 'interactive'
       expected_identity: Record<string, unknown>
     }
   ) =>

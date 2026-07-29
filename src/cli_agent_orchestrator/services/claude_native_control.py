@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Mapping, Optional, Protocol, cast
+from typing import Any, Callable, Mapping, Optional, Protocol, Tuple, cast
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services import native_attachment, provider_contracts
@@ -88,6 +88,14 @@ REFUSED_UNSUPPORTED_CONTROL = "unsupported_control"
 REFUSED_ATTACHMENT = "attachment_not_owned"
 REFUSED_UNRESOLVED_AMBIGUITY = "unresolved_ambiguity"
 REFUSED_UNPROVEN_COMPOSER_NEWLINE = "composer_newline_unproven"
+#: Lane C: the operator-message pre-write hook refused at the last safe
+#: pre-write point (after the journal claim and every deliverability/idle
+#: gate, immediately before the transport write), so zero bytes were
+#: typed.  These name the image-attachment store's answers there; the
+#: word "attachment" alone already means provider-session ownership in
+#: this module (``REFUSED_ATTACHMENT``).
+REFUSED_IMAGE_UNKNOWN = "image_attachment_unknown"
+REFUSED_IMAGE_NOT_READY = "image_attachment_not_ready"
 
 #: Slash commands this adapter will type. Held as an allow-list because a
 #: slash command is indistinguishable from message text at the transport,
@@ -997,6 +1005,7 @@ def operator_message(
     observation: Mapping[str, Any],
     transport: NativeControlTransport,
     provider_version: Optional[str] = None,
+    pre_write: Optional[Callable[[], Optional[Tuple[str, str]]]] = None,
 ) -> dict[str, Any]:
     """Submit one operator message (long text, multi-line, image references).
 
@@ -1017,6 +1026,15 @@ def operator_message(
     The caller (operator-message service) holds the pane-input lease, has
     already re-proven identity under it, and gates idle itself; the
     observed-idle assertion here is the same defense in depth queue keeps.
+
+    ``pre_write`` is the caller's last-safe-point hook (Lane C r1: the
+    image-attachment ``ready → submitted(operation_id)`` binding).  It runs
+    after the journal claim and every deliverability/idle gate, immediately
+    before the transport write.  Its answer is ``None`` to proceed or a
+    ``(refusal_reason, detail)`` pair — one of the ``REFUSED_IMAGE_*``
+    reasons — which is journaled as a typed refusal with zero bytes typed.
+    Once the hook succeeds the write proceeds; an ambiguity after that
+    point freezes the operation exactly as any post-claim uncertainty does.
     """
     binding = _validate_binding(
         operation_id=operation_id,
@@ -1059,6 +1077,17 @@ def operator_message(
             )
     except _Refusal as refusal:
         return _refuse(binding["operation_id"], refusal)
+
+    if pre_write is not None:
+        hook_refusal = pre_write()
+        if hook_refusal is not None:
+            reason, detail = hook_refusal
+            if reason not in (REFUSED_IMAGE_UNKNOWN, REFUSED_IMAGE_NOT_READY):
+                raise NativeControlInvalid(
+                    f"the pre-write hook answered with refusal reason {reason!r}, "
+                    "which is not one of the image-binding refusal reasons"
+                )
+            return _refuse(binding["operation_id"], _Refusal(reason, detail))
 
     return _post(operation_id=binding["operation_id"], plan=plan, transport=transport)
 

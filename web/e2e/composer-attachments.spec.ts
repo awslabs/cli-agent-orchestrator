@@ -19,21 +19,30 @@ const PNG_BYTES = Buffer.concat([
   Buffer.from([0x00, 0x00, 0x00, 0x00]),
 ]);
 
-async function pasteImage(page: import("@playwright/test").Page, name = "paste.png") {
-  await page.evaluate((fileName) => {
-    const input = document.querySelector<HTMLInputElement>(
-      'input[aria-label="Message to the native composer"]',
+async function pasteImages(page: import("@playwright/test").Page, names: string[]) {
+  // The paperclip marks the per-terminal identity controls resolved
+  // (image support advertised); pasting before it races the refusal path.
+  await expect(page.getByRole("button", { name: "Attach an image" })).toBeVisible();
+  await page.evaluate((fileNames) => {
+    const input = document.querySelector<HTMLTextAreaElement>(
+      '[aria-label="Message to the native composer"]',
     );
     if (!input) throw new Error("composer not mounted");
     const transfer = new DataTransfer();
-    transfer.items.add(new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], fileName, { type: "image/png" }));
+    for (const fileName of fileNames) {
+      transfer.items.add(new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], fileName, { type: "image/png" }));
+    }
     const event = new ClipboardEvent("paste", {
       clipboardData: transfer,
       bubbles: true,
       cancelable: true,
     });
     input.dispatchEvent(event);
-  }, name);
+  }, names);
+}
+
+async function pasteImage(page: import("@playwright/test").Page, name = "paste.png") {
+  await pasteImages(page, [name]);
 }
 
 test.describe("Lane C image composer (§8.7, §10.5)", () => {
@@ -103,6 +112,72 @@ test.describe("Lane C image composer (§8.7, §10.5)", () => {
     await expect(
       page.getByPlaceholder("Send a message to the native composer…"),
     ).toHaveValue("[Image #1]");
+  });
+
+  test("multiline: Shift+Enter composes, Enter sends over operator-message (P1.3)", async ({ page }) => {
+    const harness = await stubBackend(page);
+    await openNativeTerminal(page);
+
+    const composer = page.getByPlaceholder("Send a message to the native composer…");
+    await composer.fill("line one");
+    await expect(page.getByTestId("composer-route-status")).toContainText(
+      "delivers as control input",
+    );
+    // Shift+Enter is the newline gesture; the draft routes multiline.
+    await composer.press("Shift+Enter");
+    await composer.pressSequentially("line two");
+    await expect(composer).toHaveValue("line one\nline two");
+    await expect(page.getByTestId("composer-route-status")).toContainText("operator message");
+
+    // Enter sends the multiline draft over the operator-message path with
+    // the newline intact; the control-input path stays untouched.
+    await composer.press("Enter");
+    await expect.poll(() => harness.operatorMessagePosts.length).toBe(1);
+    expect(harness.operatorMessagePosts[0].text).toBe("line one\nline two");
+    expect(harness.controlInputPosts).toEqual([]);
+    await expect(composer).toHaveValue("");
+  });
+
+  test("a multi-file picker batch links one token per file and never exceeds the max (P1.3)", async ({ page }) => {
+    const harness = await stubBackend(page);
+    await openNativeTerminal(page);
+
+    const composer = page.getByPlaceholder("Send a message to the native composer…");
+    await page.getByTestId("attachment-file-input").setInputFiles([
+      { name: "a.png", mimeType: "image/png", buffer: PNG_BYTES },
+      { name: "b.png", mimeType: "image/png", buffer: PNG_BYTES },
+      { name: "c.png", mimeType: "image/png", buffer: PNG_BYTES },
+    ]);
+    // Every accepted file got exactly one editable token; none overwrote
+    // an earlier one (the pre-r1 stale-closure defect).
+    await expect(composer).toHaveValue("[Image #1][Image #2][Image #3]");
+    await expect(page.getByRole("listitem")).toHaveCount(3);
+    await expect.poll(() => harness.attachmentUploads.length).toBe(3);
+    await expect(page.getByTestId("composer-route-status")).toContainText("3 images");
+
+    // A second batch of two takes the one remaining slot and names it.
+    await page.getByTestId("attachment-file-input").setInputFiles([
+      { name: "d.png", mimeType: "image/png", buffer: PNG_BYTES },
+      { name: "e.png", mimeType: "image/png", buffer: PNG_BYTES },
+    ]);
+    await expect(composer).toHaveValue("[Image #1][Image #2][Image #3][Image #4]");
+    await expect(page.getByRole("listitem")).toHaveCount(4);
+    await expect.poll(() => harness.attachmentUploads.length).toBe(4);
+    await expect(page.getByTestId("composer-route-status")).toContainText("4 images");
+    await expect(
+      page.getByText(/at most 4 images ride one operator message — 1 accepted, 1 skipped; 0 slots remain/),
+    ).toBeVisible();
+  });
+
+  test("a multi-image paste in a single event stages the whole batch (P1.3)", async ({ page }) => {
+    const harness = await stubBackend(page);
+    await openNativeTerminal(page);
+
+    const composer = page.getByPlaceholder("Send a message to the native composer…");
+    await pasteImages(page, ["x.png", "y.png"]);
+    await expect(composer).toHaveValue("[Image #1][Image #2]");
+    await expect(page.getByRole("listitem")).toHaveCount(2);
+    await expect.poll(() => harness.attachmentUploads.length).toBe(2);
   });
 
   test("text+image sends as one operator message; zero control-input posts, zero raw WS input", async ({ page }, testInfo) => {

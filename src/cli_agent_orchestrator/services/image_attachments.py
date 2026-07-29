@@ -24,11 +24,15 @@ What lives here:
   ``attachment-not-ready`` (the one binding rule pinned now — the SQLite/CAS
   ledger is §17 backlog, deferred per the owner speed guard).
 - **Content validation**: magic-byte sniff plus structure/dimension decode
-  (PNG signature + IHDR; GIF logical screen descriptor; JPEG SOF scan; WebP
-  VP8/VP8L/VP8X headers).  The client filename and declared MIME type are
-  never trusted — content decides the format.  Limits: ≤ 5 MiB and
-  ≤ 8000×8000 px per image (the tightest documented downstream limit,
-  design Appendix A.9), ≤ 4 images per operator message (§8.3).
+  (PNG: full chunk-structure + CRC walk, IHDR field rules, a contiguous
+  IDAT run whose zlib stream must decode to exactly the IHDR-declared
+  scanline bytes with legal filter bytes, and a terminal IEND — bounded,
+  with output counted and discarded in fixed-size chunks; GIF logical
+  screen descriptor; JPEG SOF scan; WebP VP8/VP8L/VP8X headers).  The
+  client filename and declared MIME type are never trusted — content
+  decides the format.  Limits: ≤ 5 MiB and ≤ 8000×8000 px per image (the
+  tightest documented downstream limit, design Appendix A.9), ≤ 4 images
+  per operator message (§8.3).
 - **The sweep** (§8.4 + §17 B7 — the mechanism, named): runs at server
   startup (the API lifespan) and opportunistically on every staging/binding
   mutation.  It deletes orphan files (crashed uploads), ``removed`` records,
@@ -47,6 +51,7 @@ import os
 import re
 import tempfile
 import uuid
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, cast
@@ -175,14 +180,198 @@ def staged_file_path(terminal_id: str, attachment_id: str, image_format: str) ->
 # --- Content validation ------------------------------------------------------
 
 
+#: IHDR field rules (PNG spec §11.2.2): the legal bit depths per color type
+#: and the channel count used to size a scanline.
+_PNG_CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+_PNG_BIT_DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
+
+#: Adam7 pass origins and strides, in stream order (PNG spec §8).
+_PNG_ADAM7 = (
+    (0, 0, 8, 8),
+    (4, 0, 8, 8),
+    (0, 4, 4, 8),
+    (2, 0, 4, 4),
+    (0, 2, 2, 4),
+    (1, 0, 2, 2),
+    (0, 1, 1, 2),
+)
+
+#: Inflation is bounded by the IHDR-declared size and consumed in fixed
+#: chunks; nothing larger than this is ever allocated per step.
+_PNG_INFLATE_CHUNK = 65536
+
+
+def _png_scanline_lengths(
+    width: int, height: int, bit_depth: int, color_type: int, interlace: int
+) -> List[int]:
+    """The payload length (without the filter byte) of every scanline, in
+    stream order — one row repeated for a plain image, the seven Adam7
+    passes concatenated for an interlaced one."""
+    channels = _PNG_CHANNELS[color_type]
+
+    def row_bytes(pixels: int) -> int:
+        return (pixels * channels * bit_depth + 7) // 8
+
+    if interlace == 0:
+        return [row_bytes(width)] * height
+    lengths: List[int] = []
+    for x0, y0, dx, dy in _PNG_ADAM7:
+        pass_width = 0 if width <= x0 else (width - x0 + dx - 1) // dx
+        pass_height = 0 if height <= y0 else (height - y0 + dy - 1) // dy
+        if pass_width and pass_height:
+            lengths.extend([row_bytes(pass_width)] * pass_height)
+    return lengths
+
+
+def _verify_png_image_data(idat_parts: List[bytes], row_lengths: List[int]) -> None:
+    """Prove the IDAT stream decodes to exactly the IHDR-declared pixels.
+
+    The concatenated IDAT payloads are one zlib stream (PNG spec §11.2.4).
+    It is inflated with a bounded per-step allocation, the output counted
+    and discarded: the stream must end cleanly after exactly the declared
+    scanline bytes, every scanline must open with a legal filter byte
+    (0–4), and no trailing bytes may follow the stream.  Anything less is
+    a header that *claims* to be an image, not usable image data.
+    """
+    expected = sum(row_lengths) + len(row_lengths)
+    try:
+        decompressor = zlib.decompressobj()
+        produced = 0
+        row = 0
+        col = -1  # -1: the next output byte is row `row`'s filter byte
+        for part in idat_parts:
+            data = part
+            while data:
+                if decompressor.eof:
+                    raise ValueError(
+                        "not a PNG: bytes continue past the end of the image data stream"
+                    )
+                out = decompressor.decompress(data, _PNG_INFLATE_CHUNK)
+                data = decompressor.unconsumed_tail
+                produced += len(out)
+                if produced > expected:
+                    raise ValueError(
+                        "not a PNG: the image data decodes past the IHDR-declared size"
+                    )
+                pos = 0
+                while pos < len(out):
+                    if col == -1:
+                        if out[pos] > 4:
+                            raise ValueError(
+                                f"not a PNG: illegal filter byte {out[pos]} on scanline {row}"
+                            )
+                        col = row_lengths[row]
+                        pos += 1
+                    else:
+                        step = min(col, len(out) - pos)
+                        col -= step
+                        pos += step
+                        if col == 0:
+                            row += 1
+                            col = -1
+        if not decompressor.eof:
+            raise ValueError("not a PNG: the image data stream is truncated")
+        if decompressor.unused_data:
+            raise ValueError("not a PNG: bytes follow the end of the image data stream")
+    except zlib.error as exc:
+        raise ValueError(f"not a PNG: the image data stream does not inflate: {exc}") from exc
+    if produced != expected:
+        raise ValueError(
+            f"not a PNG: the image data decodes to {produced} bytes, "
+            f"the IHDR declares {expected}"
+        )
+
+
 def _decode_png(data: bytes) -> Tuple[int, int]:
-    if len(data) < 33 or not data.startswith(_PNG_SIGNATURE):
+    """Full bounded PNG validation; returns ``(width, height)`` on success.
+
+    Validates the signature, walks every chunk checking structure and CRC
+    (IHDR first and unique, PLTE before IDAT, one contiguous IDAT run,
+    IEND last and empty, no unknown critical chunks), enforces the IHDR
+    field rules, and proves the image data usable via
+    :func:`_verify_png_image_data`.  Dimensions outside the pinned 1×1 –
+    8000×8000 envelope return *before* any inflation so an over-limit
+    header costs a header walk only; the caller refuses them with the
+    typed size reason.
+    """
+    if len(data) < 8 or not data.startswith(_PNG_SIGNATURE):
         raise ValueError("not a PNG: bad or truncated signature")
-    ihdr_len = int.from_bytes(data[8:12], "big")
-    if data[12:16] != b"IHDR" or ihdr_len != 13:
-        raise ValueError("not a PNG: the first chunk is not a well-formed IHDR")
-    width = int.from_bytes(data[16:20], "big")
-    height = int.from_bytes(data[20:24], "big")
+    ihdr: Optional[Tuple[int, int, int, int, int]] = None
+    idat_parts: List[bytes] = []
+    idat_closed = False
+    seen_iend = False
+    offset = 8
+    while offset < len(data):
+        if offset + 8 > len(data):
+            raise ValueError("not a PNG: truncated chunk header before any IEND")
+        length = int.from_bytes(data[offset : offset + 4], "big")
+        chunk_type = data[offset + 4 : offset + 8]
+        if length > 0x7FFFFFFF or offset + 12 + length > len(data):
+            raise ValueError(f"not a PNG: truncated or impossible {chunk_type!r} chunk")
+        if not all(0x41 <= byte <= 0x5A or 0x61 <= byte <= 0x7A for byte in chunk_type):
+            raise ValueError(f"not a PNG: illegal chunk type {chunk_type!r}")
+        payload = data[offset + 8 : offset + 8 + length]
+        crc_stored = int.from_bytes(data[offset + 8 + length : offset + 12 + length], "big")
+        if zlib.crc32(chunk_type + payload) & 0xFFFFFFFF != crc_stored:
+            raise ValueError(f"not a PNG: CRC mismatch in the {chunk_type!r} chunk")
+        if chunk_type == b"IHDR":
+            if offset != 8 or ihdr is not None:
+                raise ValueError("not a PNG: IHDR must be the first and only IHDR chunk")
+            if length != 13:
+                raise ValueError("not a PNG: the IHDR chunk is not 13 bytes")
+            width = int.from_bytes(payload[0:4], "big")
+            height = int.from_bytes(payload[4:8], "big")
+            bit_depth, color_type = payload[8], payload[9]
+            compression, filter_method, interlace = payload[10], payload[11], payload[12]
+            if color_type not in _PNG_CHANNELS or bit_depth not in _PNG_BIT_DEPTHS[color_type]:
+                raise ValueError(
+                    f"not a PNG: bit depth {bit_depth} is not legal for color type {color_type}"
+                )
+            if compression != 0 or filter_method != 0:
+                raise ValueError("not a PNG: unknown compression or filter method")
+            if interlace not in (0, 1):
+                raise ValueError(f"not a PNG: unknown interlace method {interlace}")
+            ihdr = (width, height, bit_depth, color_type, interlace)
+        elif chunk_type == b"PLTE":
+            if idat_parts:
+                raise ValueError("not a PNG: PLTE follows IDAT")
+        elif chunk_type == b"IDAT":
+            if ihdr is None:
+                raise ValueError("not a PNG: IDAT precedes IHDR")
+            if idat_closed:
+                raise ValueError("not a PNG: the IDAT run is not contiguous")
+            idat_parts.append(payload)
+        elif chunk_type == b"IEND":
+            if length != 0:
+                raise ValueError("not a PNG: IEND must be empty")
+            seen_iend = True
+            offset += 12
+            break
+        else:
+            if idat_parts:
+                idat_closed = True
+            if not chunk_type[0] & 0x20:
+                raise ValueError(f"not a PNG: unknown critical chunk {chunk_type!r}")
+        offset += 12 + length
+    if ihdr is None:
+        raise ValueError("not a PNG: no IHDR chunk")
+    if not seen_iend:
+        raise ValueError("not a PNG: no IEND chunk")
+    if offset != len(data):
+        raise ValueError("not a PNG: bytes follow IEND")
+    width, height, bit_depth, color_type, interlace = ihdr
+    if (
+        width < 1
+        or height < 1
+        or width > MAX_IMAGE_WIDTH
+        or height > MAX_IMAGE_HEIGHT
+    ):
+        # The caller's size gate refuses these; proving the data stream of
+        # an out-of-envelope image is not worth its (still bounded) cost.
+        return width, height
+    _verify_png_image_data(
+        idat_parts, _png_scanline_lengths(width, height, bit_depth, color_type, interlace)
+    )
     return width, height
 
 
@@ -578,18 +767,13 @@ def remove_attachment(terminal_id: str, attachment_id: str) -> Dict[str, Any]:
     ``submitted`` records are read-only for their retention TTL (§8.4): the
     provider may still be reading the staged path mid-turn, so removing one
     is a conflict the caller must hear about, not a delete to honor quietly.
+
+    The submitted-state check and the transition are one manifest-locked
+    mutation: a bind racing the removal either commits first (the removal
+    then conflicts, and the staged file survives) or finds the record
+    already ``removed`` — it can never delete a staged file out from under
+    a binding it raced.
     """
-    existing = get_attachment(terminal_id, attachment_id)
-    if existing["state"] == STATE_SUBMITTED:
-        raise AttachmentBindingError(
-            REASON_ATTACHMENT_NOT_READY,
-            f"image attachment {attachment_id} is submitted to operation "
-            f"{existing.get('bound_operation_id')}; submitted images are retained "
-            f"read-only for {SUBMITTED_TTL_SECONDS // 3600}h so the provider can "
-            "still read the staged path mid-turn",
-        )
-    if existing["state"] == STATE_REMOVED:
-        return existing
 
     def mark_removed(document: Dict[str, Any]) -> Dict[str, Any]:
         stored = _find_record(document, terminal_id, attachment_id)
@@ -597,6 +781,16 @@ def remove_attachment(terminal_id: str, attachment_id: str) -> Dict[str, Any]:
             raise AttachmentNotFoundError(
                 f"no image attachment {attachment_id!r} for terminal {terminal_id!r}"
             )
+        if stored["state"] == STATE_SUBMITTED:
+            raise AttachmentBindingError(
+                REASON_ATTACHMENT_NOT_READY,
+                f"image attachment {attachment_id} is submitted to operation "
+                f"{stored.get('bound_operation_id')}; submitted images are retained "
+                f"read-only for {SUBMITTED_TTL_SECONDS // 3600}h so the provider can "
+                "still read the staged path mid-turn",
+            )
+        if stored["state"] == STATE_REMOVED:
+            return dict(stored)
         stored["state"] = STATE_REMOVED
         stored["updated_at"] = _utc_isots()
         return dict(stored)

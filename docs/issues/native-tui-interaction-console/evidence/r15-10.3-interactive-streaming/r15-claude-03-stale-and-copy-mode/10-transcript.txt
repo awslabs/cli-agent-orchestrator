@@ -1,0 +1,29 @@
+⚠ 1 MCP server needs authentication · run /mcp
+
+❯ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do not
+  stop early.
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ R15CLAUDE-eb91508a
+
+⏺ Got it — stopping the count. What would you like to do instead?
+
+✻ Crunched for 4s
+
+❯ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do not
+  stop early.
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do not
+  stop early.Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly
+  and do not stop early.
+
+✶ Gesticulating…
+  ⎿  Tip: Use Plan Mode to prepare for a complex request before making changes. Press shift+tab
+     twice to enable.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ctx 6% (64k/1000k) │ sess 100% →06:40 │ wk 83% →Mon │ sonnet-5 │ xhigh │ /…/cao_scratch_r150/wor…
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 3 agents

@@ -10,6 +10,8 @@ import json
 import os
 import stat
 import struct
+import threading
+import zlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -39,11 +41,121 @@ def store(tmp_path, monkeypatch):
 # --- Minimal image fixtures (structure the decoders actually parse) ---------
 
 
-def png_bytes(width=120, height=80):
-    ihdr = (
-        struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", width, height) + bytes([8, 2, 0, 0, 0])
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + tag
+        + data
+        + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
     )
-    return b"\x89PNG\r\n\x1a\n" + ihdr + b"\x00\x00\x00\x00"
+
+
+def _png_ihdr(width: int = 120, height: int = 80, interlace: int = 0) -> bytes:
+    return _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, interlace))
+
+
+def _valid_raw(width: int = 120, height: int = 80, filter_byte: int = 0) -> bytes:
+    return b"".join(bytes([filter_byte]) + b"\x7f" * (width * 3) for _ in range(height))
+
+
+def png_bytes(width=120, height=80):
+    """A genuine, fully decodable 8-bit RGB PNG: signature, IHDR, one IDAT
+    whose zlib stream carries exactly the declared scanlines (filter byte 0
+    per row), and IEND — every chunk with a valid CRC."""
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_ihdr(width, height)
+        + _png_chunk(b"IDAT", zlib.compress(_valid_raw(width, height)))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def png_interlaced_bytes(width=9, height=9):
+    """A genuine Adam7-interlaced PNG (all seven passes non-empty at 9×9)."""
+    raw = b""
+    for x0, y0, dx, dy in (
+        (0, 0, 8, 8),
+        (4, 0, 8, 8),
+        (0, 4, 4, 8),
+        (2, 0, 4, 4),
+        (0, 2, 2, 4),
+        (1, 0, 2, 2),
+        (0, 1, 1, 2),
+    ):
+        pass_width = 0 if width <= x0 else (width - x0 + dx - 1) // dx
+        pass_height = 0 if height <= y0 else (height - y0 + dy - 1) // dy
+        if pass_width and pass_height:
+            raw += b"".join(b"\x00" + b"\x7f" * (pass_width * 3) for _ in range(pass_height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_ihdr(width, height, interlace=1)
+        + _png_chunk(b"IDAT", zlib.compress(raw))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def png_header_only():
+    """The pre-r1 fixture: signature + IHDR + four zero bytes — a header
+    that claims to be an image, with no IDAT and no IEND."""
+    return b"\x89PNG\r\n\x1a\n" + _png_ihdr() + b"\x00\x00\x00\x00"
+
+
+def png_crc_broken():
+    """A genuine PNG with one IDAT payload bit flipped: CRC mismatch."""
+    data = bytearray(png_bytes())
+    idat_at = bytes(data).find(b"IDAT")
+    data[idat_at + 4] ^= 0x01
+    return bytes(data)
+
+
+def png_no_idat():
+    return b"\x89PNG\r\n\x1a\n" + _png_ihdr() + _png_chunk(b"IEND", b"")
+
+
+def png_no_iend():
+    return b"\x89PNG\r\n\x1a\n" + _png_ihdr() + _png_chunk(b"IDAT", zlib.compress(_valid_raw()))
+
+
+def png_truncated_idat():
+    """The IDAT's zlib stream is cut short; the chunk itself is CRC-sound."""
+    payload = zlib.compress(_valid_raw())[:5]
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_ihdr()
+        + _png_chunk(b"IDAT", payload)
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def png_garbage_idat():
+    """A CRC-sound IDAT whose payload is not a zlib stream at all."""
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_ihdr()
+        + _png_chunk(b"IDAT", b"\xff\xff\xff\xff")
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def png_short_image_data():
+    """A clean zlib stream that decodes to half the declared scanlines."""
+    raw = _valid_raw()[: len(_valid_raw()) // 2]
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_ihdr()
+        + _png_chunk(b"IDAT", zlib.compress(raw))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def png_bad_filter_byte():
+    """The right declared byte count, but a scanline opens with filter 5."""
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_ihdr()
+        + _png_chunk(b"IDAT", zlib.compress(_valid_raw(filter_byte=5)))
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 def gif_bytes(width=64, height=48):
@@ -117,6 +229,9 @@ def _ready_record(attachment_id="att-1", terminal=TERMINAL, **overrides):
 class TestContentValidation:
     def test_png_decodes_dimensions(self):
         assert image_attachments.sniff_image(png_bytes(120, 80)) == ("png", 120, 80)
+
+    def test_interlaced_png_decodes_dimensions(self):
+        assert image_attachments.sniff_image(png_interlaced_bytes(9, 9)) == ("png", 9, 9)
 
     def test_gif_decodes_dimensions(self):
         assert image_attachments.sniff_image(gif_bytes(64, 48)) == ("gif", 64, 48)
@@ -361,6 +476,104 @@ class TestRemoval:
     def test_remove_unknown_raises(self, store):
         with pytest.raises(image_attachments.AttachmentNotFoundError):
             image_attachments.remove_attachment(TERMINAL, "nope")
+
+
+class TestRemovalRace:
+    """The submitted-state check and the removal transition are one
+    manifest-locked mutation (Lane C r1): a bind racing a removal can never
+    delete the staged file out from under a submitted binding, in either
+    commit order.  The interleavings are forced deterministically by
+    gating the named mutator inside ``_mutate`` until the other thread's
+    mutation has committed."""
+
+    def _stage_one(self):
+        return image_attachments.stage_upload(
+            TERMINAL,
+            display_filename="a.png",
+            content=png_bytes(),
+            allowed_formats=ALLOWED_PNG_ONLY,
+        )
+
+    def test_remove_starting_first_still_conflicts_after_a_bind_commits(
+        self, store, monkeypatch
+    ):
+        record = self._stage_one()
+        staged = image_attachments.staged_absolute_path(record)
+        real_mutate = image_attachments._mutate
+        remove_parked = threading.Event()
+        bind_committed = threading.Event()
+
+        def gated(mutator):
+            # mark_removed is parked *before* its lock acquisition until the
+            # bind has committed — the exact pre-r1 interleave, which now
+            # must conflict instead of deleting.
+            if getattr(mutator, "__name__", "") == "mark_removed":
+                remove_parked.set()
+                assert bind_committed.wait(timeout=10)
+            return real_mutate(mutator)
+
+        monkeypatch.setattr(image_attachments, "_mutate", gated)
+        outcomes = {}
+
+        def do_remove():
+            try:
+                outcomes["remove"] = image_attachments.remove_attachment(
+                    TERMINAL, record["attachment_id"]
+                )
+            except image_attachments.AttachmentBindingError as exc:
+                outcomes["remove_error"] = exc
+
+        thread = threading.Thread(target=do_remove)
+        thread.start()
+        assert remove_parked.wait(timeout=10)
+        image_attachments.bind_for_submit(TERMINAL, "op-race", [record["attachment_id"]])
+        bind_committed.set()
+        thread.join(timeout=10)
+
+        assert "remove_error" in outcomes, outcomes
+        final = image_attachments.get_attachment(TERMINAL, record["attachment_id"])
+        assert final["state"] == "submitted"
+        assert final["bound_operation_id"] == "op-race"
+        assert staged.exists()
+
+    def test_bind_starting_first_is_not_ready_after_a_remove_commits(
+        self, store, monkeypatch
+    ):
+        record = self._stage_one()
+        staged = image_attachments.staged_absolute_path(record)
+        real_mutate = image_attachments._mutate
+        bind_parked = threading.Event()
+        remove_committed = threading.Event()
+
+        def gated(mutator):
+            if getattr(mutator, "__name__", "") == "bind":
+                bind_parked.set()
+                assert remove_committed.wait(timeout=10)
+            result = real_mutate(mutator)
+            if getattr(mutator, "__name__", "") == "mark_removed":
+                remove_committed.set()
+            return result
+
+        monkeypatch.setattr(image_attachments, "_mutate", gated)
+        outcomes = {}
+
+        def do_bind():
+            try:
+                outcomes["bind"] = image_attachments.bind_for_submit(
+                    TERMINAL, "op-race", [record["attachment_id"]]
+                )
+            except image_attachments.AttachmentBindingError as exc:
+                outcomes["bind_error"] = exc
+
+        thread = threading.Thread(target=do_bind)
+        thread.start()
+        assert bind_parked.wait(timeout=10)
+        image_attachments.remove_attachment(TERMINAL, record["attachment_id"])
+        thread.join(timeout=10)
+
+        assert "bind_error" in outcomes, outcomes
+        assert outcomes["bind_error"].reason_code == REASON_ATTACHMENT_NOT_READY
+        assert not staged.exists()
 
 
 class TestManifestDiscipline:

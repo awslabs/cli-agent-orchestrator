@@ -42,7 +42,14 @@ Discipline, in request order:
    path), translated host→guest through the terminal profile's
    ``container.path_maps`` longest-prefix match.  A staged path with no
    matching map is refused ``attachment-not-ready`` — never substituted
-   as an unreadable host path.
+   as an unreadable host path.  Substitution itself needs only read-only
+   attachment facts: the ``ready → submitted(operation_id)`` binding
+   happens at the last safe pre-write point — the adapter's pre-write
+   hook, after the journal claim and every deliverability/idle gate —
+   so a zero-byte refusal (path substitution, lease/copy-mode,
+   readiness/native preflight, journal claim) never strands a ready
+   image as submitted to an operation that wrote nothing, and a fresh
+   operation id may retry the unchanged image (Lane C r1).
 
 Two refusal reasons surface beyond §8.3's list, both adapter truths the
 operation store can hold and a caller must be able to act on:
@@ -407,6 +414,8 @@ _ADAPTER_REFUSAL_MAP = {
     "unresolved_ambiguity": REASON_UNRESOLVED_AMBIGUITY,
     "unsupported_control": REASON_PROVIDER_UNSUPPORTED,
     "provider_refused": REASON_PROVIDER_REFUSED,
+    "image_attachment_unknown": REASON_ATTACHMENT_UNKNOWN,
+    "image_attachment_not_ready": REASON_ATTACHMENT_NOT_READY,
 }
 
 
@@ -766,12 +775,47 @@ def submit_operator_message(
             "advertises no image capability; attachments were not submitted",
         )
 
-    # The ready → submitted(operation_id) binding, under the manifest lock.
-    try:
-        bound_records = image_attachments.bind_for_submit(terminal_id, operation_id, attachment_ids)
-    except image_attachments.AttachmentBindingError as exc:
-        return _result(operation_id, REFUSED, exc.reason_code, exc.detail)
-    for record in bound_records:
+    # Reference substitution needs read-only attachment facts only.  The
+    # ready → submitted(operation_id) binding itself happens at the last
+    # safe pre-write point — the adapter's pre-write hook, after the
+    # journal claim and every deliverability/idle gate — so a zero-byte
+    # refusal anywhere in the lease/gate run never strands a ready image
+    # as submitted to an operation that wrote nothing (Lane C r1).  The
+    # checks below mirror bind_for_submit's read side (without the
+    # transition) so the common failures answer with the same immediate
+    # typed refusal as before; anything that races them is re-checked
+    # atomically by the hook under the manifest lock.
+    attachment_records: List[Dict[str, Any]] = []
+    for attachment_id in attachment_ids:
+        try:
+            record = image_attachments.get_attachment(terminal_id, attachment_id)
+        except image_attachments.AttachmentNotFoundError:
+            return _result(
+                operation_id,
+                REFUSED,
+                REASON_ATTACHMENT_UNKNOWN,
+                f"no image attachment {attachment_id!r} is staged for terminal "
+                f"{terminal_id!r}; nothing was submitted",
+            )
+        record_state = record["state"]
+        if record_state == image_attachments.STATE_SUBMITTED:
+            bound_to = record.get("bound_operation_id")
+            if bound_to != operation_id:
+                return _result(
+                    operation_id,
+                    REFUSED,
+                    REASON_ATTACHMENT_NOT_READY,
+                    f"image attachment {attachment_id} is already submitted to "
+                    f"operation {bound_to}; a different operation may not reference it",
+                )
+        elif record_state != image_attachments.STATE_READY:
+            return _result(
+                operation_id,
+                REFUSED,
+                REASON_ATTACHMENT_NOT_READY,
+                f"image attachment {attachment_id} is {record_state}, not ready; only "
+                "a validated, fully staged image may be submitted",
+            )
         if record["format"] not in (image_block or {}).get("formats", ()):
             return _result(
                 operation_id,
@@ -781,13 +825,14 @@ def submit_operator_message(
                 f"which {resolved.provider} does not advertise "
                 f"({(image_block or {}).get('formats')}); unproven formats are refused",
             )
+        attachment_records.append(record)
 
     try:
         substituted = _substitute_references(
             terminal_id,
             text,
             tokens,
-            bound_records,
+            attachment_records,
             (image_block or {}).get("reference_template", "{path}"),
         )
     except image_attachments.AttachmentBindingError as exc:
@@ -915,6 +960,28 @@ def submit_operator_message(
                     reason = REASON_MULTILINE_UNPROVEN
                 return _result(operation_id, REFUSED, reason, detail)
             assert adapter is not None and plan is not None
+
+            def pre_write() -> Optional[Tuple[str, str]]:
+                """The last safe binding point (Lane C r1): the adapter runs
+                this after the journal claim and every deliverability/idle
+                gate, immediately before the transport write.  A refusal
+                here is journaled with zero bytes typed and leaves a ready
+                image retrievable by a fresh operation; after it succeeds,
+                any later ambiguity keeps the binding — the honest post-claim
+                state, never a rollback that could race the write."""
+                try:
+                    image_attachments.bind_for_submit(
+                        terminal_id, operation_id, attachment_ids
+                    )
+                except image_attachments.AttachmentBindingError as exc:
+                    reason = (
+                        adapter.REFUSED_IMAGE_UNKNOWN
+                        if exc.reason_code == REASON_ATTACHMENT_UNKNOWN
+                        else adapter.REFUSED_IMAGE_NOT_READY
+                    )
+                    return reason, exc.detail
+                return None
+
             observation = adapter.turn_observation(
                 active_turn_id=None,
                 observed_at=_utc_isots(),
@@ -938,6 +1005,7 @@ def submit_operator_message(
                     observation=observation,
                     transport=transport,
                     provider_version=resolved.provider_version,
+                    pre_write=pre_write,
                 )
             except adapter.NativeControlConflict as exc:
                 return _result(operation_id, REFUSED, REASON_REQUEST_REBOUND, str(exc))

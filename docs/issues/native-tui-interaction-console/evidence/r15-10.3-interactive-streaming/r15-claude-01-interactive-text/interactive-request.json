@@ -1,0 +1,14 @@
+{
+  "control_id": "ctl-c58beb0f68",
+  "events": [
+    {
+      "text": "R15CLAUDE-eb91508a",
+      "type": "text"
+    },
+    {
+      "key": "Enter",
+      "type": "key"
+    }
+  ],
+  "payload_class": "interactive"
+}

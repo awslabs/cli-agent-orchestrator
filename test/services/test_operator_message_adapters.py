@@ -116,6 +116,7 @@ def _kimi_message(
     digest=DIGEST,
     observation=None,
     provider_version="0.29.2",
+    **extra,
 ):
     return knc.operator_message(
         operation_id=operation_id,
@@ -128,6 +129,7 @@ def _kimi_message(
         observation=observation or _idle_kimi(),
         transport=transport,
         provider_version=provider_version,
+        **extra,
     )
 
 
@@ -210,6 +212,61 @@ class TestKimiOperatorMessage:
         assert found["state"] == "posted"
         assert found["kind"] == "operator-message"
 
+    def test_the_pre_write_hook_runs_after_the_gates_before_the_transport(self):
+        """Lane C r1: the binding hook is the last step before bytes."""
+        _attach_kimi()
+        transport = Recorder()
+
+        def hook():
+            transport.calls.append("hook")
+            return None
+
+        record = _kimi_message(transport, pre_write=hook)
+        assert record["state"] == "posted"
+        assert transport.calls[0] == "hook"
+        assert "enter" in transport.calls
+
+    def test_a_hook_refusal_is_journaled_with_zero_bytes(self):
+        _attach_kimi()
+        transport = Recorder()
+        record = _kimi_message(
+            transport,
+            pre_write=lambda: (knc.REFUSED_IMAGE_NOT_READY, "raced away before the write"),
+        )
+        assert record["state"] == "refused"
+        assert record["refusal_reason"] == "image_attachment_not_ready"
+        assert record["observation"]["detail"] == "raced away before the write"
+        assert transport.calls == []
+
+    def test_a_hook_refusal_with_an_unknown_reason_is_a_caller_bug(self):
+        _attach_kimi()
+        with pytest.raises(knc.NativeControlInvalid):
+            _kimi_message(Recorder(), pre_write=lambda: ("bogus_reason", "nope"))
+
+    def test_a_gate_refusal_never_calls_the_hook(self):
+        _attach_kimi()
+        calls = []
+        busy = knc.turn_observation(
+            active_turn_id="turn_1", observed_at="2026-07-29T00:00:01Z", observer="test"
+        )
+        record = _kimi_message(
+            Recorder(), observation=busy, pre_write=lambda: calls.append("hook")
+        )
+        assert record["state"] == "refused"
+        assert record["refusal_reason"] == "active_turn_in_progress"
+        assert calls == []
+
+    def test_an_identical_replay_never_calls_the_hook(self):
+        _attach_kimi()
+        _kimi_message(Recorder())
+        replay_transport = Recorder()
+        replayed = _kimi_message(
+            replay_transport,
+            pre_write=lambda: (_ for _ in ()).throw(AssertionError("hook ran on replay")),
+        )
+        assert replayed["state"] == "posted"
+        assert replay_transport.calls == []
+
 
 class TestClaudeOperatorMessage:
     def test_happy_path_posts_with_one_enter(self):
@@ -290,3 +347,48 @@ class TestClaudeOperatorMessage:
                 transport=Recorder(),
                 provider_version="2.1.220",
             )
+
+    def test_the_pre_write_hook_runs_before_the_transport(self):
+        _attach_claude()
+        transport = Recorder()
+
+        def hook():
+            transport.calls.append("hook")
+            return None
+
+        record = cnc.operator_message(
+            operation_id="op_hook",
+            native_session_id=SESSION,
+            terminal_id=TERMINAL,
+            generation=GENERATION,
+            execution_mode=em.NATIVE_TUI,
+            text="hello",
+            payload_sha256=DIGEST,
+            observation=_idle_claude(),
+            transport=transport,
+            provider_version="2.1.220",
+            pre_write=hook,
+        )
+        assert record["state"] == "posted"
+        assert transport.calls[0] == "hook"
+
+    def test_a_hook_refusal_is_journaled_with_zero_bytes(self):
+        _attach_claude()
+        transport = Recorder()
+        record = cnc.operator_message(
+            operation_id="op_hook_refused",
+            native_session_id=SESSION,
+            terminal_id=TERMINAL,
+            generation=GENERATION,
+            execution_mode=em.NATIVE_TUI,
+            text="hello",
+            payload_sha256=DIGEST,
+            observation=_idle_claude(),
+            transport=transport,
+            provider_version="2.1.220",
+            pre_write=lambda: (cnc.REFUSED_IMAGE_UNKNOWN, "no such attachment"),
+        )
+        assert record["state"] == "refused"
+        assert record["refusal_reason"] == "image_attachment_unknown"
+        assert record["observation"]["detail"] == "no such attachment"
+        assert transport.calls == []

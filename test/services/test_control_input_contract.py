@@ -751,6 +751,89 @@ class TestV4CommandClassDeclaration:
             assert verdict is None
 
 
+class TestV4InteractiveDeclaration:
+    """Schema v4's second declared class (§6.7, r15): ``"interactive"``.
+
+    The declaration is a distinct request identity — declared interactive,
+    declared command, and undeclared requests of the same id and events
+    digest differently under the one v4 domain — while its legal payload
+    is the ordinary v3 sequence grammar (no command grammar applies).
+    """
+
+    VECTOR = {
+        "control_id": "ctl-interactive-1",
+        "events": [{"type": "text", "text": "hello mid-turn"}, {"type": "key", "key": "Enter"}],
+        "payload_class": "interactive",
+        "expected_identity": {
+            "terminal_id": "term-1",
+            "terminal_generation": "gen-3",
+            "provider_process_id": 4242,
+            "provider": "kimi_cli",
+            "session_name": "cao-demo",
+        },
+    }
+    PREIMAGE = (
+        '{"domain":"cao-control-input-request-v4","schema_version":4,'
+        '"control_id":"ctl-interactive-1",'
+        '"events":[{"type":"text","text":"hello mid-turn"},{"type":"key","key":"Enter"}],'
+        '"payload_class":"interactive",'
+        '"expected_identity":{"terminal_id":"term-1",'
+        '"terminal_incarnation":null,"terminal_generation":"gen-3","pane_birth_id":null,'
+        '"provider_process_id":4242,"provider":"kimi_cli","native_session_id":null,'
+        '"execution_mode":null,"session_name":"cao-demo"}}\n'
+    )
+    DIGEST = "522621f6b05c036a63bfd8a0ec6b3393a589fcf3811b502c4a814c35591e4ef2"
+
+    def test_interactive_matches_the_recorded_digest(self):
+        assert (
+            contract.control_input_request_digest_v4(
+                control_id=self.VECTOR["control_id"],
+                events=self.VECTOR["events"],
+                payload_class=self.VECTOR["payload_class"],
+                expected_identity=self.VECTOR["expected_identity"],
+            )
+            == self.DIGEST
+        )
+
+    def test_interactive_matches_the_recorded_preimage_byte_for_byte(self):
+        assert hashlib.sha256(self.PREIMAGE.encode("utf-8")).hexdigest() == self.DIGEST
+        encoded = canonical_json.encode_canonical(
+            {
+                "domain": contract.CONTROL_INPUT_DIGEST_DOMAIN_V4,
+                "schema_version": contract.CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
+                "control_id": self.VECTOR["control_id"],
+                "events": contract.normalize_sequence_events(self.VECTOR["events"]),
+                "payload_class": self.VECTOR["payload_class"],
+                "expected_identity": contract.normalize_expected_identity(
+                    self.VECTOR["expected_identity"]
+                ),
+            }
+        )
+        assert encoded.decode("utf-8") == self.PREIMAGE
+
+    def test_the_three_declaration_states_digest_distinctly(self):
+        """Declared interactive, declared command, and undeclared requests
+        of one id and one events array are three different requests."""
+        interactive = contract.control_input_request_digest_v4(
+            control_id=self.VECTOR["control_id"],
+            events=self.VECTOR["events"],
+            payload_class="interactive",
+            expected_identity=self.VECTOR["expected_identity"],
+        )
+        command = contract.control_input_request_digest_v4(
+            control_id=self.VECTOR["control_id"],
+            events=self.VECTOR["events"],
+            payload_class="command",
+            expected_identity=self.VECTOR["expected_identity"],
+        )
+        undeclared = contract.control_input_request_digest_v3(
+            control_id=self.VECTOR["control_id"],
+            events=self.VECTOR["events"],
+            expected_identity=self.VECTOR["expected_identity"],
+        )
+        assert len({interactive, command, undeclared}) == 3
+
+
 class TestCrossImplementationDigest:
     """The fork and the conductor must produce the same 64 hex characters.
 

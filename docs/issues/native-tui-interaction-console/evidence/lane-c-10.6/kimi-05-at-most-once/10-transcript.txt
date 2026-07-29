@@ -3,8 +3,8 @@
  │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                │
  │  ▐█████▌  Send /help for help information.                                                     │
  │                                                                                                │
- │  Directory: /private/var/folders/cm/v5tlfz_d4wbg9mxjsppm32600000gn/T/pytest-of-<USER>/pytest-57…│
- │  Session:   session_8495d424-b55e-4d0d-8b05-3d1efac31c5f                                       │
+ │  Directory: <HOST_TMP>/pytest-of-<USER>/pytest-60…│
+ │  Session:   session_bf8405fe-f39b-45c1-87e1-8ae7d2d544a6                                       │
  │  Model:     K2.7 Coding                                                                        │
  │  Version:   0.29.2                                                                             │
  │                                                                                                │
@@ -17,24 +17,24 @@
  ~/.tmux.conf and restart tmux.
 
  ✨ Use the ReadMediaFile tool to read the image file at
-    /private/var/folders/cm/v5tlfz_d4wbg9mxjsppm32600000gn/T/pytest-of-<USER>/pytest-576/cao_state_l
-    anec0/attachments/a48c37ab/8a3629074dd04c7993c23d5141c9f00c.png and analyze it in the context
+    <HOST_TMP>/pytest-of-<USER>/pytest-607/cao_state_l
+    anec0/attachments/fd90aab3/b4ef679903a3440a87b5a98685928945.png and analyze it in the context
     of this message. This image has one solid color on its left half and another on its right half.
     Name the two colors in one short sentence.
 
- ● The user wants me to read an image file and analyze it. They want me to name the two colors -
-   one on the left half and one on the right half - in one short sentence.
-   ... (2 more lines, ctrl+o to expand)
+ ● The user wants me to use ReadMediaFile tool to read an image file and analyze it. The image has
+   one solid color on the left half and another on the right half. I need to name the two colors in
+   ... (3 more lines, ctrl+o to expand)
 
- ● Used ReadMediaFile (…0/attachments/a48c37ab/8a3629074dd04c7993c23d5141c9f00c.png) · image
+ ● Used ReadMediaFile (…0/attachments/fd90aab3/b4ef679903a3440a87b5a98685928945.png) · image
  (image/png, 302 B)
 
- ● The image is 120x80 pixels. The left half is red and the right half is blue. I need to answer in
-   one short sentence.
+ ● The image shows two vertical halves: left half is red, right half is blue. I need to name the
+   two colors in one short sentence.
 
  ● The left half is red and the right half is blue.
 
- ✨ Reply with exactly the marker MARKER-e6cc02e3 and nothing else. This operator message
+ ✨ Reply with exactly the marker MARKER-bf00744f and nothing else. This operator message
     deliberately exceeds the 512-byte control-input limit to prove the operator-message path. This
     operator message deliberately exceeds the 512-byte control-input limit to prove the
     operator-message path. This operator message deliberately exceeds the 512-byte control-input
@@ -46,15 +46,16 @@
     limit to prove the operator-message path. This operator message deliberately exceeds the
     512-byte control-input limit to prove the operator-message path.
 
- ● The user wants me to reply with exactly the marker "MARKER-e6cc02e3" and nothing else.
+ ● The user wants exactly the marker "MARKER-bf00744f" and nothing else. I should reply with just
+   that.
 
- ● MARKER-e6cc02e3
+ ● MARKER-bf00744f
 
- ✨ Reply with exactly the marker ONCE-6c67504a and nothing else.
+ ✨ Reply with exactly the marker ONCE-e27209ae and nothing else.
 
-  🌑 · Tip: /tasks to check progress and status for background tasks
+  🌑 · Tip: @: mention files
  ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
  │ >                                                                                              │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
- K2.7 Coding thinking  …/pytest-576/cao_scratch_lanec0/worktree-lanec-kimi  master
-                                                                           context: 9% (22.4k/256k)
+ K2.7 Coding thinking  …/pytest-607/cao_scratch_lanec0/worktree-lanec-kimi  master
+                                                                           context: 9% (22.3k/256k)

@@ -1,10 +1,10 @@
 {
   "body": {
     "attachment": {
-      "attachment_id": "8b2765b5f45d4f5cae2f1a88a55539cb",
+      "attachment_id": "c4335558e951453b896f37aa00da9e4f",
       "bound_operation_id": null,
       "content_type": null,
-      "created_at": "2026-07-29T03:22:38.665536Z",
+      "created_at": "2026-07-29T05:45:29.189683Z",
       "display_filename": "photo.jpg",
       "error": {
         "detail": "content is jpeg, which this provider does not advertise (allowed: ['png']); unproven formats are refused rather than converted",
@@ -16,8 +16,8 @@
       "size_bytes": 18,
       "staged_path": null,
       "state": "failed",
-      "terminal_id": "a48c37ab",
-      "updated_at": "2026-07-29T03:22:38.665536Z",
+      "terminal_id": "fd90aab3",
+      "updated_at": "2026-07-29T05:45:29.189683Z",
       "width": 64
     },
     "detail": "content is jpeg, which this provider does not advertise (allowed: ['png']); unproven formats are refused rather than converted",

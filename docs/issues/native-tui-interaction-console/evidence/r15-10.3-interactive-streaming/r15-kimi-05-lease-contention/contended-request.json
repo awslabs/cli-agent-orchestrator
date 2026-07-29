@@ -1,0 +1,10 @@
+{
+  "control_id": "ctl-190afdadb6",
+  "events": [
+    {
+      "key": "Down",
+      "type": "key"
+    }
+  ],
+  "payload_class": "interactive"
+}

@@ -69,40 +69,54 @@ const FULL_KEYS = [
   'PageUp', 'PageDown', 'Delete', 'Insert', 'Tab',
 ]
 
-const IDENTITY = {
-  terminal_id: 't-native',
-  terminal_incarnation: 'incarnation-1',
-  terminal_generation: 'generation-1',
-  pane_birth_id: '%7',
-  provider_process_id: '42@start',
-  provider: 'kimi_cli',
-  native_session_id: 'session-1',
-  execution_mode: 'native_tui',
-  session_name: 'cao-test',
-  control_input: {
-    schema_versions: [1, 2, 3, 4],
-    sequence: { keys: FULL_KEYS, max_events: 32, max_text_bytes: 512 },
-    provider_controls: {
-      kimi_cli: {
-        steer_chords: ['C-s'],
-        dispatch_grace_ms: 5000,
-        operator_message: { supported: true, max_text_bytes: 8192, multiline: true, max_attachments: 4 },
-        image: {
-          supported: true,
-          formats: ['png'],
-          max_bytes: 5242880,
-          max_width: 8000,
-          max_height: 8000,
-          mechanism: 'staged-path-text',
-          reference_template: 'Use the ReadMediaFile tool to read the image file at {path}.',
+const IDENTITY_LANE_C_BLOCKS = {
+  operator_message: { supported: true, max_text_bytes: 8192, multiline: true, max_attachments: 4 },
+  image: {
+    supported: true,
+    formats: ['png'],
+    max_bytes: 5242880,
+    max_width: 8000,
+    max_height: 8000,
+    mechanism: 'staged-path-text',
+    reference_template: 'Use the ReadMediaFile tool to read the image file at {path}.',
+  },
+}
+
+function identityPayload(laneCBlocks: boolean, imageBlock: boolean) {
+  return {
+    terminal_id: 't-native',
+    terminal_incarnation: 'incarnation-1',
+    terminal_generation: 'generation-1',
+    pane_birth_id: '%7',
+    provider_process_id: '42@start',
+    provider: 'kimi_cli',
+    native_session_id: 'session-1',
+    execution_mode: 'native_tui',
+    session_name: 'cao-test',
+    control_input: {
+      schema_versions: [1, 2, 3, 4],
+      sequence: { keys: FULL_KEYS, max_events: 32, max_text_bytes: 512 },
+      provider_controls: {
+        kimi_cli: {
+          steer_chords: ['C-s'],
+          dispatch_grace_ms: 5000,
+          ...(laneCBlocks
+            ? {
+                operator_message: IDENTITY_LANE_C_BLOCKS.operator_message,
+                ...(imageBlock ? { image: IDENTITY_LANE_C_BLOCKS.image } : {}),
+              }
+            : {}),
         },
       },
     },
-  },
+  }
 }
 
 interface StubOptions {
   laneCBlocks?: boolean
+  // false simulates a text-proven but image-unproven build (kimi 0.29.0/0.29.1):
+  // the per-terminal entry carries operator_message without the image block.
+  imageBlock?: boolean
   uploadStatus?: number
   uploadBody?: Record<string, unknown>
   operatorMessageOutcome?: Record<string, unknown>
@@ -116,6 +130,7 @@ function stubLaneCFetch(
 ) {
   const {
     laneCBlocks = true,
+    imageBlock = true,
     uploadStatus = 201,
     uploadBody,
     operatorMessageOutcome = { outcome: 'accepted', reason_code: 'delivered' },
@@ -174,7 +189,7 @@ function stubLaneCFetch(
       } as Response
     }
     if (url.endsWith('/control-identity')) {
-      return { ok: true, json: async () => IDENTITY } as Response
+      return { ok: true, json: async () => identityPayload(laneCBlocks, imageBlock) } as Response
     }
     if (url.includes('/macros')) {
       return { ok: true, json: async () => ({ macros: [] }) } as Response
@@ -269,6 +284,10 @@ interface RequestRecord {
 
 function operatorMessagePosts(requests: RequestRecord[]) {
   return requests.filter(r => r.url.endsWith('/operator-message') && r.method === 'POST')
+}
+
+function controlInputPosts(requests: RequestRecord[]) {
+  return requests.filter(r => r.url.endsWith('/control-input') && r.method === 'POST')
 }
 
 function attachmentUploads(requests: RequestRecord[]) {
@@ -421,6 +440,62 @@ describe('TerminalView Lane C attachments (§8.7)', () => {
     expect(screen.getAllByRole('listitem')).toHaveLength(4)
     await waitFor(() => expect(attachmentUploads(requests)).toHaveLength(4))
   })
+
+  it('stages a multi-file picker batch in one event: one linked token per file, none overwritten', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown>; formData?: boolean }> = []
+    const composer = await renderNativeView(requests)
+    fireEvent.change(composer, { target: { value: 'compare ' } })
+    fireEvent.change(screen.getByTestId('attachment-file-input'), {
+      target: { files: [pngFile('a.png'), pngFile('b.png'), pngFile('c.png')] },
+    })
+
+    await screen.findByTestId('attachment-strip')
+    // Every accepted file got exactly one editable token, and earlier
+    // tokens survived the batch (the pre-r1 stale-closure defect dropped
+    // all but the last marker).
+    await waitFor(() =>
+      expect((composer as HTMLTextAreaElement).value).toBe('compare [Image #1][Image #2][Image #3]'),
+    )
+    expect(screen.getAllByRole('listitem')).toHaveLength(3)
+    await waitFor(() => expect(attachmentUploads(requests)).toHaveLength(3))
+  })
+
+  it('stages a multi-image paste batch in one event', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown>; formData?: boolean }> = []
+    const composer = await renderNativeView(requests)
+    fireEvent.paste(composer, {
+      clipboardData: { files: [pngFile('x.png'), pngFile('y.png')], types: ['Files'] },
+    })
+    await screen.findByTestId('attachment-strip')
+    await waitFor(() =>
+      expect((composer as HTMLTextAreaElement).value).toBe('[Image #1][Image #2]'),
+    )
+    expect(screen.getAllByRole('listitem')).toHaveLength(2)
+    await waitFor(() => expect(attachmentUploads(requests)).toHaveLength(2))
+  })
+
+  it('a single over-max batch accepts only the remaining slots and names the count', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown>; formData?: boolean }> = []
+    const composer = await renderNativeView(requests)
+    // Two slots already used.
+    fireEvent.paste(composer, {
+      clipboardData: { files: [pngFile('a.png'), pngFile('b.png')], types: ['Files'] },
+    })
+    await screen.findByTestId('attachment-strip')
+    await waitFor(() => expect(attachmentUploads(requests)).toHaveLength(2))
+    // One batch of three more: two accepted, one skipped, the count named.
+    fireEvent.paste(composer, {
+      clipboardData: { files: [pngFile('c.png'), pngFile('d.png'), pngFile('e.png')], types: ['Files'] },
+    })
+    await screen.findByText(/at most 4 images ride one operator message — 2 accepted, 1 skipped; 0 slots remain/)
+    expect(screen.getAllByRole('listitem')).toHaveLength(4)
+    await waitFor(() => expect(attachmentUploads(requests)).toHaveLength(4))
+    await waitFor(() =>
+      expect((composer as HTMLTextAreaElement).value).toBe(
+        '[Image #1][Image #2][Image #3][Image #4]',
+      ),
+    )
+  })
 })
 
 describe('TerminalView Lane C routing (§8.5)', () => {
@@ -511,6 +586,52 @@ describe('TerminalView Lane C routing (§8.5)', () => {
     expect(operatorMessagePosts(requests)).toHaveLength(1)
     await screen.findByText(/operator message: ambiguous/)
   })
+
+  it('an accepted reconcile after a lost response retires the draft and chips like a direct accept (P1.5)', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown>; formData?: boolean }> = []
+    const composer = await renderNativeView(requests, {
+      operatorMessageFails: true,
+      reconcileBody: { outcome: 'accepted', reason_code: 'delivered' },
+    })
+    fireEvent.change(composer, { target: { value: 'see this' } })
+    fireEvent.paste(composer, { clipboardData: { files: [pngFile()] } })
+    await screen.findByText('ready')
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    // One POST, one exact-id reconcile, and the accepted reconcile takes
+    // the same post-accept path as a direct response: the draft and the
+    // chips retire, the operation id stays named for any later reconcile.
+    await screen.findByText(/operator message: accepted \(uuid-/)
+    expect(operatorMessagePosts(requests)).toHaveLength(1)
+    expect((composer as HTMLTextAreaElement).value).toBe('')
+    expect(screen.queryByTestId('attachment-strip')).toBeNull()
+    // Send is disabled on the empty draft: a second click cannot mint a
+    // new operation id for the same message.
+    expect((screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('Shift+Enter never sends; a multiline draft routes over operator-message (P1.3)', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown>; formData?: boolean }> = []
+    const composer = await renderNativeView(requests)
+    fireEvent.change(composer, { target: { value: 'line one' } })
+    expect(screen.getByTestId('composer-route-status').textContent).toContain(
+      'delivers as control input',
+    )
+
+    // Shift+Enter is the newline gesture: it must not send anything.
+    fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true })
+    expect(operatorMessagePosts(requests)).toHaveLength(0)
+    expect(controlInputPosts(requests)).toHaveLength(0)
+
+    // The multiline draft the pre-r1 single-line input could never hold:
+    // it routes to the operator-message path and sends the newline intact.
+    fireEvent.change(composer, { target: { value: 'line one\nline two' } })
+    expect(screen.getByTestId('composer-route-status').textContent).toContain('operator message')
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await waitFor(() => expect(operatorMessagePosts(requests)).toHaveLength(1))
+    expect(operatorMessagePosts(requests)[0].body?.text).toBe('line one\nline two')
+    expect(controlInputPosts(requests)).toHaveLength(0)
+  })
 })
 
 describe('TerminalView Lane C degradation (§8.6/D9)', () => {
@@ -534,9 +655,27 @@ describe('TerminalView Lane C degradation (§8.6/D9)', () => {
     const requests: Array<{ url: string; method?: string; body?: Record<string, unknown>; formData?: boolean }> = []
     const composer = await renderNativeView(requests, { laneCBlocks: false })
     fireEvent.paste(composer, { clipboardData: { files: [pngFile()] } })
-    await screen.findByText(/image attachments are unavailable for this provider/)
+    await screen.findByText(/image attachments are unavailable on this terminal’s provider build/)
     expect(attachmentUploads(requests)).toHaveLength(0)
     expect(screen.queryByTestId('attachment-strip')).toBeNull()
+  })
+
+  it('a text-proven but image-unproven build (kimi 0.29.0/0.29.1) hides the image affordance honestly', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown>; formData?: boolean }> = []
+    const composer = await renderNativeView(requests, { imageBlock: false })
+    // The paperclip is hidden; the note explains the build-exact reason.
+    expect(screen.queryByRole('button', { name: 'Attach an image' })).toBeNull()
+    await screen.findByTestId('image-unavailable-note')
+    // Multiline still routes over the operator-message path (text is proven).
+    fireEvent.change(composer, { target: { value: 'line one' } })
+    fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true })
+    fireEvent.change(composer, { target: { value: 'line one\nline two' } })
+    expect(screen.getByTestId('composer-route-status').textContent).toContain('operator message')
+    expect((screen.getByRole('button', { name: 'Send' }) as HTMLButtonElement).disabled).toBe(false)
+    // A paste is refused with the build-exact explanation and zero uploads.
+    fireEvent.paste(composer, { clipboardData: { files: [pngFile()] } })
+    await screen.findByText(/image attachments are unavailable on this terminal’s provider build/)
+    expect(attachmentUploads(requests)).toHaveLength(0)
   })
 
   it('streaming armed replaces the composer; an image paste there uploads nothing (§6.2)', async () => {

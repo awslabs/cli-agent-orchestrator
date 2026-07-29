@@ -46,10 +46,14 @@ class ProviderControls(TypedDict):
     entry without re-walking the tree.
 
     Lane C's ``operator_message`` and ``image`` blocks (§8.6) follow the
-    same build-exact rule as ``steer_chords``: present for builds the
-    evidence covers (``SUPPORTED_VERSIONS``), ``None`` otherwise — an
-    unpinned build advertises no message/image capability rather than
-    inheriting another build's proof.
+    same build-exact rule as ``steer_chords``, with one stricter split:
+    ``operator_message`` is present for builds the text evidence covers
+    (``SUPPORTED_VERSIONS``) while ``image`` is present only for the exact
+    build(s) whose live acceptance proves image delivery
+    (``IMAGE_PROVEN_BUILDS``) — an unpinned build advertises no
+    message/image capability, and a text-proven but image-unproven build
+    (kimi 0.29.0/0.29.1) advertises the message block without the image
+    block rather than inheriting another build's proof.
     """
 
     compact: Optional[List[Dict[str, Any]]]
@@ -58,6 +62,7 @@ class ProviderControls(TypedDict):
     dispatch_grace_ms: Optional[int]
     operator_message: Optional[Dict[str, Any]]
     image: Optional[Dict[str, Any]]
+    interactive_streaming: Optional[Dict[str, Any]]
     evidence: Dict[str, Any]
 
 
@@ -106,6 +111,17 @@ def _operator_message_block() -> Dict[str, Any]:
     }
 
 
+def _interactive_streaming_block() -> Dict[str, Any]:
+    """The §6.7 (r15) interactive-streaming advertisement.
+
+    Present only for builds the deployed v3 sequence transport is proven
+    on (``SUPPORTED_VERSIONS``); the per-terminal block is the send
+    authority for a ``payload_class: "interactive"`` declaration, the
+    top-level union discovery only.
+    """
+    return {"supported": True}
+
+
 def _kimi_entry() -> ProviderControls:
     """The kimi_cli row, re-shaped from the adapter's own pins.
 
@@ -139,6 +155,7 @@ def _kimi_entry() -> ProviderControls:
             "reference_template": KIMI_IMAGE_REFERENCE_TEMPLATE,
             "evidence": "live acceptance on pinned 0.29.2 (§10.6)",
         },
+        interactive_streaming=_interactive_streaming_block(),
         evidence={
             "compact": "kimi_native_control.CONTROL_COMPACT (adapter pin, imported)",
             "stop": (
@@ -156,6 +173,11 @@ def _kimi_entry() -> ProviderControls:
                 "staged-path PNG via the provider's own ReadMediaFile, proven by "
                 "live acceptance on pinned 0.29.2 (design §10.6, round 3); the "
                 "reference template is the proven directive phrasing (§8.6)"
+            ),
+            "interactive_streaming": (
+                "§6.7 (r15) declared interactive streaming over the deployed v3 "
+                "sequence transport, live-proven on the pinned 0.29.x acceptance "
+                "line (§10.1/§10.3)"
             ),
         },
     )
@@ -184,6 +206,7 @@ def _claude_entry() -> ProviderControls:
                 "documented path-in-prompt flow (design Appendix A.9); " "live acceptance per §10.6"
             ),
         },
+        interactive_streaming=_interactive_streaming_block(),
         evidence={
             "compact": "claude_native_control.CONTROL_COMPACT (adapter pin, imported)",
             "stop": 'providers/claude_code.py: the TUI shows "esc to interrupt"',
@@ -195,6 +218,11 @@ def _claude_entry() -> ProviderControls:
             "image": (
                 "documented image-via-path flow (design Appendix A.9); CAO-side "
                 "limits pinned per F9; live acceptance per §10.6"
+            ),
+            "interactive_streaming": (
+                "§6.7 (r15) declared interactive streaming over the deployed v3 "
+                "sequence transport, live-proven on the pinned 2.1.220 acceptance "
+                "(§10.1/§10.3)"
             ),
         },
     )
@@ -245,6 +273,8 @@ def _wire_shape(entry: ProviderControls) -> Dict[str, Any]:
         block["operator_message"] = dict(entry["operator_message"])
     if entry["image"] is not None:
         block["image"] = dict(entry["image"])
+    if entry["interactive_streaming"] is not None:
+        block["interactive_streaming"] = dict(entry["interactive_streaming"])
     return block
 
 
@@ -258,14 +288,37 @@ _SHORT_NAME_FOR_WIRE = {
 }
 
 
+#: The exact builds whose live acceptance proves image delivery (§10.6,
+#: keyed by the canonical wire provider keys this registry speaks).  Text
+#: and multiline operator messages ride the adapter composer plans proven
+#: across each provider's ``SUPPORTED_VERSIONS`` line, but the image block
+#: is build-exact: kimi's staged-path ``ReadMediaFile`` flow is proven on
+#: 0.29.2 alone, so 0.29.0/0.29.1 — and any unknown build — advertise no
+#: image block rather than inheriting 0.29.2's proof.  Claude's single
+#: accepted build is its proven build.
+IMAGE_PROVEN_BUILDS: Dict[str, tuple] = {
+    provider_contracts.PROVIDER_KIMI_CLI: ("0.29.2",),
+    provider_contracts.PROVIDER_CLAUDE_CODE: ("2.1.220",),
+}
+
+
+def _normalized_build(provider_version: Optional[str]) -> Optional[str]:
+    if provider_version is None:
+        return None
+    try:
+        return provider_contracts.normalized_version(provider_version)
+    except Exception:
+        return None
+
+
 def _build_supports_operator_message(provider: str, provider_version: Optional[str]) -> bool:
-    """Whether Lane C's message/image blocks are proven for this exact build.
+    """Whether Lane C's operator-message (text) block is proven for this
+    exact build.
 
     Same fail-closed rule as steer chords: the evidence lives on pinned
     builds, so an unpinned (or unresolved) build advertises no
-    ``operator_message``/``image`` blocks at all rather than inheriting a
-    build it never proved.  The §8.4 delivery matrix scopes kimi's image
-    support to the 0.29.x line — exactly ``SUPPORTED_VERSIONS``.
+    ``operator_message`` block at all rather than inheriting a build it
+    never proved.
 
     ``SUPPORTED_VERSIONS`` is keyed by the recovery-capability short names
     (``kimi``/``claude``) while this registry speaks the canonical wire
@@ -273,16 +326,38 @@ def _build_supports_operator_message(provider: str, provider_version: Optional[s
     here, mirroring ``_WIRE_FOR_RECOVERY_NAME``'s warning about the two
     namespaces.
     """
-    if provider_version is None:
+    normalized = _normalized_build(provider_version)
+    if normalized is None:
         return False
     short = _SHORT_NAME_FOR_WIRE.get(provider)
     if short is None:
         return False
-    try:
-        normalized = provider_contracts.normalized_version(provider_version)
-    except Exception:
-        return False
     return normalized in provider_contracts.SUPPORTED_VERSIONS.get(short, ())
+
+
+def _build_supports_image(provider: str, provider_version: Optional[str]) -> bool:
+    """Whether Lane C's image block is proven for this exact build.
+
+    Stricter than the text gate (Lane C r1): image delivery authority is
+    proven only by the pinned live acceptance builds in
+    ``IMAGE_PROVEN_BUILDS`` — kimi 0.29.2, claude 2.1.220 — so a build
+    whose text plan is proven (kimi 0.29.0/0.29.1) still advertises no
+    image capability it never demonstrated.
+    """
+    normalized = _normalized_build(provider_version)
+    if normalized is None:
+        return False
+    return normalized in IMAGE_PROVEN_BUILDS.get(provider, ())
+
+
+def _build_supports_interactive_streaming(provider: str, provider_version: Optional[str]) -> bool:
+    """Whether §6.7 interactive streaming is advertised for this exact build.
+
+    The declaration rides the deployed v3 sequence transport, so the proof
+    basis is the same accepted-build line as the text gate; an unpinned or
+    unresolved build advertises nothing (fail closed, D9).
+    """
+    return _build_supports_operator_message(provider, provider_version)
 
 
 def controls_for(provider: str, provider_version: Optional[str]) -> Optional[ProviderControls]:
@@ -305,6 +380,12 @@ def controls_for(provider: str, provider_version: Optional[str]) -> Optional[Pro
     if not _build_supports_operator_message(provider, provider_version):
         entry["operator_message"] = None
         entry["image"] = None
+    elif not _build_supports_image(provider, provider_version):
+        # Text-proven but image-unproven (kimi 0.29.0/0.29.1): the message
+        # block stays; the image block does not inherit 0.29.2's proof.
+        entry["image"] = None
+    if not _build_supports_interactive_streaming(provider, provider_version):
+        entry["interactive_streaming"] = None
     return entry
 
 

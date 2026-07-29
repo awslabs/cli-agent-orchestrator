@@ -159,6 +159,7 @@ class TestDiscoveryWireShape:
                 "dispatch_grace_ms": 5000,
                 "operator_message": OPERATOR_MESSAGE_BLOCK,
                 "image": KIMI_IMAGE_BLOCK,
+                "interactive_streaming": {"supported": True},
             },
             CLAUDE: {
                 "compact": {"events": COMPACT_EVENTS},
@@ -166,6 +167,7 @@ class TestDiscoveryWireShape:
                 "steer_chords": [],
                 "operator_message": OPERATOR_MESSAGE_BLOCK,
                 "image": CLAUDE_IMAGE_BLOCK,
+                "interactive_streaming": {"supported": True},
             },
         }
 
@@ -191,7 +193,9 @@ class TestPerTerminalBlock:
     the per-terminal send authority on the control-identity route."""
 
     def test_a_proven_build_advertises_its_chords(self):
-        block = provider_controls.controls_block_for(KIMI, "0.29.1")
+        # 0.29.2 is the exact build whose live acceptance proves image
+        # delivery, so it is the one that advertises the full block.
+        block = provider_controls.controls_block_for(KIMI, "0.29.2")
         assert block == {
             "compact": {"events": COMPACT_EVENTS},
             "stop": {"events": STOP_EVENTS},
@@ -199,6 +203,7 @@ class TestPerTerminalBlock:
             "dispatch_grace_ms": 5000,
             "operator_message": OPERATOR_MESSAGE_BLOCK,
             "image": KIMI_IMAGE_BLOCK,
+            "interactive_streaming": {"supported": True},
         }
 
     def test_an_unpinned_build_advertises_no_chords(self):
@@ -265,10 +270,30 @@ class TestLaneCBlocks:
         assert block["image"]["reference_template"] == "{path}"
 
     @pytest.mark.parametrize("build", KIMI_PINNED_BUILDS)
-    def test_every_supported_kimi_build_advertises_message_and_image(self, build):
+    def test_every_supported_kimi_build_advertises_the_message_block(self, build):
+        # The text plan is proven across the 0.29.x line (the adapter's
+        # build-pinned composer-newline table), so all three advertise it.
         block = provider_controls.controls_block_for(KIMI, build)
         assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
-        assert block["image"] == KIMI_IMAGE_BLOCK
+
+    @pytest.mark.parametrize("build", ["0.29.0", "0.29.1"])
+    def test_a_text_proven_but_image_unproven_kimi_build_advertises_no_image(self, build):
+        """Image delivery authority is proven only on 0.29.2 (§10.6): the
+        older text-proven builds keep the message block but must not
+        inherit the image block's proof (Lane C r1)."""
+        block = provider_controls.controls_block_for(KIMI, build)
+        assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
+        assert "image" not in block
+        entry = provider_controls.controls_for(KIMI, build)
+        assert entry["operator_message"] is not None
+        assert entry["image"] is None
+
+    def test_only_the_image_proven_kimi_build_advertises_image(self):
+        assert "image" not in provider_controls.controls_block_for(KIMI, "0.29.0")
+        assert "image" not in provider_controls.controls_block_for(KIMI, "0.29.1")
+        assert (
+            provider_controls.controls_block_for(KIMI, "0.29.2")["image"] == KIMI_IMAGE_BLOCK
+        )
 
     def test_operator_message_limits_are_the_spec_pins(self):
         block = provider_controls.controls_block_for(CLAUDE, "2.1.220")

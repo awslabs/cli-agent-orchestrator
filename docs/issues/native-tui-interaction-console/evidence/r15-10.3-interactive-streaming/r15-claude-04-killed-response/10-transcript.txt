@@ -1,0 +1,29 @@
+❯ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do not
+  stop early.
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ R15CLAUDE-eb91508a
+
+⏺ Got it — stopping the count. What would you like to do instead?
+
+✻ Brewed for 4s
+
+❯ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do not
+  stop early.
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do not
+  stop early.Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly
+  and do not stop early.Count from 1 to 120, one number per line, thinking briefly between lines.
+  Work slowly and do not stop early.
+
+· Puttering… (3s · thinking with xhigh effort)
+  ⎿  Tip: Hit shift+tab to cycle between manual mode, auto-accept edit mode, and plan mode
+
+  ❯ R15CKILL-74b7d9e8
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Press up to edit queued messages
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ctx 6% (64k/1000k) │ sess 100% →06:40 │ wk 83% →Mon │ sonnet-5 │ xhigh │ /…/cao_scratch_r150/wor…
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 3 agents

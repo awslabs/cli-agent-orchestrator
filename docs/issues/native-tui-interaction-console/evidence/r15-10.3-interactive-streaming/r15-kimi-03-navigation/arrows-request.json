@@ -1,0 +1,14 @@
+{
+  "control_id": "ctl-3fe5b67098",
+  "events": [
+    {
+      "key": "Down",
+      "type": "key"
+    },
+    {
+      "key": "Up",
+      "type": "key"
+    }
+  ],
+  "payload_class": "interactive"
+}

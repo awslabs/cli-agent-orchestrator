@@ -152,8 +152,17 @@ export async function stubBackend(page: Page, options?: {
   macros?: StubMacro[];
   /** §8.6: omit the operator_message/image blocks (old-server degradation). */
   laneC?: boolean;
+  /** §6.7 (r15): advertise interactive_streaming in the per-terminal,
+   * build-exact identity block. Default false — the honest old-server
+   * shape, under which armed batches never declare. */
+  interactiveStreaming?: boolean;
+  /** Canned control-input POST responses by ordinal (1-based); later POSTs
+   * fall back to the default accepted answer. */
+  controlInputResponses?: Array<Record<string, unknown>>;
 }): Promise<StubHarness> {
   const laneC = options?.laneC ?? true;
+  const interactiveStreaming = options?.interactiveStreaming ?? false;
+  let controlInputPostNumber = 0;
   const harness: StubHarness = {
     controlInputPosts: [],
     operatorMessagePosts: [],
@@ -297,6 +306,7 @@ export async function stubBackend(page: Page, options?: {
             kimi_cli: {
               steer_chords: ["C-s"],
               dispatch_grace_ms: 5000,
+              ...(interactiveStreaming ? { interactive_streaming: { supported: true } } : {}),
               ...(laneC
                 ? {
                     operator_message: {
@@ -385,6 +395,11 @@ export async function stubBackend(page: Page, options?: {
     if (path === "/terminals/t-native/control-input" && method === "POST") {
       const body = request.postDataJSON() as ControlInputPost;
       harness.controlInputPosts.push(body);
+      controlInputPostNumber += 1;
+      const canned = options?.controlInputResponses?.[controlInputPostNumber - 1];
+      if (canned) {
+        return json(route, { control_id: body.control_id, events: body.events, ...canned });
+      }
       return json(route, {
         control_id: body.control_id,
         outcome: "accepted",

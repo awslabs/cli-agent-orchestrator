@@ -2747,6 +2747,269 @@ class TestCommandDeclarationShape:
         assert tmux.writes == []
 
 
+def _deliver_interactive(journal, events, **overrides):
+    kwargs = {"control_id": CONTROL, "events": events, "payload_class": "interactive"}
+    kwargs.update(overrides)
+    return service.deliver_control_input(TERMINAL, journal=journal, **kwargs)
+
+
+class TestInteractiveDeclaration:
+    """§6.7 (r15): a declared interactive batch bypasses only the provider
+    turn-state readiness refusal and the kimi dispatch grace — capability-
+    gated per terminal build — with every other guard (lease, identity,
+    copy mode, journal, deadline) exactly as for an undeclared batch."""
+
+    INTERACTIVE_EVENTS = [{"type": "text", "text": "queued mid-turn"}]
+
+    def _wire(self, monkeypatch, resolved, adapter, plans, turn_status=TerminalStatus.IDLE):
+        from cli_agent_orchestrator.services import managed_launch_v2
+
+        with service._native_kimi_dispatch_guard_lock:
+            service._native_kimi_dispatch_times.clear()
+        monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
+        client = FakeTmux(
+            identities=[
+                FakePaneIdentity(
+                    pane_id=resolved.pane_id,
+                    window_id=resolved.window_id,
+                    pane_pid=resolved.pane_pid,
+                )
+            ]
+        )
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        monkeypatch.setattr(
+            service,
+            "_native_sequence_preflight",
+            lambda *a, **k: (adapter, plans, None),
+        )
+
+        def _observe(provider, **kwargs):
+            if isinstance(turn_status, BaseException):
+                raise turn_status
+            return turn_status
+
+        monkeypatch.setattr(managed_launch_v2, "_observe_turn_state", _observe)
+        return client
+
+    def test_interactive_bypasses_the_turn_gate_that_gates_the_same_events_undeclared(
+        self, monkeypatch, journal
+    ):
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+            turn_status=TerminalStatus.PROCESSING,
+        )
+        undeclared = _deliver_sequence(journal, events=self.INTERACTIVE_EVENTS)
+        assert undeclared.outcome == REFUSED
+        assert undeclared.reason_code == REASON_PANE_BUSY
+        assert client.writes == []
+
+        declared = _deliver_interactive(
+            journal, self.INTERACTIVE_EVENTS, control_id="ctl-interactive-1"
+        )
+        assert declared.outcome == ACCEPTED
+        assert declared.request_schema_version == 4
+        assert len(client.writes) == 1
+
+    def test_interactive_bypasses_the_kimi_dispatch_grace_but_marks_after_enter(
+        self, monkeypatch, journal
+    ):
+        resolved = _seq_resolved()
+        binding = ControlInputBinding(
+            request_id=CONTROL,
+            terminal_id=TERMINAL,
+            pane_id=PANE,
+            window_id=WINDOW,
+            pane_pid=PANE_PID,
+            request_sha256="0" * 64,
+            generation=GENERATION,
+            server_socket_path=SOCKET,
+        )
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+            turn_status=TerminalStatus.IDLE,
+        )
+        # Inside the grace of a preceding Enter: undeclared is gated (the
+        # §6.4 pause case), the declared interactive batch is not.
+        service._mark_native_kimi_dispatch(service._native_kimi_dispatch_key(resolved, binding))
+        declared = _deliver_interactive(
+            journal,
+            [{"type": "text", "text": "queued mid-turn"}, {"type": "key", "key": "Enter"}],
+            control_id="ctl-interactive-1",
+        )
+        assert declared.outcome == ACCEPTED
+        # The interactive Enter still marked the dispatch: a following
+        # undeclared composer batch keeps its grace protection.
+        undeclared = _deliver_sequence(
+            journal, events=self.INTERACTIVE_EVENTS, control_id="ctl-undeclared-1"
+        )
+        assert undeclared.outcome == REFUSED
+        assert undeclared.reason_code == REASON_PANE_BUSY
+        assert "dispatch grace" in undeclared.detail
+
+    def test_interactive_still_refuses_real_lease_contention(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+
+        @contextmanager
+        def _held_lease(*a, **k):
+            raise service.PaneBusyError(
+                "input lease is held by another process/thread: operator-message:op-1"
+            )
+
+        monkeypatch.setattr(service, "pane_input_lease", _held_lease)
+        result = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PANE_BUSY
+        assert "input lease is held by" in result.detail
+        assert result.request_schema_version == 4
+        assert client.writes == []
+
+    def test_interactive_on_an_unproven_build_fails_closed_pre_write(
+        self, monkeypatch, journal
+    ):
+        resolved = _seq_resolved(provider_version="9.9.9")
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+        result = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PROVIDER_UNSUPPORTED
+        assert "interactive-streaming" in result.detail
+        assert client.writes == []
+
+    def test_interactive_on_an_unknown_version_fails_closed(self, monkeypatch, journal):
+        resolved = _seq_resolved(provider_version=None)
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+        result = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PROVIDER_UNSUPPORTED
+        assert client.writes == []
+
+    def test_interactive_still_runs_the_copy_mode_guard(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+        monkeypatch.setattr(
+            service,
+            "_copy_mode_guard_refusal",
+            lambda *a, **k: ("copy-mode-active", "the pane is in copy mode"),
+        )
+        result = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
+        assert result.outcome == REFUSED
+        assert result.reason_code == "copy-mode-active"
+        assert client.writes == []
+
+    def test_interactive_refuses_fail_closed_in_copy_mode_without_exiting_it(
+        self, monkeypatch, journal
+    ):
+        """§6.7 (r15): the interactive bypass never skips the copy-mode
+        guard, and for a declared batch the guard is fail-closed — zero
+        bytes, no exit control, the operator's copy mode untouched."""
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+        monkeypatch.setattr(client, "pane_in_copy_mode", lambda pane_id, **kwargs: True)
+        result = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
+        assert result.outcome == REFUSED
+        assert result.reason_code == "copy-mode-active"
+        assert "left untouched" in result.detail
+        # Fail closed: no exit control and no payload bytes.
+        assert client.writes == []
+
+    def test_undeclared_keeps_the_legacy_copy_mode_exit_and_deliver(
+        self, monkeypatch, journal
+    ):
+        """The legacy undeclared behavior is preserved exactly: a proven
+        copy mode is exited once and the payload delivered exactly once."""
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+        in_mode = {"value": True}
+        monkeypatch.setattr(
+            client, "pane_in_copy_mode", lambda pane_id, **kwargs: in_mode["value"]
+        )
+        original_cancel = client.send_copy_mode_cancel
+
+        def _cancel(pane_id, **kwargs):
+            in_mode["value"] = False
+            return original_cancel(pane_id, **kwargs)
+
+        monkeypatch.setattr(client, "send_copy_mode_cancel", _cancel)
+        result = _deliver_sequence(journal, events=self.INTERACTIVE_EVENTS)
+        assert result.outcome == ACCEPTED
+        assert client.writes[0]["copy_mode_cancel"] is True
+        assert any(write.get("text") == "queued mid-turn" for write in client.writes)
+
+    def test_a_divergent_declaration_on_a_reused_id_is_request_rebound(
+        self, monkeypatch, journal
+    ):
+        resolved = _seq_resolved()
+        self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+        declared = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
+        assert declared.outcome == ACCEPTED
+        # The same id with the same events but undeclared is a different
+        # request (the declaration participates in the digest), not a replay.
+        undeclared = _deliver_sequence(journal, events=self.INTERACTIVE_EVENTS)
+        assert undeclared.outcome == REFUSED
+        assert undeclared.reason_code == REASON_REQUEST_REBOUND
+
+    def test_interactive_legal_payload_is_the_v3_sequence_grammar(
+        self, monkeypatch, journal
+    ):
+        """Prose text, ordinary keys, and chords ride a declaration that
+        never enters the command grammar — even slash-led prose."""
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["see /tmp/x"]}},
+        )
+        result = _deliver_interactive(
+            journal,
+            [{"type": "text", "text": "see /tmp/x"}, {"type": "key", "key": "Down"}],
+        )
+        assert result.outcome == ACCEPTED
+        assert len(client.writes) == 2
+
+
 class TestCommandClassGuard:
     """The never-concatenate guard (§4.1): a declared command is written
     only against a composer *proven empty*, under the lease, before the

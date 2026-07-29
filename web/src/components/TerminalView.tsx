@@ -9,7 +9,9 @@ import {
   type AttachmentRefusalBody,
   type ControlInputCapabilities,
   type ImageAttachmentRecord,
+  type ImageCapabilityBlock,
   type MacroRecord,
+  type OperatorMessageBlock,
 } from '../api'
 import { type SequenceEvent } from '../lib/sequenceRecorder'
 import { StreamingEngine, type SendResult, type TraceEntry } from '../lib/streaming'
@@ -119,16 +121,33 @@ function typedOutcome(body: Record<string, unknown>): {
   reasonCode?: string
   reasonDetail?: string
 } {
+  // r15: the control-input wire field is `detail`; `reason_detail` is the
+  // managed-bridge spelling.  Both normalize into the typed outcome — a
+  // missing discriminator would otherwise misclassify a pauseable
+  // pane-busy as an unrecognized disarm on the live path.
+  const detail = body.reason_detail ?? body.detail
   return {
     outcome: String(body.outcome || 'unknown'),
     reasonCode: body.reason_code ? String(body.reason_code) : undefined,
-    reasonDetail: body.reason_detail ? String(body.reason_detail) : undefined,
+    reasonDetail: detail != null ? String(detail) : undefined,
   }
+}
+
+/** The reason a typed outcome names for a status line (r15: `detail`
+ * included, so an explainable result never renders empty). */
+function outcomeReason(body: Record<string, unknown>): unknown {
+  return body.reason_code || body.reason_detail || body.detail
 }
 
 interface PerTerminalProviderControlEntry {
   steer_chords?: string[]
   dispatch_grace_ms?: number
+  // Lane C (§8.6) and r15 (§6.7) blocks: present only when this terminal's
+  // exact provider build carries the proof — the send authority, unlike
+  // the top-level discovery union.
+  operator_message?: OperatorMessageBlock
+  image?: ImageCapabilityBlock
+  interactive_streaming?: { supported: boolean }
 }
 
 /**
@@ -168,6 +187,13 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   const [controlStatus, setControlStatus] = useState('')
   const [sequenceSupported, setSequenceSupported] = useState(false)
   const [capabilities, setCapabilities] = useState<ControlInputCapabilities | null>(null)
+  // Lane C/r15: the per-terminal, build-exact Lane C blocks from the
+  // identity route — the ONLY send authority for the composer affordances
+  // (§8.6/D9). The top-level capabilities union is discovery only.
+  const [perTerminalLaneC, setPerTerminalLaneC] = useState<{
+    operatorMessage?: OperatorMessageBlock
+    image?: ImageCapabilityBlock
+  }>({})
 
   // ── Lane B: macro library + streaming state ──────────────────────────
   const [macros, setMacros] = useState<MacroRecord[]>([])
@@ -190,6 +216,10 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     generationShort: string
   }>({ provider: provider ?? 'unknown', profile: agentProfile ?? null, generationShort: '—' })
   const engineRef = useRef<StreamingEngine | null>(null)
+  // r15 (§6.7): whether armed batches declare `payload_class: "interactive"`.
+  // Set at arm from the per-terminal, build-exact block; never from the
+  // top-level union, and never by macros/composer/automation.
+  const declareInteractiveRef = useRef(false)
   const macrosButtonRef = useRef<HTMLButtonElement>(null)
   const streamingWsCloseRef = useRef<() => void>(() => {})
 
@@ -201,7 +231,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   const attachmentsRef = useRef<DraftAttachment[]>([])
   attachmentsRef.current = attachments
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const composerInputRef = useRef<HTMLInputElement>(null)
+  const composerInputRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => {
     // Object URLs are the only thing to release; records live server-side.
@@ -213,6 +243,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
 
   useEffect(() => {
     managedRef.current = null
+    setPerTerminalLaneC({})
     api.getManagedControl(terminalId)
       .then(result => {
         managedRef.current = result.managed
@@ -238,6 +269,18 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
               const v3 = (liveCapabilities.request_schema_versions ?? []).includes(3)
               setSequenceSupported(v3)
               if (v3) loadMacroLibrary()
+              // The composer's Lane C affordances resolve from THIS
+              // terminal's build-exact identity controls, never the
+              // top-level discovery union (P1.4/§8.6). Failure is fail-closed.
+              api.getControlIdentity(terminalId)
+                .then(identity => {
+                  const entry = perTerminalProviderControls(identity)
+                  setPerTerminalLaneC({
+                    operatorMessage: entry?.operator_message,
+                    image: entry?.image,
+                  })
+                })
+                .catch(() => setPerTerminalLaneC({}))
               setNativeControlResolved(true)
             })
             .catch(() => {
@@ -401,7 +444,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         expected_identity: expectedIdentity,
       })
       const outcome = String(response.outcome || 'unknown')
-      const reason = response.reason_code || response.reason_detail
+      const reason = outcomeReason(response)
       setControlStatus(
         `${label}: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}`,
       )
@@ -430,7 +473,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       try {
         const response = await api.queryControlInput(controlId)
         const outcome = String(response.outcome || 'unknown')
-        const reason = response.reason_code || response.reason_detail
+        const reason = outcomeReason(response)
         setControlStatus(
           `${label}: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}`,
         )
@@ -454,19 +497,26 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     )
   }
 
-  /** Insert `[Image #N]` at the caret and focus the composer. */
-  const insertTokenAtCaret = (token: number) => {
-    const marker = `[Image #${token}]`
+  /** Insert `[Image #N]` markers at the caret in ONE functional update
+   * (P1.3): a batch composes with any other pending message edit instead
+   * of each token overwriting the previous from a stale closure. */
+  const insertTokensAtCaret = (tokens: number[]) => {
+    if (tokens.length === 0) return
+    const markers = tokens.map(token => `[Image #${token}]`).join('')
     const input = composerInputRef.current
-    const start = input && document.activeElement === input ? (input.selectionStart ?? message.length) : message.length
-    const end = input && document.activeElement === input ? (input.selectionEnd ?? message.length) : message.length
-    const next = message.slice(0, start) + marker + message.slice(end)
-    setMessage(next)
+    const focused = input && document.activeElement === input
+    const start = focused ? (input.selectionStart ?? message.length) : message.length
+    const end = focused ? (input.selectionEnd ?? message.length) : message.length
+    setMessage(prev => {
+      const safeStart = Math.min(start, prev.length)
+      const safeEnd = Math.min(Math.max(end, safeStart), prev.length)
+      return prev.slice(0, safeStart) + markers + prev.slice(safeEnd)
+    })
     requestAnimationFrame(() => {
       if (composerInputRef.current) {
         composerInputRef.current.focus()
-        composerInputRef.current.selectionStart = start + marker.length
-        composerInputRef.current.selectionEnd = start + marker.length
+        composerInputRef.current.selectionStart = start + markers.length
+        composerInputRef.current.selectionEnd = start + markers.length
       }
     })
   }
@@ -498,37 +548,47 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     }
   }
 
+  /** Stage one picker/paste batch (P1.3): the remaining slot count is
+   * computed once, the batch is accepted into one functional state update
+   * with one linked editable token per accepted file, and selection can
+   * never exceed the advertised maximum or overwrite earlier tokens. */
   const stageFiles = (files: File[]) => {
+    if (files.length === 0) return
     const advertised = imageBlock?.formats ?? []
-    for (const file of files) {
-      if (attachmentsRef.current.length >= maxAttachments) {
-        setControlStatus(
-          `at most ${maxAttachments} images ride one operator message; remove one first`,
-        )
-        break
-      }
-      const token = nextTokenRef.current++
-      const localId = crypto.randomUUID()
+    const remainingSlots = Math.max(0, maxAttachments - attachmentsRef.current.length)
+    const accepted = files.slice(0, remainingSlots)
+    const skipped = files.length - accepted.length
+    if (skipped > 0) {
+      setControlStatus(
+        `at most ${maxAttachments} images ride one operator message — ` +
+        `${accepted.length} accepted, ${skipped} skipped; ` +
+        `${remainingSlots - accepted.length} slots remain`,
+      )
+    }
+    if (accepted.length === 0) return
+    const drafts: DraftAttachment[] = accepted.map(file => {
       const format = MIME_TO_FORMAT[file.type]
-      const draft: DraftAttachment = {
-        localId,
-        token,
+      const formatAdvertised = format !== undefined && advertised.includes(format)
+      return {
+        localId: crypto.randomUUID(),
+        token: nextTokenRef.current++,
         file,
         previewUrl: URL.createObjectURL(file),
-        state: format && advertised.includes(format) ? 'staging' : 'failed',
-        error:
-          format && advertised.includes(format)
-            ? undefined
-            : `${file.type || 'this content type'} is not advertised by this provider ` +
-              `(${advertised.join(', ') || 'none'}); unproven formats are refused, not converted`,
+        state: formatAdvertised ? 'staging' : 'failed',
+        error: formatAdvertised
+          ? undefined
+          : `${file.type || 'this content type'} is not advertised by this provider ` +
+            `(${advertised.join(', ') || 'none'}); unproven formats are refused, not converted`,
       }
-      insertTokenAtCaret(token)
-      setAttachments(prev => [...prev, draft])
+    })
+    setAttachments(prev => [...prev, ...drafts])
+    insertTokensAtCaret(drafts.map(draft => draft.token))
+    for (const draft of drafts) {
       if (draft.state === 'staging') {
-        setAttachmentNotice(`Image #${token} uploading…`)
-        void uploadAttachment(localId, file)
+        setAttachmentNotice(`Image #${draft.token} uploading…`)
+        void uploadAttachment(draft.localId, draft.file)
       } else {
-        setAttachmentNotice(`Image #${token} refused — ${draft.error}`)
+        setAttachmentNotice(`Image #${draft.token} refused — ${draft.error}`)
       }
     }
   }
@@ -574,12 +634,15 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     }
   }
 
-  const handleComposerPaste = (event: ClipboardEvent<HTMLInputElement>) => {
+  const handleComposerPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const files = Array.from(event.clipboardData?.files ?? [])
     if (files.length === 0) return // plain-text paste: ordinary text paste
     event.preventDefault()
     if (!imageAttachAvailable) {
-      setControlStatus('image attachments are unavailable for this provider')
+      setControlStatus(
+        'image attachments are unavailable on this terminal’s provider build — ' +
+        'no proven image support is advertised; text and multiline still send',
+      )
       return
     }
     stageFiles(files)
@@ -597,6 +660,17 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         attachmentIds.push(attachment.record.attachment_id)
       }
     }
+    // The one post-accept path (P1.5): a direct accepted POST and an
+    // exact-id reconcile that resolves `accepted` are the same fact, so
+    // both retire the draft and chips identically — the operation id stays
+    // named in the status for any later reconcile, and with the draft gone
+    // a new click cannot mint a second operation for the same message.
+    const applyAccepted = () => {
+      attachmentsRef.current.forEach(attachment => URL.revokeObjectURL(attachment.previewUrl))
+      setAttachments([])
+      nextTokenRef.current = 1
+      setMessage('')
+    }
     setControlBusy(true)
     setControlStatus(`operator message: submitting… (${operationId})`)
     try {
@@ -609,16 +683,11 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         expected_identity: pickExpectedIdentity(identity),
       })
       const outcome = String(response.outcome || 'unknown')
-      const reason = response.reason_code || response.reason_detail
+      const reason = outcomeReason(response)
       setControlStatus(
         `operator message: ${outcome} (${operationId})${reason ? ` — ${String(reason)}` : ''}`,
       )
-      if (outcome === 'accepted') {
-        attachmentsRef.current.forEach(attachment => URL.revokeObjectURL(attachment.previewUrl))
-        setAttachments([])
-        nextTokenRef.current = 1
-        setMessage('')
-      }
+      if (outcome === 'accepted') applyAccepted()
     } catch (error) {
       const apiError = error as ApiError
       if (apiError.status && CONTROL_UNSUPPORTED_STATUSES.has(apiError.status)) {
@@ -644,10 +713,13 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       try {
         const response = await api.reconcileOperatorMessage(operationId)
         const outcome = String(response.outcome || 'unknown')
-        const reason = response.reason_code || response.reason_detail
+        const reason = outcomeReason(response)
         setControlStatus(
           `operator message: ${outcome} (${operationId})${reason ? ` — ${String(reason)}` : ''}`,
         )
+        // An accepted reconcile is the same post-accept fact as a direct
+        // response (P1.5): retire the draft and chips identically.
+        if (outcome === 'accepted') applyAccepted()
       } catch {
         setControlStatus(
           `operator message: response unavailable; operation ${operationId} retained for reconciliation`,
@@ -686,7 +758,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         expected_identity: expectedIdentity,
       })
       const outcome = String(response.outcome || 'unknown')
-      const reason = response.reason_code || response.reason_detail
+      const reason = outcomeReason(response)
       const perEvent = Array.isArray(response.events)
         ? ` [${(response.events as Array<Record<string, unknown>>)
             .map(entry => String(entry.outcome ?? '—'))
@@ -721,7 +793,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       try {
         const response = await api.queryControlInput(controlId)
         const outcome = String(response.outcome || 'unknown')
-        const reason = response.reason_code || response.reason_detail
+        const reason = outcomeReason(response)
         setControlStatus(
           `${label}: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}`,
         )
@@ -748,7 +820,10 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   // §6.3 step 7 + §3.4: the POST's typed body wins; an ambiguous transport
   // result (including a lost response) is reconciled by exactly one
   // exact-id GET — the journaled record is the truth and a batch is never
-  // re-sent. The engine routes the resolved outcome per §6.4.
+  // re-sent. The engine routes the resolved outcome per §6.4. An armed
+  // batch declares `payload_class: "interactive"` only when the
+  // per-terminal block advertised it (§6.7) — the declaration rides the
+  // same POST body, the wire sequence is otherwise unchanged.
   const sendStreamBatch = async (
     controlId: string,
     events: SequenceEvent[],
@@ -758,6 +833,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       const response = await api.sendControlInput(terminalId, {
         control_id: controlId,
         events,
+        ...(declareInteractiveRef.current ? { payload_class: 'interactive' as const } : {}),
         expected_identity: expectedIdentity,
       })
       return { kind: 'resolved', result: typedOutcome(response) }
@@ -811,6 +887,13 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       const expectedIdentity = pickExpectedIdentity(identity)
       const providerEntry = perTerminalProviderControls(identity)
       const chords = new Set(providerEntry?.steer_chords ?? [])
+      // §6.7 (r15): armed batches declare interactive only when THIS
+      // terminal's build-exact block advertises it. An old or unpinned
+      // server omits the block: the armed surface keeps the §6.4 readiness
+      // behavior (busy turns pause batches) and says so — never a
+      // speculative bypass.
+      const interactiveAdvertised = providerEntry?.interactive_streaming?.supported === true
+      declareInteractiveRef.current = interactiveAdvertised
       const graceMs =
         providerEntry?.dispatch_grace_ms ??
         (provider ? liveCapabilities.provider_controls?.[provider]?.dispatch_grace_ms : undefined)
@@ -856,6 +939,12 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       setStreamingTrace([])
       setDisarmInfo(null)
       setStreamingArmed(true)
+      if (!interactiveAdvertised) {
+        setControlStatus(
+          'streaming: interactive declaration unavailable on this server — ' +
+          'busy provider turns pause batches (§6.4), nothing is bypassed',
+        )
+      }
     } catch {
       setControlStatus('streaming could not arm: capabilities or identity fetch failed')
     } finally {
@@ -1102,9 +1191,12 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   // single-line draft ≤ 512 bytes rides the deployed control-input path
   // byte-identically; anything else uses the operator-message path when the
   // provider advertises it, or disables Send with the reason when not (D9:
-  // the advertised capability, never a probe).
-  const operatorMessageBlock = providerControlEntry?.operator_message
-  const imageBlock = providerControlEntry?.image
+  // the advertised capability, never a probe). The blocks come from the
+  // per-terminal, build-exact identity controls — not the top-level
+  // discovery union (P1.4): a kimi 0.29.0/0.29.1 build advertises the
+  // message block without the image block, and the composer reflects it.
+  const operatorMessageBlock = perTerminalLaneC.operatorMessage
+  const imageBlock = perTerminalLaneC.image
   const operatorMessageAvailable = operatorMessageBlock?.supported === true
   const imageAttachAvailable = operatorMessageAvailable && imageBlock?.supported === true
   const maxMessageBytes = operatorMessageBlock?.max_text_bytes ?? 8192
@@ -1209,19 +1301,24 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
                   </button>
                 </>
               )}
-              <input
+              <textarea
                 ref={composerInputRef}
                 value={message}
                 onChange={event => handleMessageChange(event.target.value)}
                 onPaste={handleComposerPaste}
                 onKeyDown={event => {
-                  if (event.key === 'Enter' && canSend) {
+                  // Enter sends (the accepted §8.5 behavior); Shift+Enter
+                  // composes a newline — a multiline draft routes to the
+                  // operator-message path, named live in the routing line.
+                  if (event.key === 'Enter' && !event.shiftKey && canSend) {
+                    event.preventDefault()
                     sendDraft()
                   }
                 }}
+                rows={Math.min(4, message.split('\n').length)}
                 placeholder="Send a message to the native composer…"
                 aria-label="Message to the native composer"
-                className="min-w-0 flex-1 rounded border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none"
+                className="min-w-0 flex-1 resize-none rounded border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none"
               />
               <button
                 disabled={!canSend}
@@ -1414,6 +1511,14 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
               </span>
             )}
           </div>
+          {operatorMessageAvailable && !imageAttachAvailable && (
+            <div className="text-[10px] text-gray-600" data-testid="image-unavailable-note">
+              Image attachments are unavailable on this terminal&apos;s provider build — the
+              build-exact controls advertise no proven image support (kimi image delivery
+              is proven on the pinned 0.29.2 build only); text and multiline operator
+              messages still send.
+            </div>
+          )}
           <div aria-live="polite" className="sr-only" data-testid="attachment-notice">
             {attachmentNotice}
           </div>

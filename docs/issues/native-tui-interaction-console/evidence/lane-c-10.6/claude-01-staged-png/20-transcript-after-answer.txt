@@ -1,6 +1,6 @@
 ╭─── Claude Code v2.1.220 ─────────────────────────────────────────────────────────────────────────╮
 │                                                    │ Tips for getting started                    │
-│                 Welcome back Amber!                │ Run /init to create a CLAUDE.md file with … │
+│                 Welcome back <ACCOUNT>!                │ Run /init to create a CLAUDE.md file with … │
 │                                                    │ ─────────────────────────────────────────── │
 │                       ▐▛███▜▌                      │ What's new                                  │
 │                      ▝▜█████▛▘                     │ Bug fixes and reliability improvements      │
@@ -12,8 +12,8 @@
 
  ⚠ 1 MCP server needs authentication · run /mcp
 
-❯ Read the image file at /private/var/folders/cm/v5tlfz_d4wbg9mxjsppm32600000gn/T/pytest-of-<USER>/p
-  ytest-577/cao_state_lanec0/attachments/ec425f5a/261b56755a3a4b81948cdba33380a47c.png and tell me
+❯ Read the image file at <HOST_TMP>/pytest-of-<USER>/p
+  ytest-607/cao_state_lanec0/attachments/0f0824cd/92694f9fcb4442cf910d1b8168049a4b.png and tell me
   the two colors in it, left half and right half, in one short sentence.
 
   Read 1 file
@@ -25,5 +25,5 @@
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯ 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-  ctx 7% (65k/1000k) │ sess 81% →00:40 │ wk 83% →Mon │ sonnet-5 │ xhigh │ /…/cao_scratch_lanec0/wo…
+  ctx 7% (65k/1000k) │ sess 100% →06:40 │ wk 83% →Mon │ sonnet-5 │ xhigh │ /…/cao_scratch_lanec0/w…
   ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 3 agents

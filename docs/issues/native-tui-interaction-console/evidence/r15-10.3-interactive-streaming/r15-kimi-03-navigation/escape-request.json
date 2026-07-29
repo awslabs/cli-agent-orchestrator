@@ -1,0 +1,10 @@
+{
+  "control_id": "ctl-bcd949b388",
+  "events": [
+    {
+      "key": "Escape",
+      "type": "key"
+    }
+  ],
+  "payload_class": "interactive"
+}

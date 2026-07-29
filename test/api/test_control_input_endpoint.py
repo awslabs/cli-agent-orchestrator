@@ -1209,6 +1209,9 @@ class TestAdditiveCapabilities:
                     ),
                     "evidence": "live acceptance on pinned 0.29.2 (§10.6)",
                 },
+                # §6.7 (r15): the build-exact interactive-streaming send
+                # authority for this terminal's pinned build.
+                "interactive_streaming": {"supported": True},
             }
         }
         assert block["command_controls"] == {"composer_nonempty_guard": True}

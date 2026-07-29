@@ -1,0 +1,9 @@
+- provider: `kimi_cli`
+- executable (canonical): `/opt/homebrew/lib/node_modules/@moonshot-ai/kimi-code/dist/main.mjs`
+- version banner: `0.29.2`
+- reservation: `2517ed2b-7ce1-4e46-885c-e8f77ff4f472`
+- terminal: `3c557a3d`
+- generation: `4f1c479d-fa12-40e9-9688-a6569e8a0979`
+- pane: `%2` in session `cao-a103-r15-kimi-86c93e`
+- native_session_id: `session_a8f3cc62-e315-4015-970e-dadfb67faa57`
+- bind state: `bound`

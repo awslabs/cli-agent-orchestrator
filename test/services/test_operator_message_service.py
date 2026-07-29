@@ -11,7 +11,9 @@ deployed inbox-payload suite mocks them.
 
 from __future__ import annotations
 
+import struct
 import uuid
+import zlib
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -91,7 +93,15 @@ def _record(operation_id, *, state="posted", digest="d" * 64, terminal=TERMINAL,
 
 
 class _FakeAdapter:
-    """Records the adapter call; the canned record is its answer."""
+    """Records the adapter call; the canned record is its answer.
+
+    Runs the Lane C r1 pre-write hook exactly as the real adapters do: a
+    hook refusal becomes the journaled refused record with zero bytes
+    typed, and a replay (or a raise) never touches the hook.
+    """
+
+    REFUSED_IMAGE_UNKNOWN = "image_attachment_unknown"
+    REFUSED_IMAGE_NOT_READY = "image_attachment_not_ready"
 
     class NativeControlConflict(Exception):
         pass
@@ -99,10 +109,13 @@ class _FakeAdapter:
     class NativeControlInvalid(Exception):
         pass
 
-    def __init__(self, record=None, raises=None):
+    def __init__(self, record=None, raises=None, raises_after_hook=False):
         self.calls = []
         self.record = record
         self.raises = raises
+        # False: raise before the hook (claim/transport failure); True:
+        # raise after a successful hook (the post-binding ambiguity window).
+        self.raises_after_hook = raises_after_hook
         self.ambiguous_marks = []
 
     def turn_observation(self, *, active_turn_id, observed_at, observer):
@@ -115,6 +128,19 @@ class _FakeAdapter:
 
     def operator_message(self, **kwargs):
         self.calls.append(kwargs)
+        if self.raises is not None and not self.raises_after_hook:
+            raise self.raises
+        pre_write = kwargs.get("pre_write")
+        if pre_write is not None:
+            hook_refusal = pre_write()
+            if hook_refusal is not None:
+                reason, detail = hook_refusal
+                return _record(
+                    kwargs["operation_id"],
+                    state="refused",
+                    refusal_reason=reason,
+                    observation={"detail": detail},
+                )
         if self.raises is not None:
             raise self.raises
         return self.record
@@ -295,6 +321,20 @@ class TestIdentityAndCapabilityGates:
 
 class TestAttachmentBindingAndSubstitution:
     def _bound(self, monkeypatch, records):
+        """Fake the attachment store's read side and the hook's binding.
+
+        Records default to ``ready`` so the service's pre-lease read-side
+        checks pass; ``bind_for_submit`` is stubbed because the pre-write
+        hook would otherwise hit the real manifest.
+        """
+        by_id = {
+            record["attachment_id"]: {"state": "ready", **record} for record in records
+        }
+        monkeypatch.setattr(
+            oms.image_attachments,
+            "get_attachment",
+            lambda terminal_id, attachment_id: dict(by_id[attachment_id]),
+        )
         monkeypatch.setattr(oms.image_attachments, "bind_for_submit", lambda *a: records)
         monkeypatch.setattr(
             oms.image_attachments,
@@ -306,11 +346,15 @@ class TestAttachmentBindingAndSubstitution:
         def _raise(*a):
             raise AttachmentBindingError("attachment-unknown", "no such attachment")
 
+        self._bound(monkeypatch, [{"attachment_id": "att-1", "format": "png"}])
         monkeypatch.setattr(oms.image_attachments, "bind_for_submit", _raise)
-        monkeypatch.setattr(cis, "resolve_control_identity", lambda tid: _resolved())
+        adapter = _FakeAdapter(record=_record(OP))
+        wire(_resolved(), adapter, {"deliverable": True})
         result = _submit(text="see [Image #1]", attachments=["att-1"], token_map={"1": "att-1"})
         assert result.outcome == "refused"
         assert result.reason_code == "attachment-unknown"
+        # The hook refusal is journaled: zero bytes typed, fresh id retriable.
+        assert result.record_state == "refused"
 
     def test_a_format_outside_the_advertised_set_is_refused(self, wire, monkeypatch):
         # A kimi terminal (png-only) holding a staged jpeg: upload gating
@@ -364,6 +408,15 @@ class TestAttachmentBindingAndSubstitution:
         wire(resolved, adapter, {"deliverable": True})
         monkeypatch.setattr(
             oms.image_attachments,
+            "get_attachment",
+            lambda terminal_id, attachment_id: {
+                "attachment_id": "att-1",
+                "state": "ready",
+                "format": "png",
+            },
+        )
+        monkeypatch.setattr(
+            oms.image_attachments,
             "bind_for_submit",
             lambda *a: [{"attachment_id": "att-1", "format": "png"}],
         )
@@ -403,6 +456,15 @@ class TestAttachmentBindingAndSubstitution:
 
         monkeypatch.setattr(
             oms.image_attachments,
+            "get_attachment",
+            lambda terminal_id, attachment_id: {
+                "attachment_id": "att-1",
+                "state": "ready",
+                "format": "png",
+            },
+        )
+        monkeypatch.setattr(
+            oms.image_attachments,
             "bind_for_submit",
             lambda *a: [{"attachment_id": "att-1", "format": "png"}],
         )
@@ -434,6 +496,193 @@ class TestAttachmentBindingAndSubstitution:
         assert result.outcome == "refused"
         assert result.reason_code == "attachment-not-ready"
         assert "maps to no guest path" in result.detail
+
+
+class TestBindingSeam:
+    """Lane C r1: the ready → submitted binding happens at the adapter's
+    pre-write hook — after the journal claim and every gate — so a
+    zero-byte refusal never strands a ready image as submitted, an
+    unchanged ready image is retriable by a fresh operation id, and a
+    post-hook ambiguity keeps the binding (no rollback races the write).
+    """
+
+    @pytest.fixture
+    def store(self, tmp_path, monkeypatch):
+        root = tmp_path / "attachments"
+        manifest = tmp_path / "attachments.json"
+        monkeypatch.setattr(oms.image_attachments, "attachments_root", lambda: root)
+        monkeypatch.setattr(oms.image_attachments, "manifest_path", lambda: manifest)
+        return tmp_path
+
+    @staticmethod
+    def _png_bytes() -> bytes:
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            return (
+                struct.pack(">I", len(data))
+                + tag
+                + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+            )
+
+        ihdr = struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)
+        raw = b"".join(b"\x00" + b"\x7f" * (2 * 3) for _ in range(2))
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b"")
+        )
+
+    def _stage(self):
+        return oms.image_attachments.stage_upload(
+            TERMINAL,
+            display_filename="shot.png",
+            content=self._png_bytes(),
+            allowed_formats=frozenset({"png"}),
+        )
+
+    def _submit_image(self, operation_id, attachment_id):
+        return _submit(
+            operation_id=operation_id,
+            text="see [Image #1]",
+            attachments=[attachment_id],
+            token_map={"1": attachment_id},
+        )
+
+    def test_a_post_bind_gate_refusal_leaves_the_image_ready_and_a_fresh_id_retries(
+        self, wire, monkeypatch, store
+    ):
+        attachment = self._stage()
+        aid = attachment["attachment_id"]
+        monkeypatch.setattr(oms, "_terminal_agent_profile", lambda tid: None)
+
+        # A busy turn refuses with zero bytes before the adapter call: the
+        # hook never ran, so the image stays ready and unbound.
+        adapter = _FakeAdapter(record=_record(OP))
+        wire(_resolved(), adapter, {"deliverable": True}, turn_status=TerminalStatus.PROCESSING)
+        result = self._submit_image(_op_id(), aid)
+        assert result.outcome == "refused"
+        assert result.reason_code == REASON_PANE_BUSY
+        assert adapter.calls == []
+        record = oms.image_attachments.get_attachment(TERMINAL, aid)
+        assert record["state"] == "ready"
+        assert record["bound_operation_id"] is None
+
+        # A fresh operation id retries the unchanged ready image and binds it.
+        retry_adapter = _FakeAdapter(record=_record(OP))
+        wire(_resolved(), retry_adapter, {"deliverable": True}, turn_status=TerminalStatus.IDLE)
+        retry_id = _op_id()
+        retry = self._submit_image(retry_id, aid)
+        assert retry.outcome == "accepted", retry.detail
+        record = oms.image_attachments.get_attachment(TERMINAL, aid)
+        assert record["state"] == "submitted"
+        assert record["bound_operation_id"] == retry_id
+
+    def test_a_substitution_refusal_leaves_the_image_ready(self, wire, monkeypatch, store):
+        """Path substitution is a zero-byte gate ahead of the hook."""
+        from cli_agent_orchestrator.models.agent_profile import (
+            AgentProfile,
+            ContainerConfig,
+            ContainerPathMap,
+        )
+
+        attachment = self._stage()
+        aid = attachment["attachment_id"]
+        monkeypatch.setattr(
+            oms,
+            "_terminal_agent_profile",
+            lambda tid: AgentProfile(
+                name="containerized",
+                description="test",
+                container=ContainerConfig(
+                    path_maps=[ContainerPathMap(host="/nowhere", guest="/guest")]
+                ),
+            ),
+        )
+        resolved = _resolved(provider="claude_code", provider_version="2.1.220")
+        adapter = _FakeAdapter(record=_record(OP))
+        wire(resolved, adapter, {"deliverable": True})
+        expected = {**EXPECTED, "provider": "claude_code"}
+        result = _submit(
+            operation_id=_op_id(),
+            text="see [Image #1]",
+            attachments=[aid],
+            token_map={"1": aid},
+            expected_identity=expected,
+        )
+        assert result.outcome == "refused"
+        assert result.reason_code == "attachment-not-ready"
+        assert adapter.calls == []
+        record = oms.image_attachments.get_attachment(TERMINAL, aid)
+        assert record["state"] == "ready"
+        assert record["bound_operation_id"] is None
+
+    def test_a_hook_refusal_is_journaled_with_zero_bytes(self, wire, monkeypatch, store):
+        """A bind that fails only at the hook (the pre-lease read side was
+        raced) is journaled as a typed refusal with zero bytes typed."""
+        monkeypatch.setattr(
+            oms.image_attachments,
+            "get_attachment",
+            lambda terminal_id, attachment_id: {
+                "attachment_id": attachment_id,
+                "state": "ready",
+                "format": "png",
+            },
+        )
+        monkeypatch.setattr(
+            oms.image_attachments,
+            "staged_absolute_path",
+            lambda record: f"{store}/attachments/{TERMINAL}/att-ghost.png",
+        )
+        monkeypatch.setattr(oms, "_terminal_agent_profile", lambda tid: None)
+        adapter = _FakeAdapter(record=_record(OP))
+        wire(_resolved(), adapter, {"deliverable": True})
+        # The hook's bind hits the real (empty) store: attachment-unknown.
+        result = self._submit_image(_op_id(), "att-ghost")
+        assert result.outcome == "refused"
+        assert result.reason_code == "attachment-unknown"
+        assert result.record_state == "refused"
+        assert adapter.calls[0]["pre_write"] is not None
+
+    def test_an_ambiguity_after_the_hook_keeps_the_binding(self, wire, monkeypatch, store):
+        """After a successful hook, a mid-submit raise freezes the operation
+        and the image stays submitted — no rollback may race the write."""
+        attachment = self._stage()
+        aid = attachment["attachment_id"]
+        monkeypatch.setattr(oms, "_terminal_agent_profile", lambda tid: None)
+        adapter = _FakeAdapter(
+            record=_record(OP), raises=RuntimeError("transport died"), raises_after_hook=True
+        )
+        wire(_resolved(), adapter, {"deliverable": True})
+        operation_id = _op_id()
+        result = self._submit_image(operation_id, aid)
+        assert result.outcome == "ambiguous"
+        assert result.reason_code == "response-lost"
+        assert adapter.ambiguous_marks
+        record = oms.image_attachments.get_attachment(TERMINAL, aid)
+        assert record["state"] == "submitted"
+        assert record["bound_operation_id"] == operation_id
+
+    def test_the_hook_binds_only_after_every_gate(self, wire, monkeypatch, store):
+        """Lease contention never reaches the hook: no binding, no write."""
+        attachment = self._stage()
+        aid = attachment["attachment_id"]
+        monkeypatch.setattr(oms, "_terminal_agent_profile", lambda tid: None)
+        adapter = _FakeAdapter(record=_record(OP))
+        wire(_resolved(), adapter, {"deliverable": True})
+
+        @contextmanager
+        def _busy_lease(*a, **k):
+            raise cis.PaneBusyError("held by another writer")
+
+        monkeypatch.setattr(oms, "pane_input_lease", _busy_lease)
+        result = self._submit_image(_op_id(), aid)
+        assert result.outcome == "refused"
+        assert result.reason_code == REASON_PANE_BUSY
+        assert adapter.calls == []
+        record = oms.image_attachments.get_attachment(TERMINAL, aid)
+        assert record["state"] == "ready"
+        assert record["bound_operation_id"] is None
 
 
 class TestUnderLeaseGuards:

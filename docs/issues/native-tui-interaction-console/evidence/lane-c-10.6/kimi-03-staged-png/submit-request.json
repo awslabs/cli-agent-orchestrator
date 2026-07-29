@@ -1,11 +1,11 @@
 {
   "attachments": [
-    "8a3629074dd04c7993c23d5141c9f00c"
+    "b4ef679903a3440a87b5a98685928945"
   ],
   "expected_identity": "<9 fields bound>",
-  "operation_id": "4a8f762b-1897-4826-8358-324b9d145589",
+  "operation_id": "80bc3d01-916e-4594-8c15-93ba5ef1fef7",
   "text": "[Image #1] This image has one solid color on its left half and another on its right half. Name the two colors in one short sentence.",
   "token_map": {
-    "1": "8a3629074dd04c7993c23d5141c9f00c"
+    "1": "b4ef679903a3440a87b5a98685928945"
   }
 }

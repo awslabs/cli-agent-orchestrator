@@ -1,8 +1,9 @@
 # Lane C — §10.6 installed live-provider acceptance evidence
 
-Run date: 2026-07-29. Branch: `feature/native-tui-console-lane-c`.
+Run date: 2026-07-29 (r1 repair head). Branch: `feature/native-tui-console-lane-c`.
 Harness: `test/e2e/test_operator_message_live.py` (pytestmark `e2e`).
-Result: **6 passed** (5 kimi + 1 claude) — kimi class in 59.69 s, claude case in 30.22 s.
+Result: **7 passed** (6 kimi + 1 claude) in 102.09 s, including the r1
+killed-response case (kimi-06).
 
 ## Provenance
 
@@ -25,7 +26,13 @@ CAO_LANE_C_EVIDENCE_DIR=<run evidence dir> \
 ```
 
 All home paths, scratch paths, and account-identifying strings are redacted
-(`<HOME>`, `<SCRATCH>`, `<STATE_ROOT>`, `<TMUX_SOCKDIR>`, `<ACCOUNT>`, …).
+(`<HOME>`, `<SCRATCH>`, `<STATE_ROOT>`, `<TMUX_SOCKDIR>`, `<HOST_TMP>`,
+`<ACCOUNT>`, …). `<HOST_TMP>` covers the machine-specific
+`/private/var/folders/.../T` prefix of the per-run pytest tmp dir (the TUI's
+box-width truncation made the exact-path redaction miss those fragments in
+the first committed bundle — repaired in the r1 sanitation pass, which also
+replaced the personal first name in the Claude welcome banner with
+`<ACCOUNT>`). No credential or secret value appears anywhere in the bundle.
 
 ## Cases
 
@@ -55,6 +62,13 @@ All home paths, scratch paths, and account-identifying strings are redacted
   `refused/request-rebound`; the exact-id reconcile returns the same
   journaled record; the transcript contains the marker **exactly once**
   (see `notes.md`) — no duplicate provider submission.
+- **kimi-06 killed response** (`kimi-06-killed-response/`, r1): the submit
+  POST is written over a raw socket that closes **without reading** — the
+  response is provably lost mid-submit while the server completes the
+  write — then one exact-id `GET /operator-message/{operation_id}`
+  reconciles to the journaled `accepted` answer and the transcript
+  contains the marker **exactly once** (see `notes.md`). This is the
+  §10.6 dropped/killed-response acceptance drill, not an ordinary replay.
 - **claude-01 staged PNG** (`claude-01-staged-png/`): upload 201 →
   operator-message submit `accepted` → the bare staged path (claude's
   documented reference form) reaches the composer and the provider reads
