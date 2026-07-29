@@ -1176,6 +1176,28 @@ def execute_composer_plan(
     if not submit:
         return {"lines_typed": len(lines), "enter_sent": False}
 
+    submit_composer_plan(
+        plan=plan,
+        transport=transport,
+        deadline_monotonic=deadline_monotonic,
+    )
+    return {"lines_typed": len(lines), "enter_sent": True}
+
+
+def submit_composer_plan(
+    *,
+    plan: Mapping[str, Any],
+    transport: NativeControlTransport,
+    deadline_monotonic: Optional[float] = None,
+) -> None:
+    """Submit text already typed from ``plan`` with Kimi's proven boundary.
+
+    This is split from :func:`execute_composer_plan` so a caller that must
+    observe the text resting in Kimi's composer can type with
+    ``submit=False``, make that observation, and then cross the exact same
+    reset/settle/Enter boundary.  It never types payload content and sends
+    exactly one Enter.
+    """
     # Clear the provider's paste-burst window before submitting. Without
     # this the final Enter can be swallowed and turned into yet another
     # composer newline -- no error, no turn, the task simply never sent.
@@ -1211,8 +1233,6 @@ def execute_composer_plan(
             f"the composer may hold unsubmitted text",
             enter_attempted=True,
         ) from exc
-
-    return {"lines_typed": len(lines), "enter_sent": True}
 
 
 def _post(

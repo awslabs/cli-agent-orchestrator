@@ -51,11 +51,15 @@ class TestBarrierPinning:
         assert barrier.poll_interval_seconds > 0
         assert barrier.composer_tail_rows > 0
 
-    def test_providers_with_adapter_proven_submits_have_no_barrier(self):
-        # Kimi and Claude cross the submit boundary inside their own
-        # composer plans; a second barrier there would change behaviour
-        # with no contrary evidence (cond-0026 is Codex-only).
-        assert submission_barrier_for("kimi_cli") is None
+    def test_kimi_has_a_pinned_barrier(self):
+        barrier = submission_barrier_for("kimi_cli")
+        assert barrier is not None
+        assert barrier.compose_settle_seconds > 0
+        assert barrier.post_enter_seconds > 0
+        assert barrier.poll_interval_seconds > 0
+        assert barrier.composer_tail_rows == 5
+
+    def test_unpinned_provider_keeps_fused_submit(self):
         assert submission_barrier_for("claude_code") is None
 
     def test_an_unknown_or_absent_provider_has_no_barrier(self):

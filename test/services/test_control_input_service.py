@@ -1759,6 +1759,19 @@ class CodexFakeTmux(FakeTmux):
         return accepted
 
 
+class KimiFakeComposer(FakeComposer):
+    """Kimi's pinned prompt box and two status rows."""
+
+    def rows(self):
+        return self.transcript + [
+            "╭──────────────────────────────────────────────────────╮",
+            f"│ > {self.composed}",
+            "╰──────────────────────────────────────────────────────╯",
+            " auto  K3 thinking: max  …/workspace",
+            " context: 17% (172k/1M)",
+        ]
+
+
 @pytest.fixture
 def codex(monkeypatch):
     """A Codex terminal whose composer answers capture-pane, and a fast barrier.
@@ -1788,6 +1801,34 @@ def codex(monkeypatch):
             post_enter_seconds=0.3,
             poll_interval_seconds=0.01,
             composer_tail_rows=4,
+        ),
+    )
+    return SimpleNamespace(client=client, composer=composer)
+
+
+@pytest.fixture
+def kimi(monkeypatch):
+    """A Kimi terminal using the production five-row observation region."""
+    composer = KimiFakeComposer()
+    client = CodexFakeTmux(composer)
+    monkeypatch.setattr(service, "_tmux_client", lambda: client)
+    monkeypatch.setattr(
+        service, "_terminal_metadata", lambda terminal_id: _metadata(provider="kimi_cli")
+    )
+    monkeypatch.setattr(service, "_managed_identity", lambda terminal_id: None)
+    monkeypatch.setattr(
+        native_pane_input,
+        "capture_pane_screen",
+        lambda pane_id, timeout=10.0: composer.rows(),
+    )
+    monkeypatch.setitem(
+        native_pane_input._SUBMISSION_BARRIERS,
+        "kimi_cli",
+        SubmissionBarrier(
+            compose_settle_seconds=0.3,
+            post_enter_seconds=0.3,
+            poll_interval_seconds=0.01,
+            composer_tail_rows=5,
         ),
     )
     return SimpleNamespace(client=client, composer=composer)
@@ -2010,7 +2051,7 @@ class TestCodexSubmissionBarrier:
         assert [write["submit"] for write in codex.client.writes] == [False]
 
     def test_a_non_codex_provider_keeps_the_fused_write(self, tmux, journal):
-        """A4: absent contrary evidence, Kimi/Claude keep current behaviour."""
+        """A4: an unpinned provider keeps the fused-write behavior."""
         result = _deliver(journal)
 
         assert result.outcome == ACCEPTED
@@ -2019,6 +2060,31 @@ class TestCodexSubmissionBarrier:
         assert result.as_response()["submission_evidence_ref"] is None
         # One fused text+Enter write, exactly as before cond-0026.
         assert [write["submit"] for write in tmux.writes] == [True]
+
+
+class TestKimiSubmissionBarrier:
+    """A retained Kimi round gets provider-visible submission truth."""
+
+    def test_kimi_reports_one_observed_submission(self, kimi, journal):
+        result = _deliver(journal)
+
+        assert result.outcome == ACCEPTED
+        assert result.submission_observed == SUBMISSION_SUBMITTED
+        assert result.submission_evidence_ref is not None
+        assert [write["submit"] for write in kimi.client.writes] == [False, True]
+        assert journal.get(CONTROL).submission_observed == SUBMISSION_SUBMITTED
+
+    def test_kimi_swallowed_enter_is_ambiguous_and_not_replayed(self, kimi, journal):
+        kimi.composer.swallow_enter = True
+
+        first = _deliver(journal)
+        writes_after_first = len(kimi.client.writes)
+        replayed = _deliver(journal)
+
+        assert first.outcome == AMBIGUOUS
+        assert first.submission_observed == SUBMISSION_UNSUBMITTED
+        assert replayed.submission_observed == SUBMISSION_UNSUBMITTED
+        assert len(kimi.client.writes) == writes_after_first == 2
 
 
 # --- Schema v3: ordered structured event sequences ---------------------------
@@ -2335,6 +2401,7 @@ class _FakeSequenceAdapter:
 
     def __init__(self, *, raise_with=None):
         self.calls = []
+        self.submit_calls = []
         self._raise_with = raise_with
 
     def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic=None):
@@ -2345,11 +2412,24 @@ class _FakeSequenceAdapter:
         if self._raise_with is not None:
             raise self._raise_with
 
+    def submit_composer_plan(self, *, plan, transport, deadline_monotonic=None):
+        self.submit_calls.append(plan)
+        transport.send_enter()
+
 
 class TestSequenceManagedAdapter:
     """The managed native path: plans, the proven submit sequence, ordering."""
 
-    def _send(self, journal, client, events, *, adapter=None, dispatch_key=None):
+    def _send(
+        self,
+        journal,
+        client,
+        events,
+        *,
+        adapter=None,
+        dispatch_key=None,
+        submission_barrier=None,
+    ):
         adapter = adapter or _FakeSequenceAdapter()
         plans = {
             index: {"lines": [event["text"]]}
@@ -2375,6 +2455,7 @@ class TestSequenceManagedAdapter:
             digest=digest,
             deadline_monotonic=time.monotonic() + service.WRITE_DEADLINE_SECONDS,
             dispatch_key=dispatch_key,
+            submission_barrier=submission_barrier,
         )
 
     def test_text_then_enter_submits_through_the_adapter_once(self, journal):
@@ -2390,6 +2471,46 @@ class TestSequenceManagedAdapter:
         record = journal.find(CONTROL)
         assert record.state == DELIVERED
         assert record.enter_attempted is True
+
+    def test_managed_kimi_reports_provider_visible_submission(self, kimi, journal):
+        events = [
+            {"type": "text", "text": "continue retained task"},
+            {"type": "key", "key": "Enter"},
+        ]
+        adapter, result = self._send(
+            journal,
+            kimi.client,
+            events,
+            submission_barrier=native_pane_input.submission_barrier_for("kimi_cli"),
+        )
+
+        assert result.outcome == ACCEPTED
+        assert result.submission_observed == SUBMISSION_SUBMITTED
+        assert result.submission_evidence_ref is not None
+        assert adapter.calls == [({"lines": ["continue retained task"]}, False)]
+        assert adapter.submit_calls == [{"lines": ["continue retained task"]}]
+        assert [write["submit"] for write in kimi.client.writes] == [False, True]
+        assert journal.find(CONTROL).submission_observed == SUBMISSION_SUBMITTED
+
+    def test_managed_kimi_swallowed_enter_is_ambiguous_without_replay(self, kimi, journal):
+        kimi.composer.swallow_enter = True
+        events = [
+            {"type": "text", "text": "continue retained task"},
+            {"type": "key", "key": "Enter"},
+        ]
+        _, result = self._send(
+            journal,
+            kimi.client,
+            events,
+            submission_barrier=native_pane_input.submission_barrier_for("kimi_cli"),
+        )
+        writes_after_first = len(kimi.client.writes)
+        replayed = service.lookup_control_input(CONTROL, journal=journal)
+
+        assert result.outcome == AMBIGUOUS
+        assert result.submission_observed == SUBMISSION_UNSUBMITTED
+        assert replayed.submission_observed == SUBMISSION_UNSUBMITTED
+        assert len(kimi.client.writes) == writes_after_first == 2
 
     def test_bare_enter_is_the_named_key_not_a_plan(self, journal):
         client = _FakeChordClient()
@@ -3222,23 +3343,37 @@ class TestCommandClassGuard:
         assert result.request_schema_version == 3
         assert adapter.calls == [({"lines": ["/tmp/x"]}, False)]
 
-    def test_undeclared_compact_text_stays_the_deployed_button(self, monkeypatch, journal):
+    def test_undeclared_compact_text_uses_the_kimi_submission_barrier(
+        self, monkeypatch, kimi, journal
+    ):
         """The deployed Compact button sends '/compact' as ordinary text:
-        undeclared, unguarded, byte-identical behaviour (§4: compact-as-
-        composer-text is preserved; only the registry built-in declares)."""
+        undeclared text remains prose rather than acquiring command
+        semantics, while its text-plus-Enter still gets the provider's
+        ordinary submission proof."""
+        from cli_agent_orchestrator.services import managed_launch_v2
+
         resolved = _seq_resolved()
         adapter = _FakeSequenceAdapter()
-        self._wire(
-            monkeypatch,
-            resolved,
-            adapter,
-            {0: {"lines": ["/compact"]}},
-            empty=AssertionError("undeclared prose must never be observed"),
+        monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
+        monkeypatch.setattr(service, "_tmux_client", lambda: kimi.client)
+        monkeypatch.setattr(
+            service,
+            "_native_sequence_preflight",
+            lambda *a, **k: (adapter, {0: {"lines": ["/compact"]}}, None),
+        )
+        monkeypatch.setattr(
+            managed_launch_v2,
+            "_observe_turn_state",
+            lambda provider, **kwargs: TerminalStatus.IDLE,
         )
         result = _deliver_sequence(journal, events=COMMAND_EVENTS)
+
         assert result.outcome == ACCEPTED
         assert result.request_schema_version == 3
-        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+        assert result.submission_observed == SUBMISSION_SUBMITTED
+        assert adapter.calls == [({"lines": ["/compact"]}, False)]
+        assert adapter.submit_calls == [{"lines": ["/compact"]}]
+        assert [write["submit"] for write in kimi.client.writes] == [False, True]
 
 
 class TestCommandTwoClose:
@@ -3597,7 +3732,7 @@ class TestSequenceJournalReplay:
 
 
 class TestSequenceSubmissionBarrier:
-    """A sequence's text+Enter pair reuses the cond-0026 barrier (Codex)."""
+    """A sequence's text+Enter pair reuses the provider-pinned barrier."""
 
     def _codex_metadata(self):
         return _metadata(provider="codex")
@@ -3641,6 +3776,23 @@ class TestSequenceSubmissionBarrier:
         record = journal.get(CONTROL)
         assert record.submission_observed == "submitted"
         assert record.submission_evidence_ref == "evidence://ref-1"
+
+    def test_kimi_text_then_enter_reports_submission(self, kimi, journal):
+        events = [
+            {"type": "text", "text": "continue retained task"},
+            {"type": "key", "key": "Enter"},
+        ]
+
+        result = _deliver_sequence(journal, events=events)
+
+        assert result.outcome == ACCEPTED
+        assert result.submission_observed == SUBMISSION_SUBMITTED
+        assert result.submission_evidence_ref is not None
+        assert [write.get("submit") for write in kimi.client.writes] == [
+            False,
+            True,
+        ]
+        assert [event["outcome"] for event in result.events] == ["sent", "sent"]
 
     def test_the_barrier_withholds_the_enter_when_text_never_settles(self, monkeypatch, journal):
         from cli_agent_orchestrator.services import native_pane_input

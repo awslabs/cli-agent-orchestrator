@@ -3560,6 +3560,11 @@ def _deliver_sequence_under_lease(
             dispatch_key=dispatch_key,
             request_schema_version=result_schema_version,
             command_observation=command_observation,
+            submission_barrier=(
+                None
+                if command_observation is not None or declared_interactive
+                else native_pane_input.submission_barrier_for(resolved.provider)
+            ),
         )
     return _send_sequence_through_literal_sink(
         journal,
@@ -3643,6 +3648,7 @@ def _send_sequence_through_native_adapter(
     dispatch_key: Optional[Tuple[str, Optional[str], str, int]],
     request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
     command_observation: Optional[Tuple[Any, Any, str, Any]] = None,
+    submission_barrier: Optional["native_pane_input.SubmissionBarrier"] = None,
 ) -> ControlInputResult:
     """Write one claimed v3 sequence through the provider's own adapter.
 
@@ -3654,7 +3660,10 @@ def _send_sequence_through_native_adapter(
     Enter land after a literal burst, and sending it where no burst
     precedes would be a keystroke at a composer for no reason.  Per-event
     outcomes are honest transport facts; none of them is provider
-    completion.  A declared command (``command_observation`` set)
+    completion.  A provider-pinned submission barrier may split the
+    adapter's type and submit phases so the composer is observed holding
+    the text before exactly one Enter, then observed releasing it.  A
+    declared command (``command_observation`` set)
     additionally closes by the r11 two-close rule: ``accepted`` only with
     the execution signal observed and its evidence journaled, otherwise
     ``ambiguous``/``submission-unproven`` — never a transport-only
@@ -3669,6 +3678,8 @@ def _send_sequence_through_native_adapter(
     )
     run = _SequenceRun(events)
     last_chord: Optional[str] = None
+    submission_observed: Optional[str] = None
+    submission_evidence_ref: Optional[str] = None
 
     def _mark_dispatch() -> None:
         if dispatch_key is not None and transport.enter_attempted:
@@ -3742,6 +3753,83 @@ def _send_sequence_through_native_adapter(
                 and events[ordinal + 1]["key"] == "Enter"
             )
             run.mark_attempted(ordinal)
+            if submits and submission_barrier is not None:
+                try:
+                    adapter.execute_composer_plan(
+                        plan=plans[ordinal],
+                        transport=transport,
+                        submit=False,
+                        deadline_monotonic=deadline_monotonic,
+                    )
+                except adapter.ComposerWriteInterrupted as exc:
+                    return _ambiguous(f"the composer write stopped part-way: {exc.detail}.")
+                except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
+                    logger.error(
+                        "control-input sequence adapter raised for %s: %s",
+                        control_id,
+                        exc,
+                    )
+                    return _ambiguous(f"the provider composer adapter raised while writing: {exc}.")
+                run.mark_sent(ordinal)
+                if not native_pane_input.await_compose_visible(
+                    binding.pane_id,
+                    event["text"],
+                    barrier=submission_barrier,
+                    deadline_monotonic=deadline_monotonic,
+                ):
+                    return _ambiguous(
+                        f"the control text never became visible in the composer of "
+                        f"pane {binding.pane_id}, so the submitting Enter was withheld; "
+                        "no Enter was sent and none will be.",
+                        reason=REASON_SUBMISSION_UNPROVEN,
+                        observed=SUBMISSION_UNKNOWN,
+                    )
+                run.mark_attempted(ordinal + 1)
+                try:
+                    adapter.submit_composer_plan(
+                        plan=plans[ordinal],
+                        transport=transport,
+                        deadline_monotonic=deadline_monotonic,
+                    )
+                except adapter.ComposerWriteInterrupted as exc:
+                    return _ambiguous(f"the composer submit stopped part-way: {exc.detail}.")
+                except Exception as exc:  # noqa: BLE001 - uncertainty, not failure
+                    logger.error(
+                        "control-input sequence adapter raised while submitting %s: %s",
+                        control_id,
+                        exc,
+                    )
+                    return _ambiguous(
+                        f"the provider composer adapter raised while submitting: {exc}."
+                    )
+                run.mark_sent(ordinal + 1)
+                submission_observed, submission_evidence_ref = native_pane_input.observe_submission(
+                    binding.pane_id,
+                    event["text"],
+                    barrier=submission_barrier,
+                    deadline_monotonic=deadline_monotonic,
+                )
+                if submission_observed != SUBMISSION_SUBMITTED:
+                    if submission_observed == SUBMISSION_UNSUBMITTED:
+                        detail = (
+                            f"the composer of pane {binding.pane_id} was observed to "
+                            "still hold the control text after the single Enter; no "
+                            "second Enter was sent and none will be."
+                        )
+                    else:
+                        detail = (
+                            f"the composer of pane {binding.pane_id} could not be "
+                            "observed after the single Enter, so submission is unproven; "
+                            "no second Enter was sent and none will be."
+                        )
+                    return _ambiguous(
+                        detail,
+                        reason=REASON_SUBMISSION_UNPROVEN,
+                        observed=submission_observed,
+                        evidence_ref=submission_evidence_ref,
+                    )
+                ordinal += 2
+                continue
             try:
                 adapter.execute_composer_plan(
                     plan=plans[ordinal],
@@ -3818,8 +3906,6 @@ def _send_sequence_through_native_adapter(
     expired = _deadline_ambiguity()
     if expired is not None:
         return expired
-    submission_observed: Optional[str] = None
-    submission_evidence_ref: Optional[str] = None
     if command_observation is not None:
         # The r11 two-close rule: transport acceptance is not command
         # execution.  A declared command closes accepted only when the
@@ -3926,7 +4012,16 @@ def _send_sequence_through_literal_sink(
     # sequence's text+Enter pair exactly as for the v1 control.  Providers
     # without a pin keep the fused literal write; no barrier is ever
     # guessed at a composer whose layout was never read.
-    barrier = native_pane_input.submission_barrier_for(resolved.provider)
+    # A declared command has its own stronger execution observation after the
+    # write.  Do not interpose the generic composer-consumption barrier there:
+    # it would replace the command-specific terminal verdict and evidence with
+    # an earlier, weaker submission check.  Ordinary text+Enter sequences
+    # (including retained-round pointers) use the provider-pinned barrier.
+    barrier = (
+        None
+        if command_observation is not None
+        else native_pane_input.submission_barrier_for(resolved.provider)
+    )
     submission_observed: Optional[str] = None
     submission_evidence_ref: Optional[str] = None
 

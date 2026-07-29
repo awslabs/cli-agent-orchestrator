@@ -424,15 +424,13 @@ _OBSERVATION_SUFFIX_CHARS = 48
 # failed observation, not a slow one.
 _OBSERVATION_CAPTURE_TIMEOUT_SECONDS = 2.0
 
-#: The provider-pinned barrier table, beside the adapters' steer-chord
-#: pins.  Only Codex has an entry: it is the provider whose composer was
-#: proven to swallow a back-to-back Enter (cond-0026), and it has no
-#: native control adapter to cross the boundary on its own.  Kimi and
-#: Claude deliberately have no entry — their adapter plans already carry
-#: the proven submit settle, and adding a second barrier there would
-#: change behaviour that has no contrary evidence.  A provider absent
-#: from the table gets today's behaviour: text and Enter back to back,
-#: with no observation claimed.
+#: Provider-pinned composer observation.  A barrier is needed wherever a
+#: caller must distinguish "tmux accepted Enter" from "the provider consumed
+#: the composer as a submitted turn."  Codex and Kimi both expose stable,
+#: pinned composer regions that make that observation possible.  Claude keeps
+#: its existing fused write because no equivalent region has been pinned.
+#: A provider absent from the table gets that legacy behavior with no
+#: submission observation claimed.
 _SUBMISSION_BARRIERS = {
     # Codex (ratatui composer, pinned 0.145.x): the observed region is
     # the bottom four rows — the status line, the composer box's bottom
@@ -453,6 +451,18 @@ _SUBMISSION_BARRIERS = {
         post_enter_seconds=5.0,
         poll_interval_seconds=0.1,
         composer_tail_rows=4,
+    ),
+    # Kimi Code (pinned 0.29-0.30): the bottom five rows contain the three-row
+    # prompt box followed by its model and context status rows.  A submitted
+    # turn moves the echo above this region, while an Enter retained by the
+    # composer leaves the control's unique suffix inside it.  The same bounded
+    # timings as Codex cover the prompt_toolkit repaint without ever sending a
+    # second Enter.
+    "kimi_cli": SubmissionBarrier(
+        compose_settle_seconds=3.0,
+        post_enter_seconds=5.0,
+        poll_interval_seconds=0.1,
+        composer_tail_rows=5,
     ),
 }
 
