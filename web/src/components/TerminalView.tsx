@@ -1123,10 +1123,14 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         </div>
       )}
       {/* Terminal — absolute positioning gives xterm.js real pixel dimensions to measure.
-          The 50dvh floor keeps the armed streaming terminal at or above half the
+          The floor keeps the armed streaming terminal at or above half the
           viewport on mobile; the control area above scrolls instead of
-          squeezing the xterm below it. */}
-      <div style={{ flex: 1, position: 'relative', overflow: 'hidden', minHeight: '50dvh' }}>
+          squeezing the xterm below it. FitAddon floors the fit to whole rows,
+          so the visible .xterm lands up to one row short of this wrapper
+          (390×844 armed: wrapper 422px but .xterm 416px). The +10px pads the
+          floor by that row-quantization slack so the actual visible terminal —
+          not just the wrapper — clears 50dvh. */}
+      <div style={{ flex: 1, position: 'relative', overflow: 'hidden', minHeight: 'calc(50dvh + 10px)' }}>
         <div ref={containerRef} style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }} />
       </div>
     </div>
