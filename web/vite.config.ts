@@ -30,6 +30,7 @@ export default defineConfig({
       '/graph': { target: 'http://localhost:9889', changeOrigin: true },
       '/macros': { target: 'http://localhost:9889', changeOrigin: true },
       '/control-input': { target: 'http://localhost:9889', changeOrigin: true },
+      '/operator-message': { target: 'http://localhost:9889', changeOrigin: true },
     },
   },
 })

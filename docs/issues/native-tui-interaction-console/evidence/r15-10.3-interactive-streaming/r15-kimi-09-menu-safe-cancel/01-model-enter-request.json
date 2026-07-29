@@ -1,0 +1,14 @@
+{
+  "control_id": "ctl-f5c5f60bc3",
+  "events": [
+    {
+      "text": "/model",
+      "type": "text"
+    },
+    {
+      "key": "Enter",
+      "type": "key"
+    }
+  ],
+  "payload_class": "interactive"
+}

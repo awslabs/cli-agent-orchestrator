@@ -1,0 +1,16 @@
+{
+  "control_id": "ctl-8c8d7cbcb0",
+  "enter": true,
+  "expected_identity": {
+    "execution_mode": "native_tui",
+    "native_session_id": "session_e56dc1aa-76bb-4800-97c2-485209fa9465",
+    "pane_birth_id": "%2",
+    "provider": "kimi_cli",
+    "provider_process_id": "98591@Wed Jul 29 05:20:26 2026",
+    "session_name": "cao-a103-kimi-0300-2f1c81",
+    "terminal_generation": "3aaa4b12-4603-4d77-83c1-948925747c48",
+    "terminal_id": "7821ef85",
+    "terminal_incarnation": null
+  },
+  "text": "Reply with exactly the marker V1TEXT-34563bc8 and nothing else."
+}

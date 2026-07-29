@@ -1,0 +1,36 @@
+- provider: `kimi_cli`
+- executable (canonical): `/opt/homebrew/lib/node_modules/@moonshot-ai/kimi-code/dist/main.mjs`
+- version banner: `0.29.2`
+- reservation: `2517ed2b-7ce1-4e46-885c-e8f77ff4f472`
+- terminal: `3c557a3d`
+- generation: `4f1c479d-fa12-40e9-9688-a6569e8a0979`
+- pane: `%2` in session `cao-a103-r15-kimi-86c93e`
+- native_session_id: `session_a8f3cc62-e315-4015-970e-dadfb67faa57`
+- bind state: `bound`
+- provider: `kimi_cli`
+- executable (canonical): `/opt/homebrew/lib/node_modules/@moonshot-ai/kimi-code/dist/main.mjs`
+- version banner: `0.29.2`
+- reservation: `3649c729-cedd-4e00-b39e-9fcbe40f977f`
+- terminal: `7a1947bb`
+- generation: `afd393e9-bb04-4ebd-b642-1326b13eccde`
+- pane: `%2` in session `cao-a103-r15-kimi-6be9b0`
+- native_session_id: `session_d0234d3c-3867-41ec-8bea-9b2c142609ec`
+- bind state: `bound`
+- provider: `kimi_cli`
+- executable (canonical): `/opt/homebrew/lib/node_modules/@moonshot-ai/kimi-code/dist/main.mjs`
+- version banner: `0.29.2`
+- reservation: `fdc48b20-4436-438b-9772-9387d4683304`
+- terminal: `ccf514d7`
+- generation: `0c9f07f9-4a54-4de1-af39-2d96e26859b9`
+- pane: `%2` in session `cao-a103-r15-kimi-dcc802`
+- native_session_id: `session_a263a04a-dcd6-44ff-85ab-d95741ee7b79`
+- bind state: `bound`
+- provider: `kimi_cli`
+- executable (canonical): `/private/tmp/kimi-pinned-0.29.2/node_modules/@moonshot-ai/kimi-code/dist/main.mjs`
+- version banner: `0.29.2`
+- reservation: `fd82978b-a5b2-45a4-962c-e9b7398e3704`
+- terminal: `e79ed9c0`
+- generation: `93601ac4-d507-4c07-8c99-d9d2e8a868aa`
+- pane: `%2` in session `cao-a103-r15-kimi-bbe337`
+- native_session_id: `session_596d4528-abd6-4955-b71b-250b46b2c177`
+- bind state: `bound`

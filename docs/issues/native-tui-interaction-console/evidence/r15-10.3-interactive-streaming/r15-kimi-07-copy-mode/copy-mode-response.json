@@ -1,0 +1,49 @@
+{
+  "chord": null,
+  "chord_attempted": null,
+  "chord_sent": null,
+  "chunks_sent": null,
+  "control_id": "ctl-0e66db8a50",
+  "detail": "pane %2 is in copy mode; a declared interactive batch refuses fail-closed rather than exiting the operator's copy mode for them \u2014 no payload was typed, the mode was left untouched, and the write may be sent again after the operator exits copy mode",
+  "enter_attempted": null,
+  "enter_sent": false,
+  "events": [
+    {
+      "ordinal": 0,
+      "outcome": "refused",
+      "text": "R15COPY-b995d93b",
+      "type": "text"
+    }
+  ],
+  "in_flight": false,
+  "outcome": "refused",
+  "protocol": "cao-control-input-v1",
+  "reason_code": "copy-mode-active",
+  "reattemptable": true,
+  "request_digest": "1e33d2587f93545fef539a25158f564927f0d0de90081a2e9e7a06c3ae1573be",
+  "request_schema_version": 4,
+  "resolved_identity": {
+    "execution_mode": "native_tui",
+    "native_session_id": "session_a8f3cc62-e315-4015-970e-dadfb67faa57",
+    "pane": {
+      "bound_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "dead": false,
+      "observed_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "pane_id": "%2",
+      "pane_pid": 87180,
+      "window_id": "@2"
+    },
+    "pane_birth_id": "%2",
+    "provider": "kimi_cli",
+    "provider_process_id": "87180@Wed Jul 29 02:12:34 2026",
+    "session_name": "cao-a103-r15-kimi-86c93e",
+    "terminal_generation": "4f1c479d-fa12-40e9-9688-a6569e8a0979",
+    "terminal_id": "3c557a3d",
+    "terminal_incarnation": null
+  },
+  "state": "refused",
+  "submission_evidence_ref": null,
+  "submission_observed": null,
+  "terminal_id": "3c557a3d",
+  "text_sent": false
+}

@@ -1,0 +1,61 @@
+╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                │
+ │  ▐█████▌  Send /help for help information.                                                     │
+ │                                                                                                │
+ │  Directory: <HOST_TMP>/pytest-of-<USER>/pytest-60…│
+ │  Session:   session_bf8405fe-f39b-45c1-87e1-8ae7d2d544a6                                       │
+ │  Model:     K2.7 Coding                                                                        │
+ │  Version:   0.29.2                                                                             │
+ │                                                                                                │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Use Kimi K3 with High thinking effort - for the best balance between token spend and capability
+   Run /model to switch to K3 and set thinking effort to High
+
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to
+ ~/.tmux.conf and restart tmux.
+
+ ✨ Use the ReadMediaFile tool to read the image file at
+    <HOST_TMP>/pytest-of-<USER>/pytest-607/cao_state_l
+    anec0/attachments/fd90aab3/b4ef679903a3440a87b5a98685928945.png and analyze it in the context
+    of this message. This image has one solid color on its left half and another on its right half.
+    Name the two colors in one short sentence.
+
+ ● The user wants me to use ReadMediaFile tool to read an image file and analyze it. The image has
+   one solid color on the left half and another on the right half. I need to name the two colors in
+   ... (3 more lines, ctrl+o to expand)
+
+ ● Used ReadMediaFile (…0/attachments/fd90aab3/b4ef679903a3440a87b5a98685928945.png) · image
+ (image/png, 302 B)
+
+ ● The image shows two vertical halves: left half is red, right half is blue. I need to name the
+   two colors in one short sentence.
+
+ ● The left half is red and the right half is blue.
+
+ ✨ Reply with exactly the marker MARKER-bf00744f and nothing else. This operator message
+    deliberately exceeds the 512-byte control-input limit to prove the operator-message path. This
+    operator message deliberately exceeds the 512-byte control-input limit to prove the
+    operator-message path. This operator message deliberately exceeds the 512-byte control-input
+    limit to prove the operator-message path. This operator message deliberately exceeds the
+    512-byte control-input limit to prove the operator-message path. This operator message
+    deliberately exceeds the 512-byte control-input limit to prove the operator-message path. This
+    operator message deliberately exceeds the 512-byte control-input limit to prove the
+    operator-message path. This operator message deliberately exceeds the 512-byte control-input
+    limit to prove the operator-message path. This operator message deliberately exceeds the
+    512-byte control-input limit to prove the operator-message path.
+
+ ● The user wants exactly the marker "MARKER-bf00744f" and nothing else. I should reply with just
+   that.
+
+ ● MARKER-bf00744f
+
+ ✨ Reply with exactly the marker ONCE-e27209ae and nothing else.
+
+  🌑 · Tip: @: mention files
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                              │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+ K2.7 Coding thinking  …/pytest-607/cao_scratch_lanec0/worktree-lanec-kimi  master
+                                                                           context: 9% (22.3k/256k)

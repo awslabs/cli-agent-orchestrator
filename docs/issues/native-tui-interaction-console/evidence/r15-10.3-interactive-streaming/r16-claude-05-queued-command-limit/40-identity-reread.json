@@ -1,0 +1,47 @@
+{
+  "compact": {
+    "events": [
+      {
+        "text": "/compact",
+        "type": "text"
+      },
+      {
+        "key": "Enter",
+        "type": "key"
+      }
+    ]
+  },
+  "image": {
+    "evidence": "documented path-in-prompt flow (design Appendix A.9); live acceptance per \u00a710.6",
+    "formats": [
+      "png",
+      "jpeg",
+      "gif",
+      "webp"
+    ],
+    "max_bytes": 5242880,
+    "max_height": 8000,
+    "max_width": 8000,
+    "mechanism": "staged-path-text",
+    "reference_template": "{path}",
+    "supported": true
+  },
+  "interactive_streaming": {
+    "supported": true
+  },
+  "operator_message": {
+    "max_attachments": 4,
+    "max_text_bytes": 8192,
+    "multiline": true,
+    "supported": true
+  },
+  "steer_chords": [],
+  "stop": {
+    "events": [
+      {
+        "key": "Escape",
+        "type": "key"
+      }
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "control_id": "ctl-660a27c59e",
+  "events": [
+    {
+      "text": "R15CSTALE-a0d82c77",
+      "type": "text"
+    }
+  ],
+  "expected_identity": {
+    "execution_mode": "native_tui",
+    "native_session_id": "56474cc6-6b9b-4acb-83e8-7969f6368e8a",
+    "pane_birth_id": "%4",
+    "provider": "claude_code",
+    "provider_process_id": "88788@Wed Jul 29 02:14:52 2026",
+    "session_name": "cao-a103-r15-claude-5bb90e",
+    "terminal_generation": "00000000-0000-0000-0000-000000000000",
+    "terminal_id": "a99bee0a",
+    "terminal_incarnation": null
+  },
+  "payload_class": "interactive"
+}

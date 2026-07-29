@@ -1,0 +1,29 @@
+╭─── Claude Code v2.1.220 ─────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                    │
+│                 Welcome back <ACCOUNT>!                │ Run /init to create a CLAUDE.md file with … │
+│                                                    │ ─────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                  │
+│                      ▝▜█████▛▘                     │ Bug fixes and reliability improvements      │
+│                        ▘▘ ▝▝                       │ Added Claude Opus 5 (`claude-opus-5`), now… │
+│     Sonnet 5 with xhigh effort · Claude Max ·      │ Added `sandbox.network.strictAllowlist` se… │
+│     <ACCOUNT>          │ /release-notes for more                     │
+│ /…/pytest-635/cao_scratch_r150/worktree-r15-claude │                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 1 MCP server needs authentication · run /mcp
+
+❯ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do not
+  stop early.
+
+
+
+
+✻ Churning…
+
+  ❯ /model
+  tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus trac…
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Press up to edit queued messages
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  sonnet-5 │ xhigh │ /…/cao_scratch_r150/worktree-r15-claude │ master
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 3 agents

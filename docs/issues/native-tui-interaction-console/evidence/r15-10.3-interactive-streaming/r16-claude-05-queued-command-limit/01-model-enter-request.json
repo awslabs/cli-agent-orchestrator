@@ -1,0 +1,14 @@
+{
+  "control_id": "ctl-155f398220",
+  "events": [
+    {
+      "text": "/model",
+      "type": "text"
+    },
+    {
+      "key": "Enter",
+      "type": "key"
+    }
+  ],
+  "payload_class": "interactive"
+}

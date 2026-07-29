@@ -1,0 +1,30 @@
+Run /model to switch to K3 and set thinking effort to High
+
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to
+ ~/.tmux.conf and restart tmux.
+
+ ✨ Reply with exactly the marker V1TEXT-34563bc8 and nothing else.
+
+ ● The user wants exactly the marker "V1TEXT-34563bc8" and nothing else. No tool needed.
+
+ ● V1TEXT-34563bc8
+
+ ✨ Reply with the two markers MULTI-c50d37-line-one and MULTI-c50d37-line-two, one per line.
+    MULTI-c50d37-line-two (this second line rides the proven C-j composer plan)
+
+ ● The user wants exactly two lines:
+   MULTI-c50d37-line-one
+   ... (5 more lines, ctrl+o to expand)
+
+ ● MULTI-c50d37-line-one
+   MULTI-c50d37-line-two
+
+ ✨ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do
+    not stop early.
+
+  🌓 · Tip: /goal for multi-step work with a clear finish line
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > IACT-11a4ab31                                                                                │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+ K2.7 Coding thinking  …/pytest-659/cao_scratch_03000/worktree-kimi-0300  master
+                                                                           context: 9% (21.9k/256k)

@@ -584,6 +584,14 @@ interface StubOptions {
   macros?: MacroFixture[]
   schemaVersions?: number[]
   sequenceKeys?: string[]
+  // r15 (§6.7): whether the per-terminal, build-exact identity block
+  // advertises interactive streaming. Default false — the honest
+  // old-server shape, under which armed batches never declare.
+  interactiveStreaming?: boolean
+  // When true, the first control-input POST answers a pane-busy refusal
+  // carrying the wire `detail` field (never `reason_detail`) — the r15
+  // normalization case; later POSTs answer accepted.
+  firstBatchBusy?: boolean
 }
 
 /**
@@ -604,8 +612,11 @@ function stubLaneBFetch(
     macros = [builtinFixture('compact'), builtinFixture('stop'), userFixture({})],
     schemaVersions = [1, 2, 3, 4],
     sequenceKeys = FULL_KEYS,
+    interactiveStreaming = false,
+    firstBatchBusy = false,
   } = options
   let controlNumber = 0
+  let postNumber = 0
   vi.stubGlobal('crypto', { randomUUID: () => `control-${++controlNumber}` })
   vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input)
@@ -671,7 +682,11 @@ function stubLaneBFetch(
             ...(providerControls
               ? {
                   provider_controls: {
-                    kimi_cli: { steer_chords: steerChords, dispatch_grace_ms: 5000 },
+                    kimi_cli: {
+                      steer_chords: steerChords,
+                      dispatch_grace_ms: 5000,
+                      ...(interactiveStreaming ? { interactive_streaming: { supported: true } } : {}),
+                    },
                   },
                 }
               : {}),
@@ -691,6 +706,20 @@ function stubLaneBFetch(
       return { ok: true, json: async () => ({ macros }) } as Response
     }
     if (url.endsWith('/control-input') && init?.method === 'POST') {
+      postNumber += 1
+      if (firstBatchBusy && postNumber === 1) {
+        return {
+          ok: true,
+          json: async () => ({
+            control_id: body?.control_id,
+            outcome: 'refused',
+            reason_code: 'pane-busy',
+            detail:
+              'the receiver is processing, not idle; a composer-class sequence is ' +
+              'readiness-gated and nothing was written',
+          }),
+        } as Response
+      }
       return {
         ok: true,
         json: async () => ({ control_id: body?.control_id, outcome: 'accepted', events: body?.events }),
@@ -763,6 +792,69 @@ describe('TerminalView Lane B dashboard (§6, §7)', () => {
     expect(
       (screen.getByPlaceholderText('Send a message to the native composer…') as HTMLInputElement).value,
     ).toBe('keep me')
+  })
+
+  it('§6.7: armed batches declare payload_class "interactive" when the per-terminal block advertises it', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, { interactiveStreaming: true })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" agentProfile="spec-writer-k3" onClose={() => {}} />)
+    await screen.findByText('Managed native TUI · identity-bound controls')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Streaming' }))
+    const capture = await screen.findByRole('textbox', { name: /Streaming keystroke capture/ })
+    fireEvent.keyDown(capture, { key: 'h' })
+    fireEvent.keyDown(capture, { key: 'i' })
+    fireEvent.keyDown(capture, { key: 'Enter' })
+
+    await waitFor(() => {
+      const posts = controlInputPosts(requests)
+      expect(posts).toHaveLength(1)
+      // The declaration rides the same POST body; the wire sequence is
+      // otherwise unchanged (§6.7 — text+Enter fusion intact).
+      expect(posts[0].body?.payload_class).toBe('interactive')
+      expect(posts[0].body?.events).toEqual([
+        { type: 'text', text: 'hi' },
+        { type: 'key', key: 'Enter' },
+      ])
+    })
+  })
+
+  it('§6.7: no declaration without the per-terminal block, and the arm notice says why', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests) // interactiveStreaming defaults to the honest absent shape
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" agentProfile="spec-writer-k3" onClose={() => {}} />)
+    await screen.findByText('Managed native TUI · identity-bound controls')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Streaming' }))
+    const capture = await screen.findByRole('textbox', { name: /Streaming keystroke capture/ })
+    // The old-server fallback is stated, never a speculative bypass.
+    await screen.findByText(/interactive declaration unavailable on this server/)
+    fireEvent.keyDown(capture, { key: 'x' })
+    fireEvent.keyDown(capture, { key: 'Enter' })
+    await waitFor(() => expect(controlInputPosts(requests)).toHaveLength(1))
+    expect(controlInputPosts(requests)[0].body?.payload_class).toBeUndefined()
+  })
+
+  it('r15: a pane-busy carrying the wire `detail` field pauses instead of disarming', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, { firstBatchBusy: true })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" agentProfile="spec-writer-k3" onClose={() => {}} />)
+    await screen.findByText('Managed native TUI · identity-bound controls')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Streaming' }))
+    const capture = await screen.findByRole('textbox', { name: /Streaming keystroke capture/ })
+    fireEvent.keyDown(capture, { key: 'h' })
+    fireEvent.keyDown(capture, { key: 'i' })
+    fireEvent.keyDown(capture, { key: 'Enter' })
+
+    // Before r15 this exact wire shape (detail, never reason_detail) took
+    // the fail-closed "unrecognized" disarm on the live path. Now the
+    // batch pauses on the turn-gate discriminator and retries once.
+    await screen.findByText(/provider busy/)
+    expect(screen.queryByText(/Streaming disarmed/)).toBeNull()
+    await waitFor(() => expect(controlInputPosts(requests)).toHaveLength(2), { timeout: 4000 })
+    // No disarm followed the explainable sequence either.
+    expect(screen.queryByText(/Streaming disarmed/)).toBeNull()
   })
 
   it('§6.6: the armed capture surface sends zero websocket input frames', async () => {

@@ -1,0 +1,1 @@
+steer effect proven: 8 fresh provider-output row(s) carry the requested suffix, e.g. ['2 ZQe4598a', '3 ZQe4598a', '4 ZQe4598a']; instruction/queue echoes and pre-steer capture excluded by the shape predicate

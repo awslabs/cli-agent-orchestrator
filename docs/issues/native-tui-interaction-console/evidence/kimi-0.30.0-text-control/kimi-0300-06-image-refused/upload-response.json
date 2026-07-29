@@ -1,0 +1,8 @@
+{
+  "body": {
+    "detail": "provider 'kimi_cli' on build '0.30.0' advertises no image capability; unproven providers refuse image uploads honestly",
+    "outcome": "refused",
+    "reason_code": "provider-unsupported"
+  },
+  "status_code": 422
+}

@@ -1,0 +1,21 @@
+{
+  "control_id": "ctl-1d175cb919",
+  "events": [
+    {
+      "text": "R15STALE-ee8d93af",
+      "type": "text"
+    }
+  ],
+  "expected_identity": {
+    "execution_mode": "native_tui",
+    "native_session_id": "session_a8f3cc62-e315-4015-970e-dadfb67faa57",
+    "pane_birth_id": "%2",
+    "provider": "kimi_cli",
+    "provider_process_id": "87180@Wed Jul 29 02:12:34 2026",
+    "session_name": "cao-a103-r15-kimi-86c93e",
+    "terminal_generation": "00000000-0000-0000-0000-000000000000",
+    "terminal_id": "3c557a3d",
+    "terminal_incarnation": null
+  },
+  "payload_class": "interactive"
+}

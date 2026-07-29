@@ -834,26 +834,34 @@ def control_input_request_digest_v3(
     )
 
 
-# --- Schema v4: the command-class declaration carrier ----------------------
+# --- Schema v4: the declaration carrier (command, interactive) --------------
 #
-# Schema v4 is v3 plus exactly one optional additive field, ``payload_class``,
-# whose sole defined value is ``"command"`` (native-TUI-console §4.1, r7).
-# It travels under its own domain so a declared request can never collide
-# with an undeclared one: a request that declares command-class is a
-# different request from one that does not, and a field that did not
-# participate would digest a declared and an undeclared request of the same
-# id and events alike (rebound blindness) — the same reason ``chord``
-# participates in v2.  v1/v2/v3 requests and their domains are
+# Schema v4 is v3 plus exactly one optional additive field, ``payload_class``.
+# Its defined values are ``"command"`` (native-TUI-console §4.1, r7) and
+# ``"interactive"`` (§6.7, r15 — the armed manual streaming capture's declared
+# intent, which bypasses only the provider-turn readiness gate and the kimi
+# dispatch grace).  The field travels under its own domain so a declared
+# request can never collide with an undeclared one: a request that declares
+# command-class is a different request from one that does not, and a field
+# that did not participate would digest a declared and an undeclared request
+# of the same id and events alike (rebound blindness) — the same reason
+# ``chord`` participates in v2.  v1/v2/v3 requests and their domains are
 # byte-unchanged; a request with ``payload_class`` absent is a v3 request
 # and digests under the v3 domain exactly as before.
 CONTROL_INPUT_DIGEST_DOMAIN_V4 = "cao-control-input-request-v4"
 CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4 = 4
 
-# The sole declared payload class.  ``None`` (absent) means prose.  Command
+# The declared payload classes.  ``None`` (absent) means prose.  Command
 # detection is NEVER derived from payload shape: a batch whose text happens
 # to begin with ``/`` (e.g. a streamed utterance split so a batch starts
 # ``/tmp/x``) is undeclared prose and never enters the composer guard.
 PAYLOAD_CLASS_COMMAND = "command"
+#: §6.7 (r15): the armed manual streaming capture's declaration — ordinary
+#: v3-valid sequence grammar (never command grammar), bypassing only the
+#: provider IDLE/COMPLETED turn-state refusal and the kimi dispatch grace.
+#: Only the armed capture surface declares it; automation never does.
+PAYLOAD_CLASS_INTERACTIVE = "interactive"
+DECLARED_PAYLOAD_CLASSES = frozenset({PAYLOAD_CLASS_COMMAND, PAYLOAD_CLASS_INTERACTIVE})
 
 # Fixed field order for the v4 digest preimage: the v3 order with
 # ``payload_class`` spliced between ``events`` and ``expected_identity``.

@@ -21,7 +21,7 @@ from cli_agent_orchestrator.services.recovery_capabilities import build_capabili
 
 def test_pinned_versions():
     # The current pin is the stage-verified installed build.
-    assert pc.PINNED_VERSIONS == {"codex": "0.145.0", "kimi": "0.29.2", "claude": "2.1.220"}
+    assert pc.PINNED_VERSIONS == {"codex": "0.145.0", "kimi": "0.30.0", "claude": "2.1.220"}
     pc.check_pinned_version("codex", "0.145.0")
     pc.check_pinned_version("codex", "codex-cli 0.145.0")
     with pytest.raises(pc.ProviderVersionDrift):
@@ -31,14 +31,17 @@ def test_pinned_versions():
 
 
 def test_kimi_accepts_both_pinned_and_retained_versions_but_never_a_range():
-    # Exact-set acceptance: 0.29.2 is the current pin and 0.29.1/0.29.0 are
-    # retained for already-minted sessions.  Nothing between or beyond is
-    # accepted — this is a set of proven builds, not a version range.
-    assert pc.SUPPORTED_VERSIONS["kimi"] == ("0.29.2", "0.29.1", "0.29.0")
+    # Exact-set acceptance: 0.30.0 is the current pin (cond-0198: the
+    # operator's binary auto-updated; text/control live-proven on the real
+    # build) and 0.29.2/0.29.1/0.29.0 are retained for already-minted
+    # sessions.  Nothing between or beyond is accepted — this is a set of
+    # proven builds, not a version range.
+    assert pc.SUPPORTED_VERSIONS["kimi"] == ("0.30.0", "0.29.2", "0.29.1", "0.29.0")
+    pc.check_pinned_version("kimi", "kimi 0.30.0")
     pc.check_pinned_version("kimi", "kimi 0.29.2")
     pc.check_pinned_version("kimi", "kimi 0.29.1")
     pc.check_pinned_version("kimi", "kimi 0.29.0")
-    for rejected in ("0.28.0", "0.29.3", "0.30.0", "1.29.0"):
+    for rejected in ("0.28.0", "0.29.3", "0.30.1", "1.29.0"):
         with pytest.raises(pc.ProviderVersionDrift):
             pc.check_pinned_version("kimi", rejected)
     # The current pin is always an accepted build.

@@ -1,0 +1,30 @@
+│                        ▘▘ ▝▝                       │ Added Claude Opus 5 (`claude-opus-5`), now… │
+│     Sonnet 5 with xhigh effort · Claude Max ·      │ Added `sandbox.network.strictAllowlist` se… │
+│     <ACCOUNT>'s Organization          │ /release-notes for more                     │
+│ /…/pytest-617/cao_scratch_r150/worktree-r15-claude │                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 1 MCP server needs authentication · run /mcp
+
+❯ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do not
+  stop early.
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ R15CLAUDE-eb91508a
+
+⏺ Got it — stopping the count. What would you like to do instead?
+
+✻ Crunched for 4s
+
+❯ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do not
+  stop early.
+
+· Zigzagging…
+  ⎿  Tip: Run claude --continue or claude --resume to resume a conversation
+
+─── History 3/3 ────────────────────────────────────────────────────────────────────────────────────
+❯ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do not
+  stop early.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ctx 6% (64k/1000k) │ sess 100% →06:40 │ wk 83% →Mon │ sonnet-5 │ xhigh │ /…/cao_scratch_r150/wor…
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

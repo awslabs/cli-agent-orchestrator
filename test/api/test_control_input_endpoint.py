@@ -1189,6 +1189,29 @@ class TestAdditiveCapabilities:
                 "stop": {"events": [{"type": "key", "key": "Escape"}]},
                 "steer_chords": ["C-s"],
                 "dispatch_grace_ms": 5000,
+                # §8.6 additive Lane C blocks (build-exact like steer chords).
+                "operator_message": {
+                    "supported": True,
+                    "max_text_bytes": 8192,
+                    "multiline": True,
+                    "max_attachments": 4,
+                },
+                "image": {
+                    "supported": True,
+                    "formats": ["png"],
+                    "max_bytes": 5242880,
+                    "max_width": 8000,
+                    "max_height": 8000,
+                    "mechanism": "staged-path-text",
+                    "reference_template": (
+                        "Use the ReadMediaFile tool to read the image file at "
+                        "{path} and analyze it in the context of this message."
+                    ),
+                    "evidence": "live acceptance on pinned 0.29.2 (§10.6)",
+                },
+                # §6.7 (r15): the build-exact interactive-streaming send
+                # authority for this terminal's pinned build.
+                "interactive_streaming": {"supported": True},
             }
         }
         assert block["command_controls"] == {"composer_nonempty_guard": True}
@@ -1207,6 +1230,10 @@ class TestAdditiveCapabilities:
         block = client.get(f"/terminals/{TERMINAL}/control-identity").json()["control_input"]
         assert block["provider_controls"]["kimi_cli"]["steer_chords"] == []
         assert block["command_controls"] == {"composer_nonempty_guard": False}
+        # §8.6: the Lane C blocks fail closed with the chords — an unproven
+        # build advertises no message/image capability (omitted, not nulled).
+        assert "operator_message" not in block["provider_controls"]["kimi_cli"]
+        assert "image" not in block["provider_controls"]["kimi_cli"]
 
     def test_a_provider_without_a_registry_entry_has_no_controls_block(self, client, monkeypatch):
         monkeypatch.setattr(

@@ -1,0 +1,55 @@
+{
+  "chord": null,
+  "chord_attempted": false,
+  "chord_sent": false,
+  "chunks_sent": 1,
+  "control_id": "ctl-155f398220",
+  "detail": "delivered 2 ordered event(s) into pane %2 through the claude_code native composer adapter; every event was acknowledged",
+  "enter_attempted": true,
+  "enter_sent": true,
+  "events": [
+    {
+      "ordinal": 0,
+      "outcome": "sent",
+      "text": "/model",
+      "type": "text"
+    },
+    {
+      "key": "Enter",
+      "ordinal": 1,
+      "outcome": "sent",
+      "type": "key"
+    }
+  ],
+  "in_flight": false,
+  "outcome": "accepted",
+  "protocol": "cao-control-input-v1",
+  "reason_code": null,
+  "reattemptable": false,
+  "request_digest": "c3dfdbaf6017af6d6a77366a0f43e3b41235f5c2373a23e04b0033c999cf132b",
+  "request_schema_version": 4,
+  "resolved_identity": {
+    "execution_mode": "native_tui",
+    "native_session_id": "c0d3037c-4049-4047-8f1e-05f70c7f7ead",
+    "pane": {
+      "bound_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "dead": false,
+      "observed_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "pane_id": "%2",
+      "pane_pid": 36226,
+      "window_id": "@2"
+    },
+    "pane_birth_id": "%2",
+    "provider": "claude_code",
+    "provider_process_id": "36226@Wed Jul 29 03:30:08 2026",
+    "session_name": "cao-a103-r15-claude-3610c5",
+    "terminal_generation": "78699ed0-3da7-4617-ab4d-5d0da7780ccc",
+    "terminal_id": "647f5d32",
+    "terminal_incarnation": null
+  },
+  "state": "delivered",
+  "submission_evidence_ref": null,
+  "submission_observed": null,
+  "terminal_id": "647f5d32",
+  "text_sent": true
+}

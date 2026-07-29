@@ -77,6 +77,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     MAX_SEQUENCE_EVENTS,
     MAX_SEQUENCE_TEXT_BYTES,
     PAYLOAD_CLASS_COMMAND,
+    PAYLOAD_CLASS_INTERACTIVE,
     REASON_COMPOSER_NONEMPTY,
     REASON_CONTROL_ROUTE_ABSENT,
     REASON_COPY_MODE_ACTIVE,
@@ -199,6 +200,19 @@ def _native_kimi_dispatch_key(
         binding.pane_id,
         binding.pane_pid,
     )
+
+
+def _interactive_streaming_advertised(resolved: "ResolvedControlIdentity") -> bool:
+    """Whether this terminal's exact provider build advertises the §6.7
+    interactive-streaming block — the per-terminal send authority (D9) for
+    a declared interactive batch.  Anything unmanaged, non-native, unpinned,
+    or unproven fails closed here."""
+    if not resolved.managed or resolved.execution_mode != EXECUTION_MODE_NATIVE_TUI:
+        return False
+    if resolved.provider is None:
+        return False
+    controls = provider_controls.controls_for(resolved.provider, resolved.provider_version)
+    return controls is not None and controls["interactive_streaming"] is not None
 
 
 def _native_kimi_dispatch_is_guarded(
@@ -1486,6 +1500,7 @@ def deliver_control_input(
     # bound into the digest under the v4 domain, so a declared command and
     # the same events undeclared are different requests.
     declared_command = False
+    declared_interactive = False
     if normalized_events is not None and payload_class is not None:
         if not isinstance(payload_class, str):
             # A typed refusal, never a shape error: the declaration is
@@ -1495,9 +1510,9 @@ def deliver_control_input(
                 control_id,
                 REASON_MALFORMED_COMMAND_DECLARATION,
                 f"payload_class must be a string or absent, got "
-                f"{type(payload_class).__name__}; the sole declared class is "
-                f"{PAYLOAD_CLASS_COMMAND!r} and the declaration is never inferred "
-                "from payload shape",
+                f"{type(payload_class).__name__}; the declared classes are "
+                f"{PAYLOAD_CLASS_COMMAND!r} and {PAYLOAD_CLASS_INTERACTIVE!r} and the "
+                "declaration is never inferred from payload shape",
                 events=normalized_events,
                 terminal_id=terminal_id,
                 request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
@@ -1557,12 +1572,13 @@ def deliver_control_input(
     # text happens to begin with '/' (the streamed `/tmp/x` split case).
     if payload_class is not None:
         assert normalized_events is not None  # the v4 either/or rule above
-        if payload_class != PAYLOAD_CLASS_COMMAND:
+        if payload_class not in (PAYLOAD_CLASS_COMMAND, PAYLOAD_CLASS_INTERACTIVE):
             return _sequence_refusal(
                 control_id,
                 REASON_MALFORMED_COMMAND_DECLARATION,
                 f"payload_class {payload_class!r} is not a declared class this schema "
-                f"defines; the sole v4 value is {PAYLOAD_CLASS_COMMAND!r}. The "
+                f"defines; the v4 values are {PAYLOAD_CLASS_COMMAND!r} and "
+                f"{PAYLOAD_CLASS_INTERACTIVE!r}. The "
                 "declaration is refused rather than approximated into prose, because "
                 "a caller that declared something is owed the declaration it made, "
                 "not a guess at it",
@@ -1571,19 +1587,28 @@ def deliver_control_input(
                 digest=digest,
                 request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
             )
-        violation = command_declaration_violation(normalized_events)
-        if violation is not None:
-            return _sequence_refusal(
-                control_id,
-                REASON_MALFORMED_COMMAND_DECLARATION,
-                violation + "; the declaration is refused with zero bytes rather than executed "
-                "partially or approximated into prose",
-                events=normalized_events,
-                terminal_id=terminal_id,
-                digest=digest,
-                request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
-            )
-        declared_command = True
+        if payload_class == PAYLOAD_CLASS_INTERACTIVE:
+            # §6.7 (r15): the armed manual capture's declaration.  Its legal
+            # payload is any v3-valid sequence — the grammar the events
+            # already passed — so there is no declaration-specific grammar
+            # here; the behavioral delta (the narrow turn-gate/dispatch-
+            # grace bypass) is applied under the lease, capability-gated
+            # per terminal build.
+            declared_interactive = True
+        else:
+            violation = command_declaration_violation(normalized_events)
+            if violation is not None:
+                return _sequence_refusal(
+                    control_id,
+                    REASON_MALFORMED_COMMAND_DECLARATION,
+                    violation + "; the declaration is refused with zero bytes rather than executed "
+                    "partially or approximated into prose",
+                    events=normalized_events,
+                    terminal_id=terminal_id,
+                    digest=digest,
+                    request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
+                )
+            declared_command = True
 
     def _refuse(
         reason: str,
@@ -1608,7 +1633,7 @@ def deliver_control_input(
                 digest=digest,
                 request_schema_version=(
                     CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
-                    if declared_command
+                    if declared_command or declared_interactive
                     else CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
                 ),
             )
@@ -1752,6 +1777,7 @@ def deliver_control_input(
                     resolved=resolved,
                     digest=digest,
                     declared_command=declared_command,
+                    declared_interactive=declared_interactive,
                 )
             return _deliver_under_lease(
                 book,
@@ -1780,7 +1806,7 @@ def deliver_control_input(
                 digest=digest,
                 request_schema_version=(
                     CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
-                    if declared_command
+                    if declared_command or declared_interactive
                     else CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
                 ),
             )
@@ -2156,6 +2182,7 @@ def _copy_mode_guard_refusal(
     binding: ControlInputBinding,
     *,
     deadline_monotonic: float,
+    exit_proven: bool = True,
 ) -> Optional[Tuple[str, str]]:
     """Prove the exact bound pane is out of copy mode, exiting it if proven in it.
 
@@ -2177,7 +2204,11 @@ def _copy_mode_guard_refusal(
     - a mode state that cannot be observed, an exit control tmux did not
       accept, or an exit the re-proof cannot confirm is
       ``copy-mode-active`` — proven zero payload bytes, reattemptable
-      under the existing refused rule.
+      under the existing refused rule;
+    - with ``exit_proven=False`` (§6.7 declared interactive batches), a
+      pane proven in copy mode is ``copy-mode-active`` fail-closed: the
+      batch refuses with zero bytes and the operator's copy mode is left
+      exactly as found, never exited by a machine write.
 
     ``send-keys -X cancel`` is the only non-payload keystroke ever sent
     here: only to the exact pane just proven in copy mode, never treated
@@ -2223,6 +2254,17 @@ def _copy_mode_guard_refusal(
         )
     if not in_mode:
         return None
+    if not exit_proven:
+        # §6.7 (r15): a declared interactive batch refuses fail-closed on a
+        # proven copy mode — zero bytes, and the operator's copy mode left
+        # exactly as found, never exited by a machine write.
+        return (
+            REASON_COPY_MODE_ACTIVE,
+            f"pane {binding.pane_id} is in copy mode; a declared interactive batch "
+            "refuses fail-closed rather than exiting the operator's copy mode for "
+            "them — no payload was typed, the mode was left untouched, and the "
+            "write may be sent again after the operator exits copy mode",
+        )
 
     # The exact pane is proven in copy mode: the exit control is licensed,
     # to this pane only — the sole non-payload keystroke this path sends.
@@ -3267,6 +3309,7 @@ def _deliver_sequence_under_lease(
     resolved: ResolvedControlIdentity,
     digest: str,
     declared_command: bool = False,
+    declared_interactive: bool = False,
 ) -> ControlInputResult:
     """Re-verify, gate, claim, and write one v3 sequence under the lease.
 
@@ -3275,14 +3318,19 @@ def _deliver_sequence_under_lease(
     the same refusal/ambiguous split.  One sequence is one claim — the
     ordered events are the write, not separate operations.  A declared
     command-class sequence additionally proves the composer empty before
-    the claim (§4.1); undeclared sequences never see that guard.
+    the claim (§4.1); undeclared sequences never see that guard.  A
+    declared interactive sequence (§6.7, r15) bypasses only the provider
+    turn-state readiness refusal and the kimi dispatch grace — and only
+    where the terminal's exact build advertises interactive streaming;
+    the lease, identity/socket re-proof, copy-mode guard, journal,
+    deadline, and admission caps apply exactly as for any other batch.
     """
     control_id = binding.request_id
     deadline = time.monotonic() + WRITE_DEADLINE_SECONDS
     write_claimed = False
     result_schema_version = (
         CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
-        if declared_command
+        if declared_command or declared_interactive
         else CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
     )
 
@@ -3352,10 +3400,31 @@ def _deliver_sequence_under_lease(
     # stale idle prompt to the turn observation, and a payload Enter aimed
     # into the mode is consumed by it.  Same lease, same exact-pane rule:
     # a proven copy mode is exited once and the sequence delivered exactly
-    # once, or the refusal is zero bytes and reattemptable.
-    copy_mode_refusal = _copy_mode_guard_refusal(client, binding, deadline_monotonic=deadline)
+    # once, or the refusal is zero bytes and reattemptable.  A declared
+    # interactive batch is the fail-closed exception (§6.7): it refuses
+    # zero-byte and leaves the operator's copy mode untouched.
+    copy_mode_refusal = _copy_mode_guard_refusal(
+        client,
+        binding,
+        deadline_monotonic=deadline,
+        exit_proven=not declared_interactive,
+    )
     if copy_mode_refusal is not None:
         return _refuse_pre_claim(copy_mode_refusal[0], copy_mode_refusal[1])
+
+    if declared_interactive and not _interactive_streaming_advertised(resolved):
+        # §6.7 (r15), fail closed pre-write: a declared interactive batch
+        # is admitted only where the per-terminal, build-exact
+        # interactive-streaming block is advertised — never delivered as
+        # an undeclared batch, never speculatively bypassed on an old or
+        # unpinned server/provider.
+        return _refuse_pre_claim(
+            REASON_PROVIDER_UNSUPPORTED,
+            f"provider {resolved.provider!r} on build {resolved.provider_version!r} "
+            "advertises no interactive-streaming capability for this terminal; a "
+            "declared interactive batch is refused pre-write, never delivered as an "
+            "undeclared one",
+        )
 
     adapter: Optional[Any] = None
     plans: Optional[Dict[int, Any]] = None
@@ -3380,6 +3449,13 @@ def _deliver_sequence_under_lease(
         if native_refusal is not None:
             return _refuse_pre_claim(native_refusal[0], native_refusal[1])
 
+        # The dispatch key is computed for every kimi sequence — declared
+        # interactive batches skip the grace *check* below but still mark
+        # after an Enter-carrying write, so a later undeclared batch keeps
+        # its §6.4 pause-case protection against the stale ready frame.
+        if resolved.provider == "kimi_cli":
+            dispatch_key = _native_kimi_dispatch_key(resolved, binding)
+
         # The per-event intent policy, applied to the sequence as a whole
         # (see the table at _sequence_event_intent): a sequence that shapes
         # or submits composer content inherits the readiness guards the
@@ -3387,10 +3463,10 @@ def _deliver_sequence_under_lease(
         # provider-native live-turn idle gate, observed under this lease so
         # the idle proof and the write are atomic against a turn starting
         # between them.  A pure interrupt/steer sequence is deliverable
-        # during an active turn and skips both.
-        if _sequence_is_readiness_gated(events):
-            if resolved.provider == "kimi_cli":
-                dispatch_key = _native_kimi_dispatch_key(resolved, binding)
+        # during an active turn and skips both.  A declared interactive
+        # sequence (§6.7) skips the same two — the turn-state refusal and
+        # the dispatch grace — and nothing else.
+        if _sequence_is_readiness_gated(events) and not declared_interactive:
             if dispatch_key is not None and _native_kimi_dispatch_is_guarded(dispatch_key):
                 return _refuse_pre_claim(
                     REASON_PANE_BUSY,

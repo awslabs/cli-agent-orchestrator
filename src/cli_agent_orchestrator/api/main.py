@@ -24,11 +24,13 @@ from fastapi import (
     Body,
     Depends,
     FastAPI,
+    File,
     Header,
     HTTPException,
     Query,
     Request,
     Response,
+    UploadFile,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -119,9 +121,11 @@ from cli_agent_orchestrator.services import (
     companion_receipts,
     control_input_service,
     flow_service,
+    image_attachments,
     macro_notation,
     managed_launch,
     managed_launch_v2,
+    operator_message_service,
     secret_gate,
     session_env,
     session_service,
@@ -522,6 +526,27 @@ class ControlInputRequest(BaseModel):
     lease_timeout: float = Field(default=0.0, ge=0.0, le=5.0)
 
 
+class OperatorMessageRequest(BaseModel):
+    """One identity-bound operator message (Lane C, design §8.3).
+
+    A sibling typed operation to control-input — never an extension of it
+    (D11): up to 8192 UTF-8 bytes, multi-line only through the provider's
+    build-proven composer-newline plan, plus staged image attachments
+    referenced by ``[Image #N]`` tokens in the draft text and mapped in
+    ``token_map``.  The same 9-field ``expected_identity`` binds it, and
+    the same at-most-once discipline governs it: reuse ``operation_id``
+    only to reconcile; a refused message may be tried again with a new id.
+    """
+
+    operation_id: str
+    text: str = ""
+    attachments: Optional[List[str]] = None
+    token_map: Optional[Dict[str, str]] = None
+    expected_identity: Optional[Dict[str, Any]] = None
+    # Same bounded-wait discipline as control-input.
+    lease_timeout: float = Field(default=0.0, ge=0.0, le=5.0)
+
+
 class InstallAgentProfileRequest(BaseModel):
     """Request body for installing an agent profile.
 
@@ -623,6 +648,10 @@ async def lifespan(app: FastAPI):
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
     asyncio.create_task(cleanup_expired_memories())
+    # Lane C: sweep expired/orphaned image attachments at startup (§8.4 —
+    # submitted images past the 24 h retention, crashed-upload orphans,
+    # stale staging/failed records; never ``ready`` operator drafts).
+    asyncio.create_task(asyncio.to_thread(image_attachments.sweep_attachments))
 
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
@@ -3090,6 +3119,137 @@ async def send_terminal_control_input(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
     return JSONResponse(status_code=result.http_status, content=result.as_response())
+
+
+@app.post("/terminals/{terminal_id}/operator-message")
+async def send_terminal_operator_message(
+    terminal_id: TerminalId,
+    body: OperatorMessageRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """Submit one text+image operator message, at most once, or say why not.
+
+    The Lane C typed operation (design §8.3): the same 200-with-typed-
+    outcome discipline as control-input — a 404 here is reserved for the
+    route being absent altogether (an older server), which a client reads
+    as ``unsupported``.  Every terminal-level failure — unknown terminal,
+    identity drift, busy pane, unproven build, attachment not ready — is
+    a typed outcome.  A lost response is resolved by one exact-id GET,
+    never by resending.
+    """
+    try:
+        result = await asyncio.to_thread(
+            partial(
+                operator_message_service.submit_operator_message,
+                terminal_id,
+                operation_id=body.operation_id,
+                text=body.text,
+                attachments=body.attachments,
+                token_map=body.token_map,
+                expected_identity=body.expected_identity,
+                lease_timeout=body.lease_timeout,
+            )
+        )
+    except operator_message_service.OperatorMessageRequestInvalid as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    return JSONResponse(status_code=result.http_status, content=result.as_response())
+
+
+@app.get("/operator-message/{operation_id}")
+async def get_operator_message_result(
+    operation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """What happened to one operator message, for a lost reply.
+
+    Keyed by operation id alone, mirroring the control-input reconcile:
+    the journaled record is the answer, and a message is never re-sent
+    automatically.  The id spans the two per-provider operation stores
+    (OD6); an unreadable store is answered as the unknown it is, never as
+    "proven absent".
+    """
+    try:
+        result = await asyncio.to_thread(
+            operator_message_service.reconcile_operator_message, operation_id
+        )
+    except operator_message_service.OperatorMessageRequestInvalid as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    return JSONResponse(status_code=result.http_status, content=result.as_response())
+
+
+@app.post("/terminals/{terminal_id}/attachments", status_code=201)
+async def upload_terminal_attachment(
+    terminal_id: TerminalId,
+    file: UploadFile = File(...),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """Stage one image attachment for one terminal (design §8.4).
+
+    Content is validated, never the filename: magic-byte sniff plus
+    structure/dimension decode, then the provider's advertised
+    ``image.formats`` allowlist.  Over-limit, corrupt, or unproven-format
+    uploads answer 422 with a typed refusal body and leave a durable
+    ``failed`` record; nothing is ever half-written.
+    """
+    content = await file.read(image_attachments.MAX_IMAGE_BYTES + 1)
+    try:
+        record = await asyncio.to_thread(
+            partial(
+                operator_message_service.upload_attachment,
+                terminal_id,
+                display_filename=file.filename,
+                content=content,
+            )
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except operator_message_service.AttachmentRefusal as exc:
+        return JSONResponse(status_code=exc.status_code, content=exc.as_response())
+    return JSONResponse(status_code=201, content={"attachment": record})
+
+
+@app.get("/terminals/{terminal_id}/attachments")
+async def list_terminal_attachments(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """The terminal's live image-attachment records (``removed`` are gone)."""
+    try:
+        records = await asyncio.to_thread(
+            operator_message_service.list_terminal_attachments, terminal_id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return {"attachments": records}
+
+
+@app.delete("/terminals/{terminal_id}/attachments/{attachment_id}")
+async def delete_terminal_attachment(
+    terminal_id: TerminalId,
+    attachment_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """Remove one attachment and its staged file.
+
+    A ``submitted`` attachment is retained read-only for its TTL so the
+    provider can still read the staged path mid-turn (§8.4); deleting one
+    is a 409 with the typed explanation, not a silent delete.
+    """
+    try:
+        record = await asyncio.to_thread(
+            operator_message_service.delete_terminal_attachment,
+            terminal_id,
+            attachment_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except operator_message_service.AttachmentRefusal as exc:
+        return JSONResponse(status_code=exc.status_code, content=exc.as_response())
+    return JSONResponse(content={"deleted": True, "attachment": record})
 
 
 @app.post("/terminals/{terminal_id}/input")

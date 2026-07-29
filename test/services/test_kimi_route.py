@@ -82,7 +82,7 @@ def test_probe_attests_k3_max_without_prompt(tmp_path, monkeypatch):
 def test_probe_fails_closed_on_version_drift(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="0.30.0\n", stderr=""),
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="0.30.1\n", stderr=""),
     )
     with pytest.raises(KimiRouteProbeError, match="unsupported Kimi version"):
         attest_kimi_route(

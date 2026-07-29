@@ -24,7 +24,14 @@ round 10 (§4.2: state-aware activation, no blind replay, truthful
 outcomes); declared-command outcome two-close rule pinned in round 11
 (F16, Sol/high PR #48 review: accepted only with execution evidence) —
 implementation NOT green-lit; Lane A's PR #48 correction requires a fresh
-Fable lead delta gate at the amended head first)
+Fable lead delta gate at the amended head first; cond-0194 interactive
+streaming added in round 15 (§6.7, owner override: `payload_class:
+"interactive"` under schema v4 bypasses only the turn gate and dispatch
+grace — a focused Fable P1 delta gate is required before that amended
+contract merges; r16 keeps its acceptance honest per build — Claude
+2.1.220 queues `/model`-class commands mid-turn rather than opening a
+menu (pinned provider limit, live-proven; Kimi's full menu/steer
+acceptance passes))
 
 Task ID: `native-tui-console/spec-initial-v1`
 
@@ -45,6 +52,8 @@ source disagreed, the source won and the divergence is named in §13
 | `origin` remote | `https://github.com/colindmurray/cli-agent-orchestrator.git` |
 | `upstream` remote | AWS Labs repository (read-only reference) |
 | PR target | `origin/main` via the integration branch (§9) |
+| Integration head (r14) | `38ad00ee8857acf90fc5bb56a484f8aecc1a079d` on `origin/feature/native-tui-interaction-console` — A+B merged and installed-GO (PR #49 visual-QA fixes, PR #50 390×844 fitted-`.xterm` geometry; installed Sol/xhigh retest P4 GO, bundle `index-DOXq5tKp.js` live on localhost + tailnet); supersedes the r13 row below |
+| Integration head (r13) | `ada0d1982cb00dbef5492bc4a1c0d0ed2debfc3e` on `origin/feature/native-tui-interaction-console` — Lane A (PR #48), r9-r12 docs, and Lane B (PR #47, seamed at `6fc348e`, merged 2026-07-28) are all integrated; supersedes the r12 row below |
 | Integration head (r12) | `8687af27ee0bcd5d7f37b46f0bee2061260762bf` on `origin/feature/native-tui-interaction-console` (Lane A merged, PR #48); Lane B (PR #47, `8c2d4a0`) serializes next per §9's seam |
 | Canonical document | this file, on the design branch |
 | Visual baseline for Lane C | `docs/issues/native-tui-interaction-console/baseline-dashboard.png` (operator screenshot of the deployed dashboard, 2026-07-27; **predates the cond-0175 recorder row** — the deployed bundle renders that row whenever the native composer is visible, so the current render has one more control row than the image shows. The image remains authoritative for the compact single-composer footprint; §10.5 visual acceptance measures the current deployed render — F13) |
@@ -599,6 +608,10 @@ ignore unknown keys):
    **only** by registry built-in sends and supervisor/provider command
    controls, only after the `command_controls` block is advertised;
    streaming, macros, and prose never set it.
+7. The §6.7 interactive declaration (`payload_class: "interactive"`) —
+   consumed **only** by the armed streaming capture surface, only after
+   the per-terminal `interactive_streaming` block is advertised; every
+   other send path leaves it absent.
 
 ## 4. Provider-control registry (Lane A)
 
@@ -664,8 +677,11 @@ execution.
 
 **Definition and the declaration carrier (r7 P1-Δ2).** A control is
 **command-class** only when the caller *declares* it: the request schema
-gains one optional additive field, `payload_class`, whose sole defined
-value is `"command"`; absent means **prose**. Command-class is **never
+gains one optional additive field, `payload_class`; absent means
+**prose**. Two values are defined: `"command"` (this section) and
+`"interactive"` (§6.7 manual interactive streaming — a distinct intent
+with a distinct server policy, never the command grammar). Command-class
+is **never
 derived from payload shape** — a batch whose text happens to begin with
 `/` (e.g. a streamed utterance split so a batch starts `/tmp/x`) is
 undeclared prose and never enters the composer guard; declaration is the
@@ -1019,7 +1035,10 @@ Streaming is an explicit toggle in the header, available only when:
 full §3.2 key set, and identity resolved. On arm the client fetches
 `managed-control`, `control-identity`, and capabilities fresh, pins the
 9-field `expected_identity`, and displays provider / agent profile /
-generation in the armed header (§7.3). Arming replaces the composer with the
+generation in the armed header (§7.3). When the per-terminal
+`interactive_streaming` block is advertised (§6.7), every armed batch
+declares `payload_class: "interactive"`; when it is absent, the surface
+runs with the §6.4 readiness behavior and an honest notice. Arming replaces the composer with the
 capture surface; the ordinary literal composer is restored on disarm with its
 draft preserved (attachments, once Lane C exists, survive arm/disarm as draft
 state — §8.7).
@@ -1206,6 +1225,108 @@ the non-bypass invariant is unaffected. Lane A adds a small hardening
 ≤ 500×200) and a type check that rejects malformed frames with a typed
 close reason instead of a teardown, with tests.
 
+### 6.7 Declared interactive streaming (cond-0194 owner override, r15)
+
+Owner product decision (authoritative, cond-0194): **provider/model turn
+activity is not a write prohibition for manual native-TUI interactive
+streaming.** While a provider turn is active, the operator must be able to
+queue/enter manual text, navigate or safely cancel provider model/effort
+menus, issue Stop, and use supported steering. The previously observed
+`pane-busy` disarm of an armed streaming session in those states is a P1
+defect. Automated delivery (inbox, prose composer sends, macros, Lane C
+messages) remains separately readiness-gated and must never silently
+inherit this bypass. (Per-build menu honesty, r16: where a pinned build
+queues a `/model`-class command instead of opening a menu mid-turn —
+Claude 2.1.220, live-proven — the override means "the command queues and
+the turn continues", never a claimed menu action; §10.3.)
+
+- **Carrier (minimal, deployed-compatible):** a second defined value of
+  the r7 v4 declaration field — `payload_class: "interactive"` under the
+  **existing** request schema v4 (`cao-control-input-request-v4`, pinned
+  preimage order with `payload_class` spliced, §4.1). No new digest
+  domain and no shape inference: the field already participates, so
+  declared-interactive, declared-command, and undeclared requests of the
+  same id and events all digest distinctly. Legal payload: any
+  v3-valid event sequence (the streaming batch grammar); no command
+  grammar applies. Unknown values and non-strings remain
+  `malformed-command-declaration` (the declaration-validity refusal
+  covers the field generally; no new reason code, no typed sub-reason).
+- **Declarer discipline (the inheritance fence):** only the **armed
+  streaming capture surface** (§6.1-6.2 — human keystrokes) may declare
+  `"interactive"`. Macros, favorites/built-ins, the literal composer,
+  Lane C, inbox delivery, and every automated path **never** set it, and
+  §10.1/§10.4 assert that mechanically. Declaration is the only trigger:
+  the server applies the interactive policy to declared requests only.
+- **Exact server policy:** for a declared interactive request the server
+  bypasses **only** the provider IDLE/COMPLETED turn-state refusal and
+  the kimi dispatch grace for that batch. It does **not** bypass: pane
+  lease contention (`pane-busy` from a real concurrent lease owner still
+  refuses and §6.4 still disarms), terminal/generation/incarnation/
+  pane/socket/native-session proof and under-lease re-proof, the
+  copy-mode guard, malformed/declaration/representability refusals,
+  journal ambiguity (one exact-id reconcile, never auto-resend), the
+  write deadline, or the §3.2/§3.3 key/chord admission rules. Outcome
+  truthfulness is unchanged: `accepted` means bytes delivered; whether the
+  provider queued or consumed the text is recorded per the deployed
+  submission vocabulary (kimi/claude visibly queue mid-turn composer
+  text; steering rides the pinned chord, §4.2) — never inferred.
+- **Advertisement and old/new behavior:** the per-terminal
+  `provider_controls` entry gains `"interactive_streaming": { "supported":
+  true }` (discovery at top level; the per-terminal block is send
+  authority, D9). A declared interactive request to a provider/build
+  without the pin refuses `provider-unsupported` pre-write. New clients
+  send `payload_class: "interactive"` **only** when the per-terminal block
+  advertises it; an old server omits the block and the armed surface
+  falls back to the §6.4 readiness behavior with an honest notice — never
+  a speculative bypass. Old clients are unchanged (they never declare).
+  The distinction is explicit: `"command"` = §4.1 command-class (grammar +
+  composer-empty guard); `"interactive"` = this manual-streaming intent
+  (sequence grammar + turn-gate bypass); absent = prose/automated.
+- **Client status honesty (r15 pin):** the dashboard normalizes typed
+  backend detail into typed status: `reason_code` plus the §6.4 pinned
+  detail discriminators map to specific status text; an unrecognized
+  detail renders the **raw detail string**, never an empty or
+  "unrecognized" reason. And no blind disarm after an explainable
+  `accepted`/queued/steered result: an accepted interactive batch —
+  including text the provider visibly queues mid-turn — is a trace entry
+  with its submission observation, not a disarm trigger. Disarm follows
+  the §6.4 taxonomy only.
+- **§6.3/§6.4 deltas (narrow):** armed streaming includes
+  `payload_class: "interactive"` in each batch when the per-terminal
+  block advertises it (the declaration rides the same POST body;
+  §6.3's wire sequence is otherwise unchanged). §6.4's two pause cases
+  (dispatch grace, readiness gate) apply to **undeclared** batches; they
+  do not fire for declared interactive batches because the server no
+  longer issues those refusals for them.
+
+**Acceptance (§10.3):** active-turn disposable Kimi **and** Claude
+sessions: manual printable text lands (queued per provider semantics with
+an honest submission observation); Stop interrupts. Menu behavior is
+**per-provider/build-pinned and honest** (r16, root-r15-claude-limit-125):
+
+- **Kimi 0.29.2 (live-proven):** active-turn menu navigation delivers and
+  `Escape` safe-cancels the menu; queued text followed by a declared
+  `C-s` is consumed (the steer effect). This is required acceptance and
+  it passes.
+- **Claude 2.1.220 (live-proven provider limit, not a CAO defect):** an
+  active-turn `/model` (or effort command) is **accepted and queued in
+  the native composer** — it does **not** open a model/effort menu. The
+  acceptance proves the command is queued, claims **no** menu open,
+  setting change, or menu cancellation, and shows the active turn
+  continuing unchanged. This is pinned provider behavior for this build;
+  it is never classified as a product P1 and never reported as a menu
+  success. Dashboard/provider-status honesty follows: where the pinned
+  build queues a command, UI and evidence say **"queued command"**, never
+  a menu action.
+
+True concurrent lease contention refuses and disarms.
+Stale identity and copy mode refuse with zero bytes. Response loss
+resolves by exact id, never resend. Managed websocket input stays
+wheel-only (resize is geometry). Old/new capability combinations behave
+honestly (§6.7 advertisement rules). Desktop and mobile status evidence
+is captured for the interactive states (armed banner, queued
+observation, pause/disarm notices).
+
 ## 7. Layout and accessibility acceptance (Lanes B and C)
 
 ### 7.1 Header (all widths)
@@ -1233,7 +1354,12 @@ One primary row (wraps to two on narrow widths):
   recorder; the header keeps no third row.
 - Acceptance: row height ≤ 48 px at ≥1024 px; ≤ 96 px total (two rows) at
   390 px; terminal viewport keeps ≥ 50 % of viewport height with header +
-  favorite strip visible at 390×844. (Matches the §0 visual baseline's
+  favorite strip visible at 390×844. The ≥ 50 % rule is measured on the
+  **visible fitted `.xterm` child**, not its wrapper: FitAddon floors the
+  fit to whole rows, so wrapper floors must include row-quantization slack
+  (the merged implementation pads `50dvh` by +10 px; installed A+B QA
+  measured the visible `.xterm` at 432 px ≥ 422 px at 390×844 and
+  400 px ≥ 400 px at 360×800 — GO, PR #50). (Matches the §0 visual baseline's
   compact footprint.)
 
 ### 7.2 Favorite strip
@@ -1603,6 +1729,34 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
 
 ### Integration status and the Lane B seam (r12, verified topology)
 
+- **r14 update — A+B installed-GO; only Lane C remains:** canonical head
+  `38ad00ee8857acf90fc5bb56a484f8aecc1a079d` (PR #50 merge) carries the
+  A+B visual-QA fixes (PR #49: streaming quiet-timer binding + mobile
+  overlay layout — semantics unchanged; PR #50: armed-terminal floor
+  padded past row quantization). The installed Sol/xhigh retest is **P4
+  GO** at this head (fitted `.xterm` 432 px ≥ 422 px at 390×844,
+  400 px ≥ 400 px at 360×800; desktop first-printable identity batch;
+  zero raw managed-pane websocket input). The A+B staging gate is
+  **complete**; the only remaining product lane is the isolated Lane C
+  PR/worktree (§9, merges last). The campaign is not complete until Lane
+  C lands. (Tooling note: the deploy `--dry-run --bounce`
+  activation-receipt contradiction is a known dry-run-only tooling P2 —
+  cond-0087/cond-0116/cond-0138 — not a product blocker.)
+- **r13 update — integration complete through Lane B:** canonical head
+  `ada0d1982cb00dbef5492bc4a1c0d0ed2debfc3e` (merge of PR #47,
+  2026-07-28) contains Lane A (PR #48), the r9-r12 docs merge
+  (`b796043`), and the Lane B seam (`6fc348e`): duplicate
+  `macro_notation.py`/`macro_builtins.py` removed, the approved repeat
+  fix ported onto Lane A's canonical parser (pre-conversion >2-digit
+  rejection, offset-422 never-500), `macro_store.py` synthesized from
+  `services/provider_controls.py`, Lane A's parse-notation route kept,
+  `/macros` CRUD additive, golden vectors carrying the `up*100`/30-digit
+  cases byte-identical across TS/Python. **Lane C is not implemented at
+  this head** (only the future-facing `provider_controls` docstring
+  exists; no attachment/operator-message routes, branch, or PR) — the
+  Lane C image/operator-message PR starts next as its own isolated lane
+  per §9, and upload checks belong to its acceptance, not to the current
+  A+B QA checkpoint.
 - **Lane A merged** into the integration branch at
   `8687af27ee0bcd5d7f37b46f0bee2061260762bf` (PR #48, final exact-head
   Sol/high review at `7b3674f44f0289aedb9cfca67638fd951396b1d6`; includes
@@ -1709,6 +1863,17 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
   lease is held by"`) — and the three discriminators are asserted
   pairwise-disjoint, so a server wording tweak fails the suite loudly
   rather than silently changing streaming's pause/disarm routing.
+- **Interactive declaration (§6.7):** `payload_class: "interactive"`
+  digests distinctly from declared-command and undeclared v4 requests
+  (golden vectors); a declared interactive batch skips **only** the
+  turn-state gate and dispatch grace while every other refusal fires
+  (lease contention, stale identity, copy mode, malformed/representable,
+  deadline — each asserted with zero bytes where pre-write); an
+  interactive declaration to an unpinned provider/build refuses
+  `provider-unsupported` pre-write; unknown values/non-strings remain
+  `malformed-command-declaration`; and no automated path (macro send,
+  inbox payload, Lane C message, literal composer) ever emits the field
+  (asserted at their call sites).
 
 ### 10.2 Live tmux (Lane A; `pytest -m e2e`, isolated server fixtures)
 
@@ -1811,6 +1976,30 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
   control unresolved (never "entered"), activated once by the Enter
   discipline; no second activation without the fresh identity+content
   proof.
+- **Interactive-streaming acceptance (cond-0194, §6.7; menu behavior
+  per-provider-pinned per r16):** active-turn
+  disposable Kimi **and** Claude sessions — manual printable text lands
+  and is visibly queued per provider semantics (honest submission
+  observation, no inference); Stop interrupts.
+  **Kimi 0.29.2 (required, passes live):** active-turn menu navigation
+  delivers and `Escape` safe-cancels; queued text followed by declared
+  `C-s` is consumed (steer effect proven).
+  **Claude 2.1.220 (required honest-limit proof):** an active-turn
+  `/model` (or effort command) is accepted and **queued in the native
+  composer** — the acceptance proves the command queued, claims no menu
+  open, no setting change, and no menu cancellation, and shows the active
+  turn continuing unchanged. This is pinned provider behavior for this
+  build (root-r15-claude-limit-125), not a CAO identity/lease/interactive
+  failure; it is never classified as a product P1 and UI/evidence says
+  **"queued command"**, never a menu action. True concurrent lease
+  contention refuses `pane-busy` and
+  disarms. Stale identity and copy mode refuse with zero bytes. Response
+  loss resolves by exact id, never resend. Managed websocket input stays
+  wheel-only (resize is geometry). Old/new capability combinations behave
+  per §6.7's advertisement rules (fallback with honest notice, never a
+  speculative bypass; old client unchanged). Desktop and mobile status
+  evidence is captured for the armed banner, queued observation, and
+  pause/disarm notices.
 
 ### 10.4 Web unit + component (Lane B; vitest)
 
@@ -1853,7 +2042,8 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
 Projects: desktop Chromium 1280×800 and mobile Chromium 390×844
 (device-scale, touch). Against a stubbed server (MSW-style route mocks or
 the `cao_mcp_apps` harness pattern): header/strip/modal render and operate at
-both widths; terminal keeps ≥ 50 % height at mobile width; streaming arms,
+both widths; terminal keeps ≥ 50 % height at mobile width (measured on the
+visible fitted `.xterm` child with row-quantization slack, §7.1); streaming arms,
 captures, shows trace, and Stop-streaming works with touch; macro sheet
 list→editor navigation; Lane C chip strip, picker, paste, and wrap behavior
 against the §0 visual baseline; wheel scrolling works with streaming off and
@@ -2116,6 +2306,20 @@ jobs with the two projects of §10.5.
   emptiness determination. Same root theme as F15 (unobserved effect
   recorded as success) but a distinct path — v4 declared commands, not
   the v2 steer surface; cond-0031 is not duplicated.
+- **F17 (P1, owner override applied in r15):** cond-0194 — the deployed
+  readiness gate made manual interactive streaming self-disarm during
+  provider turn activity, which the owner ruled is **not** a write
+  prohibition for manual streaming (queue/enter text, navigate/cancel
+  menus, Stop, supported steering must work mid-turn). Amended as §6.7:
+  a declared `payload_class: "interactive"` under existing schema v4
+  bypasses **only** the turn-state gate and dispatch grace, with every
+  other guard preserved and automation fenced out by declarer
+  discipline. Automated delivery remains readiness-gated. The r16
+  follow-up keeps acceptance honest per build: Kimi 0.29.2 active-turn
+  menu navigation + Escape cancel + queued-text→C-s steer passes live;
+  Claude 2.1.220 queues `/model`-class commands mid-turn without opening
+  a menu (pinned provider limit, not a CAO defect, never reported as a
+  menu success — UI/evidence says "queued command").
 
 ## 15. Challenges applied (per track mandate)
 

@@ -436,6 +436,7 @@ def _launch_provider_session(
     expected_model: str,
     expected_effort: str,
     tag: str,
+    agent_profile: str = AGENT_PROFILE,
 ) -> ProviderSession:
     """One disposable managed native-TUI session on the real provider CLI."""
     case = f"launch-{tag}"
@@ -466,7 +467,7 @@ def _launch_provider_session(
         "reservation_id": str(uuid.uuid4()),
         "session_name": session_name,
         "provider": provider,
-        "agent_profile": AGENT_PROFILE,
+        "agent_profile": agent_profile,
         "caller_id": uuid.uuid4().hex[:8],
         "working_directory": workdir,
         "trusted_project_root": None,
