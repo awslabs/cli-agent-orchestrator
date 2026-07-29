@@ -1,0 +1,11 @@
+{
+  "attachments": [
+    "8a3629074dd04c7993c23d5141c9f00c"
+  ],
+  "expected_identity": "<9 fields bound>",
+  "operation_id": "4a8f762b-1897-4826-8358-324b9d145589",
+  "text": "[Image #1] This image has one solid color on its left half and another on its right half. Name the two colors in one short sentence.",
+  "token_map": {
+    "1": "8a3629074dd04c7993c23d5141c9f00c"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "body": {
+    "attachment": {
+      "attachment_id": "8b2765b5f45d4f5cae2f1a88a55539cb",
+      "bound_operation_id": null,
+      "content_type": null,
+      "created_at": "2026-07-29T03:22:38.665536Z",
+      "display_filename": "photo.jpg",
+      "error": {
+        "detail": "content is jpeg, which this provider does not advertise (allowed: ['png']); unproven formats are refused rather than converted",
+        "reason_code": "attachment-type-unsupported"
+      },
+      "format": "jpeg",
+      "height": 48,
+      "sha256": "de8aad4b4c987f39aed42ee26f665fc09793d79685fb4c6ffc925b62fcd7ee3c",
+      "size_bytes": 18,
+      "staged_path": null,
+      "state": "failed",
+      "terminal_id": "a48c37ab",
+      "updated_at": "2026-07-29T03:22:38.665536Z",
+      "width": 64
+    },
+    "detail": "content is jpeg, which this provider does not advertise (allowed: ['png']); unproven formats are refused rather than converted",
+    "outcome": "refused",
+    "reason_code": "attachment-type-unsupported"
+  },
+  "status_code": 422
+}

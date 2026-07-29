@@ -1,0 +1,11 @@
+{
+  "attachments": [
+    "261b56755a3a4b81948cdba33380a47c"
+  ],
+  "expected_identity": "<9 fields bound>",
+  "operation_id": "bf206a89-5096-479d-9c86-a80821477d9a",
+  "text": "Read the image file at [Image #1] and tell me the two colors in it, left half and right half, in one short sentence.",
+  "token_map": {
+    "1": "261b56755a3a4b81948cdba33380a47c"
+  }
+}
