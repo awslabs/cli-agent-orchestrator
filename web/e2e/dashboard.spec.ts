@@ -131,6 +131,7 @@ test.describe("terminal header, favorite strip, macro modal (§7.1-7.4)", () => 
     // axe: header + strip surfaces, zero serious violations.
     const headerScan = await new AxeBuilder({ page })
       .include('[data-testid="native-control-area"]')
+      .include('[data-testid="favorite-strip-row"]')
       .analyze();
     expect(
       headerScan.violations.filter((v) => v.impact === "serious" || v.impact === "critical"),

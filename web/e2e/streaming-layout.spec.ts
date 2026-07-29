@@ -146,3 +146,116 @@ test.describe("terminal overlay layout at the exact QA sizes", () => {
     });
   }
 });
+
+// Installed-QA P2 follow-up (post-PR-#51): while Streaming is armed at the
+// two mobile QA widths, the fitted .xterm must not cover the Compact/Stop
+// favorite controls — the strip rides a reserved row directly above the
+// terminal, so its buttons stay fully visible and operable no matter how
+// tall the (scrolling) control area gets. The ordinary composer textarea
+// and its Send / Streaming / Macros primary controls must be real 44×44px
+// touch targets with no horizontal overflow. The prior fitted-.xterm floors
+// (422px @390×844, 400px @360×800) are retained.
+const MOBILE_SIZES = [
+  { width: 390, height: 844, floor: 422 },
+  { width: 360, height: 800, floor: 400 },
+] as const;
+
+test.describe("mobile control geometry (installed-QA P2 follow-up)", () => {
+  for (const { width, height, floor } of MOBILE_SIZES) {
+    test(`armed: Compact/Stop favorites stay fully visible above the fitted xterm at ${width}×${height}`, async ({
+      page,
+    }) => {
+      await page.setViewportSize({ width, height });
+      const harness = await stubBackend(page);
+      await openNativeTerminal(page);
+
+      const strip = page.getByTestId("favorite-strip");
+      await expect(strip).toBeVisible();
+
+      await page.getByRole("button", { name: "Streaming" }).click();
+      await page.getByRole("textbox", { name: /Streaming keystroke capture/ }).waitFor();
+
+      // Wait for the armed refit before measuring (same gate as above).
+      const xterm = page.locator(".xterm");
+      const wrapper = page
+        .locator('[title="Close terminal"]')
+        .locator('xpath=ancestor::div[contains(@class,"fixed")][1]')
+        .locator(":scope > div:last-child");
+      const fittedXtermHeight = async () => {
+        const x = await xterm.boundingBox();
+        const w = await wrapper.boundingBox();
+        if (!x || !w) return 0;
+        return x.height <= w.height ? x.height : 0;
+      };
+      await expect.poll(fittedXtermHeight).toBeGreaterThanOrEqual(floor);
+
+      // The strip is fully inside the viewport and entirely above the fitted
+      // terminal — no cover, no overlap, no horizontal bleed.
+      const stripBox = await strip.boundingBox();
+      const xtermBox = await xterm.boundingBox();
+      if (!stripBox || !xtermBox) throw new Error("strip or terminal not laid out while armed");
+      expect(stripBox.x).toBeGreaterThanOrEqual(0);
+      expect(stripBox.y).toBeGreaterThanOrEqual(0);
+      expect(stripBox.x + stripBox.width).toBeLessThanOrEqual(width);
+      expect(stripBox.y + stripBox.height).toBeLessThanOrEqual(height);
+      expect(stripBox.y + stripBox.height).toBeLessThanOrEqual(xtermBox.y);
+
+      // The Compact and Stop favorites themselves: fully visible, fully above
+      // the terminal, real touch targets, and operable (one tap = one v3
+      // request, even while armed).
+      for (const name of ["Compact", "Stop"] as const) {
+        const favorite = strip.getByRole("button", { name, exact: true });
+        await expect(favorite).toBeEnabled();
+        const box = await favorite.boundingBox();
+        if (!box) throw new Error(`${name} favorite not laid out while armed`);
+        expect(box.width).toBeGreaterThanOrEqual(44);
+        expect(box.height).toBeGreaterThanOrEqual(44);
+        expect(box.x).toBeGreaterThanOrEqual(0);
+        expect(box.y).toBeGreaterThanOrEqual(0);
+        expect(box.x + box.width).toBeLessThanOrEqual(width);
+        expect(box.y + box.height).toBeLessThanOrEqual(xtermBox.y);
+      }
+      await strip.getByRole("button", { name: "Compact", exact: true }).click();
+      await expect.poll(() => harness.controlInputPosts.length).toBe(1);
+
+      // Stop streaming and Close stay reachable.
+      const stop = page.getByRole("button", { name: "Stop streaming" });
+      await stop.scrollIntoViewIfNeeded();
+      await expect(stop).toBeInViewport();
+      await expect(page.locator('[title="Close terminal"]')).toBeInViewport();
+      await stop.click();
+      await expect(page.getByText(/Streaming disarmed: operator stopped streaming/)).toBeVisible();
+    });
+
+    test(`composer controls meet 44×44 touch targets without horizontal overflow at ${width}×${height}`, async ({
+      page,
+    }) => {
+      await page.setViewportSize({ width, height });
+      await stubBackend(page);
+      await openNativeTerminal(page);
+
+      const controls = [
+        page.getByRole("textbox", { name: "Message to the native composer" }),
+        page.getByTestId("composer-row").getByRole("button", { name: "Send", exact: true }),
+        page.getByTestId("composer-row").getByRole("button", { name: "Streaming", exact: true }),
+        page.getByTestId("composer-row").getByRole("button", { name: /^Macros/ }),
+      ];
+      for (const control of controls) {
+        const box = await control.boundingBox();
+        if (!box) throw new Error("composer control not laid out");
+        expect(box.width).toBeGreaterThanOrEqual(44);
+        expect(box.height).toBeGreaterThanOrEqual(44);
+        expect(box.x).toBeGreaterThanOrEqual(0);
+        expect(box.x + box.width).toBeLessThanOrEqual(width);
+      }
+
+      // No horizontal overflow on the page or the composer row.
+      const docScrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+      expect(docScrollWidth).toBeLessThanOrEqual(width);
+      const rowBox = await page.getByTestId("composer-row").boundingBox();
+      if (!rowBox) throw new Error("composer row not laid out");
+      expect(rowBox.x).toBeGreaterThanOrEqual(0);
+      expect(rowBox.x + rowBox.width).toBeLessThanOrEqual(width);
+    });
+  }
+});
