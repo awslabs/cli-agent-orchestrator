@@ -2,19 +2,24 @@ import { test, expect } from "@playwright/test";
 import { openNativeTerminal, stubBackend, wsSentFrames } from "./stub";
 
 // Sol P1 regression + mobile terminal-overlay layout acceptance at the exact
-// QA viewports (390×844 and 360×800). The P1: the streaming engine stored
-// bare `setTimeout`/`clearTimeout` as its defaults and invoked them as
-// methods of its config object, which browsers reject with
-// `TypeError: Illegal invocation` — the first printable key threw from
+// QA viewports (390×844 and 360×800), plus a desktop sanity size. The P1: the
+// streaming engine stored bare `setTimeout`/`clearTimeout` as its defaults
+// and invoked them as methods of its config object, which browsers reject
+// with `TypeError: Illegal invocation` — the first printable key threw from
 // `armQuietTimer` and no batch ever formed. Node/vitest timers never check
 // the receiver, so this spec drives a real browser: the quiet timer must
 // flush a batch with zero page errors. The layout cases pin the fullscreen
 // overlay (no 24px dashboard strip), an in-viewport touch/keyboard Close,
-// and the armed terminal's ≥50% viewport-height floor.
+// and the armed terminal's ≥50% viewport-height floor — measured on the
+// fitted `.xterm` element itself, not its wrapper: FitAddon floors the fit
+// to whole rows, so the wrapper can meet the floor while the visible
+// terminal is one row short (the 390×844 P2: wrapper 422px, .xterm 416px).
 
-const MOBILE_SIZES = [
+const GEOMETRY_SIZES = [
   { width: 390, height: 844, floor: 422 },
   { width: 360, height: 800, floor: 400 },
+  // Desktop sanity: the floor padding must not disturb the desktop layout.
+  { width: 1280, height: 800, floor: 400 },
 ] as const;
 
 test.describe("streaming quiet-timer flush (Sol P1 regression)", () => {
@@ -53,7 +58,7 @@ test.describe("streaming quiet-timer flush (Sol P1 regression)", () => {
 });
 
 test.describe("terminal overlay layout at the exact QA sizes", () => {
-  for (const { width, height, floor } of MOBILE_SIZES) {
+  for (const { width, height, floor } of GEOMETRY_SIZES) {
     test(`fullscreen overlay with in-viewport touch/keyboard Close at ${width}×${height}`, async ({
       page,
     }) => {
@@ -101,23 +106,36 @@ test.describe("terminal overlay layout at the exact QA sizes", () => {
       await stubBackend(page);
       await openNativeTerminal(page);
 
-      const terminalWrapper = page
+      // Measure the fitted .xterm — the actual visible terminal — never its
+      // wrapper: the wrapper meets the floor by CSS while the row-quantized
+      // fit can leave the .xterm one row short.
+      const xterm = page.locator(".xterm");
+      const wrapper = page
         .locator('[title="Close terminal"]')
         .locator('xpath=ancestor::div[contains(@class,"fixed")][1]')
         .locator(":scope > div:last-child");
+      // After arming, the control area grows synchronously but the refit is
+      // debounced (~50ms), so a fresh measurement can catch the stale
+      // pre-arm height. Post-fit the .xterm is never taller than its wrapper;
+      // pre-refit it still is. Gate on that to wait for the armed fit.
+      const fittedXtermHeight = async () => {
+        const x = await xterm.boundingBox();
+        const w = await wrapper.boundingBox();
+        if (!x || !w) return 0;
+        return x.height <= w.height ? x.height : 0;
+      };
 
       // Baseline (streaming off): the terminal already meets the floor.
-      const offBox = await terminalWrapper.boundingBox();
-      if (!offBox) throw new Error("terminal not laid out");
-      expect(offBox.height).toBeGreaterThanOrEqual(floor);
+      await expect.poll(fittedXtermHeight).toBeGreaterThanOrEqual(floor);
 
       await page.getByRole("button", { name: "Streaming" }).click();
       await page.getByRole("textbox", { name: /Streaming keystroke capture/ }).waitFor();
 
-      const armedBox = await terminalWrapper.boundingBox();
+      // Armed: the visible terminal still meets the floor and nothing is
+      // clipped past the viewport bottom.
+      await expect.poll(fittedXtermHeight).toBeGreaterThanOrEqual(floor);
+      const armedBox = await xterm.boundingBox();
       if (!armedBox) throw new Error("terminal not laid out while armed");
-      expect(armedBox.height).toBeGreaterThanOrEqual(floor);
-      // The terminal still ends at the viewport bottom — nothing clipped.
       expect(armedBox.y + armedBox.height).toBeLessThanOrEqual(height);
 
       // Stop stays reachable (it scrolls into view if the control area is tall).
