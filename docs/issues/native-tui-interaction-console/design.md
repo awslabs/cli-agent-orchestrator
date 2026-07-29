@@ -45,6 +45,7 @@ source disagreed, the source won and the divergence is named in §13
 | `origin` remote | `https://github.com/colindmurray/cli-agent-orchestrator.git` |
 | `upstream` remote | AWS Labs repository (read-only reference) |
 | PR target | `origin/main` via the integration branch (§9) |
+| Integration head (r14) | `38ad00ee8857acf90fc5bb56a484f8aecc1a079d` on `origin/feature/native-tui-interaction-console` — A+B merged and installed-GO (PR #49 visual-QA fixes, PR #50 390×844 fitted-`.xterm` geometry; installed Sol/xhigh retest P4 GO, bundle `index-DOXq5tKp.js` live on localhost + tailnet); supersedes the r13 row below |
 | Integration head (r13) | `ada0d1982cb00dbef5492bc4a1c0d0ed2debfc3e` on `origin/feature/native-tui-interaction-console` — Lane A (PR #48), r9-r12 docs, and Lane B (PR #47, seamed at `6fc348e`, merged 2026-07-28) are all integrated; supersedes the r12 row below |
 | Integration head (r12) | `8687af27ee0bcd5d7f37b46f0bee2061260762bf` on `origin/feature/native-tui-interaction-console` (Lane A merged, PR #48); Lane B (PR #47, `8c2d4a0`) serializes next per §9's seam |
 | Canonical document | this file, on the design branch |
@@ -1234,7 +1235,12 @@ One primary row (wraps to two on narrow widths):
   recorder; the header keeps no third row.
 - Acceptance: row height ≤ 48 px at ≥1024 px; ≤ 96 px total (two rows) at
   390 px; terminal viewport keeps ≥ 50 % of viewport height with header +
-  favorite strip visible at 390×844. (Matches the §0 visual baseline's
+  favorite strip visible at 390×844. The ≥ 50 % rule is measured on the
+  **visible fitted `.xterm` child**, not its wrapper: FitAddon floors the
+  fit to whole rows, so wrapper floors must include row-quantization slack
+  (the merged implementation pads `50dvh` by +10 px; installed A+B QA
+  measured the visible `.xterm` at 432 px ≥ 422 px at 390×844 and
+  400 px ≥ 400 px at 360×800 — GO, PR #50). (Matches the §0 visual baseline's
   compact footprint.)
 
 ### 7.2 Favorite strip
@@ -1604,6 +1610,19 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
 
 ### Integration status and the Lane B seam (r12, verified topology)
 
+- **r14 update — A+B installed-GO; only Lane C remains:** canonical head
+  `38ad00ee8857acf90fc5bb56a484f8aecc1a079d` (PR #50 merge) carries the
+  A+B visual-QA fixes (PR #49: streaming quiet-timer binding + mobile
+  overlay layout — semantics unchanged; PR #50: armed-terminal floor
+  padded past row quantization). The installed Sol/xhigh retest is **P4
+  GO** at this head (fitted `.xterm` 432 px ≥ 422 px at 390×844,
+  400 px ≥ 400 px at 360×800; desktop first-printable identity batch;
+  zero raw managed-pane websocket input). The A+B staging gate is
+  **complete**; the only remaining product lane is the isolated Lane C
+  PR/worktree (§9, merges last). The campaign is not complete until Lane
+  C lands. (Tooling note: the deploy `--dry-run --bounce`
+  activation-receipt contradiction is a known dry-run-only tooling P2 —
+  cond-0087/cond-0116/cond-0138 — not a product blocker.)
 - **r13 update — integration complete through Lane B:** canonical head
   `ada0d1982cb00dbef5492bc4a1c0d0ed2debfc3e` (merge of PR #47,
   2026-07-28) contains Lane A (PR #48), the r9-r12 docs merge
@@ -1869,7 +1888,8 @@ branch): `feature/native-tui-console-lane-a`, `…-lane-b`, `…-lane-c`, then
 Projects: desktop Chromium 1280×800 and mobile Chromium 390×844
 (device-scale, touch). Against a stubbed server (MSW-style route mocks or
 the `cao_mcp_apps` harness pattern): header/strip/modal render and operate at
-both widths; terminal keeps ≥ 50 % height at mobile width; streaming arms,
+both widths; terminal keeps ≥ 50 % height at mobile width (measured on the
+visible fitted `.xterm` child with row-quantization slack, §7.1); streaming arms,
 captures, shows trace, and Stop-streaming works with touch; macro sheet
 list→editor navigation; Lane C chip strip, picker, paste, and wrap behavior
 against the §0 visual baseline; wheel scrolling works with streaming off and
