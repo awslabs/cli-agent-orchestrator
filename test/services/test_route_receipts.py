@@ -63,7 +63,7 @@ def _write(harness, **changes):
         "protocol": "app-server/1",
         "event_sequence": 1,
         "model_input_digest": harness["digest"],
-        "provider_version": "codex 0.145.0",
+        "provider_version": "codex 0.146.0",
     }
     args.update(changes)
     return route_receipts.write_route_receipt(**args)
@@ -131,7 +131,7 @@ def test_hand_authored_file_off_content_address_exposes_nothing(harness):
         "event_sequence": 1,
         "model_input_digest": harness["digest"],
         "non_echo": True,
-        "provider_version": "codex 0.145.0",
+        "provider_version": "codex 0.146.0",
         "receipt_hmac": "0" * 64,
     }
     (harness["state_dir"] / "route-receipt.hand-authored.json").write_text(

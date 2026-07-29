@@ -18,22 +18,22 @@ NATIVE = "thr_0192a7b4"
 # Normative golden chain: creation (chain_seq 1) -> route (chain_seq 2) ->
 # first route segment, all for codex/thr_0192a7b4.
 CREATION_PAYLOAD_BYTES = 293
-CREATION_PAYLOAD_SHA = "7465db28bfae172989c005e9d74a41e1d71b55069f232959552fd9e8a9662416"
+CREATION_PAYLOAD_SHA = "a258aa554d77e9a7cd5e1291af9a7bf97ffef5ca70dd8ab3e04f7e521d01767a"
 CREATION_RECEIPT_BYTES = 245
-CREATION_RECEIPT_SHA = "0ed5b89dd215a623c29db8814ef6257139c1d6de302d1881876f5231f1afecbd"
+CREATION_RECEIPT_SHA = "a6cd2284e53db3ebfed7780219fc015db6bb212aa920ac1cc7471c9f1a950244"
 ROUTE_PAYLOAD_BYTES = 663
 ROUTE_PAYLOAD_SHA = "2af5437a1cb3831bc06f9c1448b768fed46d4a25065f723bb142a4e396b82d5e"
 ROUTE_RECEIPT_BYTES = 304
-ROUTE_RECEIPT_SHA = "0e3e9b0da2df6c7a8ef56145bbc789d7a39106ae6045833710e6954573602dfd"
+ROUTE_RECEIPT_SHA = "dc9337604ec4e6db5f4b0fe0dd864b238ea94177081d41858729f3e7fd202d28"
 SEGMENT_BYTES = 734
-SEGMENT_SHA = "9e7335536c11c4160ca5b90acf03a0d196d4f888670d2a0989d9a85800d0a483"
+SEGMENT_SHA = "904830fa6e8587781e94e491b2410a84bb1a8f43e14af3a8f139c9248f71668c"
 
 
 def _creation_payload() -> bytes:
     return rr.creation_payload(
         provider=PROVIDER,
         native_id=NATIVE,
-        provider_version="0.145.0",
+        provider_version="0.146.0",
         issuance_source="app_server_thread_start",
         obligation_generation="obgen-7c2e4a1b",
         task_id="self-heal-demo-task",
@@ -225,7 +225,7 @@ def test_resume_attempt_payload_vector() -> None:
     )
     assert len(payload) == 311
     assert rr.payload_digest(payload) == (
-        "4915e5c5a64e06a1adbcf81471ed38005dcbdae7c07f2535349823d6ccca1464"
+        "284b0f8dd5898862e338efbbfda6a48a6b690665860357ea975c604178099592"
     )
 
 

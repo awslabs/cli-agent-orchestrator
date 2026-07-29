@@ -101,7 +101,7 @@ _NATIVE = {"execution_mode": "native_tui", **_NATIVE_PROVIDER}
 #: distinct from the ACP kind, so a receipt from one mode cannot satisfy
 #: a bind in the other.
 _PROVIDER_FIXTURES = {
-    "codex": {"version": "0.145.0", "acp_kind": "codex-thread-start", "native_kind": None},
+    "codex": {"version": "0.146.0", "acp_kind": "codex-thread-start", "native_kind": None},
     "kimi_cli": {
         "version": "0.29.0",
         "acp_kind": "kimi-acp-session-new",

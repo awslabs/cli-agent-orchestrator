@@ -209,7 +209,7 @@ bug, not an error.
   the repo today; `_SEQUENCE_INTERRUPT_KEYS = {"Escape","C-c","C-s"}`
   (`control_input_service.py:723`) is provider-agnostic.
 - Version pins: `SUPPORTED_VERSIONS` kimi `("0.29.2","0.29.1","0.29.0")`,
-  claude `("2.1.220",)`, codex `("0.145.0",)`
+  claude `("2.1.220",)`, codex `("0.146.0",)`
   (`services/provider_contracts.py:77-81`).
 - Only `execution_mode == native_tui` panes accept control input; ACP panes
   are refused `managed-acp-pane` (`control_input_service.py:831-847`).

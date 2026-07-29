@@ -21,11 +21,13 @@ from cli_agent_orchestrator.services.recovery_capabilities import build_capabili
 
 def test_pinned_versions():
     # The current pin is the stage-verified installed build.
-    assert pc.PINNED_VERSIONS == {"codex": "0.145.0", "kimi": "0.30.0", "claude": "2.1.220"}
-    pc.check_pinned_version("codex", "0.145.0")
-    pc.check_pinned_version("codex", "codex-cli 0.145.0")
+    assert pc.PINNED_VERSIONS == {"codex": "0.146.0", "kimi": "0.30.0", "claude": "2.1.220"}
+    pc.check_pinned_version("codex", "0.146.0")
+    pc.check_pinned_version("codex", "codex-cli 0.146.0")
     with pytest.raises(pc.ProviderVersionDrift):
-        pc.check_pinned_version("codex", "codex-cli 0.144.6")
+        pc.check_pinned_version("codex", "codex-cli 0.145.0")
+    with pytest.raises(pc.ProviderVersionDrift):
+        pc.check_pinned_version("codex", "codex-cli 0.146.1")
     with pytest.raises(pc.ProviderVersionDrift):
         pc.check_pinned_version("kimi", "0.28.0")
 
@@ -120,9 +122,9 @@ def test_resume_status_truthful_defaults():
 def test_resume_status_version_checked_and_receipt_bound():
     # A version-matched binary restores resume identity (never authority);
     # version drift removes it again (outcome 41 semantics).
-    codex = pc.resume_status("codex", installed_version="codex 0.145.0")
+    codex = pc.resume_status("codex", installed_version="codex 0.146.0")
     assert codex.identity_available and not codex.authority_supported
-    drifted = pc.resume_status("codex", installed_version="codex 0.145.1")
+    drifted = pc.resume_status("codex", installed_version="codex 0.146.1")
     assert not drifted.identity_available
     claude = pc.resume_status("claude", installed_version="2.1.220 (Claude Code)")
     assert claude.identity_available and not claude.authority_supported
@@ -137,7 +139,7 @@ def test_resume_status_version_checked_and_receipt_bound():
     assert kimi_proven.identity_available and not kimi_proven.authority_supported
     # A provider-specific route receipt promotes ONLY that provider's authority.
     codex_route = pc.resume_status(
-        "codex", installed_version="codex 0.145.0", route_proof=_valid_route_proof("codex")
+        "codex", installed_version="codex 0.146.0", route_proof=_valid_route_proof("codex")
     )
     assert codex_route.authority_supported
     # An unvalidated/foreign/echo route object never promotes authority.
@@ -147,7 +149,7 @@ def test_resume_status_version_checked_and_receipt_bound():
         {**_valid_route_proof("codex"), "non_echo": False},
         {**_valid_route_proof("codex"), "observed_effort": ""},
     ):
-        status = pc.resume_status("codex", installed_version="codex 0.145.0", route_proof=bad_proof)
+        status = pc.resume_status("codex", installed_version="codex 0.146.0", route_proof=bad_proof)
         assert status.identity_available and not status.authority_supported
 
 
@@ -326,7 +328,7 @@ def test_capability_claims_derive_from_receipts_never_caller_booleans():
     )
     payload = build_capabilities(
         containment=composition,
-        provider_versions={"codex": "codex 0.145.0", "kimi": "kimi 0.29.0"},
+        provider_versions={"codex": "codex 0.146.0", "kimi": "kimi 0.29.0"},
         kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"},
         route_proofs={"codex": _valid_route_proof("codex")},
     )
@@ -347,7 +349,7 @@ def test_capability_claims_derive_from_receipts_never_caller_booleans():
     # even with containment proven and exact pinned versions.
     identity_only = build_capabilities(
         containment=composition,
-        provider_versions={"codex": "codex 0.145.0", "kimi": "kimi 0.29.0"},
+        provider_versions={"codex": "codex 0.146.0", "kimi": "kimi 0.29.0"},
         kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"},
     )
     assert identity_only["resume"]["codex"]["identity_available"] is True
@@ -367,7 +369,7 @@ def test_capability_claims_derive_from_receipts_never_caller_booleans():
     ):
         unproven = build_capabilities(
             containment=composition,
-            provider_versions={"codex": "codex 0.145.0"},
+            provider_versions={"codex": "codex 0.146.0"},
             route_proofs={"codex": bad_proof},
         )
         assert unproven["observed_route"]["codex"] == "unsupported"
@@ -376,7 +378,7 @@ def test_capability_claims_derive_from_receipts_never_caller_booleans():
     # Runtime version drift removes the capability.
     drifted = build_capabilities(
         containment=composition,
-        provider_versions={"codex": "codex 0.145.1", "kimi": "kimi 0.29.0"},
+        provider_versions={"codex": "codex 0.146.1", "kimi": "kimi 0.29.0"},
         kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"},
         route_proofs={"codex": _valid_route_proof("codex")},
     )
@@ -386,7 +388,7 @@ def test_capability_claims_derive_from_receipts_never_caller_booleans():
     # expectation exposes no authority even for a well-formed receipt.
     pinned = build_capabilities(
         containment=composition,
-        provider_versions={"codex": "codex 0.145.0"},
+        provider_versions={"codex": "codex 0.146.0"},
         route_proofs={"codex": _valid_route_proof("codex")},
         route_expectations={
             "codex": {"model": "gpt-5.6-sol", "effort": "max", "model_input_digest": "d" * 64}
@@ -400,7 +402,7 @@ def test_capability_claims_derive_from_receipts_never_caller_booleans():
     ):
         refused = build_capabilities(
             containment=composition,
-            provider_versions={"codex": "codex 0.145.0"},
+            provider_versions={"codex": "codex 0.146.0"},
             route_proofs={"codex": _valid_route_proof("codex")},
             route_expectations={"codex": drifted_expectation},
         )

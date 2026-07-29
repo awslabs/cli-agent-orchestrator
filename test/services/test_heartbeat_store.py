@@ -25,7 +25,7 @@ def _identity(**changes) -> hb.HeartbeatIdentity:
         "generation": "gen-000042",
         "attempt_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
         "provider": "codex",
-        "provider_version": "0.145.0",
+        "provider_version": "0.146.0",
         "native_session_id": "thr_0192a7b4",
         "assigned_policy_sha256": "7" * 64,
         "segment_hash": "9" * 64,

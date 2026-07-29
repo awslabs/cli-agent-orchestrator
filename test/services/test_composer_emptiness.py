@@ -70,7 +70,7 @@ class TestEmptinessPins:
     def test_an_unpinned_build_or_provider_has_no_pin(self):
         assert npi.composer_emptiness_pin_for("kimi_cli", "0.28.0") is None
         assert npi.composer_emptiness_pin_for("kimi_cli", None) is None
-        assert npi.composer_emptiness_pin_for("codex", "0.145.0") is None
+        assert npi.composer_emptiness_pin_for("codex", "0.146.0") is None
         assert npi.composer_emptiness_pin_for(None, "0.29.2") is None
 
     def test_every_pin_carries_its_evidence(self):

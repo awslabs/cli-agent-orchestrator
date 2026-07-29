@@ -61,7 +61,7 @@ def _identity():
         generation="gen-000042",
         attempt_id=ATTEMPT,
         provider="codex",
-        provider_version="0.145.0",
+        provider_version="0.146.0",
         native_session_id="thr_0192a7b4",
         assigned_policy_sha256="7" * 64,
         segment_hash="9" * 64,
