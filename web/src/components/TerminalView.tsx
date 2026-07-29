@@ -1319,12 +1319,12 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
                 rows={Math.min(4, message.split('\n').length)}
                 placeholder="Send a message to the native composer…"
                 aria-label="Message to the native composer"
-                className="min-w-0 flex-1 resize-none rounded border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none"
+                className="min-h-[44px] min-w-[44px] flex-1 resize-none rounded border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none sm:min-h-0 sm:min-w-0"
               />
               <button
                 disabled={!canSend}
                 onClick={sendDraft}
-                className="min-h-[36px] rounded bg-emerald-700 px-3 py-1.5 text-xs text-white transition-colors hover:bg-emerald-600 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                className="min-h-[44px] min-w-[44px] rounded bg-emerald-700 px-3 py-1.5 text-xs text-white transition-colors hover:bg-emerald-600 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500 sm:min-h-[36px] sm:min-w-0"
               >
                 Send
               </button>
@@ -1338,7 +1338,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
                     ? 'Arm streaming mode: type directly to the terminal in bounded identity-bound batches'
                     : 'Streaming needs a server advertising streaming support and the full key set'
                 }
-                className="min-h-[36px] rounded bg-gray-800 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-700 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                className="min-h-[44px] min-w-[44px] rounded bg-gray-800 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-700 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500 sm:min-h-[36px] sm:min-w-0"
               >
                 {arming ? 'Arming…' : 'Streaming'}
               </button>
@@ -1347,7 +1347,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
                   type="button"
                   ref={macrosButtonRef}
                   onClick={() => setMacroModalOpen(true)}
-                  className="relative min-h-[36px] rounded bg-gray-800 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  className="relative min-h-[44px] min-w-[44px] rounded bg-gray-800 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 sm:min-h-[36px] sm:min-w-0"
                 >
                   Macros
                   {visibleMacros.length > 0 && (
@@ -1471,14 +1471,6 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
               </div>
             </div>
           )}
-          {favorites.length > 0 && (
-            <FavoriteStrip
-              favorites={favorites}
-              disabled={controlBusy}
-              onSend={sendMacro}
-              guardNotice={compactGuardNotice}
-            />
-          )}
           <div className="flex items-center gap-2 text-[11px] text-gray-400">
             <span>Cancel, route, effort, and resume controls are unavailable for native TUI sessions.</span>
             <span className="min-w-0 truncate">{controlStatus}</span>
@@ -1558,6 +1550,25 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
               onChanged={loadMacroLibrary}
             />
           )}
+        </div>
+      )}
+      {/* §7.2 favorites ride a reserved, non-shrinking row directly above the
+          terminal. The control area scrolls when it grows tall (armed
+          streaming at mobile widths); a strip inside it could be clipped
+          beneath the fitted xterm (installed-QA P2). Reserved here, the
+          Compact/Stop favorites are always fully visible and operable,
+          armed or not. */}
+      {nativeManaged && nativeControlSupported && favorites.length > 0 && (
+        <div
+          data-testid="favorite-strip-row"
+          className="shrink-0 border-b border-gray-700/50 bg-gray-950 px-4 py-1"
+        >
+          <FavoriteStrip
+            favorites={favorites}
+            disabled={controlBusy}
+            onSend={sendMacro}
+            guardNotice={compactGuardNotice}
+          />
         </div>
       )}
       {nativeManaged && nativeControlResolved && !nativeControlSupported && (
