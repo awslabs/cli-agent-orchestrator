@@ -1,11 +1,13 @@
 """Focused regression for the Kimi 0.30 steer-effect ACK predicate
-(Sol r17, cond steer 138): only the exact PROVIDER-BULLETED output row
+(Sol r17, cond steers 138/139): only the exact PROVIDER-BULLETED output row
 (``● {ack}``) proves the effect.  A bare ``{ack}`` continuation row — the
 shape a wrapped queue/context echo takes — must be rejected, and the
 ✨-marked instruction row and pre-steer content never satisfy it.
 
-Runs in the ordinary unit suite (deliberately not e2e-marked): the
-predicate is a pure function of transcript text.
+Lives in the ordinary unit-test collection path (NOT under ``test/e2e/``,
+which CI's ``--ignore=test/e2e`` unit matrix skips): the predicate is a
+pure function of transcript text, so the CI unit matrix executes it on
+every run.
 """
 
 from __future__ import annotations
