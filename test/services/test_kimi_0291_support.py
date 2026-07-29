@@ -27,14 +27,15 @@ from cli_agent_orchestrator.services import kimi_native_control as knc
 from cli_agent_orchestrator.services import kimi_route
 from cli_agent_orchestrator.services import provider_contracts as pc
 
-CURRENT = "0.29.2"
+CURRENT = "0.30.0"
+PIN_0292 = "0.29.2"
 RETAINED = "0.29.1"
 OLDEST = "0.29.0"
-ACCEPTED = (CURRENT, RETAINED, OLDEST)
+ACCEPTED = (CURRENT, PIN_0292, RETAINED, OLDEST)
 
 
 # --------------------------------------------------------------------
-# The version gates accept exactly {0.29.2, 0.29.1, 0.29.0}
+# The version gates accept exactly {0.30.0, 0.29.2, 0.29.1, 0.29.0}
 # --------------------------------------------------------------------
 
 
@@ -48,11 +49,11 @@ def test_the_accepted_set_is_current_then_retained():
     "banner",
     [f"kimi {version}" for version in ACCEPTED] + list(ACCEPTED),
 )
-def test_check_pinned_version_accepts_all_three_builds(banner):
+def test_check_pinned_version_accepts_every_accepted_build(banner):
     pc.check_pinned_version("kimi", banner)
 
 
-@pytest.mark.parametrize("bad", ["0.29.3", "0.28.9", "0.30.0", "1.0.0", "kimi", ""])
+@pytest.mark.parametrize("bad", ["0.29.3", "0.28.9", "0.30.1", "1.0.0", "kimi", ""])
 def test_check_pinned_version_rejects_everything_outside_the_set(bad):
     with pytest.raises(pc.ProviderVersionDrift):
         pc.check_pinned_version("kimi", bad)
@@ -70,6 +71,15 @@ def test_the_composer_newline_table_keeps_the_separate_proven_0291_entry():
     assert entry["keystroke"] == knc._PROVEN_COMPOSER_NEWLINE[OLDEST]["keystroke"]
     assert entry["normalization"] == knc.NORMALIZATION_JOIN_LF_THEN_TRIM
     assert "cba31835395ff75fa6b5bc9b81a7907c7d933e7e6a7d8ba53afac23dd0f5ab04" in entry["evidence"]
+
+
+def test_the_composer_newline_table_keeps_the_separate_proven_0300_entry():
+    entry = knc._PROVEN_COMPOSER_NEWLINE.get(CURRENT)
+    assert entry is not None, "0.30.0 must be a separate keyed entry, never a range"
+    # The same composer facts as the 0.29.x line, read from the installed bundle.
+    assert entry["keystroke"] == knc._PROVEN_COMPOSER_NEWLINE[OLDEST]["keystroke"]
+    assert entry["normalization"] == knc.NORMALIZATION_JOIN_LF_THEN_TRIM
+    assert "49ad0553cff0b5f60f83ba85df56bb5ccdbcb908158c80d9363d0e5a529ea51c" in entry["evidence"]
 
 
 @pytest.mark.parametrize("version", ACCEPTED)

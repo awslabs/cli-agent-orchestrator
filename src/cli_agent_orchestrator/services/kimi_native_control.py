@@ -38,7 +38,7 @@ import time
 import unicodedata
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-from typing import Any, Optional, Protocol, cast
+from typing import Any, Callable, Optional, Protocol, Tuple, cast
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services import execution_mode as em
@@ -62,7 +62,11 @@ PROVIDER_OBSERVATION_SCHEMA = "cao-kimi-native-control-observation-v1"
 KIND_QUEUE = "queue"
 KIND_STEER = "steer"
 KIND_CONTROL = "control"
-OPERATION_KINDS = frozenset({KIND_QUEUE, KIND_STEER, KIND_CONTROL})
+#: Lane C (design §8.3): one text+image operator message, journaled and
+#: gated exactly like a queue operation but replaying on the caller's
+#: whole-request digest.
+KIND_OPERATOR_MESSAGE = "operator-message"
+OPERATION_KINDS = frozenset({KIND_QUEUE, KIND_STEER, KIND_CONTROL, KIND_OPERATOR_MESSAGE})
 
 #: ``intended`` -> intent is durable, nothing has been typed.
 #: ``posted``   -> bytes reached the transport.  Transport fact only.
@@ -106,6 +110,14 @@ REFUSED_PROVIDER = "provider_refused"
 #: raised error, and a caller whose response was lost finds it by exact
 #: id instead of having to guess whether anything was sent.
 REFUSED_UNPROVEN_COMPOSER_NEWLINE = "composer_newline_unproven"
+#: Lane C: the operator-message pre-write hook refused at the last safe
+#: pre-write point (after the journal claim and every deliverability/idle
+#: gate, immediately before the transport write), so zero bytes were
+#: typed.  These name the image-attachment store's answers there; the
+#: word "attachment" alone already means provider-session ownership in
+#: this module (``REFUSED_ATTACHMENT``).
+REFUSED_IMAGE_UNKNOWN = "image_attachment_unknown"
+REFUSED_IMAGE_NOT_READY = "image_attachment_not_ready"
 REFUSAL_REASONS = frozenset(
     {
         REFUSED_ACTIVE_TURN,
@@ -116,6 +128,8 @@ REFUSAL_REASONS = frozenset(
         REFUSED_UNRESOLVED_AMBIGUITY,
         REFUSED_PROVIDER,
         REFUSED_UNPROVEN_COMPOSER_NEWLINE,
+        REFUSED_IMAGE_UNKNOWN,
+        REFUSED_IMAGE_NOT_READY,
     }
 )
 
@@ -277,6 +291,29 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
             "(three-way bundle comparison)"
         ),
     },
+    # 0.30.0 is likewise a *separate* proven entry, not a range widening:
+    # read from the installed 0.30.0 bundle (main.mjs sha256
+    # 49ad0553cff0b5f60f83ba85df56bb5ccdbcb908158c80d9363d0e5a529ea51c),
+    # which declares the same composer facts as the 0.29.x line — the
+    # ['shift+enter', 'ctrl+j'] newLine defaultKeys, the
+    # expandPasteMarkers(lines.join("\n")) submit computation, and
+    # PASTE_ENTER_SUPPRESS_WINDOW_MS = 120.  Same proven behaviour, so the
+    # same normalization identifier; no behavioral drift is claimed.
+    "0.30.0": {
+        "keystroke": "C-j",
+        "burst_reset_keystroke": "End",
+        "submit_settle_seconds": 0.25,
+        "normalization": NORMALIZATION_JOIN_LF_THEN_TRIM,
+        "evidence": (
+            "installed 0.30.0 dist/main.mjs (sha256 49ad0553cff0b5f60f83ba"
+            "85df56bb5ccdbcb908158c80d9363d0e5a529ea51c) declares the "
+            "['shift+enter', 'ctrl+j'] newLine defaultKeys and computes "
+            "expandPasteMarkers(this.state.lines.join('\\n')) on submit; "
+            "PASTE_ENTER_SUPPRESS_WINDOW_MS = 120 "
+            "— the same composer facts as the 0.29.x line (bundle read; "
+            "live acceptance per cond-0198)"
+        ),
+    },
 }
 
 #: The steer chords proven for each pinned Kimi build.  Distinct from
@@ -293,6 +330,10 @@ _PROVEN_STEER_CHORDS: dict[str, frozenset[str]] = {
     # Key.ctrl("s") exists in the 0.29.2 bundle exactly as in 0.29.0/0.29.1
     # (three-way comparison; sha256 keyed in _PROVEN_COMPOSER_NEWLINE).
     "0.29.2": frozenset({"C-s"}),
+    # ctrl("s") exists in the installed 0.30.0 bundle exactly as in the
+    # 0.29.x line (bundle read; sha256 keyed in _PROVEN_COMPOSER_NEWLINE;
+    # live acceptance per cond-0198).
+    "0.30.0": frozenset({"C-s"}),
 }
 
 
@@ -1289,6 +1330,105 @@ def queue(
             )
     except _Refusal as refusal:
         return _refuse(binding["operation_id"], refusal)
+
+    return _post(operation_id=binding["operation_id"], plan=plan, transport=transport)
+
+
+def operator_message(
+    *,
+    operation_id: str,
+    native_session_id: str,
+    terminal_id: str,
+    generation: str,
+    execution_mode: str,
+    text: str,
+    payload_sha256: str,
+    observation: Mapping[str, Any],
+    transport: NativeControlTransport,
+    provider_version: Optional[str] = None,
+    pre_write: Optional[Callable[[], Optional[Tuple[str, str]]]] = None,
+) -> dict[str, Any]:
+    """Submit one operator message (long text, multi-line, image references).
+
+    Lane C's typed operation (design §8.3): the same journaling, gating,
+    and at-most-once discipline as :func:`queue`, with two deliberate
+    differences:
+
+    - ``payload_sha256`` is supplied by the caller and digests the *whole
+      request* (draft text + attachment ids + token map), not just the
+      provider-bound text.  The replay identity of an operator message is
+      everything the operator sent, so a same-id request whose attachments
+      changed is a conflict, not a replay.
+    - ``text`` arrives already reference-substituted by the
+      operator-message service (staged image paths per the registry's
+      ``reference_template``).  This adapter types what it is given; which
+      bytes name an image is the service's contract.
+
+    The caller (operator-message service) holds the pane-input lease, has
+    already re-proven identity under it, and gates idle itself; the
+    observed-idle assertion here is the same defense in depth queue keeps.
+
+    ``pre_write`` is the caller's last-safe-point hook (Lane C r1: the
+    image-attachment ``ready → submitted(operation_id)`` binding).  It runs
+    after the journal claim and every deliverability/idle gate, immediately
+    before the transport write.  Its answer is ``None`` to proceed or a
+    ``(refusal_reason, detail)`` pair — one of the ``REFUSED_IMAGE_*``
+    reasons — which is journaled as a typed refusal with zero bytes typed.
+    Once the hook succeeds the write proceeds; an ambiguity after that
+    point freezes the operation exactly as any post-claim uncertainty does.
+    """
+    binding = _validate_binding(
+        operation_id=operation_id,
+        native_session_id=native_session_id,
+        terminal_id=terminal_id,
+        generation=generation,
+        execution_mode=execution_mode,
+    )
+    plan = plan_composer_keystrokes(text, provider_version=provider_version, field="text")
+    observed = _validated_turn_observation(observation)
+
+    record, is_new = _open(
+        kind=KIND_OPERATOR_MESSAGE,
+        binding=binding,
+        turn_id=None,
+        payload_sha256=payload_sha256,
+        observation=observed,
+        keystroke_plan=plan,
+    )
+    if not is_new:
+        return record
+
+    try:
+        _assert_session_unblocked(
+            native_session_id=binding["native_session_id"],
+            operation_id=binding["operation_id"],
+        )
+        _assert_attachment_owner(
+            native_session_id=binding["native_session_id"],
+            terminal_id=binding["terminal_id"],
+            generation=binding["generation"],
+            execution_mode=binding["execution_mode"],
+        )
+        _assert_deliverable(plan)
+        if observed["active_turn_id"] is not None:
+            raise _Refusal(
+                REFUSED_ACTIVE_TURN,
+                f"turn {observed['active_turn_id']} is active; an operator message waits "
+                "for idle, exactly as the control-input readiness gate requires",
+            )
+    except _Refusal as refusal:
+        return _refuse(binding["operation_id"], refusal)
+
+    if pre_write is not None:
+        hook_refusal = pre_write()
+        if hook_refusal is not None:
+            reason, detail = hook_refusal
+            if reason not in (REFUSED_IMAGE_UNKNOWN, REFUSED_IMAGE_NOT_READY):
+                raise NativeControlInvalid(
+                    f"the pre-write hook answered with refusal reason {reason!r}, "
+                    "which is not one of the image-binding refusal reasons"
+                )
+            return _refuse(binding["operation_id"], _Refusal(reason, detail))
 
     return _post(operation_id=binding["operation_id"], plan=plan, transport=transport)
 

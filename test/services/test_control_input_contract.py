@@ -458,8 +458,27 @@ class TestV3SequenceDigest:
         assert contract.MAX_SEQUENCE_TEXT_BYTES == 512
         assert contract.MAX_SEQUENCE_TEXT_BYTES == 512  # aggregate across text events
 
-    def test_the_normalized_key_set_is_the_pinned_minimum(self):
-        assert contract.SEQUENCE_KEY_NAMES == {"Escape", "C-c", "C-s", "Enter", "Backspace"}
+    def test_the_normalized_key_set_is_the_pinned_set(self):
+        """The §3.2 set: the deployed five plus the eleven navigation/editing
+        keys, extended in place under schema v3 (design D1)."""
+        assert contract.SEQUENCE_KEY_NAMES == {
+            "Escape",
+            "C-c",
+            "C-s",
+            "Enter",
+            "Backspace",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "Delete",
+            "Insert",
+            "Tab",
+        }
 
     def test_new_reason_codes_are_refusals_decided_before_any_write(self):
         assert contract.REASON_UNSUPPORTED_KEY == "unsupported-key"
@@ -470,6 +489,23 @@ class TestV3SequenceDigest:
         )
         assert contract.REASON_UNSUPPORTED_KEY in contract.CONTROL_INPUT_REASON_CODES
         assert contract.REASON_UNREPRESENTABLE_EVENT in contract.CONTROL_INPUT_REASON_CODES
+
+    def test_command_class_reason_codes_are_refusals_decided_before_any_write(self):
+        """§4.1: both new reasons are decided before any byte, so both carry
+        the zero-bytes proof and bind to REFUSED (the import-time assert in
+        the contract covers the table; this pins the intent)."""
+        assert contract.REASON_MALFORMED_COMMAND_DECLARATION == "malformed-command-declaration"
+        assert contract.REASON_COMPOSER_NONEMPTY == "composer-nonempty"
+        assert (
+            contract.outcome_for_reason(contract.REASON_MALFORMED_COMMAND_DECLARATION)
+            == contract.REFUSED
+        )
+        assert contract.outcome_for_reason(contract.REASON_COMPOSER_NONEMPTY) == contract.REFUSED
+        assert contract.REASON_MALFORMED_COMMAND_DECLARATION in contract.CONTROL_INPUT_REASON_CODES
+        assert contract.REASON_COMPOSER_NONEMPTY in contract.CONTROL_INPUT_REASON_CODES
+        assert contract.is_reattemptable(
+            contract.outcome_for_reason(contract.REASON_COMPOSER_NONEMPTY)
+        )
 
     def test_thirty_two_events_is_the_cap(self):
         events = [{"type": "key", "key": "Escape"}] * 32
@@ -535,6 +571,267 @@ class TestV3SequenceDigest:
         assert list(normalized[2].keys()) == ["type", "chord"]
         # A bare unknown type normalizes to its name only.
         assert contract.normalize_sequence_events([{"type": "macro"}]) == [{"type": "macro"}]
+
+
+class TestV4CommandClassDeclaration:
+    """Schema v4: v3 plus the optional ``payload_class`` declaration carrier (§4.1, r7).
+
+    A declared command is a different request from the same events
+    undeclared, so the declaration participates in the digest under its
+    own domain — the same reason ``chord`` participates in v2.  Command
+    detection is never derived from payload shape: ``payload_class`` is
+    the only trigger, its sole defined value is ``"command"``, and a v4
+    request with the field absent digests as the v3 request it is.
+    """
+
+    VECTOR = {
+        "control_id": "cmd-1",
+        "events": [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}],
+        "payload_class": "command",
+        "expected_identity": {
+            "terminal_id": "term-1",
+            "terminal_generation": "gen-3",
+            "provider_process_id": 4242,
+            "provider": "kimi_cli",
+            "session_name": "cao-demo",
+        },
+    }
+    PREIMAGE = (
+        '{"domain":"cao-control-input-request-v4","schema_version":4,'
+        '"control_id":"cmd-1",'
+        '"events":[{"type":"text","text":"/compact"},{"type":"key","key":"Enter"}],'
+        '"payload_class":"command",'
+        '"expected_identity":{"terminal_id":"term-1",'
+        '"terminal_incarnation":null,"terminal_generation":"gen-3","pane_birth_id":null,'
+        '"provider_process_id":4242,"provider":"kimi_cli","native_session_id":null,'
+        '"execution_mode":null,"session_name":"cao-demo"}}\n'
+    )
+    DIGEST = "6f774aba4cffa06755e981c89bbf5bf41e4608b0d9bedec47e71fa453ed8b2d5"
+
+    def test_v4_domain_is_separate_from_v1_v2_and_v3(self):
+        assert contract.CONTROL_INPUT_DIGEST_DOMAIN_V4 == "cao-control-input-request-v4"
+        assert contract.CONTROL_INPUT_DIGEST_DOMAIN_V4 != contract.CONTROL_INPUT_DIGEST_DOMAIN
+        assert contract.CONTROL_INPUT_DIGEST_DOMAIN_V4 != contract.CONTROL_INPUT_DIGEST_DOMAIN_V2
+        assert contract.CONTROL_INPUT_DIGEST_DOMAIN_V4 != contract.CONTROL_INPUT_DIGEST_DOMAIN_V3
+        assert contract.CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4 == 4
+
+    def test_v4_field_order_splices_payload_class_between_events_and_identity(self):
+        order = contract.REQUEST_DIGEST_FIELD_ORDER_V4
+        assert order == (
+            "domain",
+            "schema_version",
+            "control_id",
+            "events",
+            "payload_class",
+            "expected_identity",
+        )
+        assert order != tuple(sorted(order))
+
+    def test_matches_the_recorded_digest(self):
+        assert (
+            contract.control_input_request_digest_v4(
+                control_id=self.VECTOR["control_id"],
+                events=self.VECTOR["events"],
+                payload_class=self.VECTOR["payload_class"],
+                expected_identity=self.VECTOR["expected_identity"],
+            )
+            == self.DIGEST
+        )
+
+    def test_matches_the_recorded_preimage_byte_for_byte(self):
+        assert (
+            hashlib.sha256(self.PREIMAGE.encode("utf-8")).hexdigest() == self.DIGEST
+        ), "the recorded v4 preimage does not hash to the recorded digest"
+        encoded = canonical_json.encode_canonical(
+            {
+                "domain": contract.CONTROL_INPUT_DIGEST_DOMAIN_V4,
+                "schema_version": contract.CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
+                "control_id": self.VECTOR["control_id"],
+                "events": contract.normalize_sequence_events(self.VECTOR["events"]),
+                "payload_class": self.VECTOR["payload_class"],
+                "expected_identity": contract.normalize_expected_identity(
+                    self.VECTOR["expected_identity"]
+                ),
+            }
+        )
+        assert encoded.decode("utf-8") == self.PREIMAGE
+
+    def test_the_declaration_participates_in_the_digest(self):
+        """A declared and an undeclared request of the same id and events
+        must never digest alike (rebound blindness is the failure the
+        carrier exists to prevent)."""
+        declared = contract.control_input_request_digest_v4(
+            control_id="cmd-1",
+            events=self.VECTOR["events"],
+            payload_class="command",
+            expected_identity=self.VECTOR["expected_identity"],
+        )
+        undeclared_v3 = contract.control_input_request_digest_v3(
+            control_id="cmd-1",
+            events=self.VECTOR["events"],
+            expected_identity=self.VECTOR["expected_identity"],
+        )
+        null_declared_v4 = contract.control_input_request_digest_v4(
+            control_id="cmd-1",
+            events=self.VECTOR["events"],
+            payload_class=None,
+            expected_identity=self.VECTOR["expected_identity"],
+        )
+        assert declared != undeclared_v3
+        assert declared != null_declared_v4
+        # "v4 with no declaration" and "v3" are different requests too:
+        # the domain separates them even though both mean prose.
+        assert null_declared_v4 != undeclared_v3
+
+    def test_a_non_string_payload_class_is_not_declarable(self):
+        """The wire type is pinned the way ``chord``'s is in v2: anything
+        else raises here and is the typed malformed-declaration refusal at
+        the service layer."""
+        with pytest.raises(ValueError):
+            contract.control_input_request_digest_v4(
+                control_id="cmd-1",
+                events=self.VECTOR["events"],
+                payload_class=42,
+                expected_identity=None,
+            )
+
+    def test_declaration_validity_is_not_decided_by_the_digest(self):
+        """A digest must be computable for a declaration the server will
+        then refuse, so the two sides never disagree about which requests
+        exist."""
+        digest = contract.control_input_request_digest_v4(
+            control_id="cmd-2",
+            events=[{"type": "text", "text": "not a command"}],
+            payload_class="command",
+            expected_identity=None,
+        )
+        assert len(digest) == 64
+
+    def test_v3_digest_bytes_are_unchanged_by_v4(self):
+        """The v4 addition must not move what a v3 request digests to."""
+        assert (
+            contract.control_input_request_digest_v3(
+                control_id="seq-1",
+                events=TestV3SequenceDigest.VECTOR["events"],
+                expected_identity=TestV3SequenceDigest.VECTOR["expected_identity"],
+            )
+            == TestV3SequenceDigest.DIGEST
+        )
+
+    @pytest.mark.parametrize(
+        "events,violation",
+        [
+            # The two grammar shapes: bare command text, and the fused
+            # submitting Enter (the registry Compact shape).
+            ([{"type": "text", "text": "/compact"}], False),
+            ([{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}], False),
+            ([{"type": "text", "text": "/"}], False),  # bare slash is still slash-led
+            # Everything else is malformed under a declaration.
+            ([{"type": "text", "text": "prose"}], True),  # not slash-led
+            ([{"type": "text", "text": "see /tmp/x"}], True),  # slash later, not leading
+            ([{"type": "key", "key": "Enter"}], True),  # no text event
+            ([{"type": "text", "text": "/a"}, {"type": "text", "text": "/b"}], True),
+            ([{"type": "text", "text": "/a"}, {"type": "key", "key": "Escape"}], True),
+            ([{"type": "text", "text": "/a"}, {"type": "chord", "chord": "C-s"}], True),
+            (
+                [
+                    {"type": "text", "text": "/a"},
+                    {"type": "key", "key": "Enter"},
+                    {"type": "key", "key": "Enter"},
+                ],
+                True,
+            ),
+        ],
+    )
+    def test_the_command_grammar(self, events, violation):
+        verdict = contract.command_declaration_violation(events)
+        if violation:
+            assert isinstance(verdict, str) and verdict
+        else:
+            assert verdict is None
+
+
+class TestV4InteractiveDeclaration:
+    """Schema v4's second declared class (§6.7, r15): ``"interactive"``.
+
+    The declaration is a distinct request identity — declared interactive,
+    declared command, and undeclared requests of the same id and events
+    digest differently under the one v4 domain — while its legal payload
+    is the ordinary v3 sequence grammar (no command grammar applies).
+    """
+
+    VECTOR = {
+        "control_id": "ctl-interactive-1",
+        "events": [{"type": "text", "text": "hello mid-turn"}, {"type": "key", "key": "Enter"}],
+        "payload_class": "interactive",
+        "expected_identity": {
+            "terminal_id": "term-1",
+            "terminal_generation": "gen-3",
+            "provider_process_id": 4242,
+            "provider": "kimi_cli",
+            "session_name": "cao-demo",
+        },
+    }
+    PREIMAGE = (
+        '{"domain":"cao-control-input-request-v4","schema_version":4,'
+        '"control_id":"ctl-interactive-1",'
+        '"events":[{"type":"text","text":"hello mid-turn"},{"type":"key","key":"Enter"}],'
+        '"payload_class":"interactive",'
+        '"expected_identity":{"terminal_id":"term-1",'
+        '"terminal_incarnation":null,"terminal_generation":"gen-3","pane_birth_id":null,'
+        '"provider_process_id":4242,"provider":"kimi_cli","native_session_id":null,'
+        '"execution_mode":null,"session_name":"cao-demo"}}\n'
+    )
+    DIGEST = "522621f6b05c036a63bfd8a0ec6b3393a589fcf3811b502c4a814c35591e4ef2"
+
+    def test_interactive_matches_the_recorded_digest(self):
+        assert (
+            contract.control_input_request_digest_v4(
+                control_id=self.VECTOR["control_id"],
+                events=self.VECTOR["events"],
+                payload_class=self.VECTOR["payload_class"],
+                expected_identity=self.VECTOR["expected_identity"],
+            )
+            == self.DIGEST
+        )
+
+    def test_interactive_matches_the_recorded_preimage_byte_for_byte(self):
+        assert hashlib.sha256(self.PREIMAGE.encode("utf-8")).hexdigest() == self.DIGEST
+        encoded = canonical_json.encode_canonical(
+            {
+                "domain": contract.CONTROL_INPUT_DIGEST_DOMAIN_V4,
+                "schema_version": contract.CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
+                "control_id": self.VECTOR["control_id"],
+                "events": contract.normalize_sequence_events(self.VECTOR["events"]),
+                "payload_class": self.VECTOR["payload_class"],
+                "expected_identity": contract.normalize_expected_identity(
+                    self.VECTOR["expected_identity"]
+                ),
+            }
+        )
+        assert encoded.decode("utf-8") == self.PREIMAGE
+
+    def test_the_three_declaration_states_digest_distinctly(self):
+        """Declared interactive, declared command, and undeclared requests
+        of one id and one events array are three different requests."""
+        interactive = contract.control_input_request_digest_v4(
+            control_id=self.VECTOR["control_id"],
+            events=self.VECTOR["events"],
+            payload_class="interactive",
+            expected_identity=self.VECTOR["expected_identity"],
+        )
+        command = contract.control_input_request_digest_v4(
+            control_id=self.VECTOR["control_id"],
+            events=self.VECTOR["events"],
+            payload_class="command",
+            expected_identity=self.VECTOR["expected_identity"],
+        )
+        undeclared = contract.control_input_request_digest_v3(
+            control_id=self.VECTOR["control_id"],
+            events=self.VECTOR["events"],
+            expected_identity=self.VECTOR["expected_identity"],
+        )
+        assert len({interactive, command, undeclared}) == 3
 
 
 class TestCrossImplementationDigest:

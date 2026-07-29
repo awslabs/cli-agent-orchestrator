@@ -57,7 +57,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
 
 from cli_agent_orchestrator.clients.tmux import TmuxLiteralSendError, TmuxServerIdentityError
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.services import native_pane_input
+from cli_agent_orchestrator.services import native_pane_input, provider_controls
 from cli_agent_orchestrator.services.control_input_contract import (
     ACCEPTED,
     AMBIGUOUS,
@@ -68,6 +68,7 @@ from cli_agent_orchestrator.services.control_input_contract import (
     CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
     CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
     CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+    CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
     EVENT_OUTCOME_ATTEMPTED,
     EVENT_OUTCOME_REFUSED,
     EVENT_OUTCOME_SENT,
@@ -75,11 +76,15 @@ from cli_agent_orchestrator.services.control_input_contract import (
     IDENTITY_FIELDS,
     MAX_SEQUENCE_EVENTS,
     MAX_SEQUENCE_TEXT_BYTES,
+    PAYLOAD_CLASS_COMMAND,
+    PAYLOAD_CLASS_INTERACTIVE,
+    REASON_COMPOSER_NONEMPTY,
     REASON_CONTROL_ROUTE_ABSENT,
     REASON_COPY_MODE_ACTIVE,
     REASON_IDENTITY_MISMATCH,
     REASON_ILLEGAL_CONTROL_BYTES,
     REASON_LINEAGE_UNPROVEN,
+    REASON_MALFORMED_COMMAND_DECLARATION,
     REASON_MANAGED_ACP_PANE,
     REASON_MULTILINE_REJECTED,
     REASON_OWNER_LOST_BEFORE_WRITE,
@@ -106,10 +111,12 @@ from cli_agent_orchestrator.services.control_input_contract import (
     SUBMISSION_SUBMITTED,
     SUBMISSION_UNKNOWN,
     SUBMISSION_UNSUBMITTED,
+    command_declaration_violation,
     contains_bracketed_paste_sentinel,
     control_input_request_digest,
     control_input_request_digest_v2,
     control_input_request_digest_v3,
+    control_input_request_digest_v4,
     is_reattemptable,
     normalize_expected_identity,
     normalize_sequence_events,
@@ -193,6 +200,19 @@ def _native_kimi_dispatch_key(
         binding.pane_id,
         binding.pane_pid,
     )
+
+
+def _interactive_streaming_advertised(resolved: "ResolvedControlIdentity") -> bool:
+    """Whether this terminal's exact provider build advertises the §6.7
+    interactive-streaming block — the per-terminal send authority (D9) for
+    a declared interactive batch.  Anything unmanaged, non-native, unpinned,
+    or unproven fails closed here."""
+    if not resolved.managed or resolved.execution_mode != EXECUTION_MODE_NATIVE_TUI:
+        return False
+    if resolved.provider is None:
+        return False
+    controls = provider_controls.controls_for(resolved.provider, resolved.provider_version)
+    return controls is not None and controls["interactive_streaming"] is not None
 
 
 def _native_kimi_dispatch_is_guarded(
@@ -1201,6 +1221,7 @@ def _sequence_refusal(
     resolved: Optional[ResolvedControlIdentity] = None,
     digest: Optional[str] = None,
     state: Optional[str] = None,
+    request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
 ) -> ControlInputResult:
     """The v3 refusal: typed, and stamped with the refused sequence.
 
@@ -1218,7 +1239,7 @@ def _sequence_refusal(
         request_digest=digest,
         resolved_identity=None if resolved is None else resolved.as_dict(),
         events=_sequence_events_with_outcome(events, EVENT_OUTCOME_REFUSED),
-        request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+        request_schema_version=request_schema_version,
     )
 
 
@@ -1232,6 +1253,7 @@ def _record_sequence_refusal(
     terminal_id: str,
     resolved: ResolvedControlIdentity,
     digest: str,
+    request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
 ) -> ControlInputResult:
     """The journaled v3 refusal, for decisions made after the intent.
 
@@ -1262,6 +1284,7 @@ def _record_sequence_refusal(
         resolved=resolved,
         digest=digest,
         state=result.state,
+        request_schema_version=request_schema_version,
     )
 
 
@@ -1335,6 +1358,7 @@ def deliver_control_input(
     protocol: Optional[str] = None,
     chord: Any = None,
     events: Any = None,
+    payload_class: Any = None,
     lease_timeout: float = 0.0,
     journal: Optional[ControlInputJournal] = None,
 ) -> ControlInputResult:
@@ -1364,6 +1388,12 @@ def deliver_control_input(
         events: Schema v3: an ordered array of ``text`` / ``key`` /
             ``chord`` events delivered as one at-most-once control.  A
             request carries ``events`` *or* the v1/v2 fields, never both.
+        payload_class: Schema v4: the optional declaration carrier.  The
+            sole defined value is ``"command"``; absent (or null) means
+            prose.  Command-class is never derived from payload shape —
+            only this field declares it, and only a declared command runs
+            the composer-emptiness guard.  Accompanies an ``events``
+            array, never the v1/v2 fields.
         lease_timeout: Seconds to wait for the pane lease.  The default
             of 0 refuses immediately rather than queueing.
         journal: Journal override (tests / isolated state roots).
@@ -1412,6 +1442,19 @@ def deliver_control_input(
             )
         normalized_events = _require_sequence_shape(control_id, events, request_digest)
     else:
+        if payload_class is not None:
+            # v4 is v3 + the declaration carrier: ``payload_class`` exists
+            # only beside an ``events`` array.  Beside the v1/v2 fields it
+            # is a shape error rather than a silently-dropped declaration —
+            # the same discipline that keeps ``chord`` off v1: a declared
+            # command delivered as ordinary prose is a control the caller
+            # did not authorise.
+            raise ControlInputRequestInvalid(
+                "payload_class accompanies an 'events' array (request schema v4 = v3 "
+                "+ the declaration carrier); it is not defined beside the v1/v2 "
+                "fields, so this request is refused as a shape error rather than "
+                "delivered with its declaration silently dropped"
+            )
         if enter is ENTER_EXPLICIT_NULL:
             raise ControlInputRequestInvalid(
                 "enter must be a boolean when stated; an explicit JSON null is not the "
@@ -1453,7 +1496,34 @@ def deliver_control_input(
     # and field order, so the chord is bound into the digest the way text is.
     # A v1 request names no chord and keeps its byte-identical v1 digest.  A
     # sequence request is v3: its ordered events are bound into the digest.
-    if normalized_events is not None:
+    # A stated ``payload_class`` makes the request v4: the declaration is
+    # bound into the digest under the v4 domain, so a declared command and
+    # the same events undeclared are different requests.
+    declared_command = False
+    declared_interactive = False
+    if normalized_events is not None and payload_class is not None:
+        if not isinstance(payload_class, str):
+            # A typed refusal, never a shape error: the declaration is
+            # well-formed enough to refuse (zero bytes proven), and the
+            # caller may retry with a corrected or absent declaration.
+            return _sequence_refusal(
+                control_id,
+                REASON_MALFORMED_COMMAND_DECLARATION,
+                f"payload_class must be a string or absent, got "
+                f"{type(payload_class).__name__}; the declared classes are "
+                f"{PAYLOAD_CLASS_COMMAND!r} and {PAYLOAD_CLASS_INTERACTIVE!r} and the "
+                "declaration is never inferred from payload shape",
+                events=normalized_events,
+                terminal_id=terminal_id,
+                request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
+            )
+        digest = control_input_request_digest_v4(
+            control_id=control_id,
+            events=normalized_events,
+            payload_class=payload_class,
+            expected_identity=expected,
+        )
+    elif normalized_events is not None:
         digest = control_input_request_digest_v3(
             control_id=control_id,
             events=normalized_events,
@@ -1494,6 +1564,52 @@ def deliver_control_input(
             )
         return rebound
 
+    # The declaration's validity, decided once the digest is settled and
+    # before any identity work: it is a request-level fact, and a malformed
+    # declaration is the same refusal aimed at any terminal.  Only the
+    # declared field triggers any of this — an undeclared payload is prose
+    # and never enters the command grammar at all, including a batch whose
+    # text happens to begin with '/' (the streamed `/tmp/x` split case).
+    if payload_class is not None:
+        assert normalized_events is not None  # the v4 either/or rule above
+        if payload_class not in (PAYLOAD_CLASS_COMMAND, PAYLOAD_CLASS_INTERACTIVE):
+            return _sequence_refusal(
+                control_id,
+                REASON_MALFORMED_COMMAND_DECLARATION,
+                f"payload_class {payload_class!r} is not a declared class this schema "
+                f"defines; the v4 values are {PAYLOAD_CLASS_COMMAND!r} and "
+                f"{PAYLOAD_CLASS_INTERACTIVE!r}. The "
+                "declaration is refused rather than approximated into prose, because "
+                "a caller that declared something is owed the declaration it made, "
+                "not a guess at it",
+                events=normalized_events,
+                terminal_id=terminal_id,
+                digest=digest,
+                request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
+            )
+        if payload_class == PAYLOAD_CLASS_INTERACTIVE:
+            # §6.7 (r15): the armed manual capture's declaration.  Its legal
+            # payload is any v3-valid sequence — the grammar the events
+            # already passed — so there is no declaration-specific grammar
+            # here; the behavioral delta (the narrow turn-gate/dispatch-
+            # grace bypass) is applied under the lease, capability-gated
+            # per terminal build.
+            declared_interactive = True
+        else:
+            violation = command_declaration_violation(normalized_events)
+            if violation is not None:
+                return _sequence_refusal(
+                    control_id,
+                    REASON_MALFORMED_COMMAND_DECLARATION,
+                    violation + "; the declaration is refused with zero bytes rather than executed "
+                    "partially or approximated into prose",
+                    events=normalized_events,
+                    terminal_id=terminal_id,
+                    digest=digest,
+                    request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
+                )
+            declared_command = True
+
     def _refuse(
         reason: str,
         detail: str,
@@ -1515,6 +1631,11 @@ def deliver_control_input(
                 terminal_id=terminal_id,
                 resolved=resolved,
                 digest=digest,
+                request_schema_version=(
+                    CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
+                    if declared_command or declared_interactive
+                    else CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
+                ),
             )
         return _refusal(
             control_id,
@@ -1655,6 +1776,8 @@ def deliver_control_input(
                     terminal_id=terminal_id,
                     resolved=resolved,
                     digest=digest,
+                    declared_command=declared_command,
+                    declared_interactive=declared_interactive,
                 )
             return _deliver_under_lease(
                 book,
@@ -1681,6 +1804,11 @@ def deliver_control_input(
                 terminal_id=terminal_id,
                 resolved=resolved,
                 digest=digest,
+                request_schema_version=(
+                    CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
+                    if declared_command or declared_interactive
+                    else CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
+                ),
             )
         return _record_refusal(
             book,
@@ -2054,6 +2182,7 @@ def _copy_mode_guard_refusal(
     binding: ControlInputBinding,
     *,
     deadline_monotonic: float,
+    exit_proven: bool = True,
 ) -> Optional[Tuple[str, str]]:
     """Prove the exact bound pane is out of copy mode, exiting it if proven in it.
 
@@ -2075,7 +2204,11 @@ def _copy_mode_guard_refusal(
     - a mode state that cannot be observed, an exit control tmux did not
       accept, or an exit the re-proof cannot confirm is
       ``copy-mode-active`` — proven zero payload bytes, reattemptable
-      under the existing refused rule.
+      under the existing refused rule;
+    - with ``exit_proven=False`` (§6.7 declared interactive batches), a
+      pane proven in copy mode is ``copy-mode-active`` fail-closed: the
+      batch refuses with zero bytes and the operator's copy mode is left
+      exactly as found, never exited by a machine write.
 
     ``send-keys -X cancel`` is the only non-payload keystroke ever sent
     here: only to the exact pane just proven in copy mode, never treated
@@ -2121,6 +2254,17 @@ def _copy_mode_guard_refusal(
         )
     if not in_mode:
         return None
+    if not exit_proven:
+        # §6.7 (r15): a declared interactive batch refuses fail-closed on a
+        # proven copy mode — zero bytes, and the operator's copy mode left
+        # exactly as found, never exited by a machine write.
+        return (
+            REASON_COPY_MODE_ACTIVE,
+            f"pane {binding.pane_id} is in copy mode; a declared interactive batch "
+            "refuses fail-closed rather than exiting the operator's copy mode for "
+            "them — no payload was typed, the mode was left untouched, and the "
+            "write may be sent again after the operator exits copy mode",
+        )
 
     # The exact pane is proven in copy mode: the exit control is licensed,
     # to this pane only — the sole non-payload keystroke this path sends.
@@ -3073,6 +3217,88 @@ def _send_through_native_adapter(
     )
 
 
+def _command_class_pins(
+    resolved: ResolvedControlIdentity,
+) -> Tuple[Optional[Any], Optional[Any]]:
+    """The two pins a declared command requires for this exact build.
+
+    Returns ``(emptiness_pin, execution_pin)``; either is None when the
+    provider/build has no live-verified determination.  Declared commands
+    require BOTH — an emptiness proof without an execution observation
+    would close on transport facts alone, which is the PR #48 defect
+    class (§4.1 r11).
+    """
+    emptiness = native_pane_input.composer_emptiness_pin_for(
+        resolved.provider, resolved.provider_version
+    )
+    execution = native_pane_input.command_execution_pin_for(
+        resolved.provider, resolved.provider_version
+    )
+    return (emptiness, execution)
+
+
+def _command_class_guard_refusal(
+    resolved: ResolvedControlIdentity,
+    binding: ControlInputBinding,
+    *,
+    deadline_monotonic: float,
+    screen: Optional[Any] = None,
+) -> Optional[Tuple[str, str]]:
+    """Reason/detail when a declared command may not be written, or None.
+
+    The §4.1 never-concatenate guard: a declared command-class control is
+    written only against a composer *proven empty* by the provider+build
+    pinned determination, observed under the same pane-input lease before
+    the first command byte.  A provider/build without BOTH pins (the
+    emptiness determination and the r11 execution observation) is
+    ``provider-unsupported`` rather than guessed at; a composer that
+    holds content — or whose emptiness cannot be proven — is
+    ``composer-nonempty`` with zero command bytes and the prefill
+    untouched.  No blind clearing: the guard observes and refuses, it
+    never sends a keystroke (prefill has been observed to survive Escape,
+    so no keystroke-count ritual may be specified as a clear).
+    """
+    pin, execution_pin = _command_class_pins(resolved)
+    if pin is None or execution_pin is None:
+        if pin is None and execution_pin is None:
+            missing = "no composer-emptiness determination or command-execution observation"
+        elif pin is None:
+            missing = "no composer-emptiness determination"
+        else:
+            missing = "no command-execution observation"
+        return (
+            REASON_PROVIDER_UNSUPPORTED,
+            f"{missing} is proven for {resolved.provider!r} version "
+            f"{resolved.provider_version!r}, and a declared command requires both "
+            "pins: the emptiness proof against prefill concatenation and the "
+            "execution observation that keeps the close honest. Refused with zero "
+            "bytes rather than typed at a composer whose layout was never read",
+        )
+    try:
+        empty = native_pane_input.observe_composer_empty(
+            binding.pane_id, pin, deadline_monotonic=deadline_monotonic, screen=screen
+        )
+    except Exception as exc:  # noqa: BLE001 - "could not look" is not "empty"
+        logger.error("composer-emptiness observation raised for %s: %s", binding.pane_id, exc)
+        empty = None
+    if empty is True:
+        return None
+    if empty is False:
+        return (
+            REASON_COMPOSER_NONEMPTY,
+            "the composer holds content; a declared command submitted now would "
+            "concatenate with the queued prefill and deliver as ordinary prompt text. "
+            "Zero command bytes were written and the prefill is untouched — submit or "
+            "clear it as the operator, then retry the command",
+        )
+    return (
+        REASON_COMPOSER_NONEMPTY,
+        "the composer's emptiness could not be proven (the input region was "
+        "unreadable or unparseable), and a declared command is written only against "
+        "a proven-empty composer; zero bytes were written",
+    )
+
+
 def _deliver_sequence_under_lease(
     journal: ControlInputJournal,
     client: Any,
@@ -3082,17 +3308,31 @@ def _deliver_sequence_under_lease(
     terminal_id: str,
     resolved: ResolvedControlIdentity,
     digest: str,
+    declared_command: bool = False,
+    declared_interactive: bool = False,
 ) -> ControlInputResult:
     """Re-verify, gate, claim, and write one v3 sequence under the lease.
 
     The v3 twin of ``_deliver_under_lease``: the same live re-verification
     under the same lease, the same claim-before-first-byte ordering, and
     the same refusal/ambiguous split.  One sequence is one claim — the
-    ordered events are the write, not separate operations.
+    ordered events are the write, not separate operations.  A declared
+    command-class sequence additionally proves the composer empty before
+    the claim (§4.1); undeclared sequences never see that guard.  A
+    declared interactive sequence (§6.7, r15) bypasses only the provider
+    turn-state readiness refusal and the kimi dispatch grace — and only
+    where the terminal's exact build advertises interactive streaming;
+    the lease, identity/socket re-proof, copy-mode guard, journal,
+    deadline, and admission caps apply exactly as for any other batch.
     """
     control_id = binding.request_id
     deadline = time.monotonic() + WRITE_DEADLINE_SECONDS
     write_claimed = False
+    result_schema_version = (
+        CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
+        if declared_command or declared_interactive
+        else CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3
+    )
 
     def _refuse_pre_claim(reason: str, detail: str) -> ControlInputResult:
         return _record_sequence_refusal(
@@ -3104,6 +3344,7 @@ def _deliver_sequence_under_lease(
             terminal_id=terminal_id,
             resolved=resolved,
             digest=digest,
+            request_schema_version=result_schema_version,
         )
 
     def _deadline_breached() -> Optional[ControlInputResult]:
@@ -3159,10 +3400,31 @@ def _deliver_sequence_under_lease(
     # stale idle prompt to the turn observation, and a payload Enter aimed
     # into the mode is consumed by it.  Same lease, same exact-pane rule:
     # a proven copy mode is exited once and the sequence delivered exactly
-    # once, or the refusal is zero bytes and reattemptable.
-    copy_mode_refusal = _copy_mode_guard_refusal(client, binding, deadline_monotonic=deadline)
+    # once, or the refusal is zero bytes and reattemptable.  A declared
+    # interactive batch is the fail-closed exception (§6.7): it refuses
+    # zero-byte and leaves the operator's copy mode untouched.
+    copy_mode_refusal = _copy_mode_guard_refusal(
+        client,
+        binding,
+        deadline_monotonic=deadline,
+        exit_proven=not declared_interactive,
+    )
     if copy_mode_refusal is not None:
         return _refuse_pre_claim(copy_mode_refusal[0], copy_mode_refusal[1])
+
+    if declared_interactive and not _interactive_streaming_advertised(resolved):
+        # §6.7 (r15), fail closed pre-write: a declared interactive batch
+        # is admitted only where the per-terminal, build-exact
+        # interactive-streaming block is advertised — never delivered as
+        # an undeclared batch, never speculatively bypassed on an old or
+        # unpinned server/provider.
+        return _refuse_pre_claim(
+            REASON_PROVIDER_UNSUPPORTED,
+            f"provider {resolved.provider!r} on build {resolved.provider_version!r} "
+            "advertises no interactive-streaming capability for this terminal; a "
+            "declared interactive batch is refused pre-write, never delivered as an "
+            "undeclared one",
+        )
 
     adapter: Optional[Any] = None
     plans: Optional[Dict[int, Any]] = None
@@ -3187,6 +3449,13 @@ def _deliver_sequence_under_lease(
         if native_refusal is not None:
             return _refuse_pre_claim(native_refusal[0], native_refusal[1])
 
+        # The dispatch key is computed for every kimi sequence — declared
+        # interactive batches skip the grace *check* below but still mark
+        # after an Enter-carrying write, so a later undeclared batch keeps
+        # its §6.4 pause-case protection against the stale ready frame.
+        if resolved.provider == "kimi_cli":
+            dispatch_key = _native_kimi_dispatch_key(resolved, binding)
+
         # The per-event intent policy, applied to the sequence as a whole
         # (see the table at _sequence_event_intent): a sequence that shapes
         # or submits composer content inherits the readiness guards the
@@ -3194,10 +3463,10 @@ def _deliver_sequence_under_lease(
         # provider-native live-turn idle gate, observed under this lease so
         # the idle proof and the write are atomic against a turn starting
         # between them.  A pure interrupt/steer sequence is deliverable
-        # during an active turn and skips both.
-        if _sequence_is_readiness_gated(events):
-            if resolved.provider == "kimi_cli":
-                dispatch_key = _native_kimi_dispatch_key(resolved, binding)
+        # during an active turn and skips both.  A declared interactive
+        # sequence (§6.7) skips the same two — the turn-state refusal and
+        # the dispatch grace — and nothing else.
+        if _sequence_is_readiness_gated(events) and not declared_interactive:
             if dispatch_key is not None and _native_kimi_dispatch_is_guarded(dispatch_key):
                 return _refuse_pre_claim(
                     REASON_PANE_BUSY,
@@ -3231,6 +3500,40 @@ def _deliver_sequence_under_lease(
                     "sequence is readiness-gated and nothing was written",
                 )
 
+    command_observation: Optional[Tuple[Any, Any, str, Any]] = None
+    if declared_command:
+        # The §4.1 never-concatenate guard, under this lease and before
+        # the claim: the composer must be *proven empty* by the
+        # provider+build pinned determination.  Runs only for declared
+        # command-class requests — undeclared payloads are prose and never
+        # see this guard — and refuses with zero command bytes and the
+        # prefill untouched.  Blind clearing is prohibited.  The same
+        # capture is the pre-write baseline the r11 execution observation
+        # counts against, so a stale signal from an earlier command in
+        # this session can never close this one; a failed baseline fails
+        # the guard closed (zero bytes), never the other way.
+        emptiness_pin, execution_pin = _command_class_pins(resolved)
+        baseline_rows: List[str] = []
+        if emptiness_pin is not None and execution_pin is not None:
+            try:
+                baseline_rows = native_pane_input.capture_execution_rows(
+                    binding.pane_id, execution_pin, deadline_monotonic=deadline
+                )
+            except Exception as exc:  # noqa: BLE001 - a failed baseline is unproven
+                logger.error("command baseline capture failed for %s: %s", binding.pane_id, exc)
+                baseline_rows = []
+        guard_refusal = _command_class_guard_refusal(
+            resolved, binding, deadline_monotonic=deadline, screen=lambda: baseline_rows
+        )
+        if guard_refusal is not None:
+            return _refuse_pre_claim(guard_refusal[0], guard_refusal[1])
+        command_observation = (
+            execution_pin,
+            emptiness_pin,
+            events[0]["text"],
+            baseline_rows,
+        )
+
     breached = _deadline_breached()
     if breached is not None:
         return breached
@@ -3255,6 +3558,8 @@ def _deliver_sequence_under_lease(
             digest=digest,
             deadline_monotonic=deadline,
             dispatch_key=dispatch_key,
+            request_schema_version=result_schema_version,
+            command_observation=command_observation,
         )
     return _send_sequence_through_literal_sink(
         journal,
@@ -3265,6 +3570,8 @@ def _deliver_sequence_under_lease(
         resolved=resolved,
         digest=digest,
         deadline_monotonic=deadline,
+        request_schema_version=result_schema_version,
+        command_observation=command_observation,
     )
 
 
@@ -3285,6 +3592,7 @@ def _sequence_accepted(
     chord_sent: Optional[bool],
     submission_observed: Optional[str] = None,
     submission_evidence_ref: Optional[str] = None,
+    request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
 ) -> ControlInputResult:
     """The accepted v3 answer: every event sent, in order, once."""
     return ControlInputResult(
@@ -3316,7 +3624,7 @@ def _sequence_accepted(
         submission_observed=submission_observed,
         submission_evidence_ref=submission_evidence_ref,
         events=run.events,
-        request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+        request_schema_version=request_schema_version,
     )
 
 
@@ -3333,6 +3641,8 @@ def _send_sequence_through_native_adapter(
     digest: str,
     deadline_monotonic: float,
     dispatch_key: Optional[Tuple[str, Optional[str], str, int]],
+    request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+    command_observation: Optional[Tuple[Any, Any, str, Any]] = None,
 ) -> ControlInputResult:
     """Write one claimed v3 sequence through the provider's own adapter.
 
@@ -3344,7 +3654,11 @@ def _send_sequence_through_native_adapter(
     Enter land after a literal burst, and sending it where no burst
     precedes would be a keystroke at a composer for no reason.  Per-event
     outcomes are honest transport facts; none of them is provider
-    completion.
+    completion.  A declared command (``command_observation`` set)
+    additionally closes by the r11 two-close rule: ``accepted`` only with
+    the execution signal observed and its evidence journaled, otherwise
+    ``ambiguous``/``submission-unproven`` — never a transport-only
+    acceptance, never a retry licence.
     """
     control_id = binding.request_id
     transport = _NativeComposerTransport(
@@ -3360,23 +3674,31 @@ def _send_sequence_through_native_adapter(
         if dispatch_key is not None and transport.enter_attempted:
             _mark_native_kimi_dispatch(dispatch_key)
 
-    def _ambiguous(detail: str) -> ControlInputResult:
+    def _ambiguous(
+        detail: str,
+        *,
+        reason: str = REASON_WRITE_INCOMPLETE,
+        observed: Optional[str] = None,
+        evidence_ref: Optional[str] = None,
+    ) -> ControlInputResult:
         _mark_dispatch()
         journal.mark_ambiguous(
             control_id,
-            reason_code=REASON_WRITE_INCOMPLETE,
+            reason_code=reason,
             chunks_sent=transport.chunks_sent,
             enter_attempted=transport.enter_attempted,
             chord=last_chord,
             chord_attempted=transport.chord_attempted,
             chord_sent=transport.chord_sent,
+            submission_observed=observed,
+            submission_evidence_ref=evidence_ref,
             sequence_event_outcomes=[(event["ordinal"], event["outcome"]) for event in run.events],
             evidence_digest=digest,
         )
         return ControlInputResult(
             control_id=control_id,
             outcome=AMBIGUOUS,
-            reason_code=REASON_WRITE_INCOMPLETE,
+            reason_code=reason,
             detail=detail
             + " What reached the pane is bounded by the per-event outcomes but is not "
             "knowable exactly, so this sequence must not be sent again",
@@ -3389,8 +3711,10 @@ def _send_sequence_through_native_adapter(
             chord=last_chord,
             chord_attempted=transport.chord_attempted,
             chord_sent=transport.chord_sent,
+            submission_observed=observed,
+            submission_evidence_ref=evidence_ref,
             events=run.events,
-            request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+            request_schema_version=request_schema_version,
         )
 
     def _deadline_ambiguity() -> Optional[ControlInputResult]:
@@ -3494,6 +3818,43 @@ def _send_sequence_through_native_adapter(
     expired = _deadline_ambiguity()
     if expired is not None:
         return expired
+    submission_observed: Optional[str] = None
+    submission_evidence_ref: Optional[str] = None
+    if command_observation is not None:
+        # The r11 two-close rule: transport acceptance is not command
+        # execution.  A declared command closes accepted only when the
+        # pinned execution signal is observed on the pane within the
+        # remaining write deadline; anything else is the terminal
+        # ambiguity it is, with no retry licence — never a forced
+        # completion and never a transport-only acceptance.
+        execution_pin, composer_pin, command_text, baseline_rows = command_observation
+        observed, evidence_ref = native_pane_input.observe_command_execution(
+            binding.pane_id,
+            execution_pin,
+            command_text=command_text,
+            composer_pin=composer_pin,
+            baseline_rows=baseline_rows,
+            deadline_monotonic=deadline_monotonic,
+        )
+        if observed == SUBMISSION_SUBMITTED and time.monotonic() > deadline_monotonic:
+            # Defence at the one place acceptance is decided: the bounded
+            # window has closed, so a signal from a capture that completed
+            # after it is unproven evidence, whatever the helper returned —
+            # no future helper can leak a late signal into an accepted
+            # close on this path.
+            observed, evidence_ref = SUBMISSION_UNKNOWN, None
+        if observed != SUBMISSION_SUBMITTED:
+            return _ambiguous(
+                f"the declared command {command_text!r} was written, but its execution "
+                f"signal ({execution_pin.signal}) was not observed within the bound "
+                f"(observation: {observed}); transport acceptance is not command "
+                "execution, so this control closes ambiguous rather than accepted.",
+                reason=REASON_SUBMISSION_UNPROVEN,
+                observed=observed,
+                evidence_ref=evidence_ref,
+            )
+        submission_observed = observed
+        submission_evidence_ref = evidence_ref
     _mark_dispatch()
     record = journal.mark_delivered(
         control_id,
@@ -3502,6 +3863,8 @@ def _send_sequence_through_native_adapter(
         chord=last_chord,
         chord_attempted=transport.chord_attempted,
         chord_sent=transport.chord_sent,
+        submission_observed=submission_observed,
+        submission_evidence_ref=submission_evidence_ref,
         sequence_event_outcomes=[(event["ordinal"], event["outcome"]) for event in run.events],
         evidence_digest=digest,
     )
@@ -3519,6 +3882,9 @@ def _send_sequence_through_native_adapter(
         chord=last_chord,
         chord_attempted=transport.chord_attempted,
         chord_sent=transport.chord_sent,
+        submission_observed=submission_observed,
+        submission_evidence_ref=submission_evidence_ref,
+        request_schema_version=request_schema_version,
     )
 
 
@@ -3532,6 +3898,8 @@ def _send_sequence_through_literal_sink(
     resolved: ResolvedControlIdentity,
     digest: str,
     deadline_monotonic: float,
+    request_schema_version: int = CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+    command_observation: Optional[Tuple[Any, Any, str, Any]] = None,
 ) -> ControlInputResult:
     """Write one claimed v3 sequence through the generic literal primitive.
 
@@ -3601,7 +3969,7 @@ def _send_sequence_through_literal_sink(
             submission_observed=observed,
             submission_evidence_ref=evidence_ref,
             events=run.events,
-            request_schema_version=CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+            request_schema_version=request_schema_version,
         )
 
     ordinal = 0
@@ -3815,6 +4183,39 @@ def _send_sequence_through_literal_sink(
             observed=submission_observed,
             evidence_ref=submission_evidence_ref,
         )
+    if command_observation is not None:
+        # The r11 two-close rule, identical to the adapter path's: a
+        # declared command closes accepted only with the pinned execution
+        # signal observed inside the remaining write deadline; anything
+        # else is terminal ambiguity with no retry licence.
+        execution_pin, composer_pin, command_text, baseline_rows = command_observation
+        observed, evidence_ref = native_pane_input.observe_command_execution(
+            binding.pane_id,
+            execution_pin,
+            command_text=command_text,
+            composer_pin=composer_pin,
+            baseline_rows=baseline_rows,
+            deadline_monotonic=deadline_monotonic,
+        )
+        if observed == SUBMISSION_SUBMITTED and time.monotonic() > deadline_monotonic:
+            # Defence at the one place acceptance is decided: the bounded
+            # window has closed, so a signal from a capture that completed
+            # after it is unproven evidence, whatever the helper returned —
+            # no future helper can leak a late signal into an accepted
+            # close on this path.
+            observed, evidence_ref = SUBMISSION_UNKNOWN, None
+        if observed != SUBMISSION_SUBMITTED:
+            return _ambiguous(
+                f"the declared command {command_text!r} was written, but its execution "
+                f"signal ({execution_pin.signal}) was not observed within the bound "
+                f"(observation: {observed}); transport acceptance is not command "
+                "execution, so this control closes ambiguous rather than accepted.",
+                reason=REASON_SUBMISSION_UNPROVEN,
+                observed=observed,
+                evidence_ref=evidence_ref,
+            )
+        submission_observed = observed
+        submission_evidence_ref = evidence_ref
     record = journal.mark_delivered(
         control_id,
         chunks_sent=chunks,
@@ -3843,6 +4244,7 @@ def _send_sequence_through_literal_sink(
         chord_sent=chord_sent,
         submission_observed=submission_observed,
         submission_evidence_ref=submission_evidence_ref,
+        request_schema_version=request_schema_version,
     )
 
 
@@ -4177,8 +4579,17 @@ def lookup_control_input(
 
 # --- Capability advertisement ---------------------------------------------
 
+# The streaming-mode policy facts the server owns (§3.5): the client reads
+# them rather than hardcoding, so pacing policy can be tuned without a
+# client release.  ``coalesce_window_ms`` is the quiet-timer default (OD4);
+# ``max_in_flight`` is the §3.4 one-batch-per-terminal rule.
+STREAMING_COALESCE_WINDOW_MS = 200
+STREAMING_MAX_IN_FLIGHT = 1
 
-def control_input_capability_block() -> Dict[str, Any]:
+
+def control_input_capability_block(
+    resolved: Optional[ResolvedControlIdentity] = None,
+) -> Dict[str, Any]:
     """The per-terminal discovery block advertised on the identity route.
 
     A conductor that needs v2 reads this before sending a chord, because a
@@ -4187,12 +4598,21 @@ def control_input_capability_block() -> Dict[str, Any]:
     advertised is the one safe answer to a server whose allowlist a caller
     cannot observe: it fails closed with the typed ``unsupported`` verdict
     and zero bytes, never degrading to text-without-chord.
+
+    When the terminal's resolved identity is supplied, the block also
+    carries the §3.5 send-authority entry: this terminal's provider
+    controls resolved at this terminal's exact build (whose
+    ``steer_chords`` is the exact set the server would admit for this
+    pane), and whether the §4.1 composer-emptiness guard can protect a
+    declared command on this build.  Providers with no registry entry
+    advertise no ``provider_controls`` key (§13 OD3).
     """
-    return {
+    block: Dict[str, Any] = {
         "schema_versions": [
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+            CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
         ],
         "chords": _advertised_steer_chords(),
         # v3 structured sequences: the exact event forms, the normalized
@@ -4205,6 +4625,21 @@ def control_input_capability_block() -> Dict[str, Any]:
             "max_text_bytes": MAX_SEQUENCE_TEXT_BYTES,
         },
     }
+    if resolved is not None and resolved.provider is not None:
+        controls = provider_controls.controls_block_for(
+            resolved.provider, resolved.provider_version
+        )
+        if controls is not None:
+            block["provider_controls"] = {resolved.provider: controls}
+        block["command_controls"] = {
+            "composer_nonempty_guard": (
+                native_pane_input.composer_emptiness_pin_for(
+                    resolved.provider, resolved.provider_version
+                )
+                is not None
+            )
+        }
+    return block
 
 
 def control_input_capabilities() -> Dict[str, Any]:
@@ -4221,14 +4656,16 @@ def control_input_capabilities() -> Dict[str, Any]:
         "protocol": CONTROL_INPUT_PROTOCOL,
         "request_schema_version": CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
         # The set of request schema versions this server speaks.  v2 adds the
-        # optional ``chord`` field; v3 adds the ordered ``events`` array; v1
-        # is unchanged.  A conductor that needs v2 or v3 reads this (and the
-        # per-terminal block on the identity route) before sending, and fails
-        # closed against a server that offers only earlier versions.
+        # optional ``chord`` field; v3 adds the ordered ``events`` array; v4
+        # adds the optional ``payload_class`` declaration carrier; v1 is
+        # unchanged.  A conductor that needs v2, v3, or v4 reads this (and
+        # the per-terminal block on the identity route) before sending, and
+        # fails closed against a server that offers only earlier versions.
         "request_schema_versions": [
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION,
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V2,
             CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3,
+            CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
         ],
         "digest_domain": CONTROL_INPUT_DIGEST_DOMAIN,
         "steer_chords": _advertised_steer_chords(),
@@ -4246,6 +4683,25 @@ def control_input_capabilities() -> Dict[str, Any]:
             "max_events": MAX_SEQUENCE_EVENTS,
             "max_text_bytes": MAX_SEQUENCE_TEXT_BYTES,
         },
+        # Streaming is a client mode, not a transport (D3): the server
+        # advertises that the v3 batching discipline exists and owns the
+        # pacing facts, so policy stays server-owned (§3.5, OD4).
+        "streaming": {
+            "supported": True,
+            "max_in_flight": STREAMING_MAX_IN_FLIGHT,
+            "coalesce_window_ms": STREAMING_COALESCE_WINDOW_MS,
+        },
+        # The provider-control registry (§4), discovery only: the union
+        # over builds.  Send authority is the per-terminal, build-exact
+        # block on the identity route — a chord absent from it is refused
+        # locally at capture time with zero POSTs (D9).
+        "provider_controls": provider_controls.advertised_provider_controls(),
+        # The §4.1 declared-command surface: the composer-emptiness guard
+        # exists on this server.  A client sends ``payload_class`` only
+        # when this block is advertised — never earlier, never as a shape
+        # probe — and the per-terminal block says whether the guard can
+        # prove emptiness for that terminal's build.
+        "command_controls": {"composer_nonempty_guard": True},
         # Stated so a caller never has to infer them from behaviour.
         "literal_write": True,
         "bracketed_paste": False,

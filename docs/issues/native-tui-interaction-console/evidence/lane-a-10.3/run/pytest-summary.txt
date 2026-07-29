@@ -1,0 +1,9 @@
+Round 3 (2026-07-28, r11 declared-command two-close): 15 passed in 149.25s
+Full -q summary line: "15 passed in 149.25s (0:02:29)"
+The r11 two-close run: case-08 (kimi) and case-12 (claude) assert the
+accepted declared-Compact records carry submission_observed=submitted and
+a capture-pane: evidence reference, replayed by exact id. Only the
+case-08/case-12 evidence and this note were kept from this run; other
+cases' regenerated churn was restored (steer 040 scope guard).
+Round 1 summary preserved in round-1/pytest-summary.txt.
+Round 2 (2026-07-28, corrected kimi emptiness pin): 15 passed in 139.69s

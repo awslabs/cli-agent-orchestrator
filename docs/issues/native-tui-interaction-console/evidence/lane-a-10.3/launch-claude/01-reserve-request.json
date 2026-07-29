@@ -1,0 +1,20 @@
+{
+  "agent_profile": "acceptance",
+  "caller_id": "03e30f8d",
+  "delivery_id": "f3e74d1f-d5ec-4ee2-b059-fed7ce46efa8",
+  "execution_mode": "native_tui",
+  "expected_effort": "provider-default",
+  "expected_model": "sonnet",
+  "launch_nonce": "861de4ce10954655a8437f230f13832b09f31dea",
+  "obligation_generation": "obgen-85da98c5",
+  "protocol_version": "cao-managed-launch-v2",
+  "provider": "claude_code",
+  "provider_executable": "<HOME>/.local/share/claude/versions/2.1.220",
+  "provider_executable_sha256": "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081",
+  "reservation_id": "271e3eba-577c-46d8-b287-a3217cb0fb35",
+  "run_id": "run-bfed9850",
+  "session_name": "cao-a103-claude-d1a278",
+  "task_id": "lane-a-10-3-claude",
+  "trusted_project_root": null,
+  "working_directory": "<WORKTREE-CLAUDE>"
+}

@@ -100,22 +100,25 @@ function terminalContainer(): HTMLElement {
 // = 17px. Every notch below therefore corresponds to 17px of finger travel.
 const LINE_H = 17
 
+beforeEach(() => {
+  wheelEvents.length = 0
+  termRegistry.current = null
+  FakeWebSocket.instances.length = 0
+  ;(globalThis as unknown as { WebSocket: unknown }).WebSocket = FakeWebSocket
+  ;(globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = FakeResizeObserver
+})
+
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+})
+
 describe('TerminalView touch scrolling', () => {
   beforeEach(() => {
-    wheelEvents.length = 0
-    termRegistry.current = null
-    FakeWebSocket.instances.length = 0
-    ;(globalThis as unknown as { WebSocket: unknown }).WebSocket = FakeWebSocket
-    ;(globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = FakeResizeObserver
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({ managed: false }),
     }))
-  })
-
-  afterEach(() => {
-    cleanup()
-    vi.unstubAllGlobals()
   })
 
   it('emits exactly one line-mode notch per row of travel', () => {
@@ -190,7 +193,7 @@ describe('TerminalView touch scrolling', () => {
 
     el.dispatchEvent(touch('touchstart', [200]))
     el.dispatchEvent(touch('touchmove', [200 - 3 * LINE_H]))
-    expect(wheelEvents.length).toBe(3)
+    expect(wheelEvents).toHaveLength(3)
 
     // Gesture cancelled (e.g. palm rejection): state must reset.
     el.dispatchEvent(touch('touchcancel', []))
@@ -198,7 +201,7 @@ describe('TerminalView touch scrolling', () => {
 
     // A move with no fresh touchstart is ignored (touchY is null again).
     el.dispatchEvent(touch('touchmove', [100]))
-    expect(wheelEvents.length).toBe(0)
+    expect(wheelEvents).toHaveLength(0)
   })
 
   it('stops dispatching after unmount (listeners cleaned up)', () => {
@@ -210,10 +213,12 @@ describe('TerminalView touch scrolling', () => {
     el.dispatchEvent(touch('touchstart', [200]))
     el.dispatchEvent(touch('touchmove', [100]))
 
-    expect(wheelEvents.length).toBe(0)
+    expect(wheelEvents).toHaveLength(0)
   })
+})
 
-  it('routes native Send and Compact through identity-bound control input', async () => {
+describe('TerminalView native literal control', () => {
+  it('routes native Send through identity-bound control input; the header has no Compact button (§7.1)', async () => {
     const requests: Array<{ url: string; body?: Record<string, unknown> }> = []
     let controlNumber = 0
     vi.stubGlobal('crypto', {
@@ -271,7 +276,7 @@ describe('TerminalView touch scrolling', () => {
     expect(screen.queryByRole('button', { name: 'Cancel turn' })).toBeNull()
 
     fireEvent.change(
-      screen.getByPlaceholderText('Send literal text to the native composer…'),
+      screen.getByPlaceholderText('Send a message to the native composer…'),
       { target: { value: 'continue the review' } },
     )
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
@@ -280,6 +285,7 @@ describe('TerminalView touch scrolling', () => {
       const control = requests.find(request => request.url.endsWith('/control-input'))
       expect(control?.body?.text).toBe('continue the review')
       expect(control?.body?.enter).toBe(true)
+      expect(control?.body?.payload_class).toBeUndefined()
       expect(control?.body?.expected_identity).toEqual({
         terminal_id: 't-native',
         terminal_incarnation: 'incarnation-1',
@@ -295,18 +301,14 @@ describe('TerminalView touch scrolling', () => {
     await waitFor(() => {
       expect(
         (screen.getByPlaceholderText(
-          'Send literal text to the native composer…',
+          'Send a message to the native composer…',
         ) as HTMLInputElement).value,
       ).toBe('')
     })
 
-    fireEvent.click(screen.getByRole('button', { name: 'Compact' }))
-    await waitFor(() => {
-      const controls = requests.filter(request => request.url.endsWith('/control-input'))
-      expect(controls).toHaveLength(2)
-      expect(controls[1].body?.text).toBe('/compact')
-      expect(controls[1].body?.enter).toBe(true)
-    })
+    // §7.1: the standalone Compact button is removed — Compact is a built-in
+    // favorite macro now, not a header control.
+    expect(screen.queryByRole('button', { name: 'Compact' })).toBeNull()
   })
 
   it('forwards only mouse-wheel reports from a managed transcript', async () => {
@@ -398,7 +400,7 @@ describe('TerminalView touch scrolling', () => {
     render(<TerminalView terminalId="t-native" onClose={() => {}} />)
     await screen.findByText('Managed native TUI · identity-bound controls')
     fireEvent.change(
-      screen.getByPlaceholderText('Send literal text to the native composer…'),
+      screen.getByPlaceholderText('Send a message to the native composer…'),
       { target: { value: 'continue' } },
     )
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
@@ -472,7 +474,7 @@ describe('TerminalView touch scrolling', () => {
     render(<TerminalView terminalId="t-native" onClose={() => {}} />)
     await screen.findByText('Managed native TUI · identity-bound controls')
     fireEvent.change(
-      screen.getByPlaceholderText('Send literal text to the native composer…'),
+      screen.getByPlaceholderText('Send a message to the native composer…'),
       { target: { value: 'continue' } },
     )
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
@@ -511,36 +513,125 @@ describe('TerminalView touch scrolling', () => {
   })
 })
 
+// ── Lane B: streaming, macros, capability degradation (§6, §7, §3.5) ────
 
-describe('TerminalView structured key-sequence recorder', () => {
-  beforeEach(() => {
-    wheelEvents.length = 0
-    termRegistry.current = null
-    FakeWebSocket.instances.length = 0
-    ;(globalThis as unknown as { WebSocket: unknown }).WebSocket = FakeWebSocket
-    ;(globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = FakeResizeObserver
-  })
+const FULL_KEYS = [
+  'Backspace', 'C-c', 'C-s', 'Delete', 'Down', 'End', 'Enter', 'Escape',
+  'Home', 'Insert', 'Left', 'PageDown', 'PageUp', 'Right', 'Tab', 'Up',
+]
 
-  afterEach(() => {
-    cleanup()
-    vi.unstubAllGlobals()
-  })
+const KIMI_COMPACT_EVENTS = [
+  { type: 'text', text: '/compact' },
+  { type: 'key', key: 'Enter' },
+]
+const KIMI_STOP_EVENTS = [{ type: 'key', key: 'Escape' }]
 
-  function stubNativeControlFetch(
-    requests: Array<{ url: string; body?: Record<string, unknown> }>,
-    { schemaVersions = [1, 2, 3] }: { schemaVersions?: number[] } = {},
-  ) {
-    let controlNumber = 0
-    vi.stubGlobal('crypto', { randomUUID: () => `control-${++controlNumber}` })
-    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      const url = String(input)
-      const body = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined
-      requests.push({ url, body })
-      let response: Record<string, unknown>
-      if (url.endsWith('/managed-control')) {
-        response = { managed: true, generation: 'generation-1', execution_mode: 'native_tui' }
-      } else if (url.endsWith('/control-input/capabilities')) {
-        response = {
+interface MacroFixture {
+  id: string
+  name: string
+  description: string | null
+  scope: Record<string, unknown>
+  events: Array<Record<string, unknown>>
+  favorite: boolean
+  origin: 'builtin' | 'user'
+  mutable: boolean
+  builtin_kind?: 'compact' | 'stop'
+  created_at: string | null
+  updated_at: string | null
+}
+
+function builtinFixture(kind: 'compact' | 'stop'): MacroFixture {
+  return {
+    id: `builtin:kimi_cli:${kind}`,
+    name: kind === 'compact' ? 'Compact' : 'Stop',
+    description: null,
+    scope: { kind: 'provider', provider: 'kimi_cli' },
+    events: kind === 'compact' ? KIMI_COMPACT_EVENTS : KIMI_STOP_EVENTS,
+    favorite: true,
+    origin: 'builtin',
+    mutable: false,
+    builtin_kind: kind,
+    created_at: null,
+    updated_at: null,
+  }
+}
+
+function userFixture(overrides: Partial<MacroFixture>): MacroFixture {
+  return {
+    id: 'user-1',
+    name: 'Model K2.7',
+    description: null,
+    scope: { kind: 'provider', provider: 'kimi_cli' },
+    events: [
+      { type: 'text', text: '/model' },
+      { type: 'key', key: 'Enter' },
+    ],
+    favorite: true,
+    origin: 'user',
+    mutable: true,
+    created_at: null,
+    updated_at: null,
+    ...overrides,
+  }
+}
+
+interface StubOptions {
+  streamingBlock?: boolean
+  commandControls?: boolean
+  providerControls?: boolean
+  steerChords?: string[]
+  macrosStatus?: number
+  macros?: MacroFixture[]
+  schemaVersions?: number[]
+  sequenceKeys?: string[]
+  // r15 (§6.7): whether the per-terminal, build-exact identity block
+  // advertises interactive streaming. Default false — the honest
+  // old-server shape, under which armed batches never declare.
+  interactiveStreaming?: boolean
+  // When true, the first control-input POST answers a pane-busy refusal
+  // carrying the wire `detail` field (never `reason_detail`) — the r15
+  // normalization case; later POSTs answer accepted.
+  firstBatchBusy?: boolean
+}
+
+/**
+ * A fetch stub shaped like the §3.5 new-server responses: full key set,
+ * streaming, provider_controls (kimi), command_controls, and a /macros
+ * library. Options remove blocks to exercise the §3.5 old-server rows.
+ */
+function stubLaneBFetch(
+  requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }>,
+  options: StubOptions = {},
+) {
+  const {
+    streamingBlock = true,
+    commandControls = true,
+    providerControls = true,
+    steerChords = ['C-s'],
+    macrosStatus = 200,
+    macros = [builtinFixture('compact'), builtinFixture('stop'), userFixture({})],
+    schemaVersions = [1, 2, 3, 4],
+    sequenceKeys = FULL_KEYS,
+    interactiveStreaming = false,
+    firstBatchBusy = false,
+  } = options
+  let controlNumber = 0
+  let postNumber = 0
+  vi.stubGlobal('crypto', { randomUUID: () => `control-${++controlNumber}` })
+  vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input)
+    const body = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined
+    requests.push({ url, method: init?.method, body })
+    if (url.endsWith('/managed-control')) {
+      return {
+        ok: true,
+        json: async () => ({ managed: true, generation: 'generation-1', execution_mode: 'native_tui' }),
+      } as Response
+    }
+    if (url.endsWith('/control-input/capabilities')) {
+      return {
+        ok: true,
+        json: async () => ({
           protocol: 'cao-control-input-v1',
           execution_modes: ['native_tui'],
           literal_write: true,
@@ -549,138 +640,387 @@ describe('TerminalView structured key-sequence recorder', () => {
           request_schema_versions: schemaVersions,
           sequence: {
             event_types: ['chord', 'key', 'text'],
-            keys: ['Backspace', 'C-c', 'C-s', 'Enter', 'Escape'],
+            keys: sequenceKeys,
             max_events: 32,
             max_text_bytes: 512,
           },
-        }
-      } else if (url.endsWith('/control-identity')) {
-        response = {
+          ...(streamingBlock
+            ? { streaming: { supported: true, max_in_flight: 1, coalesce_window_ms: 200 } }
+            : {}),
+          ...(providerControls
+            ? {
+                provider_controls: {
+                  kimi_cli: {
+                    compact: { events: KIMI_COMPACT_EVENTS },
+                    stop: { events: KIMI_STOP_EVENTS },
+                    steer_chords: steerChords,
+                    dispatch_grace_ms: 5000,
+                  },
+                },
+              }
+            : {}),
+          ...(commandControls ? { command_controls: { composer_nonempty_guard: true } } : {}),
+        }),
+      } as Response
+    }
+    if (url.endsWith('/control-identity')) {
+      return {
+        ok: true,
+        json: async () => ({
           terminal_id: 't-native',
+          terminal_incarnation: 'incarnation-1',
           terminal_generation: 'generation-1',
           pane_birth_id: '%7',
+          provider_process_id: '42@start',
           provider: 'kimi_cli',
+          native_session_id: 'session-1',
           execution_mode: 'native_tui',
           session_name: 'cao-test',
-        }
-      } else {
-        response = { control_id: body?.control_id, outcome: 'accepted', events: body?.events }
-      }
-      return { ok: true, json: async () => response } as Response
-    }))
-  }
-
-  function recorderInput(): HTMLElement {
-    const el = document.activeElement as HTMLElement | null
-    if (!el || !el.textContent?.startsWith('Recording')) {
-      throw new Error('the recorder capture element is not focused')
+          control_input: {
+            schema_versions: [1, 2, 3, 4],
+            sequence: { keys: FULL_KEYS, max_events: 32, max_text_bytes: 512 },
+            ...(providerControls
+              ? {
+                  provider_controls: {
+                    kimi_cli: {
+                      steer_chords: steerChords,
+                      dispatch_grace_ms: 5000,
+                      ...(interactiveStreaming ? { interactive_streaming: { supported: true } } : {}),
+                    },
+                  },
+                }
+              : {}),
+          },
+        }),
+      } as Response
     }
-    return el
-  }
+    if (url.includes('/macros')) {
+      if (macrosStatus !== 200) {
+        return {
+          ok: false,
+          status: macrosStatus,
+          statusText: 'Not Found',
+          json: async () => ({ detail: 'not found' }),
+        } as Response
+      }
+      return { ok: true, json: async () => ({ macros }) } as Response
+    }
+    if (url.endsWith('/control-input') && init?.method === 'POST') {
+      postNumber += 1
+      if (firstBatchBusy && postNumber === 1) {
+        return {
+          ok: true,
+          json: async () => ({
+            control_id: body?.control_id,
+            outcome: 'refused',
+            reason_code: 'pane-busy',
+            detail:
+              'the receiver is processing, not idle; a composer-class sequence is ' +
+              'readiness-gated and nothing was written',
+          }),
+        } as Response
+      }
+      return {
+        ok: true,
+        json: async () => ({ control_id: body?.control_id, outcome: 'accepted', events: body?.events }),
+      } as Response
+    }
+    if (url.includes('/control-input/')) {
+      return {
+        ok: true,
+        json: async () => ({ outcome: 'ambiguous', reason_code: 'response-lost' }),
+      } as Response
+    }
+    throw new Error(`unexpected request: ${url}`)
+  }))
+}
 
-  it('records, previews, and sends the exact structured events', async () => {
-    const requests: Array<{ url: string; body?: Record<string, unknown> }> = []
-    stubNativeControlFetch(requests)
-    render(<TerminalView terminalId="t-native" onClose={() => {}} />)
+function controlInputPosts(
+  requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }>,
+) {
+  return requests.filter(r => r.url.endsWith('/control-input') && r.method === 'POST')
+}
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Record' }))
-    const capture = recorderInput()
-    fireEvent.keyDown(capture, { key: 'Escape' })
-    fireEvent.keyDown(capture, { key: 'c', ctrlKey: true })
-    fireEvent.keyDown(capture, { key: 's', ctrlKey: true })
-    fireEvent.keyDown(capture, { key: ',' })
-    fireEvent.keyDown(capture, { key: '+' })
-    fireEvent.keyDown(capture, { key: '\\' })
-    fireEvent.keyDown(capture, { key: 'Backspace' })
+describe('TerminalView Lane B dashboard (§6, §7)', () => {
+  it('arms streaming, captures a fused utterance, shows the trace, and Stop restores the draft', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests)
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" agentProfile="spec-writer-k3" onClose={() => {}} />)
+
+    await screen.findByText('Managed native TUI · identity-bound controls')
+    // The draft survives arm/disarm (§6.1).
+    fireEvent.change(screen.getByPlaceholderText('Send a message to the native composer…'), {
+      target: { value: 'keep me' },
+    })
+    // The favorite strip renders in server order with a count badge.
+    await screen.findByText('Model K2.7')
+    expect(screen.getByRole('button', { name: /Macros/ })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Streaming' }))
+    const capture = await screen.findByRole('textbox', { name: /Streaming keystroke capture/ })
+    expect(
+      screen.getByText(/STREAMING TO kimi_cli \/ spec-writer-k3 · gen genera/),
+    ).toBeTruthy()
+
+    fireEvent.keyDown(capture, { key: 'h' })
+    fireEvent.keyDown(capture, { key: 'i' })
     fireEvent.keyDown(capture, { key: 'Enter' })
-    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
 
-    // The readable preview renders the recorded tokens in order.
-    expect(screen.getByText('[Escape]')).toBeTruthy()
-    expect(screen.getByText('[Ctrl+C]')).toBeTruthy()
-    expect(screen.getByText('[Ctrl+S]')).toBeTruthy()
-    expect(screen.getByText('",+\\"')).toBeTruthy()
-    expect(screen.getByText('[Backspace]')).toBeTruthy()
-    expect(screen.getByText('[Enter]')).toBeTruthy()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Send sequence' }))
     await waitFor(() => {
-      const control = requests.find(request => request.url.endsWith('/control-input'))
-      expect(control?.body?.control_id).toBe('control-1')
-      expect(control?.body?.events).toEqual([
-        { type: 'key', key: 'Escape' },
-        { type: 'key', key: 'C-c' },
-        { type: 'chord', chord: 'C-s' },
-        { type: 'text', text: ',+\\' },
-        { type: 'key', key: 'Backspace' },
+      const posts = controlInputPosts(requests)
+      expect(posts).toHaveLength(1)
+      // Enter-after-text fusion: one request carries text+Enter (§6.3).
+      expect(posts[0].body?.events).toEqual([
+        { type: 'text', text: 'hi' },
         { type: 'key', key: 'Enter' },
       ])
-      // No v1/v2 fields travel beside the events — never both.
-      expect(control?.body?.text).toBeUndefined()
-      expect(control?.body?.enter).toBeUndefined()
-      expect(control?.body?.expected_identity).toMatchObject({
+      // Streaming NEVER declares command-class (§4.1).
+      expect(posts[0].body?.payload_class).toBeUndefined()
+      // The identity pinned at arm is bound to the batch (§6.3 step 4).
+      expect(posts[0].body?.expected_identity).toMatchObject({
         terminal_id: 't-native',
         terminal_generation: 'generation-1',
-        pane_birth_id: '%7',
       })
     })
-    // An accepted send clears the recording.
+
+    // The trace records the accepted batch.
+    expect(await screen.findByText('accepted')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop streaming' }))
+    expect(await screen.findByText(/Streaming disarmed: operator stopped streaming/)).toBeTruthy()
+    // The composer returns with its draft preserved.
+    expect(
+      (screen.getByPlaceholderText('Send a message to the native composer…') as HTMLInputElement).value,
+    ).toBe('keep me')
+  })
+
+  it('§6.7: armed batches declare payload_class "interactive" when the per-terminal block advertises it', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, { interactiveStreaming: true })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" agentProfile="spec-writer-k3" onClose={() => {}} />)
+    await screen.findByText('Managed native TUI · identity-bound controls')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Streaming' }))
+    const capture = await screen.findByRole('textbox', { name: /Streaming keystroke capture/ })
+    fireEvent.keyDown(capture, { key: 'h' })
+    fireEvent.keyDown(capture, { key: 'i' })
+    fireEvent.keyDown(capture, { key: 'Enter' })
+
     await waitFor(() => {
-      expect(screen.queryByText('[Escape]')).toBeNull()
+      const posts = controlInputPosts(requests)
+      expect(posts).toHaveLength(1)
+      // The declaration rides the same POST body; the wire sequence is
+      // otherwise unchanged (§6.7 — text+Enter fusion intact).
+      expect(posts[0].body?.payload_class).toBe('interactive')
+      expect(posts[0].body?.events).toEqual([
+        { type: 'text', text: 'hi' },
+        { type: 'key', key: 'Enter' },
+      ])
     })
   })
 
-  it('cancel before send writes nothing', async () => {
-    const requests: Array<{ url: string; body?: Record<string, unknown> }> = []
-    stubNativeControlFetch(requests)
-    render(<TerminalView terminalId="t-native" onClose={() => {}} />)
+  it('§6.7: no declaration without the per-terminal block, and the arm notice says why', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests) // interactiveStreaming defaults to the honest absent shape
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" agentProfile="spec-writer-k3" onClose={() => {}} />)
+    await screen.findByText('Managed native TUI · identity-bound controls')
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Record' }))
-    const capture = recorderInput()
-    fireEvent.keyDown(capture, { key: 'Escape' })
+    fireEvent.click(screen.getByRole('button', { name: 'Streaming' }))
+    const capture = await screen.findByRole('textbox', { name: /Streaming keystroke capture/ })
+    // The old-server fallback is stated, never a speculative bypass.
+    await screen.findByText(/interactive declaration unavailable on this server/)
     fireEvent.keyDown(capture, { key: 'x' })
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
-
-    expect(screen.queryByText('[Escape]')).toBeNull()
-    expect(requests.find(request => request.url.endsWith('/control-input'))).toBeUndefined()
+    fireEvent.keyDown(capture, { key: 'Enter' })
+    await waitFor(() => expect(controlInputPosts(requests)).toHaveLength(1))
+    expect(controlInputPosts(requests)[0].body?.payload_class).toBeUndefined()
   })
 
-  it('refuses an unrepresentable combination with a message and records nothing for it', async () => {
-    const requests: Array<{ url: string; body?: Record<string, unknown> }> = []
-    stubNativeControlFetch(requests)
-    render(<TerminalView terminalId="t-native" onClose={() => {}} />)
+  it('r15: a pane-busy carrying the wire `detail` field pauses instead of disarming', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, { firstBatchBusy: true })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" agentProfile="spec-writer-k3" onClose={() => {}} />)
+    await screen.findByText('Managed native TUI · identity-bound controls')
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Record' }))
-    const capture = recorderInput()
-    fireEvent.keyDown(capture, { key: 'x', ctrlKey: true, altKey: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Streaming' }))
+    const capture = await screen.findByRole('textbox', { name: /Streaming keystroke capture/ })
+    fireEvent.keyDown(capture, { key: 'h' })
+    fireEvent.keyDown(capture, { key: 'i' })
+    fireEvent.keyDown(capture, { key: 'Enter' })
+
+    // Before r15 this exact wire shape (detail, never reason_detail) took
+    // the fail-closed "unrecognized" disarm on the live path. Now the
+    // batch pauses on the turn-gate discriminator and retries once.
+    await screen.findByText(/provider busy/)
+    expect(screen.queryByText(/Streaming disarmed/)).toBeNull()
+    await waitFor(() => expect(controlInputPosts(requests)).toHaveLength(2), { timeout: 4000 })
+    // No disarm followed the explainable sequence either.
+    expect(screen.queryByText(/Streaming disarmed/)).toBeNull()
+  })
+
+  it('§6.6: the armed capture surface sends zero websocket input frames', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests)
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" onClose={() => {}} />)
+    await screen.findByText('Managed native TUI · identity-bound controls')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Streaming' }))
+    const capture = await screen.findByRole('textbox', { name: /Streaming keystroke capture/ })
+    fireEvent.keyDown(capture, { key: 'x' })
+    fireEvent.keyDown(capture, { key: 'Enter' })
+
+    await waitFor(() => expect(controlInputPosts(requests)).toHaveLength(1))
+    const socket = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]
+    expect(socket.sent.filter(frame => frame.includes('"input"'))).toHaveLength(0)
+  })
+
+  it('gates chords on the per-terminal advertised set: unadvertised Ctrl+S is refused locally, zero POSTs', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, { steerChords: [] })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" onClose={() => {}} />)
+    await screen.findByText('Managed native TUI · identity-bound controls')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Streaming' }))
+    const capture = await screen.findByRole('textbox', { name: /Streaming keystroke capture/ })
+    fireEvent.keyDown(capture, { key: 's', ctrlKey: true })
+
+    // The refusal is shown inline AND recorded in the trace (§6.2).
+    expect(
+      (await screen.findAllByText(/not admitted for this terminal's provider and build/))
+        .length,
+    ).toBeGreaterThan(0)
+    expect(controlInputPosts(requests)).toHaveLength(0)
+  })
+
+  it('sends an advertised chord as a chord event', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, { steerChords: ['C-s'] })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" onClose={() => {}} />)
+    await screen.findByText('Managed native TUI · identity-bound controls')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Streaming' }))
+    const capture = await screen.findByRole('textbox', { name: /Streaming keystroke capture/ })
+    fireEvent.keyDown(capture, { key: 's', ctrlKey: true })
+
+    await waitFor(() => {
+      const posts = controlInputPosts(requests)
+      expect(posts).toHaveLength(1)
+      expect(posts[0].body?.events).toEqual([{ type: 'chord', chord: 'C-s' }])
+    })
+  })
+
+  it('sends a favorite-strip macro as one v3 request; user macros never set payload_class', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests)
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" onClose={() => {}} />)
+
+    const macroButton = await screen.findByRole('button', { name: 'Model K2.7' })
+    fireEvent.click(macroButton)
+
+    await waitFor(() => {
+      const posts = controlInputPosts(requests)
+      expect(posts).toHaveLength(1)
+      expect(posts[0].body?.events).toEqual([
+        { type: 'text', text: '/model' },
+        { type: 'key', key: 'Enter' },
+      ])
+      expect(posts[0].body?.payload_class).toBeUndefined()
+      expect(posts[0].body?.expected_identity).toMatchObject({ terminal_id: 't-native' })
+    })
+  })
+
+  it('the Compact built-in declares payload_class "command" only when command_controls is advertised', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, { commandControls: true })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" onClose={() => {}} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Compact' }))
+    await waitFor(() => {
+      const posts = controlInputPosts(requests)
+      expect(posts).toHaveLength(1)
+      expect(posts[0].body?.payload_class).toBe('command')
+      expect(posts[0].body?.events).toEqual(KIMI_COMPACT_EVENTS)
+    })
+  })
+
+  it('without command_controls the Compact built-in sends no payload_class and states why (§4.1 rule 4)', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, { commandControls: false })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" onClose={() => {}} />)
 
     expect(
-      await screen.findByText(/cannot be represented: terminal protocols cannot express/),
+      await screen.findByText('prefill-concatenation guard unavailable on this server'),
     ).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
-    expect(screen.getByRole('button', { name: 'Send sequence' })).toHaveProperty('disabled', true)
+    fireEvent.click(screen.getByRole('button', { name: 'Compact' }))
+    await waitFor(() => {
+      const posts = controlInputPosts(requests)
+      expect(posts).toHaveLength(1)
+      expect(posts[0].body?.payload_class).toBeUndefined()
+    })
   })
 
-  it('keeps the managed onData guard: recording never leaks into the websocket', async () => {
-    const requests: Array<{ url: string; body?: Record<string, unknown> }> = []
-    stubNativeControlFetch(requests)
-    render(<TerminalView terminalId="t-native" onClose={() => {}} />)
+  it('opens the macro library modal (layout smoke) and closes it again', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests)
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" onClose={() => {}} />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Record' }))
-    const capture = recorderInput()
-    fireEvent.keyDown(capture, { key: 'x' })
-    const ws = FakeWebSocket.instances[0]
-    expect(ws.sent.filter(frame => frame.includes('"input"'))).toHaveLength(0)
+    fireEvent.click(await screen.findByRole('button', { name: /Macros/ }))
+    expect(await screen.findByRole('dialog')).toBeTruthy()
   })
+})
 
-  it('hides the recorder on a server that does not advertise v3', async () => {
-    const requests: Array<{ url: string; body?: Record<string, unknown> }> = []
-    stubNativeControlFetch(requests, { schemaVersions: [1, 2] })
-    render(<TerminalView terminalId="t-native" onClose={() => {}} />)
+describe('TerminalView Lane B old-server degradation (§3.5)', () => {
+  it('v3 absent: macros/streaming hidden behind the stated notice', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, { schemaVersions: [1, 2], streamingBlock: false })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" onClose={() => {}} />)
 
     expect(
-      await screen.findByText(/Sequence recording needs control-input schema v3/),
+      await screen.findByText(/Macros and streaming need control-input schema v3/),
     ).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Record' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /Macros/ })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Streaming' })).toHaveProperty('disabled', true)
+  })
+
+  it('streaming block absent: the toggle is disabled with "server predates streaming"', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, { streamingBlock: false })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" onClose={() => {}} />)
+
+    expect(await screen.findByText(/this server predates streaming/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Streaming' })).toHaveProperty('disabled', true)
+  })
+
+  it('key set incomplete: the streaming toggle stays disabled', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, {
+      sequenceKeys: ['Backspace', 'C-c', 'C-s', 'Enter', 'Escape'],
+    })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" onClose={() => {}} />)
+
+    expect(await screen.findByText(/this server predates streaming/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Streaming' })).toHaveProperty('disabled', true)
+  })
+
+  it('/macros 404: the library UI is hidden behind a notice', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, { macrosStatus: 404 })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" onClose={() => {}} />)
+
+    expect(
+      await screen.findByText('The macro library is unavailable on this server.'),
+    ).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Macros/ })).toBeNull()
+  })
+
+  it('provider_controls absent: built-ins hidden, user macros still available', async () => {
+    const requests: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = []
+    stubLaneBFetch(requests, { providerControls: false })
+    render(<TerminalView terminalId="t-native" provider="kimi_cli" onClose={() => {}} />)
+
+    // The user favorite still renders in the strip…
+    expect(await screen.findByRole('button', { name: 'Model K2.7' })).toBeTruthy()
+    // …but the synthesized built-ins are hidden (§3.5).
+    expect(screen.queryByRole('button', { name: 'Compact' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull()
   })
 })

@@ -1,0 +1,597 @@
+{
+  "schema": "cao-macro-notation-vectors-v1",
+  "offsets": "0-based character offsets into the notation string",
+  "valid": [
+    {
+      "notation": "\"/model\"",
+      "events": [
+        {
+          "type": "text",
+          "text": "/model"
+        }
+      ],
+      "preview": "\"/model\""
+    },
+    {
+      "notation": "\"say \\\"hi\\\" \\\\ a,b+c/d\"",
+      "events": [
+        {
+          "type": "text",
+          "text": "say \"hi\" \\ a,b+c/d"
+        }
+      ],
+      "preview": "\"say \\\"hi\\\" \\\\ a,b+c/d\""
+    },
+    {
+      "notation": "enter",
+      "events": [
+        {
+          "type": "key",
+          "key": "Enter"
+        }
+      ],
+      "preview": "[Enter]"
+    },
+    {
+      "notation": "escape",
+      "events": [
+        {
+          "type": "key",
+          "key": "Escape"
+        }
+      ],
+      "preview": "[Escape]"
+    },
+    {
+      "notation": "up",
+      "events": [
+        {
+          "type": "key",
+          "key": "Up"
+        }
+      ],
+      "preview": "[Up]"
+    },
+    {
+      "notation": "down",
+      "events": [
+        {
+          "type": "key",
+          "key": "Down"
+        }
+      ],
+      "preview": "[Down]"
+    },
+    {
+      "notation": "left",
+      "events": [
+        {
+          "type": "key",
+          "key": "Left"
+        }
+      ],
+      "preview": "[Left]"
+    },
+    {
+      "notation": "right",
+      "events": [
+        {
+          "type": "key",
+          "key": "Right"
+        }
+      ],
+      "preview": "[Right]"
+    },
+    {
+      "notation": "home",
+      "events": [
+        {
+          "type": "key",
+          "key": "Home"
+        }
+      ],
+      "preview": "[Home]"
+    },
+    {
+      "notation": "end",
+      "events": [
+        {
+          "type": "key",
+          "key": "End"
+        }
+      ],
+      "preview": "[End]"
+    },
+    {
+      "notation": "page-up",
+      "events": [
+        {
+          "type": "key",
+          "key": "PageUp"
+        }
+      ],
+      "preview": "[PageUp]"
+    },
+    {
+      "notation": "page-down",
+      "events": [
+        {
+          "type": "key",
+          "key": "PageDown"
+        }
+      ],
+      "preview": "[PageDown]"
+    },
+    {
+      "notation": "delete",
+      "events": [
+        {
+          "type": "key",
+          "key": "Delete"
+        }
+      ],
+      "preview": "[Delete]"
+    },
+    {
+      "notation": "insert",
+      "events": [
+        {
+          "type": "key",
+          "key": "Insert"
+        }
+      ],
+      "preview": "[Insert]"
+    },
+    {
+      "notation": "tab",
+      "events": [
+        {
+          "type": "key",
+          "key": "Tab"
+        }
+      ],
+      "preview": "[Tab]"
+    },
+    {
+      "notation": "backspace",
+      "events": [
+        {
+          "type": "key",
+          "key": "Backspace"
+        }
+      ],
+      "preview": "[Backspace]"
+    },
+    {
+      "notation": "up*3",
+      "events": [
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        }
+      ],
+      "preview": "[Up]×3"
+    },
+    {
+      "notation": "up up up",
+      "events": [
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        }
+      ],
+      "preview": "[Up]×3"
+    },
+    {
+      "notation": "ctrl+c",
+      "events": [
+        {
+          "type": "key",
+          "key": "C-c"
+        }
+      ],
+      "preview": "[Ctrl+C]"
+    },
+    {
+      "notation": "ctrl+s",
+      "events": [
+        {
+          "type": "chord",
+          "chord": "C-s"
+        }
+      ],
+      "preview": "[Ctrl+S]"
+    },
+    {
+      "notation": "ctrl+x",
+      "events": [
+        {
+          "type": "chord",
+          "chord": "C-x"
+        }
+      ],
+      "preview": "[Ctrl+X]"
+    },
+    {
+      "notation": "ctrl+s*2",
+      "events": [
+        {
+          "type": "chord",
+          "chord": "C-s"
+        },
+        {
+          "type": "chord",
+          "chord": "C-s"
+        }
+      ],
+      "preview": "[Ctrl+S]×2"
+    },
+    {
+      "notation": "\"a\" \"a\"",
+      "events": [
+        {
+          "type": "text",
+          "text": "a"
+        },
+        {
+          "type": "text",
+          "text": "a"
+        }
+      ],
+      "preview": "\"a\" \"a\""
+    },
+    {
+      "notation": "up*32",
+      "events": [
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        }
+      ],
+      "preview": "[Up]×32"
+    },
+    {
+      "notation": "\"/model\" enter up*3 enter",
+      "events": [
+        {
+          "type": "text",
+          "text": "/model"
+        },
+        {
+          "type": "key",
+          "key": "Enter"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Up"
+        },
+        {
+          "type": "key",
+          "key": "Enter"
+        }
+      ],
+      "preview": "\"/model\" [Enter] [Up]×3 [Enter]"
+    }
+  ],
+  "invalid": [
+    {
+      "notation": "",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "a macro names at least one event"
+        }
+      ]
+    },
+    {
+      "notation": "   ",
+      "errors": [
+        {
+          "offset": 3,
+          "message": "a macro names at least one event"
+        }
+      ]
+    },
+    {
+      "notation": "f5",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "unknown named key 'f5'; known key names are ['backspace', 'delete', 'down', 'end', 'enter', 'escape', 'home', 'insert', 'left', 'page-down', 'page-up', 'right', 'tab', 'up'] — unlisted keys (BTab, modified arrows, F-keys) are refused, never approximated"
+        }
+      ]
+    },
+    {
+      "notation": "ctrl+",
+      "errors": [
+        {
+          "offset": 5,
+          "message": "a chord is 'ctrl+' followed by one letter a-z; multi-modifier and non-letter chords are unrepresentable and refused, never approximated"
+        }
+      ]
+    },
+    {
+      "notation": "ctrl+9",
+      "errors": [
+        {
+          "offset": 5,
+          "message": "a chord is 'ctrl+' followed by one letter a-z; multi-modifier and non-letter chords are unrepresentable and refused, never approximated"
+        }
+      ]
+    },
+    {
+      "notation": "ctrl+shift+x",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "multi-modifier combination 'ctrl+shift+x' cannot be represented: no standard-mode terminal byte encoding exists for it (tmux would inject the base key or a wrong encoding), so it is refused, never approximated"
+        }
+      ]
+    },
+    {
+      "notation": "alt+x",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "multi-modifier combination 'alt+x' cannot be represented: no standard-mode terminal byte encoding exists for it (tmux would inject the base key or a wrong encoding), so it is refused, never approximated"
+        }
+      ]
+    },
+    {
+      "notation": "up*0",
+      "errors": [
+        {
+          "offset": 3,
+          "message": "a repeat count is a positive integer written [1-9][0-9]* (zero and empty counts are malformed, not no-ops)"
+        }
+      ]
+    },
+    {
+      "notation": "up*",
+      "errors": [
+        {
+          "offset": 3,
+          "message": "a repeat count is a positive integer written [1-9][0-9]* (zero and empty counts are malformed, not no-ops)"
+        }
+      ]
+    },
+    {
+      "notation": "up*33",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "this event brings the sequence past the 32-event cap; a repeat expansion counts every event it stands for"
+        }
+      ]
+    },
+    {
+      "notation": "\"/model",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "unterminated string: a text token is a JSON string"
+        }
+      ]
+    },
+    {
+      "notation": "\"\"",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "a text event must be a non-empty string"
+        }
+      ]
+    },
+    {
+      "notation": "\"a\\u001bb\"",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "the text contains a control character (ESC, C1 CSI, CR, or LF) the control path can never send honestly; an unrepresentable macro is refused, never approximated"
+        }
+      ]
+    },
+    {
+      "notation": "up*3x",
+      "errors": [
+        {
+          "offset": 4,
+          "message": "expected whitespace between events, not 'x'"
+        }
+      ]
+    },
+    {
+      "notation": "\"x\"ctrl+c",
+      "errors": [
+        {
+          "offset": 3,
+          "message": "expected whitespace between events, not 'c'"
+        }
+      ]
+    },
+    {
+      "notation": "\"a\\qb\"",
+      "errors": [
+        {
+          "offset": 2,
+          "message": "invalid JSON string: Invalid \\escape; text uses JSON escaping exactly (comma, plus, slash and backslash are literal inside quotes)"
+        }
+      ]
+    },
+    {
+      "notation": "up*100",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "this event brings the sequence past the 32-event cap; a repeat expansion counts every event it stands for"
+        }
+      ]
+    },
+    {
+      "notation": "up*999999999999999999999999999999",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "this event brings the sequence past the 32-event cap; a repeat expansion counts every event it stands for"
+        }
+      ]
+    },
+    {
+      "notation": "\"\\ud800\"",
+      "errors": [
+        {
+          "offset": 0,
+          "message": "the text contains a lone surrogate that is not UTF-8-encodable; an unrepresentable macro is refused, never approximated"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "body": {
+    "attachment": {
+      "attachment_id": "b4ef679903a3440a87b5a98685928945",
+      "bound_operation_id": null,
+      "content_type": "image/png",
+      "created_at": "2026-07-29T05:45:35.144766Z",
+      "display_filename": "stripe-fixture.png",
+      "error": null,
+      "format": "png",
+      "height": 80,
+      "sha256": "bf242a5a3899642819b1a5b5da138e2edca073bf228b9f34cc342b3a475cc6f1",
+      "size_bytes": 302,
+      "staged_path": "attachments/fd90aab3/b4ef679903a3440a87b5a98685928945.png",
+      "state": "ready",
+      "terminal_id": "fd90aab3",
+      "updated_at": "2026-07-29T05:45:35.145840Z",
+      "width": 120
+    }
+  },
+  "status_code": 201
+}

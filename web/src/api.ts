@@ -10,6 +10,8 @@ const BASE = ''  // Vite proxy handles routing to backend
 export interface ApiError extends Error {
   status?: number
   detail?: string
+  /** The parsed JSON error body, when there was one (e.g. §5.3 `{errors}`). */
+  body?: unknown
 }
 
 async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: number }): Promise<T> {
@@ -22,13 +24,17 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
       // `detail` without leaking a full response. A non-JSON body is fine —
       // detail just stays undefined.
       let detail: string | undefined
+      let body: unknown
       try {
-        const body = await res.json()
-        if (body && typeof body.detail === 'string') detail = body.detail
+        body = await res.json()
+        if (body && typeof (body as { detail?: unknown }).detail === 'string') {
+          detail = (body as { detail: string }).detail
+        }
       } catch { /* non-JSON error body */ }
       const err: ApiError = new Error(`${res.status} ${res.statusText}`)
       err.status = res.status
       err.detail = detail
+      err.body = body
       throw err
     }
     return res.json()
@@ -163,6 +169,141 @@ export interface GraphView {
   meta: Record<string, unknown>
 }
 
+// The v3 event wire shape (§3.1): text, key, or chord.
+export interface WireEvent {
+  type: 'text' | 'key' | 'chord'
+  text?: string
+  key?: string
+  chord?: string
+}
+
+// ── Control-input capabilities (§3.5) ─────────────────────────────────
+// The deployed keys plus the additive §3.5 blocks Lane B gates on. Unknown
+// keys are ignored by construction (the interface is additive); absence of
+// a block drives the old-server degradation rows of §3.5.
+export interface ProviderControlBlock {
+  compact?: { events: WireEvent[] }
+  stop?: { events: WireEvent[] }
+  steer_chords?: string[]
+  dispatch_grace_ms?: number
+  // §8.6 additive Lane C blocks (absent on old servers and unproven builds).
+  operator_message?: OperatorMessageBlock
+  image?: ImageCapabilityBlock
+}
+
+// ── Lane C: operator messages + image attachments (§8.3/§8.4/§8.6) ─────
+
+export interface OperatorMessageBlock {
+  supported: boolean
+  max_text_bytes: number
+  multiline: boolean
+  max_attachments: number
+}
+
+export interface ImageCapabilityBlock {
+  supported: boolean
+  formats: string[]
+  max_bytes: number
+  max_width: number
+  max_height: number
+  mechanism: string
+  reference_template?: string
+  evidence?: string
+}
+
+export interface ImageAttachmentRecord {
+  attachment_id: string
+  terminal_id: string
+  state: 'staging' | 'ready' | 'failed' | 'removed' | 'submitted'
+  format: string | null
+  content_type: string | null
+  width: number | null
+  height: number | null
+  size_bytes: number
+  display_filename: string
+  bound_operation_id: string | null
+  error: { reason_code: string; detail: string } | null
+  created_at: string
+  updated_at: string
+}
+
+/** The typed refusal body of a failed upload/delete (422/409). */
+export interface AttachmentRefusalBody {
+  outcome?: string
+  reason_code?: string
+  detail?: string
+  attachment?: ImageAttachmentRecord
+}
+
+export interface ControlInputCapabilities {
+  protocol: string
+  execution_modes: string[]
+  literal_write: boolean
+  bracketed_paste: boolean
+  enter_required: boolean
+  request_schema_versions?: number[]
+  sequence?: {
+    event_types: string[]
+    keys: string[]
+    max_events: number
+    max_text_bytes: number
+  }
+  streaming?: {
+    supported: boolean
+    max_in_flight: number
+    coalesce_window_ms: number
+  }
+  provider_controls?: Record<string, ProviderControlBlock>
+  command_controls?: {
+    composer_nonempty_guard: boolean
+  }
+}
+
+// ── Operator macro library (§5.4) ─────────────────────────────────────
+export interface MacroScope {
+  kind: 'global' | 'provider' | 'profile'
+  provider?: string
+  profile?: string
+}
+
+export interface MacroRecord {
+  id: string
+  name: string
+  description: string | null
+  scope: MacroScope
+  events: WireEvent[]
+  favorite: boolean
+  origin: 'builtin' | 'user'
+  mutable: boolean
+  builtin_kind?: 'compact' | 'stop'
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface MacroListResponse {
+  macros: MacroRecord[]
+  quarantine?: { count: number | null; path: string }
+}
+
+export interface MacroWriteBody {
+  name: string
+  description?: string
+  scope: MacroScope
+  events?: WireEvent[]
+  notation?: string
+  favorite?: boolean
+}
+
+export interface MacroNotationParseResult {
+  events: WireEvent[]
+  preview: string
+}
+
+/** The §5.3 422 error body shape (offset may be null for non-notation errors). */
+export interface MacroErrorsBody {
+  errors?: Array<{ offset: number | null; message: string }>
+}
+
 // Request body for POST /graph/{provider}/export. `dest` MUST be a relative
 // name; the server confines it under CAO_GRAPH_EXPORT_ROOT and rejects
 // absolute/traversal paths with 400.
@@ -209,20 +350,7 @@ export const api = {
   getManagedControl: (id: string) =>
     fetchJSON<{ managed: boolean; generation?: string; provider?: string; execution_mode?: string; vintage?: string }>(`/terminals/${id}/managed-control`),
   getControlInputCapabilities: () =>
-    fetchJSON<{
-      protocol: string
-      execution_modes: string[]
-      literal_write: boolean
-      bracketed_paste: boolean
-      enter_required: boolean
-      request_schema_versions?: number[]
-      sequence?: {
-        event_types: string[]
-        keys: string[]
-        max_events: number
-        max_text_bytes: number
-      }
-    }>('/control-input/capabilities'),
+    fetchJSON<ControlInputCapabilities>('/control-input/capabilities'),
   getControlIdentity: (id: string) =>
     fetchJSON<Record<string, unknown>>(`/terminals/${id}/control-identity`),
   sendControlInput: (
@@ -233,7 +361,16 @@ export const api = {
       enter?: boolean
       // v3 structured sequences: the request carries events OR the v1/v2
       // fields, never both.
-      events?: Array<{ type: string; text?: string; key?: string; chord?: string }>
+      events?: WireEvent[]
+      // v4 declaration carrier. "command" (§4.1): sent ONLY by the registry
+      // Compact built-in send (and supervisor/provider command controls),
+      // and only after the server advertises the command_controls block.
+      // "interactive" (§6.7, r15): sent ONLY by the armed manual streaming
+      // capture, and only after the per-terminal, build-exact
+      // interactive_streaming block advertises support. Macros, favorites,
+      // the prose composer, operator messages, and inbox/automation never
+      // set either.
+      payload_class?: 'command' | 'interactive'
       expected_identity: Record<string, unknown>
     }
   ) =>
@@ -245,6 +382,82 @@ export const api = {
     }),
   queryControlInput: (controlId: string) =>
     fetchJSON<Record<string, unknown>>(`/control-input/${encodeURIComponent(controlId)}`),
+
+  // Lane C: operator messages + image attachments (§8.3/§8.4). Typed
+  // outcomes travel as 200 like control-input; a 404 on either route is the
+  // old-server signal and resolves to `unsupported` — never a resend.
+  submitOperatorMessage: (
+    id: string,
+    body: {
+      operation_id: string
+      text: string
+      attachments: string[]
+      token_map: Record<string, string>
+      expected_identity: Record<string, unknown>
+    }
+  ) =>
+    fetchJSON<Record<string, unknown>>(`/terminals/${id}/operator-message`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      // The server's write deadline is 20s; the client must outlast it.
+      timeoutMs: 25000,
+    }),
+  reconcileOperatorMessage: (operationId: string) =>
+    fetchJSON<Record<string, unknown>>(`/operator-message/${encodeURIComponent(operationId)}`),
+  uploadAttachment: (id: string, file: File) => {
+    const form = new FormData()
+    form.append('file', file, file.name)
+    // No Content-Type header: the browser sets the multipart boundary.
+    return fetchJSON<{ attachment: ImageAttachmentRecord }>(
+      `/terminals/${id}/attachments`,
+      { method: 'POST', body: form, timeoutMs: 15000 },
+    )
+  },
+  listAttachments: (id: string) =>
+    fetchJSON<{ attachments: ImageAttachmentRecord[] }>(`/terminals/${id}/attachments`),
+  deleteAttachment: (id: string, attachmentId: string) =>
+    fetchJSON<{ deleted: boolean; attachment: ImageAttachmentRecord }>(
+      `/terminals/${id}/attachments/${encodeURIComponent(attachmentId)}`,
+      { method: 'DELETE' },
+    ),
+
+  // Operator macro library (§5.4). Sending a macro is NOT a store
+  // operation: the client takes the resolved events and sends an ordinary
+  // v3 control-input request (D2) — these routes only manage the library.
+  listMacros: (filters?: { provider?: string; profile?: string }) => {
+    const params = [
+      filters?.provider ? `provider=${encodeURIComponent(filters.provider)}` : '',
+      filters?.profile ? `profile=${encodeURIComponent(filters.profile)}` : '',
+    ].filter(Boolean).join('&')
+    return fetchJSON<MacroListResponse>(`/macros${params ? `?${params}` : ''}`)
+  },
+  createMacro: (body: MacroWriteBody) =>
+    fetchJSON<MacroRecord>('/macros', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  updateMacro: (macroId: string, body: MacroWriteBody) =>
+    fetchJSON<MacroRecord>(`/macros/${encodeURIComponent(macroId)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  deleteMacro: (macroId: string) =>
+    fetchJSON<{ deleted: string }>(`/macros/${encodeURIComponent(macroId)}`, { method: 'DELETE' }),
+  duplicateMacro: (macroId: string, name?: string) =>
+    fetchJSON<MacroRecord>(`/macros/${encodeURIComponent(macroId)}/duplicate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(name ? { name } : {}),
+    }),
+  parseMacroNotation: (notation: string) =>
+    fetchJSON<MacroNotationParseResult>('/macros/parse-notation', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notation }),
+    }),
   beginManagedOperation: (
     id: string,
     body: {

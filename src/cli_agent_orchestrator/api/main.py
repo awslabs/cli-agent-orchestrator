@@ -24,11 +24,13 @@ from fastapi import (
     Body,
     Depends,
     FastAPI,
+    File,
     Header,
     HTTPException,
     Query,
     Request,
     Response,
+    UploadFile,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -119,8 +121,11 @@ from cli_agent_orchestrator.services import (
     companion_receipts,
     control_input_service,
     flow_service,
+    image_attachments,
+    macro_notation,
     managed_launch,
     managed_launch_v2,
+    operator_message_service,
     secret_gate,
     session_env,
     session_service,
@@ -506,9 +511,39 @@ class ControlInputRequest(BaseModel):
     # parser must never silently drop a v3 payload and deliver the request
     # as something else.  Never combined with the v1/v2 fields.
     events: Optional[List[Dict[str, Any]]] = None
+    # v4 only: the optional command-class declaration carrier
+    # (``payload_class: "command"``).  Declared as ``Any`` on purpose: a
+    # non-string value must reach the service, which answers with the
+    # *typed* zero-write ``malformed-command-declaration`` refusal, rather
+    # than dying as an untyped pydantic 422.  An explicit null is the
+    # absent declaration (prose), exactly as ``chord`` treats null.  Never
+    # combined with the v1/v2 fields; command-class is declared only by
+    # this field, never derived from payload shape.
+    payload_class: Optional[Any] = None
     # Bounded on purpose.  An unbounded wait converts a truthful
     # "the pane is busy, nothing was written, try again" into a request
     # that may never answer.
+    lease_timeout: float = Field(default=0.0, ge=0.0, le=5.0)
+
+
+class OperatorMessageRequest(BaseModel):
+    """One identity-bound operator message (Lane C, design §8.3).
+
+    A sibling typed operation to control-input — never an extension of it
+    (D11): up to 8192 UTF-8 bytes, multi-line only through the provider's
+    build-proven composer-newline plan, plus staged image attachments
+    referenced by ``[Image #N]`` tokens in the draft text and mapped in
+    ``token_map``.  The same 9-field ``expected_identity`` binds it, and
+    the same at-most-once discipline governs it: reuse ``operation_id``
+    only to reconcile; a refused message may be tried again with a new id.
+    """
+
+    operation_id: str
+    text: str = ""
+    attachments: Optional[List[str]] = None
+    token_map: Optional[Dict[str, str]] = None
+    expected_identity: Optional[Dict[str, Any]] = None
+    # Same bounded-wait discipline as control-input.
     lease_timeout: float = Field(default=0.0, ge=0.0, le=5.0)
 
 
@@ -613,6 +648,10 @@ async def lifespan(app: FastAPI):
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
     asyncio.create_task(cleanup_expired_memories())
+    # Lane C: sweep expired/orphaned image attachments at startup (§8.4 —
+    # submitted images past the 24 h retention, crashed-upload orphans,
+    # stale staging/failed records; never ``ready`` operator drafts).
+    asyncio.create_task(asyncio.to_thread(image_attachments.sweep_attachments))
 
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
@@ -1426,6 +1465,147 @@ async def set_skill_dirs_endpoint(
         "skills_dir": str(SKILLS_DIR),
         "extra_dirs": result_extra or get_extra_skill_dirs(),
     }
+
+
+# ── Operator macro library (§5.4) ────────────────────────────────────────
+#
+# The durable macro store of §5: versioned JSON at CAO_HOME_DIR/macros.json,
+# flock-serialized atomic writes, quarantine reporting on every list.  READ
+# scope for list/parse, WRITE scope for mutations — the settings-route
+# discipline.  Validation failures are 422 with an ``errors`` array of
+# ``{offset, message}`` pairs (§5.3); built-in mutation attempts are 409;
+# unknown ids are 404.  Sending a macro is deliberately NOT a store
+# operation (§5.4): the client takes the resolved events and sends an
+# ordinary v3 control-input request (D2) — the store never writes to panes.
+
+
+class MacroScopeBody(BaseModel):
+    kind: str
+    provider: Optional[str] = None
+    profile: Optional[str] = None
+
+
+class MacroWriteBody(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    scope: Optional[MacroScopeBody] = None
+    events: Optional[List[Dict[str, Any]]] = None
+    notation: Optional[str] = None
+    favorite: Optional[bool] = None
+
+
+class MacroDuplicateBody(BaseModel):
+    name: Optional[str] = None
+
+
+def _macro_validation_response(exc: "macro_store.MacroValidationError") -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"errors": exc.errors},
+    )
+
+
+def _macro_write_kwargs(body: MacroWriteBody) -> Dict[str, Any]:
+    return {
+        "name": body.name,
+        "description": body.description,
+        "scope": body.scope.model_dump() if body.scope is not None else None,
+        "events": body.events,
+        "notation": body.notation,
+        "favorite": body.favorite,
+    }
+
+
+@app.get("/macros")
+async def list_macros_endpoint(
+    provider: Optional[str] = None,
+    profile: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """The visible macro set: registry built-ins for ``provider`` (synthesized,
+    D6) plus user records whose scope is global, provider-matching, or
+    profile-matching, in the pinned server-side order (§5.4).  Reports
+    ``quarantine`` while a quarantine file exists (§5.2)."""
+    from cli_agent_orchestrator.services import macro_store
+
+    return await asyncio.to_thread(macro_store.list_macros, provider, profile)
+
+
+@app.post("/macros", status_code=status.HTTP_201_CREATED)
+async def create_macro_endpoint(
+    body: MacroWriteBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Create a user macro from ``events`` or ``notation`` (exactly one)."""
+    from cli_agent_orchestrator.services import macro_store
+
+    try:
+        return await asyncio.to_thread(macro_store.create_macro, **_macro_write_kwargs(body))
+    except macro_store.MacroValidationError as exc:
+        return _macro_validation_response(exc)
+
+
+@app.put("/macros/{macro_id}")
+async def update_macro_endpoint(
+    macro_id: str,
+    body: MacroWriteBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Full replace of a user record's mutable fields; built-in ids 409."""
+    from cli_agent_orchestrator.services import macro_store
+
+    try:
+        return await asyncio.to_thread(
+            macro_store.update_macro, macro_id, **_macro_write_kwargs(body)
+        )
+    except macro_store.MacroValidationError as exc:
+        return _macro_validation_response(exc)
+    except macro_store.BuiltinMacroConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except macro_store.MacroNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no macro with id {macro_id!r}",
+        ) from exc
+
+
+@app.delete("/macros/{macro_id}")
+async def delete_macro_endpoint(
+    macro_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Delete a user record; built-in ids 409."""
+    from cli_agent_orchestrator.services import macro_store
+
+    try:
+        return await asyncio.to_thread(macro_store.delete_macro, macro_id)
+    except macro_store.BuiltinMacroConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except macro_store.MacroNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no macro with id {macro_id!r}",
+        ) from exc
+
+
+@app.post("/macros/{macro_id}/duplicate", status_code=status.HTTP_201_CREATED)
+async def duplicate_macro_endpoint(
+    macro_id: str,
+    body: MacroDuplicateBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Mint a user record from any source — the only way to "edit" a built-in."""
+    from cli_agent_orchestrator.services import macro_store
+
+    try:
+        return await asyncio.to_thread(macro_store.duplicate_macro, macro_id, name=body.name)
+    except macro_store.MacroValidationError as exc:
+        return _macro_validation_response(exc)
+    except macro_store.MacroNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no macro with id {macro_id!r}",
+        ) from exc
 
 
 @app.get("/skills/{name}", response_model=SkillContentResponse)
@@ -2844,9 +3024,44 @@ async def get_terminal_control_identity(
     # The discovery block (§3): a conductor that needs v2 reads this before
     # sending a chord, so a v2 request against a v1-only server fails closed
     # with typed ``unsupported`` and zero bytes rather than silently
-    # delivering text without the chord.
-    body["control_input"] = control_input_service.control_input_capability_block()
+    # delivering text without the chord.  The resolved identity is passed so
+    # the block carries this terminal's build-exact provider controls (the
+    # §3.5 send authority) and its composer-guard availability (§4.1).
+    body["control_input"] = control_input_service.control_input_capability_block(resolved)
     return body
+
+
+class ParseNotationRequest(BaseModel):
+    """One macro notation string to resolve through the pinned grammar."""
+
+    notation: str
+
+
+@app.post("/macros/parse-notation")
+async def parse_macro_notation(
+    body: ParseNotationRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """The server-authoritative macro-notation parse (§5.3).
+
+    The one authority for the notation grammar — Lane B's TypeScript
+    preview is tested against the same golden vectors so the two cannot
+    drift into spelling the same macro two ways.  Answers the resolved v3
+    event array and its canonical preview, or ``422`` with the parse
+    errors (each carrying a 0-based offset and a message).  This route
+    only parses: it persists nothing and writes nothing to any pane.
+    """
+    result = macro_notation.parse_notation(body.notation)
+    if result.errors:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "errors": [
+                    {"offset": error.offset, "message": error.message} for error in result.errors
+                ]
+            },
+        )
+    return JSONResponse(content={"events": result.events, "preview": result.preview})
 
 
 def _stated_enter(body: ControlInputRequest) -> Any:
@@ -2895,6 +3110,7 @@ async def send_terminal_control_input(
                 protocol=body.protocol,
                 chord=body.chord,
                 events=body.events,
+                payload_class=body.payload_class,
                 lease_timeout=body.lease_timeout,
             )
         )
@@ -2903,6 +3119,137 @@ async def send_terminal_control_input(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
     return JSONResponse(status_code=result.http_status, content=result.as_response())
+
+
+@app.post("/terminals/{terminal_id}/operator-message")
+async def send_terminal_operator_message(
+    terminal_id: TerminalId,
+    body: OperatorMessageRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """Submit one text+image operator message, at most once, or say why not.
+
+    The Lane C typed operation (design §8.3): the same 200-with-typed-
+    outcome discipline as control-input — a 404 here is reserved for the
+    route being absent altogether (an older server), which a client reads
+    as ``unsupported``.  Every terminal-level failure — unknown terminal,
+    identity drift, busy pane, unproven build, attachment not ready — is
+    a typed outcome.  A lost response is resolved by one exact-id GET,
+    never by resending.
+    """
+    try:
+        result = await asyncio.to_thread(
+            partial(
+                operator_message_service.submit_operator_message,
+                terminal_id,
+                operation_id=body.operation_id,
+                text=body.text,
+                attachments=body.attachments,
+                token_map=body.token_map,
+                expected_identity=body.expected_identity,
+                lease_timeout=body.lease_timeout,
+            )
+        )
+    except operator_message_service.OperatorMessageRequestInvalid as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    return JSONResponse(status_code=result.http_status, content=result.as_response())
+
+
+@app.get("/operator-message/{operation_id}")
+async def get_operator_message_result(
+    operation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """What happened to one operator message, for a lost reply.
+
+    Keyed by operation id alone, mirroring the control-input reconcile:
+    the journaled record is the answer, and a message is never re-sent
+    automatically.  The id spans the two per-provider operation stores
+    (OD6); an unreadable store is answered as the unknown it is, never as
+    "proven absent".
+    """
+    try:
+        result = await asyncio.to_thread(
+            operator_message_service.reconcile_operator_message, operation_id
+        )
+    except operator_message_service.OperatorMessageRequestInvalid as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    return JSONResponse(status_code=result.http_status, content=result.as_response())
+
+
+@app.post("/terminals/{terminal_id}/attachments", status_code=201)
+async def upload_terminal_attachment(
+    terminal_id: TerminalId,
+    file: UploadFile = File(...),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """Stage one image attachment for one terminal (design §8.4).
+
+    Content is validated, never the filename: magic-byte sniff plus
+    structure/dimension decode, then the provider's advertised
+    ``image.formats`` allowlist.  Over-limit, corrupt, or unproven-format
+    uploads answer 422 with a typed refusal body and leave a durable
+    ``failed`` record; nothing is ever half-written.
+    """
+    content = await file.read(image_attachments.MAX_IMAGE_BYTES + 1)
+    try:
+        record = await asyncio.to_thread(
+            partial(
+                operator_message_service.upload_attachment,
+                terminal_id,
+                display_filename=file.filename,
+                content=content,
+            )
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except operator_message_service.AttachmentRefusal as exc:
+        return JSONResponse(status_code=exc.status_code, content=exc.as_response())
+    return JSONResponse(status_code=201, content={"attachment": record})
+
+
+@app.get("/terminals/{terminal_id}/attachments")
+async def list_terminal_attachments(
+    terminal_id: TerminalId,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """The terminal's live image-attachment records (``removed`` are gone)."""
+    try:
+        records = await asyncio.to_thread(
+            operator_message_service.list_terminal_attachments, terminal_id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return {"attachments": records}
+
+
+@app.delete("/terminals/{terminal_id}/attachments/{attachment_id}")
+async def delete_terminal_attachment(
+    terminal_id: TerminalId,
+    attachment_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> JSONResponse:
+    """Remove one attachment and its staged file.
+
+    A ``submitted`` attachment is retained read-only for its TTL so the
+    provider can still read the staged path mid-turn (§8.4); deleting one
+    is a 409 with the typed explanation, not a silent delete.
+    """
+    try:
+        record = await asyncio.to_thread(
+            operator_message_service.delete_terminal_attachment,
+            terminal_id,
+            attachment_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except operator_message_service.AttachmentRefusal as exc:
+        return JSONResponse(status_code=exc.status_code, content=exc.as_response())
+    return JSONResponse(content={"deleted": True, "attachment": record})
 
 
 @app.post("/terminals/{terminal_id}/input")
@@ -3903,6 +4250,37 @@ def _web_terminal_input_bytes(
     return data.encode()
 
 
+# The resize frame is accepted viewer geometry, not pane input (§6.6): it
+# reflows the bound TUI and carries no keystroke content.  Dimensions are
+# clamped to a sane bound (positive, at most 500 columns by 200 rows) so a
+# wild value cannot balloon the pty, and a non-integer dimension rejects
+# the frame with a typed close reason instead of tearing the viewer
+# websocket down on a struct.pack TypeError.
+_WS_RESIZE_MAX_COLS = 500
+_WS_RESIZE_MAX_ROWS = 200
+_WS_CLOSE_RESIZE_MALFORMED = 4000
+
+
+def _web_resize_dimensions(payload: dict[str, Any]) -> tuple[int, int] | None:
+    """The clamped ``(rows, cols)`` of one resize frame, or None if malformed.
+
+    Absent dimensions keep the deployed defaults (24×80); a stated
+    dimension must be an integer (booleans are rejected: ``True`` is not
+    a size), and integers are clamped into the bound rather than
+    rejected, because an over-large viewer is a reasonable thing to
+    satisfy at the bound.
+    """
+    rows = payload.get("rows", 24)
+    cols = payload.get("cols", 80)
+    for dimension in (rows, cols):
+        if isinstance(dimension, bool) or not isinstance(dimension, int):
+            return None
+    return (
+        max(1, min(rows, _WS_RESIZE_MAX_ROWS)),
+        max(1, min(cols, _WS_RESIZE_MAX_COLS)),
+    )
+
+
 @app.websocket("/terminals/{terminal_id}/ws")
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
@@ -4104,8 +4482,17 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                         if i + chunk_size < len(raw):
                             await asyncio.sleep(0.01)
                 elif payload.get("type") == "resize":
-                    rows = payload.get("rows", 24)
-                    cols = payload.get("cols", 80)
+                    dimensions = _web_resize_dimensions(payload)
+                    if dimensions is None:
+                        # Fail closed with a typed reason: a malformed
+                        # resize is a client bug the operator should see,
+                        # not an untyped teardown.
+                        await websocket.close(
+                            code=_WS_CLOSE_RESIZE_MALFORMED,
+                            reason="resize-malformed: rows/cols must be integers",
+                        )
+                        return
+                    rows, cols = dimensions
                     winsize_data = struct.pack("HHHH", rows, cols, 0, 0)
                     fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize_data)
                     # Explicitly notify tmux of the size change —

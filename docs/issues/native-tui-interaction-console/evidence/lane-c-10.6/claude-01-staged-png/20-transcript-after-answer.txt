@@ -1,0 +1,29 @@
+╭─── Claude Code v2.1.220 ─────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                    │
+│                 Welcome back <ACCOUNT>!                │ Run /init to create a CLAUDE.md file with … │
+│                                                    │ ─────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                  │
+│                      ▝▜█████▛▘                     │ Bug fixes and reliability improvements      │
+│                        ▘▘ ▝▝                       │ Added Claude Opus 5 (`claude-opus-5`), now… │
+│     Sonnet 5 with xhigh effort · Claude Max ·      │ Added `sandbox.network.strictAllowlist` se… │
+│     <ACCOUNT>'s Organization          │ /release-notes for more                     │
+│     /…/cao_scratch_lanec0/worktree-lanec-claude    │                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 1 MCP server needs authentication · run /mcp
+
+❯ Read the image file at <HOST_TMP>/pytest-of-<USER>/p
+  ytest-607/cao_state_lanec0/attachments/0f0824cd/92694f9fcb4442cf910d1b8168049a4b.png and tell me
+  the two colors in it, left half and right half, in one short sentence.
+
+  Read 1 file
+
+⏺ Left half is red, right half is blue.
+
+✻ Worked for 10s
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ctx 7% (65k/1000k) │ sess 100% →06:40 │ wk 83% →Mon │ sonnet-5 │ xhigh │ /…/cao_scratch_lanec0/w…
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 3 agents

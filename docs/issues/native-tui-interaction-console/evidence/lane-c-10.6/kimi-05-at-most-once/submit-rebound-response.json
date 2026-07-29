@@ -1,0 +1,10 @@
+{
+  "body": {
+    "detail": "operation id was already used with a different payload; a caller-minted id is immutable",
+    "operation_id": "2d6da4a2-1614-408f-b6e5-f71a821eb062",
+    "outcome": "refused",
+    "reason_code": "request-rebound",
+    "replayed": false
+  },
+  "status_code": 200
+}

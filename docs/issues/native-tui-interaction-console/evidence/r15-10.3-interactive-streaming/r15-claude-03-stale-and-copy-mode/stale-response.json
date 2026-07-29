@@ -1,0 +1,49 @@
+{
+  "chord": null,
+  "chord_attempted": null,
+  "chord_sent": null,
+  "chunks_sent": null,
+  "control_id": "ctl-660a27c59e",
+  "detail": "the expected generation is not the terminal's live generation; the terminal the caller meant has been replaced",
+  "enter_attempted": null,
+  "enter_sent": false,
+  "events": [
+    {
+      "ordinal": 0,
+      "outcome": "refused",
+      "text": "R15CSTALE-a0d82c77",
+      "type": "text"
+    }
+  ],
+  "in_flight": false,
+  "outcome": "refused",
+  "protocol": "cao-control-input-v1",
+  "reason_code": "stale-generation",
+  "reattemptable": true,
+  "request_digest": "44e303424c01449533e9b8523a261a3d54f9030023cfd8faa1e6c85a3a2d1c55",
+  "request_schema_version": 4,
+  "resolved_identity": {
+    "execution_mode": "native_tui",
+    "native_session_id": "56474cc6-6b9b-4acb-83e8-7969f6368e8a",
+    "pane": {
+      "bound_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "dead": false,
+      "observed_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "pane_id": "%4",
+      "pane_pid": 88788,
+      "window_id": "@4"
+    },
+    "pane_birth_id": "%4",
+    "provider": "claude_code",
+    "provider_process_id": "88788@Wed Jul 29 02:14:52 2026",
+    "session_name": "cao-a103-r15-claude-5bb90e",
+    "terminal_generation": "226ab116-1e54-4154-92ba-06112ff9e959",
+    "terminal_id": "a99bee0a",
+    "terminal_incarnation": null
+  },
+  "state": null,
+  "submission_evidence_ref": null,
+  "submission_observed": null,
+  "terminal_id": "a99bee0a",
+  "text_sent": false
+}

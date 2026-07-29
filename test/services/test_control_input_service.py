@@ -2288,6 +2288,20 @@ class TestSequenceIntentPolicy:
             ({"type": "key", "key": "C-c"}, service.INTENT_INTERRUPT),
             ({"type": "key", "key": "C-s"}, service.INTENT_INTERRUPT),
             ({"type": "chord", "chord": "C-s"}, service.INTENT_INTERRUPT),
+            # §3.2, pinned: every one of the eleven new navigation/editing
+            # keys is composer-class — idle-gated like any composer write,
+            # because no per-provider evidence supports exempting them.
+            ({"type": "key", "key": "Up"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Down"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Left"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Right"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Home"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "End"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "PageUp"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "PageDown"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Delete"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Insert"}, service.INTENT_COMPOSER),
+            ({"type": "key", "key": "Tab"}, service.INTENT_COMPOSER),
         ],
     )
     def test_every_event_form_has_one_class(self, event, intent):
@@ -2406,6 +2420,27 @@ class TestSequenceManagedAdapter:
         assert client.sent[3] == ("literal", "two", False)
         assert client.sent[4] == ("literal", "", True)
         assert adapter.calls == [({"lines": ["one"]}, False), ({"lines": ["two"]}, True)]
+        assert [event["outcome"] for event in result.events] == ["sent"] * 6
+
+    def test_ordering_across_text_navigation_and_chords(self, journal):
+        """The §3.2 extension rides the same ordering: text, navigation
+        keys, and a chord land in sequence order with per-event outcomes."""
+        client = _FakeChordClient()
+        events = [
+            {"type": "text", "text": "/model"},
+            {"type": "key", "key": "Up"},
+            {"type": "key", "key": "Up"},
+            {"type": "key", "key": "PageDown"},
+            {"type": "key", "key": "Enter"},
+            {"type": "chord", "chord": "C-s"},
+        ]
+        adapter, result = self._send(journal, client, events)
+        assert result.outcome == ACCEPTED
+        kinds = [entry[0] for entry in client.sent]
+        assert kinds == ["literal", "key", "key", "key", "literal", "chord"]
+        assert client.sent[1] == ("key", "Up")
+        assert client.sent[2] == ("key", "Up")
+        assert client.sent[3] == ("key", "PageDown")
         assert [event["outcome"] for event in result.events] == ["sent"] * 6
 
     def test_interrupted_text_leaves_the_tail_skipped(self, journal):
@@ -2598,6 +2633,880 @@ class TestSequenceReadinessGate:
         )
         assert delivered.outcome == ACCEPTED
         assert [write["key"] for write in client.writes] == ["Escape"]
+
+
+# --- §4.1: the declared command-class guard ----------------------------------
+
+from cli_agent_orchestrator.services.control_input_contract import (  # noqa: E402
+    REASON_COMPOSER_NONEMPTY,
+    REASON_MALFORMED_COMMAND_DECLARATION,
+    REASON_PROVIDER_UNSUPPORTED,
+    control_input_request_digest_v4,
+)
+
+COMMAND_EVENTS = [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
+
+
+def _deliver_declared(journal, events=COMMAND_EVENTS, **overrides):
+    kwargs = {"control_id": CONTROL, "events": events, "payload_class": "command"}
+    kwargs.update(overrides)
+    return service.deliver_control_input(TERMINAL, journal=journal, **kwargs)
+
+
+class TestCommandDeclarationShape:
+    """The v4 carrier's request-level rules: the either/or, the typed
+    malformed-declaration refusal, and the no-shape-detection rule."""
+
+    def test_payload_class_beside_the_v1_fields_is_a_shape_error(self, journal):
+        """v4 = v3 + the declaration carrier: the field is undefined beside
+        text/enter, refused as a shape error rather than silently dropped
+        (a declared command delivered as prose is a control nobody authorised)."""
+        with pytest.raises(service.ControlInputRequestInvalid):
+            service.deliver_control_input(
+                TERMINAL,
+                control_id=CONTROL,
+                text="/compact",
+                enter=True,
+                payload_class="command",
+                journal=journal,
+            )
+
+    def test_payload_class_beside_v2_chord_is_a_shape_error(self, journal):
+        with pytest.raises(service.ControlInputRequestInvalid):
+            service.deliver_control_input(
+                TERMINAL,
+                control_id=CONTROL,
+                text="/compact",
+                enter=False,
+                chord="C-s",
+                payload_class="command",
+                journal=journal,
+            )
+
+    def test_an_unknown_payload_class_value_is_the_typed_refusal(self, tmux, journal):
+        result = _deliver_declared(journal, payload_class="probe")
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_MALFORMED_COMMAND_DECLARATION
+        assert result.request_schema_version == 4
+        assert result.as_response()["reattemptable"] is True
+        assert tmux.writes == []
+
+    def test_a_non_string_payload_class_is_the_typed_refusal(self, tmux, journal):
+        result = _deliver_declared(journal, payload_class=42)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_MALFORMED_COMMAND_DECLARATION
+        assert tmux.writes == []
+
+    @pytest.mark.parametrize(
+        "events",
+        [
+            [{"type": "text", "text": "prose"}],
+            [{"type": "text", "text": "see /tmp/x"}],
+            [{"type": "key", "key": "Enter"}],
+            [{"type": "text", "text": "/a"}, {"type": "text", "text": "/b"}],
+            [{"type": "text", "text": "/a"}, {"type": "key", "key": "Escape"}],
+            [
+                {"type": "text", "text": "/a"},
+                {"type": "key", "key": "Enter"},
+                {"type": "key", "key": "Enter"},
+            ],
+        ],
+    )
+    def test_a_declared_command_outside_the_grammar_is_the_typed_refusal(
+        self, tmux, journal, events
+    ):
+        result = _deliver_declared(journal, events=events)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_MALFORMED_COMMAND_DECLARATION
+        assert [event["outcome"] for event in result.events] == ["refused"] * len(events)
+        assert tmux.writes == []
+
+    def test_an_explicit_null_payload_class_is_the_absent_declaration(self, tmux, journal):
+        """A JSON null is the prose spelling: the request is v3, and the
+        guard never fires."""
+        result = service.deliver_control_input(
+            TERMINAL,
+            control_id=CONTROL,
+            events=[{"type": "text", "text": "hello"}],
+            payload_class=None,
+            journal=journal,
+        )
+        assert result.outcome == ACCEPTED
+        assert result.request_schema_version == 3
+
+    def test_a_declared_request_rebinds_against_a_v3_caller_digest(self, tmux, journal):
+        """The declaration participates in the digest: a caller that
+        authorised the v3 (undeclared) request is not bound to the
+        declared one — rebound blindness is what the carrier prevents."""
+        v3_digest = control_input_request_digest_v3(
+            control_id=CONTROL, events=COMMAND_EVENTS, expected_identity=None
+        )
+        result = _deliver_declared(journal, request_digest=v3_digest)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_REQUEST_REBOUND
+        assert tmux.writes == []
+
+
+def _deliver_interactive(journal, events, **overrides):
+    kwargs = {"control_id": CONTROL, "events": events, "payload_class": "interactive"}
+    kwargs.update(overrides)
+    return service.deliver_control_input(TERMINAL, journal=journal, **kwargs)
+
+
+class TestInteractiveDeclaration:
+    """§6.7 (r15): a declared interactive batch bypasses only the provider
+    turn-state readiness refusal and the kimi dispatch grace — capability-
+    gated per terminal build — with every other guard (lease, identity,
+    copy mode, journal, deadline) exactly as for an undeclared batch."""
+
+    INTERACTIVE_EVENTS = [{"type": "text", "text": "queued mid-turn"}]
+
+    def _wire(self, monkeypatch, resolved, adapter, plans, turn_status=TerminalStatus.IDLE):
+        from cli_agent_orchestrator.services import managed_launch_v2
+
+        with service._native_kimi_dispatch_guard_lock:
+            service._native_kimi_dispatch_times.clear()
+        monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
+        client = FakeTmux(
+            identities=[
+                FakePaneIdentity(
+                    pane_id=resolved.pane_id,
+                    window_id=resolved.window_id,
+                    pane_pid=resolved.pane_pid,
+                )
+            ]
+        )
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        monkeypatch.setattr(
+            service,
+            "_native_sequence_preflight",
+            lambda *a, **k: (adapter, plans, None),
+        )
+
+        def _observe(provider, **kwargs):
+            if isinstance(turn_status, BaseException):
+                raise turn_status
+            return turn_status
+
+        monkeypatch.setattr(managed_launch_v2, "_observe_turn_state", _observe)
+        return client
+
+    def test_interactive_bypasses_the_turn_gate_that_gates_the_same_events_undeclared(
+        self, monkeypatch, journal
+    ):
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+            turn_status=TerminalStatus.PROCESSING,
+        )
+        undeclared = _deliver_sequence(journal, events=self.INTERACTIVE_EVENTS)
+        assert undeclared.outcome == REFUSED
+        assert undeclared.reason_code == REASON_PANE_BUSY
+        assert client.writes == []
+
+        declared = _deliver_interactive(
+            journal, self.INTERACTIVE_EVENTS, control_id="ctl-interactive-1"
+        )
+        assert declared.outcome == ACCEPTED
+        assert declared.request_schema_version == 4
+        assert len(client.writes) == 1
+
+    def test_interactive_bypasses_the_kimi_dispatch_grace_but_marks_after_enter(
+        self, monkeypatch, journal
+    ):
+        resolved = _seq_resolved()
+        binding = ControlInputBinding(
+            request_id=CONTROL,
+            terminal_id=TERMINAL,
+            pane_id=PANE,
+            window_id=WINDOW,
+            pane_pid=PANE_PID,
+            request_sha256="0" * 64,
+            generation=GENERATION,
+            server_socket_path=SOCKET,
+        )
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+            turn_status=TerminalStatus.IDLE,
+        )
+        # Inside the grace of a preceding Enter: undeclared is gated (the
+        # §6.4 pause case), the declared interactive batch is not.
+        service._mark_native_kimi_dispatch(service._native_kimi_dispatch_key(resolved, binding))
+        declared = _deliver_interactive(
+            journal,
+            [{"type": "text", "text": "queued mid-turn"}, {"type": "key", "key": "Enter"}],
+            control_id="ctl-interactive-1",
+        )
+        assert declared.outcome == ACCEPTED
+        # The interactive Enter still marked the dispatch: a following
+        # undeclared composer batch keeps its grace protection.
+        undeclared = _deliver_sequence(
+            journal, events=self.INTERACTIVE_EVENTS, control_id="ctl-undeclared-1"
+        )
+        assert undeclared.outcome == REFUSED
+        assert undeclared.reason_code == REASON_PANE_BUSY
+        assert "dispatch grace" in undeclared.detail
+
+    def test_interactive_still_refuses_real_lease_contention(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+
+        @contextmanager
+        def _held_lease(*a, **k):
+            raise service.PaneBusyError(
+                "input lease is held by another process/thread: operator-message:op-1"
+            )
+
+        monkeypatch.setattr(service, "pane_input_lease", _held_lease)
+        result = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PANE_BUSY
+        assert "input lease is held by" in result.detail
+        assert result.request_schema_version == 4
+        assert client.writes == []
+
+    def test_interactive_on_an_unproven_build_fails_closed_pre_write(self, monkeypatch, journal):
+        resolved = _seq_resolved(provider_version="9.9.9")
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+        result = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PROVIDER_UNSUPPORTED
+        assert "interactive-streaming" in result.detail
+        assert client.writes == []
+
+    def test_interactive_on_an_unknown_version_fails_closed(self, monkeypatch, journal):
+        resolved = _seq_resolved(provider_version=None)
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+        result = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PROVIDER_UNSUPPORTED
+        assert client.writes == []
+
+    def test_interactive_still_runs_the_copy_mode_guard(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+        monkeypatch.setattr(
+            service,
+            "_copy_mode_guard_refusal",
+            lambda *a, **k: ("copy-mode-active", "the pane is in copy mode"),
+        )
+        result = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
+        assert result.outcome == REFUSED
+        assert result.reason_code == "copy-mode-active"
+        assert client.writes == []
+
+    def test_interactive_refuses_fail_closed_in_copy_mode_without_exiting_it(
+        self, monkeypatch, journal
+    ):
+        """§6.7 (r15): the interactive bypass never skips the copy-mode
+        guard, and for a declared batch the guard is fail-closed — zero
+        bytes, no exit control, the operator's copy mode untouched."""
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+        monkeypatch.setattr(client, "pane_in_copy_mode", lambda pane_id, **kwargs: True)
+        result = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
+        assert result.outcome == REFUSED
+        assert result.reason_code == "copy-mode-active"
+        assert "left untouched" in result.detail
+        # Fail closed: no exit control and no payload bytes.
+        assert client.writes == []
+
+    def test_undeclared_keeps_the_legacy_copy_mode_exit_and_deliver(self, monkeypatch, journal):
+        """The legacy undeclared behavior is preserved exactly: a proven
+        copy mode is exited once and the payload delivered exactly once."""
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+        in_mode = {"value": True}
+        monkeypatch.setattr(client, "pane_in_copy_mode", lambda pane_id, **kwargs: in_mode["value"])
+        original_cancel = client.send_copy_mode_cancel
+
+        def _cancel(pane_id, **kwargs):
+            in_mode["value"] = False
+            return original_cancel(pane_id, **kwargs)
+
+        monkeypatch.setattr(client, "send_copy_mode_cancel", _cancel)
+        result = _deliver_sequence(journal, events=self.INTERACTIVE_EVENTS)
+        assert result.outcome == ACCEPTED
+        assert client.writes[0]["copy_mode_cancel"] is True
+        assert any(write.get("text") == "queued mid-turn" for write in client.writes)
+
+    def test_a_divergent_declaration_on_a_reused_id_is_request_rebound(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["queued mid-turn"]}},
+        )
+        declared = _deliver_interactive(journal, self.INTERACTIVE_EVENTS)
+        assert declared.outcome == ACCEPTED
+        # The same id with the same events but undeclared is a different
+        # request (the declaration participates in the digest), not a replay.
+        undeclared = _deliver_sequence(journal, events=self.INTERACTIVE_EVENTS)
+        assert undeclared.outcome == REFUSED
+        assert undeclared.reason_code == REASON_REQUEST_REBOUND
+
+    def test_interactive_legal_payload_is_the_v3_sequence_grammar(self, monkeypatch, journal):
+        """Prose text, ordinary keys, and chords ride a declaration that
+        never enters the command grammar — even slash-led prose."""
+        resolved = _seq_resolved()
+        client = self._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["see /tmp/x"]}},
+        )
+        result = _deliver_interactive(
+            journal,
+            [{"type": "text", "text": "see /tmp/x"}, {"type": "key", "key": "Down"}],
+        )
+        assert result.outcome == ACCEPTED
+        assert len(client.writes) == 2
+
+
+class TestCommandClassGuard:
+    """The never-concatenate guard (§4.1): a declared command is written
+    only against a composer *proven empty*, under the lease, before the
+    claim — and undeclared payloads never see the guard at all."""
+
+    def _wire(
+        self,
+        monkeypatch,
+        resolved,
+        adapter,
+        plans,
+        *,
+        empty,
+        turn_status=TerminalStatus.IDLE,
+        execution_close=None,
+    ):
+        from cli_agent_orchestrator.services import managed_launch_v2
+        from cli_agent_orchestrator.services.control_input_contract import SUBMISSION_SUBMITTED
+
+        with service._native_kimi_dispatch_guard_lock:
+            service._native_kimi_dispatch_times.clear()
+        monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
+        client = FakeTmux(
+            identities=[
+                FakePaneIdentity(
+                    pane_id=resolved.pane_id,
+                    window_id=resolved.window_id,
+                    pane_pid=resolved.pane_pid,
+                )
+            ]
+        )
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        monkeypatch.setattr(
+            service,
+            "_native_sequence_preflight",
+            lambda *a, **k: (adapter, plans, None),
+        )
+        monkeypatch.setattr(managed_launch_v2, "_observe_turn_state", lambda *a, **k: turn_status)
+        # The pre-write baseline capture and the r11 post-write execution
+        # observation: no real pane exists here, so both are staged.  The
+        # default close is the proven one — submitted with an evidence ref —
+        # and two-close tests pass their own (observed, ref) pair.
+        monkeypatch.setattr(
+            native_pane_input, "capture_execution_rows", lambda pane_id, pin, **k: []
+        )
+        if execution_close is None:
+            execution_close = (SUBMISSION_SUBMITTED, "capture-pane:%17:test:sha256:beef")
+        monkeypatch.setattr(
+            native_pane_input,
+            "observe_command_execution",
+            lambda pane_id, pin, **k: execution_close,
+        )
+        if isinstance(empty, BaseException):
+            monkeypatch.setattr(
+                native_pane_input, "observe_composer_empty", self._raising_observer(empty)
+            )
+        else:
+            observations = []
+            monkeypatch.setattr(
+                native_pane_input,
+                "observe_composer_empty",
+                lambda pane_id, pin, **k: observations.append((pane_id, pin)) or empty,
+            )
+            return client, observations
+        return client, None
+
+    @staticmethod
+    def _raising_observer(exc):
+        def _observe(pane_id, pin, **kwargs):
+            raise exc
+
+        return _observe
+
+    def _declared(
+        self, journal, monkeypatch, *, empty, resolved=None, execution_close=None, **overrides
+    ):
+        # 0.29.2 is the live-verified emptiness pin; an unpinned build is
+        # the provider-unsupported case, pinned separately below.
+        resolved = resolved or _seq_resolved(provider_version="0.29.2")
+        adapter = _FakeSequenceAdapter()
+        plans = {0: {"lines": ["/compact"]}}
+        wired = self._wire(
+            monkeypatch, resolved, adapter, plans, empty=empty, execution_close=execution_close
+        )
+        client = wired[0]
+        result = _deliver_declared(journal, **overrides)
+        return result, client, adapter, wired[1]
+
+    def test_a_nonempty_composer_is_the_zero_byte_refusal(self, monkeypatch, journal):
+        result, client, adapter, _ = self._declared(journal, monkeypatch, empty=False)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_COMPOSER_NONEMPTY
+        assert result.request_schema_version == 4
+        assert result.as_response()["reattemptable"] is True
+        # Zero command bytes — and zero bytes of any kind: the guard
+        # observes and refuses, it never clears (no Escape, no edit keys).
+        assert client.writes == []
+        assert adapter.calls == []
+        assert [event["outcome"] for event in result.events] == ["refused"] * 2
+
+    def test_an_unobservable_composer_fails_closed_identically(self, monkeypatch, journal):
+        """ "Could not look" is not "empty": an unproven composer is the
+        same zero-byte refusal as a proven-non-empty one."""
+        result, client, adapter, _ = self._declared(journal, monkeypatch, empty=None)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_COMPOSER_NONEMPTY
+        assert client.writes == []
+        assert adapter.calls == []
+
+    def test_a_failed_observation_also_fails_closed(self, monkeypatch, journal):
+        result, client, adapter, _ = self._declared(
+            journal, monkeypatch, empty=NativePaneInputUnavailable("tmux died")
+        )
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_COMPOSER_NONEMPTY
+        assert client.writes == []
+        assert adapter.calls == []
+
+    def test_a_proven_empty_composer_delivers_exactly_the_command(self, monkeypatch, journal):
+        result, client, adapter, observations = self._declared(journal, monkeypatch, empty=True)
+        assert result.outcome == ACCEPTED
+        assert result.request_schema_version == 4
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+        assert [event["outcome"] for event in result.events] == ["sent"] * 2
+        # The observation ran under the lease against the bound pane.
+        assert observations == [
+            (PANE, native_pane_input.composer_emptiness_pin_for("kimi_cli", "0.29.2"))
+        ]
+        # The r11 close: accepted only with the execution evidence attached
+        # — an accepted declared-command record with a null submission
+        # observation or evidence ref is the PR #48 defect class.
+        assert result.submission_observed == "submitted"
+        assert result.submission_evidence_ref == "capture-pane:%17:test:sha256:beef"
+        record = journal.find(CONTROL)
+        assert record.state == DELIVERED
+        assert record.submission_observed == "submitted"
+        assert record.submission_evidence_ref == "capture-pane:%17:test:sha256:beef"
+
+    def test_a_provider_build_without_a_pin_is_provider_unsupported(self, monkeypatch, journal):
+        """No proven emptiness determination for this exact build: refused
+        rather than guessed at (§4.1)."""
+        result, client, adapter, _ = self._declared(
+            journal, monkeypatch, empty=True, resolved=_seq_resolved(provider_version="0.28.0")
+        )
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PROVIDER_UNSUPPORTED
+        assert client.writes == []
+        assert adapter.calls == []
+
+    def test_the_guard_is_journaled_and_reconciles_by_exact_id(self, monkeypatch, journal):
+        result, _, _, _ = self._declared(journal, monkeypatch, empty=False)
+        assert result.reason_code == REASON_COMPOSER_NONEMPTY
+        looked_up = service.lookup_control_input(CONTROL, journal=journal)
+        assert looked_up.outcome == REFUSED
+        assert looked_up.reason_code == REASON_COMPOSER_NONEMPTY
+        assert [event["outcome"] for event in looked_up.events] == ["refused"] * 2
+
+    def test_a_retry_after_the_refusal_rearms_and_delivers(self, monkeypatch, journal):
+        """refusal proves zero bytes, so the same control id may re-arm
+        (the deployed refused → intent edge): once the operator clears the
+        composer, the identical retry delivers."""
+        refused, _, _, _ = self._declared(journal, monkeypatch, empty=False)
+        assert refused.reason_code == REASON_COMPOSER_NONEMPTY
+        accepted, _, adapter, _ = self._declared(journal, monkeypatch, empty=True)
+        assert accepted.outcome == ACCEPTED
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+
+    def test_the_readiness_gate_still_precedes_the_guard(self, monkeypatch, journal):
+        """During an active turn the answer is the deployed pane-busy, and
+        the composer is never observed: the guard adds nothing to the
+        existing gates."""
+        resolved = _seq_resolved()
+        adapter = _FakeSequenceAdapter()
+        client, observations = self._wire(
+            monkeypatch,
+            resolved,
+            adapter,
+            {0: {"lines": ["/compact"]}},
+            empty=AssertionError("the guard must not observe during a turn"),
+            turn_status=TerminalStatus.PROCESSING,
+        )
+        result = _deliver_declared(journal)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PANE_BUSY
+        assert client.writes == []
+
+    def test_a_stale_identity_never_reaches_the_guard(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        adapter = _FakeSequenceAdapter()
+        self._wire(
+            monkeypatch,
+            resolved,
+            adapter,
+            {0: {"lines": ["/compact"]}},
+            empty=AssertionError("the guard must not observe for a stale binding"),
+        )
+        result = _deliver_declared(
+            journal, expected_identity={"terminal_generation": "gen-from-before"}
+        )
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_STALE_GENERATION
+        assert result.request_schema_version == 4
+
+    def test_undeclared_command_shaped_text_is_prose_and_never_guarded(self, monkeypatch, journal):
+        """The r7 carrier case: a batch whose text begins with '/' is
+        undeclared prose.  The streamed `see /tmp/x` split — a batch
+        starting '/tmp/x' after the quiet timer — sails through with no
+        guard and no observation, exactly as before v4 existed."""
+        resolved = _seq_resolved()
+        adapter = _FakeSequenceAdapter()
+        self._wire(
+            monkeypatch,
+            resolved,
+            adapter,
+            {0: {"lines": ["/tmp/x"]}},
+            empty=AssertionError("undeclared prose must never be observed"),
+        )
+        result = _deliver_sequence(journal, events=[{"type": "text", "text": "/tmp/x"}])
+        assert result.outcome == ACCEPTED
+        assert result.request_schema_version == 3
+        assert adapter.calls == [({"lines": ["/tmp/x"]}, False)]
+
+    def test_undeclared_compact_text_stays_the_deployed_button(self, monkeypatch, journal):
+        """The deployed Compact button sends '/compact' as ordinary text:
+        undeclared, unguarded, byte-identical behaviour (§4: compact-as-
+        composer-text is preserved; only the registry built-in declares)."""
+        resolved = _seq_resolved()
+        adapter = _FakeSequenceAdapter()
+        self._wire(
+            monkeypatch,
+            resolved,
+            adapter,
+            {0: {"lines": ["/compact"]}},
+            empty=AssertionError("undeclared prose must never be observed"),
+        )
+        result = _deliver_sequence(journal, events=COMMAND_EVENTS)
+        assert result.outcome == ACCEPTED
+        assert result.request_schema_version == 3
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+
+
+class TestCommandTwoClose:
+    """The r11 two-close rule for declared commands (§4.1): transport
+    acceptance is not command execution — ``accepted`` only with the
+    pinned execution signal observed and its evidence journaled;
+    otherwise ``ambiguous``/``submission-unproven``, terminal, never a
+    retry licence."""
+
+    def _declared(self, journal, monkeypatch, *, execution_close, resolved=None, **overrides):
+        harness = TestCommandClassGuard()
+        resolved = resolved or _seq_resolved(provider_version="0.29.2")
+        adapter = _FakeSequenceAdapter()
+        harness._wire(
+            monkeypatch,
+            resolved,
+            adapter,
+            {0: {"lines": ["/compact"]}},
+            empty=True,
+            execution_close=execution_close,
+        )
+        result = _deliver_declared(journal, **overrides)
+        return result, adapter
+
+    def test_an_unproven_execution_closes_ambiguous_never_accepted(self, monkeypatch, journal):
+        result, adapter = self._declared(
+            journal, monkeypatch, execution_close=(SUBMISSION_UNKNOWN, None)
+        )
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        assert result.request_schema_version == 4
+        assert result.submission_observed == "unknown"
+        assert "execution signal" in result.detail
+        # The write happened; the close is terminal for automation — the
+        # exact-id reconcile replays the record and a re-POST never resends.
+        record = journal.find(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        assert record.submission_observed == "unknown"
+        looked_up = service.lookup_control_input(CONTROL, journal=journal)
+        assert looked_up.outcome == AMBIGUOUS
+        assert looked_up.reason_code == "submission-unproven"
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]  # exactly one write, ever
+
+    def test_a_resting_command_closes_unsubmitted_with_evidence(self, monkeypatch, journal):
+        result, _ = self._declared(
+            journal,
+            monkeypatch,
+            execution_close=(SUBMISSION_UNSUBMITTED, "capture-pane:%17:t2:sha256:cafe"),
+        )
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        assert result.submission_observed == "unsubmitted"
+        assert result.submission_evidence_ref == "capture-pane:%17:t2:sha256:cafe"
+
+    def test_a_same_id_repost_replays_the_ambiguous_record_with_zero_new_writes(
+        self, monkeypatch, journal
+    ):
+        result, adapter = self._declared(
+            journal, monkeypatch, execution_close=(SUBMISSION_UNKNOWN, None)
+        )
+        assert result.outcome == AMBIGUOUS
+        replay, _ = self._declared(journal, monkeypatch, execution_close=(SUBMISSION_UNKNOWN, None))
+        assert replay.outcome == AMBIGUOUS
+        assert replay.reason_code == "submission-unproven"
+        # One composer plan execution total — the replay answered from the
+        # journal, never from the pane.
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+
+    def test_a_build_without_the_execution_pin_is_refused_pre_write(self, monkeypatch, journal):
+        """Both pins are required: an emptiness pin alone would close on
+        transport facts — the PR #48 defect class."""
+        monkeypatch.setattr(native_pane_input, "command_execution_pin_for", lambda *a: None)
+        result, adapter = self._declared(journal, monkeypatch, execution_close=None)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_PROVIDER_UNSUPPORTED
+        assert "execution observation" in result.detail
+        assert adapter.calls == []
+
+    def test_a_failed_baseline_capture_fails_the_guard_closed(self, monkeypatch, journal):
+        harness = TestCommandClassGuard()
+        resolved = _seq_resolved(provider_version="0.29.2")
+        adapter = _FakeSequenceAdapter()
+        harness._wire(monkeypatch, resolved, adapter, {0: {"lines": ["/compact"]}}, empty=True)
+        monkeypatch.setattr(
+            native_pane_input,
+            "capture_execution_rows",
+            lambda *a, **k: (_ for _ in ()).throw(NativePaneInputUnavailable("tmux died")),
+        )
+        # The baseline feeds the guard's observation, so an empty baseline
+        # is an unproven composer — zero bytes, never a guessed write.
+        monkeypatch.setattr(
+            native_pane_input,
+            "observe_composer_empty",
+            lambda pane_id, pin, **k: None if k.get("screen")() == [] else True,
+        )
+        result = _deliver_declared(journal)
+        assert result.outcome == REFUSED
+        assert result.reason_code == REASON_COMPOSER_NONEMPTY
+        assert adapter.calls == []
+
+    def test_every_accepted_declared_command_carries_execution_evidence(self, monkeypatch, journal):
+        """The PR #48 regression shape, forbidden outright: no accepted
+        declared-command record may have a null submission observation or
+        a null evidence reference."""
+        result, _ = self._declared(
+            journal,
+            monkeypatch,
+            execution_close=(SUBMISSION_SUBMITTED, "capture-pane:%17:t3:sha256:d00d"),
+        )
+        assert result.outcome == ACCEPTED
+        assert result.submission_observed is not None
+        assert result.submission_evidence_ref is not None
+        record = journal.find(CONTROL)
+        assert record.state == DELIVERED
+        assert record.submission_observed is not None
+        assert record.submission_evidence_ref is not None
+        # And the replayed answer carries the same evidence, not a null.
+        looked_up = service.lookup_control_input(CONTROL, journal=journal)
+        assert looked_up.outcome == ACCEPTED
+        assert looked_up.submission_observed == "submitted"
+        assert looked_up.submission_evidence_ref == "capture-pane:%17:t3:sha256:d00d"
+
+    def test_a_late_signal_never_closes_accepted_on_the_send_path(self, monkeypatch, journal):
+        """The caller-side deadline defense (steer-041): the helper hands
+        back a submitted observation *after* the write deadline — a
+        capture that completed late — and the close is still the terminal
+        ambiguity, never an accepted record carrying after-deadline
+        evidence.  Replaying by exact id writes nothing further."""
+        import time as _time
+
+        monkeypatch.setattr(service, "WRITE_DEADLINE_SECONDS", 0.2)
+
+        def _late_submitted(*args, **kwargs):
+            _time.sleep(0.4)
+            return (SUBMISSION_SUBMITTED, "capture-pane:%17:late:sha256:1afe")
+
+        harness = TestCommandClassGuard()
+        resolved = _seq_resolved(provider_version="0.29.2")
+        adapter = _FakeSequenceAdapter()
+        harness._wire(monkeypatch, resolved, adapter, {0: {"lines": ["/compact"]}}, empty=True)
+        monkeypatch.setattr(native_pane_input, "observe_command_execution", _late_submitted)
+        result = _deliver_declared(journal)
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        assert result.submission_observed == "unknown"
+        # No accepted record exists: the journal never reached delivered,
+        # so nothing carries the after-deadline evidence ref.
+        record = journal.find(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        assert record.submission_evidence_ref != "capture-pane:%17:late:sha256:1afe"
+        looked_up = service.lookup_control_input(CONTROL, journal=journal)
+        assert looked_up.outcome == AMBIGUOUS
+        assert looked_up.reason_code == "submission-unproven"
+        # One composer plan execution total — the exact-id reconcile
+        # answered from the record and never wrote again.
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+
+    def test_a_late_signal_never_closes_accepted_on_the_literal_sink(self, monkeypatch, journal):
+        """The literal-sink twin (steer-043): the unmanaged send path has
+        its own caller defense, and it holds the same boundary — a helper
+        returning submitted only after the write deadline closes the
+        declared command terminally ambiguous with no accepted record and
+        no after-deadline evidence anywhere."""
+        import time as _time
+
+        monkeypatch.setattr(service, "WRITE_DEADLINE_SECONDS", 0.2)
+
+        def _late_submitted(*args, **kwargs):
+            _time.sleep(0.4)
+            return (SUBMISSION_SUBMITTED, "capture-pane:%17:late:sha256:1afe")
+
+        # The literal sink serves an unmanaged pane: same provider+build
+        # pins, no managed adapter preflight.
+        resolved = _seq_resolved(provider_version="0.29.2", managed=False)
+        monkeypatch.setattr(service, "resolve_control_identity", lambda tid: resolved)
+        client = FakeTmux(
+            identities=[
+                FakePaneIdentity(
+                    pane_id=resolved.pane_id,
+                    window_id=resolved.window_id,
+                    pane_pid=resolved.pane_pid,
+                )
+            ]
+        )
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        monkeypatch.setattr(native_pane_input, "observe_composer_empty", lambda *a, **k: True)
+        monkeypatch.setattr(native_pane_input, "capture_execution_rows", lambda *a, **k: [])
+        monkeypatch.setattr(native_pane_input, "observe_command_execution", _late_submitted)
+
+        result = _deliver_declared(journal)
+        assert result.outcome == AMBIGUOUS
+        assert result.reason_code == "submission-unproven"
+        assert result.submission_observed == "unknown"
+        # Null evidence in the response AND in the journal row — nothing
+        # may carry the after-deadline ref.
+        assert result.submission_evidence_ref is None
+        record = journal.find(CONTROL)
+        assert record.state == STATE_AMBIGUOUS
+        assert record.submission_evidence_ref is None
+        # The one fused text+Enter write happened exactly once; the
+        # exact-id replay adds zero writes.
+        writes_before = len(client.writes)
+        assert writes_before == 1
+        looked_up = service.lookup_control_input(CONTROL, journal=journal)
+        assert looked_up.outcome == AMBIGUOUS
+        assert looked_up.reason_code == "submission-unproven"
+        assert len(client.writes) == writes_before
+
+
+class TestPaneBusyDetailDiscriminators:
+    """The three pane-busy detail strings, verbatim and pairwise-disjoint
+    (§10.1): streaming's pause/disarm routing reads them, so a wording
+    tweak must fail this suite loudly rather than silently re-route."""
+
+    GRACE = "inside its dispatch grace"
+    TURN = "not idle"
+    LEASE = "input lease is held by"
+
+    def test_the_three_discriminators_are_pairwise_disjoint(self):
+        for mine, theirs in (
+            (self.GRACE, (self.TURN, self.LEASE)),
+            (self.TURN, (self.GRACE, self.LEASE)),
+            (self.LEASE, (self.GRACE, self.TURN)),
+        ):
+            assert all(mine not in other for other in theirs)
+
+    def test_dispatch_grace_detail(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        binding = _chord_binding(
+            control_input_request_digest_v3(
+                control_id=CONTROL,
+                events=[{"type": "text", "text": "hello"}],
+                expected_identity=None,
+            )
+        )
+        gate = TestSequenceReadinessGate()
+        gate._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["hello"]}},
+            turn_status=TerminalStatus.IDLE,
+        )
+        service._mark_native_kimi_dispatch(service._native_kimi_dispatch_key(resolved, binding))
+        result = _deliver_sequence(journal, events=[{"type": "text", "text": "hello"}])
+        assert result.reason_code == REASON_PANE_BUSY
+        assert self.GRACE in result.detail
+
+    def test_turn_state_detail(self, monkeypatch, journal):
+        resolved = _seq_resolved()
+        gate = TestSequenceReadinessGate()
+        gate._wire(
+            monkeypatch,
+            resolved,
+            _FakeSequenceAdapter(),
+            {0: {"lines": ["hello"]}},
+            turn_status=TerminalStatus.PROCESSING,
+        )
+        result = _deliver_sequence(journal, events=[{"type": "text", "text": "hello"}])
+        assert result.reason_code == REASON_PANE_BUSY
+        assert self.TURN in result.detail
+
+    def test_arbiter_contention_detail(self, tmux, journal):
+        with _pane_held_elsewhere():
+            result = _deliver_sequence(journal, events=[{"type": "key", "key": "Up"}])
+        assert result.reason_code == REASON_PANE_BUSY
+        assert self.LEASE in result.detail
+        assert tmux.writes == []
 
 
 class TestSequenceJournalReplay:

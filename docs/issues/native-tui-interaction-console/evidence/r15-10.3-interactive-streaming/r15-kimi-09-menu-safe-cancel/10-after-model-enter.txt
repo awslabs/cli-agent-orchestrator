@@ -1,0 +1,27 @@
+╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                │
+ │  ▐█████▌  Send /help for help information.                                                     │
+ │                                                                                                │
+ │  Directory: <HOST_TMP>/pytest-of-<USER>/pytest-63…│
+ │  Session:   session_d0234d3c-3867-41ec-8bea-9b2c142609ec                                       │
+ │  Model:     K2.7 Coding                                                                        │
+ │  Version:   0.29.2                                                                             │
+ │                                                                                                │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Use Kimi K3 with High thinking effort - for the best balance between token spend and capability
+   Run /model to switch to K3 and set thinking effort to High
+
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to
+ ~/.tmux.conf and restart tmux.
+
+ ✨ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do
+    not stop early.
+
+  🌕 · Tip: ask Kimi to schedule tasks, e.g. "remind me at 5pm"
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                              │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+ K2.7 Coding thinking  …/pytest-634/cao_scratch_r150/worktree-r15-kimi  master
+                                                                               context: 0% (0/256k)

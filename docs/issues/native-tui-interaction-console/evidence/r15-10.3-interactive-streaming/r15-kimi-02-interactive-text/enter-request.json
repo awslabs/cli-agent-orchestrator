@@ -1,0 +1,10 @@
+{
+  "control_id": "ctl-55c0717187",
+  "events": [
+    {
+      "key": "Enter",
+      "type": "key"
+    }
+  ],
+  "payload_class": "interactive"
+}

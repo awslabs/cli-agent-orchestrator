@@ -1,0 +1,20 @@
+{
+  "agent_profile": "lanec-acceptance",
+  "caller_id": "01313ac6",
+  "delivery_id": "82532102-1f36-44b4-a183-bcfa7c7edca2",
+  "execution_mode": "native_tui",
+  "expected_effort": "provider-default",
+  "expected_model": "sonnet",
+  "launch_nonce": "bdd12ee7fec9403590350f152392402193ba6634",
+  "obligation_generation": "obgen-5e300d19",
+  "protocol_version": "cao-managed-launch-v2",
+  "provider": "claude_code",
+  "provider_executable": "<HOME>/.local/share/claude/versions/2.1.220",
+  "provider_executable_sha256": "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081",
+  "reservation_id": "82390df9-899a-4907-9345-aa15224aecea",
+  "run_id": "run-a6e589f7",
+  "session_name": "cao-a103-lanec-claude-62441f",
+  "task_id": "lane-a-10-3-lanec-claude",
+  "trusted_project_root": null,
+  "working_directory": "<WORKTREE-LANEC-CLAUDE>"
+}

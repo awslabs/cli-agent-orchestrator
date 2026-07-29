@@ -4,7 +4,9 @@ on:
   push:
     branches: [main, conductor-deploy]
   pull_request:
-    branches: [main, conductor-deploy]
+    # The native-TUI-console integration branch is the base of the lane PRs
+    # (design.md §9); CI must run on PRs targeting it as well.
+    branches: [main, conductor-deploy, feature/native-tui-interaction-console]
 
 permissions:
   contents: read
@@ -96,6 +98,43 @@ jobs:
       - name: Build
         run: npm run build
         working-directory: web
+
+  web-e2e:
+    name: Web UI E2E (Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: web
+
+      - name: Install Playwright browser (chromium)
+        run: npm run test:e2e:install
+        working-directory: web
+
+      - name: Run Playwright E2E (desktop + mobile projects)
+        # The §10.5 suite: playwright.config.ts builds the app, serves it via
+        # vite preview, and runs the stubbed-server specs (route mocks +
+        # injected FakeWebSocket) at 1280×800 and 390×844.
+        run: npm run test:e2e
+        working-directory: web
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-playwright-report
+          path: web/playwright-report/
+          retention-days: 7
 
   cao-mcp-apps:
     name: CAO MCP Apps

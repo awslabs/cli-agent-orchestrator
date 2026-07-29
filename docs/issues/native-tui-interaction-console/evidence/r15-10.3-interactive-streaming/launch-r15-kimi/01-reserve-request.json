@@ -1,0 +1,20 @@
+{
+  "agent_profile": "lanec-acceptance",
+  "caller_id": "6173ff93",
+  "delivery_id": "58b1e35e-0bc3-4021-9e0f-f4b24e6d5d7b",
+  "execution_mode": "native_tui",
+  "expected_effort": "provider-default",
+  "expected_model": "kimi-code/kimi-for-coding",
+  "launch_nonce": "bd2d1bdfd6894f9ba185316f34da085501de19a9",
+  "obligation_generation": "obgen-1e7a5ab1",
+  "protocol_version": "cao-managed-launch-v2",
+  "provider": "kimi_cli",
+  "provider_executable": "/private/tmp/kimi-pinned-0.29.2/node_modules/@moonshot-ai/kimi-code/dist/main.mjs",
+  "provider_executable_sha256": "2ee6e2f15d68bffdce532d1c8e50f8d40e0230090b3a0dd1dbcdb7c29bf532db",
+  "reservation_id": "fd82978b-a5b2-45a4-962c-e9b7398e3704",
+  "run_id": "run-ae8e5848",
+  "session_name": "cao-a103-r15-kimi-bbe337",
+  "task_id": "lane-a-10-3-r15-kimi",
+  "trusted_project_root": null,
+  "working_directory": "<WORKTREE-R15-KIMI>"
+}

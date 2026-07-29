@@ -31,6 +31,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.security import auth
 from cli_agent_orchestrator.services import control_input_service as service
 from cli_agent_orchestrator.services import native_pane_input
@@ -329,24 +330,59 @@ class TestV2ChordDiscovery:
 
     def test_the_capability_document_advertises_v2_and_the_chord_allowlist(self, client):
         body = client.get("/control-input/capabilities").json()
-        # v1 stays the named default; v2 and v3 are advertised alongside it.
+        # v1 stays the named default; v2, v3 and v4 are advertised alongside it.
         assert body["request_schema_version"] == CONTROL_INPUT_REQUEST_SCHEMA_VERSION
-        assert body["request_schema_versions"] == [1, 2, 3]
+        assert body["request_schema_versions"] == [1, 2, 3, 4]
         assert body["digest_domain"] == CONTROL_INPUT_DIGEST_DOMAIN
         # The steer-chord allowlist is truthful: only the pinned Kimi chord.
         assert body["steer_chords"] == {"kimi_cli": ["C-s"]}
         # The v3 sequence surface states its exact representable forms.
         assert body["sequence"]["event_types"] == ["chord", "key", "text"]
-        assert body["sequence"]["keys"] == ["Backspace", "C-c", "C-s", "Enter", "Escape"]
+        # The §3.2 key set (advertised order is sorted and non-normative).
+        assert set(body["sequence"]["keys"]) == {
+            "Escape",
+            "C-c",
+            "C-s",
+            "Enter",
+            "Backspace",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "Delete",
+            "Insert",
+            "Tab",
+        }
         assert body["sequence"]["max_events"] == 32
         assert body["sequence"]["max_text_bytes"] == 512
 
     def test_the_identity_route_advertises_the_control_input_block(self, client, tmux):
         body = client.get(f"/terminals/{TERMINAL}/control-identity").json()
         block = body["control_input"]
-        assert block["schema_versions"] == [1, 2, 3]
+        assert block["schema_versions"] == [1, 2, 3, 4]
         assert block["chords"] == {"kimi_cli": ["C-s"]}
-        assert block["sequence"]["keys"] == ["Backspace", "C-c", "C-s", "Enter", "Escape"]
+        assert set(block["sequence"]["keys"]) == {
+            "Escape",
+            "C-c",
+            "C-s",
+            "Enter",
+            "Backspace",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "Delete",
+            "Insert",
+            "Tab",
+        }
 
     def test_the_identity_route_block_is_absent_on_an_unknown_terminal(self, client, tmux):
         # No body to inspect on a 404; the block is only on a resolved terminal.
@@ -1045,3 +1081,417 @@ class TestSubmissionObservationOnTheWire:
         assert body["submission_observed"] is None
         assert "submission_evidence_ref" in body
         assert body["submission_evidence_ref"] is None
+
+
+# --- §3.5/§4.1: additive capability blocks and the v4 declaration carrier -----
+
+from cli_agent_orchestrator.services.control_input_contract import (  # noqa: E402
+    CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4,
+    control_input_request_digest_v4,
+)
+
+
+def _kimi_resolved(**overrides):
+    fields = {
+        "terminal_id": TERMINAL,
+        "terminal_incarnation": None,
+        # A managed generation is a UUID: the readiness gate derives the
+        # managed window name from it and refuses anything else.
+        "terminal_generation": "11111111-2222-3333-4444-555555555555",
+        "provider": "kimi_cli",
+        "native_session_id": "sess-1",
+        "execution_mode": service.EXECUTION_MODE_NATIVE_TUI,
+        "session_name": "cao",
+        "provider_process_id": "4242@boot-1",
+        "provider_version": "0.29.2",
+        "pane_id": PANE,
+        "window_id": WINDOW,
+        "pane_pid": PANE_PID,
+        "pane_dead": False,
+        "managed": True,
+        "recorded_pane_id": PANE,
+        "bound_server_socket_path": SOCKET,
+        "observed_server_socket_path": SOCKET,
+    }
+    fields.update(overrides)
+    return service.ResolvedControlIdentity(**fields)
+
+
+class TestAdditiveCapabilities:
+    """The §3.5 blocks are additive: every deployed key is unchanged, and
+    the new keys ride alongside — old clients ignore what they do not know."""
+
+    def test_the_streaming_block_is_advertised_with_server_owned_policy(self, client):
+        body = client.get("/control-input/capabilities").json()
+        assert body["streaming"] == {
+            "supported": True,
+            "max_in_flight": 1,
+            "coalesce_window_ms": 200,
+        }
+
+    def test_the_provider_controls_block_is_the_discovery_union(self, client):
+        body = client.get("/control-input/capabilities").json()
+        controls = body["provider_controls"]
+        assert set(controls) == {"kimi_cli", "claude_code"}
+        assert controls["kimi_cli"]["compact"] == {
+            "events": [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
+        }
+        assert controls["kimi_cli"]["stop"] == {"events": [{"type": "key", "key": "Escape"}]}
+        assert controls["kimi_cli"]["steer_chords"] == ["C-s"]
+        assert controls["kimi_cli"]["dispatch_grace_ms"] == 5000
+        assert controls["claude_code"]["compact"] == controls["kimi_cli"]["compact"]
+        assert controls["claude_code"]["stop"] == controls["kimi_cli"]["stop"]
+        assert controls["claude_code"]["steer_chords"] == []
+        # No grace for Claude: providers without one omit the key (§3.5).
+        assert "dispatch_grace_ms" not in controls["claude_code"]
+        # Codex has no registry entry on this base (§13 OD3).
+        assert "codex" not in controls
+
+    def test_the_command_controls_block_is_advertised(self, client):
+        body = client.get("/control-input/capabilities").json()
+        assert body["command_controls"] == {"composer_nonempty_guard": True}
+
+    def test_the_deployed_capability_keys_are_unchanged(self, client):
+        """The additive-only proof: every key the deployed document carried
+        is still present with its deployed value (the §10.1 golden diff)."""
+        body = client.get("/control-input/capabilities").json()
+        assert body["protocol"] == CONTROL_INPUT_PROTOCOL
+        assert body["request_schema_version"] == 1
+        assert body["digest_domain"] == CONTROL_INPUT_DIGEST_DOMAIN
+        assert body["steer_chords"] == {"kimi_cli": ["C-s"]}
+        assert body["identity_fields"] == list(IDENTITY_FIELDS)
+        assert set(body["outcomes"]) == set(CONTROL_INPUT_OUTCOMES)
+        assert body["max_text_bytes"] == 512
+        assert body["literal_write"] is True
+        assert body["bracketed_paste"] is False
+        assert body["enter_required"] is True
+        assert body["server_identity_bound"] is True
+        assert body["execution_modes"] == ["native_tui"]
+        assert "malformed-command-declaration" in body["reason_codes"]
+        assert "composer-nonempty" in body["reason_codes"]
+
+    def test_the_per_terminal_block_is_the_build_exact_send_authority(self, client, monkeypatch):
+        """§3.5: the identity route's block resolves this terminal's provider
+        at this terminal's build — its steer_chords is the exact set the
+        server would admit for this pane, and the guard availability is the
+        honest per-build fact."""
+        monkeypatch.setattr(service, "resolve_control_identity", lambda tid: _kimi_resolved())
+        body = client.get(f"/terminals/{TERMINAL}/control-identity").json()
+        block = body["control_input"]
+        assert block["provider_controls"] == {
+            "kimi_cli": {
+                "compact": {
+                    "events": [
+                        {"type": "text", "text": "/compact"},
+                        {"type": "key", "key": "Enter"},
+                    ]
+                },
+                "stop": {"events": [{"type": "key", "key": "Escape"}]},
+                "steer_chords": ["C-s"],
+                "dispatch_grace_ms": 5000,
+                # §8.6 additive Lane C blocks (build-exact like steer chords).
+                "operator_message": {
+                    "supported": True,
+                    "max_text_bytes": 8192,
+                    "multiline": True,
+                    "max_attachments": 4,
+                },
+                "image": {
+                    "supported": True,
+                    "formats": ["png"],
+                    "max_bytes": 5242880,
+                    "max_width": 8000,
+                    "max_height": 8000,
+                    "mechanism": "staged-path-text",
+                    "reference_template": (
+                        "Use the ReadMediaFile tool to read the image file at "
+                        "{path} and analyze it in the context of this message."
+                    ),
+                    "evidence": "live acceptance on pinned 0.29.2 (§10.6)",
+                },
+                # §6.7 (r15): the build-exact interactive-streaming send
+                # authority for this terminal's pinned build.
+                "interactive_streaming": {"supported": True},
+            }
+        }
+        assert block["command_controls"] == {"composer_nonempty_guard": True}
+
+    def test_the_per_terminal_block_on_an_unpinned_build_admits_no_chords(
+        self, client, monkeypatch
+    ):
+        """Build-exact, never the union: a kimi build outside the pinned
+        table advertises an empty chord set and no emptiness guard, so the
+        client refuses locally with zero POSTs (D9)."""
+        monkeypatch.setattr(
+            service,
+            "resolve_control_identity",
+            lambda tid: _kimi_resolved(provider_version="9.9.9"),
+        )
+        block = client.get(f"/terminals/{TERMINAL}/control-identity").json()["control_input"]
+        assert block["provider_controls"]["kimi_cli"]["steer_chords"] == []
+        assert block["command_controls"] == {"composer_nonempty_guard": False}
+        # §8.6: the Lane C blocks fail closed with the chords — an unproven
+        # build advertises no message/image capability (omitted, not nulled).
+        assert "operator_message" not in block["provider_controls"]["kimi_cli"]
+        assert "image" not in block["provider_controls"]["kimi_cli"]
+
+    def test_a_provider_without_a_registry_entry_has_no_controls_block(self, client, monkeypatch):
+        monkeypatch.setattr(
+            service,
+            "resolve_control_identity",
+            lambda tid: _kimi_resolved(provider="codex", provider_version="0.145.0"),
+        )
+        block = client.get(f"/terminals/{TERMINAL}/control-identity").json()["control_input"]
+        assert "provider_controls" not in block
+        assert block["command_controls"] == {"composer_nonempty_guard": False}
+
+
+class _FakeSequenceAdapter:
+    """An adapter that executes plans through the transport, recording calls."""
+
+    class ComposerWriteInterrupted(Exception):
+        def __init__(self, detail):
+            super().__init__(detail)
+            self.detail = detail
+
+    def __init__(self):
+        self.calls = []
+
+    def execute_composer_plan(self, *, plan, transport, submit, deadline_monotonic=None):
+        self.calls.append((plan, submit))
+        transport.send_literal(plan["lines"][0])
+        if submit:
+            transport.send_enter()
+
+
+class TestCommandClassOverTheWire:
+    """The v4 declaration carrier at the HTTP boundary (§4.1): declared
+    commands run the guard; undeclared payloads are prose, byte-identical
+    to before the carrier existed."""
+
+    def _wire_managed_kimi(self, monkeypatch, *, empty, execution_close=None):
+        from cli_agent_orchestrator.services import managed_launch_v2
+        from cli_agent_orchestrator.services.control_input_contract import SUBMISSION_SUBMITTED
+
+        # A fresh server, dispatch-wise: an earlier test's accepted Enter
+        # would otherwise sit inside its grace and answer pane-busy where
+        # this test means to exercise the composer guard.
+        with service._native_kimi_dispatch_guard_lock:
+            service._native_kimi_dispatch_times.clear()
+        adapter = _FakeSequenceAdapter()
+        monkeypatch.setattr(service, "resolve_control_identity", lambda tid: _kimi_resolved())
+        client = FakeTmux()
+        monkeypatch.setattr(service, "_tmux_client", lambda: client)
+        monkeypatch.setattr(
+            service,
+            "_native_sequence_preflight",
+            lambda *a, **k: (adapter, {0: {"lines": ["/compact"]}}, None),
+        )
+        monkeypatch.setattr(
+            managed_launch_v2, "_observe_turn_state", lambda *a, **k: TerminalStatus.IDLE
+        )
+        monkeypatch.setattr(
+            native_pane_input, "observe_composer_empty", lambda pane_id, pin, **k: empty
+        )
+        monkeypatch.setattr(
+            native_pane_input, "capture_execution_rows", lambda pane_id, pin, **k: []
+        )
+        if execution_close is None:
+            execution_close = (SUBMISSION_SUBMITTED, "capture-pane:%17:wire:sha256:beef")
+        monkeypatch.setattr(
+            native_pane_input,
+            "observe_command_execution",
+            lambda pane_id, pin, **k: execution_close,
+        )
+        return client, adapter
+
+    def test_a_declared_compact_against_a_proven_empty_composer_is_accepted(
+        self, client, monkeypatch
+    ):
+        tmux_client, adapter = self._wire_managed_kimi(monkeypatch, empty=True)
+        events = [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
+        digest = control_input_request_digest_v4(
+            control_id=CONTROL, events=events, payload_class="command", expected_identity=None
+        )
+        response = _post(
+            client, text=None, events=events, payload_class="command", request_digest=digest
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["outcome"] == ACCEPTED
+        assert body["request_schema_version"] == CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+        assert [event["outcome"] for event in body["events"]] == ["sent", "sent"]
+        # The r11 close: accepted only with the execution evidence attached
+        # — over the wire as in the journal (no null-evidence acceptance).
+        assert body["submission_observed"] == "submitted"
+        assert body["submission_evidence_ref"] == "capture-pane:%17:wire:sha256:beef"
+        # The exact-id reconcile replays the evidence-bearing record.
+        looked_up = client.get(f"/control-input/{CONTROL}").json()
+        assert looked_up["outcome"] == ACCEPTED
+        assert looked_up["submission_observed"] == "submitted"
+        assert looked_up["submission_evidence_ref"] == "capture-pane:%17:wire:sha256:beef"
+
+    def test_a_declared_command_with_execution_unproven_closes_ambiguous(self, client, monkeypatch):
+        from cli_agent_orchestrator.services.control_input_contract import SUBMISSION_UNKNOWN
+
+        tmux_client, adapter = self._wire_managed_kimi(
+            monkeypatch, empty=True, execution_close=(SUBMISSION_UNKNOWN, None)
+        )
+        events = [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
+        response = _post(client, text=None, events=events, payload_class="command")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["outcome"] == AMBIGUOUS
+        assert body["reason_code"] == "submission-unproven"
+        assert body["reattemptable"] is False
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]  # one write, never resent
+        looked_up = client.get(f"/control-input/{CONTROL}").json()
+        assert looked_up["outcome"] == AMBIGUOUS
+        assert looked_up["reason_code"] == "submission-unproven"
+
+    def test_a_late_signal_closes_ambiguous_over_the_wire_with_no_second_write(
+        self, client, monkeypatch
+    ):
+        """The steer-041 boundary over HTTP: a submitted observation that
+        completes after the write deadline is unproven evidence — the
+        close is the terminal ambiguity, and the exact-id replay never
+        writes again."""
+        import time as _time
+
+        from cli_agent_orchestrator.services.control_input_contract import SUBMISSION_SUBMITTED
+
+        monkeypatch.setattr(service, "WRITE_DEADLINE_SECONDS", 0.2)
+
+        def _late_submitted(*args, **kwargs):
+            _time.sleep(0.4)
+            return (SUBMISSION_SUBMITTED, "capture-pane:%17:late:sha256:1afe")
+
+        tmux_client, adapter = self._wire_managed_kimi(monkeypatch, empty=True)
+        monkeypatch.setattr(native_pane_input, "observe_command_execution", _late_submitted)
+        events = [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
+        response = _post(client, text=None, events=events, payload_class="command")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["outcome"] == AMBIGUOUS
+        assert body["reason_code"] == "submission-unproven"
+        # No accepted record carries the after-deadline evidence.
+        assert body["outcome"] != ACCEPTED
+        looked_up = client.get(f"/control-input/{CONTROL}").json()
+        assert looked_up["outcome"] == AMBIGUOUS
+        assert looked_up["reason_code"] == "submission-unproven"
+        assert adapter.calls == [({"lines": ["/compact"]}, True)]
+
+    def test_a_declared_compact_against_a_nonempty_composer_is_the_typed_refusal(
+        self, client, monkeypatch
+    ):
+        tmux_client, adapter = self._wire_managed_kimi(monkeypatch, empty=False)
+        events = [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
+        response = _post(client, text=None, events=events, payload_class="command")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["outcome"] == REFUSED
+        assert body["reason_code"] == "composer-nonempty"
+        assert body["reattemptable"] is True
+        assert adapter.calls == []
+        assert tmux_client.writes == []
+        # The refusal is durable: the exact-id reconcile answers from the journal.
+        looked_up = client.get(f"/control-input/{CONTROL}").json()
+        assert looked_up["outcome"] == REFUSED
+        assert looked_up["reason_code"] == "composer-nonempty"
+
+    def test_a_malformed_declaration_is_a_typed_200_refusal_not_a_422(self, client, tmux):
+        response = _post(
+            client, text=None, events=[{"type": "text", "text": "prose"}], payload_class="command"
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["outcome"] == REFUSED
+        assert body["reason_code"] == "malformed-command-declaration"
+        assert body["request_schema_version"] == CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4
+        assert tmux.writes == []
+
+    def test_an_unknown_payload_class_value_is_the_typed_refusal(self, client, tmux):
+        response = _post(
+            client,
+            text=None,
+            events=[{"type": "text", "text": "/compact"}],
+            payload_class="probe",
+        )
+        body = response.json()
+        assert body["outcome"] == REFUSED
+        assert body["reason_code"] == "malformed-command-declaration"
+        assert tmux.writes == []
+
+    def test_payload_class_beside_the_v1_fields_is_a_422(self, client, tmux):
+        response = _post(client, payload_class="command")
+        assert response.status_code == 422
+        assert tmux.writes == []
+
+    def test_an_undeclared_batch_beginning_with_a_slash_is_prose(self, client, tmux):
+        """The r7 regression: a streamed utterance split so a batch begins
+        '/tmp/x' is undeclared prose — no guard, no refusal, delivered
+        exactly as before the carrier existed."""
+        response = _post(client, text=None, events=[{"type": "text", "text": "/tmp/x"}])
+        assert response.status_code == 200
+        body = response.json()
+        assert body["outcome"] == ACCEPTED
+        assert body["request_schema_version"] == 3
+        assert tmux.writes == [
+            {
+                "pane_id": PANE,
+                "text": "/tmp/x",
+                "submit": False,
+                "expected_server_identity": SOCKET,
+            }
+        ]
+
+
+class TestParseNotationEndpoint:
+    """The §5.3 server-authoritative parse: the events and preview, or a
+    422 carrying offset-addressed errors.  It only parses — nothing is
+    persisted and nothing reaches a pane."""
+
+    def test_a_valid_notation_resolves_to_events_and_preview(self, client, tmux):
+        response = client.post(
+            "/macros/parse-notation", json={"notation": '"/model" enter up*3 enter'}
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["events"] == [
+            {"type": "text", "text": "/model"},
+            {"type": "key", "key": "Enter"},
+            {"type": "key", "key": "Up"},
+            {"type": "key", "key": "Up"},
+            {"type": "key", "key": "Up"},
+            {"type": "key", "key": "Enter"},
+        ]
+        assert body["preview"] == '"/model" [Enter] [Up]×3 [Enter]'
+        assert tmux.writes == []
+
+    def test_an_invalid_notation_is_a_422_with_offset_and_message(self, client):
+        response = client.post("/macros/parse-notation", json={"notation": "ctrl+shift+x"})
+        assert response.status_code == 422
+        body = response.json()
+        assert body["errors"][0]["offset"] == 0
+        assert "cannot be represented" in body["errors"][0]["message"]
+
+    def test_the_parse_is_the_same_authority_the_module_speaks(self, client):
+        """The endpoint answers exactly what parse_notation answers — the
+        two surfaces of the one authority cannot drift."""
+        from cli_agent_orchestrator.services import macro_notation
+
+        notation = '"save, + / close" ctrl+s'
+        expected = macro_notation.parse_notation(notation)
+        body = client.post("/macros/parse-notation", json={"notation": notation}).json()
+        assert body["events"] == expected.events
+        assert body["preview"] == expected.preview
+
+    def test_the_route_requires_a_scope(self, client, auth_on):
+        response = client.post("/macros/parse-notation", json={"notation": "enter"})
+        assert response.status_code in (401, 403)
+
+    def test_a_read_scope_may_parse(self, client, auth_on):
+        _grant(auth.SCOPE_READ)
+        response = client.post("/macros/parse-notation", json={"notation": "enter"})
+        assert response.status_code == 200

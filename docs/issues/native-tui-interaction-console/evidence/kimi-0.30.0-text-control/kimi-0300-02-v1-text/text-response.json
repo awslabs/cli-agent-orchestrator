@@ -1,0 +1,42 @@
+{
+  "chord": null,
+  "chord_attempted": false,
+  "chord_sent": false,
+  "chunks_sent": 1,
+  "control_id": "ctl-8c8d7cbcb0",
+  "detail": "typed 1 literal write(s) into pane %2 through the kimi_cli native composer adapter and submitted with one Enter",
+  "enter_attempted": true,
+  "enter_sent": true,
+  "events": null,
+  "in_flight": false,
+  "outcome": "accepted",
+  "protocol": "cao-control-input-v1",
+  "reason_code": null,
+  "reattemptable": false,
+  "request_digest": "e06da7f6ebb100837a9eaf0f20f373fdfed582bd938f45918aae5624438d725a",
+  "request_schema_version": 1,
+  "resolved_identity": {
+    "execution_mode": "native_tui",
+    "native_session_id": "session_e56dc1aa-76bb-4800-97c2-485209fa9465",
+    "pane": {
+      "bound_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "dead": false,
+      "observed_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "pane_id": "%2",
+      "pane_pid": 98591,
+      "window_id": "@2"
+    },
+    "pane_birth_id": "%2",
+    "provider": "kimi_cli",
+    "provider_process_id": "98591@Wed Jul 29 05:20:26 2026",
+    "session_name": "cao-a103-kimi-0300-2f1c81",
+    "terminal_generation": "3aaa4b12-4603-4d77-83c1-948925747c48",
+    "terminal_id": "7821ef85",
+    "terminal_incarnation": null
+  },
+  "state": "delivered",
+  "submission_evidence_ref": null,
+  "submission_observed": null,
+  "terminal_id": "7821ef85",
+  "text_sent": true
+}

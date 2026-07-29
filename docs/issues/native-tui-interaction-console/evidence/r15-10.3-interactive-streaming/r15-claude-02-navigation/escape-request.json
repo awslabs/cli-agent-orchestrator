@@ -1,0 +1,10 @@
+{
+  "control_id": "ctl-f81f1f7c3b",
+  "events": [
+    {
+      "key": "Escape",
+      "type": "key"
+    }
+  ],
+  "payload_class": "interactive"
+}

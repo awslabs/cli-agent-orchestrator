@@ -1,0 +1,10 @@
+{
+  "control_id": "ctl-8976753ad4",
+  "events": [
+    {
+      "chord": "C-s",
+      "type": "chord"
+    }
+  ],
+  "payload_class": "interactive"
+}

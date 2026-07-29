@@ -195,6 +195,24 @@ REASON_UNREPRESENTABLE_EVENT = "unrepresentable-event"
 # this carries the zero-bytes proof and is reattemptable under the refused
 # rule.  It never means delivery, transport success, or provider submission.
 REASON_COPY_MODE_ACTIVE = "copy-mode-active"
+# A v4 ``payload_class`` declaration the server cannot honour as made: the
+# value is not the one declared class this schema defines (or is not a
+# string at all), or a declared command's events do not match the command
+# grammar.  Decided before any write, so it is proven zero bytes and the
+# caller may retry with a corrected (or absent) declaration.  Never
+# approximated into prose and never executed partially: a declaration the
+# server cannot read is not licence to guess the caller meant prose.
+REASON_MALFORMED_COMMAND_DECLARATION = "malformed-command-declaration"
+# A declared command-class control found the composer holding content (or
+# its emptiness could not be proven) at the pre-write observation under
+# the pane-input lease: submitting the command would concatenate it with
+# the queued prefill and deliver it as ordinary prompt text (the r5
+# evidence).  Decided before any command byte, the prefill is untouched,
+# and the refusal is reattemptable — the operator clears or submits the
+# prefill and tries again.  Blind clearing is prohibited: no keystroke
+# ritual may be specified as a clear, because prefill has been observed
+# to survive Escape.
+REASON_COMPOSER_NONEMPTY = "composer-nonempty"
 
 # Every reason is bound to the one outcome it can honestly carry.
 #
@@ -230,6 +248,8 @@ REASON_OUTCOMES: "dict[str, str]" = {
     REASON_UNSUPPORTED_KEY: REFUSED,
     REASON_UNREPRESENTABLE_EVENT: REFUSED,
     REASON_COPY_MODE_ACTIVE: REFUSED,
+    REASON_MALFORMED_COMMAND_DECLARATION: REFUSED,
+    REASON_COMPOSER_NONEMPTY: REFUSED,
     REASON_WRITE_DEADLINE: REFUSED,
     REASON_CONTROL_ROUTE_ABSENT: UNSUPPORTED,
     REASON_PROTOCOL_MISMATCH: UNSUPPORTED,
@@ -614,15 +634,46 @@ SEQUENCE_EVENT_TYPES = frozenset(
     {SEQUENCE_EVENT_TYPE_TEXT, SEQUENCE_EVENT_TYPE_KEY, SEQUENCE_EVENT_TYPE_CHORD}
 )
 
-# The normalized key-name set a ``key`` event may name (cond-0175 §5): the
-# exact representable control keystrokes, and nothing else.  A name outside
+# The normalized key-name set a ``key`` event may name (cond-0175 §5,
+# extended in place by the native-TUI-console track §3.2): the exact
+# representable control keystrokes, and nothing else.  A name outside
 # this set — including any modifier combination it does not list — is
 # refused with ``unsupported-key`` before any write rather than dropped or
 # approximated.  Membership is a service-layer decision; it is deliberately
 # *not* enforced by the digest path, for the same reason chord allowlist
 # membership is not: a digest must be computable for a request the server
 # will then refuse.
-SEQUENCE_KEY_NAMES = frozenset({"Escape", "C-c", "C-s", "Enter", "Backspace"})
+#
+# The eleven navigation/editing keys extend the deployed five under the
+# same request schema v3 (design D1): a key name is an opaque string
+# inside ``events``, so the digest preimage shape is unchanged, an old
+# server typed-refuses a new key ``unsupported-key`` with zero bytes, and
+# a new client gates on the advertised ``sequence.keys``.  ``BTab``,
+# modified arrows (``C-Up``), and ``F1``-``F12`` stay outside the set: the
+# tmux mechanism exists but no managed provider has evidence of consuming
+# them, so they are refused until a registry pin admits them.
+SEQUENCE_KEY_NAMES = frozenset(
+    {
+        # Deployed (cond-0175).
+        "Escape",
+        "C-c",
+        "C-s",
+        "Enter",
+        "Backspace",
+        # Navigation/editing (native-TUI-console §3.2, P1).
+        "Up",
+        "Down",
+        "Left",
+        "Right",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "Delete",
+        "Insert",
+        "Tab",
+    }
+)
 
 # Hard caps, both checked as shape errors before anything is journaled or
 # written: at most 32 events per sequence, and at most 512 UTF-8 bytes of
@@ -777,6 +828,119 @@ def control_input_request_digest_v3(
                 ("schema_version", CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V3),
                 ("control_id", control_id),
                 ("events", normalize_sequence_events(events)),
+                ("expected_identity", normalize_expected_identity(expected_identity)),
+            ]
+        )
+    )
+
+
+# --- Schema v4: the declaration carrier (command, interactive) --------------
+#
+# Schema v4 is v3 plus exactly one optional additive field, ``payload_class``.
+# Its defined values are ``"command"`` (native-TUI-console §4.1, r7) and
+# ``"interactive"`` (§6.7, r15 — the armed manual streaming capture's declared
+# intent, which bypasses only the provider-turn readiness gate and the kimi
+# dispatch grace).  The field travels under its own domain so a declared
+# request can never collide with an undeclared one: a request that declares
+# command-class is a different request from one that does not, and a field
+# that did not participate would digest a declared and an undeclared request
+# of the same id and events alike (rebound blindness) — the same reason
+# ``chord`` participates in v2.  v1/v2/v3 requests and their domains are
+# byte-unchanged; a request with ``payload_class`` absent is a v3 request
+# and digests under the v3 domain exactly as before.
+CONTROL_INPUT_DIGEST_DOMAIN_V4 = "cao-control-input-request-v4"
+CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4 = 4
+
+# The declared payload classes.  ``None`` (absent) means prose.  Command
+# detection is NEVER derived from payload shape: a batch whose text happens
+# to begin with ``/`` (e.g. a streamed utterance split so a batch starts
+# ``/tmp/x``) is undeclared prose and never enters the composer guard.
+PAYLOAD_CLASS_COMMAND = "command"
+#: §6.7 (r15): the armed manual streaming capture's declaration — ordinary
+#: v3-valid sequence grammar (never command grammar), bypassing only the
+#: provider IDLE/COMPLETED turn-state refusal and the kimi dispatch grace.
+#: Only the armed capture surface declares it; automation never does.
+PAYLOAD_CLASS_INTERACTIVE = "interactive"
+DECLARED_PAYLOAD_CLASSES = frozenset({PAYLOAD_CLASS_COMMAND, PAYLOAD_CLASS_INTERACTIVE})
+
+# Fixed field order for the v4 digest preimage: the v3 order with
+# ``payload_class`` spliced between ``events`` and ``expected_identity``.
+REQUEST_DIGEST_FIELD_ORDER_V4 = (
+    "domain",
+    "schema_version",
+    "control_id",
+    "events",
+    "payload_class",
+    "expected_identity",
+)
+
+
+def command_declaration_violation(events: List[Dict[str, Any]]) -> Optional[str]:
+    """Why these normalized events fail the declared-command grammar, or None.
+
+    The grammar a declared command-class request must match (§4.1): exactly
+    one ``text`` event whose text begins with ``/``, optionally followed by
+    one ``key:Enter`` (the fused submitting Enter — the registry Compact
+    shape).  Anything else under a declaration is malformed: it is never
+    approximated into prose and never executed partially.  Takes the
+    *normalized* events so the check reads exactly what the digest bound.
+    """
+    first = events[0]
+    if first["type"] != SEQUENCE_EVENT_TYPE_TEXT or not first["text"].startswith("/"):
+        return (
+            "a declared command is exactly one text event whose text begins with "
+            "'/', optionally followed by one Enter key; the first event is not that text"
+        )
+    if len(events) == 1:
+        return None
+    if (
+        len(events) == 2
+        and events[1]["type"] == SEQUENCE_EVENT_TYPE_KEY
+        and events[1]["key"] == "Enter"
+    ):
+        return None
+    return (
+        "a declared command carries at most one Enter key after its command text "
+        "(the fused submitting Enter); further events make the declaration malformed"
+    )
+
+
+def control_input_request_digest_v4(
+    *,
+    control_id: str,
+    events: Any,
+    payload_class: Any,
+    expected_identity: Optional[Mapping[str, Any]],
+) -> str:
+    """The v4 digest: the v3 binding plus the declared ``payload_class``.
+
+    The preimage is :data:`REQUEST_DIGEST_FIELD_ORDER_V4` under the v4
+    domain.  ``payload_class`` participates for the same reason ``chord``
+    does in v2: a request that declares command-class is a different
+    request from one that does not, and a non-participating field would
+    digest a declared and an undeclared request of the same id and events
+    alike.  ``None`` spells the absent declaration (prose) as an explicit
+    null, so "v4 with no declaration" and "declared" can never collide.
+
+    Declaration *validity* is not checked here — a digest must be
+    computable for any syntactically declarable v4 request, including one
+    the server will then refuse ``malformed-command-declaration``, so the
+    two sides never disagree about which requests exist.  The field's wire
+    type is pinned (string or null): anything else is not declarable and
+    raises, the way a non-string ``chord`` raises in v2.
+    """
+    if payload_class is not None and not isinstance(payload_class, str):
+        raise ValueError(
+            f"payload_class must be a string or null, got {type(payload_class).__name__}"
+        )
+    return canonical_sha256(
+        build_canonical(
+            [
+                ("domain", CONTROL_INPUT_DIGEST_DOMAIN_V4),
+                ("schema_version", CONTROL_INPUT_REQUEST_SCHEMA_VERSION_V4),
+                ("control_id", control_id),
+                ("events", normalize_sequence_events(events)),
+                ("payload_class", payload_class),
                 ("expected_identity", normalize_expected_identity(expected_identity)),
             ]
         )

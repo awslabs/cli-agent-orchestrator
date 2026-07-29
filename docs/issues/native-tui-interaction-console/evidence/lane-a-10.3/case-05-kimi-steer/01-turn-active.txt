@@ -1,0 +1,22 @@
+│  Session:   session_45bade86-9308-4196-a166-d3e19ca6740c                                       │
+ │  Model:     K2.7 Coding Highspeed                                                              │
+ │  Version:   0.29.2                                                                             │
+ │                                                                                                │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Use Kimi K3 with High thinking effort - for the best balance between token spend and capability
+   Run /model to switch to K3 and set thinking effort to High
+
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to
+ ~/.tmux.conf and restart tmux.
+   Saved K2.7 Coding with thinking max as default.
+   Switched to K2.7 Coding Highspeed with thinking max.
+
+ ✨ Count from 1 to 1000 slowly, one number per line.
+
+  🌑
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                              │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+ K2.7 Coding Highspeed thinking  …/pytest-508/cao_scratch_1030/worktree-kimi  master
+                                                                               context: 0% (0/256k)

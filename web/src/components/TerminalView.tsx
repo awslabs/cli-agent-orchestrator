@@ -1,17 +1,23 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ClipboardEvent } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
-import { X, Terminal as TermIcon } from 'lucide-react'
-import { api, type ApiError } from '../api'
+import { X, Terminal as TermIcon, Paperclip, RotateCcw } from 'lucide-react'
 import {
-  applyKeyToRecording,
-  previewToken,
-  sequenceTextBytes,
-  MAX_SEQUENCE_EVENTS,
-  MAX_SEQUENCE_TEXT_BYTES,
-  type SequenceEvent,
-} from '../lib/sequenceRecorder'
+  api,
+  type ApiError,
+  type AttachmentRefusalBody,
+  type ControlInputCapabilities,
+  type ImageAttachmentRecord,
+  type ImageCapabilityBlock,
+  type MacroRecord,
+  type OperatorMessageBlock,
+} from '../api'
+import { type SequenceEvent } from '../lib/sequenceRecorder'
+import { StreamingEngine, type SendResult, type TraceEntry } from '../lib/streaming'
+import { StreamingPanel } from './StreamingPanel'
+import { FavoriteStrip } from './FavoriteStrip'
+import { MacroLibraryModal } from './MacroLibraryModal'
 
 interface TerminalViewProps {
   terminalId: string
@@ -28,6 +34,68 @@ const DEFAULT_LINE_HEIGHT = Math.round(TERMINAL_FONT_SIZE * 1.2)
 const CONTROL_UNSUPPORTED_STATUSES = new Set([404, 405, 501])
 const CONTROL_AMBIGUOUS_STATUSES = new Set([408, 425, 500, 502, 503, 504])
 
+// §3.2: the full sixteen-name key set. The streaming toggle arms only when
+// the live capabilities advertise streaming support AND this whole set
+// (§6.1); anything less degrades per the §3.5 old-server rows.
+const FULL_SEQUENCE_KEY_SET = [
+  'Escape', 'C-c', 'C-s', 'Enter', 'Backspace',
+  'Up', 'Down', 'Left', 'Right',
+  'Home', 'End', 'PageUp', 'PageDown',
+  'Delete', 'Insert', 'Tab',
+]
+
+// The composer's delivery path is the control-input path; its 512-byte cap
+// is a contract feature (F8) and the status line names it live (§7.1).
+const MAX_COMPOSER_BYTES = 512
+
+const EXPECTED_IDENTITY_FIELDS = [
+  'terminal_id',
+  'terminal_incarnation',
+  'terminal_generation',
+  'pane_birth_id',
+  'provider_process_id',
+  'provider',
+  'native_session_id',
+  'execution_mode',
+  'session_name',
+]
+
+// Refusal reasons that mean the pinned identity drifted; on these the
+// disarm explanation refetches identity so it names the new generation (§6.4).
+const IDENTITY_REFUSAL_CODES = new Set(['stale-generation', 'identity-mismatch', 'pane-dead'])
+
+// ── Lane C: image attachments (§8.4/§8.7) ─────────────────────────────
+
+// The editable draft token, per §8.4: `[Image #N]` is plain text the
+// operator can place, edit, or delete; the chip with the same N is its
+// visual twin.
+const IMAGE_TOKEN_PATTERN = /\[Image #(\d+)\]/g
+
+// One attachment in the composer draft: the server record once staged,
+// the local File for the thumbnail and for retrying a failed upload.
+interface DraftAttachment {
+  localId: string
+  token: number
+  file: File
+  previewUrl: string
+  state: 'staging' | 'ready' | 'failed'
+  record?: ImageAttachmentRecord
+  error?: string
+}
+
+const MIME_TO_FORMAT: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpeg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
 function isWheelMouseReport(data: string): boolean {
   const sgr = /^\x1b\[<(\d+);\d+;\d+[Mm]$/.exec(data)
   if (sgr) return (Number(sgr[1]) & 64) === 64
@@ -40,6 +108,68 @@ function isWheelMouseReport(data: string): boolean {
     return button >= 0 && (button & 64) === 64
   }
   return false
+}
+
+/** The 9-field expected_identity bound into every control-input request. */
+function pickExpectedIdentity(identity: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(EXPECTED_IDENTITY_FIELDS.map(key => [key, identity[key] ?? null]))
+}
+
+/** Normalize a typed control-input body (POST 200 or journaled GET record). */
+function typedOutcome(body: Record<string, unknown>): {
+  outcome: string
+  reasonCode?: string
+  reasonDetail?: string
+} {
+  // r15: the control-input wire field is `detail`; `reason_detail` is the
+  // managed-bridge spelling.  Both normalize into the typed outcome — a
+  // missing discriminator would otherwise misclassify a pauseable
+  // pane-busy as an unrecognized disarm on the live path.
+  const detail = body.reason_detail ?? body.detail
+  return {
+    outcome: String(body.outcome || 'unknown'),
+    reasonCode: body.reason_code ? String(body.reason_code) : undefined,
+    reasonDetail: detail != null ? String(detail) : undefined,
+  }
+}
+
+/** The reason a typed outcome names for a status line (r15: `detail`
+ * included, so an explainable result never renders empty). */
+function outcomeReason(body: Record<string, unknown>): unknown {
+  return body.reason_code || body.reason_detail || body.detail
+}
+
+interface PerTerminalProviderControlEntry {
+  steer_chords?: string[]
+  dispatch_grace_ms?: number
+  // Lane C (§8.6) and r15 (§6.7) blocks: present only when this terminal's
+  // exact provider build carries the proof — the send authority, unlike
+  // the top-level discovery union.
+  operator_message?: OperatorMessageBlock
+  image?: ImageCapabilityBlock
+  interactive_streaming?: { supported: boolean }
+}
+
+/**
+ * The per-terminal provider_controls entry from the identity route's
+ * control_input block (§3.5): the exact chord set and dispatch grace the
+ * server would admit for THIS terminal's provider+build. The top-level
+ * capabilities union is discovery only — it never licenses a send.
+ */
+function perTerminalProviderControls(
+  identity: Record<string, unknown>,
+): PerTerminalProviderControlEntry | undefined {
+  const block = identity?.control_input as Record<string, unknown> | undefined
+  const controls = block?.provider_controls as
+    | Record<string, PerTerminalProviderControlEntry>
+    | undefined
+  if (!controls) return undefined
+  const provider = identity.provider
+  return typeof provider === 'string' ? controls[provider] : undefined
+}
+
+function perTerminalSteerChords(identity: Record<string, unknown>): string[] {
+  return perTerminalProviderControls(identity)?.steer_chords ?? []
 }
 
 export function TerminalView({ terminalId, provider, agentProfile, onClose }: TerminalViewProps) {
@@ -56,12 +186,64 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   const [controlBusy, setControlBusy] = useState(false)
   const [controlStatus, setControlStatus] = useState('')
   const [sequenceSupported, setSequenceSupported] = useState(false)
-  const [recording, setRecording] = useState(false)
-  const [recordedEvents, setRecordedEvents] = useState<SequenceEvent[]>([])
-  const [recordNotice, setRecordNotice] = useState('')
+  const [capabilities, setCapabilities] = useState<ControlInputCapabilities | null>(null)
+  // Lane C/r15: the per-terminal, build-exact Lane C blocks from the
+  // identity route — the ONLY send authority for the composer affordances
+  // (§8.6/D9). The top-level capabilities union is discovery only.
+  const [perTerminalLaneC, setPerTerminalLaneC] = useState<{
+    operatorMessage?: OperatorMessageBlock
+    image?: ImageCapabilityBlock
+  }>({})
+
+  // ── Lane B: macro library + streaming state ──────────────────────────
+  const [macros, setMacros] = useState<MacroRecord[]>([])
+  const [macroQuarantine, setMacroQuarantine] = useState<
+    { count: number | null; path: string } | undefined
+  >()
+  const [macrosUnavailable, setMacrosUnavailable] = useState(false)
+  const [macroModalOpen, setMacroModalOpen] = useState(false)
+  // The per-terminal advertised chord set: the ONLY chord send authority
+  // (§3.5 — the top-level union is discovery only, never a license).
+  const [advertisedChords, setAdvertisedChords] = useState<ReadonlySet<string>>(new Set())
+  const [streamingArmed, setStreamingArmed] = useState(false)
+  const [arming, setArming] = useState(false)
+  const [streamingTrace, setStreamingTrace] = useState<TraceEntry[]>([])
+  const [streamingTick, setStreamingTick] = useState(0)
+  const [disarmInfo, setDisarmInfo] = useState<{ reason: string; reasonCode?: string } | null>(null)
+  const [streamingTarget, setStreamingTarget] = useState<{
+    provider: string
+    profile: string | null
+    generationShort: string
+  }>({ provider: provider ?? 'unknown', profile: agentProfile ?? null, generationShort: '—' })
+  const engineRef = useRef<StreamingEngine | null>(null)
+  // r15 (§6.7): whether armed batches declare `payload_class: "interactive"`.
+  // Set at arm from the per-terminal, build-exact block; never from the
+  // top-level union, and never by macros/composer/automation.
+  const declareInteractiveRef = useRef(false)
+  const macrosButtonRef = useRef<HTMLButtonElement>(null)
+  const streamingWsCloseRef = useRef<() => void>(() => {})
+
+  // ── Lane C: composer image attachments (§8.4/§8.7) ───────────────────
+  const [attachments, setAttachments] = useState<DraftAttachment[]>([])
+  // Announced via the visually-hidden aria-live region (§8.7 item 8).
+  const [attachmentNotice, setAttachmentNotice] = useState('')
+  const nextTokenRef = useRef(1)
+  const attachmentsRef = useRef<DraftAttachment[]>([])
+  attachmentsRef.current = attachments
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const composerInputRef = useRef<HTMLTextAreaElement>(null)
+
+  useEffect(() => {
+    // Object URLs are the only thing to release; records live server-side.
+    const current = attachmentsRef
+    return () => {
+      current.current.forEach(attachment => URL.revokeObjectURL(attachment.previewUrl))
+    }
+  }, [])
 
   useEffect(() => {
     managedRef.current = null
+    setPerTerminalLaneC({})
     api.getManagedControl(terminalId)
       .then(result => {
         managedRef.current = result.managed
@@ -72,19 +254,33 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         setNativeControlResolved(result.execution_mode !== 'native_tui')
         if (result.managed && result.execution_mode === 'native_tui') {
           api.getControlInputCapabilities()
-            .then(capabilities => {
+            .then(liveCapabilities => {
+              setCapabilities(liveCapabilities)
               setNativeControlSupported(
-                capabilities.execution_modes.includes('native_tui')
-                && capabilities.literal_write === true
-                && capabilities.bracketed_paste === false
-                && capabilities.enter_required === true,
+                liveCapabilities.execution_modes.includes('native_tui')
+                && liveCapabilities.literal_write === true
+                && liveCapabilities.bracketed_paste === false
+                && liveCapabilities.enter_required === true,
               )
-              // The structured-sequence recorder is v3-only: a server that
-              // does not advertise it gets the literal bar alone, and the
-              // recorder's absence is stated rather than silently missing.
-              setSequenceSupported(
-                (capabilities.request_schema_versions ?? []).includes(3),
-              )
+              // v3 is the macro/streaming floor: a server that does not
+              // advertise it offers the literal bar alone, and the absence
+              // of the library affordances is stated rather than silently
+              // missing (§3.5).
+              const v3 = (liveCapabilities.request_schema_versions ?? []).includes(3)
+              setSequenceSupported(v3)
+              if (v3) loadMacroLibrary()
+              // The composer's Lane C affordances resolve from THIS
+              // terminal's build-exact identity controls, never the
+              // top-level discovery union (P1.4/§8.6). Failure is fail-closed.
+              api.getControlIdentity(terminalId)
+                .then(identity => {
+                  const entry = perTerminalProviderControls(identity)
+                  setPerTerminalLaneC({
+                    operatorMessage: entry?.operator_message,
+                    image: entry?.image,
+                  })
+                })
+                .catch(() => setPerTerminalLaneC({}))
               setNativeControlResolved(true)
             })
             .catch(() => {
@@ -107,6 +303,70 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         setControlStatus('terminal control identity unavailable')
       })
   }, [terminalId])
+
+  // The macro library (§5.4): fetched for the terminal's provider/profile.
+  // A 404 is the old-server signal — the library UI is hidden behind a
+  // notice, never a fallback to local storage as the authoritative store
+  // (§3.5). The per-terminal chord set comes from the identity route's
+  // control_input.provider_controls entry — the only chord send authority;
+  // absent means the empty set (fail closed, D9).
+  const loadMacroLibrary = () => {
+    api
+      .listMacros({ provider, profile: agentProfile ?? undefined })
+      .then(response => {
+        setMacros(response.macros)
+        setMacroQuarantine(response.quarantine)
+        setMacrosUnavailable(false)
+      })
+      .catch((error: ApiError) => {
+        if (error.status === 404) {
+          setMacros([])
+          setMacrosUnavailable(true)
+        } else {
+          setControlStatus('macro library unavailable')
+        }
+      })
+    api
+      .getControlIdentity(terminalId)
+      .then(identity => {
+        setAdvertisedChords(new Set(perTerminalSteerChords(identity)))
+      })
+      .catch(() => setAdvertisedChords(new Set()))
+  }
+
+  // Disarm streaming when the terminal is closed or swapped out: timers die
+  // with the view and nothing typed later is ever sent (§6.4).
+  useEffect(() => {
+    return () => {
+      engineRef.current?.disarm('terminal view closed')
+      engineRef.current = null
+    }
+  }, [terminalId])
+
+  // Environment disarm (§6.4): page hidden / pagehide while armed.
+  useEffect(() => {
+    if (!streamingArmed) return
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        engineRef.current?.disarm('page hidden')
+      }
+    }
+    const onPageHide = () => engineRef.current?.disarm('page hidden')
+    document.addEventListener('visibilitychange', onVisibility)
+    window.addEventListener('pagehide', onPageHide)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('pagehide', onPageHide)
+    }
+  }, [streamingArmed])
+
+  // Environment disarm (§6.4): the output websocket closing while armed.
+  // The websocket lives in the xterm effect below; it calls this ref.
+  useEffect(() => {
+    streamingWsCloseRef.current = () => {
+      if (streamingArmed) engineRef.current?.disarm('output websocket closed')
+    }
+  }, [streamingArmed])
 
   const runManagedOperation = async (body: {
     action: string
@@ -184,7 +444,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         expected_identity: expectedIdentity,
       })
       const outcome = String(response.outcome || 'unknown')
-      const reason = response.reason_code || response.reason_detail
+      const reason = outcomeReason(response)
       setControlStatus(
         `${label}: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}`,
       )
@@ -213,7 +473,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       try {
         const response = await api.queryControlInput(controlId)
         const outcome = String(response.outcome || 'unknown')
-        const reason = response.reason_code || response.reason_detail
+        const reason = outcomeReason(response)
         setControlStatus(
           `${label}: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}`,
         )
@@ -227,97 +487,212 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     }
   }
 
-  // --- Structured key-sequence recorder (cond-0175) ------------------------
-  //
-  // Record captures the ordered, representable events; the preview renders
-  // them readably; send submits the exact structured events through the
-  // arbiter with terminal/pane/process/generation re-proof (the same
-  // expected-identity re-fetch the literal send uses) and a fresh request
-  // id; cancel before send writes nothing — no request is ever sent on a
-  // discard.
+  // ── Lane C: attachment staging and the operator-message send (§8.3-8.5) ──
 
-  const startRecording = () => {
-    setRecordedEvents([])
-    setRecordNotice('')
-    setRecording(true)
+  const updateAttachment = (localId: string, patch: Partial<DraftAttachment>) => {
+    setAttachments(prev =>
+      prev.map(attachment =>
+        attachment.localId === localId ? { ...attachment, ...patch } : attachment,
+      ),
+    )
   }
 
-  const stopRecording = () => {
-    setRecording(false)
-    setRecordNotice('')
-  }
-
-  const cancelRecording = () => {
-    // Discard is purely local: no request id is minted and nothing is
-    // sent, so a cancelled sequence provably wrote nothing.
-    setRecording(false)
-    setRecordedEvents([])
-    setRecordNotice('')
-    setControlStatus('sequence: cancelled — nothing was sent')
-  }
-
-  const onRecorderKeyDown = (event: React.KeyboardEvent) => {
-    // While recording, every key is the payload: none of them may reach
-    // the terminal, the page, or the browser's own bindings.
-    event.preventDefault()
-    event.stopPropagation()
-    const result = applyKeyToRecording(recordedEvents, {
-      key: event.key,
-      ctrlKey: event.ctrlKey,
-      metaKey: event.metaKey,
-      altKey: event.altKey,
+  /** Insert `[Image #N]` markers at the caret in ONE functional update
+   * (P1.3): a batch composes with any other pending message edit instead
+   * of each token overwriting the previous from a stale closure. */
+  const insertTokensAtCaret = (tokens: number[]) => {
+    if (tokens.length === 0) return
+    const markers = tokens.map(token => `[Image #${token}]`).join('')
+    const input = composerInputRef.current
+    const focused = input && document.activeElement === input
+    const start = focused ? (input.selectionStart ?? message.length) : message.length
+    const end = focused ? (input.selectionEnd ?? message.length) : message.length
+    setMessage(prev => {
+      const safeStart = Math.min(start, prev.length)
+      const safeEnd = Math.min(Math.max(end, safeStart), prev.length)
+      return prev.slice(0, safeStart) + markers + prev.slice(safeEnd)
     })
-    if (result.refused) {
-      setRecordNotice(result.refused)
+    requestAnimationFrame(() => {
+      if (composerInputRef.current) {
+        composerInputRef.current.focus()
+        composerInputRef.current.selectionStart = start + markers.length
+        composerInputRef.current.selectionEnd = start + markers.length
+      }
+    })
+  }
+
+  const uploadAttachment = async (localId: string, file: File) => {
+    try {
+      const { attachment } = await api.uploadAttachment(terminalId, file)
+      // The token may have been deleted while the upload was in flight:
+      // stage it, then delete the orphaned record so nothing lingers.
+      if (!attachmentsRef.current.some(candidate => candidate.localId === localId)) {
+        void api.deleteAttachment(terminalId, attachment.attachment_id).catch(() => {})
+        return
+      }
+      updateAttachment(localId, { state: 'ready', record: attachment, error: undefined })
+      setAttachmentNotice(
+        `Image #${attachmentsRef.current.find(c => c.localId === localId)?.token}: ` +
+        `${attachment.display_filename}, ${formatBytes(attachment.size_bytes)}, ready`,
+      )
+    } catch (error) {
+      const apiError = error as ApiError
+      const body = apiError.body as AttachmentRefusalBody | undefined
+      const detail = body?.detail || apiError.detail || 'the upload failed'
+      updateAttachment(localId, {
+        state: 'failed',
+        record: body?.attachment,
+        error: detail,
+      })
+      setAttachmentNotice(`Image upload failed — ${detail}`)
+    }
+  }
+
+  /** Stage one picker/paste batch (P1.3): the remaining slot count is
+   * computed once, the batch is accepted into one functional state update
+   * with one linked editable token per accepted file, and selection can
+   * never exceed the advertised maximum or overwrite earlier tokens. */
+  const stageFiles = (files: File[]) => {
+    if (files.length === 0) return
+    const advertised = imageBlock?.formats ?? []
+    const remainingSlots = Math.max(0, maxAttachments - attachmentsRef.current.length)
+    const accepted = files.slice(0, remainingSlots)
+    const skipped = files.length - accepted.length
+    if (skipped > 0) {
+      setControlStatus(
+        `at most ${maxAttachments} images ride one operator message — ` +
+        `${accepted.length} accepted, ${skipped} skipped; ` +
+        `${remainingSlots - accepted.length} slots remain`,
+      )
+    }
+    if (accepted.length === 0) return
+    const drafts: DraftAttachment[] = accepted.map(file => {
+      const format = MIME_TO_FORMAT[file.type]
+      const formatAdvertised = format !== undefined && advertised.includes(format)
+      return {
+        localId: crypto.randomUUID(),
+        token: nextTokenRef.current++,
+        file,
+        previewUrl: URL.createObjectURL(file),
+        state: formatAdvertised ? 'staging' : 'failed',
+        error: formatAdvertised
+          ? undefined
+          : `${file.type || 'this content type'} is not advertised by this provider ` +
+            `(${advertised.join(', ') || 'none'}); unproven formats are refused, not converted`,
+      }
+    })
+    setAttachments(prev => [...prev, ...drafts])
+    insertTokensAtCaret(drafts.map(draft => draft.token))
+    for (const draft of drafts) {
+      if (draft.state === 'staging') {
+        setAttachmentNotice(`Image #${draft.token} uploading…`)
+        void uploadAttachment(draft.localId, draft.file)
+      } else {
+        setAttachmentNotice(`Image #${draft.token} refused — ${draft.error}`)
+      }
+    }
+  }
+
+  /** Remove the chip and its token; the server record is deleted best-effort. */
+  const removeAttachment = (target: DraftAttachment) => {
+    setMessage(prev => prev.replace(`[Image #${target.token}]`, ''))
+    if (target.record) {
+      void api.deleteAttachment(terminalId, target.record.attachment_id).catch(() => {})
+    }
+    URL.revokeObjectURL(target.previewUrl)
+    setAttachments(prev => prev.filter(attachment => attachment.localId !== target.localId))
+    setAttachmentNotice(`Image #${target.token} removed`)
+    composerInputRef.current?.focus()
+  }
+
+  const retryAttachment = (target: DraftAttachment) => {
+    if (target.record) {
+      void api.deleteAttachment(terminalId, target.record.attachment_id).catch(() => {})
+    }
+    updateAttachment(target.localId, { state: 'staging', record: undefined, error: undefined })
+    setAttachmentNotice(`Image #${target.token} uploading…`)
+    void uploadAttachment(target.localId, target.file)
+  }
+
+  /** Message edits detach any attachment whose token was deleted (§8.7.4). */
+  const handleMessageChange = (value: string) => {
+    setMessage(value)
+    const present = new Set(
+      [...value.matchAll(IMAGE_TOKEN_PATTERN)].map(match => Number(match[1])),
+    )
+    for (const attachment of attachmentsRef.current) {
+      if (!present.has(attachment.token)) {
+        if (attachment.record) {
+          void api.deleteAttachment(terminalId, attachment.record.attachment_id).catch(() => {})
+        }
+        URL.revokeObjectURL(attachment.previewUrl)
+        setAttachments(prev =>
+          prev.filter(candidate => candidate.localId !== attachment.localId),
+        )
+        setAttachmentNotice(`Image #${attachment.token} detached`)
+      }
+    }
+  }
+
+  const handleComposerPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(event.clipboardData?.files ?? [])
+    if (files.length === 0) return // plain-text paste: ordinary text paste
+    event.preventDefault()
+    if (!imageAttachAvailable) {
+      setControlStatus(
+        'image attachments are unavailable on this terminal’s provider build — ' +
+        'no proven image support is advertised; text and multiline still send',
+      )
       return
     }
-    setRecordNotice('')
-    setRecordedEvents(result.events)
+    stageFiles(files)
   }
 
-  const runNativeSequence = async (events: SequenceEvent[]) => {
-    const controlId = crypto.randomUUID()
+  /** The §8.3 send: one typed operation, one reconcile, never a resend. */
+  const runOperatorMessage = async () => {
+    const operationId = crypto.randomUUID()
+    const text = message
+    const tokenMap: Record<string, string> = {}
+    const attachmentIds: string[] = []
+    for (const attachment of attachmentsRef.current) {
+      if (attachment.record) {
+        tokenMap[String(attachment.token)] = attachment.record.attachment_id
+        attachmentIds.push(attachment.record.attachment_id)
+      }
+    }
+    // The one post-accept path (P1.5): a direct accepted POST and an
+    // exact-id reconcile that resolves `accepted` are the same fact, so
+    // both retire the draft and chips identically — the operation id stays
+    // named in the status for any later reconcile, and with the draft gone
+    // a new click cannot mint a second operation for the same message.
+    const applyAccepted = () => {
+      attachmentsRef.current.forEach(attachment => URL.revokeObjectURL(attachment.previewUrl))
+      setAttachments([])
+      nextTokenRef.current = 1
+      setMessage('')
+    }
     setControlBusy(true)
-    setControlStatus(`sequence: submitting… (${controlId})`)
+    setControlStatus(`operator message: submitting… (${operationId})`)
     try {
       const identity = await api.getControlIdentity(terminalId)
-      const expectedIdentity = Object.fromEntries(
-        [
-          'terminal_id',
-          'terminal_incarnation',
-          'terminal_generation',
-          'pane_birth_id',
-          'provider_process_id',
-          'provider',
-          'native_session_id',
-          'execution_mode',
-          'session_name',
-        ].map(key => [key, identity[key] ?? null]),
-      )
-      const response = await api.sendControlInput(terminalId, {
-        control_id: controlId,
-        events,
-        expected_identity: expectedIdentity,
+      const response = await api.submitOperatorMessage(terminalId, {
+        operation_id: operationId,
+        text,
+        attachments: attachmentIds,
+        token_map: tokenMap,
+        expected_identity: pickExpectedIdentity(identity),
       })
       const outcome = String(response.outcome || 'unknown')
-      const reason = response.reason_code || response.reason_detail
-      const perEvent = Array.isArray(response.events)
-        ? ` [${(response.events as Array<Record<string, unknown>>)
-            .map(entry => String(entry.outcome ?? '—'))
-            .join(', ')}]`
-        : ''
+      const reason = outcomeReason(response)
       setControlStatus(
-        `sequence: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}${perEvent}`,
+        `operator message: ${outcome} (${operationId})${reason ? ` — ${String(reason)}` : ''}`,
       )
-      if (outcome === 'accepted') {
-        setRecording(false)
-        setRecordedEvents([])
-      }
+      if (outcome === 'accepted') applyAccepted()
     } catch (error) {
       const apiError = error as ApiError
       if (apiError.status && CONTROL_UNSUPPORTED_STATUSES.has(apiError.status)) {
         setControlStatus(
-          `sequence: unsupported (HTTP ${apiError.status})`
+          `operator message: unsupported (HTTP ${apiError.status})`
           + (apiError.detail ? ` — ${apiError.detail}` : ''),
         )
         return
@@ -329,7 +704,86 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         && apiError.status < 500
       ) {
         setControlStatus(
-          `sequence: refused (HTTP ${apiError.status})`
+          `operator message: refused (HTTP ${apiError.status})`
+          + (apiError.detail ? ` — ${apiError.detail}` : ''),
+        )
+        return
+      }
+      // Lost response: exactly one exact-id reconcile, never a resend (§8.3).
+      try {
+        const response = await api.reconcileOperatorMessage(operationId)
+        const outcome = String(response.outcome || 'unknown')
+        const reason = outcomeReason(response)
+        setControlStatus(
+          `operator message: ${outcome} (${operationId})${reason ? ` — ${String(reason)}` : ''}`,
+        )
+        // An accepted reconcile is the same post-accept fact as a direct
+        // response (P1.5): retire the draft and chips identically.
+        if (outcome === 'accepted') applyAccepted()
+      } catch {
+        setControlStatus(
+          `operator message: response unavailable; operation ${operationId} retained for reconciliation`,
+        )
+      }
+    } finally {
+      setControlBusy(false)
+    }
+  }
+
+  // --- Lane B: macro sends and streaming (§5.4 send path, §6) -------------
+  //
+  // Sending a macro is NOT a store operation (§5.4): the client takes the
+  // resolved events and sends an ordinary v3 control-input request (D2)
+  // with the deployed per-send identity re-proof and outcome reporting.
+  // Streaming pins the identity once at arm instead (§6.3 step 4).
+
+  const runNativeSequence = async (
+    events: SequenceEvent[],
+    label = 'sequence',
+    options?: { commandClass?: boolean },
+  ) => {
+    const controlId = crypto.randomUUID()
+    setControlBusy(true)
+    setControlStatus(`${label}: submitting… (${controlId})`)
+    try {
+      const identity = await api.getControlIdentity(terminalId)
+      const expectedIdentity = pickExpectedIdentity(identity)
+      const response = await api.sendControlInput(terminalId, {
+        control_id: controlId,
+        events,
+        // §4.1: only the registry Compact built-in declares command-class,
+        // and only after the command_controls block is advertised (gated by
+        // the caller). Streaming and ordinary macros NEVER set this field.
+        ...(options?.commandClass ? { payload_class: 'command' as const } : {}),
+        expected_identity: expectedIdentity,
+      })
+      const outcome = String(response.outcome || 'unknown')
+      const reason = outcomeReason(response)
+      const perEvent = Array.isArray(response.events)
+        ? ` [${(response.events as Array<Record<string, unknown>>)
+            .map(entry => String(entry.outcome ?? '—'))
+            .join(', ')}]`
+        : ''
+      setControlStatus(
+        `${label}: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}${perEvent}`,
+      )
+    } catch (error) {
+      const apiError = error as ApiError
+      if (apiError.status && CONTROL_UNSUPPORTED_STATUSES.has(apiError.status)) {
+        setControlStatus(
+          `${label}: unsupported (HTTP ${apiError.status})`
+          + (apiError.detail ? ` — ${apiError.detail}` : ''),
+        )
+        return
+      }
+      if (
+        apiError.status
+        && !CONTROL_AMBIGUOUS_STATUSES.has(apiError.status)
+        && apiError.status >= 400
+        && apiError.status < 500
+      ) {
+        setControlStatus(
+          `${label}: refused (HTTP ${apiError.status})`
           + (apiError.detail ? ` — ${apiError.detail}` : ''),
         )
         return
@@ -339,17 +793,163 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       try {
         const response = await api.queryControlInput(controlId)
         const outcome = String(response.outcome || 'unknown')
-        const reason = response.reason_code || response.reason_detail
+        const reason = outcomeReason(response)
         setControlStatus(
-          `sequence: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}`,
+          `${label}: ${outcome} (${controlId})${reason ? ` — ${String(reason)}` : ''}`,
         )
       } catch {
         setControlStatus(
-          `sequence: response unavailable; control ${controlId} retained for reconciliation`,
+          `${label}: response unavailable; control ${controlId} retained for reconciliation`,
         )
       }
     } finally {
       setControlBusy(false)
+    }
+  }
+
+  // One tap = one v3 request (§7.2, D2). The Compact built-in is
+  // command-class (§4.1): it declares payload_class "command" only when the
+  // server advertised the command_controls block; otherwise it sends
+  // without the field and the guard-absent notice says why (§3.5).
+  const sendMacro = (macro: MacroRecord) => {
+    void runNativeSequence(macro.events, `macro "${macro.name}"`, {
+      commandClass: macro.builtin_kind === 'compact' && commandGuardAvailable,
+    })
+  }
+
+  // §6.3 step 7 + §3.4: the POST's typed body wins; an ambiguous transport
+  // result (including a lost response) is reconciled by exactly one
+  // exact-id GET — the journaled record is the truth and a batch is never
+  // re-sent. The engine routes the resolved outcome per §6.4. An armed
+  // batch declares `payload_class: "interactive"` only when the
+  // per-terminal block advertised it (§6.7) — the declaration rides the
+  // same POST body, the wire sequence is otherwise unchanged.
+  const sendStreamBatch = async (
+    controlId: string,
+    events: SequenceEvent[],
+    expectedIdentity: Record<string, unknown>,
+  ): Promise<SendResult> => {
+    try {
+      const response = await api.sendControlInput(terminalId, {
+        control_id: controlId,
+        events,
+        ...(declareInteractiveRef.current ? { payload_class: 'interactive' as const } : {}),
+        expected_identity: expectedIdentity,
+      })
+      return { kind: 'resolved', result: typedOutcome(response) }
+    } catch (error) {
+      const apiError = error as ApiError
+      if (apiError.status && CONTROL_UNSUPPORTED_STATUSES.has(apiError.status)) {
+        return { kind: 'resolved', result: { outcome: 'unsupported', reasonDetail: apiError.detail } }
+      }
+      if (
+        apiError.status
+        && !CONTROL_AMBIGUOUS_STATUSES.has(apiError.status)
+        && apiError.status >= 400
+        && apiError.status < 500
+      ) {
+        return { kind: 'resolved', result: { outcome: 'refused', reasonDetail: apiError.detail } }
+      }
+      try {
+        const record = await api.queryControlInput(controlId)
+        return { kind: 'resolved', result: typedOutcome(record) }
+      } catch {
+        return { kind: 'reconcile-failed' }
+      }
+    }
+  }
+
+  // §6.1 arming: fetch managed-control, control-identity, and capabilities
+  // fresh; pin the 9-field expected_identity and the per-terminal chord
+  // set; display provider / agent profile / generation in the armed
+  // header. Arming replaces the composer with the capture surface; the
+  // ordinary composer is restored on disarm with its draft preserved.
+  const armStreaming = async () => {
+    setArming(true)
+    setControlStatus('')
+    try {
+      const [managedControl, identity, liveCapabilities] = await Promise.all([
+        api.getManagedControl(terminalId),
+        api.getControlIdentity(terminalId),
+        api.getControlInputCapabilities(),
+      ])
+      if (!managedControl.managed || managedControl.execution_mode !== 'native_tui') {
+        setControlStatus('streaming: terminal is no longer native-managed')
+        return
+      }
+      const fullKeySet = FULL_SEQUENCE_KEY_SET.every(key =>
+        liveCapabilities.sequence?.keys?.includes(key),
+      )
+      if (liveCapabilities.streaming?.supported !== true || !fullKeySet) {
+        setControlStatus('streaming: server predates streaming')
+        return
+      }
+      const expectedIdentity = pickExpectedIdentity(identity)
+      const providerEntry = perTerminalProviderControls(identity)
+      const chords = new Set(providerEntry?.steer_chords ?? [])
+      // §6.7 (r15): armed batches declare interactive only when THIS
+      // terminal's build-exact block advertises it. An old or unpinned
+      // server omits the block: the armed surface keeps the §6.4 readiness
+      // behavior (busy turns pause batches) and says so — never a
+      // speculative bypass.
+      const interactiveAdvertised = providerEntry?.interactive_streaming?.supported === true
+      declareInteractiveRef.current = interactiveAdvertised
+      const graceMs =
+        providerEntry?.dispatch_grace_ms ??
+        (provider ? liveCapabilities.provider_controls?.[provider]?.dispatch_grace_ms : undefined)
+      const generationShort = String(
+        identity.terminal_generation ?? managedControl.generation ?? '—',
+      ).slice(0, 6)
+      const engine = new StreamingEngine(
+        {
+          coalesceWindowMs: liveCapabilities.streaming.coalesce_window_ms ?? 200,
+          dispatchGraceMs: graceMs,
+          declareInteractive: interactiveAdvertised,
+          advertisedChords: chords,
+        },
+        {
+          onSendBatch: (controlId, events) => sendStreamBatch(controlId, events, expectedIdentity),
+          onTrace: trace => setStreamingTrace(trace),
+          onDisarm: (reason, reasonCode) => {
+            setStreamingArmed(false)
+            setDisarmInfo({ reason, reasonCode })
+            if (reasonCode && IDENTITY_REFUSAL_CODES.has(reasonCode)) {
+              // §6.4: on any identity refusal, refetch identity so the
+              // explanation names the new generation.
+              api
+                .getControlIdentity(terminalId)
+                .then(fresh => {
+                  const gen = String(fresh.terminal_generation ?? '?').slice(0, 6)
+                  setDisarmInfo(info =>
+                    info ? { ...info, reason: `${info.reason} — current generation ${gen}` } : info,
+                  )
+                })
+                .catch(() => {})
+            }
+          },
+          onChange: () => setStreamingTick(tick => tick + 1),
+        },
+      )
+      engineRef.current = engine
+      setAdvertisedChords(chords)
+      setStreamingTarget({
+        provider: provider ?? 'unknown',
+        profile: agentProfile ?? null,
+        generationShort,
+      })
+      setStreamingTrace([])
+      setDisarmInfo(null)
+      setStreamingArmed(true)
+      if (!interactiveAdvertised) {
+        setControlStatus(
+          'streaming: interactive declaration unavailable on this server — ' +
+          'busy provider turns pause batches (§6.4), nothing is bypassed',
+        )
+      }
+    } catch {
+      setControlStatus('streaming could not arm: capabilities or identity fetch failed')
+    } finally {
+      setArming(false)
     }
   }
 
@@ -488,6 +1088,8 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
 
     ws.onclose = () => {
       term.write('\r\n\x1b[33m[Connection closed]\x1b[0m\r\n')
+      // §6.4 environment disarm: the output websocket closing while armed.
+      streamingWsCloseRef.current()
     }
 
     // Copy selection to clipboard on mouse-up
@@ -562,13 +1164,73 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   const nativeManaged = managed && executionMode === 'native_tui'
   const acpManaged = managed && executionMode === 'acp'
 
+  // ── Lane B capability gating (§3.5/D9: advertisement, never probing) ──
+  const fullKeySetAdvertised = FULL_SEQUENCE_KEY_SET.every(key =>
+    capabilities?.sequence?.keys?.includes(key),
+  )
+  const streamingAdvertised = capabilities?.streaming?.supported === true && fullKeySetAdvertised
+  const providerControlEntry = provider ? capabilities?.provider_controls?.[provider] : undefined
+  // §3.5: provider_controls absent → built-ins hidden (user macros still
+  // available when v3 is advertised); providers with no registry entry hide
+  // the built-ins and the modal states why (§13, OD3).
+  const builtinsVisible = providerControlEntry != null
+  // §4.1 rule 4: payload_class is sent only when command_controls is
+  // advertised — never earlier, never as a shape probe.
+  const commandGuardAvailable = capabilities?.command_controls != null
+  const visibleMacros = macros.filter(macro =>
+    macro.origin === 'builtin' ? builtinsVisible : sequenceSupported,
+  )
+  const favorites = visibleMacros.filter(macro => macro.favorite)
+  const compactGuardNotice =
+    !commandGuardAvailable && visibleMacros.some(macro => macro.builtin_kind === 'compact')
+      ? 'prefill-concatenation guard unavailable on this server'
+      : null
+  const composerBytes = new TextEncoder().encode(message).length
+
+  // ── Lane C composer routing (§8.5): one composer, two explicitly named
+  // operations — never silent truncation, never a surprise 422. A text-only
+  // single-line draft ≤ 512 bytes rides the deployed control-input path
+  // byte-identically; anything else uses the operator-message path when the
+  // provider advertises it, or disables Send with the reason when not (D9:
+  // the advertised capability, never a probe). The blocks come from the
+  // per-terminal, build-exact identity controls — not the top-level
+  // discovery union (P1.4): a kimi 0.29.0/0.29.1 build advertises the
+  // message block without the image block, and the composer reflects it.
+  const operatorMessageBlock = perTerminalLaneC.operatorMessage
+  const imageBlock = perTerminalLaneC.image
+  const operatorMessageAvailable = operatorMessageBlock?.supported === true
+  const imageAttachAvailable = operatorMessageAvailable && imageBlock?.supported === true
+  const maxMessageBytes = operatorMessageBlock?.max_text_bytes ?? 8192
+  const maxAttachments = operatorMessageBlock?.max_attachments ?? 4
+  const hasAttachments = attachments.length > 0
+  const needsOperatorMessage =
+    hasAttachments || message.includes('\n') || composerBytes > MAX_COMPOSER_BYTES
+  const unresolvedAttachments = attachments.filter(attachment => attachment.state !== 'ready')
+  const overMessageLimit = needsOperatorMessage && composerBytes > maxMessageBytes
+  const hasContent = message.trim().length > 0 || hasAttachments
+  const canSend =
+    !controlBusy
+    && hasContent
+    && !(needsOperatorMessage && !operatorMessageAvailable)
+    && unresolvedAttachments.length === 0
+    && !overMessageLimit
+  const sendDraft = () => {
+    if (needsOperatorMessage) void runOperatorMessage()
+    else void runNativeControl(message.trim(), 'send')
+  }
+
   return (
-    <div className="fixed inset-0 z-50 flex flex-col" style={{ background: '#0d1117' }}>
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2 bg-gray-900 border-b border-gray-700/50 shrink-0">
-        <div className="flex items-center gap-3">
-          <TermIcon size={16} className="text-emerald-400" />
-          <span className="text-sm font-mono text-gray-300">{terminalId}</span>
+    // marginTop: 0 — DashboardHome lays this view out as a later sibling
+    // inside a `space-y-6` container, whose `> * + *` rule would otherwise
+    // apply a 24 px margin-top even to this fixed overlay, leaving a
+    // dashboard strip visible above the supposedly fullscreen terminal.
+    <div className="fixed inset-0 z-50 flex flex-col" style={{ background: '#0d1117', marginTop: 0 }}>
+      {/* Header — wraps within the viewport so Close stays reachable at
+          mobile widths instead of overflowing past the right edge. */}
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b border-gray-700/50 bg-gray-900 px-4 py-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+          <TermIcon size={16} className="shrink-0 text-emerald-400" />
+          <span className="truncate text-sm font-mono text-gray-300">{terminalId}</span>
           {provider && <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">{provider}</span>}
           {agentProfile && <span className="text-xs text-emerald-400 bg-emerald-900/30 px-2 py-0.5 rounded">{agentProfile}</span>}
           {managed && (
@@ -581,11 +1243,11 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
             </span>
           )}
         </div>
-        <div className="flex items-center gap-3">
-          <span className="text-[10px] text-gray-600">Click X to close</span>
+        <div className="ml-auto flex shrink-0 items-center gap-3">
+          <span className="hidden text-[10px] text-gray-600 sm:block">Click X to close</span>
           <button
             onClick={onClose}
-            className="p-1 text-gray-500 hover:text-white transition-colors rounded"
+            className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded p-1 text-gray-500 transition-colors hover:text-white"
             title="Close terminal"
           >
             <X size={18} />
@@ -593,111 +1255,320 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         </div>
       </div>
       {nativeManaged && nativeControlSupported && (
-        <div className="shrink-0 border-b border-gray-700/50 bg-gray-950 px-4 py-2 space-y-2">
-          <div className="flex gap-2">
-            <input
-              value={message}
-              onChange={event => setMessage(event.target.value)}
-              onKeyDown={event => {
-                if (event.key === 'Enter' && message.trim() && !controlBusy) {
-                  void runNativeControl(message.trim(), 'send')
-                }
-              }}
-              placeholder="Send literal text to the native composer…"
-              className="min-w-0 flex-1 rounded border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none"
+        <div
+          data-testid="native-control-area"
+          className="shrink min-h-0 overflow-y-auto border-b border-gray-700/50 bg-gray-950 px-4 py-2 space-y-2"
+        >
+          {streamingArmed && engineRef.current ? (
+            <StreamingPanel
+              engine={engineRef.current}
+              provider={streamingTarget.provider}
+              agentProfile={streamingTarget.profile}
+              generationShort={streamingTarget.generationShort}
+              trace={streamingTrace}
+              tick={streamingTick}
+              onStop={() => engineRef.current?.disarm('operator stopped streaming')}
+              onClearTrace={() => engineRef.current?.clearTrace()}
             />
-            <button
-              disabled={controlBusy || !message.trim()}
-              onClick={() => void runNativeControl(message.trim(), 'send')}
-              className="rounded bg-emerald-700 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+          ) : (
+            <div data-testid="composer-row" className="flex flex-wrap items-center gap-2">
+              {imageAttachAvailable && (
+                <>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept={imageBlock?.formats.map(format => `image/${format}`).join(',')}
+                    multiple
+                    className="hidden"
+                    aria-hidden="true"
+                    tabIndex={-1}
+                    data-testid="attachment-file-input"
+                    onChange={event => {
+                      const files = Array.from(event.target.files ?? [])
+                      if (files.length > 0) stageFiles(files)
+                      // Reset so picking the same file twice still fires.
+                      event.target.value = ''
+                    }}
+                  />
+                  <button
+                    type="button"
+                    aria-label="Attach an image"
+                    title={`Attach an image (${(imageBlock?.formats ?? []).join(', ')})`}
+                    disabled={controlBusy}
+                    onClick={() => fileInputRef.current?.click()}
+                    className="flex min-h-[36px] min-w-[36px] items-center justify-center rounded bg-gray-800 px-2 py-1.5 text-gray-200 transition-colors hover:bg-gray-700 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  >
+                    <Paperclip size={15} />
+                  </button>
+                </>
+              )}
+              <textarea
+                ref={composerInputRef}
+                value={message}
+                onChange={event => handleMessageChange(event.target.value)}
+                onPaste={handleComposerPaste}
+                onKeyDown={event => {
+                  // Enter sends (the accepted §8.5 behavior); Shift+Enter
+                  // composes a newline — a multiline draft routes to the
+                  // operator-message path, named live in the routing line.
+                  if (event.key === 'Enter' && !event.shiftKey && canSend) {
+                    event.preventDefault()
+                    sendDraft()
+                  }
+                }}
+                rows={Math.min(4, message.split('\n').length)}
+                placeholder="Send a message to the native composer…"
+                aria-label="Message to the native composer"
+                className="min-h-[44px] min-w-[44px] flex-1 resize-none rounded border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none sm:min-h-0 sm:min-w-0"
+              />
+              <button
+                disabled={!canSend}
+                onClick={sendDraft}
+                className="min-h-[44px] min-w-[44px] rounded bg-emerald-700 px-3 py-1.5 text-xs text-white transition-colors hover:bg-emerald-600 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500 sm:min-h-[36px] sm:min-w-0"
+              >
+                Send
+              </button>
+              <button
+                type="button"
+                aria-pressed={false}
+                disabled={controlBusy || arming || !streamingAdvertised}
+                onClick={() => void armStreaming()}
+                title={
+                  streamingAdvertised
+                    ? 'Arm streaming mode: type directly to the terminal in bounded identity-bound batches'
+                    : 'Streaming needs a server advertising streaming support and the full key set'
+                }
+                className="min-h-[44px] min-w-[44px] rounded bg-gray-800 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-700 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500 sm:min-h-[36px] sm:min-w-0"
+              >
+                {arming ? 'Arming…' : 'Streaming'}
+              </button>
+              {sequenceSupported && !macrosUnavailable && (
+                <button
+                  type="button"
+                  ref={macrosButtonRef}
+                  onClick={() => setMacroModalOpen(true)}
+                  className="relative min-h-[44px] min-w-[44px] rounded bg-gray-800 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-emerald-500 sm:min-h-[36px] sm:min-w-0"
+                >
+                  Macros
+                  {visibleMacros.length > 0 && (
+                    <span className="ml-1.5 rounded-full bg-gray-700 px-1.5 py-0.5 text-[10px] text-gray-300">
+                      {visibleMacros.length}
+                    </span>
+                  )}
+                </button>
+              )}
+            </div>
+          )}
+          {!streamingArmed && attachments.length > 0 && (
+            <ul
+              role="list"
+              aria-label="Image attachments"
+              data-testid="attachment-strip"
+              className="flex max-h-14 items-stretch gap-2 overflow-x-auto"
             >
-              Send
-            </button>
-            <button
-              disabled={controlBusy}
-              onClick={() => void runNativeControl('/compact', 'compact')}
-              className="rounded bg-indigo-700 px-3 py-1.5 text-xs text-white disabled:opacity-40"
+              {attachments.map(attachment => (
+                <li
+                  key={attachment.localId}
+                  className="flex items-center gap-1.5 rounded border border-gray-700 bg-gray-900 p-1"
+                >
+                  <span className="relative shrink-0">
+                    <img
+                      src={attachment.previewUrl}
+                      alt={
+                        `Image #${attachment.token}: ` +
+                        `${attachment.record?.display_filename ?? attachment.file.name}, ` +
+                        `${formatBytes(attachment.record?.size_bytes ?? attachment.file.size)}, ` +
+                        `${attachment.state === 'staging' ? 'uploading' : attachment.state}`
+                      }
+                      className="h-9 w-9 rounded object-cover"
+                    />
+                    <span
+                      aria-hidden="true"
+                      className="absolute -left-1 -top-1 rounded bg-emerald-800 px-1 text-[9px] font-semibold text-emerald-100"
+                    >
+                      {attachment.token}
+                    </span>
+                  </span>
+                  <span className="flex min-w-0 flex-col justify-center">
+                    <span className="max-w-28 truncate text-[10px] text-gray-300">
+                      {attachment.record?.display_filename ?? attachment.file.name}
+                    </span>
+                    {attachment.state === 'staging' && (
+                      <span className="text-[9px] text-gray-500">uploading…</span>
+                    )}
+                    {attachment.state === 'ready' && (
+                      <span className="text-[9px] text-emerald-400">ready</span>
+                    )}
+                    {attachment.state === 'failed' && (
+                      <span className="max-w-40 truncate text-[9px] text-amber-300" title={attachment.error}>
+                        {attachment.error ?? 'upload failed'}
+                      </span>
+                    )}
+                  </span>
+                  {attachment.state === 'failed' && (
+                    <button
+                      type="button"
+                      aria-label={`Retry image #${attachment.token} upload`}
+                      disabled={controlBusy}
+                      onClick={() => retryAttachment(attachment)}
+                      className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded text-gray-400 transition-colors hover:text-white disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    >
+                      <RotateCcw size={14} />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    aria-label={`Remove image #${attachment.token}`}
+                    disabled={controlBusy}
+                    onClick={() => removeAttachment(attachment)}
+                    className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded text-gray-500 transition-colors hover:text-white disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  >
+                    <X size={14} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {disarmInfo && !streamingArmed && (
+            <div
+              role="alert"
+              className="space-y-1 rounded border border-amber-600/60 bg-amber-950/30 px-3 py-2"
             >
-              Compact
-            </button>
-          </div>
-          <div className="flex items-center gap-2 text-[11px] text-gray-500">
+              <div className="text-xs text-amber-200">
+                Streaming disarmed: {disarmInfo.reason}
+              </div>
+              {streamingTrace.length > 0 && (
+                <div className="max-h-24 space-y-0.5 overflow-y-auto font-mono text-[10px] text-gray-400">
+                  {streamingTrace.map((entry, index) => (
+                    <div key={index}>
+                      {entry.preview || '(no events)'} — {entry.outcome}
+                      {entry.reasonCode ? `/${entry.reasonCode}` : ''} ({entry.controlIdShort})
+                      {entry.note ? ` ${entry.note}` : ''}
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  disabled={arming || !streamingAdvertised}
+                  onClick={() => void armStreaming()}
+                  className="min-h-[36px] rounded bg-emerald-700 px-3 py-1 text-xs text-white transition-colors hover:bg-emerald-600 disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                >
+                  Re-arm
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    engineRef.current = null
+                    setDisarmInfo(null)
+                    setStreamingTrace([])
+                  }}
+                  className="min-h-[36px] rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 transition-colors hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
+          <div className="flex items-center gap-2 text-[11px] text-gray-400">
             <span>Cancel, route, effort, and resume controls are unavailable for native TUI sessions.</span>
             <span className="min-w-0 truncate">{controlStatus}</span>
           </div>
-          {sequenceSupported && (
-            <div className="space-y-1 border-t border-gray-800 pt-2">
-              <div className="flex items-center gap-2">
-                {!recording ? (
-                  <button
-                    disabled={controlBusy}
-                    onClick={startRecording}
-                    className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
-                  >
-                    Record
-                  </button>
-                ) : (
-                  <button
-                    disabled={controlBusy}
-                    onClick={stopRecording}
-                    className="rounded bg-amber-700 px-3 py-1 text-xs text-white disabled:opacity-40"
-                  >
-                    Stop
-                  </button>
-                )}
-                {recording && (
-                  <div
-                    tabIndex={0}
-                    onKeyDown={onRecorderKeyDown}
-                    ref={element => element?.focus()}
-                    className="min-w-0 flex-1 rounded border border-amber-600/60 bg-gray-900 px-3 py-1 text-xs text-amber-200 focus:outline-none"
-                  >
-                    Recording — press keys now ({recordedEvents.length}/{MAX_SEQUENCE_EVENTS}{' '}
-                    events, {sequenceTextBytes(recordedEvents)}/{MAX_SEQUENCE_TEXT_BYTES} B)
-                  </div>
-                )}
-                {!recording && recordedEvents.length > 0 && (
-                  <div className="min-w-0 flex-1 truncate rounded border border-gray-700 bg-gray-900 px-3 py-1 font-mono text-xs text-gray-200">
-                    {recordedEvents.map((event, index) => (
-                      <span key={index} className="mr-2">
-                        {previewToken(event)}
-                      </span>
-                    ))}
-                  </div>
-                )}
-                <button
-                  disabled={controlBusy || recording || recordedEvents.length === 0}
-                  onClick={() => void runNativeSequence(recordedEvents)}
-                  className="rounded bg-emerald-700 px-3 py-1 text-xs text-white disabled:opacity-40"
-                >
-                  Send sequence
-                </button>
-                <button
-                  disabled={controlBusy || (!recording && recordedEvents.length === 0)}
-                  onClick={cancelRecording}
-                  className="rounded bg-gray-800 px-3 py-1 text-xs text-gray-200 disabled:opacity-40"
-                >
-                  Cancel
-                </button>
-              </div>
-              {recordNotice && (
-                <div className="text-[11px] text-amber-300">{recordNotice}</div>
-              )}
-              <div className="text-[10px] text-gray-600">
-                Records exact representable events only: Escape, Ctrl+C, Ctrl+S (steer chord),
-                Enter, Backspace, and printable text. Comma, plus, and backslash are ordinary
-                text. Terminal protocols cannot express arbitrary simultaneous physical-key
-                combinations; a combination this surface cannot represent is refused with a
-                message, never approximated. Cancel before send writes nothing.
-              </div>
+          <div className="text-[10px] text-gray-400" data-testid="composer-route-status">
+            {needsOperatorMessage ? (
+              operatorMessageAvailable ? (
+                <>
+                  operator message — {formatBytes(composerBytes)}
+                  {hasAttachments &&
+                    `, ${attachments.length} image${attachments.length > 1 ? 's' : ''}`}
+                  {unresolvedAttachments.length > 0 && (
+                    <span className="text-amber-300"> — waiting on image uploads</span>
+                  )}
+                </>
+              ) : (
+                <span className="text-amber-300">
+                  operator message unavailable for this provider — this draft needs the
+                  operator-message path (&gt;{MAX_COMPOSER_BYTES} bytes, multiline, or an
+                  image), which this provider does not advertise
+                </span>
+              )
+            ) : (
+              <>delivers as control input · {composerBytes}/{MAX_COMPOSER_BYTES} B</>
+            )}
+            {overMessageLimit && (
+              <span className="text-amber-300">
+                {' '}
+                — over the {maxMessageBytes}-byte operator-message limit; trim the draft
+                (it is refused whole, never silently truncated)
+              </span>
+            )}
+          </div>
+          {operatorMessageAvailable && !imageAttachAvailable && (
+            <div className="text-[10px] text-gray-600" data-testid="image-unavailable-note">
+              Image attachments are unavailable on this terminal&apos;s provider build — the
+              build-exact controls advertise no proven image support (kimi image delivery
+              is proven on the pinned 0.29.2 build only); text and multiline operator
+              messages still send.
             </div>
           )}
+          <div aria-live="polite" className="sr-only" data-testid="attachment-notice">
+            {attachmentNotice}
+          </div>
           {nativeControlResolved && !sequenceSupported && (
             <div className="text-[10px] text-gray-600">
-              Sequence recording needs control-input schema v3; this server offers the literal
+              Macros and streaming need control-input schema v3; this server offers the literal
               control only.
             </div>
           )}
+          {sequenceSupported && !streamingAdvertised && (
+            <div className="text-[10px] text-gray-600">
+              Streaming is unavailable: this server predates streaming (or does not advertise the
+              full key set).
+            </div>
+          )}
+          {sequenceSupported && macrosUnavailable && (
+            <div className="text-[10px] text-gray-600">
+              The macro library is unavailable on this server.
+            </div>
+          )}
+          {macroModalOpen && (
+            <MacroLibraryModal
+              provider={provider}
+              agentProfile={agentProfile}
+              macros={macros}
+              quarantine={macroQuarantine}
+              builtinsVisible={builtinsVisible}
+              commandGuardAvailable={commandGuardAvailable}
+              advertisedChords={advertisedChords}
+              busy={controlBusy}
+              onClose={() => {
+                setMacroModalOpen(false)
+                macrosButtonRef.current?.focus()
+              }}
+              onSend={sendMacro}
+              onChanged={loadMacroLibrary}
+            />
+          )}
+        </div>
+      )}
+      {/* §7.2 favorites ride a reserved, non-shrinking row directly above the
+          terminal. The control area scrolls when it grows tall (armed
+          streaming at mobile widths); a strip inside it could be clipped
+          beneath the fitted xterm (installed-QA P2). Reserved here, the
+          Compact/Stop favorites are always fully visible and operable,
+          armed or not. */}
+      {nativeManaged && nativeControlSupported && favorites.length > 0 && (
+        <div
+          data-testid="favorite-strip-row"
+          className="shrink-0 border-b border-gray-700/50 bg-gray-950 px-4 py-1"
+        >
+          <FavoriteStrip
+            favorites={favorites}
+            disabled={controlBusy}
+            onSend={sendMacro}
+            guardNotice={compactGuardNotice}
+          />
         </div>
       )}
       {nativeManaged && nativeControlResolved && !nativeControlSupported && (
@@ -787,8 +1658,15 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
           </div>
         </div>
       )}
-      {/* Terminal — absolute positioning gives xterm.js real pixel dimensions to measure */}
-      <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+      {/* Terminal — absolute positioning gives xterm.js real pixel dimensions to measure.
+          The floor keeps the armed streaming terminal at or above half the
+          viewport on mobile; the control area above scrolls instead of
+          squeezing the xterm below it. FitAddon floors the fit to whole rows,
+          so the visible .xterm lands up to one row short of this wrapper
+          (390×844 armed: wrapper 422px but .xterm 416px). The +10px pads the
+          floor by that row-quantization slack so the actual visible terminal —
+          not just the wrapper — clears 50dvh. */}
+      <div style={{ flex: 1, position: 'relative', overflow: 'hidden', minHeight: 'calc(50dvh + 10px)' }}>
         <div ref={containerRef} style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }} />
       </div>
     </div>

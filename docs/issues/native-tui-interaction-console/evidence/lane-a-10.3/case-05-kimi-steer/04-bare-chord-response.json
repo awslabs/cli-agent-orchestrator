@@ -1,0 +1,49 @@
+{
+  "chord": "C-s",
+  "chord_attempted": true,
+  "chord_sent": true,
+  "chunks_sent": 0,
+  "control_id": "ctl-76b57e3b91",
+  "detail": "delivered 1 ordered event(s) into pane %2 through the kimi_cli native composer adapter; every event was acknowledged",
+  "enter_attempted": false,
+  "enter_sent": false,
+  "events": [
+    {
+      "chord": "C-s",
+      "ordinal": 0,
+      "outcome": "sent",
+      "type": "chord"
+    }
+  ],
+  "in_flight": false,
+  "outcome": "accepted",
+  "protocol": "cao-control-input-v1",
+  "reason_code": null,
+  "reattemptable": false,
+  "request_digest": "41d0ffd299fa54d7d4d7e6177f7c63e1c82ff846823851c36dbabd422f8fdc8e",
+  "request_schema_version": 3,
+  "resolved_identity": {
+    "execution_mode": "native_tui",
+    "native_session_id": "session_45bade86-9308-4196-a166-d3e19ca6740c",
+    "pane": {
+      "bound_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "dead": false,
+      "observed_server_socket_path": "/private<TMUX_SOCKDIR>/server.sock",
+      "pane_id": "%2",
+      "pane_pid": 27613,
+      "window_id": "@2"
+    },
+    "pane_birth_id": "%2",
+    "provider": "kimi_cli",
+    "provider_process_id": "27613@Tue Jul 28 13:10:52 2026",
+    "session_name": "cao-a103-kimi-507f32",
+    "terminal_generation": "9955f723-ab02-440f-9ae8-78e0b28ca41d",
+    "terminal_id": "321548ff",
+    "terminal_incarnation": null
+  },
+  "state": "delivered",
+  "submission_evidence_ref": null,
+  "submission_observed": null,
+  "terminal_id": "321548ff",
+  "text_sent": false
+}

@@ -1,0 +1,29 @@
+✦ Use Kimi K3 with High thinking effort - for the best balance between token spend and capability
+   Run /model to switch to K3 and set thinking effort to High
+
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to
+ ~/.tmux.conf and restart tmux.
+
+ ✨ Count from 1 to 120, one number per line, thinking briefly between lines. Work slowly and do
+    not stop early.
+
+  🌔 · Tip: ask Kimi to schedule tasks, e.g. "remind me at 5pm"
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+  Select a model  (type to search)
+  Tab toggle provider · ↑↓ navigate · Enter select · Alt+S session-only · Esc cancel
+  Note: Switching models invalidates the existing prompt cache. Use /new to avoid extra token
+  costs.
+
+   All   Kimi Code
+
+   ❯ K2.7 Coding            Kimi Code ← current
+     K2.7 Coding Highspeed  Kimi Code
+     K3                     Kimi Code
+     K3-256k                Kimi Code
+
+  Thinking
+   [ On ]   Off (Unsupported)
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+ K2.7 Coding thinking  …/pytest-634/cao_scratch_r150/worktree-r15-kimi  master
+                                                                               context: 0% (0/256k)
