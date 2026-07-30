@@ -51,6 +51,16 @@ def _claude_screen(tail_rows):
     ]
 
 
+def _codex_screen(transcript_rows):
+    return [
+        *transcript_rows,
+        "",
+        f"{ESC}[1m›{RESET} {DIM}Explain this codebase{RESET}",
+        "",
+        f"  {DIM}gpt-5.6-terra xhigh · ~/project · branch{RESET}",
+    ]
+
+
 class TestExecutionPins:
     def test_the_pinned_builds_are_exactly_the_live_verified_ones(self):
         pin = npi.command_execution_pin_for("kimi_cli", "0.29.2")
@@ -58,18 +68,21 @@ class TestExecutionPins:
         assert pin.signal and pin.evidence
         pin = npi.command_execution_pin_for("claude_code", "2.1.220")
         assert pin is not None and pin.rule == "claude-command-echo-response" and pin.styled
+        pin = npi.command_execution_pin_for("codex", "0.146.0")
+        assert pin is not None and pin.rule == "codex-compaction-signal" and pin.styled
 
     def test_unpinned_builds_have_no_execution_pin(self):
         # Same honesty as the emptiness pins: no live evidence, no pin.
         assert npi.command_execution_pin_for("kimi_cli", "0.29.0") is None
         assert npi.command_execution_pin_for("kimi_cli", "0.29.1") is None
         assert npi.command_execution_pin_for("claude_code", "2.1.218") is None
-        assert npi.command_execution_pin_for("codex", "0.146.0") is None
+        assert npi.command_execution_pin_for("codex", "0.145.0") is None
         assert npi.command_execution_pin_for(None, "0.29.2") is None
 
     def test_version_banners_normalize(self):
         assert npi.command_execution_pin_for("kimi_cli", "kimi 0.29.2") is not None
         assert npi.command_execution_pin_for("claude_code", "2.1.220 (Claude Code)") is not None
+        assert npi.command_execution_pin_for("codex", "codex-cli 0.146.0") is not None
 
 
 class TestSignalCount:
@@ -119,6 +132,23 @@ class TestSignalCount:
     def test_unparseable_styled_rows_count_nothing(self):
         pin = npi.command_execution_pin_for("claude_code", "2.1.220")
         assert npi._execution_signal_count(pin, ["❯ /compact" + ESC + "[38;2;1"], "/compact") == 0
+
+    def test_codex_context_compacted_notice_is_counted_per_occurrence(self):
+        pin = npi.command_execution_pin_for("codex", "0.146.0")
+        notice = f"{DIM}• {RESET}Context compacted"
+        assert npi._execution_signal_count(pin, _codex_screen([notice]), "/compact") == 1
+        assert npi._execution_signal_count(pin, _codex_screen([notice, notice]), "/compact") == 2
+        assert npi._execution_signal_count(pin, _codex_screen([]), "/compact") == 0
+
+    def test_codex_busy_rejection_or_generic_working_is_not_completion(self):
+        pin = npi.command_execution_pin_for("codex", "0.146.0")
+        rows = _codex_screen(
+            [
+                "■ '/compact' is disabled while a task is in progress.",
+                "• Working (9s • esc to interrupt)",
+            ]
+        )
+        assert npi._execution_signal_count(pin, rows, "/compact") == 0
 
 
 class TestObserveCommandExecution:
@@ -227,6 +257,20 @@ class TestObserveCommandExecution:
             composer_pin=composer,
             baseline_rows=_claude_screen([]),
             screen=lambda: _claude_screen(["❯ /compact", "  ⎿  Not enough messages to compact."]),
+        )
+        assert observed == SUBMISSION_SUBMITTED
+        assert ref
+
+    def test_codex_notice_above_baseline_closes_submitted(self):
+        pin = npi.command_execution_pin_for("codex", "0.146.0")
+        composer = npi.composer_emptiness_pin_for("codex", "0.146.0")
+        observed, ref = npi.observe_command_execution(
+            "%1",
+            pin,
+            command_text="/compact",
+            composer_pin=composer,
+            baseline_rows=_codex_screen([]),
+            screen=lambda: _codex_screen([f"{DIM}• {RESET}Context compacted"]),
         )
         assert observed == SUBMISSION_SUBMITTED
         assert ref

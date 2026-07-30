@@ -9,7 +9,7 @@ import pathlib
 import select
 import subprocess
 import time
-from typing import Any, Optional, cast
+from typing import Any, Callable, Mapping, Optional, Sequence, cast
 
 from cli_agent_orchestrator.providers.codex import (
     _toml_override,
@@ -54,9 +54,24 @@ def _response_by_id(stdout: str, request_id: int) -> dict[str, Any]:
 
 
 def _run_app_server_probe(
-    argv: list[str], requests: list[dict[str, Any]], timeout: float
+    argv: list[str],
+    requests: list[dict[str, Any]],
+    timeout: float,
+    *,
+    env: Optional[dict[str, str]] = None,
+    followup_factory: Optional[
+        Callable[[Mapping[int, Mapping[str, Any]]], Sequence[dict[str, Any]]]
+    ] = None,
 ) -> tuple[str, str, int]:
-    """Exchange requests incrementally so EOF cannot overtake async replies."""
+    """Exchange requests incrementally so EOF cannot overtake async replies.
+
+    ``followup_factory`` is evaluated only after every fixed request has a
+    response.  It exists for provider operations whose parameters come from
+    an earlier response in the same app-server lifetime, such as materializing
+    a newly assigned thread id with ``thread/name/set``.  The factory receives
+    only parsed responses keyed by request id; notifications cannot become
+    accidental authority for a dependent request.
+    """
     try:
         proc = subprocess.Popen(
             argv,
@@ -65,6 +80,7 @@ def _run_app_server_probe(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=env,
         )
     except OSError as exc:
         raise CodexTrustProbeError(f"could not start Codex app-server: {exc}") from exc
@@ -76,7 +92,10 @@ def _run_app_server_probe(
     responses: set[int] = set()
     deadline = time.monotonic() + timeout
     try:
-        for request in requests:
+        pending = list(requests)
+        followups_added = False
+        while pending:
+            request = pending.pop(0)
             proc.stdin.write(json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n")
             proc.stdin.flush()
             request_id = request.get("id")
@@ -105,6 +124,13 @@ def _run_app_server_probe(
                     continue
                 if isinstance(item.get("id"), int):
                     responses.add(item["id"])
+            if not pending and followup_factory is not None and not followups_added:
+                parsed = {
+                    item_id: _response_by_id("".join(output), item_id)
+                    for item_id in sorted(responses)
+                }
+                pending.extend(list(followup_factory(parsed)))
+                followups_added = True
     finally:
         try:
             proc.stdin.close()

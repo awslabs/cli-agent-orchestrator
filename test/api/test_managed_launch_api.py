@@ -97,6 +97,14 @@ def test_capability_handshake_is_exact_and_versioned(client):
         "native_tui": {
             "schema_version": 1,
             "providers": {
+                "codex": {
+                    "supported": True,
+                    "id_source": "app_server_thread_start",
+                    "readiness_receipt_kind": "codex-native-thread-start",
+                    "executable": "codex",
+                    "pinned_version": "0.146.0",
+                    "supported_versions": ["0.146.0"],
+                },
                 "claude_code": {
                     "supported": True,
                     "id_source": "cli_session_id",

@@ -68,6 +68,11 @@ ATTACHMENT_STATES = frozenset(LIVE_STATES | {DETACHED, AMBIGUOUS})
 #: How a native session id was obtained.  Closed, because each value
 #: carries different obligations that ``declare`` validates.
 ACQUISITION_ACP_BOOTSTRAP = "zero_prompt_acp_bootstrap"
+# A provider-native control plane minted the persistent session without
+# submitting a model turn.  Codex app-server is such a control plane; calling
+# it ACP would make the durable attachment receipt claim a route that was not
+# used.
+ACQUISITION_ZERO_TURN_BOOTSTRAP = "zero_turn_provider_bootstrap"
 ACQUISITION_RESUME = "pinned_resume"
 #: The id was *chosen* by this system and handed to the provider at launch
 #: rather than obtained from it.  Distinct from the other two because both
@@ -77,7 +82,12 @@ ACQUISITION_RESUME = "pinned_resume"
 #: journaled receipt say the session pre-dated the launch when it did not.
 ACQUISITION_CHOSEN_SESSION_ID = "chosen_session_id"
 ACQUISITION_METHODS = frozenset(
-    {ACQUISITION_ACP_BOOTSTRAP, ACQUISITION_RESUME, ACQUISITION_CHOSEN_SESSION_ID}
+    {
+        ACQUISITION_ACP_BOOTSTRAP,
+        ACQUISITION_ZERO_TURN_BOOTSTRAP,
+        ACQUISITION_RESUME,
+        ACQUISITION_CHOSEN_SESSION_ID,
+    }
 )
 
 INTENT_SCHEMA = "cao-native-attachment-intent-v1"
@@ -178,7 +188,7 @@ def acquire_intent(
     the old task, and re-sending those bytes runs the work twice inside a
     session whose transcript makes it look like one run.
 
-    ``zero_prompt_acp_bootstrap`` must additionally assert that the
+    Either zero-turn bootstrap method must additionally assert that the
     bootstrap sent no task or turn and fully detached before the native
     launch.  A bootstrap that overlaps the native TUI is itself the
     double-attach this module prevents, and it would be holding the very
@@ -210,10 +220,13 @@ def acquire_intent(
         "replays_task_bytes": False,
     }
 
-    if acquisition_method == ACQUISITION_ACP_BOOTSTRAP:
+    if acquisition_method in {
+        ACQUISITION_ACP_BOOTSTRAP,
+        ACQUISITION_ZERO_TURN_BOOTSTRAP,
+    }:
         if bootstrap_sent_no_turn is not True or bootstrap_detached_before_launch is not True:
             raise NativeAttachmentInvalid(
-                "a zero-prompt ACP bootstrap must assert bootstrap_sent_no_turn=True and "
+                "a zero-turn bootstrap must assert bootstrap_sent_no_turn=True and "
                 "bootstrap_detached_before_launch=True; a bootstrap that sent a turn or "
                 "still holds the session cannot hand it to a native TUI"
             )

@@ -11,6 +11,7 @@ import pytest
 
 from cli_agent_orchestrator.services import (
     claude_native_control,
+    codex_native_control,
     control_input_service,
     kimi_native_control,
     provider_contracts,
@@ -19,6 +20,7 @@ from cli_agent_orchestrator.services import (
 
 KIMI = provider_contracts.PROVIDER_KIMI_CLI
 CLAUDE = provider_contracts.PROVIDER_CLAUDE_CODE
+CODEX = provider_contracts.PROVIDER_CODEX
 
 # The pinned v3 sequences, restated exactly as a client sends them.
 COMPACT_EVENTS = [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
@@ -74,6 +76,12 @@ class TestSendAuthority:
         assert entry["compact"] == COMPACT_EVENTS
         assert entry["stop"] == STOP_EVENTS
 
+    def test_codex_compact_and_stop_are_the_pinned_sequences(self):
+        entry = provider_controls.controls_for(CODEX, "0.146.0")
+        assert entry["compact"] == COMPACT_EVENTS
+        assert entry["stop"] == STOP_EVENTS
+        assert entry["compact"][0]["text"] is codex_native_control.CONTROL_COMPACT
+
     def test_the_kimi_compact_text_is_the_adapters_own_pin(self):
         """Object identity, not equality: restating ``"/compact"`` in the
         registry would fork the one fact both sides must hold."""
@@ -102,11 +110,10 @@ class TestSendAuthority:
 
     @pytest.mark.parametrize(
         "provider,version",
-        [(provider_contracts.PROVIDER_CODEX, "0.146.0"), ("no_such_provider", "1.0")],
+        [("no_such_provider", "1.0")],
     )
     def test_a_provider_without_a_native_adapter_has_no_entry(self, provider, version):
-        """No adapter and no launch binder means no Compact/Stop/Steer is
-        deliverable through the managed path (§13 OD3)."""
+        """No adapter means no Compact/Stop/Steer is deliverable."""
         assert provider_controls.controls_for(provider, version) is None
 
     def test_the_kimi_dispatch_grace_is_the_service_constant_in_ms(self):
@@ -152,6 +159,13 @@ class TestDiscoveryWireShape:
 
     def test_the_advertised_block_matches_the_wire_shape_exactly(self):
         assert provider_controls.advertised_provider_controls() == {
+            CODEX: {
+                "compact": {"events": COMPACT_EVENTS},
+                "stop": {"events": STOP_EVENTS},
+                "steer_chords": [],
+                "operator_message": OPERATOR_MESSAGE_BLOCK,
+                "interactive_streaming": {"supported": True},
+            },
             KIMI: {
                 "compact": {"events": COMPACT_EVENTS},
                 "stop": {"events": STOP_EVENTS},
@@ -220,9 +234,12 @@ class TestPerTerminalBlock:
         assert "dispatch_grace_ms" not in block
         assert "evidence" not in block
 
-    def test_a_provider_without_an_entry_has_no_block(self):
-        codex = provider_contracts.PROVIDER_CODEX
-        assert provider_controls.controls_block_for(codex, "0.146.0") is None
+    def test_codex_has_a_build_exact_native_control_block(self):
+        block = provider_controls.controls_block_for(CODEX, "0.146.0")
+        assert block["compact"] == {"events": COMPACT_EVENTS}
+        assert block["stop"] == {"events": STOP_EVENTS}
+        assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
+        assert "image" not in block
 
 
 class TestEvidence:
@@ -328,8 +345,11 @@ class TestLaneCBlocks:
         assert "operator_message" not in block
         assert "image" not in block
 
-    def test_a_provider_without_an_entry_advertises_no_blocks(self):
-        assert provider_controls.controls_block_for("codex", "0.146.0") is None
+    def test_codex_native_text_is_advertised_but_image_waits_for_acceptance(self):
+        block = provider_controls.controls_block_for(CODEX, "0.146.0")
+        assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
+        assert block["interactive_streaming"] == {"supported": True}
+        assert "image" not in block
 
     def test_the_entries_name_their_lane_c_evidence(self):
         kimi_evidence = provider_controls.controls_for(KIMI, "0.29.2")["evidence"]

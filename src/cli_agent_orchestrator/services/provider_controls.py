@@ -21,10 +21,9 @@ Two read surfaces, deliberately different:
   and a chord absent from it is refused locally at capture time with zero
   POSTs (D9).
 
-Providers with no entry (codex and all others on this base) advertise
-nothing: there is no native control adapter and no native-TUI launch
-binder for them, so their Compact/Stop cannot be delivered through the
-managed path (§13 OD3).  Adding a provider is adding one row plus its
+Providers with no entry advertise nothing: there is no native control
+adapter for them, so their Compact/Stop cannot be delivered through the
+managed path (§13 OD3). Adding a provider is adding one row plus its
 evidence — no wire-schema change.
 """
 
@@ -228,11 +227,43 @@ def _claude_entry() -> ProviderControls:
     )
 
 
+def _codex_entry() -> ProviderControls:
+    """The Codex row, pinned to the installed native composer contract."""
+    from cli_agent_orchestrator.services import codex_native_control
+
+    return ProviderControls(
+        compact=[_text(codex_native_control.CONTROL_COMPACT), _key("Enter")],
+        stop=[_key("Escape")],
+        steer_chords=(),
+        dispatch_grace_ms=None,
+        operator_message=_operator_message_block(),
+        # Staged-path image delivery is intentionally unadvertised until the
+        # native Codex canary proves it on the pinned build.
+        image=None,
+        interactive_streaming=_interactive_streaming_block(),
+        evidence={
+            "compact": "codex_native_control.CONTROL_COMPACT (adapter pin, imported)",
+            "stop": 'Codex TUI progress footer advertises "esc to interrupt"',
+            "steer_chords": "no steer chord is pinned for Codex 0.146.0",
+            "operator_message": (
+                "Codex 0.146.0 composer Ctrl-J newline binding and 120ms "
+                "paste-burst Enter-suppression window"
+            ),
+            "image": "unadvertised pending build-exact native acceptance",
+            "interactive_streaming": (
+                "declared streaming over the same build-pinned v3 sequence "
+                "transport as native operator messages"
+            ),
+        },
+    )
+
+
 #: The registry rows.  Compact travels as ordinary composer text through
 #: the v3 path — identical to the deployed Compact button — and the kimi
 #: adapter's ``control()`` gating on provider-advertised commands applies
 #: to the adapter operation path, not this composer-text path.
 _REGISTRY = {
+    provider_contracts.PROVIDER_CODEX: _codex_entry,
     provider_contracts.PROVIDER_KIMI_CLI: _kimi_entry,
     provider_contracts.PROVIDER_CLAUDE_CODE: _claude_entry,
 }
@@ -283,6 +314,7 @@ def _wire_shape(entry: ProviderControls) -> Dict[str, Any]:
 #: (provider_contracts.py); the reverse map lives there as
 #: ``_WIRE_FOR_RECOVERY_NAME``.
 _SHORT_NAME_FOR_WIRE = {
+    provider_contracts.PROVIDER_CODEX: provider_contracts.PROVIDER_CODEX,
     provider_contracts.PROVIDER_KIMI_CLI: provider_contracts.PROVIDER_KIMI,
     provider_contracts.PROVIDER_CLAUDE_CODE: provider_contracts.PROVIDER_CLAUDE,
 }

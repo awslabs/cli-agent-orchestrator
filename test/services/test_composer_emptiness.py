@@ -49,12 +49,36 @@ def _claude_rows(prompt_row):
     ]
 
 
+def _codex_rows(prompt_row, *wrapped_rows, suggestion=None):
+    """A styled Codex 0.146.0 screen ending in its live composer/footer."""
+    rows = [
+        f"{ESC}[1m›{RESET} {DIM}earlier transcript prompt{RESET}",
+        "",
+        "• Earlier response",
+        "",
+        prompt_row,
+        *wrapped_rows,
+        "",
+    ]
+    if suggestion is not None:
+        rows.append(suggestion)
+    rows.extend(
+        [
+            "",
+            f"  {DIM}gpt-5.6-terra xhigh · ~/project · branch{RESET}",
+        ]
+    )
+    return rows
+
+
 class TestEmptinessPins:
     def test_the_pinned_builds_are_exactly_the_live_verified_ones(self):
         pin = npi.composer_emptiness_pin_for("kimi_cli", "0.29.2")
         assert pin is not None and pin.rule == "kimi-composer-box" and not pin.styled
         pin = npi.composer_emptiness_pin_for("claude_code", "2.1.220")
         assert pin is not None and pin.rule == "claude-prompt-box" and pin.styled
+        pin = npi.composer_emptiness_pin_for("codex", "0.146.0")
+        assert pin is not None and pin.rule == "codex-prompt-footer" and pin.styled
 
     def test_kimi_0290_and_0291_are_honestly_unpinned(self):
         """Only 0.29.2's composer is live-verified (§10.3): the older
@@ -70,11 +94,15 @@ class TestEmptinessPins:
     def test_an_unpinned_build_or_provider_has_no_pin(self):
         assert npi.composer_emptiness_pin_for("kimi_cli", "0.28.0") is None
         assert npi.composer_emptiness_pin_for("kimi_cli", None) is None
-        assert npi.composer_emptiness_pin_for("codex", "0.146.0") is None
+        assert npi.composer_emptiness_pin_for("codex", "0.145.0") is None
         assert npi.composer_emptiness_pin_for(None, "0.29.2") is None
 
     def test_every_pin_carries_its_evidence(self):
-        for provider, version in (("kimi_cli", "0.29.2"), ("claude_code", "2.1.220")):
+        for provider, version in (
+            ("kimi_cli", "0.29.2"),
+            ("claude_code", "2.1.220"),
+            ("codex", "0.146.0"),
+        ):
             pin = npi.composer_emptiness_pin_for(provider, version)
             assert pin.evidence and "§10.3" in pin.evidence
 
@@ -213,6 +241,40 @@ class TestClaudePromptBox:
         assert npi._claude_composer_empty(rows) is True
 
 
+class TestCodexPromptFooter:
+    def test_a_dim_placeholder_is_an_empty_composer(self):
+        placeholder = f"{ESC}[1m›{RESET} {DIM}Explain this codebase{RESET}"
+        assert npi._codex_composer_empty(_codex_rows(placeholder)) is True
+
+    def test_a_bare_prompt_is_empty(self):
+        assert npi._codex_composer_empty(_codex_rows(f"{ESC}[1m›{RESET} ")) is True
+
+    def test_normally_styled_prefill_is_content(self):
+        prompt = f"{ESC}[1m›{RESET} /compact"
+        assert npi._codex_composer_empty(_codex_rows(prompt)) is False
+
+    def test_wrapped_normally_styled_prefill_is_content(self):
+        prompt = f"{ESC}[1m›{RESET} "
+        assert npi._codex_composer_empty(_codex_rows(prompt, "wrapped draft")) is False
+
+    def test_footer_and_slash_suggestion_are_not_composer_content(self):
+        prompt = f"{ESC}[1m›{RESET} {DIM}Summarize recent commits{RESET}"
+        suggestion = (
+            f"  {ESC}[1m{ESC}[38;5;6m/compact  summarize conversation to prevent "
+            f"hitting the context limit{RESET}"
+        )
+        assert npi._codex_composer_empty(_codex_rows(prompt, suggestion=suggestion)) is True
+
+    def test_last_prompt_wins_and_missing_separator_is_unproven(self):
+        prompt = f"{ESC}[1m›{RESET} {DIM}Explain this codebase{RESET}"
+        assert npi._codex_composer_empty(_codex_rows(prompt)) is True
+        assert npi._codex_composer_empty([prompt, "footer without separator"]) is None
+
+    def test_missing_prompt_or_unparseable_style_is_unproven(self):
+        assert npi._codex_composer_empty(["no prompt", "", "footer"]) is None
+        assert npi._codex_composer_empty([f"› {ESC}[38;2;1", ""]) is None
+
+
 class TestObserveComposerEmpty:
     def test_the_plain_capture_serves_the_kimi_rule(self):
         pin = npi.composer_emptiness_pin_for("kimi_cli", "0.29.2")
@@ -234,6 +296,11 @@ class TestObserveComposerEmpty:
         assert (
             npi.observe_composer_empty("%1", pin, screen=lambda: _claude_rows("❯ prefill")) is False
         )
+
+    def test_the_styled_capture_serves_the_codex_rule(self):
+        pin = npi.composer_emptiness_pin_for("codex", "codex-cli 0.146.0")
+        prompt = f"{ESC}[1m›{RESET} /compact"
+        assert npi.observe_composer_empty("%1", pin, screen=lambda: _codex_rows(prompt)) is False
 
     def test_an_unknown_rule_proves_nothing(self):
         pin = npi.ComposerEmptinessPin(

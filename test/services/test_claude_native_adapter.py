@@ -252,10 +252,14 @@ class TestPerProviderArgvDispatch:
 
     def test_a_provider_with_no_adapter_is_refused_rather_than_defaulted(self):
         with pytest.raises(ntl.NativeLaunchInvalid, match="no native-TUI argv binding"):
-            ntl._binder("codex")
+            ntl._binder("no_such_provider")
 
     def test_the_supported_set_is_read_from_the_registered_binders(self):
-        assert ntl.SUPPORTED_NATIVE_PROVIDERS == {"kimi_cli", "claude_code"}
+        assert ntl.SUPPORTED_NATIVE_PROVIDERS == {
+            "codex",
+            "kimi_cli",
+            "claude_code",
+        }
         for provider in ntl.SUPPORTED_NATIVE_PROVIDERS:
             binder = ntl._binder(provider)
             assert callable(binder["build"]) and callable(binder["binds_exactly"])
@@ -616,12 +620,15 @@ class TestProviderDispatchRefusesAnUnknownProvider:
 
     def test_the_control_adapter_is_chosen_by_canonical_provider(self):
         assert v2._control_adapter("claude_code") is control
+        from cli_agent_orchestrator.services import codex_native_control
+
+        assert v2._control_adapter("codex") is codex_native_control
         with pytest.raises(Exception, match="no native control adapter"):
-            v2._control_adapter("codex")
+            v2._control_adapter("no_such_provider")
 
     def test_the_turn_observer_is_chosen_by_canonical_provider(self):
         with pytest.raises(Exception, match="no native turn-state observer"):
-            v2._observe_turn_state("codex", pane_id="%1")
+            v2._observe_turn_state("no_such_provider", pane_id="%1")
 
     def test_the_executable_name_is_not_a_provider_key(self):
         """``claude`` is the binary; ``claude_code`` is the provider."""

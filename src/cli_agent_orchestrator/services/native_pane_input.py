@@ -333,6 +333,27 @@ def observe_kimi_turn_state(
     return provider.get_status_from_screen(rows)
 
 
+def observe_codex_turn_state(
+    pane_id: str,
+    *,
+    terminal_id: str,
+    session_name: str,
+    window_name: str,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+    screen: Optional[Sequence[str]] = None,
+) -> TerminalStatus:
+    """Read the bound Codex TUI's current turn state from its rendered screen."""
+    from cli_agent_orchestrator.providers.codex import CodexProvider
+
+    rows = list(screen) if screen is not None else capture_pane_screen(pane_id, timeout=timeout)
+    provider = CodexProvider(
+        terminal_id=terminal_id,
+        session_name=session_name,
+        window_name=window_name,
+    )
+    return provider.get_status_from_screen(rows)
+
+
 def observe_claude_turn_state(
     pane_id: str,
     *,
@@ -671,6 +692,7 @@ def observe_submission(
 
 _RULE_KIMI_COMPOSER_BOX = "kimi-composer-box"
 _RULE_CLAUDE_PROMPT_BOX = "claude-prompt-box"
+_RULE_CODEX_PROMPT_FOOTER = "codex-prompt-footer"
 
 
 @dataclass(frozen=True)
@@ -712,6 +734,17 @@ _CLAUDE_EMPTY_EVIDENCE = (
     "Escape on this build (the r5 evidence generalizes)"
 )
 
+_CODEX_EMPTY_EVIDENCE = (
+    "composer layout live-verified on the installed Codex CLI 0.146.0 "
+    "(§10.3, 2026-07-30, cond-0222 native-TUI canaries): the last '›' "
+    "prompt row and any wrapped rows before the following blank separator "
+    "are the composer; an empty composer renders only a dim-styled rotating "
+    "placeholder (SGR 2), while typed /compact renders in normal video. "
+    "The prompt glyph itself is bold and excluded, and footer/suggestion "
+    "rows below the blank separator are excluded, so neither can prove "
+    "content"
+)
+
 
 #: The per-provider+build emptiness pins, keyed by normalized version.
 #: A build appears here only when its composer layout was read; an
@@ -735,6 +768,14 @@ _COMPOSER_EMPTINESS_PINS: dict[str, dict[str, ComposerEmptinessPin]] = {
             rule=_RULE_CLAUDE_PROMPT_BOX,
             styled=True,
             evidence=_CLAUDE_EMPTY_EVIDENCE,
+        ),
+    },
+    "codex": {
+        "0.146.0": ComposerEmptinessPin(
+            provider="codex",
+            rule=_RULE_CODEX_PROMPT_FOOTER,
+            styled=True,
+            evidence=_CODEX_EMPTY_EVIDENCE,
         ),
     },
 }
@@ -927,6 +968,49 @@ def _claude_composer_empty(styled_rows: Sequence[str]) -> Optional[bool]:
     return True
 
 
+def _codex_composer_empty(styled_rows: Sequence[str]) -> Optional[bool]:
+    """Empty iff the last Codex prompt region contains only placeholder cells.
+
+    Codex draws transcript prompts and the live composer with the same ``›``
+    glyph.  The live composer is the last such row and ends at the first
+    blank row below it; the footer or slash-command suggestion begins after
+    that separator.  Within the region, the live-verified build distinguishes
+    its rotating placeholder from prefill by styling, not text: placeholder
+    cells are dim, while typed cells are normal video.
+    """
+    parsed = _parse_styled_rows(styled_rows)
+    if parsed is None:
+        return None
+    plain = ["".join(char for char, _, _ in row) for row in parsed]
+    prompt_row = next(
+        (index for index in range(len(plain) - 1, -1, -1) if "›" in plain[index]),
+        None,
+    )
+    if prompt_row is None:
+        return None
+    separator = next(
+        (index for index in range(prompt_row + 1, len(plain)) if not plain[index].strip()),
+        None,
+    )
+    if separator is None:
+        return None
+    prompt_at = next(
+        (index for index, (char, _, _) in enumerate(parsed[prompt_row]) if char == "›"),
+        None,
+    )
+    if prompt_at is None:
+        return None
+    cells = parsed[prompt_row][prompt_at + 1 :] + [
+        cell for row in parsed[prompt_row + 1 : separator] for cell in row
+    ]
+    for char, dim, inverse in cells:
+        if char.isspace():
+            continue
+        if not (dim or inverse):
+            return False
+    return True
+
+
 def observe_composer_empty(
     pane_id: str,
     pin: ComposerEmptinessPin,
@@ -954,6 +1038,8 @@ def observe_composer_empty(
         return _kimi_composer_empty(rows)
     if pin.rule == _RULE_CLAUDE_PROMPT_BOX:
         return _claude_composer_empty(rows)
+    if pin.rule == _RULE_CODEX_PROMPT_FOOTER:
+        return _codex_composer_empty(rows)
     # A rule this build does not know proves nothing.
     return None
 
@@ -972,6 +1058,7 @@ def observe_composer_empty(
 
 _RULE_KIMI_COMPACTION_SIGNAL = "kimi-compaction-signal"
 _RULE_CLAUDE_COMMAND_ECHO_RESPONSE = "claude-command-echo-response"
+_RULE_CODEX_COMPACTION_SIGNAL = "codex-compaction-signal"
 
 
 @dataclass(frozen=True)
@@ -1008,6 +1095,14 @@ _CLAUDE_EXECUTION_EVIDENCE = (
     "distinguishes this command's pair from any earlier one"
 )
 
+_CODEX_EXECUTION_EVIDENCE = (
+    "live-proven on the installed Codex CLI 0.146.0 (§10.3, 2026-07-30, "
+    "cond-0222 native-TUI canary): an idle declared /compact starts a real "
+    "Codex task and terminates with the transcript notice '• Context "
+    "compacted'; the occurrence count over a pre-write baseline "
+    "distinguishes this command's completion from any earlier compaction"
+)
+
 
 #: The per-provider+build execution pins.  Same scope as the emptiness
 #: pins — a build appears only with live evidence; an unpinned build
@@ -1029,6 +1124,15 @@ _COMMAND_EXECUTION_PINS: dict[str, dict[str, CommandExecutionPin]] = {
             signal="the command echo plus its response region",
             styled=True,
             evidence=_CLAUDE_EXECUTION_EVIDENCE,
+        ),
+    },
+    "codex": {
+        "0.146.0": CommandExecutionPin(
+            provider="codex",
+            rule=_RULE_CODEX_COMPACTION_SIGNAL,
+            signal="the context-compacted notice",
+            styled=True,
+            evidence=_CODEX_EXECUTION_EVIDENCE,
         ),
     },
 }
@@ -1055,6 +1159,7 @@ def command_execution_pin_for(
 # The live-proven compaction notice on kimi 0.29.2.
 _KIMI_COMPACTION_NOTICE = "Compacting context"
 _CLAUDE_RESPONSE_GLYPH = "⎿"
+_CODEX_COMPACTION_NOTICE = "Context compacted"
 
 
 def _execution_signal_count(
@@ -1080,6 +1185,12 @@ def _execution_signal_count(
             ):
                 pairs += 1
         return pairs
+    if pin.rule == _RULE_CODEX_COMPACTION_SIGNAL:
+        parsed = _parse_styled_rows(rows)
+        if parsed is None:
+            return 0
+        plain = ["".join(char for char, _, _ in row) for row in parsed]
+        return sum(1 for row in plain if _CODEX_COMPACTION_NOTICE in row)
     return 0
 
 

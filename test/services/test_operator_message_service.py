@@ -285,9 +285,9 @@ class TestIdentityAndCapabilityGates:
         monkeypatch.setattr(
             cis,
             "resolve_control_identity",
-            lambda tid: _resolved(provider="codex", provider_version="0.146.0"),
+            lambda tid: _resolved(provider="opencode", provider_version="1.2.3"),
         )
-        expected = {**EXPECTED, "provider": "codex"}
+        expected = {**EXPECTED, "provider": "opencode"}
         result = _submit(expected_identity=expected)
         assert result.outcome == "refused"
         assert result.reason_code == "provider-unsupported"

@@ -50,6 +50,14 @@ from cli_agent_orchestrator.models.managed_launch_v2 import (
     ManagedLaunchV2NegativeRequest,
     ManagedLaunchV2ReserveRequest,
 )
+from cli_agent_orchestrator.providers.codex import _toml_override as _codex_toml_override
+from cli_agent_orchestrator.providers.codex import _toml_scalar as _codex_toml_scalar
+from cli_agent_orchestrator.providers.codex import (
+    _validate_config_key as _validate_codex_config_key,
+)
+from cli_agent_orchestrator.providers.codex import (
+    render_trusted_project_override,
+)
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import (
     generation_fence,
@@ -186,6 +194,92 @@ def _kimi_profile_launch_args(profile_material: dict[str, Any]) -> list[str]:
     return []
 
 
+def _codex_profile_launch_args(
+    *,
+    record: dict[str, Any],
+    request: dict[str, Any],
+    profile_material: dict[str, Any],
+    tui: bool,
+) -> list[str]:
+    """Build the sealed profile and route arguments for native Codex.
+
+    The app-server bootstrap and resumed TUI receive the same profile, model,
+    effort, prompt, and MCP material.  TUI-only rendering flags are omitted
+    from app-server because they are not valid app-server options.
+    """
+    profile = profile_material["profile"]
+    allowed_tools = profile_material.get("allowed_tools") or []
+    yolo = bool("*" in allowed_tools)
+    if profile.codexProfile and not yolo:
+        args = ["--profile", profile.codexProfile]
+    else:
+        args = ["--yolo"]
+
+    if tui:
+        args.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
+
+    # _profile_material already applies the shared restricted-tool security
+    # prompt. Reapplying it here would duplicate the developer instructions
+    # only on the native Codex route.
+    system_prompt = profile_material.get("system_prompt") or ""
+    if system_prompt:
+        args.extend(["-c", f"developer_instructions={_codex_toml_scalar(system_prompt)}"])
+
+    for server in profile_material.get("mcp_servers") or []:
+        name = _validate_codex_config_key(server["name"], source="mcpServers name")
+        prefix = f"mcp_servers.{name}"
+        args.extend(["-c", f"{prefix}.command={_codex_toml_scalar(server['command'])}"])
+        server_args = (
+            "[" + ", ".join(_codex_toml_scalar(item) for item in server.get("args") or []) + "]"
+        )
+        args.extend(["-c", f"{prefix}.args={server_args}"])
+        for item in server.get("env") or []:
+            key = _validate_codex_config_key(item["name"], source="mcpServers env")
+            args.extend(["-c", f"{prefix}.env.{key}={_codex_toml_scalar(item['value'])}"])
+        env_vars = list(server.get("env_vars") or [])
+        if "CAO_TERMINAL_ID" not in env_vars:
+            env_vars.append("CAO_TERMINAL_ID")
+        for index, value in enumerate(env_vars):
+            if not isinstance(value, str):
+                raise ManagedLaunchConflict(
+                    f"mcpServers {name!r} env_vars[{index}] must be a string"
+                )
+        env_vars_toml = "[" + ", ".join(_codex_toml_scalar(item) for item in env_vars) + "]"
+        timeout = server.get("tool_timeout_sec")
+        if timeout is None:
+            timeout = 600.0
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ManagedLaunchConflict(
+                f"mcpServers {name!r} tool_timeout_sec must be a positive number"
+            )
+        timeout = float(timeout)
+        args.extend(
+            [
+                "-c",
+                f"{prefix}.env_vars={env_vars_toml}",
+                "-c",
+                f"{prefix}.tool_timeout_sec={_codex_toml_scalar(timeout)}",
+            ]
+        )
+
+    for key, value in (profile.codexConfig or {}).items():
+        args.extend(["-c", _codex_toml_override(key, value)])
+
+    # Route and trust are emitted after profile configuration, so neither a
+    # named profile nor codexConfig can silently replace the sealed request.
+    args.extend(
+        [
+            "-c",
+            render_trusted_project_override(record["working_directory"]),
+            "--model",
+            request["expected_model"],
+            "-c",
+            _codex_toml_override("model_reasoning_effort", request["expected_effort"]),
+        ]
+    )
+    return args
+
+
 def _kimi_profile_environment(
     *,
     record: dict[str, Any],
@@ -250,6 +344,7 @@ def _kimi_profile_environment(
 #: wrong one is not weaker evidence, it is evidence about a different
 #: thing entirely.
 _NATIVE_TUI_READINESS_RECEIPT_KINDS = {
+    "codex": "codex-native-thread-start",
     "kimi_cli": "kimi-native-tui-attached",
     # Distinct from Kimi's for the same structural reason the native and
     # ACP kinds are distinct: the two providers prove readiness by
@@ -1017,9 +1112,14 @@ def native_control_adapter(provider: str) -> Any:
     that path could disagree with this one, and the disagreement would
     surface as one provider's keystroke plan typed at another's composer.
     """
-    from cli_agent_orchestrator.services import claude_native_control, kimi_native_control
+    from cli_agent_orchestrator.services import (
+        claude_native_control,
+        codex_native_control,
+        kimi_native_control,
+    )
 
     adapters = {
+        "codex": codex_native_control,
         "kimi_cli": kimi_native_control,
         "claude_code": claude_native_control,
     }
@@ -1047,10 +1147,12 @@ def _observe_turn_state(provider: str, **kwargs: Any) -> Any:
     """
     from cli_agent_orchestrator.services.native_pane_input import (
         observe_claude_turn_state,
+        observe_codex_turn_state,
         observe_kimi_turn_state,
     )
 
     observers = {
+        "codex": observe_codex_turn_state,
         "kimi_cli": observe_kimi_turn_state,
         "claude_code": observe_claude_turn_state,
     }
@@ -1068,6 +1170,7 @@ def _observe_turn_state(provider: str, **kwargs: Any) -> Any:
 #: it — two providers' status strings look alike and would otherwise be
 #: indistinguishable after the fact.
 TURN_OBSERVER_AUTHORITY = {
+    "codex": "observe_codex_turn_state",
     "kimi_cli": "observe_kimi_turn_state",
     "claude_code": "observe_claude_turn_state",
 }
@@ -3364,6 +3467,7 @@ async def _launch_native_tui(
     from cli_agent_orchestrator.services import (
         claude_native_launch,
         claude_native_readiness,
+        codex_native_bootstrap,
         glm_native_launch,
         kimi_native_bootstrap,
         session_env,
@@ -3440,26 +3544,22 @@ async def _launch_native_tui(
             reason=PREFLIGHT_REASON_NATIVE_PREFLIGHT,
         )
 
-    # How a session acquires its identity is the one place the two native
-    # providers genuinely differ, and the difference decides the launch
-    # form. Kimi's id is *discovered*: a separate ACP conversation mints
-    # it, sends no turn, and is proven dead before anything else happens,
-    # after which the TUI resumes that id. Claude's id is *chosen*: a
-    # canonical uuid minted here, before any provider I/O at all, and
-    # handed to the TUI as --session-id. The consequence is that a Claude
-    # launch which dies before its first turn still has a recorded
-    # identity, because the identity preceded the launch.
+    # Every provider acquires its identity before task admission. Codex and
+    # Kimi discover persistent ids from zero-turn provider control planes and
+    # resume them exactly. Claude chooses an id and proves it through its
+    # SessionStart hook.
     readiness_hook: Optional[dict[str, Any]] = None
     launch_extra_args: Optional[list[str]] = None
     try:
         if provider == "claude_code":
-            bootstrap, readiness_hook = await asyncio.to_thread(
+            bootstrap, minted_readiness_hook = await asyncio.to_thread(
                 _mint_claude_native_session,
                 record=record,
                 request=request,
                 version_output=version_output,
                 digest=digest,
             )
+            readiness_hook = minted_readiness_hook
             launch_kind = native_tui_launch.LAUNCH_KIND_NEW
             # The model is pinned on the launch argv itself. There is no
             # later moment that could apply it: by the time anything could
@@ -3471,13 +3571,37 @@ async def _launch_native_tui(
                 "--model",
                 bootstrap["requested_model"],
                 "--settings",
-                claude_native_readiness.settings_argument(readiness_hook["settings"]),
+                claude_native_readiness.settings_argument(minted_readiness_hook["settings"]),
                 *_claude_profile_launch_args(
                     record=record,
                     request=request,
                     profile_material=profile_material,
                 ),
             ]
+        elif provider == "codex":
+            bootstrap = await asyncio.to_thread(
+                codex_native_bootstrap.mint_session,
+                codex_binary=executable,
+                binary_sha256=digest,
+                version_output=version_output,
+                working_directory=record["working_directory"],
+                model=request["expected_model"],
+                effort=request["expected_effort"],
+                profile_args=_codex_profile_launch_args(
+                    record=record,
+                    request=request,
+                    profile_material=profile_material,
+                    tui=False,
+                ),
+                environment=environment,
+            )
+            launch_kind = native_tui_launch.LAUNCH_KIND_RESUME
+            launch_extra_args = _codex_profile_launch_args(
+                record=record,
+                request=request,
+                profile_material=profile_material,
+                tui=True,
+            )
         else:
             bootstrap = await asyncio.to_thread(
                 _mint_native_session,
@@ -3499,13 +3623,16 @@ async def _launch_native_tui(
         )
 
     try:
-        intent = (
-            _claude_bootstrap_intent(bootstrap, reservation_id=reservation_id)
-            if provider == "claude_code"
-            else kimi_native_bootstrap.bootstrap_intent(
+        if provider == "claude_code":
+            intent = _claude_bootstrap_intent(bootstrap, reservation_id=reservation_id)
+        elif provider == "codex":
+            intent = codex_native_bootstrap.bootstrap_intent(
                 bootstrap, note=f"v2 native launch of reservation {reservation_id}"
             )
-        )
+        else:
+            intent = kimi_native_bootstrap.bootstrap_intent(
+                bootstrap, note=f"v2 native launch of reservation {reservation_id}"
+            )
         transport = _V2NativePane(
             record=record,
             request=request,

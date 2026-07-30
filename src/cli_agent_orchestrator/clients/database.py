@@ -517,6 +517,36 @@ class ClaudeNativeControlOperationModel(Base):
     updated_at = Column(Text, nullable=False)
 
 
+class CodexNativeControlOperationModel(Base):
+    """One at-most-once control operation against a native Codex TUI.
+
+    Kept in its own table so neither Claude nor Kimi operation evidence can
+    satisfy a Codex delivery or ambiguity check.
+    """
+
+    __tablename__ = "codex_native_control_operations"
+
+    operation_id = Column(Text, primary_key=True)
+    kind = Column(Text, nullable=False)
+    state = Column(Text, nullable=False)
+    provider = Column(Text, nullable=False)
+    native_session_id = Column(Text, nullable=False)
+    terminal_id = Column(Text, nullable=False)
+    generation = Column(Text, nullable=False)
+    execution_mode = Column(Text, nullable=False)
+    turn_id = Column(Text, nullable=True)
+    payload_sha256 = Column(Text, nullable=False)
+    intent_json = Column(Text, nullable=False)
+    transport_json = Column(Text, nullable=True)
+    observation_json = Column(Text, nullable=True)
+    posted_at = Column(Text, nullable=True)
+    refusal_reason = Column(Text, nullable=True)
+    ambiguity_reason = Column(Text, nullable=True)
+    epoch = Column(Integer, nullable=False, default=0)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
+
+
 class FlowModel(Base):
     """SQLAlchemy model for flow metadata."""
 
@@ -595,6 +625,7 @@ def init_db() -> None:
     _migrate_native_session_attachments()
     _migrate_kimi_native_control_operations()
     _migrate_claude_native_control_operations()
+    _migrate_codex_native_control_operations()
     _migrate_managed_launch_reservations()
     _migrate_managed_launch_v2()
 
@@ -1068,6 +1099,41 @@ def _migrate_claude_native_control_operations() -> None:
             )
     except Exception as e:  # noqa: BLE001 - the operation path fails closed
         logger.warning(f"claude native control migration failed: {e}")
+
+
+def _migrate_codex_native_control_operations() -> None:
+    """Create the provider-private Codex control journal on older databases."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS codex_native_control_operations ("
+                "operation_id TEXT PRIMARY KEY, "
+                "kind TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "provider TEXT NOT NULL, "
+                "native_session_id TEXT NOT NULL, "
+                "terminal_id TEXT NOT NULL, "
+                "generation TEXT NOT NULL, "
+                "execution_mode TEXT NOT NULL, "
+                "turn_id TEXT, "
+                "payload_sha256 TEXT NOT NULL, "
+                "intent_json TEXT NOT NULL, "
+                "transport_json TEXT, "
+                "observation_json TEXT, "
+                "posted_at TEXT, "
+                "refusal_reason TEXT, "
+                "ambiguity_reason TEXT, "
+                "epoch INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 - operation paths fail closed
+        logger.warning(f"codex native control migration failed: {e}")
 
 
 def _migrate_managed_launch_reservations() -> None:

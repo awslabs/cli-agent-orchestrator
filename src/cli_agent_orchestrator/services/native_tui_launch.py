@@ -77,7 +77,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Mapping, NoReturn, Optional, Protocol, Sequence
 
-from cli_agent_orchestrator.services import claude_native_launch
+from cli_agent_orchestrator.services import claude_native_launch, codex_native_launch
 from cli_agent_orchestrator.services import execution_mode as em
 from cli_agent_orchestrator.services import kimi_native_launch, native_attachment
 
@@ -686,12 +686,31 @@ def _claude_argv(
         raise NativeLaunchInvalid(str(exc)) from exc
 
 
+def _codex_argv(
+    *, session_id: str, binary: str, extra_args: Optional[Sequence[str]], launch_kind: str
+) -> list[str]:
+    if launch_kind != LAUNCH_KIND_RESUME:
+        raise NativeLaunchInvalid(
+            "Codex native sessions are minted by a zero-turn app-server bootstrap; "
+            f"the TUI must resume the exact id, got launch_kind {launch_kind!r}"
+        )
+    try:
+        return codex_native_launch.build_resume_argv(
+            session_id=session_id,
+            codex_binary=binary,
+            extra_args=extra_args,
+        )
+    except codex_native_launch.CodexNativeLaunchError as exc:
+        raise NativeLaunchInvalid(str(exc)) from exc
+
+
 #: Per-provider argv construction and the matching "does this argv bind
 #: exactly that session?" check. The two halves are registered together
 #: on purpose: a builder paired with the wrong checker would construct a
 #: correct argv and then verify it against a different provider's rules,
 #: which passes and means nothing.
 _ARGV_BINDERS: dict[str, dict[str, Any]] = {
+    "codex": {"build": _codex_argv, "binds_exactly": codex_native_launch.resumes_exactly},
     "kimi_cli": {"build": _kimi_argv, "binds_exactly": kimi_native_launch.resumes_exactly},
     "claude_code": {"build": _claude_argv, "binds_exactly": claude_native_launch.binds_exactly},
 }

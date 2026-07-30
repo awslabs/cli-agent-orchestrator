@@ -1132,7 +1132,7 @@ class TestAdditiveCapabilities:
     def test_the_provider_controls_block_is_the_discovery_union(self, client):
         body = client.get("/control-input/capabilities").json()
         controls = body["provider_controls"]
-        assert set(controls) == {"kimi_cli", "claude_code"}
+        assert set(controls) == {"codex", "kimi_cli", "claude_code"}
         assert controls["kimi_cli"]["compact"] == {
             "events": [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
         }
@@ -1144,8 +1144,10 @@ class TestAdditiveCapabilities:
         assert controls["claude_code"]["steer_chords"] == []
         # No grace for Claude: providers without one omit the key (§3.5).
         assert "dispatch_grace_ms" not in controls["claude_code"]
-        # Codex has no registry entry on this base (§13 OD3).
-        assert "codex" not in controls
+        assert controls["codex"]["compact"] == controls["kimi_cli"]["compact"]
+        assert controls["codex"]["stop"] == controls["kimi_cli"]["stop"]
+        assert controls["codex"]["steer_chords"] == []
+        assert "dispatch_grace_ms" not in controls["codex"]
 
     def test_the_command_controls_block_is_advertised(self, client):
         body = client.get("/control-input/capabilities").json()
@@ -1239,7 +1241,7 @@ class TestAdditiveCapabilities:
         monkeypatch.setattr(
             service,
             "resolve_control_identity",
-            lambda tid: _kimi_resolved(provider="codex", provider_version="0.146.0"),
+            lambda tid: _kimi_resolved(provider="opencode", provider_version="1.2.3"),
         )
         block = client.get(f"/terminals/{TERMINAL}/control-identity").json()["control_input"]
         assert "provider_controls" not in block

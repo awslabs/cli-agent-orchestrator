@@ -1073,6 +1073,8 @@ def _profile_material(agent_profile: str, terminal_id: str) -> dict[str, Any]:
                 "command": config["command"],
                 "args": [str(item) for item in (config.get("args") or [])],
                 "env": [{"name": key, "value": value} for key, value in sorted(env.items())],
+                "env_vars": [str(item) for item in (config.get("env_vars") or [])],
+                "tool_timeout_sec": config.get("tool_timeout_sec"),
             }
         )
     return {

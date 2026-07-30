@@ -378,10 +378,11 @@ def _request_digest(
 def _provider_stores() -> List[Any]:
     from cli_agent_orchestrator.services import (
         claude_native_control,
+        codex_native_control,
         kimi_native_control,
     )
 
-    return [kimi_native_control, claude_native_control]
+    return [kimi_native_control, claude_native_control, codex_native_control]
 
 
 def _find_operation(operation_id: str) -> Tuple[Optional[Dict[str, Any]], List[str]]:
