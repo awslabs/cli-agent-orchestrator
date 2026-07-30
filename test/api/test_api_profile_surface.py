@@ -1,9 +1,9 @@
 """Tests for the read-only profile HTTP surface.
 
 Covers ``/agents/profiles/search``, the scaffold template routes, and the two
-non-mutating ``validate`` / ``preview`` routes. These endpoints exist so the Web
-Future UI, TUI, and external clients can consume the same ranking and
-validation paths as the CLI instead of reimplementing them.
+non-mutating ``validate`` / ``preview`` routes. These endpoints exist so
+future UI, TUI, and external clients can consume the same ranking and validation
+paths as the CLI instead of reimplementing them.
 """
 
 from unittest.mock import patch
