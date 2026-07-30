@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import subprocess
+import threading
 import time
 from typing import Callable, Dict, Optional, Set
 
@@ -63,6 +64,7 @@ class HerdrInboxService:
         # Kiro-specific tracking for supplement check
         self._kiro_terminals: Set[str] = set()  # terminal_ids using kiro-cli
         self._working_since: Dict[str, float] = {}  # terminal_id → timestamp
+        self._ownership_lock = threading.RLock()
 
         # Workspace tracking for lifecycle events
         self._workspace_to_session: Dict[str, str] = {}  # workspace_id → session_name
@@ -105,10 +107,29 @@ class HerdrInboxService:
             pane_id: Current herdr compact pane_id
             is_kiro: Whether this terminal runs kiro-cli (enables supplement check)
         """
-        self._pane_to_terminal[pane_id] = terminal_id
-        self._terminal_to_pane[terminal_id] = pane_id
-        if is_kiro:
-            self._kiro_terminals.add(terminal_id)
+        with self._ownership_lock:
+            replaced_terminal = self._pane_to_terminal.get(pane_id)
+            if (
+                replaced_terminal
+                and replaced_terminal != terminal_id
+                and self._terminal_to_pane.get(replaced_terminal) == pane_id
+            ):
+                self._terminal_to_pane.pop(replaced_terminal, None)
+                self._kiro_terminals.discard(replaced_terminal)
+                self._working_since.pop(replaced_terminal, None)
+            previous_pane = self._terminal_to_pane.get(terminal_id)
+            if (
+                previous_pane
+                and previous_pane != pane_id
+                and self._pane_to_terminal.get(previous_pane) == terminal_id
+            ):
+                self._pane_to_terminal.pop(previous_pane, None)
+            self._pane_to_terminal[pane_id] = terminal_id
+            self._terminal_to_pane[terminal_id] = pane_id
+            if is_kiro:
+                self._kiro_terminals.add(terminal_id)
+            else:
+                self._kiro_terminals.discard(terminal_id)
 
         logger.info(f"Registered terminal {terminal_id} (pane={pane_id}, kiro={is_kiro})")
 
@@ -127,18 +148,38 @@ class HerdrInboxService:
         if self._connected and self._loop is not None:
             asyncio.run_coroutine_threadsafe(self._force_reconnect(), self._loop)
 
-    def unregister_terminal(self, terminal_id: str) -> None:
-        """Remove a terminal from managed set.
+    def unregister_terminal(
+        self,
+        terminal_id: str,
+        *,
+        expected_pane_id: str | None = None,
+    ) -> bool:
+        """Compare-and-remove one terminal from the managed ownership maps.
 
         Args:
             terminal_id: Terminal to unregister
+            expected_pane_id: When supplied, refuse if the terminal has moved
+                to a different compact pane incarnation.
         """
-        pane_id = self._terminal_to_pane.pop(terminal_id, None)
-        if pane_id:
-            self._pane_to_terminal.pop(pane_id, None)
-        self._kiro_terminals.discard(terminal_id)
-        self._working_since.pop(terminal_id, None)
+        with self._ownership_lock:
+            pane_id = self._terminal_to_pane.get(terminal_id)
+            if expected_pane_id is not None and pane_id != expected_pane_id:
+                return False
+            self._terminal_to_pane.pop(terminal_id, None)
+            if pane_id and self._pane_to_terminal.get(pane_id) == terminal_id:
+                self._pane_to_terminal.pop(pane_id, None)
+            self._kiro_terminals.discard(terminal_id)
+            self._working_since.pop(terminal_id, None)
         logger.info(f"Unregistered terminal {terminal_id}")
+        return True
+
+    def _ownership_items(self) -> tuple[tuple[str, str], ...]:
+        with self._ownership_lock:
+            return tuple(self._pane_to_terminal.items())
+
+    def _terminal_for_pane(self, pane_id: str) -> str | None:
+        with self._ownership_lock:
+            return self._pane_to_terminal.get(pane_id)
 
     async def start(self) -> None:
         """Start the event loop: wait for first terminal, then connect and listen."""
@@ -251,7 +292,11 @@ class HerdrInboxService:
         """
         while True:
             # Wait until there is at least one pane to subscribe to
-            while not self._pane_to_terminal:
+            while True:
+                with self._ownership_lock:
+                    has_terminals = bool(self._pane_to_terminal)
+                if has_terminals:
+                    break
                 await asyncio.sleep(0.5)
 
             try:
@@ -380,7 +425,8 @@ class HerdrInboxService:
         # still-running terminal's stored pane_id can fall out of the live list
         # while its tab is very much alive. Identity must come from the durable
         # tab label (tmux_window), never the ephemeral pane_id.
-        stale_pane_ids = set(self._pane_to_terminal.keys()) - live_pane_ids
+        with self._ownership_lock:
+            stale_pane_ids = set(self._pane_to_terminal) - live_pane_ids
         if not stale_pane_ids:
             logger.debug("Reconcile: all panes live, nothing to prune")
             return
@@ -395,9 +441,8 @@ class HerdrInboxService:
         deleted = 0
 
         for pane_id in stale_pane_ids:
-            terminal_id = self._pane_to_terminal.get(pane_id)
+            terminal_id = self._terminal_for_pane(pane_id)
             if not terminal_id:
-                self._pane_to_terminal.pop(pane_id, None)
                 continue
 
             # Session/window identity before any mutation.
@@ -427,9 +472,15 @@ class HerdrInboxService:
                         e,
                     )
                 else:
-                    self._pane_to_terminal.pop(pane_id, None)
-                    self._pane_to_terminal[new_pane_id] = terminal_id
-                    self._terminal_to_pane[terminal_id] = new_pane_id
+                    with self._ownership_lock:
+                        if (
+                            self._pane_to_terminal.get(pane_id) != terminal_id
+                            or self._terminal_to_pane.get(terminal_id) != pane_id
+                        ):
+                            continue
+                        self._pane_to_terminal.pop(pane_id, None)
+                        self._pane_to_terminal[new_pane_id] = terminal_id
+                        self._terminal_to_pane[terminal_id] = new_pane_id
                     logger.info(
                         "Reconcile: re-mapped %s %s -> %s (pane renumbered, tab still live)",
                         terminal_id,
@@ -456,10 +507,7 @@ class HerdrInboxService:
                 logger.warning(f"Reconcile: failed to delete terminal {terminal_id}: {e}")
                 continue
 
-            self._pane_to_terminal.pop(pane_id, None)
-            self._terminal_to_pane.pop(terminal_id, None)
-            self._kiro_terminals.discard(terminal_id)
-            self._working_since.pop(terminal_id, None)
+            self.unregister_terminal(terminal_id, expected_pane_id=pane_id)
 
             if term_session:
                 affected_sessions.add(term_session)
@@ -508,9 +556,10 @@ class HerdrInboxService:
         compacts them), and _reconcile() has already pruned stale panes before
         this runs.
         """
+        ownership = self._ownership_items()
         subscriptions: list = [
             {"type": "pane.agent_status_changed", "pane_id": pane_id}
-            for pane_id in self._pane_to_terminal
+            for pane_id, _terminal_id in ownership
         ]
         subscriptions.append({"type": "pane.closed"})
         subscriptions.append({"type": "workspace.closed"})
@@ -522,7 +571,7 @@ class HerdrInboxService:
         }
         await self._send(message)
         logger.info(
-            f"Subscribed to {len(self._pane_to_terminal)} pane(s) + lifecycle events "
+            f"Subscribed to {len(ownership)} pane(s) + lifecycle events "
             f"in one events.subscribe call"
         )
 
@@ -578,20 +627,24 @@ class HerdrInboxService:
             status = data.get("agent_status", "")
 
             # Only process events for managed panes
-            terminal_id = self._pane_to_terminal.get(pane_id)
+            terminal_id = self._terminal_for_pane(pane_id)
             if not terminal_id:
                 continue
 
             if status in ("idle", "done"):
                 # Clear working timestamp
-                self._working_since.pop(terminal_id, None)
+                with self._ownership_lock:
+                    self._working_since.pop(terminal_id, None)
                 # Trigger delivery
                 self._deliver(terminal_id)
 
             elif status == "working":
                 # Track working start for kiro supplement check
-                if terminal_id in self._kiro_terminals:
-                    if terminal_id not in self._working_since:
+                with self._ownership_lock:
+                    if (
+                        terminal_id in self._kiro_terminals
+                        and terminal_id not in self._working_since
+                    ):
                         self._working_since[terminal_id] = time.time()
 
     def _schedule_lifecycle_retirement(self, event_type: str, data: dict) -> None:
@@ -701,7 +754,7 @@ class HerdrInboxService:
 
         if event_type == "pane.closed":
             pane_id = data.get("pane_id", "")
-            terminal_id = self._pane_to_terminal.get(pane_id)
+            terminal_id = self._terminal_for_pane(pane_id)
             if not terminal_id:
                 return
             meta = await asyncio.to_thread(get_terminal_metadata, terminal_id)
@@ -725,6 +778,7 @@ class HerdrInboxService:
                     terminal_id,
                     expected_session=session_name,
                     expected_pane_id=pane_id,
+                    unregister_inbox=False,
                 )
             except Exception as exc:  # noqa: BLE001 - preserve ownership on hold
                 logger.warning(
@@ -736,17 +790,10 @@ class HerdrInboxService:
             if not retired:
                 return
 
-            # No background thread touches these maps. Revalidate ownership
-            # after every await so a compact pane-id reuse registered while
-            # retirement was running is never removed as the old terminal.
-            if (
-                self._pane_to_terminal.get(pane_id) == terminal_id
-                and self._terminal_to_pane.get(terminal_id) == pane_id
-            ):
-                self._pane_to_terminal.pop(pane_id, None)
-                self._terminal_to_pane.pop(terminal_id, None)
-                self._kiro_terminals.discard(terminal_id)
-                self._working_since.pop(terminal_id, None)
+            # Worker-thread retirement deliberately skips map mutation.
+            # Compare-and-remove under the ownership lock so a compact pane-id
+            # reuse registered while retirement was running survives.
+            self.unregister_terminal(terminal_id, expected_pane_id=pane_id)
             if session_name:
                 remaining = await asyncio.to_thread(
                     list_terminals_by_session,
@@ -793,7 +840,7 @@ class HerdrInboxService:
             if not session_name:
                 return
 
-        ownership_snapshot = tuple(self._pane_to_terminal.items())
+        ownership_snapshot = self._ownership_items()
 
         def session_ownership() -> tuple[tuple[str, str], ...]:
             return tuple(
@@ -810,6 +857,7 @@ class HerdrInboxService:
             await asyncio.to_thread(
                 terminal_service.retire_closed_workspace_session,
                 session_name,
+                unregister_inbox=False,
             )
         except Exception as exc:  # noqa: BLE001 - preserve ownership on hold
             logger.warning(
@@ -819,14 +867,7 @@ class HerdrInboxService:
             )
             return
         for pane_id, terminal_id in to_remove:
-            if (
-                self._pane_to_terminal.get(pane_id) == terminal_id
-                and self._terminal_to_pane.get(terminal_id) == pane_id
-            ):
-                self._pane_to_terminal.pop(pane_id, None)
-                self._terminal_to_pane.pop(terminal_id, None)
-                self._kiro_terminals.discard(terminal_id)
-                self._working_since.pop(terminal_id, None)
+            self.unregister_terminal(terminal_id, expected_pane_id=pane_id)
         if self._workspace_to_session.get(workspace_id) == session_name:
             self._workspace_to_session.pop(workspace_id, None)
         logger.info(
@@ -845,7 +886,7 @@ class HerdrInboxService:
 
         if event_type == "pane.closed":
             pane_id = data.get("pane_id", "")
-            terminal_id = self._pane_to_terminal.get(pane_id)
+            terminal_id = self._terminal_for_pane(pane_id)
             if not terminal_id:
                 return
 
@@ -892,10 +933,7 @@ class HerdrInboxService:
                 logger.warning(f"pane.closed: failed to delete terminal {terminal_id}: {e}")
                 return
 
-            self._pane_to_terminal.pop(pane_id, None)
-            self._terminal_to_pane.pop(terminal_id, None)
-            self._kiro_terminals.discard(terminal_id)
-            self._working_since.pop(terminal_id, None)
+            self.unregister_terminal(terminal_id, expected_pane_id=pane_id)
 
             logger.info(f"pane.closed: cleaned up terminal {terminal_id} (pane={pane_id})")
 
@@ -927,7 +965,7 @@ class HerdrInboxService:
             # the whole session when a callback recovery is still open.
             to_remove = [
                 (pid, tid)
-                for pid, tid in self._pane_to_terminal.items()
+                for pid, tid in self._ownership_items()
                 if (m := get_terminal_metadata(tid)) and m.get("tmux_session") == session_name
             ]
             try:
@@ -944,10 +982,7 @@ class HerdrInboxService:
             # they begin with the workspace_id, so a prefix test is unreliable.
             # This mirrors the session match used in the pane.closed handler.
             for pid, tid in to_remove:
-                self._pane_to_terminal.pop(pid, None)
-                self._terminal_to_pane.pop(tid, None)
-                self._kiro_terminals.discard(tid)
-                self._working_since.pop(tid, None)
+                self.unregister_terminal(tid, expected_pane_id=pid)
 
             self._workspace_to_session.pop(workspace_id, None)
             logger.info(
@@ -973,16 +1008,20 @@ class HerdrInboxService:
         import subprocess
 
         now = time.time()
-        for terminal_id in list(self._working_since.keys()):
-            if terminal_id not in self._kiro_terminals:
+        with self._ownership_lock:
+            working_snapshot = tuple(self._working_since.items())
+            kiro_terminals = frozenset(self._kiro_terminals)
+            terminal_to_pane = dict(self._terminal_to_pane)
+        for terminal_id, working_since in working_snapshot:
+            if terminal_id not in kiro_terminals:
                 continue
 
-            working_duration = now - self._working_since[terminal_id]
+            working_duration = now - working_since
             if working_duration < _KIRO_WORKING_THRESHOLD:
                 continue
 
             # Read pane and check for permission prompt
-            pane_id = self._terminal_to_pane.get(terminal_id)
+            pane_id = terminal_to_pane.get(terminal_id)
             if not pane_id:
                 continue
 
@@ -1006,7 +1045,9 @@ class HerdrInboxService:
                 )
                 self._deliver(terminal_id)
                 # Reset the timer so we don't spam
-                self._working_since[terminal_id] = now
+                with self._ownership_lock:
+                    if self._working_since.get(terminal_id) == working_since:
+                        self._working_since[terminal_id] = now
 
     async def _send(self, message: dict) -> None:
         """Send a JSON message to the herdr socket."""

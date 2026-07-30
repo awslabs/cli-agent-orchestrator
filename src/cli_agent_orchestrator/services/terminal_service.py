@@ -2899,6 +2899,8 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 def retire_closed_workspace_session(
     session_name: str,
     registry: PluginRegistry | None = None,
+    *,
+    unregister_inbox: bool = True,
 ) -> list[str]:
     """Retire DB state after Herdr authoritatively reports a closed workspace.
 
@@ -2966,7 +2968,10 @@ def retire_closed_workspace_session(
         retired: list[str] = []
         for item in current_rows:
             generation = item.get("generation")
-            kwargs: dict[str, Any] = {"backend_already_closed": True}
+            kwargs: dict[str, Any] = {
+                "backend_already_closed": True,
+                "unregister_inbox": unregister_inbox,
+            }
             if generation:
                 kwargs.update(
                     expected_generation=generation,
@@ -2984,6 +2989,7 @@ def retire_observed_terminal(
     expected_session: str | None = None,
     expected_pane_id: str | None = None,
     backend_already_closed: bool = True,
+    unregister_inbox: bool = True,
 ) -> bool:
     """Retire one lifecycle-observed terminal without bypassing recovery.
 
@@ -3036,6 +3042,7 @@ def retire_observed_terminal(
             expected_generation=observed.get("generation"),
             expected_session=expected_session or observed.get("tmux_session"),
             backend_already_closed=backend_already_closed,
+            unregister_inbox=unregister_inbox,
         )
 
 
@@ -3047,6 +3054,7 @@ def delete_terminal(
     expected_session: str | None = None,
     via_destructive_endpoint: bool = False,
     backend_already_closed: bool = False,
+    unregister_inbox: bool = True,
 ) -> bool:
     """Delete under the same exact-generation claim recovery admission uses."""
     from cli_agent_orchestrator.services import callback_recovery
@@ -3060,6 +3068,7 @@ def delete_terminal(
                 expected_session=expected_session,
                 via_destructive_endpoint=via_destructive_endpoint,
                 backend_already_closed=backend_already_closed,
+                unregister_inbox=unregister_inbox,
             )
 
     metadata = get_terminal_metadata(terminal_id)
@@ -3084,6 +3093,7 @@ def delete_terminal(
             expected_session=expected_session,
             via_destructive_endpoint=via_destructive_endpoint,
             backend_already_closed=backend_already_closed,
+            unregister_inbox=unregister_inbox,
         )
 
 
@@ -3095,6 +3105,7 @@ def _delete_terminal_claimed(
     expected_session: str | None = None,
     via_destructive_endpoint: bool = False,
     backend_already_closed: bool = False,
+    unregister_inbox: bool = True,
 ) -> bool:
     """Delete terminal and kill its tmux window.
 
@@ -3209,10 +3220,13 @@ def _delete_terminal_claimed(
 
         # Unregister from herdr inbox service
         _recheck_teardown_claim()
-        svc = get_herdr_inbox_service()
+        svc = get_herdr_inbox_service() if unregister_inbox else None
         if svc:
             try:
-                svc.unregister_terminal(terminal_id)
+                svc.unregister_terminal(
+                    terminal_id,
+                    expected_pane_id=(metadata or {}).get("pane_id"),
+                )
             except Exception as e:
                 logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
 

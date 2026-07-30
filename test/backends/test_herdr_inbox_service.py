@@ -52,6 +52,49 @@ class TestHerdrInboxServiceRegistration:
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.unregister_terminal("nonexistent")  # Should not raise
 
+    def test_ownership_snapshot_serializes_concurrent_registration(self):
+        """A registration cannot resize the pane map during a loop snapshot."""
+        snapshot_entered = threading.Event()
+        release_snapshot = threading.Event()
+        registration_done = threading.Event()
+        failures = []
+
+        class PausingDict(dict):
+            def items(self):
+                for index, item in enumerate(super().items()):
+                    if index == 0:
+                        snapshot_entered.set()
+                        assert release_snapshot.wait(timeout=3)
+                    yield item
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._pane_to_terminal = PausingDict({"pane-old": "tid-old"})
+        service._terminal_to_pane = {"tid-old": "pane-old"}
+
+        def snapshot():
+            try:
+                service._ownership_items()
+            except Exception as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        def register():
+            service.register_terminal("tid-new", "pane-new")
+            registration_done.set()
+
+        snapshot_thread = threading.Thread(target=snapshot)
+        registration_thread = threading.Thread(target=register)
+        snapshot_thread.start()
+        assert snapshot_entered.wait(timeout=2)
+        registration_thread.start()
+        assert not registration_done.wait(timeout=0.1)
+        release_snapshot.set()
+        snapshot_thread.join(timeout=2)
+        registration_thread.join(timeout=2)
+
+        assert not failures
+        assert registration_done.is_set()
+        assert service._pane_to_terminal["pane-new"] == "tid-new"
+
 
 class TestHerdrInboxServiceRegisterReconnect:
     """Registering a terminal on a live connection must force a reconnect, never
@@ -1181,7 +1224,8 @@ class TestHerdrInboxServiceLifecycleEvents:
         service.register_terminal("tid-old", "pane-old")
         mock_meta.return_value = {"tmux_session": "session-old"}
 
-        def retire(_session_name):
+        def retire(_session_name, **_kwargs):
+            assert _kwargs == {"unregister_inbox": False}
             blocked.set()
             assert release.wait(timeout=3)
             return ["tid-old"]
@@ -1246,7 +1290,10 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert "pane-x" not in service._pane_to_terminal
         assert "tid-x" not in service._terminal_to_pane
         mock_delete.assert_called_once_with(
-            "tid-x", expected_session=None, expected_pane_id="pane-x"
+            "tid-x",
+            expected_session=None,
+            expected_pane_id="pane-x",
+            unregister_inbox=False,
         )
 
     def test_event_loop_agent_status_real_shape_delivers(self):

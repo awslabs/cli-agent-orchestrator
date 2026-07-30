@@ -2526,7 +2526,10 @@ class TestManagedTeardownClaimRecheck:
                     expected_generation=self.GEN,
                     expected_session="cao-session",
                 )
-            (herdr.return_value.unregister_terminal).assert_called_once_with("deadbeef")
+            (herdr.return_value.unregister_terminal).assert_called_once_with(
+                "deadbeef",
+                expected_pane_id=None,
+            )
             fifo.stop_reader.assert_not_called()
             status_mon.clear_terminal.assert_not_called()
             backend.kill_window.assert_not_called()
