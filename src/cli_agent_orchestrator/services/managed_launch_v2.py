@@ -383,7 +383,11 @@ _PINNED_PROVIDER = {
 #: Overshooting the bound only delays a launch that is already waiting on
 #: a process; undershooting publishes the false readiness this exists to
 #: remove.  The poll is fine because the window itself is sub-second.
-NATIVE_PANE_READY_TIMEOUT_SECONDS = 10.0
+# Provider startup includes profile MCP handshakes. Ten seconds was shorter
+# than a healthy Codex 0.146.0 cold start with the campaign's MCP inventory,
+# producing a permanently false readiness receipt for a pane that became idle
+# moments later. Match the existing provider-initialization runway.
+NATIVE_PANE_READY_TIMEOUT_SECONDS = 60.0
 _NATIVE_PANE_READY_POLL_SECONDS = 0.1
 
 #: Machine-readable reasons for a native admission that wrote no bytes.
@@ -4040,10 +4044,11 @@ def _await_native_pane_input_ready(
                 authority=authority,
             )
         else:
+            input_ready = status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
             observation = _readiness_observation(
                 pane_id=pane_handle,
                 provider_status=status.value,
-                input_ready=status is TerminalStatus.IDLE,
+                input_ready=input_ready,
                 detail=None,
                 authority=authority,
             )

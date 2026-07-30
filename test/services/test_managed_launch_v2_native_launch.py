@@ -875,6 +875,23 @@ async def test_a_pane_ready_on_the_first_look_is_certified_without_waiting(
 
 
 @pytest.mark.asyncio
+async def test_a_completed_pane_is_also_input_ready(
+    isolated_memory_db, worktree, tmp_path, harness
+):
+    """A settled response leaves the composer just as writable as fresh idle."""
+    harness.pane_status_script = [TerminalStatus.COMPLETED]
+
+    record, _ = await _launch(worktree, tmp_path)
+
+    receipt = _published_receipt(record["reservation_id"])
+    assert receipt["model_input_ready"] is True
+    assert receipt["model_input_ready_observation"]["provider_status"] == (
+        TerminalStatus.COMPLETED.value
+    )
+    assert harness.pane_reads == ["%7"]
+
+
+@pytest.mark.asyncio
 async def test_a_pane_that_never_becomes_ready_is_reported_unready_and_bind_refuses(
     isolated_memory_db, worktree, tmp_path, harness
 ):

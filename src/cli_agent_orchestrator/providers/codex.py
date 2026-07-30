@@ -530,6 +530,11 @@ class CodexProvider(BaseProvider):
         self._initialized = True
         return True
 
+    # Codex 0.146.0 redraws its inline TUI in place and leaves completed
+    # progress rows in the raw pipe-pane buffer. Opt into the composited
+    # viewport path so status/inbox callers use the spatial detector below.
+    supports_screen_detection = True
+
     def get_status_from_screen(self, screen_lines: list[str]) -> TerminalStatus:
         """Detect live 0.146.0 activity from a rendered viewport.
 

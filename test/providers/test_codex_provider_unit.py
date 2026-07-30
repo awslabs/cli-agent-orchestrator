@@ -948,6 +948,9 @@ class TestCodexProviderStatusDetection:
 class TestCodexBulletFormatStatusDetection:
     """Tests for Codex's real interactive output format using › prompt and • bullets."""
 
+    def test_codex_opts_into_rendered_screen_detection(self):
+        assert CodexProvider.supports_screen_detection is True
+
     def test_get_status_completed_bullet_format(self):
         """COMPLETED when › user message followed by • response and idle prompt."""
         output = (
