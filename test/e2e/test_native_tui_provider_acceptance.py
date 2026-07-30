@@ -4,6 +4,7 @@ This suite drives the *real* v2 managed-launch native_tui flow
 (reserve → launch → bind) over HTTP against a real ``cao-server``
 subprocess, with the pinned provider builds installed on this host:
 
+* ``codex`` 0.146.0 (``codex``)
 * ``kimi`` 0.29.2 (``kimi_cli``)
 * ``claude`` 2.1.220 (``claude_code``)
 
@@ -67,10 +68,13 @@ PROTOCOL_V2 = "cao-managed-launch-v2"
 
 KIMI_PIN = "0.29.2"
 CLAUDE_PIN = "2.1.220"
+CODEX_PIN = "0.146.0"
 
 KIMI_MODEL = "kimi-code/kimi-for-coding"
 EFFORT_PROVIDER_DEFAULT = "provider-default"
 CLAUDE_MODEL_ALIAS = "sonnet"
+CODEX_MODEL = "gpt-5.6-terra"
+CODEX_EFFORT = "xhigh"
 
 AGENT_PROFILE = "acceptance"
 
@@ -470,7 +474,7 @@ def _launch_provider_session(
         "agent_profile": agent_profile,
         "caller_id": uuid.uuid4().hex[:8],
         "working_directory": workdir,
-        "trusted_project_root": None,
+        "trusted_project_root": workdir if provider == "codex" else None,
         "expected_model": expected_model,
         "expected_effort": expected_effort,
         "provider_executable": exe,
@@ -634,6 +638,23 @@ def claude_session(harness: Harness) -> Iterator[ProviderSession]:
         _kill_session(harness, session)
 
 
+@pytest.fixture(scope="module")
+def codex_session(harness: Harness) -> Iterator[ProviderSession]:
+    session = _launch_provider_session(
+        harness,
+        provider="codex",
+        binary="codex",
+        pin=CODEX_PIN,
+        expected_model=CODEX_MODEL,
+        expected_effort=CODEX_EFFORT,
+        tag="codex",
+    )
+    try:
+        yield session
+    finally:
+        _kill_session(harness, session)
+
+
 # ---------------------------------------------------------------------------
 # Control-input + capture helpers
 # ---------------------------------------------------------------------------
@@ -709,6 +730,7 @@ def _await(predicate, timeout: float = 5.0, poll: float = 0.1) -> bool:
 
 _KIMI_SPINNER = re.compile(r"[⠁-⣿🌑-🌘]")
 _CLAUDE_SPINNER = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*ing\b.*…", re.M)
+_CODEX_SPINNER = re.compile(r"[•◦].*\(\d+s\s*•\s*esc to interrupt\)")
 _CLAUDE_BOX_RULE = re.compile(r"^\s*─{3,}\s*$")
 
 
@@ -717,6 +739,8 @@ def _turn_active(harness: Harness, session: ProviderSession) -> bool:
     if session.provider == "kimi_cli":
         tail = "\n".join(screen.splitlines()[-18:])
         return bool(_KIMI_SPINNER.search(tail))
+    if session.provider == "codex":
+        return bool(_CODEX_SPINNER.search(screen))
     return bool(_CLAUDE_SPINNER.search(screen))
 
 
@@ -789,11 +813,29 @@ def _claude_composer_rows_plain(screen: str) -> Optional[List[str]]:
     return rows[rules[-2] + 1 : rules[-1]]
 
 
+def _codex_composer_rows_plain(screen: str) -> Optional[List[str]]:
+    """Rows from the last Codex prompt through its blank footer separator."""
+    rows = screen.splitlines()
+    prompt = next((index for index in range(len(rows) - 1, -1, -1) if "›" in rows[index]), None)
+    if prompt is None:
+        return None
+    separator = next(
+        (index for index in range(prompt + 1, len(rows)) if not rows[index].strip()),
+        None,
+    )
+    if separator is None:
+        return None
+    return rows[prompt:separator]
+
+
 def _composer_holds(harness: Harness, session: ProviderSession, text: str) -> bool:
     screen = _capture(harness, session)
     if session.provider == "kimi_cli":
         composer = _kimi_composer_text(screen)
         return composer is not None and text in composer
+    if session.provider == "codex":
+        rows = _codex_composer_rows_plain(screen)
+        return rows is not None and any(text in row for row in rows)
     rows = _claude_composer_rows_plain(screen)
     return rows is not None and any(text in row for row in rows)
 
@@ -904,23 +946,21 @@ def _save_screen(
 
 
 # ===========================================================================
-# Codex: no registry entry (§10.3, OD3) — no session needed
+# Codex 0.146.0 — discovery plus disposable native-TUI session
 # ===========================================================================
 
 
 class TestCodexAdvertisement:
-    def test_codex_has_no_provider_controls_entry(self, harness: Harness) -> None:
+    def test_codex_has_a_provider_controls_entry(self, harness: Harness) -> None:
         response = requests.get(f"{harness.server.url}/control-input/capabilities", timeout=30)
         assert response.status_code == 200, response.text
         body = response.json()
         harness.evidence.write_json("case-10-codex-advertisement", "capabilities.json", body)
 
         provider_controls = body.get("provider_controls") or {}
-        assert (
-            "codex" not in provider_controls
-        ), f"codex unexpectedly advertised in provider_controls: {sorted(provider_controls)}"
         assert sorted(provider_controls) == [
             "claude_code",
+            "codex",
             "kimi_cli",
         ], f"provider_controls keys drifted: {sorted(provider_controls)}"
         # The §3.5 additive block shape, asserted while we are here.
@@ -934,11 +974,85 @@ class TestCodexAdvertisement:
         assert kimi_block.get("steer_chords") == ["C-s"], kimi_block
         assert kimi_block.get("dispatch_grace_ms") == 5000, kimi_block
         assert provider_controls["claude_code"].get("steer_chords") == []
+        codex_block = provider_controls["codex"]
+        assert codex_block.get("steer_chords") == []
+        assert (codex_block.get("compact") or {}).get("events") == [
+            {"type": "text", "text": "/compact"},
+            {"type": "key", "key": "Enter"},
+        ]
         harness.evidence.note(
             "case-10-codex-advertisement",
-            "PASS: no codex key in provider_controls; keys are exactly "
+            "PASS: codex is advertised with the pinned compact sequence; keys are exactly "
             f"{sorted(provider_controls)}; schema versions {body.get('request_schema_versions')}.",
         )
+
+
+class TestCodexNativeTui:
+    def test_01_control_identity_is_build_exact(
+        self, harness: Harness, codex_session: ProviderSession
+    ) -> None:
+        identity = _control_identity(harness, codex_session)
+        harness.evidence.write_json("case-14-codex-identity", "control-identity.json", identity)
+        block = identity.get("control_input") or {}
+        provider_controls = (block.get("provider_controls") or {}).get("codex") or {}
+        assert provider_controls.get("steer_chords") == [], provider_controls
+        assert (provider_controls.get("compact") or {}).get("events") == [
+            {"type": "text", "text": "/compact"},
+            {"type": "key", "key": "Enter"},
+        ], provider_controls
+        assert (block.get("command_controls") or {}).get("composer_nonempty_guard") is True, block
+        assert codex_session.native_session_id, codex_session.launched_record
+
+    def test_02_declared_compact_refuses_prefill_without_mutation(
+        self, harness: Harness, codex_session: ProviderSession
+    ) -> None:
+        case = "case-15-codex-guard-prefill"
+        _ensure_idle(harness, codex_session, case=case)
+        _request, seeded = _post_events(
+            harness, codex_session, [{"type": "text", "text": "queued draft"}]
+        )
+        assert seeded["outcome"] == "accepted", seeded
+        assert _await(lambda: _composer_holds(harness, codex_session, "queued draft"))
+        before = _save_screen(harness, codex_session, case, "01-prefill.txt", styled=True)
+
+        request, refused = _post_events(
+            harness,
+            codex_session,
+            [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}],
+            payload_class="command",
+        )
+        harness.evidence.write_json(case, "02-request.json", request)
+        harness.evidence.write_json(case, "03-response.json", refused)
+        assert refused["outcome"] == "refused", refused
+        assert refused["reason_code"] == "composer-nonempty", refused
+        assert _composer_holds(harness, codex_session, "queued draft")
+        after = _save_screen(harness, codex_session, case, "04-after.txt", styled=True)
+        assert _codex_composer_rows_plain(before) == _codex_composer_rows_plain(after)
+        _clear_composer(harness, codex_session, seeded="queued draft", case=case)
+
+    def test_03_declared_compact_executes_on_empty_composer(
+        self, harness: Harness, codex_session: ProviderSession
+    ) -> None:
+        case = "case-16-codex-compact-executes"
+        _ensure_idle(harness, codex_session, case=case)
+        _save_screen(harness, codex_session, case, "01-empty.txt", styled=True)
+        request, accepted = _post_events(
+            harness,
+            codex_session,
+            [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}],
+            payload_class="command",
+        )
+        harness.evidence.write_json(case, "02-request.json", request)
+        harness.evidence.write_json(case, "03-response.json", accepted)
+        assert accepted["outcome"] == "accepted", accepted
+        assert accepted.get("submission_observed") == "submitted", accepted
+        assert accepted.get("submission_evidence_ref", "").startswith("capture-pane:"), accepted
+        assert _await(
+            lambda: "Context compacted" in _capture(harness, codex_session, history=True),
+            timeout=30.0,
+            poll=0.5,
+        )
+        _save_screen(harness, codex_session, case, "04-history.txt", history=True)
 
 
 # ===========================================================================

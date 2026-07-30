@@ -73,9 +73,10 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])
 # "• Thinking (2s ...)", "• Starting script creation (10s • esc to interrupt)".
 # The prefix text varies but the "(Ns • esc to interrupt)" format is consistent.
 # Appears inline with --no-alt-screen when the agent is actively processing.
-# Must be checked before COMPLETED to avoid false positives (the • matches
-# ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
-TUI_PROGRESS_PATTERN = r"•.*\(\d+s\s*•\s*esc to interrupt\)"
+# Must be checked before COMPLETED to avoid false positives (the solid/hollow
+# progress bullet can resemble an assistant row and the TUI footer › matches
+# the idle prompt).
+TUI_PROGRESS_PATTERN = r"[•◦].*\(\d+s\s*•\s*esc to interrupt\)"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:
@@ -528,6 +529,37 @@ class CodexProvider(BaseProvider):
 
         self._initialized = True
         return True
+
+    def get_status_from_screen(self, screen_lines: list[str]) -> TerminalStatus:
+        """Detect live 0.146.0 activity from a rendered viewport.
+
+        Inline Codex keeps completed progress rows in scrollback.  The raw
+        detector deliberately scans history, which is useful for response
+        extraction but makes a stale ``Starting MCP servers (... esc to
+        interrupt)`` row look like current work forever.  In the rendered TUI,
+        a current progress row is adjacent to the live (last) composer prompt.
+        Require that spatial relationship before returning ``PROCESSING``;
+        otherwise preserve the generic detector's waiting/error/completed
+        answers and treat its history-only processing result as idle.
+        """
+        rows = [strip_terminal_escapes(row).rstrip() for row in screen_lines]
+        if not any(row.strip() for row in rows):
+            return TerminalStatus.UNKNOWN
+        prompt_index = next(
+            (
+                index
+                for index in range(len(rows) - 1, -1, -1)
+                if re.match(r"^\s*(?:❯|›|codex>)(?:\s|$)", rows[index])
+            ),
+            None,
+        )
+        if prompt_index is None:
+            return self.get_status("\n".join(rows))
+        current_region = "\n".join(rows[max(0, prompt_index - 6) : prompt_index])
+        if re.search(TUI_PROGRESS_PATTERN, current_region, re.MULTILINE):
+            return TerminalStatus.PROCESSING
+        status = self.get_status("\n".join(rows))
+        return TerminalStatus.IDLE if status is TerminalStatus.PROCESSING else status
 
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available;

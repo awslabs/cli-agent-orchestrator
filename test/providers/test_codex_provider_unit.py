@@ -1105,6 +1105,37 @@ class TestCodexBulletFormatStatusDetection:
 
         assert status == TerminalStatus.PROCESSING
 
+    def test_rendered_screen_ignores_a_stale_startup_spinner_in_scrollback(self):
+        screen = [
+            "◦ Starting MCP servers (11/12): codex_apps (20s • esc to interrupt)",
+            "",
+            "⚠ MCP startup incomplete (failed: anki, jina)",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "› Explain this codebase",
+            "",
+            "  gpt-5.6-terra xhigh · ~/project · branch",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.get_status_from_screen(screen) == TerminalStatus.IDLE
+
+    def test_rendered_screen_requires_the_current_spinner_next_to_the_composer(self):
+        screen = [
+            "• Earlier response",
+            "",
+            "• Working (9s • esc to interrupt)",
+            "",
+            "",
+            "› Explain this codebase",
+            "",
+            "  gpt-5.6-terra xhigh · ~/project · branch",
+        ]
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
     def test_get_status_processing_tui_thinking_spinner(self):
         """PROCESSING when TUI shows • Thinking spinner."""
         output = (
