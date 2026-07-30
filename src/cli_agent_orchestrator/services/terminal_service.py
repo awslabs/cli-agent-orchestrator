@@ -2919,7 +2919,7 @@ def retire_closed_workspace_session(
     claim_keys = {
         (
             item["id"],
-            item.get("generation") or item.get("pane_id") or "legacy-unversioned",
+            item.get("generation") or "legacy-unversioned",
         )
         for item in observed
     }
@@ -2927,8 +2927,17 @@ def retire_closed_workspace_session(
         (item["id"], item["pane_id"])
         for item in observed
         if item.get("pane_id")
-        and item["pane_id"]
-        != (item.get("generation") or item.get("pane_id") or "legacy-unversioned")
+        and item["pane_id"] != (item.get("generation") or "legacy-unversioned")
+    )
+    claim_keys.update(
+        (item["id"], item["callback_target_generation"])
+        for item in observed
+        if item.get("callback_target_generation")
+        and item["callback_target_generation"]
+        not in {
+            item.get("generation"),
+            item.get("pane_id"),
+        }
     )
 
     with callback_recovery.generation_lifecycle_claims(claim_keys):
@@ -2996,6 +3005,12 @@ def retire_observed_terminal(
     claim_keys = {(terminal_id, generation)}
     if pane_id and pane_id != generation:
         claim_keys.add((terminal_id, pane_id))
+    callback_target_generation = observed.get("callback_target_generation")
+    if callback_target_generation and callback_target_generation not in {
+        generation,
+        pane_id,
+    }:
+        claim_keys.add((terminal_id, callback_target_generation))
 
     with callback_recovery.generation_lifecycle_claims(claim_keys):
         current = _get_terminal_metadata_any(terminal_id)
@@ -3055,6 +3070,12 @@ def delete_terminal(
     claim_keys = {(terminal_id, claim_generation)}
     if pane_generation and pane_generation != claim_generation:
         claim_keys.add((terminal_id, pane_generation))
+    callback_target_generation = (metadata or {}).get("callback_target_generation")
+    if callback_target_generation and callback_target_generation not in {
+        claim_generation,
+        pane_generation,
+    }:
+        claim_keys.add((terminal_id, callback_target_generation))
     with callback_recovery.generation_lifecycle_claims(claim_keys):
         return _delete_terminal_claimed(
             terminal_id,

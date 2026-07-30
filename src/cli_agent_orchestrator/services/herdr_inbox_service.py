@@ -567,10 +567,10 @@ class HerdrInboxService:
 
             # Handle lifecycle events
             if event_name in ("pane.closed", "workspace.closed"):
-                if event_name == "workspace.closed":
-                    self._schedule_workspace_retirement(event.get("data", {}))
-                else:
-                    self._handle_lifecycle_event(event_name, event.get("data", {}))
+                self._schedule_lifecycle_retirement(
+                    event_name,
+                    event.get("data", {}),
+                )
                 continue
 
             data = event.get("data", {})
@@ -594,23 +594,27 @@ class HerdrInboxService:
                     if terminal_id not in self._working_since:
                         self._working_since[terminal_id] = time.time()
 
-    def _schedule_workspace_retirement(self, data: dict) -> None:
-        """Run blocking lifecycle locks/DB cleanup away from the socket loop."""
+    def _schedule_lifecycle_retirement(self, event_type: str, data: dict) -> None:
+        """Track one off-loop retirement whose map commit returns to this loop."""
         task = asyncio.create_task(
-            asyncio.to_thread(self._handle_lifecycle_event, "workspace.closed", dict(data)),
-            name=f"herdr-workspace-retirement-{data.get('workspace_id', 'unknown')}",
+            self._handle_lifecycle_event_async(event_type, dict(data)),
+            name=(
+                f"herdr-{event_type}-retirement-"
+                f"{data.get('workspace_id') or data.get('pane_id') or 'unknown'}"
+            ),
         )
         self._lifecycle_tasks.add(task)
 
         def completed(done: asyncio.Task) -> None:
             self._lifecycle_tasks.discard(done)
             if done.cancelled():
-                logger.warning("workspace.closed managed retirement was cancelled")
+                logger.warning("%s managed retirement was cancelled", event_type)
                 return
             error = done.exception()
             if error is not None:
                 logger.error(
-                    "workspace.closed managed retirement failed off-loop",
+                    "%s managed retirement failed off-loop",
+                    event_type,
                     exc_info=(type(error), error, error.__traceback__),
                 )
 
@@ -648,6 +652,25 @@ class HerdrInboxService:
             logger.warning("_label_still_live: could not query herdr (%s)", e)
             return False
 
+    def _workspace_sessions_from_herdr(self) -> Dict[str, str]:
+        """Read workspace identities without touching event-loop-owned maps."""
+        result = subprocess.run(
+            ["herdr", "--session", self._herdr_session, "workspace", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                result.args,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
+        ws_data = json.loads(result.stdout)
+        workspaces = ws_data.get("result", {}).get("workspaces", [])
+        return {ws["workspace_id"]: ws["label"] for ws in workspaces}
+
     def _resolve_session_from_herdr(self, workspace_id: str) -> Optional[str]:
         """Resolve a workspace_id to its session name from live herdr state.
 
@@ -661,29 +684,159 @@ class HerdrInboxService:
         no destructive action.
         """
         try:
-            result = subprocess.run(
-                ["herdr", "--session", self._herdr_session, "workspace", "list"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode != 0:
-                logger.warning(
-                    "_resolve_session_from_herdr: herdr workspace list failed (rc=%s): %s",
-                    result.returncode,
-                    result.stderr.strip(),
-                )
-                return None
-            ws_data = json.loads(result.stdout)
-            workspaces = ws_data.get("result", {}).get("workspaces", [])
-            self._workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
+            self._workspace_to_session = self._workspace_sessions_from_herdr()
             return self._workspace_to_session.get(workspace_id)
         except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, OSError) as e:
             logger.warning("_resolve_session_from_herdr: could not query herdr (%s)", e)
             return None
 
+    async def _handle_lifecycle_event_async(self, event_type: str, data: dict) -> None:
+        """Retire off-loop, then commit ownership-map changes on the event loop."""
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.clients.database import (
+            get_terminal_metadata,
+            list_terminals_by_session,
+        )
+        from cli_agent_orchestrator.services import terminal_service
+
+        if event_type == "pane.closed":
+            pane_id = data.get("pane_id", "")
+            terminal_id = self._pane_to_terminal.get(pane_id)
+            if not terminal_id:
+                return
+            meta = await asyncio.to_thread(get_terminal_metadata, terminal_id)
+            session_name = meta["tmux_session"] if meta else None
+            window_name = meta["tmux_window"] if meta else None
+            if window_name and await asyncio.to_thread(
+                self._label_still_live,
+                window_name,
+            ):
+                logger.info(
+                    "pane.closed: ignoring stale close for %s (pane=%s) — "
+                    "label %s still live in herdr (compact pane_id reused)",
+                    terminal_id,
+                    pane_id,
+                    window_name,
+                )
+                return
+            try:
+                retired = await asyncio.to_thread(
+                    terminal_service.retire_observed_terminal,
+                    terminal_id,
+                    expected_session=session_name,
+                    expected_pane_id=pane_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve ownership on hold
+                logger.warning(
+                    "pane.closed: failed to delete terminal %s: %s",
+                    terminal_id,
+                    exc,
+                )
+                return
+            if not retired:
+                return
+
+            # No background thread touches these maps. Revalidate ownership
+            # after every await so a compact pane-id reuse registered while
+            # retirement was running is never removed as the old terminal.
+            if (
+                self._pane_to_terminal.get(pane_id) == terminal_id
+                and self._terminal_to_pane.get(terminal_id) == pane_id
+            ):
+                self._pane_to_terminal.pop(pane_id, None)
+                self._terminal_to_pane.pop(terminal_id, None)
+                self._kiro_terminals.discard(terminal_id)
+                self._working_since.pop(terminal_id, None)
+            if session_name:
+                remaining = await asyncio.to_thread(
+                    list_terminals_by_session,
+                    session_name,
+                )
+                if not remaining:
+                    try:
+                        await asyncio.to_thread(
+                            get_backend().kill_session,
+                            session_name,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - best-effort backend cleanup
+                        logger.warning(
+                            "pane.closed: failed to kill workspace %s: %s",
+                            session_name,
+                            exc,
+                        )
+            return
+
+        if event_type != "workspace.closed":
+            return
+        workspace_id = data.get("workspace_id", "")
+        session_name = self._workspace_to_session.get(workspace_id)
+        if not session_name:
+            try:
+                workspaces = await asyncio.to_thread(self._workspace_sessions_from_herdr)
+            except (
+                subprocess.SubprocessError,
+                json.JSONDecodeError,
+                KeyError,
+                OSError,
+            ) as exc:
+                logger.warning(
+                    "workspace.closed: could not resolve workspace %s: %s",
+                    workspace_id,
+                    exc,
+                )
+                return
+            # Registrations may have arrived while the subprocess was running.
+            # Merge the observed identities instead of replacing the loop-owned
+            # map with a snapshot that predates those registrations.
+            self._workspace_to_session.update(workspaces)
+            session_name = workspaces.get(workspace_id)
+            if not session_name:
+                return
+
+        ownership_snapshot = tuple(self._pane_to_terminal.items())
+
+        def session_ownership() -> tuple[tuple[str, str], ...]:
+            return tuple(
+                (pane_id, terminal_id)
+                for pane_id, terminal_id in ownership_snapshot
+                if (
+                    (metadata := get_terminal_metadata(terminal_id))
+                    and metadata.get("tmux_session") == session_name
+                )
+            )
+
+        to_remove = await asyncio.to_thread(session_ownership)
+        try:
+            await asyncio.to_thread(
+                terminal_service.retire_closed_workspace_session,
+                session_name,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve ownership on hold
+            logger.warning(
+                "workspace.closed: managed retirement held for %s: %s",
+                session_name,
+                exc,
+            )
+            return
+        for pane_id, terminal_id in to_remove:
+            if (
+                self._pane_to_terminal.get(pane_id) == terminal_id
+                and self._terminal_to_pane.get(terminal_id) == pane_id
+            ):
+                self._pane_to_terminal.pop(pane_id, None)
+                self._terminal_to_pane.pop(terminal_id, None)
+                self._kiro_terminals.discard(terminal_id)
+                self._working_since.pop(terminal_id, None)
+        if self._workspace_to_session.get(workspace_id) == session_name:
+            self._workspace_to_session.pop(workspace_id, None)
+        logger.info(
+            "workspace.closed: cleaned up session %s (%d terminals)",
+            session_name,
+            len(to_remove),
+        )
+
     def _handle_lifecycle_event(self, event_type: str, data: dict) -> None:
-        """Handle pane.closed and workspace.closed events."""
+        """Synchronous compatibility seam; production events use the async path."""
         from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.clients.database import (
             get_terminal_metadata,

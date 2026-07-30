@@ -46,6 +46,11 @@ class TerminalModel(Base):
     # operations. Legacy/operator terminals may be NULL; managed terminals
     # always bind the reservation generation here before provider I/O.
     generation = Column(Text, nullable=True, unique=True)
+    # Every callback target has a durable, non-reusable incarnation even when
+    # it is an ordinary operator/supervisor terminal with no managed-launch
+    # generation. This identity is intentionally separate from pane_id:
+    # compact pane ids are backend-local and reusable.
+    callback_target_generation = Column(Text, nullable=True, unique=True)
     # Server-owned immutable pane/window identity (cond-0069 attestation):
     # tmux-assigned ids recorded at creation. Window NAMES are mutable (a
     # worker can rename its own window), pane_id/window_id are not — they are
@@ -181,6 +186,7 @@ class CallbackRecoveryModel(Base):
     admission_response_json = Column(Text, nullable=True)
     provider_turn_receipt_json = Column(Text, nullable=True)
     callback_message_id = Column(Integer, nullable=True, unique=True)
+    callback_consumed_at = Column(Text, nullable=True)
     callback_response_json = Column(Text, nullable=True)
     completion_json = Column(Text, nullable=True)
     resolution_json = Column(Text, nullable=True)
@@ -1312,6 +1318,16 @@ def _migrate_terminals_schema() -> None:
             )
             conn.commit()
             logger.info("Migration: added generation column to terminals table")
+        if "callback_target_generation" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN callback_target_generation TEXT")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_terminals_callback_target_generation "
+                "ON terminals(callback_target_generation) "
+                "WHERE callback_target_generation IS NOT NULL"
+            )
+            conn.commit()
+            logger.info("Migration: added callback_target_generation column to terminals table")
         if "pane_id" not in columns:
             conn.execute("ALTER TABLE terminals ADD COLUMN pane_id TEXT")
             conn.commit()
@@ -1415,6 +1431,7 @@ def _migrate_callback_recovery_schema() -> None:
         columns = (
             ("supervisor_generation", "TEXT"),
             ("supervisor_pane_id", "TEXT"),
+            ("callback_consumed_at", "TEXT"),
             ("callback_token_sha256", "TEXT"),
             ("recovery_prompt_sha256", "TEXT"),
             ("message_created_at", "TEXT"),
@@ -1452,6 +1469,7 @@ def create_terminal(
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
     generation: Optional[str] = None,
+    callback_target_generation: Optional[str] = None,
     pane_id: Optional[str] = None,
     window_id: Optional[str] = None,
     server_socket_path: Optional[str] = None,
@@ -1463,6 +1481,7 @@ def create_terminal(
     import json as _json
 
     with SessionLocal() as db:
+        callback_target_generation = callback_target_generation or generation or str(uuid.uuid4())
         terminal = TerminalModel(
             id=terminal_id,
             tmux_session=tmux_session,
@@ -1473,6 +1492,7 @@ def create_terminal(
             shell_command=shell_command,
             caller_id=caller_id,
             generation=generation,
+            callback_target_generation=callback_target_generation,
             pane_id=pane_id,
             window_id=window_id,
             server_socket_path=server_socket_path,
@@ -1492,6 +1512,7 @@ def create_terminal(
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "generation": terminal.generation,
+            "callback_target_generation": terminal.callback_target_generation,
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
             "server_socket_path": terminal.server_socket_path,
@@ -1589,6 +1610,7 @@ def get_terminal_metadata_v2(terminal_id: str) -> Optional[Dict[str, Any]]:
             "shell_command": None,
             "caller_id": terminal.caller_id,
             "generation": terminal.generation,
+            "callback_target_generation": terminal.generation,
             "protocol_vintage": "v2",
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
@@ -1719,6 +1741,17 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         if not terminal:
             logger.warning(f"Terminal metadata not found for terminal_id: {terminal_id}")
             return None
+        if not terminal.callback_target_generation:
+            candidate = terminal.generation or str(uuid.uuid4())
+            db.query(TerminalModel).filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.callback_target_generation.is_(None),
+            ).update(
+                {TerminalModel.callback_target_generation: candidate},
+                synchronize_session=False,
+            )
+            db.commit()
+            db.refresh(terminal)
         logger.debug(
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
         )
@@ -1733,6 +1766,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "generation": terminal.generation,
+            "callback_target_generation": terminal.callback_target_generation,
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
             "server_socket_path": terminal.server_socket_path,
@@ -2297,6 +2331,18 @@ def backfill_terminal_identity_if_missing(terminal_id: str, pane_id: str, window
 
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List all terminals in a tmux session."""
+    try:
+        return _list_terminals_by_session(tmux_session)
+    except OperationalError as exc:
+        detail = str(exc).lower()
+        if "no such column" not in detail or "callback_target_generation" not in detail:
+            raise
+        _migrate_terminals_schema()
+        return _list_terminals_by_session(tmux_session)
+
+
+def _list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
+    """Unwrapped cross-vintage query used after schema readiness is proven."""
     with SessionLocal() as db:
         terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
         result = [
@@ -2307,6 +2353,9 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
                 "last_active": t.last_active,
+                "generation": t.generation,
+                "callback_target_generation": (t.callback_target_generation or t.generation),
+                "pane_id": t.pane_id,
             }
             for t in terminals
         ]
@@ -2329,6 +2378,8 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "agent_profile": t.agent_profile,
                 "last_active": t.last_active,
                 "generation": t.generation,
+                "callback_target_generation": t.generation,
+                "pane_id": t.pane_id,
                 "protocol_vintage": "v2",
             }
             for t in managed
@@ -2698,6 +2749,7 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
     """
     with SessionLocal() as db:
         if status == MessageStatus.DELIVERED:
+            message = db.get(InboxModel, message_id)
             updated = (
                 db.query(InboxModel)
                 .filter(
@@ -2709,6 +2761,15 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
                     synchronize_session=False,
                 )
             )
+            if updated == 1 and message is not None and message.callback_completion_key is not None:
+                recovery = db.get(
+                    CallbackRecoveryModel,
+                    message.callback_completion_key,
+                )
+                if recovery is not None and recovery.callback_consumed_at is None:
+                    recovery.callback_consumed_at = datetime.now(timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%S.%fZ"
+                    )
             db.commit()
             return updated == 1
 

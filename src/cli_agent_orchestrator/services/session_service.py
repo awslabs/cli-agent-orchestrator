@@ -164,6 +164,16 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             if terminal.get("pane_id")
             and terminal["pane_id"] != (terminal.get("generation") or "legacy-unversioned")
         )
+        claim_keys.update(
+            (terminal["id"], terminal["callback_target_generation"])
+            for terminal in terminals
+            if terminal.get("callback_target_generation")
+            and terminal["callback_target_generation"]
+            not in {
+                terminal.get("generation") or "legacy-unversioned",
+                terminal.get("pane_id"),
+            }
+        )
         with callback_recovery.generation_lifecycle_claims(claim_keys):
             for terminal in terminals:
                 if callback_recovery.terminal_has_open_recovery(

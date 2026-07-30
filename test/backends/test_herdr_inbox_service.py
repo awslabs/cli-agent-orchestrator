@@ -292,6 +292,7 @@ class TestHerdrInboxServiceEventParsing:
                 await service._event_loop()
             except ConnectionError:
                 pass
+            await asyncio.gather(*tuple(service._lifecycle_tasks))
 
         _run_async(run())
 
@@ -1035,13 +1036,10 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         handled = []
 
-        original = service._handle_lifecycle_event
-
-        def capture(event_type, data):
+        async def capture(event_type, data):
             handled.append(event_type)
-            original(event_type, data)
 
-        service._handle_lifecycle_event = capture
+        service._handle_lifecycle_event_async = capture
 
         async def run():
             reader = asyncio.StreamReader()
@@ -1052,6 +1050,7 @@ class TestHerdrInboxServiceLifecycleEvents:
                 await service._event_loop()
             except ConnectionError:
                 pass
+            await asyncio.gather(*tuple(service._lifecycle_tasks))
 
         _run_async(run())
 
@@ -1069,12 +1068,12 @@ class TestHerdrInboxServiceLifecycleEvents:
         )
         service.register_terminal("tid-live", "pane-live")
 
-        def slow_workspace_retirement(event_type, data):
+        async def slow_workspace_retirement(event_type, data):
             assert event_type == "workspace.closed"
             blocked.set()
-            assert release.wait(timeout=3)
+            assert await asyncio.to_thread(release.wait, 3)
 
-        service._handle_lifecycle_event = slow_workspace_retirement
+        service._handle_lifecycle_event_async = slow_workspace_retirement
         events = (
             json.dumps({"event": "workspace_closed", "data": {"workspace_id": "ws-slow"}}).encode()
             + b"\n"
@@ -1102,6 +1101,109 @@ class TestHerdrInboxServiceLifecycleEvents:
             await asyncio.gather(*tuple(service._lifecycle_tasks))
 
         _run_async(run())
+
+    def test_pane_retirement_does_not_block_socket_status_delivery(self):
+        blocked = threading.Event()
+        release = threading.Event()
+        delivered = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock",
+            delivery_callback=lambda terminal_id: delivered.append(terminal_id),
+        )
+        service.register_terminal("tid-closing", "pane-closing")
+        service.register_terminal("tid-live", "pane-live")
+
+        def slow_probe(_window_name):
+            blocked.set()
+            assert release.wait(timeout=3)
+            return False
+
+        service._label_still_live = slow_probe
+        events = (
+            json.dumps({"event": "pane_closed", "data": {"pane_id": "pane-closing"}}).encode()
+            + b"\n"
+            + json.dumps(
+                {
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": "pane-live", "agent_status": "idle"},
+                }
+            ).encode()
+            + b"\n"
+        )
+
+        async def run():
+            reader = asyncio.StreamReader()
+            service._reader = reader
+            reader.feed_data(events)
+            reader.feed_eof()
+            try:
+                await service._event_loop()
+            except ConnectionError:
+                pass
+            assert await asyncio.wait_for(
+                asyncio.to_thread(blocked.wait, 1),
+                timeout=2,
+            )
+            assert delivered == ["tid-live"]
+            release.set()
+            await asyncio.gather(*tuple(service._lifecycle_tasks))
+
+        with (
+            patch(
+                "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+                return_value={
+                    "tmux_session": "session-live",
+                    "tmux_window": "closing-window",
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.list_terminals_by_session",
+                return_value=[{"id": "tid-live"}],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.retire_observed_terminal",
+                return_value=True,
+            ),
+        ):
+            _run_async(run())
+
+    @patch("cli_agent_orchestrator.services.terminal_service.retire_closed_workspace_session")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_workspace_retirement_preserves_concurrent_map_registration(
+        self,
+        mock_meta,
+        mock_retire,
+    ):
+        blocked = threading.Event()
+        release = threading.Event()
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._workspace_to_session["ws-old"] = "session-old"
+        service.register_terminal("tid-old", "pane-old")
+        mock_meta.return_value = {"tmux_session": "session-old"}
+
+        def retire(_session_name):
+            blocked.set()
+            assert release.wait(timeout=3)
+            return ["tid-old"]
+
+        mock_retire.side_effect = retire
+
+        async def run():
+            service._schedule_lifecycle_retirement(
+                "workspace.closed",
+                {"workspace_id": "ws-old"},
+            )
+            assert await asyncio.wait_for(
+                asyncio.to_thread(blocked.wait, 1),
+                timeout=2,
+            )
+            service.register_terminal("tid-new", "pane-new")
+            release.set()
+            await asyncio.gather(*tuple(service._lifecycle_tasks))
+
+        _run_async(run())
+        assert service._pane_to_terminal == {"pane-new": "tid-new"}
+        assert service._terminal_to_pane == {"tid-new": "pane-new"}
 
     @patch(
         "cli_agent_orchestrator.services.terminal_service.retire_observed_terminal",
@@ -1137,6 +1239,7 @@ class TestHerdrInboxServiceLifecycleEvents:
                 await service._event_loop()
             except ConnectionError:
                 pass
+            await asyncio.gather(*tuple(service._lifecycle_tasks))
 
         _run_async(run())
 

@@ -411,6 +411,9 @@ def _operation_dict(row: Any) -> dict[str, Any]:
         callback = session.get(database.InboxModel, row.callback_message_id)
         if callback is not None:
             callback_delivery_status = callback.status
+    callback_consumed = bool(row.callback_consumed_at) or (
+        callback_delivery_status == MessageStatus.DELIVERED.value
+    )
     operation = {
         "operation_key": row.operation_key,
         "operation_id": row.operation_id,
@@ -447,7 +450,8 @@ def _operation_dict(row: Any) -> dict[str, Any]:
         "sender_generation": row.sender_generation,
         "callback_message_id": row.callback_message_id,
         "callback_delivery_status": callback_delivery_status,
-        "callback_consumed": callback_delivery_status == MessageStatus.DELIVERED.value,
+        "callback_consumed_at": row.callback_consumed_at,
+        "callback_consumed": callback_consumed,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -841,7 +845,11 @@ def _admit_locked(body: CallbackRecoveryRequest) -> RecoveryAdmission:
                     "the authoritative supervisor is not the root caller in the reservation session",
                     reason_code="supervisor-authority-mismatch",
                 )
-            supervisor_generation = str(getattr(supervisor, "generation", None) or "")
+            supervisor_generation = str(
+                getattr(supervisor, "callback_target_generation", None)
+                or getattr(supervisor, "generation", None)
+                or ""
+            )
             supervisor_pane_id = str(getattr(supervisor, "pane_id", None) or "")
             if not supervisor_generation:
                 raise CallbackRecoveryRefused(
@@ -1273,7 +1281,11 @@ def _create_callback_locked(
         supervisor = _terminal_row(db, row.supervisor_id)
         live_supervisor = {
             "session": str(supervisor.tmux_session),
-            "generation": str(getattr(supervisor, "generation", None) or ""),
+            "generation": str(
+                getattr(supervisor, "callback_target_generation", None)
+                or getattr(supervisor, "generation", None)
+                or ""
+            ),
             "pane_id": str(getattr(supervisor, "pane_id", None) or ""),
             "caller_id": str(getattr(supervisor, "caller_id", None) or ""),
         }
@@ -1398,6 +1410,8 @@ def complete(operation_key: str, body: CallbackRecoveryCompletionRequest) -> dic
             "completed_at": _now(),
         }
         row.callback_message_id = callback.id
+        if callback.status == MessageStatus.DELIVERED.value:
+            row.callback_consumed_at = _now()
         row.completion_json = json.dumps(completion, sort_keys=True)
         row.state = STATE_COMPLETED
         row.reason_code = None
@@ -1531,14 +1545,20 @@ def terminal_has_open_recovery(
                 if row.state not in RELEASABLE_STATES:
                     return True
                 if row.state == STATE_COMPLETED:
+                    if row.callback_consumed_at:
+                        continue
                     callback = db.get(database.InboxModel, row.callback_message_id)
                     if callback is None or callback.status != MessageStatus.DELIVERED.value:
                         return True
+                    row.callback_consumed_at = _now()
+                    db.commit()
             return False
     except OperationalError as exc:
         if "no such table: callback_recovery_operations" in str(exc):
             return False
-        if "no such column: callback_recovery_operations.supervisor_pane_id" in str(exc):
+        if "no such column: callback_recovery_operations.supervisor_pane_id" in str(
+            exc
+        ) or "no such column: callback_recovery_operations.callback_consumed_at" in str(exc):
             if _schema_retry:
                 raise
             database._migrate_callback_recovery_schema()
@@ -1556,10 +1576,16 @@ def held_inbox_ids() -> set[int]:
                     _validate_lifecycle_row(row)
                     open_state = row.state not in RELEASABLE_STATES
                     if row.state == STATE_COMPLETED:
-                        callback = db.get(database.InboxModel, row.callback_message_id)
-                        open_state = (
-                            callback is None or callback.status != MessageStatus.DELIVERED.value
-                        )
+                        if row.callback_consumed_at:
+                            open_state = False
+                        else:
+                            callback = db.get(database.InboxModel, row.callback_message_id)
+                            open_state = (
+                                callback is None or callback.status != MessageStatus.DELIVERED.value
+                            )
+                            if not open_state:
+                                row.callback_consumed_at = _now()
+                                db.commit()
                 except CallbackRecoveryError:
                     open_state = True
                 if open_state and row.inbox_message_id is not None:
@@ -1591,7 +1617,11 @@ def current_delivery_binding_matches(message: InboxMessage) -> bool:
                     return False
                 _validate_lifecycle_row(recovery)
                 terminal = _terminal_row(db, message.receiver_id)
-                live_generation = str(getattr(terminal, "generation", None) or "")
+                live_generation = str(
+                    getattr(terminal, "callback_target_generation", None)
+                    or getattr(terminal, "generation", None)
+                    or ""
+                )
                 live_pane_id = str(getattr(terminal, "pane_id", None) or "")
                 return (
                     recovery.state in {STATE_SUBMITTED, STATE_COMPLETED}

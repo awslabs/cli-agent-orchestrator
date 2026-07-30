@@ -106,7 +106,8 @@ def recovery_context(isolated_memory_db, tmp_path, monkeypatch):
                     tmux_session=SESSION_NAME,
                     tmux_window="supervisor",
                     provider="codex",
-                    generation=SUPERVISOR_GENERATION,
+                    generation=None,
+                    callback_target_generation=SUPERVISOR_GENERATION,
                     pane_id=SUPERVISOR_PANE_ID,
                 ),
                 database.TerminalModel(
@@ -463,6 +464,58 @@ def test_turn_receipt_is_strict_revalidated_and_completion_binds_callback_row(
         ),
     )
     assert replay["state"] == callback_recovery.STATE_COMPLETED
+
+
+def test_completed_delivery_remains_closed_after_inbox_retention(
+    recovery_context,
+):
+    admission = callback_recovery.admit(recovery_context)
+    _record_turn(admission)
+    callback = _publish_callback(admission)
+    callback_recovery.complete(
+        admission.operation["operation_key"],
+        CallbackRecoveryCompletionRequest(
+            callback_message_id=callback["message_id"],
+            callback_message_sha256=recovery_context.callback_message_sha256,
+            callback_created_at=callback["created_at"],
+            finalization_identity_sha256=recovery_context.finalization_identity_sha256,
+        ),
+    )
+    assert database.update_message_status(
+        callback["message_id"],
+        MessageStatus.DELIVERED,
+    )
+    assert not callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION)
+    with database.SessionLocal() as db:
+        row = db.get(
+            database.CallbackRecoveryModel,
+            admission.operation["operation_key"],
+        )
+        assert row.callback_consumed_at is not None
+        db.query(database.InboxModel).filter(
+            database.InboxModel.id == callback["message_id"]
+        ).delete()
+        db.commit()
+    assert not callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION)
+    assert callback_recovery.get(admission.operation["operation_key"])["callback_consumed"]
+
+
+def test_ordinary_supervisor_gets_distinct_callback_target_generation(
+    isolated_memory_db,
+):
+    created = database.create_terminal(
+        "normal01",
+        "cao-normal",
+        "supervisor",
+        "codex",
+        pane_id="%7",
+    )
+    generation = created["callback_target_generation"]
+    assert generation
+    assert generation != created["pane_id"]
+    assert created["generation"] is None
+    reread = database.get_terminal_metadata("normal01")
+    assert reread["callback_target_generation"] == generation
 
 
 def test_generic_inbox_row_cannot_complete_recovery(recovery_context):
