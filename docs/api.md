@@ -100,11 +100,14 @@ See [Workflows](workflows.md).
 
 ### Memory and graph
 
-- `/settings/memory` reports memory enablement.
+- `/settings/memory` reports memory enablement (including `learning_enabled`).
 - `/memory*` lists, reads, exports, and deletes memories.
 - `/graph/{provider}*` projects and exports graph views.
+- `/outcomes` records (`POST`, write-scope) and lists (`GET`) workflow
+  outcomes for the self-learning loop. Both return 404 while
+  `memory.learning_enabled` is false.
 
-See [Memory](memory.md) and
+See [Memory](memory.md), [Self-Learning](self-learning.md), and
 [Knowledge Graph Viewing](knowledge-graph-viewing.md).
 
 ### Flows

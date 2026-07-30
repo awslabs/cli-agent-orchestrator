@@ -99,6 +99,23 @@ UPDATE_DIALOG_PATTERN = r"Update available!\s+\S+\s+->\s+\S+"
 UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
 UPDATE_DIALOG_FOOTER = TRUST_PROMPT_FOOTER
 STARTUP_PROMPT_BOTTOM_LINES = 15
+STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+STARTUP_BLOCKING_INPUT_PATTERN = (
+    r"(?:Command Approval Required|\[[aA]\]\s+Accept\b|"
+    r"\[[dD]\]\s+Decline\b|Press enter to continue)"
+)
+STARTUP_IDLE_PLACEHOLDER_PATTERN = (
+    rf"^\s*{IDLE_PROMPT_PATTERN}[^\S\n]+(?:"
+    r"Explain this codebase|"
+    r"Summarize recent commits|"
+    r"Implement \{feature\}|"
+    r"Find and fix a bug in @filename|"
+    r"Write tests for @filename|"
+    r"Improve documentation in @filename|"
+    r"Run /review on my current changes|"
+    r"Use /skills to list available skills"
+    r")\s*$"
+)
 
 # Codex welcome banner indicating normal startup (no trust prompt)
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
@@ -233,6 +250,32 @@ def _has_update_dialog_in_bottom(clean_output: str) -> bool:
         and re.search(UPDATE_DIALOG_MENU_PATTERN, bottom) is not None
         and re.search(UPDATE_DIALOG_FOOTER, bottom) is not None
     )
+
+
+def _has_startup_idle_composer(clean_output: str) -> bool:
+    """Return True when the bottom of the pane shows Codex's idle composer."""
+    all_lines = clean_output.splitlines()
+    tail_lines = all_lines[-STARTUP_PROMPT_BOTTOM_LINES:]
+    tail_output = "\n".join(tail_lines)
+
+    if re.search(STARTUP_ACTIVITY_PATTERN, tail_output, re.MULTILINE):
+        return False
+    if re.search(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
+        return False
+    if re.search(STARTUP_BLOCKING_INPUT_PATTERN, tail_output, re.IGNORECASE):
+        return False
+
+    legacy_tail = all_lines[-IDLE_PROMPT_TAIL_LINES:]
+    if any(re.match(IDLE_PROMPT_STRICT_PATTERN, line) for line in legacy_tail):
+        return True
+
+    # Codex 0.145 renders placeholder text inside the idle composer instead of
+    # an empty prompt. Match only known placeholder copy and require its status
+    # footer below it so typed drafts and ordinary output are not treated as ready.
+    for index in range(len(tail_lines) - 1, -1, -1):
+        if re.match(STARTUP_IDLE_PLACEHOLDER_PATTERN, tail_lines[index]):
+            return any(re.search(TUI_FOOTER_PATTERN, line) for line in tail_lines[index + 1 :])
+    return False
 
 
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
@@ -480,8 +523,7 @@ class CodexProvider(BaseProvider):
             # Exit when the bottom region shows the idle composer prompt AND no
             # dialog is active. The welcome banner alone is insufficient — it
             # renders as normal startup chrome BEFORE a late update dialog appears.
-            bottom_tail_lines = clean_output.splitlines()[-IDLE_PROMPT_TAIL_LINES:]
-            has_idle = any(re.match(IDLE_PROMPT_STRICT_PATTERN, line) for line in bottom_tail_lines)
+            has_idle = _has_startup_idle_composer(clean_output)
             has_dialog = (
                 re.search(TRUST_PROMPT_PATTERN, bottom_region)
                 or (

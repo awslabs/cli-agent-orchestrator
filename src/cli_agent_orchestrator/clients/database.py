@@ -130,6 +130,29 @@ class ProjectAliasModel(Base):
     created_at = Column(DateTime(timezone=True), default=_utcnow)
 
 
+class WorkflowOutcomeModel(Base):
+    """SQLAlchemy model for workflow outcome records (self-learning Phase 1).
+
+    One row per reported outcome of a unit of agent work (a workflow step,
+    a package conversion, a review round). Outcomes are the raw signal the
+    retrospector agent distills into memory lessons — they carry short
+    labels and notes, never transcripts or file contents.
+    """
+
+    __tablename__ = "workflow_outcomes"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_name = Column(String, nullable=False)
+    workflow_name = Column(String, nullable=True)  # optional grouping label
+    task_label = Column(String, nullable=False)  # e.g. "convert package X"
+    agent_profile = Column(String, nullable=True)  # profile that did the work
+    source_terminal_id = Column(String, nullable=True)
+    success = Column(Boolean, nullable=False)
+    score = Column(Integer, nullable=True)  # optional 0-100 metric
+    friction_notes = Column(Text, nullable=False, default="")  # short, content-free
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+
+
 class FlowModel(Base):
     """SQLAlchemy model for flow metadata."""
 
@@ -181,6 +204,7 @@ def init_db() -> None:
     _migrate_workflow_index()
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    _migrate_workflow_outcome_indexes()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -492,6 +516,33 @@ def _migrate_workflow_run_step() -> None:
                 logger.info("Migration: added call_fingerprint column to workflow_run_step")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run_step migration skipped: {e}")
+
+
+def _migrate_workflow_outcome_indexes() -> None:
+    """Add indexes on workflow_outcomes for retrospector queries.
+
+    The table itself is created by ``Base.metadata.create_all`` (it ships in
+    the model, so fresh and existing DBs both get it). Retrospection filters
+    by session and by agent profile over a recency window — index both.
+    Idempotent, self-connecting, failure logged at debug — mirrors
+    ``_migrate_memory_indexes``.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outcome_session "
+                "ON workflow_outcomes (session_name, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outcome_agent "
+                "ON workflow_outcomes (agent_profile, created_at)"
+            )
+    except Exception as e:
+        logger.debug(f"workflow_outcomes index migration skipped: {e}")
 
 
 def _migrate_terminals_schema() -> None:

@@ -1776,9 +1776,12 @@ class AgentDirsUpdate(BaseModel):
 @app.get("/settings/memory")
 async def get_memory_settings_endpoint() -> Dict:
     """Return whether the memory subsystem is enabled (for UI feature discovery)."""
-    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+    from cli_agent_orchestrator.services.settings_service import (
+        is_learning_enabled,
+        is_memory_enabled,
+    )
 
-    return {"enabled": is_memory_enabled()}
+    return {"enabled": is_memory_enabled(), "learning_enabled": is_learning_enabled()}
 
 
 @app.post("/settings/agent-dirs")
@@ -3794,6 +3797,90 @@ async def clear_memories_endpoint(
         except Exception as e:
             logger.warning("Failed to delete memory %r during clear: %s", mem.key, e)
     return {"success": True, "deleted_count": deleted_count}
+
+
+# =============================================================================
+# Workflow outcome endpoints (self-learning Phase 1)
+# =============================================================================
+
+
+class OutcomeCreateBody(BaseModel):
+    session_name: str
+    task_label: str
+    success: bool
+    workflow_name: Optional[str] = None
+    agent_profile: Optional[str] = None
+    source_terminal_id: Optional[str] = None
+    score: Optional[int] = None
+    friction_notes: str = ""
+
+
+def _require_learning_enabled() -> None:
+    """Raise 404 when workflow self-learning is disabled.
+
+    list_outcomes() silently returns [] when disabled, so the gate must be
+    explicit rather than inferred from empty results (same reasoning as
+    ``_require_memory_enabled``).
+    """
+    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
+
+    if not is_learning_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
+        )
+
+
+@app.post("/outcomes")
+async def create_outcome_endpoint(
+    body: OutcomeCreateBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Record a workflow outcome (self-learning signal)."""
+    from cli_agent_orchestrator.services.outcome_service import (
+        LearningDisabledError,
+        OutcomeService,
+    )
+
+    _require_learning_enabled()
+    try:
+        outcome = OutcomeService().record_outcome(
+            session_name=body.session_name,
+            task_label=body.task_label,
+            success=body.success,
+            workflow_name=body.workflow_name,
+            agent_profile=body.agent_profile,
+            source_terminal_id=body.source_terminal_id,
+            score=body.score,
+            friction_notes=body.friction_notes,
+        )
+    except LearningDisabledError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"success": True, "outcome": outcome}
+
+
+@app.get("/outcomes")
+async def list_outcomes_endpoint(
+    session_name: Optional[str] = None,
+    agent_profile: Optional[str] = None,
+    workflow_name: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """List recorded workflow outcomes newest-first (retrospector read path)."""
+    from cli_agent_orchestrator.services.outcome_service import OutcomeService
+
+    _require_learning_enabled()
+    outcomes = OutcomeService().list_outcomes(
+        session_name=session_name,
+        agent_profile=agent_profile,
+        workflow_name=workflow_name,
+        limit=limit,
+    )
+    return {"outcomes": outcomes, "count": len(outcomes)}
 
 
 # Static file serving for built web UI.
