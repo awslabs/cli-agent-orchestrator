@@ -38,7 +38,12 @@ from cli_agent_orchestrator.providers.codex import (
     _validate_config_key,
     render_trusted_project_override,
 )
-from cli_agent_orchestrator.services import actor_broker, companion_receipts, provider_contracts
+from cli_agent_orchestrator.services import (
+    actor_broker,
+    companion_receipts,
+    heartbeat_store,
+    provider_contracts,
+)
 from cli_agent_orchestrator.services.codex_trust import (
     SUPPORTED_CODEX_VERSION,
     _contains_session_flags,
@@ -2217,7 +2222,9 @@ class _ProviderSession:
                 self._scan_companion_events()
                 self._emit_beat(provider_turn_id, f"{kind}:{provider_turn_id}")
         except generation_fence.FencedError as exc:
-            raise BridgeError(str(exc)) from exc
+            raise BridgeError(f"w13-fenced-before-provider-io: {exc}") from exc
+        except heartbeat_store.FencingRefused as exc:
+            raise BridgeError(f"successor-fenced-before-provider-io: {exc}") from exc
         receipt_id = provider_turn_id
         return {
             **self._base_receipt(),
@@ -2288,7 +2295,9 @@ class _ProviderSession:
                 self._scan_companion_events()
                 self._emit_beat(provider_turn_id, f"{kind}:{provider_turn_id}")
         except generation_fence.FencedError as exc:
-            raise BridgeError(str(exc)) from exc
+            raise BridgeError(f"w13-fenced-before-provider-io: {exc}") from exc
+        except heartbeat_store.FencingRefused as exc:
+            raise BridgeError(f"successor-fenced-before-provider-io: {exc}") from exc
         submitted_at = _now()
         ack: dict[str, Any]
         if command.get("sender_generation") and command.get("message_created_at"):
@@ -2862,14 +2871,48 @@ class _ProviderSession:
         if self.rpc is not None:
             self.rpc.close()
 
+    @contextlib.contextmanager
     def _admission_critical_section(self):
-        """The fence lock held across the final recheck and provider I/O."""
+        """Hold successor and W13 fences across final identity checks and I/O."""
         from cli_agent_orchestrator.constants import COMPANION_DIR
-        from cli_agent_orchestrator.services import generation_fence
-
-        return generation_fence.admission_critical_section(
-            COMPANION_DIR, self.request["terminal_id"], self.request["generation"]
+        from cli_agent_orchestrator.services import (
+            generation_fence,
+            heartbeat_store,
         )
+        from cli_agent_orchestrator.services.destructive_endpoint import (
+            binding_record_path,
+        )
+
+        terminal_id = self.request["terminal_id"]
+        generation = self.request["generation"]
+        with heartbeat_store.successor_critical_section(COMPANION_DIR, terminal_id):
+            if self.request.get("obligation_generation"):
+                binding_path = binding_record_path(COMPANION_DIR, terminal_id, generation)
+                try:
+                    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise BridgeError(
+                        "provider admission cannot revalidate generation binding"
+                    ) from exc
+                expected_binding = {
+                    "terminal_id": terminal_id,
+                    "generation": generation,
+                    "attempt_id": self.request.get("attempt_id"),
+                    "native_session_id": self.provider_session_id,
+                }
+                if {key: binding.get(key) for key in expected_binding} != expected_binding:
+                    raise BridgeError("provider admission generation/session binding changed")
+                heartbeat_store.assert_current_fencing_binding(
+                    COMPANION_DIR,
+                    terminal_id=terminal_id,
+                    generation=generation,
+                    attempt_id=str(self.request.get("attempt_id") or ""),
+                    fencing_token_id=str(binding.get("fencing_token_id") or ""),
+                )
+            with generation_fence.admission_critical_section(
+                COMPANION_DIR, terminal_id, generation
+            ):
+                yield
 
     def _assert_fence_open(self) -> None:
         """Refuse provider-bound input for a sealed (W13-fenced) generation.

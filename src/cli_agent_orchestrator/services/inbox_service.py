@@ -14,6 +14,7 @@ from typing import Any, Optional
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
+    get_pending_message,
     is_message_pending,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
@@ -572,6 +573,7 @@ class InboxService:
         terminal_id: str,
         num_messages: int = 1,
         registry: PluginRegistry | None = None,
+        required_message_id: int | None = None,
     ) -> None:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
@@ -583,8 +585,12 @@ class InboxService:
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
         """
-        limit = num_messages if num_messages > 0 else 100
-        messages = get_pending_messages(terminal_id, limit=limit)
+        if required_message_id is not None:
+            exact = get_pending_message(terminal_id, required_message_id)
+            messages = [exact] if exact is not None else []
+        else:
+            limit = num_messages if num_messages > 0 else 100
+            messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:
             return
 
@@ -634,6 +640,20 @@ class InboxService:
                         message.is_identity_bound is True
                         and not callback_recovery.current_delivery_binding_matches(message)
                     ):
+                        receipt = None
+                        try:
+                            receipt = callback_recovery.turn_receipt(message.callback_recovery_key)
+                        except callback_recovery.CallbackRecoveryError:
+                            callback_recovery.mark_delivery_ambiguous(
+                                message.callback_recovery_key,
+                                reason_code=(
+                                    "stale-binding-reconciliation-failed-"
+                                    "manual-resolution-required"
+                                ),
+                            )
+                        if receipt is not None:
+                            update_message_status(message.id, MessageStatus.DELIVERED)
+                            continue
                         logger.warning(
                             "Preserving identity-bound inbox message %s for %s: "
                             "the persisted managed generation/session/mode no "
@@ -641,13 +661,12 @@ class InboxService:
                             message.id,
                             terminal_id,
                         )
-                        if message.callback_recovery_key is not None:
-                            callback_recovery.mark_delivery_refused(
-                                message.callback_recovery_key,
-                                reason_code="source-generation-replaced",
-                            )
-                        else:
-                            remaining.append(message)
+                        callback_recovery.mark_delivery_ambiguous(
+                            message.callback_recovery_key,
+                            reason_code=(
+                                "source-generation-replaced-" "manual-resolution-required"
+                            ),
+                        )
                         continue
                     if message.is_identity_bound is True:
                         bridged = managed_launch.deliver_inbox_via_bridge(

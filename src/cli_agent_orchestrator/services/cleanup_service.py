@@ -180,29 +180,45 @@ def cleanup_old_data():
                 db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
             )
             deleted_terminals = 0
+            from cli_agent_orchestrator.services import callback_recovery
+
             for terminal in old_terminals:
-                if _terminal_has_open_callback_recovery(db, terminal.id, terminal.generation):
-                    logger.warning(
-                        "cleanup skipped terminal %s; callback recovery is open",
-                        terminal.id,
-                    )
-                    continue
-                if _is_v2_owned_row(terminal, v2_ids, v2_generations):
-                    logger.warning(
-                        f"cleanup skipped managed/v2-owned terminal row {terminal.id}; "
-                        "its lifecycle is generation-claimed"
-                    )
-                    continue
-                fifo_manager.stop_reader(terminal.id)
-                status_monitor.clear_terminal(terminal.id)
-                db.delete(terminal)
-                deleted_terminals += 1
+                with callback_recovery.generation_lifecycle_claim(
+                    terminal.id,
+                    terminal.generation or "legacy-unversioned",
+                ):
+                    if callback_recovery.terminal_has_open_recovery(
+                        terminal.id, terminal.generation
+                    ):
+                        logger.warning(
+                            "cleanup skipped terminal %s; callback recovery is open",
+                            terminal.id,
+                        )
+                        continue
+                    if _is_v2_owned_row(terminal, v2_ids, v2_generations):
+                        logger.warning(
+                            f"cleanup skipped managed/v2-owned terminal row {terminal.id}; "
+                            "its lifecycle is generation-claimed"
+                        )
+                        continue
+                    fifo_manager.stop_reader(terminal.id)
+                    status_monitor.clear_terminal(terminal.id)
+                    db.delete(terminal)
+                    deleted_terminals += 1
             db.commit()
             logger.info(f"Deleted {deleted_terminals} old terminals from database")
 
         # Clean up old inbox messages
         with SessionLocal() as db:
-            held_ids = _held_callback_recovery_inbox_ids(db)
+            try:
+                held_ids = callback_recovery.held_inbox_ids()
+            except Exception:
+                logger.warning(
+                    "callback recovery lifecycle unreadable during retention; "
+                    "preserving all inbox rows",
+                    exc_info=True,
+                )
+                held_ids = {row[0] for row in db.query(InboxModel.id).all()}
             query = db.query(InboxModel).filter(InboxModel.created_at < cutoff_date)
             if held_ids:
                 query = query.filter(InboxModel.id.not_in(held_ids))

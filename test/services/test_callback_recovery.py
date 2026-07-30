@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from datetime import timezone
 
 import pytest
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.inbox import (
+    CallbackRecoveryCallbackRequest,
     CallbackRecoveryCompletionRequest,
     CallbackRecoveryRequest,
-    MessageStatus,
+    CallbackRecoveryResolutionRequest,
 )
 from cli_agent_orchestrator.services import (
     callback_recovery,
+    callback_text_contract,
     companion_receipts,
     control_input_service,
     model_turn_receipt_contract,
@@ -40,6 +43,51 @@ REPORT_PATH = "/tmp/worktree/report.md"
 CALLBACK_LINE = (
     f"[conduct-report] status=done task=task-1 report={REPORT_PATH} " f"summary={SUMMARY}"
 )
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected_length", "expected_digest"),
+    [
+        (
+            {
+                "status": "done",
+                "task_id": "task-1",
+                "report_path": "/tmp/run/report.md",
+                "summary": "\n  finished safely  \nignored second line",
+            },
+            90,
+            "f05c9f1534e2c5fe087cd8b41a4579b69e684722e78e1a33c1e26b7c4f8af532",
+        ),
+        (
+            {
+                "status": "failed",
+                "task_id": "task-2",
+                "report_path": "/tmp/run/report.md",
+                "summary": "api_key=plainvalue bearer abcdefghijklmnop",
+            },
+            120,
+            "7dd44e09a80904df89778040361610a31326111f8eaa7b9aa8e4636b225584c7",
+        ),
+        (
+            {
+                "status": "blocked",
+                "task_id": "task-3",
+                "report_path": "/tmp/run/report.md",
+                "summary": "x" * 1000,
+            },
+            900,
+            "bdd5c964257634ace536573e0590f1e90fea4fa9469b0c366d7a5acde9adb379",
+        ),
+    ],
+)
+def test_cross_repository_canonical_text_and_digest_vectors(
+    fields,
+    expected_length,
+    expected_digest,
+):
+    message = callback_text_contract.canonical_callback_text(**fields)
+    assert len(message) == expected_length
+    assert hashlib.sha256(message.encode()).hexdigest() == expected_digest
 
 
 @pytest.fixture
@@ -73,10 +121,24 @@ def recovery_context(isolated_memory_db, tmp_path, monkeypatch):
                     caller_id=SUPERVISOR,
                     working_directory="/tmp/worktree",
                     state="admitted",
-                    request_json=json.dumps({"execution_mode": "acp"}),
+                    request_json=json.dumps(
+                        {
+                            "execution_mode": "acp",
+                            "project": "project-1",
+                            "task_id": "task-1",
+                        }
+                    ),
                     observations_json="[]",
                     readiness_json=json.dumps({"provider_session_id": PROVIDER_SESSION}),
-                    admission_json="{}",
+                    admission_json=json.dumps(
+                        {
+                            "context": {
+                                "project": "project-1",
+                                "task_id": "task-1",
+                                "run_id": "task-1",
+                            }
+                        }
+                    ),
                     created_at=now,
                     updated_at=now,
                 ),
@@ -157,6 +219,24 @@ def _record_turn(admission):
     return receipt
 
 
+def _publish_callback(admission):
+    prompt = admission.message.message
+    token_assignment = next(
+        item for item in prompt.split() if item.startswith("CAO_CALLBACK_RECOVERY_TOKEN=")
+    )
+    token = token_assignment.split("=", 1)[1]
+    return callback_recovery.create_callback(
+        admission.operation["operation_key"],
+        CallbackRecoveryCallbackRequest(
+            callback_token=token,
+            sender_id=SOURCE,
+            receiver_id=SUPERVISOR,
+            callback_occurrence_id="task-1-r1",
+            message=CALLBACK_LINE,
+        ),
+    )
+
+
 def test_exact_retry_is_one_row_and_different_operation_cannot_repeat(recovery_context):
     first = callback_recovery.admit(recovery_context)
     replay = callback_recovery.admit(recovery_context)
@@ -167,6 +247,7 @@ def test_exact_retry_is_one_row_and_different_operation_cannot_repeat(recovery_c
     different = recovery_context.model_copy(
         update={
             "operation_id": "operation-2",
+            "callback_occurrence_id": "task-1-r2",
             "callback_summary": "changed callback bytes",
             "callback_message_sha256": hashlib.sha256(changed_line.encode()).hexdigest(),
         }
@@ -176,6 +257,32 @@ def test_exact_retry_is_one_row_and_different_operation_cannot_repeat(recovery_c
     with database.SessionLocal() as db:
         assert db.query(database.CallbackRecoveryModel).count() == 1
         assert db.query(database.InboxModel).count() == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project", "other-project"),
+        ("task_id", "other-task"),
+        ("run_id", "other-run"),
+    ],
+)
+def test_workflow_claims_must_match_authoritative_reservation(
+    recovery_context,
+    field,
+    value,
+):
+    body = recovery_context.model_copy(update={field: value})
+    if field == "task_id":
+        callback_line = CALLBACK_LINE.replace("task=task-1", f"task={value}")
+        body = body.model_copy(
+            update={"callback_message_sha256": hashlib.sha256(callback_line.encode()).hexdigest()}
+        )
+    with pytest.raises(callback_recovery.CallbackRecoveryRefused, match="project/task/run"):
+        callback_recovery.admit(body)
+    stored = callback_recovery.get(callback_recovery._operation_key(body))
+    assert stored["state"] == callback_recovery.STATE_REFUSED
+    assert stored["proven_zero_bytes"] is True
 
 
 @pytest.mark.parametrize(
@@ -220,18 +327,9 @@ def test_turn_receipt_is_strict_revalidated_and_completion_binds_callback_row(
     assert callback_recovery.turn_receipt(admission.operation["operation_key"]) is None
     expected_receipt = _record_turn(admission)
     assert callback_recovery.turn_receipt(admission.operation["operation_key"]) == expected_receipt
-    with database.SessionLocal() as db:
-        callback = database.InboxModel(
-            sender_id=SOURCE,
-            receiver_id=SUPERVISOR,
-            message=CALLBACK_LINE,
-            status=MessageStatus.DELIVERED.value,
-        )
-        db.add(callback)
-        db.commit()
-        db.refresh(callback)
-        callback_id = callback.id
-        callback_created = callback.created_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    callback = _publish_callback(admission)
+    callback_id = callback["message_id"]
+    callback_created = callback["created_at"]
     completed = callback_recovery.complete(
         admission.operation["operation_key"],
         CallbackRecoveryCompletionRequest(
@@ -252,6 +350,100 @@ def test_turn_receipt_is_strict_revalidated_and_completion_binds_callback_row(
             finalization_identity_sha256=recovery_context.finalization_identity_sha256,
         ),
     )
+    assert replay["state"] == callback_recovery.STATE_COMPLETED
+
+
+def test_generic_inbox_row_cannot_complete_recovery(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+    _record_turn(admission)
+    callback_recovery.turn_receipt(admission.operation["operation_key"])
+    with database.SessionLocal() as db:
+        generic = database.InboxModel(
+            sender_id=SOURCE,
+            receiver_id=SUPERVISOR,
+            message=CALLBACK_LINE,
+            status="pending",
+        )
+        db.add(generic)
+        db.commit()
+        db.refresh(generic)
+        created = generic.created_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        callback_id = generic.id
+    with pytest.raises(callback_recovery.CallbackRecoveryConflict, match="contradicts"):
+        callback_recovery.complete(
+            admission.operation["operation_key"],
+            CallbackRecoveryCompletionRequest(
+                callback_message_id=callback_id,
+                callback_message_sha256=recovery_context.callback_message_sha256,
+                callback_created_at=created,
+                finalization_identity_sha256=(recovery_context.finalization_identity_sha256),
+            ),
+        )
+
+
+def test_callback_token_and_original_supervisor_generation_are_mandatory(
+    recovery_context,
+):
+    admission = callback_recovery.admit(recovery_context)
+    _record_turn(admission)
+    key = admission.operation["operation_key"]
+    with pytest.raises(callback_recovery.CallbackRecoveryConflict, match="token"):
+        callback_recovery.create_callback(
+            key,
+            CallbackRecoveryCallbackRequest(
+                callback_token="x" * 32,
+                sender_id=SOURCE,
+                receiver_id=SUPERVISOR,
+                callback_occurrence_id="task-1-r1",
+                message=CALLBACK_LINE,
+            ),
+        )
+    with database.SessionLocal() as db:
+        supervisor = db.get(database.TerminalModel, SUPERVISOR)
+        supervisor.generation = "replacement-supervisor-generation"
+        db.commit()
+    prompt = admission.message.message
+    token = next(
+        item.split("=", 1)[1]
+        for item in prompt.split()
+        if item.startswith("CAO_CALLBACK_RECOVERY_TOKEN=")
+    )
+    with pytest.raises(
+        callback_recovery.CallbackRecoveryRefused,
+        match="original supervisor generation",
+    ):
+        callback_recovery.create_callback(
+            key,
+            CallbackRecoveryCallbackRequest(
+                callback_token=token,
+                sender_id=SOURCE,
+                receiver_id=SUPERVISOR,
+                callback_occurrence_id="task-1-r1",
+                message=CALLBACK_LINE,
+            ),
+        )
+    assert callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION)
+
+
+def test_completed_replay_survives_prompt_inbox_retention(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+    _record_turn(admission)
+    callback = _publish_callback(admission)
+    callback_recovery.complete(
+        admission.operation["operation_key"],
+        CallbackRecoveryCompletionRequest(
+            callback_message_id=callback["message_id"],
+            callback_message_sha256=recovery_context.callback_message_sha256,
+            callback_created_at=callback["created_at"],
+            finalization_identity_sha256=recovery_context.finalization_identity_sha256,
+        ),
+    )
+    with database.SessionLocal() as db:
+        db.query(database.InboxModel).filter(
+            database.InboxModel.id == admission.message.id
+        ).delete()
+        db.commit()
+    replay = callback_recovery.get(admission.operation["operation_key"])
     assert replay["state"] == callback_recovery.STATE_COMPLETED
 
 
@@ -281,6 +473,90 @@ def test_ambiguous_delivery_holds_terminal_and_cannot_be_retried(recovery_contex
         callback_recovery.admit(recovery_context)
 
 
+def test_ambiguous_resolution_is_evidence_bound_and_releases_lifecycle(
+    recovery_context,
+):
+    admission = callback_recovery.admit(recovery_context)
+    key = admission.operation["operation_key"]
+    callback_recovery.mark_delivery_ambiguous(key, reason_code="submit-ambiguous")
+    resolution = CallbackRecoveryResolutionRequest(
+        outcome="proven-zero-provider-effect",
+        evidence_sha256="4" * 64,
+        detail="operator inspected the exact provider session journal",
+    )
+    resolved = callback_recovery.resolve_ambiguity(key, resolution)
+    assert resolved["state"] == callback_recovery.STATE_RESOLVED
+    assert callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION) is False
+    assert callback_recovery.resolve_ambiguity(key, resolution)["state"] == (
+        callback_recovery.STATE_RESOLVED
+    )
+    with pytest.raises(callback_recovery.CallbackRecoveryConflict, match="evidence"):
+        callback_recovery.resolve_ambiguity(
+            key,
+            resolution.model_copy(update={"evidence_sha256": "5" * 64}),
+        )
+
+
+def test_receipt_and_refusal_transitions_are_monotonic(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+    key = admission.operation["operation_key"]
+    callback_recovery.mark_delivery_ambiguous(key, reason_code="response-loss")
+    _record_turn(admission)
+    assert callback_recovery.turn_receipt(key) is not None
+    assert callback_recovery.get(key)["state"] == callback_recovery.STATE_SUBMITTED
+    with pytest.raises(callback_recovery.CallbackRecoveryConflict, match="cannot refuse"):
+        callback_recovery.mark_delivery_refused(
+            key,
+            reason_code="w13-fenced-before-provider-io",
+            proven_before_provider_io=True,
+        )
+    with pytest.raises(callback_recovery.CallbackRecoveryConflict, match="ambiguous"):
+        callback_recovery.mark_delivery_ambiguous(key, reason_code="late-race")
+    assert callback_recovery.get(key)["state"] == callback_recovery.STATE_SUBMITTED
+
+
+def test_kimi_acp_reservation_is_eligible(recovery_context):
+    with database.SessionLocal() as db:
+        db.get(database.TerminalModel, SOURCE).provider = "kimi_cli"
+        db.get(database.ManagedLaunchReservationModel, "reservation-1").provider = "kimi_cli"
+        db.commit()
+    body = recovery_context.model_copy(update={"expected_provider": "kimi_cli"})
+    admission = callback_recovery.admit(body)
+    assert admission.operation["expected_provider"] == "kimi_cli"
+
+
+def test_recovery_admission_serializes_with_generation_teardown_claim(
+    recovery_context,
+):
+    started = threading.Event()
+    finished = threading.Event()
+    outcome = []
+
+    def admit():
+        started.set()
+        outcome.append(callback_recovery.admit(recovery_context))
+        finished.set()
+
+    with callback_recovery.generation_lifecycle_claim(SOURCE, GENERATION):
+        worker = threading.Thread(target=admit)
+        worker.start()
+        assert started.wait(timeout=2)
+        assert finished.wait(timeout=0.1) is False
+    worker.join(timeout=2)
+    assert finished.is_set()
+    assert outcome[0].operation["state"] == callback_recovery.STATE_PENDING
+
+
+def test_generation_lifecycle_claim_is_reentrant_for_session_teardown(
+    recovery_context,
+):
+    nested = False
+    with callback_recovery.generation_lifecycle_claim(SOURCE, GENERATION):
+        with callback_recovery.generation_lifecycle_claim(SOURCE, GENERATION):
+            nested = True
+    assert nested
+
+
 def test_v2_reservation_and_terminal_are_authoritative(recovery_context):
     now = "2026-07-30T12:00:00Z"
     with database.SessionLocal() as db:
@@ -302,8 +578,14 @@ def test_v2_reservation_and_terminal_are_authoritative(recovery_context):
                 run_id="task-1",
                 launch_nonce_digest="3" * 64,
                 state="admitted",
-                request_json="{}",
-                binding_json=json.dumps({"native_session_id": PROVIDER_SESSION}),
+                request_json=json.dumps({"project": "project-1"}),
+                binding_json=json.dumps(
+                    {
+                        "native_session_id": PROVIDER_SESSION,
+                        "attempt_id": "attempt-1",
+                        "fencing_token_id": "fence-1",
+                    }
+                ),
                 admission_json="{}",
                 execution_mode="acp",
                 execution_mode_source="request",

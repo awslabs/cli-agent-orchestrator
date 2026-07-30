@@ -1326,16 +1326,32 @@ def deliver_inbox_via_bridge(
         )
         return True
     except Exception as exc:  # noqa: BLE001 - preserve or terminalize by exact outcome
-        if recovery_operation_key and (
-            "ambiguous" in str(exc).lower()
-            or "crossed its durable boundary" in str(exc).lower()
-            or "outcome uncertain" in str(exc).lower()
-        ):
+        detail = str(exc).lower()
+        if recovery_operation_key and "w13-fenced-before-provider-io:" in detail:
             from cli_agent_orchestrator.services import callback_recovery
 
+            callback_recovery.mark_delivery_refused(
+                recovery_operation_key,
+                reason_code="w13-fenced-before-provider-io",
+                proven_before_provider_io=True,
+            )
+        elif recovery_operation_key and "successor-fenced-before-provider-io:" in detail:
+            from cli_agent_orchestrator.services import callback_recovery
+
+            callback_recovery.mark_delivery_refused(
+                recovery_operation_key,
+                reason_code="source-generation-replaced",
+                proven_before_provider_io=True,
+            )
+        elif recovery_operation_key and "bridge was unavailable:" not in detail:
+            from cli_agent_orchestrator.services import callback_recovery
+
+            # Once a request may have crossed the socket write, lack of a
+            # response is effect-unknown until old-generation receipt/journal
+            # reconciliation. It is never downgraded to refusal on replacement.
             callback_recovery.mark_delivery_ambiguous(
                 recovery_operation_key,
-                reason_code="provider-submission-ambiguous-manual-resolution-required",
+                reason_code=("provider-submission-ambiguous-manual-resolution-required"),
             )
         logger.warning(
             "managed bridge inbox delivery unavailable for %s; using ordinary path",

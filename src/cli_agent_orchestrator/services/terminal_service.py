@@ -2904,6 +2904,34 @@ def delete_terminal(
     expected_session: str | None = None,
     via_destructive_endpoint: bool = False,
 ) -> bool:
+    """Delete under the same exact-generation claim recovery admission uses."""
+    from cli_agent_orchestrator.services import callback_recovery
+
+    if expected_generation is not None:
+        claim_generation = expected_generation
+    else:
+        metadata = get_terminal_metadata(terminal_id)
+        if metadata is None:
+            metadata = get_terminal_metadata_v2(terminal_id)
+        claim_generation = (metadata or {}).get("generation") or "legacy-unversioned"
+    with callback_recovery.generation_lifecycle_claim(terminal_id, claim_generation):
+        return _delete_terminal_claimed(
+            terminal_id,
+            registry=registry,
+            expected_generation=expected_generation,
+            expected_session=expected_session,
+            via_destructive_endpoint=via_destructive_endpoint,
+        )
+
+
+def _delete_terminal_claimed(
+    terminal_id: str,
+    registry: PluginRegistry | None = None,
+    *,
+    expected_generation: str | None = None,
+    expected_session: str | None = None,
+    via_destructive_endpoint: bool = False,
+) -> bool:
     """Delete terminal and kill its tmux window.
 
     A bare legacy delete can never tear down a v2 terminal row or a
@@ -2912,9 +2940,9 @@ def delete_terminal(
     session, preserving the existing compare-and-delete protection against a
     reused terminal id.  The stronger destructive endpoint may also call this
     function after performing its additional heartbeat/fence checks."""
-    try:
-        from cli_agent_orchestrator.services import callback_recovery
+    from cli_agent_orchestrator.services import callback_recovery
 
+    try:
         if callback_recovery.terminal_has_open_recovery(terminal_id, expected_generation):
             raise TerminalGenerationMismatchError(
                 f"terminal {terminal_id} has an open callback-recovery "

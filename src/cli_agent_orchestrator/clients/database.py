@@ -124,6 +124,7 @@ class InboxModel(Base):
     expected_execution_mode = Column(Text, nullable=True)
     expected_provider = Column(Text, nullable=True)
     callback_recovery_key = Column(Text, nullable=True, unique=True)
+    callback_completion_key = Column(Text, nullable=True, unique=True)
 
 
 class CallbackRecoveryModel(Base):
@@ -147,6 +148,7 @@ class CallbackRecoveryModel(Base):
     expected_execution_mode = Column(Text, nullable=False)
     supervisor_id = Column(Text, nullable=False)
     supervisor_session = Column(Text, nullable=False)
+    supervisor_generation = Column(Text, nullable=True)
     refusal_control_id = Column(Text, nullable=False)
     refusal_occurrence_sha256 = Column(Text, nullable=False)
     refusal_request_sha256 = Column(Text, nullable=False)
@@ -161,10 +163,15 @@ class CallbackRecoveryModel(Base):
     manifest_sha256 = Column(Text, nullable=False)
     finalization_identity_sha256 = Column(Text, nullable=False)
     request_sha256 = Column(Text, nullable=False)
+    callback_token_sha256 = Column(Text, nullable=True)
     inbox_message_id = Column(Integer, nullable=True, unique=True)
+    recovery_prompt_sha256 = Column(Text, nullable=True)
+    message_created_at = Column(Text, nullable=True)
+    sender_generation = Column(Text, nullable=True)
     provider_turn_receipt_json = Column(Text, nullable=True)
     callback_message_id = Column(Integer, nullable=True, unique=True)
     completion_json = Column(Text, nullable=True)
+    resolution_json = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
     updated_at = Column(Text, nullable=False)
 
@@ -1361,6 +1368,7 @@ def _migrate_callback_recovery_inbox_schema() -> None:
         ("expected_execution_mode", "TEXT"),
         ("expected_provider", "TEXT"),
         ("callback_recovery_key", "TEXT"),
+        ("callback_completion_key", "TEXT"),
     )
     try:
         with sqlite3.connect(str(DATABASE_FILE)) as conn:
@@ -1371,6 +1379,10 @@ def _migrate_callback_recovery_inbox_schema() -> None:
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_inbox_callback_recovery_key "
                 "ON inbox(callback_recovery_key) WHERE callback_recovery_key IS NOT NULL"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_inbox_callback_completion_key "
+                "ON inbox(callback_completion_key) WHERE callback_completion_key IS NOT NULL"
             )
     except Exception as exc:  # noqa: BLE001 - callback recovery fails closed
         logger.warning("callback-recovery inbox migration failed: %s", exc)
@@ -1384,6 +1396,27 @@ def _migrate_callback_recovery_schema() -> None:
     # closed instead of silently falling back to ordinary inbox delivery.
     try:
         CallbackRecoveryModel.__table__.create(bind=engine, checkfirst=True)
+        import sqlite3
+
+        from cli_agent_orchestrator.constants import DATABASE_FILE
+
+        columns = (
+            ("supervisor_generation", "TEXT"),
+            ("callback_token_sha256", "TEXT"),
+            ("recovery_prompt_sha256", "TEXT"),
+            ("message_created_at", "TEXT"),
+            ("sender_generation", "TEXT"),
+            ("resolution_json", "TEXT"),
+        )
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            present = {
+                row[1] for row in conn.execute("PRAGMA table_info(callback_recovery_operations)")
+            }
+            for name, ddl in columns:
+                if name not in present:
+                    conn.execute(
+                        f"ALTER TABLE callback_recovery_operations ADD COLUMN {name} {ddl}"
+                    )
     except Exception as exc:  # noqa: BLE001 - operation reads fail closed
         logger.warning("callback recovery migration failed: %s", exc)
 
@@ -2516,12 +2549,28 @@ def _inbox_message_from_row(row: Any) -> InboxMessage:
         expected_execution_mode=getattr(row, "expected_execution_mode", None),
         expected_provider=getattr(row, "expected_provider", None),
         callback_recovery_key=getattr(row, "callback_recovery_key", None),
+        callback_completion_key=getattr(row, "callback_completion_key", None),
     )
 
 
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
     """Get pending messages ordered by created_at ASC (oldest first)."""
     return get_inbox_messages(receiver_id, limit=limit, status=MessageStatus.PENDING)
+
+
+def get_pending_message(receiver_id: str, message_id: int) -> Optional[InboxMessage]:
+    """Get one exact pending row without oldest-first queue starvation."""
+    with SessionLocal() as db:
+        row = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id == message_id,
+                InboxModel.receiver_id == receiver_id,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .one_or_none()
+        )
+        return _inbox_message_from_row(row) if row is not None else None
 
 
 def is_message_pending(message_id: int) -> bool:

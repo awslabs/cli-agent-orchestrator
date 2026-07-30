@@ -334,11 +334,16 @@ class TestDeliverPending:
             "current_delivery_binding_matches",
             lambda _message: next(checks),
         )
-        refused = []
+        ambiguous = []
         monkeypatch.setattr(
             inbox_service.callback_recovery,
-            "mark_delivery_refused",
-            lambda key, **kwargs: refused.append((key, kwargs["reason_code"])),
+            "turn_receipt",
+            lambda _key: None,
+        )
+        monkeypatch.setattr(
+            inbox_service.callback_recovery,
+            "mark_delivery_ambiguous",
+            lambda key, **kwargs: ambiguous.append((key, kwargs["reason_code"])),
         )
         bridged = []
         monkeypatch.setattr(
@@ -355,7 +360,12 @@ class TestDeliverPending:
 
         InboxService().deliver_pending("worker", num_messages=0)
 
-        assert refused == [("recovery-stale", "source-generation-replaced")]
+        assert ambiguous == [
+            (
+                "recovery-stale",
+                "source-generation-replaced-manual-resolution-required",
+            )
+        ]
         assert [item[1]["recovery_operation_key"] for item in bridged] == ["recovery-current"]
         assert updates == [(2, MessageStatus.DELIVERED)]
 

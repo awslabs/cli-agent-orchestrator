@@ -53,6 +53,10 @@ class InboxMessage(BaseModel):
     callback_recovery_key: Optional[str] = Field(
         default=None, description="Dedicated refusal/callback recovery operation key"
     )
+    callback_completion_key: Optional[str] = Field(
+        default=None,
+        description="Server-authenticated callback producer correlation",
+    )
 
     @property
     def is_identity_bound(self) -> bool:
@@ -71,7 +75,7 @@ class CallbackRecoveryRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=300)
     source_terminal_id: str = Field(min_length=1)
     source_generation: str = Field(min_length=1)
-    expected_provider: Literal["codex"]
+    expected_provider: Literal["codex", "kimi_cli", "claude_code"]
     expected_provider_session_id: str = Field(min_length=1)
     expected_execution_mode: Literal["acp"]
     supervisor_id: str = Field(min_length=1)
@@ -102,3 +106,25 @@ class CallbackRecoveryCompletionRequest(BaseModel):
     callback_message_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     callback_created_at: str = Field(min_length=1)
     finalization_identity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CallbackRecoveryCallbackRequest(BaseModel):
+    """Worker-produced callback authenticated by the one-shot recovery secret."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    callback_token: str = Field(min_length=32, max_length=256)
+    sender_id: str = Field(min_length=1)
+    receiver_id: str = Field(min_length=1)
+    callback_occurrence_id: str = Field(min_length=1, max_length=400)
+    message: str = Field(min_length=1, max_length=900)
+
+
+class CallbackRecoveryResolutionRequest(BaseModel):
+    """Governed manual disposition for a provider-effect ambiguity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    outcome: Literal["proven-zero-provider-effect"]
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    detail: str = Field(min_length=1, max_length=500)

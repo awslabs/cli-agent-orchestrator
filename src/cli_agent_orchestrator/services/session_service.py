@@ -20,6 +20,7 @@ Session Lifecycle:
 """
 
 import logging
+from contextlib import ExitStack
 from typing import Dict, List
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -144,16 +145,53 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         session_alive = get_backend().session_exists(session_name)
 
         from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services import callback_recovery
 
         terminals = list_terminals_by_session(session_name)
 
         # Clean up each terminal (snapshot, kill window, FIFO reader,
         # status buffer, provider, DB) via the event-driven teardown path.
-        for terminal in terminals:
-            try:
-                terminal_service.delete_terminal(terminal["id"], registry=registry)
-            except Exception as e:
-                logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
+        terminal_errors = []
+        with ExitStack() as claims:
+            for terminal in sorted(terminals, key=lambda item: item["id"]):
+                claims.enter_context(
+                    callback_recovery.generation_lifecycle_claim(
+                        terminal["id"],
+                        terminal.get("generation") or "legacy-unversioned",
+                    )
+                )
+            for terminal in terminals:
+                if callback_recovery.terminal_has_open_recovery(
+                    terminal["id"], terminal.get("generation")
+                ):
+                    terminal_errors.append(
+                        {
+                            "terminal_id": terminal["id"],
+                            "detail": "open callback recovery",
+                        }
+                    )
+
+            if not terminal_errors:
+                for terminal in terminals:
+                    try:
+                        generation = terminal.get("generation")
+                        kwargs = {}
+                        if generation:
+                            kwargs = {
+                                "expected_generation": generation,
+                                "expected_session": terminal.get("tmux_session") or session_name,
+                            }
+                        terminal_service.delete_terminal(
+                            terminal["id"], registry=registry, **kwargs
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
+                        terminal_errors.append({"terminal_id": terminal["id"], "detail": str(e)})
+
+            if terminal_errors:
+                raise RuntimeError(
+                    "session deletion held because terminal cleanup failed: " f"{terminal_errors}"
+                )
 
         # Kill backend session only if it still exists
         if session_alive:

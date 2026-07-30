@@ -3,15 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import threading
 from datetime import datetime
 
 import pytest
 from starlette.requests import Request
 
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.api import main
-from cli_agent_orchestrator.models.inbox import CallbackRecoveryRequest, InboxMessage, MessageStatus
-from cli_agent_orchestrator.services import callback_recovery
+from cli_agent_orchestrator.models.inbox import (
+    CallbackRecoveryRequest,
+    InboxMessage,
+    MessageStatus,
+)
+from cli_agent_orchestrator.services import (
+    callback_recovery,
+    companion_receipts,
+    control_input_service,
+)
+from cli_agent_orchestrator.services.control_input_contract import (
+    REASON_MANAGED_ACP_PANE,
+)
+from cli_agent_orchestrator.services.control_input_journal import (
+    ControlInputBinding,
+    ControlInputJournal,
+)
 
 
 def _body() -> dict:
@@ -97,6 +115,141 @@ def test_rebind_conflict_never_claims_zero_bytes(client, monkeypatch):
     assert response.json()["proven_zero_bytes"] is False
 
 
+def test_real_http_handler_admits_authoritative_reservation(
+    client,
+    isolated_memory_db,
+    tmp_path,
+    monkeypatch,
+):
+    now = "2026-07-30T12:00:00Z"
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                database.TerminalModel(
+                    id="super01",
+                    tmux_session="cao-test",
+                    tmux_window="supervisor",
+                    provider="codex",
+                    generation="supervisor-generation",
+                ),
+                database.TerminalModel(
+                    id="abcdef12",
+                    tmux_session="cao-test",
+                    tmux_window="worker",
+                    provider="codex",
+                    caller_id="super01",
+                    generation="generation-1",
+                ),
+                database.ManagedLaunchReservationModel(
+                    reservation_id="reservation-1",
+                    terminal_id="abcdef12",
+                    generation="generation-1",
+                    session_name="cao-test",
+                    provider="codex",
+                    agent_profile="worker",
+                    caller_id="super01",
+                    working_directory="/tmp/worktree",
+                    state="admitted",
+                    request_json=json.dumps(
+                        {
+                            "execution_mode": "acp",
+                            "project": "project-1",
+                            "task_id": "task-1",
+                        }
+                    ),
+                    observations_json="[]",
+                    readiness_json=json.dumps({"provider_session_id": "provider-session-1"}),
+                    admission_json=json.dumps(
+                        {
+                            "context": {
+                                "project": "project-1",
+                                "task_id": "task-1",
+                                "run_id": "task-1",
+                            }
+                        }
+                    ),
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ]
+        )
+        db.commit()
+    journal = ControlInputJournal(tmp_path / "control.sqlite3")
+    journal.open_intent(
+        ControlInputBinding(
+            request_id="control-1",
+            terminal_id="abcdef12",
+            pane_id="%1",
+            window_id="@1",
+            pane_pid=4242,
+            generation="generation-1",
+            request_sha256="b" * 64,
+        )
+    )
+    journal.mark_refused("control-1", reason_code=REASON_MANAGED_ACP_PANE)
+    monkeypatch.setattr(control_input_service, "get_control_input_journal", lambda: journal)
+    monkeypatch.setattr(companion_receipts, "COMPANION_DIR", tmp_path / "companion")
+    body = _body()
+    body["source_terminal_id"] = "abcdef12"
+    occurrence = callback_recovery.refusal_occurrence("control-1")
+    body["refusal_occurrence_sha256"] = occurrence["refusal_occurrence_sha256"]
+    body["callback_message_sha256"] = hashlib.sha256(
+        (
+            "[conduct-report] status=done task=task-1 " "report=/tmp/report.md summary=complete"
+        ).encode()
+    ).hexdigest()
+
+    response = client.post("/terminals/abcdef12/callback-recoveries", json=body)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["outcome"] == callback_recovery.STATE_PENDING
+    assert payload["receiver_generation"] == "generation-1"
+    with database.SessionLocal() as db:
+        assert db.query(database.CallbackRecoveryModel).count() == 1
+        assert db.query(database.InboxModel).count() == 1
+
+
+def test_dedicated_callback_handler_delivers_exact_created_row(
+    client,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        callback_recovery,
+        "create_callback",
+        lambda *_args: {
+            "message_id": 777,
+            "sender_id": "abcdef12",
+            "receiver_id": "1234abcd",
+            "created_at": "2026-07-30T12:00:00.000000Z",
+            "callback_occurrence_id": "task-1-r1",
+            "replayed": False,
+        },
+    )
+    deliveries = []
+    monkeypatch.setattr(
+        main.inbox_service,
+        "deliver_pending",
+        lambda *args, **kwargs: deliveries.append((args, kwargs)),
+    )
+    response = client.post(
+        "/callback-recoveries/operation-key/callback",
+        json={
+            "callback_token": "x" * 32,
+            "sender_id": "abcdef12",
+            "receiver_id": "1234abcd",
+            "callback_occurrence_id": "task-1-r1",
+            "message": (
+                "[conduct-report] status=done task=task-1 " "report=/tmp/report.md summary=complete"
+            ),
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["message_id"] == 777
+    assert deliveries[0][0][:2] == ("1234abcd", 0)
+    assert deliveries[0][1]["required_message_id"] == 777
+
+
 @pytest.mark.asyncio
 async def test_slow_bridge_delivery_is_offloaded_from_event_loop(monkeypatch):
     entered = threading.Event()
@@ -119,8 +272,11 @@ async def test_slow_bridge_delivery_is_offloaded_from_event_loop(monkeypatch):
         )
     )
     assert await asyncio.to_thread(entered.wait, 2)
-    # The request is waiting on a worker thread; this event-loop turn must run.
-    await asyncio.sleep(0)
+    # The request is waiting on a worker thread; the actual health handler
+    # must remain responsive on the event loop.
+    monkeypatch.setattr(main, "get_backend", object)
+    health = await asyncio.wait_for(main.health_check(), timeout=1)
+    assert health["status"] == "ok"
     assert not task.done()
     release.set()
     result = await asyncio.wait_for(task, timeout=2)
