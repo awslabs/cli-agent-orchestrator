@@ -158,6 +158,7 @@ class CallbackRecoveryModel(Base):
     supervisor_id = Column(Text, nullable=False)
     supervisor_session = Column(Text, nullable=False)
     supervisor_generation = Column(Text, nullable=True)
+    supervisor_pane_id = Column(Text, nullable=True)
     refusal_control_id = Column(Text, nullable=False)
     refusal_occurrence_sha256 = Column(Text, nullable=False)
     refusal_request_sha256 = Column(Text, nullable=False)
@@ -1413,6 +1414,7 @@ def _migrate_callback_recovery_schema() -> None:
 
         columns = (
             ("supervisor_generation", "TEXT"),
+            ("supervisor_pane_id", "TEXT"),
             ("callback_token_sha256", "TEXT"),
             ("recovery_prompt_sha256", "TEXT"),
             ("message_created_at", "TEXT"),

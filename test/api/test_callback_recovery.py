@@ -46,6 +46,7 @@ def _body() -> dict:
         "supervisor_id": "super01",
         "supervisor_session": "cao-test",
         "supervisor_generation": "supervisor-generation",
+        "supervisor_pane_id": "%7",
         "refusal_control_id": "control-1",
         "refusal_occurrence_sha256": "a" * 64,
         "refusal_request_sha256": "b" * 64,
@@ -166,6 +167,7 @@ def test_real_http_handler_admits_authoritative_reservation(
                     tmux_window="supervisor",
                     provider="codex",
                     generation="supervisor-generation",
+                    pane_id="%7",
                 ),
                 database.TerminalModel(
                     id="abcdef12",

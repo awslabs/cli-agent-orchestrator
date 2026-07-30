@@ -4419,6 +4419,7 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
@@ -4443,7 +4444,15 @@ async def get_inbox_messages_endpoint(
                 )
 
         # Get messages using existing database function
-        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        # Dedicated recovery rows contain a bearer token and local report path
+        # in their provider prompt. They are managed protocol artifacts, not
+        # ordinary user-readable inbox messages, and are exposed only through
+        # the scoped callback-recovery surfaces.
+        messages = [
+            message
+            for message in get_inbox_messages(terminal_id, limit=100, status=status_filter)
+            if not message.is_identity_bound
+        ][:limit]
 
         # Convert to response format
         result = []

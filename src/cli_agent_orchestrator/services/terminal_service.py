@@ -2931,11 +2931,7 @@ def retire_closed_workspace_session(
         != (item.get("generation") or item.get("pane_id") or "legacy-unversioned")
     )
 
-    with contextlib.ExitStack() as claims:
-        for terminal_id, generation in sorted(claim_keys):
-            claims.enter_context(
-                callback_recovery.generation_lifecycle_claim(terminal_id, generation)
-            )
+    with callback_recovery.generation_lifecycle_claims(claim_keys):
 
         current_rows: list[dict[str, Any]] = []
         for item in observed:
@@ -2972,6 +2968,62 @@ def retire_closed_workspace_session(
         return retired
 
 
+def retire_observed_terminal(
+    terminal_id: str,
+    registry: PluginRegistry | None = None,
+    *,
+    expected_session: str | None = None,
+    expected_pane_id: str | None = None,
+    backend_already_closed: bool = True,
+) -> bool:
+    """Retire one lifecycle-observed terminal without bypassing recovery.
+
+    Herdr startup, reconcile, and lifecycle events all converge here. The
+    durable model generation is the teardown authority; pane identity is a
+    separate secondary claim used to detect compact-pane reuse.
+    """
+    from cli_agent_orchestrator.services import callback_recovery
+
+    observed = _get_terminal_metadata_any(terminal_id)
+    if observed is None:
+        return True
+    if expected_pane_id is not None and observed.get("pane_id") != expected_pane_id:
+        raise TerminalGenerationMismatchError(
+            f"terminal {terminal_id} pane identity changed before lifecycle retirement"
+        )
+    generation = observed.get("generation") or "legacy-unversioned"
+    pane_id = observed.get("pane_id")
+    claim_keys = {(terminal_id, generation)}
+    if pane_id and pane_id != generation:
+        claim_keys.add((terminal_id, pane_id))
+
+    with callback_recovery.generation_lifecycle_claims(claim_keys):
+        current = _get_terminal_metadata_any(terminal_id)
+        if current is None:
+            return True
+        if (
+            current.get("generation") != observed.get("generation")
+            or current.get("pane_id") != observed.get("pane_id")
+            or current.get("tmux_session") != observed.get("tmux_session")
+            or (expected_session is not None and current.get("tmux_session") != expected_session)
+            or (expected_pane_id is not None and current.get("pane_id") != expected_pane_id)
+        ):
+            raise TerminalGenerationMismatchError(
+                f"terminal {terminal_id} changed incarnation before lifecycle retirement"
+            )
+        if callback_recovery.terminal_has_open_recovery(terminal_id, observed.get("generation")):
+            raise TerminalGenerationMismatchError(
+                f"terminal {terminal_id} has an open callback-recovery operation"
+            )
+        return _delete_terminal_claimed(
+            terminal_id,
+            registry=registry,
+            expected_generation=observed.get("generation"),
+            expected_session=expected_session or observed.get("tmux_session"),
+            backend_already_closed=backend_already_closed,
+        )
+
+
 def delete_terminal(
     terminal_id: str,
     registry: PluginRegistry | None = None,
@@ -3000,17 +3052,10 @@ def delete_terminal(
         metadata = get_terminal_metadata_v2(terminal_id)
     claim_generation = (metadata or {}).get("generation") or "legacy-unversioned"
     pane_generation = (metadata or {}).get("pane_id")
-    with callback_recovery.generation_lifecycle_claim(terminal_id, claim_generation):
-        if pane_generation and pane_generation != claim_generation:
-            with callback_recovery.generation_lifecycle_claim(terminal_id, pane_generation):
-                return _delete_terminal_claimed(
-                    terminal_id,
-                    registry=registry,
-                    expected_generation=expected_generation,
-                    expected_session=expected_session,
-                    via_destructive_endpoint=via_destructive_endpoint,
-                    backend_already_closed=backend_already_closed,
-                )
+    claim_keys = {(terminal_id, claim_generation)}
+    if pane_generation and pane_generation != claim_generation:
+        claim_keys.add((terminal_id, pane_generation))
+    with callback_recovery.generation_lifecycle_claims(claim_keys):
         return _delete_terminal_claimed(
             terminal_id,
             registry=registry,

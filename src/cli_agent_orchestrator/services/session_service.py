@@ -20,7 +20,6 @@ Session Lifecycle:
 """
 
 import logging
-from contextlib import ExitStack
 from typing import Dict, List
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -152,14 +151,20 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         # Clean up each terminal (snapshot, kill window, FIFO reader,
         # status buffer, provider, DB) via the event-driven teardown path.
         terminal_errors = []
-        with ExitStack() as claims:
-            for terminal in sorted(terminals, key=lambda item: item["id"]):
-                claims.enter_context(
-                    callback_recovery.generation_lifecycle_claim(
-                        terminal["id"],
-                        terminal.get("generation") or "legacy-unversioned",
-                    )
-                )
+        claim_keys = {
+            (
+                terminal["id"],
+                terminal.get("generation") or "legacy-unversioned",
+            )
+            for terminal in terminals
+        }
+        claim_keys.update(
+            (terminal["id"], terminal["pane_id"])
+            for terminal in terminals
+            if terminal.get("pane_id")
+            and terminal["pane_id"] != (terminal.get("generation") or "legacy-unversioned")
+        )
+        with callback_recovery.generation_lifecycle_claims(claim_keys):
             for terminal in terminals:
                 if callback_recovery.terminal_has_open_recovery(
                     terminal["id"], terminal.get("generation")

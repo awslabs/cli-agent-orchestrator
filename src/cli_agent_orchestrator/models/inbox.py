@@ -81,6 +81,7 @@ class CallbackRecoveryRequest(BaseModel):
     supervisor_id: str = Field(min_length=1)
     supervisor_session: str = Field(min_length=1)
     supervisor_generation: str = Field(min_length=1)
+    supervisor_pane_id: str = Field(min_length=1)
     refusal_control_id: str = Field(min_length=1, max_length=160)
     refusal_occurrence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     refusal_request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

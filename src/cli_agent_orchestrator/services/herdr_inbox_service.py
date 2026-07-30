@@ -73,6 +73,7 @@ class HerdrInboxService:
         self._writer: Optional[asyncio.StreamWriter] = None
         self._backoff = _BACKOFF_BASE
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._lifecycle_tasks: Set[asyncio.Task] = set()
 
     @staticmethod
     def _default_socket_path(session_name: str = "cao") -> str:
@@ -150,6 +151,8 @@ class HerdrInboxService:
             await self._socket_loop()
         finally:
             kiro_task.cancel()
+            if self._lifecycle_tasks:
+                await asyncio.gather(*tuple(self._lifecycle_tasks), return_exceptions=True)
 
     async def _startup_db_cleanup(self) -> None:
         """Delete ghost DB terminals whose herdr tabs no longer exist.
@@ -159,10 +162,8 @@ class HerdrInboxService:
         (populated later by _reconcile).  Builds the workspace map directly
         from herdr workspace list.
         """
-        from cli_agent_orchestrator.clients.database import (
-            delete_terminal,
-            list_terminals_by_session,
-        )
+        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.services import terminal_service
 
         ws_result = subprocess.run(
             ["herdr", "--session", self._herdr_session, "workspace", "list"],
@@ -217,8 +218,10 @@ class HerdrInboxService:
                         f"({session_name}:{window}) — tab not in herdr"
                     )
                     try:
-                        delete_terminal(term["id"])
-                        deleted += 1
+                        if terminal_service.retire_observed_terminal(
+                            term["id"], expected_session=session_name
+                        ):
+                            deleted += 1
                     except Exception as e:
                         logger.warning(
                             f"Startup DB cleanup: failed to delete ghost terminal "
@@ -286,8 +289,8 @@ class HerdrInboxService:
         """
         from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.clients.database import (
-            delete_terminal,
             get_terminal_metadata,
+            list_terminals_by_session,
         )
 
         # Get live panes from herdr
@@ -345,10 +348,8 @@ class HerdrInboxService:
                     if ws_id and label:
                         live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
 
-                from cli_agent_orchestrator.clients.database import (
-                    delete_terminal,
-                    list_terminals_by_session,
-                )
+                from cli_agent_orchestrator.clients.database import list_terminals_by_session
+                from cli_agent_orchestrator.services import terminal_service
 
                 for ws_id, session_name in self._workspace_to_session.items():
                     live_labels = live_tabs_by_workspace.get(ws_id, set())
@@ -361,7 +362,9 @@ class HerdrInboxService:
                                 f"({session_name}:{window}) — tab not in herdr"
                             )
                             try:
-                                delete_terminal(term["id"])
+                                terminal_service.retire_observed_terminal(
+                                    term["id"], expected_session=session_name
+                                )
                             except Exception as e:
                                 logger.warning(
                                     f"Reconcile: failed to delete ghost terminal "
@@ -436,18 +439,27 @@ class HerdrInboxService:
                     remapped += 1
                     continue
 
-            # Tab label genuinely gone (or re-resolve failed): prune maps and
-            # delete the orphaned DB record.
+            # Tab label genuinely gone (or re-resolve failed): managed
+            # retirement must succeed before ownership maps are pruned.
+            try:
+                from cli_agent_orchestrator.services import terminal_service
+
+                retired = terminal_service.retire_observed_terminal(
+                    terminal_id,
+                    expected_session=term_session,
+                    expected_pane_id=pane_id,
+                )
+                if not retired:
+                    continue
+                deleted += 1
+            except Exception as e:
+                logger.warning(f"Reconcile: failed to delete terminal {terminal_id}: {e}")
+                continue
+
             self._pane_to_terminal.pop(pane_id, None)
             self._terminal_to_pane.pop(terminal_id, None)
             self._kiro_terminals.discard(terminal_id)
             self._working_since.pop(terminal_id, None)
-
-            try:
-                delete_terminal(terminal_id)
-                deleted += 1
-            except Exception as e:
-                logger.warning(f"Reconcile: failed to delete terminal {terminal_id}: {e}")
 
             if term_session:
                 affected_sessions.add(term_session)
@@ -457,11 +469,9 @@ class HerdrInboxService:
         # alive and its panes were merely renumbered — killing it would tear down
         # working agents.
         if affected_sessions:
-            remaining_by_session: Dict[str, int] = {s: 0 for s in affected_sessions}
-            for tid in self._terminal_to_pane:
-                meta = get_terminal_metadata(tid)
-                if meta and meta["tmux_session"] in remaining_by_session:
-                    remaining_by_session[meta["tmux_session"]] += 1
+            remaining_by_session: Dict[str, int] = {
+                session: len(list_terminals_by_session(session)) for session in affected_sessions
+            }
 
             for session_name, remaining in remaining_by_session.items():
                 if remaining == 0 and session_name not in live_workspace_labels:
@@ -557,7 +567,10 @@ class HerdrInboxService:
 
             # Handle lifecycle events
             if event_name in ("pane.closed", "workspace.closed"):
-                self._handle_lifecycle_event(event_name, event.get("data", {}))
+                if event_name == "workspace.closed":
+                    self._schedule_workspace_retirement(event.get("data", {}))
+                else:
+                    self._handle_lifecycle_event(event_name, event.get("data", {}))
                 continue
 
             data = event.get("data", {})
@@ -580,6 +593,28 @@ class HerdrInboxService:
                 if terminal_id in self._kiro_terminals:
                     if terminal_id not in self._working_since:
                         self._working_since[terminal_id] = time.time()
+
+    def _schedule_workspace_retirement(self, data: dict) -> None:
+        """Run blocking lifecycle locks/DB cleanup away from the socket loop."""
+        task = asyncio.create_task(
+            asyncio.to_thread(self._handle_lifecycle_event, "workspace.closed", dict(data)),
+            name=f"herdr-workspace-retirement-{data.get('workspace_id', 'unknown')}",
+        )
+        self._lifecycle_tasks.add(task)
+
+        def completed(done: asyncio.Task) -> None:
+            self._lifecycle_tasks.discard(done)
+            if done.cancelled():
+                logger.warning("workspace.closed managed retirement was cancelled")
+                return
+            error = done.exception()
+            if error is not None:
+                logger.error(
+                    "workspace.closed managed retirement failed off-loop",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(completed)
 
     def _label_still_live(self, window_name: str) -> bool:
         """Return True if a tab with this label is still live in herdr.
@@ -651,8 +686,8 @@ class HerdrInboxService:
         """Handle pane.closed and workspace.closed events."""
         from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.clients.database import (
-            delete_terminal,
             get_terminal_metadata,
+            list_terminals_by_session,
         )
 
         if event_type == "pane.closed":
@@ -690,26 +725,29 @@ class HerdrInboxService:
                 )
                 return
 
-            # Remove from maps
+            try:
+                from cli_agent_orchestrator.services import terminal_service
+
+                retired = terminal_service.retire_observed_terminal(
+                    terminal_id,
+                    expected_session=session_name,
+                    expected_pane_id=pane_id,
+                )
+                if not retired:
+                    return
+            except Exception as e:
+                logger.warning(f"pane.closed: failed to delete terminal {terminal_id}: {e}")
+                return
+
             self._pane_to_terminal.pop(pane_id, None)
             self._terminal_to_pane.pop(terminal_id, None)
             self._kiro_terminals.discard(terminal_id)
             self._working_since.pop(terminal_id, None)
 
-            # Delete DB record
-            try:
-                delete_terminal(terminal_id)
-            except Exception as e:
-                logger.warning(f"pane.closed: failed to delete terminal {terminal_id}: {e}")
-
             logger.info(f"pane.closed: cleaned up terminal {terminal_id} (pane={pane_id})")
 
             # If session has no more terminals in our map, kill workspace
-            remaining_in_session = [
-                t
-                for t in self._pane_to_terminal.values()
-                if (m := get_terminal_metadata(t)) and m.get("tmux_session") == session_name
-            ]
+            remaining_in_session = list_terminals_by_session(session_name) if session_name else []
             if session_name and not remaining_in_session:
                 try:
                     get_backend().kill_session(session_name)

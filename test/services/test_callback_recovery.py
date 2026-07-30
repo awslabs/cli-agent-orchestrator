@@ -16,6 +16,7 @@ from cli_agent_orchestrator.models.inbox import (
     CallbackRecoveryCompletionRequest,
     CallbackRecoveryRequest,
     CallbackRecoveryResolutionRequest,
+    MessageStatus,
 )
 from cli_agent_orchestrator.services import (
     callback_recovery,
@@ -38,6 +39,7 @@ SOURCE = "worker01"
 GENERATION = "worker-generation-1"
 SUPERVISOR = "super01"
 SUPERVISOR_GENERATION = "supervisor-generation-1"
+SUPERVISOR_PANE_ID = "%7"
 SESSION_NAME = "cao-test"
 PROVIDER_SESSION = "provider-session-1"
 CONTROL = "refused-control-1"
@@ -105,7 +107,7 @@ def recovery_context(isolated_memory_db, tmp_path, monkeypatch):
                     tmux_window="supervisor",
                     provider="codex",
                     generation=SUPERVISOR_GENERATION,
-                    pane_id=SUPERVISOR_GENERATION,
+                    pane_id=SUPERVISOR_PANE_ID,
                 ),
                 database.TerminalModel(
                     id=SOURCE,
@@ -180,6 +182,7 @@ def recovery_context(isolated_memory_db, tmp_path, monkeypatch):
         supervisor_id=SUPERVISOR,
         supervisor_session=SESSION_NAME,
         supervisor_generation=SUPERVISOR_GENERATION,
+        supervisor_pane_id=SUPERVISOR_PANE_ID,
         refusal_control_id=CONTROL,
         refusal_occurrence_sha256=occurrence["refusal_occurrence_sha256"],
         refusal_request_sha256=request_sha256,
@@ -199,7 +202,7 @@ def recovery_context(isolated_memory_db, tmp_path, monkeypatch):
     return body
 
 
-def _record_turn(admission):
+def _record_turn(admission, *, provider="codex"):
     message = admission.message
     created = message.created_at.replace(tzinfo=timezone.utc)
     receipt = model_turn_receipt_contract.build_receipt(
@@ -210,7 +213,7 @@ def _record_turn(admission):
         sender_generation=message.sender_generation,
         receiver_id=SOURCE,
         receiver_generation=GENERATION,
-        provider="codex",
+        provider=provider,
         provider_session_id=PROVIDER_SESSION,
         provider_turn_id="turn-1",
         submitted_at=created,
@@ -365,6 +368,7 @@ def test_workflow_claims_must_match_authoritative_reservation(
         ("supervisor_id", "other-supervisor"),
         ("supervisor_session", "other-session"),
         ("supervisor_generation", "replacement-supervisor-generation"),
+        ("supervisor_pane_id", "%99"),
         ("refusal_occurrence_sha256", "0" * 64),
         ("refusal_request_sha256", "9" * 64),
     ],
@@ -393,6 +397,25 @@ def test_callback_digest_conflict_is_a_durable_zero_byte_refusal(recovery_contex
         assert db.query(database.InboxModel).count() == 0
 
 
+def test_unclassified_refusal_is_persisted_as_ambiguity(
+    recovery_context,
+    monkeypatch,
+):
+    def unclassified(*_args, **_kwargs):
+        raise callback_recovery.CallbackRecoveryRefused(
+            "future refusal",
+            reason_code="future-unclassified-refusal",
+        )
+
+    monkeypatch.setattr(callback_recovery, "_reservation_identity", unclassified)
+    with pytest.raises(callback_recovery.CallbackRecoveryAmbiguous):
+        callback_recovery.admit(recovery_context)
+    with database.SessionLocal() as db:
+        row = db.query(database.CallbackRecoveryModel).one()
+        assert row.state == callback_recovery.STATE_AMBIGUOUS
+        assert row.reason_code == "unclassified-refusal-manual-resolution-required"
+
+
 def test_turn_receipt_is_strict_revalidated_and_completion_binds_callback_row(
     recovery_context,
 ):
@@ -414,6 +437,22 @@ def test_turn_receipt_is_strict_revalidated_and_completion_binds_callback_row(
     )
     assert completed["state"] == callback_recovery.STATE_COMPLETED
     assert completed["callback_message_id"] == callback_id
+    assert completed["callback_consumed"] is False
+    assert callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION)
+    with pytest.raises(
+        terminal_service.TerminalGenerationMismatchError,
+        match="open callback-recovery",
+    ):
+        terminal_service.retire_observed_terminal(
+            SOURCE,
+            expected_session=SESSION_NAME,
+        )
+    with database.SessionLocal() as db:
+        callback_row = db.get(database.InboxModel, callback_id)
+        callback_row.status = MessageStatus.DELIVERED.value
+        db.commit()
+    assert callback_recovery.get(admission.operation["operation_key"])["callback_consumed"] is True
+    assert callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION) is False
     replay = callback_recovery.complete(
         admission.operation["operation_key"],
         CallbackRecoveryCompletionRequest(
@@ -544,6 +583,34 @@ def test_closed_workspace_retirement_uses_exact_managed_cleanup(
     with database.SessionLocal() as db:
         assert db.get(database.TerminalModel, SOURCE) is None
         assert db.get(database.TerminalModel, SUPERVISOR) is None
+
+
+def test_observed_terminal_retirement_treats_concurrent_absence_as_complete(
+    monkeypatch,
+):
+    observed = {
+        "id": SOURCE,
+        "generation": GENERATION,
+        "pane_id": "%11",
+        "tmux_session": SESSION_NAME,
+    }
+    metadata_reads = iter((observed, None))
+    monkeypatch.setattr(
+        terminal_service,
+        "_get_terminal_metadata_any",
+        lambda _terminal_id: next(metadata_reads),
+    )
+    monkeypatch.setattr(
+        terminal_service,
+        "_delete_terminal_claimed",
+        lambda *_args, **_kwargs: pytest.fail("already-retired row was deleted again"),
+    )
+
+    assert terminal_service.retire_observed_terminal(
+        SOURCE,
+        expected_session=SESSION_NAME,
+        expected_pane_id="%11",
+    )
 
 
 def test_completed_replay_survives_prompt_inbox_retention(recovery_context):
@@ -752,6 +819,48 @@ def test_receipt_and_refusal_transitions_are_monotonic(recovery_context):
     assert callback_recovery.get(key)["state"] == callback_recovery.STATE_SUBMITTED
 
 
+def test_inflight_receipt_wins_concurrent_zero_effect_refusal(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+    key = admission.operation["operation_key"]
+    receipt_locked = threading.Event()
+    release_receipt = threading.Event()
+    refusal_errors = []
+
+    def publish_receipt():
+        with generation_fence.admission_critical_section(
+            companion_receipts.COMPANION_DIR, SOURCE, GENERATION
+        ):
+            receipt_locked.set()
+            assert release_receipt.wait(timeout=3)
+            _record_turn(admission)
+
+    def refuse():
+        assert receipt_locked.wait(timeout=2)
+        try:
+            callback_recovery.mark_delivery_refused(
+                key,
+                reason_code="w13-fenced-before-provider-io",
+                proven_before_provider_io=True,
+            )
+        except callback_recovery.CallbackRecoveryConflict as exc:
+            refusal_errors.append(str(exc))
+
+    publisher = threading.Thread(target=publish_receipt)
+    refuser = threading.Thread(target=refuse)
+    publisher.start()
+    refuser.start()
+    assert receipt_locked.wait(timeout=2)
+    release_receipt.set()
+    publisher.join(timeout=3)
+    refuser.join(timeout=3)
+
+    assert not publisher.is_alive()
+    assert not refuser.is_alive()
+    assert refusal_errors == ["cannot refuse recovery delivery after a durable provider receipt"]
+    assert callback_recovery.turn_receipt(key) is not None
+    assert callback_recovery.get(key)["state"] == callback_recovery.STATE_SUBMITTED
+
+
 def test_kimi_acp_reservation_is_eligible(recovery_context):
     with database.SessionLocal() as db:
         db.get(database.TerminalModel, SOURCE).provider = "kimi_cli"
@@ -759,7 +868,18 @@ def test_kimi_acp_reservation_is_eligible(recovery_context):
         db.commit()
     body = recovery_context.model_copy(update={"expected_provider": "kimi_cli"})
     admission = callback_recovery.admit(body)
-    assert admission.operation["expected_provider"] == "kimi_cli"
+    _record_turn(admission, provider="kimi_cli")
+    callback = _publish_callback(admission)
+    completed = callback_recovery.complete(
+        admission.operation["operation_key"],
+        CallbackRecoveryCompletionRequest(
+            callback_message_id=callback["message_id"],
+            callback_message_sha256=body.callback_message_sha256,
+            callback_created_at=callback["created_at"],
+            finalization_identity_sha256=body.finalization_identity_sha256,
+        ),
+    )
+    assert completed["state"] == callback_recovery.STATE_COMPLETED
 
 
 def test_non_acp_authoritative_mode_is_rejected(recovery_context):
@@ -817,6 +937,54 @@ def test_generation_lifecycle_claim_is_reentrant_for_session_teardown(
     assert nested
 
 
+def test_opposing_admission_and_session_retirement_use_one_lock_order(
+    recovery_context,
+    monkeypatch,
+):
+    """Source sorts after supervisor, the historical deadlock ordering."""
+    start = threading.Barrier(3)
+    results = []
+    errors = []
+    monkeypatch.setattr(
+        callback_recovery,
+        "_admit_locked",
+        lambda _body: results.append("admitted"),
+    )
+    monkeypatch.setattr(
+        terminal_service,
+        "_delete_terminal_claimed",
+        lambda *_args, **_kwargs: True,
+    )
+
+    def run_admission():
+        try:
+            start.wait(timeout=2)
+            callback_recovery.admit(recovery_context)
+        except Exception as exc:
+            errors.append(exc)
+
+    def run_retirement():
+        try:
+            start.wait(timeout=2)
+            terminal_service.retire_closed_workspace_session(SESSION_NAME)
+            results.append("retired")
+        except Exception as exc:
+            errors.append(exc)
+
+    admission = threading.Thread(target=run_admission)
+    retirement = threading.Thread(target=run_retirement)
+    admission.start()
+    retirement.start()
+    start.wait(timeout=2)
+    admission.join(timeout=3)
+    retirement.join(timeout=3)
+
+    assert not admission.is_alive()
+    assert not retirement.is_alive()
+    assert errors == []
+    assert set(results) == {"admitted", "retired"}
+
+
 def test_v2_reservation_and_terminal_are_authoritative(recovery_context):
     now = "2026-07-30T12:00:00Z"
     with database.SessionLocal() as db:
@@ -866,5 +1034,15 @@ def test_v2_reservation_and_terminal_are_authoritative(recovery_context):
         )
         db.commit()
     admitted = callback_recovery.admit(recovery_context)
-    assert admitted.operation["state"] == callback_recovery.STATE_PENDING
-    assert admitted.message.expected_provider_session_id == PROVIDER_SESSION
+    _record_turn(admitted)
+    callback = _publish_callback(admitted)
+    completed = callback_recovery.complete(
+        admitted.operation["operation_key"],
+        CallbackRecoveryCompletionRequest(
+            callback_message_id=callback["message_id"],
+            callback_message_sha256=recovery_context.callback_message_sha256,
+            callback_created_at=callback["created_at"],
+            finalization_identity_sha256=recovery_context.finalization_identity_sha256,
+        ),
+    )
+    assert completed["state"] == callback_recovery.STATE_COMPLETED

@@ -111,21 +111,12 @@ class InboxService:
     def _callback_completion_delivery_claim(messages):
         """Hold exact supervisor generations across the final pane send."""
         bound = [message for message in messages if message.callback_completion_key is not None]
-        with contextlib.ExitStack() as claims:
-            for terminal_id, generation in sorted(
-                {(message.receiver_id, message.expected_receiver_generation) for message in bound},
-                key=lambda identity: (identity[0], identity[1] or ""),
-            ):
-                if not generation:
-                    raise _CallbackCompletionGenerationReplaced(
-                        "callback completion lacks its receiver generation"
-                    )
-                claims.enter_context(
-                    callback_recovery.generation_lifecycle_claim(
-                        terminal_id,
-                        generation,
-                    )
-                )
+        keys = {(message.receiver_id, message.expected_receiver_generation) for message in bound}
+        if any(not generation for _terminal_id, generation in keys):
+            raise _CallbackCompletionGenerationReplaced(
+                "callback completion lacks its receiver generation"
+            )
+        with callback_recovery.generation_lifecycle_claims(keys):
             if any(
                 not callback_recovery.current_delivery_binding_matches(message) for message in bound
             ):
@@ -618,11 +609,19 @@ class InboxService:
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
         """
+        managed_identity = managed_launch.managed_control_identity(terminal_id)
+        native_managed = (
+            managed_identity is not None and managed_identity.get("execution_mode") == NATIVE_TUI
+        )
         if required_message_id is not None:
             exact = get_pending_message(terminal_id, required_message_id)
             messages = [exact] if exact is not None else []
         else:
-            limit = num_messages if num_messages > 0 else 100
+            # Scan past parked identity-bound rows. With the production default
+            # of one message, selecting only the oldest row lets one stale
+            # recovery callback starve every later valid message forever.
+            scan_parked = managed_identity is not None and not native_managed
+            limit = 100 if scan_parked else (num_messages if num_messages > 0 else 100)
             messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:
             return
@@ -644,14 +643,17 @@ class InboxService:
         # generation-bound native text delivery rather than the unmanaged
         # paste (which hard-refuses managed identities anyway).
         remaining = []
-        managed_identity = managed_launch.managed_control_identity(terminal_id)
-        native_managed = (
-            managed_identity is not None and managed_identity.get("execution_mode") == NATIVE_TUI
-        )
         if managed_identity is None or native_managed:
             remaining = messages
         else:
+            eligible_attempts = 0
             for message in messages:
+                if (
+                    num_messages > 0
+                    and required_message_id is None
+                    and eligible_attempts >= num_messages
+                ):
+                    break
                 lock = self._managed_delivery_lock(message.id)
                 if not lock.acquire(timeout=MANAGED_DELIVERY_LOCK_TIMEOUT_SECONDS):
                     logger.info(
@@ -694,6 +696,7 @@ class InboxService:
                             )
                         if receipt is not None:
                             update_message_status(message.id, MessageStatus.DELIVERED)
+                            eligible_attempts += 1
                             continue
                         logger.warning(
                             "Preserving identity-bound inbox message %s for %s: "
@@ -709,6 +712,7 @@ class InboxService:
                             ),
                         )
                         continue
+                    eligible_attempts += 1
                     if message.callback_recovery_key is not None:
                         bridged = managed_launch.deliver_inbox_via_bridge(
                             terminal_id,

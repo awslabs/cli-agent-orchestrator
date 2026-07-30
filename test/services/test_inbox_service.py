@@ -358,7 +358,9 @@ class TestDeliverPending:
             lambda message_id, status: updates.append((message_id, status)) or True,
         )
 
-        InboxService().deliver_pending("worker", num_messages=0)
+        # Production calls use the default one-message budget. The scanner
+        # must park the held first row and still reach the later valid row.
+        InboxService().deliver_pending("worker")
 
         assert ambiguous == [
             (

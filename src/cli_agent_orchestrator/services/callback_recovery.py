@@ -10,7 +10,7 @@ import secrets
 import shlex
 import fcntl
 import threading
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from sqlalchemy import and_, or_, text
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import object_session
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.inbox import (
@@ -69,7 +70,10 @@ _ZERO_EFFECT_REFUSAL_REASONS = frozenset(
         "source-caller-mismatch",
         "refusal-identity-mismatch",
         "refusal-occurrence-mismatch",
+        "refusal-occurrence-absent",
+        "terminal-identity-ambiguous",
         "workflow-identity-mismatch",
+        "recovery-lifecycle-fenced-before-provider-io",
         "w13-fenced-before-provider-io",
     }
 )
@@ -114,31 +118,53 @@ _LIFECYCLE_CLAIMS = threading.local()
 @contextmanager
 def generation_lifecycle_claim(terminal_id: str, generation: str):
     """Serialize recovery admission with teardown for one exact incarnation."""
+    with generation_lifecycle_claims(((terminal_id, generation),)):
+        yield
+
+
+@contextmanager
+def generation_lifecycle_claims(keys):
+    """Claim exact terminal incarnations in one canonical global order.
+
+    Any operation that needs more than one lifecycle key must pass the complete
+    set here.  Acquiring source then supervisor (or model generation then pane)
+    in caller order can deadlock against session retirement, which necessarily
+    observes the same keys in a different order.
+    """
     from cli_agent_orchestrator.constants import COMPANION_DIR
 
-    key = (terminal_id, generation)
     held = getattr(_LIFECYCLE_CLAIMS, "held", set())
-    if key in held:
+    canonical = sorted({(str(terminal_id), str(generation)) for terminal_id, generation in keys})
+    missing = [key for key in canonical if key not in held]
+    if not missing:
         yield
         return
 
-    safe_terminal = re.sub(r"[^A-Za-z0-9._-]", "-", terminal_id)
-    safe_generation = re.sub(r"[^A-Za-z0-9._-]", "-", generation)
-    directory = Path(COMPANION_DIR) / safe_terminal / safe_generation
-    directory.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(
-        directory / ".callback-recovery-lifecycle.lock", os.O_CREAT | os.O_RDWR, 0o600
-    )
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        _LIFECYCLE_CLAIMS.held = {*held, key}
+    if held and min(missing) < max(held):
+        raise RuntimeError(
+            "lifecycle keys must be acquired together in canonical order; "
+            "nested acquisition would invert the global lock order"
+        )
+
+    with ExitStack() as stack:
+        for terminal_id, generation in missing:
+            safe_terminal = re.sub(r"[^A-Za-z0-9._-]", "-", terminal_id)
+            safe_generation = re.sub(r"[^A-Za-z0-9._-]", "-", generation)
+            directory = Path(COMPANION_DIR) / safe_terminal / safe_generation
+            directory.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(
+                directory / ".callback-recovery-lifecycle.lock",
+                os.O_CREAT | os.O_RDWR,
+                0o600,
+            )
+            stack.callback(os.close, descriptor)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            stack.callback(fcntl.flock, descriptor, fcntl.LOCK_UN)
+        _LIFECYCLE_CLAIMS.held = {*held, *missing}
         try:
             yield
         finally:
             _LIFECYCLE_CLAIMS.held = held
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
 
 
 def _now() -> str:
@@ -170,6 +196,7 @@ def _workflow_identity(body: CallbackRecoveryRequest) -> dict[str, Any]:
         "supervisor_id": body.supervisor_id,
         "supervisor_session": body.supervisor_session,
         "supervisor_generation": body.supervisor_generation,
+        "supervisor_pane_id": body.supervisor_pane_id,
         "callback_occurrence_id": body.callback_occurrence_id,
     }
 
@@ -378,6 +405,12 @@ def refusal_occurrence(control_id: str) -> dict[str, Any]:
 
 
 def _operation_dict(row: Any) -> dict[str, Any]:
+    callback_delivery_status = None
+    session = object_session(row)
+    if session is not None and row.callback_message_id is not None:
+        callback = session.get(database.InboxModel, row.callback_message_id)
+        if callback is not None:
+            callback_delivery_status = callback.status
     operation = {
         "operation_key": row.operation_key,
         "operation_id": row.operation_id,
@@ -395,6 +428,7 @@ def _operation_dict(row: Any) -> dict[str, Any]:
         "supervisor_id": row.supervisor_id,
         "supervisor_session": row.supervisor_session,
         "supervisor_generation": row.supervisor_generation,
+        "supervisor_pane_id": row.supervisor_pane_id,
         "refusal_control_id": row.refusal_control_id,
         "refusal_occurrence_sha256": row.refusal_occurrence_sha256,
         "callback_occurrence_id": row.callback_occurrence_id,
@@ -412,6 +446,8 @@ def _operation_dict(row: Any) -> dict[str, Any]:
         "message_created_at": row.message_created_at,
         "sender_generation": row.sender_generation,
         "callback_message_id": row.callback_message_id,
+        "callback_delivery_status": callback_delivery_status,
+        "callback_consumed": callback_delivery_status == MessageStatus.DELIVERED.value,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -520,7 +556,11 @@ def _validate_lifecycle_row(row: Any) -> None:
         if not isinstance(value, str) or not value:
             raise CallbackRecoveryConflict(f"callback recovery field {field!r} is malformed")
     if row.state != STATE_REFUSED:
-        for field in ("supervisor_generation", "callback_token_sha256"):
+        for field in (
+            "supervisor_generation",
+            "supervisor_pane_id",
+            "callback_token_sha256",
+        ):
             value = getattr(row, field, None)
             if not isinstance(value, str) or not value:
                 raise CallbackRecoveryConflict(f"callback recovery field {field!r} is malformed")
@@ -574,6 +614,7 @@ def _validate_lifecycle_row(row: Any) -> None:
             "source_generation",
             "supervisor_id",
             "supervisor_generation",
+            "supervisor_pane_id",
             "callback_occurrence_id",
             "completed_at",
         }
@@ -615,6 +656,14 @@ def _validate_lifecycle_row(row: Any) -> None:
 
 
 def _store_refusal(db: Any, row: Any, exc: CallbackRecoveryRefused) -> None:
+    if exc.reason_code not in _ZERO_EFFECT_REFUSAL_REASONS:
+        row.state = STATE_AMBIGUOUS
+        row.reason_code = "unclassified-refusal-manual-resolution-required"
+        row.updated_at = _now()
+        db.commit()
+        raise CallbackRecoveryAmbiguous(
+            "callback recovery refusal is not classified as proven zero effect"
+        ) from exc
     row.state = STATE_REFUSED
     row.reason_code = exc.reason_code
     row.updated_at = _now()
@@ -622,9 +671,13 @@ def _store_refusal(db: Any, row: Any, exc: CallbackRecoveryRefused) -> None:
 
 
 def admit(body: CallbackRecoveryRequest) -> RecoveryAdmission:
-    with generation_lifecycle_claim(body.source_terminal_id, body.source_generation):
-        with generation_lifecycle_claim(body.supervisor_id, body.supervisor_generation):
-            return _admit_locked(body)
+    with generation_lifecycle_claims(
+        (
+            (body.source_terminal_id, body.source_generation),
+            (body.supervisor_id, body.supervisor_generation),
+        )
+    ):
+        return _admit_locked(body)
 
 
 def _admit_locked(body: CallbackRecoveryRequest) -> RecoveryAdmission:
@@ -720,6 +773,7 @@ def _admit_locked(body: CallbackRecoveryRequest) -> RecoveryAdmission:
             supervisor_id=body.supervisor_id,
             supervisor_session=body.supervisor_session,
             supervisor_generation=body.supervisor_generation,
+            supervisor_pane_id=body.supervisor_pane_id,
             refusal_control_id=body.refusal_control_id,
             refusal_occurrence_sha256=body.refusal_occurrence_sha256,
             refusal_request_sha256=body.refusal_request_sha256,
@@ -787,11 +841,8 @@ def _admit_locked(body: CallbackRecoveryRequest) -> RecoveryAdmission:
                     "the authoritative supervisor is not the root caller in the reservation session",
                     reason_code="supervisor-authority-mismatch",
                 )
-            supervisor_generation = str(
-                getattr(supervisor, "pane_id", None)
-                or getattr(supervisor, "generation", None)
-                or ""
-            )
+            supervisor_generation = str(getattr(supervisor, "generation", None) or "")
+            supervisor_pane_id = str(getattr(supervisor, "pane_id", None) or "")
             if not supervisor_generation:
                 raise CallbackRecoveryRefused(
                     "authoritative supervisor generation is absent",
@@ -801,6 +852,11 @@ def _admit_locked(body: CallbackRecoveryRequest) -> RecoveryAdmission:
                 raise CallbackRecoveryRefused(
                     "authoritative supervisor generation changed before recovery admission",
                     reason_code="supervisor-generation-mismatch",
+                )
+            if not supervisor_pane_id or supervisor_pane_id != body.supervisor_pane_id:
+                raise CallbackRecoveryRefused(
+                    "authoritative supervisor pane identity changed before recovery admission",
+                    reason_code="supervisor-authority-mismatch",
                 )
             source = _terminal_row(db, body.source_terminal_id)
             if (
@@ -913,10 +969,39 @@ def get(operation_key: str) -> dict[str, Any]:
 def mark_delivery_refused(
     operation_key: str, *, reason_code: str, proven_before_provider_io: bool
 ) -> None:
+    from cli_agent_orchestrator.services import generation_fence
+
     if not proven_before_provider_io or reason_code not in _ZERO_EFFECT_REFUSAL_REASONS:
         raise CallbackRecoveryConflict(
             "delivery refusal lacks exact proven-before-provider-I/O evidence"
         )
+    with database.SessionLocal() as lookup:
+        row = lookup.get(database.CallbackRecoveryModel, operation_key)
+        if row is None:
+            raise CallbackRecoveryNotFound(operation_key)
+        source_terminal_id = str(row.source_terminal_id)
+        source_generation = str(row.source_generation)
+        supervisor_id = str(row.supervisor_id)
+        supervisor_generation = str(row.supervisor_generation)
+    with generation_lifecycle_claims(
+        (
+            (source_terminal_id, source_generation),
+            (supervisor_id, supervisor_generation),
+        )
+    ):
+        with generation_fence.reconciliation_critical_section(
+            companion_receipts.COMPANION_DIR,
+            source_terminal_id,
+            source_generation,
+        ):
+            if turn_receipt(operation_key) is not None:
+                raise CallbackRecoveryConflict(
+                    "cannot refuse recovery delivery after a durable provider receipt"
+                )
+            _mark_delivery_refused_locked(operation_key, reason_code=reason_code)
+
+
+def _mark_delivery_refused_locked(operation_key: str, *, reason_code: str) -> None:
     with database.SessionLocal() as db:
         db.execute(text("BEGIN IMMEDIATE"))
         row = db.get(database.CallbackRecoveryModel, operation_key)
@@ -1071,12 +1156,16 @@ def create_callback(operation_key: str, body: CallbackRecoveryCallbackRequest) -
         source_generation = str(row.source_generation)
         supervisor_id = str(row.supervisor_id)
         supervisor_generation = str(row.supervisor_generation)
-    with generation_lifecycle_claim(source_terminal_id, source_generation):
-        with generation_lifecycle_claim(supervisor_id, supervisor_generation):
-            replay = _committed_callback_replay(operation_key, body)
-            if replay is not None:
-                return replay
-            return _create_callback_locked(operation_key, body)
+    with generation_lifecycle_claims(
+        (
+            (source_terminal_id, source_generation),
+            (supervisor_id, supervisor_generation),
+        )
+    ):
+        replay = _committed_callback_replay(operation_key, body)
+        if replay is not None:
+            return replay
+        return _create_callback_locked(operation_key, body)
 
 
 def _committed_callback_replay(
@@ -1184,16 +1273,14 @@ def _create_callback_locked(
         supervisor = _terminal_row(db, row.supervisor_id)
         live_supervisor = {
             "session": str(supervisor.tmux_session),
-            "generation": str(
-                getattr(supervisor, "pane_id", None)
-                or getattr(supervisor, "generation", None)
-                or ""
-            ),
+            "generation": str(getattr(supervisor, "generation", None) or ""),
+            "pane_id": str(getattr(supervisor, "pane_id", None) or ""),
             "caller_id": str(getattr(supervisor, "caller_id", None) or ""),
         }
         expected_supervisor = {
             "session": row.supervisor_session,
             "generation": row.supervisor_generation,
+            "pane_id": row.supervisor_pane_id,
             "caller_id": "",
         }
         if live_supervisor != expected_supervisor:
@@ -1306,6 +1393,7 @@ def complete(operation_key: str, body: CallbackRecoveryCompletionRequest) -> dic
             "source_generation": row.source_generation,
             "supervisor_id": row.supervisor_id,
             "supervisor_generation": row.supervisor_generation,
+            "supervisor_pane_id": row.supervisor_pane_id,
             "callback_occurrence_id": row.callback_occurrence_id,
             "completed_at": _now(),
         }
@@ -1412,7 +1500,12 @@ def resolve_ambiguity(
                 return _operation_dict(row)
 
 
-def terminal_has_open_recovery(terminal_id: str, generation: Optional[str] = None) -> bool:
+def terminal_has_open_recovery(
+    terminal_id: str,
+    generation: Optional[str] = None,
+    *,
+    _schema_retry: bool = False,
+) -> bool:
     try:
         with database.SessionLocal() as db:
             source_match = database.CallbackRecoveryModel.source_terminal_id == terminal_id
@@ -1437,10 +1530,19 @@ def terminal_has_open_recovery(terminal_id: str, generation: Optional[str] = Non
                     return True
                 if row.state not in RELEASABLE_STATES:
                     return True
+                if row.state == STATE_COMPLETED:
+                    callback = db.get(database.InboxModel, row.callback_message_id)
+                    if callback is None or callback.status != MessageStatus.DELIVERED.value:
+                        return True
             return False
     except OperationalError as exc:
         if "no such table: callback_recovery_operations" in str(exc):
             return False
+        if "no such column: callback_recovery_operations.supervisor_pane_id" in str(exc):
+            if _schema_retry:
+                raise
+            database._migrate_callback_recovery_schema()
+            return terminal_has_open_recovery(terminal_id, generation, _schema_retry=True)
         raise
 
 
@@ -1453,6 +1555,11 @@ def held_inbox_ids() -> set[int]:
                 try:
                     _validate_lifecycle_row(row)
                     open_state = row.state not in RELEASABLE_STATES
+                    if row.state == STATE_COMPLETED:
+                        callback = db.get(database.InboxModel, row.callback_message_id)
+                        open_state = (
+                            callback is None or callback.status != MessageStatus.DELIVERED.value
+                        )
                 except CallbackRecoveryError:
                     open_state = True
                 if open_state and row.inbox_message_id is not None:
@@ -1484,17 +1591,15 @@ def current_delivery_binding_matches(message: InboxMessage) -> bool:
                     return False
                 _validate_lifecycle_row(recovery)
                 terminal = _terminal_row(db, message.receiver_id)
-                live_generation = str(
-                    getattr(terminal, "pane_id", None)
-                    or getattr(terminal, "generation", None)
-                    or ""
-                )
+                live_generation = str(getattr(terminal, "generation", None) or "")
+                live_pane_id = str(getattr(terminal, "pane_id", None) or "")
                 return (
                     recovery.state in {STATE_SUBMITTED, STATE_COMPLETED}
                     and message.receiver_id == recovery.supervisor_id
                     and message.sender_id == recovery.source_terminal_id
                     and message.expected_receiver_generation == recovery.supervisor_generation
                     and live_generation == recovery.supervisor_generation
+                    and live_pane_id == recovery.supervisor_pane_id
                     and str(terminal.tmux_session) == recovery.supervisor_session
                     and not getattr(terminal, "caller_id", None)
                 )
