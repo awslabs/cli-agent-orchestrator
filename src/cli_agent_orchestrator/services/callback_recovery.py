@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
 import secrets
 import shlex
-import fcntl
 import threading
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass

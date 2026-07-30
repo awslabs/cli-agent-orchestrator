@@ -11,8 +11,8 @@ from datetime import datetime
 import pytest
 from starlette.requests import Request
 
-from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.api import main
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.inbox import (
     CallbackRecoveryRequest,
     InboxMessage,

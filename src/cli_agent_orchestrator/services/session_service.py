@@ -143,8 +143,7 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     try:
         session_alive = get_backend().session_exists(session_name)
 
-        from cli_agent_orchestrator.services import terminal_service
-        from cli_agent_orchestrator.services import callback_recovery
+        from cli_agent_orchestrator.services import callback_recovery, terminal_service
 
         terminals = list_terminals_by_session(session_name)
 

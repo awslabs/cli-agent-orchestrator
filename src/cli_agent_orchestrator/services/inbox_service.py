@@ -14,8 +14,8 @@ from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
-    get_pending_messages,
     get_pending_message,
+    get_pending_messages,
     is_message_pending,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
