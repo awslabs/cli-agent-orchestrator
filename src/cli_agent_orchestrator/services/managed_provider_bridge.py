@@ -2273,6 +2273,16 @@ class _ProviderSession:
 
         try:
             with self._admission_critical_section():
+                recovery_operation_key = command.get("recovery_operation_key")
+                if isinstance(recovery_operation_key, str) and recovery_operation_key:
+                    from cli_agent_orchestrator.services import callback_recovery
+
+                    callback_recovery.assert_provider_delivery_admissible(
+                        recovery_operation_key,
+                        terminal_id=self.request["terminal_id"],
+                        generation=self.request["generation"],
+                        message_id=message_id,
+                    )
                 expected_live = {
                     "expected_provider": self.provider,
                     "expected_provider_session_id": self.provider_session_id,
@@ -2294,52 +2304,57 @@ class _ProviderSession:
                 self._current_turn_id = provider_turn_id
                 self._scan_companion_events()
                 self._emit_beat(provider_turn_id, f"{kind}:{provider_turn_id}")
+                submitted_at = _now()
+                ack: dict[str, Any]
+                if command.get("sender_generation") and command.get("message_created_at"):
+                    from datetime import datetime, timezone
+
+                    from cli_agent_orchestrator.services import model_turn_receipt_contract
+
+                    created_at = datetime.fromisoformat(command["message_created_at"])
+                    if created_at.utcoffset() is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    ack = model_turn_receipt_contract.build_receipt(
+                        message_id=message_id,
+                        message_sha256=command["message_sha256"],
+                        message_created_at=created_at,
+                        sender_id=command["sender_id"],
+                        sender_generation=command["sender_generation"],
+                        receiver_id=self.request["terminal_id"],
+                        receiver_generation=self.request["generation"],
+                        provider=self.provider,
+                        provider_session_id=self.provider_session_id,
+                        provider_turn_id=provider_turn_id,
+                        submitted_at=datetime.fromisoformat(
+                            submitted_at.removesuffix("Z") + "+00:00"
+                        ),
+                    )
+                else:
+                    ack = {
+                        "kind": "submitted",
+                        "message_id": message_id,
+                        "message_sha256": command["message_sha256"],
+                        "sender_id": command.get("sender_id"),
+                        "receiver_id": self.request["terminal_id"],
+                        "receiver_generation": self.request["generation"],
+                        "provider": self.provider,
+                        "provider_session_id": self.provider_session_id,
+                        "provider_turn_id": provider_turn_id,
+                        "submitted_at": submitted_at,
+                    }
+                # Receipt publication is part of the same admission critical
+                # section as provider I/O. A zero-effect resolver holding this
+                # lock therefore sees either no effect or the durable receipt.
+                companion_receipts.record_message_ack(
+                    self.request["terminal_id"],
+                    self.request["generation"],
+                    message_id=message_id,
+                    ack=ack,
+                )
         except generation_fence.FencedError as exc:
             raise BridgeError(f"w13-fenced-before-provider-io: {exc}") from exc
         except heartbeat_store.FencingRefused as exc:
             raise BridgeError(f"successor-fenced-before-provider-io: {exc}") from exc
-        submitted_at = _now()
-        ack: dict[str, Any]
-        if command.get("sender_generation") and command.get("message_created_at"):
-            from datetime import datetime, timezone
-
-            from cli_agent_orchestrator.services import model_turn_receipt_contract
-
-            created_at = datetime.fromisoformat(command["message_created_at"])
-            if created_at.utcoffset() is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-            ack = model_turn_receipt_contract.build_receipt(
-                message_id=message_id,
-                message_sha256=command["message_sha256"],
-                message_created_at=created_at,
-                sender_id=command["sender_id"],
-                sender_generation=command["sender_generation"],
-                receiver_id=self.request["terminal_id"],
-                receiver_generation=self.request["generation"],
-                provider=self.provider,
-                provider_session_id=self.provider_session_id,
-                provider_turn_id=provider_turn_id,
-                submitted_at=datetime.fromisoformat(submitted_at.removesuffix("Z") + "+00:00"),
-            )
-        else:
-            ack = {
-                "kind": "submitted",
-                "message_id": message_id,
-                "message_sha256": command["message_sha256"],
-                "sender_id": command.get("sender_id"),
-                "receiver_id": self.request["terminal_id"],
-                "receiver_generation": self.request["generation"],
-                "provider": self.provider,
-                "provider_session_id": self.provider_session_id,
-                "provider_turn_id": provider_turn_id,
-                "submitted_at": submitted_at,
-            }
-        companion_receipts.record_message_ack(
-            self.request["terminal_id"],
-            self.request["generation"],
-            message_id=message_id,
-            ack=ack,
-        )
         # The per-turn route identity (§18.9) moves to this exact turn.
         companion_receipts.record_route_receipt(
             self.request["terminal_id"],

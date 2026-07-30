@@ -2896,6 +2896,82 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         raise
 
 
+def retire_closed_workspace_session(
+    session_name: str,
+    registry: PluginRegistry | None = None,
+) -> list[str]:
+    """Retire DB state after Herdr authoritatively reports a closed workspace.
+
+    Every terminal incarnation is claimed and revalidated before any row is
+    removed.  An open callback recovery on either the source or its bound
+    supervisor holds the entire session so a workspace lifecycle event cannot
+    bypass managed teardown.
+    """
+    from cli_agent_orchestrator.clients.database import list_terminals_by_session
+    from cli_agent_orchestrator.services import callback_recovery
+
+    observed: list[dict[str, Any]] = []
+    for row in list_terminals_by_session(session_name):
+        metadata = _get_terminal_metadata_any(row["id"])
+        if metadata is not None:
+            observed.append(metadata)
+
+    claim_keys = {
+        (
+            item["id"],
+            item.get("generation") or item.get("pane_id") or "legacy-unversioned",
+        )
+        for item in observed
+    }
+    claim_keys.update(
+        (item["id"], item["pane_id"])
+        for item in observed
+        if item.get("pane_id")
+        and item["pane_id"]
+        != (item.get("generation") or item.get("pane_id") or "legacy-unversioned")
+    )
+
+    with contextlib.ExitStack() as claims:
+        for terminal_id, generation in sorted(claim_keys):
+            claims.enter_context(
+                callback_recovery.generation_lifecycle_claim(terminal_id, generation)
+            )
+
+        current_rows: list[dict[str, Any]] = []
+        for item in observed:
+            current = _get_terminal_metadata_any(item["id"])
+            if current is None:
+                continue
+            if (
+                current.get("tmux_session") != session_name
+                or current.get("generation") != item.get("generation")
+                or current.get("pane_id") != item.get("pane_id")
+            ):
+                raise TerminalGenerationMismatchError(
+                    f"terminal {item['id']} changed incarnation while retiring "
+                    f"closed workspace {session_name}"
+                )
+            if callback_recovery.terminal_has_open_recovery(item["id"], item.get("generation")):
+                raise TerminalGenerationMismatchError(
+                    f"terminal {item['id']} has an open callback-recovery "
+                    "operation; closed-workspace cleanup is held"
+                )
+            current_rows.append(current)
+
+        retired: list[str] = []
+        for item in current_rows:
+            generation = item.get("generation")
+            kwargs: dict[str, Any] = {"backend_already_closed": True}
+            if generation:
+                kwargs.update(
+                    expected_generation=generation,
+                    expected_session=session_name,
+                )
+            delete_terminal(item["id"], registry=registry, **kwargs)
+            retired.append(item["id"])
+        return retired
+
+
 def delete_terminal(
     terminal_id: str,
     registry: PluginRegistry | None = None,
@@ -2903,24 +2979,45 @@ def delete_terminal(
     expected_generation: str | None = None,
     expected_session: str | None = None,
     via_destructive_endpoint: bool = False,
+    backend_already_closed: bool = False,
 ) -> bool:
     """Delete under the same exact-generation claim recovery admission uses."""
     from cli_agent_orchestrator.services import callback_recovery
 
     if expected_generation is not None:
-        claim_generation = expected_generation
-    else:
-        metadata = get_terminal_metadata(terminal_id)
-        if metadata is None:
-            metadata = get_terminal_metadata_v2(terminal_id)
-        claim_generation = (metadata or {}).get("generation") or "legacy-unversioned"
+        with callback_recovery.generation_lifecycle_claim(terminal_id, expected_generation):
+            return _delete_terminal_claimed(
+                terminal_id,
+                registry=registry,
+                expected_generation=expected_generation,
+                expected_session=expected_session,
+                via_destructive_endpoint=via_destructive_endpoint,
+                backend_already_closed=backend_already_closed,
+            )
+
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata is None:
+        metadata = get_terminal_metadata_v2(terminal_id)
+    claim_generation = (metadata or {}).get("generation") or "legacy-unversioned"
+    pane_generation = (metadata or {}).get("pane_id")
     with callback_recovery.generation_lifecycle_claim(terminal_id, claim_generation):
+        if pane_generation and pane_generation != claim_generation:
+            with callback_recovery.generation_lifecycle_claim(terminal_id, pane_generation):
+                return _delete_terminal_claimed(
+                    terminal_id,
+                    registry=registry,
+                    expected_generation=expected_generation,
+                    expected_session=expected_session,
+                    via_destructive_endpoint=via_destructive_endpoint,
+                    backend_already_closed=backend_already_closed,
+                )
         return _delete_terminal_claimed(
             terminal_id,
             registry=registry,
             expected_generation=expected_generation,
             expected_session=expected_session,
             via_destructive_endpoint=via_destructive_endpoint,
+            backend_already_closed=backend_already_closed,
         )
 
 
@@ -2931,6 +3028,7 @@ def _delete_terminal_claimed(
     expected_generation: str | None = None,
     expected_session: str | None = None,
     via_destructive_endpoint: bool = False,
+    backend_already_closed: bool = False,
 ) -> bool:
     """Delete terminal and kill its tmux window.
 
@@ -2990,16 +3088,22 @@ def _delete_terminal_claimed(
                     f"terminal {terminal_id} generation mismatch; expected "
                     f"{expected_generation!r}"
                 )
-            expected_window = managed_window_name(terminal_id, expected_generation)
-            if metadata is not None and (
-                metadata.get("tmux_session") != expected_session
-                or metadata.get("tmux_window") != expected_window
-            ):
-                raise TerminalGenerationMismatchError(
-                    f"terminal {terminal_id} route identity mismatch; expected "
-                    f"{expected_session!r}:{expected_window!r}"
-                )
-            if terminal_record_absent:
+            expected_window = None
+            if metadata is not None:
+                if metadata.get("tmux_session") != expected_session:
+                    raise TerminalGenerationMismatchError(
+                        f"terminal {terminal_id} session identity mismatch; expected "
+                        f"{expected_session!r}"
+                    )
+                if not backend_already_closed:
+                    expected_window = managed_window_name(terminal_id, expected_generation)
+                    if metadata.get("tmux_window") != expected_window:
+                        raise TerminalGenerationMismatchError(
+                            f"terminal {terminal_id} route identity mismatch; expected "
+                            f"{expected_session!r}:{expected_window!r}"
+                        )
+            if terminal_record_absent and not backend_already_closed:
+                expected_window = managed_window_name(terminal_id, expected_generation)
                 # The window name embeds the immutable generation, so recovery
                 # can finish a crash that occurred before the terminal row was
                 # persisted or after another cleanup removed it. A different
@@ -3048,43 +3152,44 @@ def _delete_terminal_claimed(
 
         if metadata:
             _recheck_teardown_claim()
-            # Snapshot scrollback + metadata before killing (for debugging/restore)
-            try:
-                # Capture plain text full scrollback (no -e, no line cap)
-                scrollback = get_backend().get_history(
-                    metadata["tmux_session"],
-                    metadata["tmux_window"],
-                    strip_escapes=True,
-                    full_history=True,
-                )
-                scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
-                scrollback_path.write_text(scrollback, encoding="utf-8")
+            if not backend_already_closed:
+                # Snapshot scrollback + metadata before killing (for debugging/restore)
+                try:
+                    # Capture plain text full scrollback (no -e, no line cap)
+                    scrollback = get_backend().get_history(
+                        metadata["tmux_session"],
+                        metadata["tmux_window"],
+                        strip_escapes=True,
+                        full_history=True,
+                    )
+                    scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+                    scrollback_path.write_text(scrollback, encoding="utf-8")
 
-                import json as _json
+                    import json as _json
 
-                snapshot = {
-                    "terminal_id": terminal_id,
-                    "session_name": metadata["tmux_session"],
-                    "window_name": metadata["tmux_window"],
-                    "agent_profile": metadata.get("agent_profile"),
-                    "provider": metadata["provider"],
-                    "working_directory": get_backend().get_pane_working_directory(
-                        metadata["tmux_session"], metadata["tmux_window"]
-                    ),
-                    "allowed_tools": metadata.get("allowed_tools"),
-                    "caller_id": metadata.get("caller_id"),
-                }
-                snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
-                snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
-            except Exception as e:
-                logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
+                    snapshot = {
+                        "terminal_id": terminal_id,
+                        "session_name": metadata["tmux_session"],
+                        "window_name": metadata["tmux_window"],
+                        "agent_profile": metadata.get("agent_profile"),
+                        "provider": metadata["provider"],
+                        "working_directory": get_backend().get_pane_working_directory(
+                            metadata["tmux_session"], metadata["tmux_window"]
+                        ),
+                        "allowed_tools": metadata.get("allowed_tools"),
+                        "caller_id": metadata.get("caller_id"),
+                    }
+                    snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
+                    snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+                except Exception as e:
+                    logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
 
-            # Stop pipe-pane logging
-            _recheck_teardown_claim()
-            try:
-                get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
-            except Exception as e:
-                logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
+                # Stop pipe-pane logging
+                _recheck_teardown_claim()
+                try:
+                    get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
+                except Exception as e:
+                    logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
 
             # Stop FIFO reader and cleanup FIFO file. Must run BEFORE kill_window
             # so the reader thread (which reopens the FIFO on EOF) unblocks and
@@ -3102,20 +3207,23 @@ def _delete_terminal_claimed(
             except Exception as e:
                 logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
 
-            # Kill the tmux window (this terminates the agent process)
-            _recheck_teardown_claim()
-            if expected_generation is None:
-                try:
+            if not backend_already_closed:
+                # Kill the tmux window (this terminates the agent process)
+                _recheck_teardown_claim()
+                if expected_generation is None:
+                    try:
+                        get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
+                    except Exception as e:
+                        logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+                else:
                     get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
-                except Exception as e:
-                    logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
-            else:
-                get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
-                if get_backend().window_exists(metadata["tmux_session"], metadata["tmux_window"]):
-                    raise RuntimeError(
-                        f"managed terminal window survived cleanup: "
-                        f"{metadata['tmux_session']}:{metadata['tmux_window']}"
-                    )
+                    if get_backend().window_exists(
+                        metadata["tmux_session"], metadata["tmux_window"]
+                    ):
+                        raise RuntimeError(
+                            f"managed terminal window survived cleanup: "
+                            f"{metadata['tmux_session']}:{metadata['tmux_window']}"
+                        )
 
         # Cleanup provider state and database record
         _recheck_teardown_claim()

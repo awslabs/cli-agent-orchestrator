@@ -45,6 +45,7 @@ def _body() -> dict:
         "expected_execution_mode": "acp",
         "supervisor_id": "super01",
         "supervisor_session": "cao-test",
+        "supervisor_generation": "supervisor-generation",
         "refusal_control_id": "control-1",
         "refusal_occurrence_sha256": "a" * 64,
         "refusal_request_sha256": "b" * 64,
@@ -113,6 +114,40 @@ def test_rebind_conflict_never_claims_zero_bytes(client, monkeypatch):
     assert response.status_code == 409
     assert response.json()["outcome"] == "conflict"
     assert response.json()["proven_zero_bytes"] is False
+
+
+def test_ambiguous_replay_never_claims_zero_bytes(client, monkeypatch):
+    def ambiguous(_body):
+        raise callback_recovery.CallbackRecoveryAmbiguous("provider effect remains possible")
+
+    monkeypatch.setattr(callback_recovery, "admit", ambiguous)
+    body = _body()
+    body["source_terminal_id"] = "abcdef12"
+    response = client.post("/terminals/abcdef12/callback-recoveries", json=body)
+    assert response.status_code == 409
+    assert response.json()["outcome"] == "ambiguous"
+    assert response.json()["proven_zero_bytes"] is False
+
+
+def test_callback_receipt_lookup_is_read_only(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        callback_recovery,
+        "callback_receipt",
+        lambda key: calls.append(key)
+        or {
+            "message_id": 777,
+            "sender_id": "abcdef12",
+            "receiver_id": "1234abcd",
+            "created_at": "2026-07-30T12:00:00.000000Z",
+            "callback_occurrence_id": "task-1-r1",
+            "replayed": True,
+        },
+    )
+    response = client.get("/callback-recoveries/operation-key/callback")
+    assert response.status_code == 200
+    assert response.json()["message_id"] == 777
+    assert calls == ["operation-key"]
 
 
 def test_real_http_handler_admits_authoritative_reservation(

@@ -1275,14 +1275,21 @@ def deliver_inbox_via_bridge(
         identity = managed_control_identity(terminal_id)
         if identity is None or identity["state"] != "admitted":
             return False
-        expected = (
-            expected_generation,
+        strict_expected = (
             expected_provider,
             expected_provider_session_id,
             expected_execution_mode,
         )
-        if any(value is not None for value in expected):
-            if any(not isinstance(value, str) or not value for value in expected):
+        if expected_generation is not None and (
+            not isinstance(expected_generation, str)
+            or not expected_generation
+            or identity["generation"] != expected_generation
+        ):
+            return False
+        if any(value is not None for value in strict_expected):
+            if expected_generation is None or any(
+                not isinstance(value, str) or not value for value in strict_expected
+            ):
                 return False
             assert isinstance(expected_generation, str)
             assert isinstance(expected_provider, str)

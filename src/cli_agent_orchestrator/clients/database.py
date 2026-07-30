@@ -131,6 +131,15 @@ class CallbackRecoveryModel(Base):
     """One terminal refusal authorizing one exact callback recovery lifecycle."""
 
     __tablename__ = "callback_recovery_operations"
+    __table_args__ = (
+        UniqueConstraint(
+            "project",
+            "task_id",
+            "run_id",
+            "callback_occurrence_id",
+            name="uq_callback_recovery_occurrence",
+        ),
+    )
 
     operation_key = Column(Text, primary_key=True)
     operation_id = Column(Text, nullable=False)
@@ -168,8 +177,10 @@ class CallbackRecoveryModel(Base):
     recovery_prompt_sha256 = Column(Text, nullable=True)
     message_created_at = Column(Text, nullable=True)
     sender_generation = Column(Text, nullable=True)
+    admission_response_json = Column(Text, nullable=True)
     provider_turn_receipt_json = Column(Text, nullable=True)
     callback_message_id = Column(Integer, nullable=True, unique=True)
+    callback_response_json = Column(Text, nullable=True)
     completion_json = Column(Text, nullable=True)
     resolution_json = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
@@ -1406,6 +1417,8 @@ def _migrate_callback_recovery_schema() -> None:
             ("recovery_prompt_sha256", "TEXT"),
             ("message_created_at", "TEXT"),
             ("sender_generation", "TEXT"),
+            ("admission_response_json", "TEXT"),
+            ("callback_response_json", "TEXT"),
             ("resolution_json", "TEXT"),
         )
         with sqlite3.connect(str(DATABASE_FILE)) as conn:
@@ -1417,6 +1430,12 @@ def _migrate_callback_recovery_schema() -> None:
                     conn.execute(
                         f"ALTER TABLE callback_recovery_operations ADD COLUMN {name} {ddl}"
                     )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_callback_recovery_occurrence "
+                "ON callback_recovery_operations"
+                "(project, task_id, run_id, callback_occurrence_id)"
+            )
     except Exception as exc:  # noqa: BLE001 - operation reads fail closed
         logger.warning("callback recovery migration failed: %s", exc)
 

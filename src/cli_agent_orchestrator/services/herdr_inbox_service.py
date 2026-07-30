@@ -652,7 +652,6 @@ class HerdrInboxService:
         from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.clients.database import (
             delete_terminal,
-            delete_terminals_by_session,
             get_terminal_metadata,
         )
 
@@ -732,24 +731,27 @@ class HerdrInboxService:
                 if not session_name:
                     return
 
-            # Delete all DB terminals for this session
+            # Snapshot map ownership before managed retirement removes the DB
+            # rows. The lifecycle guard owns all generation checks and refuses
+            # the whole session when a callback recovery is still open.
+            to_remove = [
+                (pid, tid)
+                for pid, tid in self._pane_to_terminal.items()
+                if (m := get_terminal_metadata(tid)) and m.get("tmux_session") == session_name
+            ]
             try:
-                delete_terminals_by_session(session_name)
+                from cli_agent_orchestrator.services import terminal_service
+
+                terminal_service.retire_closed_workspace_session(session_name)
             except Exception as e:
-                logger.warning(
-                    f"workspace.closed: failed to delete terminals for {session_name}: {e}"
-                )
+                logger.warning(f"workspace.closed: managed retirement held for {session_name}: {e}")
+                return
 
             # Prune maps for terminals belonging to this session. Match on each
             # terminal's DB session rather than a pane_id/workspace_id string
             # prefix: herdr renumbers compact pane_ids and does not guarantee
             # they begin with the workspace_id, so a prefix test is unreliable.
             # This mirrors the session match used in the pane.closed handler.
-            to_remove = [
-                (pid, tid)
-                for pid, tid in self._pane_to_terminal.items()
-                if (m := get_terminal_metadata(tid)) and m.get("tmux_session") == session_name
-            ]
             for pid, tid in to_remove:
                 self._pane_to_terminal.pop(pid, None)
                 self._terminal_to_pane.pop(tid, None)

@@ -4,6 +4,7 @@ Consumer: terminal.{id}.status
 """
 
 import asyncio
+import contextlib
 import logging
 import threading
 import time
@@ -83,6 +84,10 @@ class _NativeManagedSendUndeliverable(RuntimeError):
     """
 
 
+class _CallbackCompletionGenerationReplaced(RuntimeError):
+    """The callback receiver changed before any generic delivery effect."""
+
+
 # Statuses that mean "still parked": a transition to anything else is a wake.
 _PARKED_STATUSES = frozenset(
     {TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value, TerminalStatus.IDLE}
@@ -101,6 +106,34 @@ class _WakePreparation:
 
 
 class InboxService:
+    @staticmethod
+    @contextlib.contextmanager
+    def _callback_completion_delivery_claim(messages):
+        """Hold exact supervisor generations across the final pane send."""
+        bound = [message for message in messages if message.callback_completion_key is not None]
+        with contextlib.ExitStack() as claims:
+            for terminal_id, generation in sorted(
+                {(message.receiver_id, message.expected_receiver_generation) for message in bound},
+                key=lambda identity: (identity[0], identity[1] or ""),
+            ):
+                if not generation:
+                    raise _CallbackCompletionGenerationReplaced(
+                        "callback completion lacks its receiver generation"
+                    )
+                claims.enter_context(
+                    callback_recovery.generation_lifecycle_claim(
+                        terminal_id,
+                        generation,
+                    )
+                )
+            if any(
+                not callback_recovery.current_delivery_binding_matches(message) for message in bound
+            ):
+                raise _CallbackCompletionGenerationReplaced(
+                    "the original supervisor generation was replaced"
+                )
+            yield
+
     """Delivers one pending message per terminal per IDLE cycle.
 
     Also owns the unmanaged wake-confirmation watcher (cond-0072 scoped half):
@@ -640,6 +673,14 @@ class InboxService:
                         message.is_identity_bound is True
                         and not callback_recovery.current_delivery_binding_matches(message)
                     ):
+                        if message.callback_completion_key is not None:
+                            logger.warning(
+                                "Preserving generation-bound recovery callback %s for %s: "
+                                "the original supervisor generation is no longer live",
+                                message.id,
+                                terminal_id,
+                            )
+                            continue
                         receipt = None
                         try:
                             receipt = callback_recovery.turn_receipt(message.callback_recovery_key)
@@ -668,7 +709,7 @@ class InboxService:
                             ),
                         )
                         continue
-                    if message.is_identity_bound is True:
+                    if message.callback_recovery_key is not None:
                         bridged = managed_launch.deliver_inbox_via_bridge(
                             terminal_id,
                             message_id=message.id,
@@ -683,11 +724,17 @@ class InboxService:
                             recovery_operation_key=message.callback_recovery_key,
                         )
                     else:
+                        bridge_kwargs = {}
+                        if message.callback_completion_key is not None:
+                            bridge_kwargs["expected_generation"] = (
+                                message.expected_receiver_generation
+                            )
                         bridged = managed_launch.deliver_inbox_via_bridge(
                             terminal_id,
                             message_id=message.id,
                             message=message.message,
                             sender_id=message.sender_id,
+                            **bridge_kwargs,
                         )
                     if bridged:
                         if update_message_status(message.id, MessageStatus.DELIVERED) is False:
@@ -725,9 +772,11 @@ class InboxService:
         # bridge. If its exact managed identity disappeared or changed,
         # preserving the row is the only safe outcome; it must never fall
         # through to native or unmanaged pane delivery.
-        bound_pending = [message for message in messages if message.is_identity_bound is True]
+        bound_pending = [
+            message for message in messages if message.callback_recovery_key is not None
+        ]
         if bound_pending:
-            messages = [message for message in messages if message.is_identity_bound is not True]
+            messages = [message for message in messages if message.callback_recovery_key is None]
             logger.info(
                 "Preserving %d callback-recovery message(s) for %s; no generic "
                 "delivery fallback is permitted",
@@ -821,18 +870,19 @@ class InboxService:
                             )
                             if preparation is not None:
                                 preparations.append(preparation)
-                if native_managed:
-                    self._send_native_managed_text(terminal_id, combined, managed_identity)
-                elif registry is None:
-                    terminal_service.send_input(terminal_id, combined)
-                else:
-                    terminal_service.send_input(
-                        terminal_id,
-                        combined,
-                        registry=registry,
-                        sender_id=sender_id,
-                        orchestration_type=OrchestrationType.SEND_MESSAGE,
-                    )
+                with self._callback_completion_delivery_claim(batch):
+                    if native_managed:
+                        self._send_native_managed_text(terminal_id, combined, managed_identity)
+                    elif registry is None:
+                        terminal_service.send_input(terminal_id, combined)
+                    else:
+                        terminal_service.send_input(
+                            terminal_id,
+                            combined,
+                            registry=registry,
+                            sender_id=sender_id,
+                            orchestration_type=OrchestrationType.SEND_MESSAGE,
+                        )
                 logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
             except TerminalNotFoundError as e:
                 for preparation in preparations:
@@ -879,6 +929,18 @@ class InboxService:
                     f"v1 send for terminal {terminal_id} refused "
                     f"({e.reason_code}) with zero bytes proven; leaving "
                     f"{len(batch)} message(s) pending: {e.detail}"
+                )
+            except _CallbackCompletionGenerationReplaced as e:
+                for preparation in preparations:
+                    self._abort_wake_confirmation(preparation)
+                for message in batch:
+                    update_message_status(message.id, MessageStatus.PENDING)
+                logger.info(
+                    "Callback completion delivery to %s was fenced before pane "
+                    "I/O; leaving %d message(s) pending: %s",
+                    terminal_id,
+                    len(batch),
+                    e,
                 )
             except Exception as e:
                 for preparation in preparations:

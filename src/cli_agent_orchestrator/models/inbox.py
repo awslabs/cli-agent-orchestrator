@@ -61,7 +61,7 @@ class InboxMessage(BaseModel):
     @property
     def is_identity_bound(self) -> bool:
         """Whether this row belongs to the narrow managed-message protocol."""
-        return self.callback_recovery_key is not None
+        return self.callback_recovery_key is not None or self.callback_completion_key is not None
 
 
 class CallbackRecoveryRequest(BaseModel):
@@ -80,6 +80,7 @@ class CallbackRecoveryRequest(BaseModel):
     expected_execution_mode: Literal["acp"]
     supervisor_id: str = Field(min_length=1)
     supervisor_session: str = Field(min_length=1)
+    supervisor_generation: str = Field(min_length=1)
     refusal_control_id: str = Field(min_length=1, max_length=160)
     refusal_occurrence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     refusal_request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

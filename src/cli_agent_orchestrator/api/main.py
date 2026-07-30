@@ -4166,6 +4166,18 @@ def _callback_recovery_response(
     result: callback_recovery.RecoveryAdmission,
 ) -> Dict[str, Any]:
     message, operation = result.message, result.operation
+    if message is None:
+        stored = operation.get("admission_response")
+        if not isinstance(stored, dict):
+            raise callback_recovery.CallbackRecoveryConflict(
+                "terminal recovery lost its immutable admission response"
+            )
+        return {
+            **stored,
+            "outcome": operation["state"],
+            "replayed": True,
+            "proven_zero_bytes": operation["proven_zero_bytes"],
+        }
     return {
         "outcome": operation["state"],
         "operation_key": operation["operation_key"],
@@ -4219,6 +4231,18 @@ async def create_callback_recovery_endpoint(
                 "detail": str(exc),
             },
         )
+    except callback_recovery.CallbackRecoveryAmbiguous as exc:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "outcome": "ambiguous",
+                "reason_code": exc.reason_code,
+                "source_terminal_id": source_terminal_id,
+                "operation_id": body.operation_id,
+                "proven_zero_bytes": False,
+                "detail": str(exc),
+            },
+        )
     except callback_recovery.CallbackRecoveryConflict as exc:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
@@ -4234,18 +4258,21 @@ async def create_callback_recovery_endpoint(
 
     # The operation and row are durable before delivery. Select this exact row
     # so an unrelated backlog can never starve the just-admitted recovery.
-    try:
-        await asyncio.to_thread(
-            inbox_service.deliver_pending,
-            source_terminal_id,
-            0,
-            get_plugin_registry(request),
-            required_message_id=result.message.id,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Immediate callback recovery delivery failed for %s: %s", source_terminal_id, exc
-        )
+    if result.message is not None:
+        try:
+            await asyncio.to_thread(
+                inbox_service.deliver_pending,
+                source_terminal_id,
+                0,
+                get_plugin_registry(request),
+                required_message_id=result.message.id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Immediate callback recovery delivery failed for %s: %s",
+                source_terminal_id,
+                exc,
+            )
     return _callback_recovery_response(result)
 
 
@@ -4347,6 +4374,26 @@ async def create_callback_recovery_callback_endpoint(
             result["message_id"],
             exc,
         )
+    return result
+
+
+@app.get("/callback-recoveries/{operation_key}/callback")
+async def get_callback_recovery_callback_endpoint(
+    operation_key: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
+) -> Any:
+    """Reconcile a dedicated callback POST by immutable completion key."""
+    try:
+        result = await asyncio.to_thread(
+            callback_recovery.callback_receipt,
+            operation_key,
+        )
+    except callback_recovery.CallbackRecoveryNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except callback_recovery.CallbackRecoveryConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if result is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
     return result
 
 

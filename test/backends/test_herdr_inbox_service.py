@@ -854,9 +854,9 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert "pane-3" not in service._pane_to_terminal
 
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service.retire_closed_workspace_session")
     def test_workspace_closed_removes_all_terminals_for_session(
-        self, mock_delete_by_session, mock_meta
+        self, mock_retire_session, mock_meta
     ):
         """workspace.closed prunes terminals by their DB session, not by a
         pane_id/workspace_id string prefix.
@@ -890,8 +890,35 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert "tid3" in service._terminal_to_pane
         # Workspace entry cleaned up
         assert "ws-abc" not in service._workspace_to_session
-        # DB cleanup called
-        mock_delete_by_session.assert_called_once_with("my-session")
+        # Managed generation-aware retirement called
+        mock_retire_session.assert_called_once_with("my-session")
+
+    @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.retire_closed_workspace_session",
+        create=True,
+    )
+    def test_workspace_closed_preserves_session_held_by_callback_recovery(
+        self, mock_retire, mock_raw_delete
+    ):
+        """A closed workspace cannot bypass the managed recovery teardown guard."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            TerminalGenerationMismatchError,
+        )
+
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("worker01", "p-7")
+        service._workspace_to_session["ws-abc"] = "my-session"
+        mock_retire.side_effect = TerminalGenerationMismatchError(
+            "terminal worker01 has an open callback-recovery operation"
+        )
+
+        service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-abc"})
+
+        mock_retire.assert_called_once_with("my-session")
+        mock_raw_delete.assert_not_called()
+        assert service._pane_to_terminal["p-7"] == "worker01"
+        assert service._workspace_to_session["ws-abc"] == "my-session"
 
     @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
     def test_workspace_closed_unknown_workspace_is_noop(self, mock_delete):
@@ -1201,9 +1228,9 @@ class TestHerdrInboxServiceWorkspaceClosedLiveResolution:
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
-    @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service.retire_closed_workspace_session")
     def test_workspace_closed_resolves_uncached_workspace_from_live_herdr(
-        self, mock_delete_by_session, mock_meta, mock_run
+        self, mock_retire_session, mock_meta, mock_run
     ):
         """workspace_id NOT in the in-memory map is resolved via herdr workspace
         list, then the session's terminals are deleted."""
@@ -1229,7 +1256,7 @@ class TestHerdrInboxServiceWorkspaceClosedLiveResolution:
         service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-new"})
 
         # Resolved live -> session terminals deleted despite empty in-memory map.
-        mock_delete_by_session.assert_called_once_with("sess-new")
+        mock_retire_session.assert_called_once_with("sess-new")
         # Map pruned for the closed session's terminal.
         assert "p-1" not in service._pane_to_terminal
         assert "tid1" not in service._terminal_to_pane

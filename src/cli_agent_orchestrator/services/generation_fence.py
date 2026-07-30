@@ -300,3 +300,18 @@ def admission_critical_section(
     with _generation_lock(directory):
         assert_admission_open(companion_dir, terminal_id, generation)
         yield
+
+
+@contextmanager
+def reconciliation_critical_section(
+    companion_dir: Path, terminal_id: str, generation: str
+) -> Iterator[None]:
+    """Serialize zero-effect reconciliation with provider admission.
+
+    Unlike :func:`admission_critical_section`, this lock remains usable after
+    a W13 fence is installed.  Its caller is observing/finalizing an exact
+    message outcome rather than attempting new provider I/O.
+    """
+    directory = Path(companion_dir) / terminal_id / generation
+    with _generation_lock(directory):
+        yield
