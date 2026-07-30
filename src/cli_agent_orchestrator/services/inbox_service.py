@@ -29,6 +29,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
+    bound_inbox_message,
     control_input_service,
     managed_launch,
     terminal_service,
@@ -629,12 +630,38 @@ class InboxService:
                     # the provider's durable message-id journal.
                     if not is_message_pending(message.id):
                         continue
-                    bridged = managed_launch.deliver_inbox_via_bridge(
-                        terminal_id,
-                        message_id=message.id,
-                        message=message.message,
-                        sender_id=message.sender_id,
-                    )
+                    if (
+                        message.is_identity_bound is True
+                        and not bound_inbox_message.current_delivery_binding_matches(message)
+                    ):
+                        logger.warning(
+                            "Preserving identity-bound inbox message %s for %s: "
+                            "the persisted managed generation/session/mode no "
+                            "longer matches the live receiver",
+                            message.id,
+                            terminal_id,
+                        )
+                        remaining.append(message)
+                        continue
+                    if message.is_identity_bound is True:
+                        bridged = managed_launch.deliver_inbox_via_bridge(
+                            terminal_id,
+                            message_id=message.id,
+                            message=message.message,
+                            sender_id=message.sender_id,
+                            sender_generation=message.sender_generation,
+                            message_created_at=message.created_at,
+                            expected_generation=message.expected_receiver_generation,
+                            expected_provider_session_id=(message.expected_provider_session_id),
+                            expected_execution_mode=message.expected_execution_mode,
+                        )
+                    else:
+                        bridged = managed_launch.deliver_inbox_via_bridge(
+                            terminal_id,
+                            message_id=message.id,
+                            message=message.message,
+                            sender_id=message.sender_id,
+                        )
                     if bridged:
                         if update_message_status(message.id, MessageStatus.DELIVERED) is False:
                             logger.warning(
@@ -665,6 +692,21 @@ class InboxService:
                 finally:
                     lock.release()
         messages = remaining
+        if not messages:
+            return
+        # A bound operation belongs exclusively to the ACP provider bridge.
+        # If its exact managed identity disappeared or changed, preserving the
+        # row is the only safe outcome; it must never fall through to native or
+        # unmanaged pane delivery.
+        bound_pending = [message for message in messages if message.is_identity_bound is True]
+        if bound_pending:
+            messages = [message for message in messages if message.is_identity_bound is not True]
+            logger.info(
+                "Preserving %d identity-bound message(s) for %s; no generic "
+                "delivery fallback is permitted",
+                len(bound_pending),
+                terminal_id,
+            )
         if not messages:
             return
         if managed_identity is not None and not native_managed:

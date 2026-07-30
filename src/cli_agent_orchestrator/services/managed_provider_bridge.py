@@ -2281,11 +2281,30 @@ class _ProviderSession:
         except generation_fence.FencedError as exc:
             raise BridgeError(str(exc)) from exc
         submitted_at = _now()
-        companion_receipts.record_message_ack(
-            self.request["terminal_id"],
-            self.request["generation"],
-            message_id=message_id,
-            ack={
+        ack: dict[str, Any]
+        if command.get("sender_generation") and command.get("message_created_at"):
+            from datetime import datetime, timezone
+
+            from cli_agent_orchestrator.services import model_turn_receipt_contract
+
+            created_at = datetime.fromisoformat(command["message_created_at"])
+            if created_at.utcoffset() is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            ack = model_turn_receipt_contract.build_receipt(
+                message_id=message_id,
+                message_sha256=command["message_sha256"],
+                message_created_at=created_at,
+                sender_id=command["sender_id"],
+                sender_generation=command["sender_generation"],
+                receiver_id=self.request["terminal_id"],
+                receiver_generation=self.request["generation"],
+                provider=self.provider,
+                provider_session_id=self.provider_session_id,
+                provider_turn_id=provider_turn_id,
+                submitted_at=datetime.fromisoformat(submitted_at.removesuffix("Z") + "+00:00"),
+            )
+        else:
+            ack = {
                 "kind": "submitted",
                 "message_id": message_id,
                 "message_sha256": command["message_sha256"],
@@ -2296,7 +2315,12 @@ class _ProviderSession:
                 "provider_session_id": self.provider_session_id,
                 "provider_turn_id": provider_turn_id,
                 "submitted_at": submitted_at,
-            },
+            }
+        companion_receipts.record_message_ack(
+            self.request["terminal_id"],
+            self.request["generation"],
+            message_id=message_id,
+            ack=ack,
         )
         # The per-turn route identity (§18.9) moves to this exact turn.
         companion_receipts.record_route_receipt(

@@ -1,5 +1,26 @@
 # Inbox Delivery
 
+## Identity-bound managed messages
+
+`POST /terminals/{receiver}/inbox/bound-messages` is the narrow conductor
+surface for one ordinary message to an exact managed ACP generation. Its JSON
+body carries a caller operation id, exact message digest, sender generation,
+receiver generation, provider session, and execution mode. CAO takes the
+SQLite writer lock before comparing the live managed identity and inserting
+the inbox row, so replacement cannot commit between those two acts. The
+operation id is unique: an exact retry returns the original row and any
+different payload or binding is refused before a row or provider byte.
+
+The persisted binding is rechecked before provider delivery. A mismatch keeps
+the row pending and bound rows never fall through to native-TUI or unmanaged
+pane delivery. Reconciliation uses
+`GET /terminals/{receiver}/inbox/bound-messages/{operation_id}` and the sibling
+`/turn-receipt` route; both read the operation's immutable generation rather
+than requiring a still-live terminal. The latter returns only the strict
+`cao-model-turn-receipt-v1` provider-adapter acknowledgement for bound rows.
+
+The existing generic `/inbox/messages` contract is unchanged.
+
 ## Overview
 
 When an agent calls `send_message(terminal_id, message)`, the message is queued in the database and delivered to the target terminal's input area via bracketed paste. Delivery has two paths:

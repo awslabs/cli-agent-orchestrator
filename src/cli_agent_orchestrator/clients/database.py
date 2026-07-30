@@ -115,6 +115,15 @@ class InboxModel(Base):
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(DateTime, default=datetime.now)
+    # Nullable keeps the original generic inbox protocol byte-compatible.
+    # The narrow managed-message protocol fills every field and uses the
+    # operation id as its server-side idempotency key.
+    operation_id = Column(Text, nullable=True, unique=True)
+    message_sha256 = Column(Text, nullable=True)
+    sender_generation = Column(Text, nullable=True)
+    expected_receiver_generation = Column(Text, nullable=True)
+    expected_provider_session_id = Column(Text, nullable=True)
+    expected_execution_mode = Column(Text, nullable=True)
 
 
 def _utcnow() -> datetime:
@@ -614,6 +623,7 @@ def init_db() -> None:
     )
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
+    _migrate_inbox_bound_message_schema()
     _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
@@ -1291,6 +1301,34 @@ def _migrate_terminals_schema() -> None:
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
+
+
+def _migrate_inbox_bound_message_schema() -> None:
+    """Add the nullable identity-bound inbox columns to an existing database."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    columns = (
+        ("operation_id", "TEXT"),
+        ("message_sha256", "TEXT"),
+        ("sender_generation", "TEXT"),
+        ("expected_receiver_generation", "TEXT"),
+        ("expected_provider_session_id", "TEXT"),
+        ("expected_execution_mode", "TEXT"),
+    )
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            present = {row[1] for row in conn.execute("PRAGMA table_info(inbox)")}
+            for name, ddl in columns:
+                if name not in present:
+                    conn.execute(f"ALTER TABLE inbox ADD COLUMN {name} {ddl}")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_inbox_operation_id "
+                "ON inbox(operation_id) WHERE operation_id IS NOT NULL"
+            )
+    except Exception as exc:  # noqa: BLE001 - bound-message path fails closed
+        logger.warning("bound inbox-message migration failed: %s", exc)
 
 
 def create_terminal(
@@ -2402,14 +2440,25 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
         db.add(inbox_msg)
         db.commit()
         db.refresh(inbox_msg)
-        return InboxMessage(
-            id=inbox_msg.id,
-            sender_id=inbox_msg.sender_id,
-            receiver_id=inbox_msg.receiver_id,
-            message=inbox_msg.message,
-            status=MessageStatus(inbox_msg.status),
-            created_at=inbox_msg.created_at,
-        )
+        return _inbox_message_from_row(inbox_msg)
+
+
+def _inbox_message_from_row(row: Any) -> InboxMessage:
+    """Project both legacy and identity-bound inbox rows."""
+    return InboxMessage(
+        id=row.id,
+        sender_id=row.sender_id,
+        receiver_id=row.receiver_id,
+        message=row.message,
+        status=MessageStatus(row.status),
+        created_at=row.created_at,
+        operation_id=getattr(row, "operation_id", None),
+        message_sha256=getattr(row, "message_sha256", None),
+        sender_generation=getattr(row, "sender_generation", None),
+        expected_receiver_generation=getattr(row, "expected_receiver_generation", None),
+        expected_provider_session_id=getattr(row, "expected_provider_session_id", None),
+        expected_execution_mode=getattr(row, "expected_execution_mode", None),
+    )
 
 
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
@@ -2452,17 +2501,7 @@ def get_inbox_messages(
 
         messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
 
-        return [
-            InboxMessage(
-                id=msg.id,
-                sender_id=msg.sender_id,
-                receiver_id=msg.receiver_id,
-                message=msg.message,
-                status=MessageStatus(msg.status),
-                created_at=msg.created_at,
-            )
-            for msg in messages
-        ]
+        return [_inbox_message_from_row(msg) for msg in messages]
 
 
 def record_project_alias(project_id: str, alias: str, kind: str) -> None:

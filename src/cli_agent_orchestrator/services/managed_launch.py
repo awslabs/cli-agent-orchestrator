@@ -1251,6 +1251,11 @@ def deliver_inbox_via_bridge(
     message_id: Any,
     message: str,
     sender_id: Optional[str],
+    sender_generation: Optional[str] = None,
+    message_created_at: Optional[datetime] = None,
+    expected_generation: Optional[str] = None,
+    expected_provider_session_id: Optional[str] = None,
+    expected_execution_mode: Optional[str] = None,
 ) -> bool:
     """P1-7 (final conformance §20.2f): deliver one exact queued inbox message
     through the receiver's live managed provider bridge, producing the
@@ -1262,12 +1267,31 @@ def deliver_inbox_via_bridge(
     bridge is unavailable — the caller then uses the ordinary delivery path
     and NO acknowledgement is inferred from it.
     """
+    from cli_agent_orchestrator.services import bound_inbox_message
     from cli_agent_orchestrator.services.managed_provider_bridge import request_bridge
 
     try:
         identity = managed_control_identity(terminal_id)
         if identity is None or identity["state"] != "admitted":
             return False
+        expected = (
+            expected_generation,
+            expected_provider_session_id,
+            expected_execution_mode,
+        )
+        if any(value is not None for value in expected):
+            if any(not isinstance(value, str) or not value for value in expected):
+                return False
+            assert isinstance(expected_generation, str)
+            assert isinstance(expected_provider_session_id, str)
+            assert isinstance(expected_execution_mode, str)
+            if not bound_inbox_message.binding_matches(
+                terminal_id,
+                generation=expected_generation,
+                provider_session_id=expected_provider_session_id,
+                execution_mode=expected_execution_mode,
+            ):
+                return False
         reservation_id = identity["reservation_id"]
         request_bridge(
             reservation_id,
@@ -1281,6 +1305,12 @@ def deliver_inbox_via_bridge(
                 "message": message,
                 "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
                 "sender_id": sender_id,
+                "sender_generation": sender_generation,
+                "message_created_at": (
+                    message_created_at.isoformat()
+                    if isinstance(message_created_at, datetime)
+                    else None
+                ),
             },
             timeout=30.0,
         )

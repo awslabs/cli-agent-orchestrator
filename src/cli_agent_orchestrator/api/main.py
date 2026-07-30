@@ -78,7 +78,11 @@ from cli_agent_orchestrator.graph.providers import get_provider
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
 from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.flow import Flow
-from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import (
+    BoundInboxMessageRequest,
+    MessageStatus,
+    OrchestrationType,
+)
 from cli_agent_orchestrator.models.managed_launch import (
     PROTOCOL_VERSION as MANAGED_LAUNCH_PROTOCOL_VERSION,
 )
@@ -118,6 +122,7 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.services import (
+    bound_inbox_message,
     companion_receipts,
     control_input_service,
     flow_service,
@@ -4151,6 +4156,94 @@ async def create_inbox_message_endpoint(
         "receiver_id": inbox_msg.receiver_id,
         "created_at": inbox_msg.created_at.isoformat(),
     }
+
+
+def _bound_inbox_response(
+    result: bound_inbox_message.BoundInboxResult,
+) -> Dict[str, Any]:
+    message = result.message
+    return {
+        "outcome": "accepted",
+        "operation_id": message.operation_id,
+        "message_id": message.id,
+        "message_sha256": message.message_sha256,
+        "sender_id": message.sender_id,
+        "sender_generation": message.sender_generation,
+        "receiver_id": message.receiver_id,
+        "receiver_generation": message.expected_receiver_generation,
+        "provider_session_id": message.expected_provider_session_id,
+        "execution_mode": message.expected_execution_mode,
+        "created_at": message.created_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "status": message.status.value,
+        "replayed": result.replayed,
+    }
+
+
+@app.post("/terminals/{receiver_id}/inbox/bound-messages")
+async def create_bound_inbox_message_endpoint(
+    request: Request,
+    receiver_id: TerminalId,
+    body: BoundInboxMessageRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Atomically bind and enqueue one idempotent managed ACP message."""
+    try:
+        result = bound_inbox_message.enqueue(receiver_id, body)
+    except bound_inbox_message.BoundInboxConflict as exc:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "outcome": "refused",
+                "reason_code": exc.reason_code,
+                "receiver_id": receiver_id,
+                "operation_id": body.operation_id,
+                "proven_zero_bytes": True,
+                "detail": str(exc),
+            },
+        )
+
+    # The row is durable before delivery begins. Delivery revalidates the
+    # row's persisted binding at the provider-I/O boundary.
+    try:
+        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
+    except Exception as exc:
+        logger.warning("Immediate bound inbox delivery failed for %s: %s", receiver_id, exc)
+    return _bound_inbox_response(result)
+
+
+@app.get("/terminals/{receiver_id}/inbox/bound-messages/{operation_id}")
+async def get_bound_inbox_message_endpoint(
+    receiver_id: TerminalId,
+    operation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Reconcile one server-journaled operation without a live identity read."""
+    try:
+        message = bound_inbox_message.get(receiver_id, operation_id)
+    except bound_inbox_message.BoundInboxNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    return _bound_inbox_response(
+        bound_inbox_message.BoundInboxResult(message=message, replayed=True)
+    )
+
+
+@app.get("/terminals/{receiver_id}/inbox/bound-messages/{operation_id}/turn-receipt")
+async def get_bound_inbox_message_turn_receipt(
+    receiver_id: TerminalId,
+    operation_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_ADMIN)),
+):
+    """Read the receipt through the operation's immutable generation binding."""
+    try:
+        message = bound_inbox_message.get(receiver_id, operation_id)
+    except bound_inbox_message.BoundInboxNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    ack = companion_receipts.get_message_ack(
+        receiver_id, message.expected_receiver_generation, message.id
+    )
+    if ack is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return ack
 
 
 @app.get("/terminals/{terminal_id}/inbox/messages")
