@@ -331,6 +331,11 @@ def test_deliver_inbox_records_exact_provider_turn_ack(tmp_path, monkeypatch):
         "message": "ping",
         "message_sha256": hashlib.sha256(b"ping").hexdigest(),
         "sender_id": "cafebabe",
+        "sender_generation": "supervisor-generation",
+        "message_created_at": "2026-07-30T12:00:00.000000Z",
+        "expected_provider": "codex",
+        "expected_provider_session_id": "thread_provider_opaque",
+        "expected_execution_mode": "acp",
     }
     receipt = session.deliver_inbox(command)
     assert receipt["provider_turn_id"] == "turn_provider_opaque"
@@ -339,6 +344,9 @@ def test_deliver_inbox_records_exact_provider_turn_ack(tmp_path, monkeypatch):
 
     ack = companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-1")
     assert ack["kind"] == "submitted"
+    assert ack["schema"] == "cao-model-turn-receipt-v1"
+    assert ack["source"] == "provider-adapter"
+    assert ack["sender_generation"] == "supervisor-generation"
     assert ack["message_sha256"] == command["message_sha256"]
     assert ack["receiver_generation"] == request["generation"]
     assert ack["provider_session_id"] == "thread_provider_opaque"
@@ -357,9 +365,25 @@ def test_deliver_inbox_records_exact_provider_turn_ack(tmp_path, monkeypatch):
         session.deliver_inbox({**command, "message_id": "msg-2", "message_sha256": "0" * 64})
     with pytest.raises(bridge.BridgeError):
         session.deliver_inbox({**command, "message_id": "msg-3", "reservation_id": "gen-X"})
+    provider_submissions = []
+    monkeypatch.setattr(
+        session,
+        "_submit_provider_turn",
+        lambda *args, **kwargs: provider_submissions.append((args, kwargs)),
+    )
+    with pytest.raises(bridge.BridgeError, match="provider_session_id changed"):
+        session.deliver_inbox(
+            {
+                **command,
+                "message_id": "msg-4",
+                "expected_provider_session_id": "replacement-session",
+            }
+        )
+    assert provider_submissions == []
     # the refused messages recorded no ack
     assert companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-2") is None
     assert companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-3") is None
+    assert companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-4") is None
 
 
 def test_reverse_request_prompt_lifecycle_is_observation_only(tmp_path, monkeypatch):

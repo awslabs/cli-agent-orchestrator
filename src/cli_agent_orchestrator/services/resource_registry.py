@@ -925,11 +925,11 @@ _TS_MARK = f"{_TS}:945"  # registry.register_created in _mark_v2_resource_create
 _TS_MONITOR = f"{_TS}:913"  # registry.monitor in _register_v2_terminal_resources
 _TS_REUSE_DELETE = f"{_TS}:1042"  # registry.delete in _retire_reused_tmux_observation
 _TS_DELETE = f"{_TS}:1282"  # registry.delete in _deregister_v2_terminal_resources
-_CS_RESOLVE = f"{_CS}:112"  # registry.resolve_fs_path in cleanup_old_data
-_BR_DECLARE = f"{_BR}:3068"  # registry.declare in _declare_bridge_resources
-_BR_MARK = f"{_BR}:3112"  # registry.register_created in _mark_bridge_resource_created
-_BR_JOURNAL_MARK = f"{_BR}:3136"  # registry.register_created in _mark_bridge_journal_created
-_BR_DELETE = f"{_BR}:3289"  # registry.delete in _deregister_bridge_resources
+_CS_RESOLVE = f"{_CS}:155"  # registry.resolve_fs_path in cleanup_old_data
+_BR_DECLARE = f"{_BR}:3077"  # registry.declare in _declare_bridge_resources
+_BR_MARK = f"{_BR}:3121"  # registry.register_created in _mark_bridge_resource_created
+_BR_JOURNAL_MARK = f"{_BR}:3145"  # registry.register_created in _mark_bridge_journal_created
+_BR_DELETE = f"{_BR}:3298"  # registry.delete in _deregister_bridge_resources
 
 _MANIFEST_SPEC: tuple[tuple[str, str, str, str], ...] = (
     # --- terminal log artifacts (constructor + generation deleter + retention)

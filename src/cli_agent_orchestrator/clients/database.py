@@ -116,14 +116,57 @@ class InboxModel(Base):
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(DateTime, default=datetime.now)
     # Nullable keeps the original generic inbox protocol byte-compatible.
-    # The narrow managed-message protocol fills every field and uses the
-    # operation id as its server-side idempotency key.
-    operation_id = Column(Text, nullable=True, unique=True)
+    # These fields are populated only by the dedicated callback-recovery path.
     message_sha256 = Column(Text, nullable=True)
     sender_generation = Column(Text, nullable=True)
     expected_receiver_generation = Column(Text, nullable=True)
     expected_provider_session_id = Column(Text, nullable=True)
     expected_execution_mode = Column(Text, nullable=True)
+    expected_provider = Column(Text, nullable=True)
+    callback_recovery_key = Column(Text, nullable=True, unique=True)
+
+
+class CallbackRecoveryModel(Base):
+    """One terminal refusal authorizing one exact callback recovery lifecycle."""
+
+    __tablename__ = "callback_recovery_operations"
+
+    operation_key = Column(Text, primary_key=True)
+    operation_id = Column(Text, nullable=False)
+    workflow_identity_sha256 = Column(Text, nullable=False)
+    recovery_identity_sha256 = Column(Text, nullable=False, unique=True)
+    state = Column(Text, nullable=False)
+    reason_code = Column(Text, nullable=True)
+    project = Column(Text, nullable=False)
+    task_id = Column(Text, nullable=False)
+    run_id = Column(Text, nullable=False)
+    source_terminal_id = Column(Text, nullable=False)
+    source_generation = Column(Text, nullable=False)
+    expected_provider = Column(Text, nullable=False)
+    expected_provider_session_id = Column(Text, nullable=False)
+    expected_execution_mode = Column(Text, nullable=False)
+    supervisor_id = Column(Text, nullable=False)
+    supervisor_session = Column(Text, nullable=False)
+    refusal_control_id = Column(Text, nullable=False)
+    refusal_occurrence_sha256 = Column(Text, nullable=False)
+    refusal_request_sha256 = Column(Text, nullable=False)
+    callback_occurrence_id = Column(Text, nullable=False)
+    callback_message_sha256 = Column(Text, nullable=False)
+    report_path = Column(Text, nullable=False)
+    report_sha256 = Column(Text, nullable=False)
+    source_head = Column(Text, nullable=False)
+    publishing_lease_state = Column(Text, nullable=False)
+    publishing_lease_sha256 = Column(Text, nullable=False)
+    manifest_path = Column(Text, nullable=False)
+    manifest_sha256 = Column(Text, nullable=False)
+    finalization_identity_sha256 = Column(Text, nullable=False)
+    request_sha256 = Column(Text, nullable=False)
+    inbox_message_id = Column(Integer, nullable=True, unique=True)
+    provider_turn_receipt_json = Column(Text, nullable=True)
+    callback_message_id = Column(Integer, nullable=True, unique=True)
+    completion_json = Column(Text, nullable=True)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
 
 
 def _utcnow() -> datetime:
@@ -623,7 +666,8 @@ def init_db() -> None:
     )
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
-    _migrate_inbox_bound_message_schema()
+    _migrate_callback_recovery_inbox_schema()
+    _migrate_callback_recovery_schema()
     _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
@@ -1303,19 +1347,20 @@ def _migrate_terminals_schema() -> None:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 
 
-def _migrate_inbox_bound_message_schema() -> None:
-    """Add the nullable identity-bound inbox columns to an existing database."""
+def _migrate_callback_recovery_inbox_schema() -> None:
+    """Add dedicated callback-recovery bindings to an existing inbox table."""
     import sqlite3
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     columns = (
-        ("operation_id", "TEXT"),
         ("message_sha256", "TEXT"),
         ("sender_generation", "TEXT"),
         ("expected_receiver_generation", "TEXT"),
         ("expected_provider_session_id", "TEXT"),
         ("expected_execution_mode", "TEXT"),
+        ("expected_provider", "TEXT"),
+        ("callback_recovery_key", "TEXT"),
     )
     try:
         with sqlite3.connect(str(DATABASE_FILE)) as conn:
@@ -1324,11 +1369,23 @@ def _migrate_inbox_bound_message_schema() -> None:
                 if name not in present:
                     conn.execute(f"ALTER TABLE inbox ADD COLUMN {name} {ddl}")
             conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS ix_inbox_operation_id "
-                "ON inbox(operation_id) WHERE operation_id IS NOT NULL"
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_inbox_callback_recovery_key "
+                "ON inbox(callback_recovery_key) WHERE callback_recovery_key IS NOT NULL"
             )
-    except Exception as exc:  # noqa: BLE001 - bound-message path fails closed
-        logger.warning("bound inbox-message migration failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - callback recovery fails closed
+        logger.warning("callback-recovery inbox migration failed: %s", exc)
+
+
+def _migrate_callback_recovery_schema() -> None:
+    """Create the dedicated refusal/callback recovery operation store."""
+    # Fresh and existing databases are both handled by SQLAlchemy create_all.
+    # This function intentionally remains as a named migration boundary so an
+    # older install that cannot create the table fails the recovery surface
+    # closed instead of silently falling back to ordinary inbox delivery.
+    try:
+        CallbackRecoveryModel.__table__.create(bind=engine, checkfirst=True)
+    except Exception as exc:  # noqa: BLE001 - operation reads fail closed
+        logger.warning("callback recovery migration failed: %s", exc)
 
 
 def create_terminal(
@@ -2452,12 +2509,13 @@ def _inbox_message_from_row(row: Any) -> InboxMessage:
         message=row.message,
         status=MessageStatus(row.status),
         created_at=row.created_at,
-        operation_id=getattr(row, "operation_id", None),
         message_sha256=getattr(row, "message_sha256", None),
         sender_generation=getattr(row, "sender_generation", None),
         expected_receiver_generation=getattr(row, "expected_receiver_generation", None),
         expected_provider_session_id=getattr(row, "expected_provider_session_id", None),
         expected_execution_mode=getattr(row, "expected_execution_mode", None),
+        expected_provider=getattr(row, "expected_provider", None),
+        callback_recovery_key=getattr(row, "callback_recovery_key", None),
     )
 
 

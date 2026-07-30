@@ -49,6 +49,8 @@ def validate_receipt(payload: Any, *, expected: Mapping[str, Any] | None = None)
             raise ReceiptValidationError(f"receipt field {field} is not a nonempty string")
     if _DIGEST.fullmatch(payload["message_sha256"]) is None:
         raise ReceiptValidationError("receipt message digest is invalid")
+    if not payload["message_created_at"].endswith("Z") or not payload["submitted_at"].endswith("Z"):
+        raise ReceiptValidationError("receipt timestamps must use canonical UTC Z form")
     try:
         created = datetime.fromisoformat(payload["message_created_at"].removesuffix("Z") + "+00:00")
         submitted = datetime.fromisoformat(payload["submitted_at"].removesuffix("Z") + "+00:00")

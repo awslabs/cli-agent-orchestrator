@@ -4,7 +4,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
+from cli_agent_orchestrator.clients.database import (
+    CallbackRecoveryModel,
+    InboxModel,
+    SessionLocal,
+    TerminalModel,
+)
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
     MEMORY_BASE_DIR,
@@ -16,6 +21,44 @@ from cli_agent_orchestrator.services.memory_format import parse_index_entry
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 logger = logging.getLogger(__name__)
+
+
+def _callback_recovery_table_absent(exc: Exception) -> bool:
+    return "no such table: callback_recovery_operations" in str(exc).lower()
+
+
+def _terminal_has_open_callback_recovery(db, terminal_id, generation) -> bool:
+    query = db.query(CallbackRecoveryModel).filter(
+        CallbackRecoveryModel.source_terminal_id == terminal_id,
+        CallbackRecoveryModel.state.in_(("intent", "pending", "recovery-submitted", "ambiguous")),
+    )
+    if generation is not None:
+        query = query.filter(CallbackRecoveryModel.source_generation == generation)
+    try:
+        return query.first() is not None
+    except Exception as exc:  # old databases legitimately predate this table
+        if _callback_recovery_table_absent(exc):
+            return False
+        raise
+
+
+def _held_callback_recovery_inbox_ids(db) -> set[int]:
+    try:
+        return {
+            row[0]
+            for row in db.query(CallbackRecoveryModel.inbox_message_id)
+            .filter(
+                CallbackRecoveryModel.state.in_(
+                    ("intent", "pending", "recovery-submitted", "ambiguous")
+                )
+                & CallbackRecoveryModel.inbox_message_id.is_not(None)
+            )
+            .all()
+        }
+    except Exception as exc:  # old databases legitimately predate this table
+        if _callback_recovery_table_absent(exc):
+            return set()
+        raise
 
 
 def _v2_terminal_identities(db) -> tuple[set, set]:
@@ -138,6 +181,12 @@ def cleanup_old_data():
             )
             deleted_terminals = 0
             for terminal in old_terminals:
+                if _terminal_has_open_callback_recovery(db, terminal.id, terminal.generation):
+                    logger.warning(
+                        "cleanup skipped terminal %s; callback recovery is open",
+                        terminal.id,
+                    )
+                    continue
                 if _is_v2_owned_row(terminal, v2_ids, v2_generations):
                     logger.warning(
                         f"cleanup skipped managed/v2-owned terminal row {terminal.id}; "
@@ -153,9 +202,11 @@ def cleanup_old_data():
 
         # Clean up old inbox messages
         with SessionLocal() as db:
-            deleted_messages = (
-                db.query(InboxModel).filter(InboxModel.created_at < cutoff_date).delete()
-            )
+            held_ids = _held_callback_recovery_inbox_ids(db)
+            query = db.query(InboxModel).filter(InboxModel.created_at < cutoff_date)
+            if held_ids:
+                query = query.filter(InboxModel.id.not_in(held_ids))
+            deleted_messages = query.delete(synchronize_session=False)
             db.commit()
             logger.info(f"Deleted {deleted_messages} old inbox messages from database")
 

@@ -295,6 +295,70 @@ class TestDeliverPending:
         stored = database.get_inbox_messages("term-race", limit=10)
         assert [(row.id, row.status) for row in stored] == [(message.id, MessageStatus.DELIVERED)]
 
+    def test_stale_callback_recovery_cannot_starve_next_exact_row(self, monkeypatch):
+        common = {
+            "sender_id": "supervisor",
+            "receiver_id": "worker",
+            "status": MessageStatus.PENDING,
+            "created_at": datetime.now(),
+            "sender_generation": "supervisor-generation",
+            "expected_receiver_generation": "worker-generation",
+            "expected_provider_session_id": "provider-session",
+            "expected_execution_mode": "acp",
+            "expected_provider": "codex",
+        }
+        stale = InboxMessage(
+            id=1,
+            message="stale",
+            callback_recovery_key="recovery-stale",
+            **common,
+        )
+        current = InboxMessage(
+            id=2,
+            message="current",
+            callback_recovery_key="recovery-current",
+            **common,
+        )
+        monkeypatch.setattr(
+            inbox_service, "get_pending_messages", lambda *_args, **_kwargs: [stale, current]
+        )
+        monkeypatch.setattr(inbox_service, "is_message_pending", lambda _id: True)
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "managed_control_identity",
+            lambda _terminal: {"execution_mode": "acp"},
+        )
+        checks = iter((False, True))
+        monkeypatch.setattr(
+            inbox_service.callback_recovery,
+            "current_delivery_binding_matches",
+            lambda _message: next(checks),
+        )
+        refused = []
+        monkeypatch.setattr(
+            inbox_service.callback_recovery,
+            "mark_delivery_refused",
+            lambda key, **kwargs: refused.append((key, kwargs["reason_code"])),
+        )
+        bridged = []
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            lambda terminal, **kwargs: bridged.append((terminal, kwargs)) or True,
+        )
+        updates = []
+        monkeypatch.setattr(
+            inbox_service,
+            "update_message_status",
+            lambda message_id, status: updates.append((message_id, status)) or True,
+        )
+
+        InboxService().deliver_pending("worker", num_messages=0)
+
+        assert refused == [("recovery-stale", "source-generation-replaced")]
+        assert [item[1]["recovery_operation_key"] for item in bridged] == ["recovery-current"]
+        assert updates == [(2, MessageStatus.DELIVERED)]
+
 
 class TestEagerInboxDelivery:
     """Tests for eager inbox delivery (CAO_EAGER_INBOX_DELIVERY).

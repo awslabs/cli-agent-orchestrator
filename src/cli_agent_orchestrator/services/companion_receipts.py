@@ -31,6 +31,11 @@ from cli_agent_orchestrator.constants import COMPANION_DIR
 logger = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = 1
+_STRICT_ENVELOPE_SCHEMA = "cao-model-turn-receipt-envelope-v1"
+
+
+class CompanionReceiptInvalid(RuntimeError):
+    """A strict receipt store is malformed or internally contradictory."""
 
 
 def _utcnow() -> str:
@@ -61,6 +66,30 @@ def _load(path: Path) -> dict[str, Any]:
     data.setdefault("prompt", None)
     data.setdefault("refusal", None)
     data.setdefault("message_acks", {})
+    return data
+
+
+def _reject_duplicate_pairs(pairs):
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise CompanionReceiptInvalid(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
+
+
+def _load_strict(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw, object_pairs_hook=_reject_duplicate_pairs)
+    except CompanionReceiptInvalid:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CompanionReceiptInvalid("strict companion receipt store is unreadable") from exc
+    if not isinstance(data, dict) or data.get("schema_version") != _SCHEMA_VERSION:
+        raise CompanionReceiptInvalid("strict companion receipt store has an unknown shape")
+    if not isinstance(data.get("message_acks"), dict):
+        raise CompanionReceiptInvalid("strict companion receipt map is malformed")
     return data
 
 
@@ -214,7 +243,17 @@ def record_message_ack(
         acks = record.setdefault("message_acks", {})
         if key in acks:
             return  # no replay: the first exact acknowledgement stands
-        acks[key] = {**ack, "recorded_at": _utcnow()}
+        if ack.get("schema") == "cao-model-turn-receipt-v1":
+            from cli_agent_orchestrator.services import model_turn_receipt_contract
+
+            strict = model_turn_receipt_contract.validate_receipt(ack)
+            acks[key] = {
+                "schema": _STRICT_ENVELOPE_SCHEMA,
+                "receipt": strict,
+                "recorded_at": _utcnow(),
+            }
+        else:
+            acks[key] = {**ack, "recorded_at": _utcnow()}
 
     _mutate(terminal_id, generation, mutate)
 
@@ -253,4 +292,38 @@ def get_message_ack(
     if record is None:
         return None
     ack = (record.get("message_acks") or {}).get(str(message_id))
-    return ack if isinstance(ack, dict) else None
+    if not isinstance(ack, dict):
+        return None
+    if ack.get("schema") == _STRICT_ENVELOPE_SCHEMA:
+        receipt = ack.get("receipt")
+        return receipt if isinstance(receipt, dict) else None
+    return ack
+
+
+def get_strict_message_ack(
+    terminal_id: str, generation: Optional[str], message_id: Any
+) -> Optional[dict[str, str]]:
+    """Return the exact 14-field receipt, never its storage metadata envelope."""
+    if not generation:
+        return None
+    path = _record_path(terminal_id, generation)
+    if not path.exists():
+        return None
+    record = _load_strict(path)
+    stored = record["message_acks"].get(str(message_id))
+    if stored is None:
+        return None
+    if (
+        not isinstance(stored, dict)
+        or set(stored) != {"schema", "receipt", "recorded_at"}
+        or stored.get("schema") != _STRICT_ENVELOPE_SCHEMA
+        or not isinstance(stored.get("recorded_at"), str)
+        or not stored["recorded_at"]
+    ):
+        raise CompanionReceiptInvalid("strict receipt storage envelope is malformed")
+    from cli_agent_orchestrator.services import model_turn_receipt_contract
+
+    try:
+        return model_turn_receipt_contract.validate_receipt(stored.get("receipt"))
+    except model_turn_receipt_contract.ReceiptValidationError as exc:
+        raise CompanionReceiptInvalid("stored strict receipt is invalid") from exc

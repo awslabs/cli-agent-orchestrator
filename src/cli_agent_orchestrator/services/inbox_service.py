@@ -29,7 +29,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
-    bound_inbox_message,
+    callback_recovery,
     control_input_service,
     managed_launch,
     terminal_service,
@@ -632,7 +632,7 @@ class InboxService:
                         continue
                     if (
                         message.is_identity_bound is True
-                        and not bound_inbox_message.current_delivery_binding_matches(message)
+                        and not callback_recovery.current_delivery_binding_matches(message)
                     ):
                         logger.warning(
                             "Preserving identity-bound inbox message %s for %s: "
@@ -641,7 +641,13 @@ class InboxService:
                             message.id,
                             terminal_id,
                         )
-                        remaining.append(message)
+                        if message.callback_recovery_key is not None:
+                            callback_recovery.mark_delivery_refused(
+                                message.callback_recovery_key,
+                                reason_code="source-generation-replaced",
+                            )
+                        else:
+                            remaining.append(message)
                         continue
                     if message.is_identity_bound is True:
                         bridged = managed_launch.deliver_inbox_via_bridge(
@@ -652,8 +658,10 @@ class InboxService:
                             sender_generation=message.sender_generation,
                             message_created_at=message.created_at,
                             expected_generation=message.expected_receiver_generation,
+                            expected_provider=message.expected_provider,
                             expected_provider_session_id=(message.expected_provider_session_id),
                             expected_execution_mode=message.expected_execution_mode,
+                            recovery_operation_key=message.callback_recovery_key,
                         )
                     else:
                         bridged = managed_launch.deliver_inbox_via_bridge(
@@ -694,15 +702,15 @@ class InboxService:
         messages = remaining
         if not messages:
             return
-        # A bound operation belongs exclusively to the ACP provider bridge.
-        # If its exact managed identity disappeared or changed, preserving the
-        # row is the only safe outcome; it must never fall through to native or
-        # unmanaged pane delivery.
+        # A callback-recovery operation belongs exclusively to the ACP provider
+        # bridge. If its exact managed identity disappeared or changed,
+        # preserving the row is the only safe outcome; it must never fall
+        # through to native or unmanaged pane delivery.
         bound_pending = [message for message in messages if message.is_identity_bound is True]
         if bound_pending:
             messages = [message for message in messages if message.is_identity_bound is not True]
             logger.info(
-                "Preserving %d identity-bound message(s) for %s; no generic "
+                "Preserving %d callback-recovery message(s) for %s; no generic "
                 "delivery fallback is permitted",
                 len(bound_pending),
                 terminal_id,

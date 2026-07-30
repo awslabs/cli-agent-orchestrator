@@ -1254,8 +1254,10 @@ def deliver_inbox_via_bridge(
     sender_generation: Optional[str] = None,
     message_created_at: Optional[datetime] = None,
     expected_generation: Optional[str] = None,
+    expected_provider: Optional[str] = None,
     expected_provider_session_id: Optional[str] = None,
     expected_execution_mode: Optional[str] = None,
+    recovery_operation_key: Optional[str] = None,
 ) -> bool:
     """P1-7 (final conformance §20.2f): deliver one exact queued inbox message
     through the receiver's live managed provider bridge, producing the
@@ -1267,7 +1269,6 @@ def deliver_inbox_via_bridge(
     bridge is unavailable — the caller then uses the ordinary delivery path
     and NO acknowledgement is inferred from it.
     """
-    from cli_agent_orchestrator.services import bound_inbox_message
     from cli_agent_orchestrator.services.managed_provider_bridge import request_bridge
 
     try:
@@ -1276,6 +1277,7 @@ def deliver_inbox_via_bridge(
             return False
         expected = (
             expected_generation,
+            expected_provider,
             expected_provider_session_id,
             expected_execution_mode,
         )
@@ -1283,11 +1285,15 @@ def deliver_inbox_via_bridge(
             if any(not isinstance(value, str) or not value for value in expected):
                 return False
             assert isinstance(expected_generation, str)
+            assert isinstance(expected_provider, str)
             assert isinstance(expected_provider_session_id, str)
             assert isinstance(expected_execution_mode, str)
-            if not bound_inbox_message.binding_matches(
+            from cli_agent_orchestrator.services import callback_recovery
+
+            if not callback_recovery.binding_matches(
                 terminal_id,
                 generation=expected_generation,
+                provider=expected_provider,
                 provider_session_id=expected_provider_session_id,
                 execution_mode=expected_execution_mode,
             ):
@@ -1301,6 +1307,10 @@ def deliver_inbox_via_bridge(
                 "reservation_id": reservation_id,
                 "terminal_id": identity["terminal_id"],
                 "generation": identity["generation"],
+                "expected_provider": expected_provider,
+                "expected_provider_session_id": expected_provider_session_id,
+                "expected_execution_mode": expected_execution_mode,
+                "recovery_operation_key": recovery_operation_key,
                 "message_id": str(message_id),
                 "message": message,
                 "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
@@ -1315,7 +1325,18 @@ def deliver_inbox_via_bridge(
             timeout=30.0,
         )
         return True
-    except Exception:  # noqa: BLE001 - fall back to the ordinary delivery path
+    except Exception as exc:  # noqa: BLE001 - preserve or terminalize by exact outcome
+        if recovery_operation_key and (
+            "ambiguous" in str(exc).lower()
+            or "crossed its durable boundary" in str(exc).lower()
+            or "outcome uncertain" in str(exc).lower()
+        ):
+            from cli_agent_orchestrator.services import callback_recovery
+
+            callback_recovery.mark_delivery_ambiguous(
+                recovery_operation_key,
+                reason_code="provider-submission-ambiguous-manual-resolution-required",
+            )
         logger.warning(
             "managed bridge inbox delivery unavailable for %s; using ordinary path",
             terminal_id,

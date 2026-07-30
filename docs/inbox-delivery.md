@@ -1,23 +1,41 @@
+---
+created: 2026-05-30
+lastUpdated: 2026-07-30
+summary: "Reference for ordinary inbox delivery and the dedicated refusal-bound callback recovery protocol."
+category: REFERENCE
+status: CURRENT
+note: "Current fork contract; callback recovery is not a general managed-message API."
+changelog:
+  - "2026-07-30: Replaced generic bound messages with one-shot refusal/callback recovery."
+  - "2026-07-30: Added exact-generation managed message binding."
+---
+
 # Inbox Delivery
 
-## Identity-bound managed messages
+## Refusal-bound callback recovery
 
-`POST /terminals/{receiver}/inbox/bound-messages` is the narrow conductor
-surface for one ordinary message to an exact managed ACP generation. Its JSON
-body carries a caller operation id, exact message digest, sender generation,
-receiver generation, provider session, and execution mode. CAO takes the
-SQLite writer lock before comparing the live managed identity and inserting
-the inbox row, so replacement cannot commit between those two acts. The
-operation id is unique: an exact retry returns the original row and any
-different payload or binding is refused before a row or provider byte.
+`POST /terminals/{source}/callback-recoveries` is dedicated to recovering one
+already-authored callback after an exact durable `managed-acp-pane` zero-byte
+control refusal. It is not an ordinary message surface. Unknown request fields
+are rejected. Admission binds project/run/task, source terminal/generation,
+Codex provider and bridge session, supervisor caller/session, the refusal
+occurrence, callback occurrence, report/source-head/manifest/finalization
+digests, and publishing-lease state or absence inside one SQLite writer
+transaction.
 
-The persisted binding is rechecked before provider delivery. A mismatch keeps
-the row pending and bound rows never fall through to native-TUI or unmanaged
-pane delivery. Reconciliation uses
-`GET /terminals/{receiver}/inbox/bound-messages/{operation_id}` and the sibling
-`/turn-receipt` route; both read the operation's immutable generation rather
-than requiring a still-live terminal. The latter returns only the strict
-`cao-model-turn-receipt-v1` provider-adapter acknowledgement for bound rows.
+The refusal/callback identity has a unique one-shot key independent of the
+caller operation id, so another id cannot repeat recovery. Refusals and
+provider ambiguity are durable terminal outcomes. The exact provider and
+session are checked again inside the generation-fence admission critical
+section. A replaced generation is terminalized without bridge or pane
+fallback, and stale rows do not starve later inbox work.
+
+The recovery prompt's strict 14-field provider receipt is stored inside a
+separate metadata envelope and revalidated against the immutable operation and
+inbox row on every read. `POST /callback-recoveries/{key}/complete` closes the
+operation only with the exact original callback inbox row. Open operations hold
+terminal deletion and retention cleanup. Blocking database and bridge work is
+offloaded from FastAPI's event loop.
 
 The existing generic `/inbox/messages` contract is unchanged.
 

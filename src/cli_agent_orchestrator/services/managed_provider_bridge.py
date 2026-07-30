@@ -2266,6 +2266,15 @@ class _ProviderSession:
 
         try:
             with self._admission_critical_section():
+                expected_live = {
+                    "expected_provider": self.provider,
+                    "expected_provider_session_id": self.provider_session_id,
+                    "expected_execution_mode": self.request.get("execution_mode") or "acp",
+                }
+                for field, observed in expected_live.items():
+                    declared = command.get(field)
+                    if declared is not None and declared != observed:
+                        raise BridgeError(f"inbox delivery {field} changed at provider admission")
                 provider_turn_id, kind, provider_evidence = self._submit_provider_turn(
                     message,
                     client_message_id=message_id,
@@ -4002,6 +4011,37 @@ def _serve(
                             if existing is not None:
                                 if existing["state"] == "submit-refused":
                                     journal.mark_terminal_queued(obligation, message_id)
+                                elif existing["state"] in {"terminal_queued", "submitted"}:
+                                    journal.mark_submit_ambiguous(
+                                        obligation,
+                                        message_id,
+                                        evidence_digest=_digest(
+                                            {
+                                                "kind": "restart-without-provider-ack",
+                                                "prior_state": existing["state"],
+                                                "command_sha256": _digest(command),
+                                            }
+                                        ),
+                                    )
+                                    recovery_key = command.get("recovery_operation_key")
+                                    if isinstance(recovery_key, str) and recovery_key:
+                                        from cli_agent_orchestrator.services import (
+                                            callback_recovery,
+                                        )
+
+                                        callback_recovery.mark_delivery_ambiguous(
+                                            recovery_key,
+                                            reason_code=(
+                                                "provider-submission-ambiguous-"
+                                                "manual-resolution-required"
+                                            ),
+                                        )
+                                    raise BridgeError(
+                                        "inbox delivery restart found a provider "
+                                        f"boundary state {existing['state']!r} without "
+                                        "an acknowledgement; recorded submit-ambiguous "
+                                        "and manual resolution is required"
+                                    )
                                 else:
                                     raise BridgeError(
                                         "inbox delivery already crossed its durable boundary "
@@ -4040,6 +4080,17 @@ def _serve(
                                             "command_sha256": _digest(command),
                                             "error": str(exc),
                                         }
+                                    ),
+                                )
+                            recovery_key = command.get("recovery_operation_key")
+                            if isinstance(recovery_key, str) and recovery_key:
+                                from cli_agent_orchestrator.services import callback_recovery
+
+                                callback_recovery.mark_delivery_ambiguous(
+                                    recovery_key,
+                                    reason_code=(
+                                        "provider-submission-ambiguous-"
+                                        "manual-resolution-required"
                                     ),
                                 )
                             raise BridgeError(

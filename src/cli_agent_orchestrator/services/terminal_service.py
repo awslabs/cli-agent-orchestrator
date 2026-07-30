@@ -2913,6 +2913,14 @@ def delete_terminal(
     reused terminal id.  The stronger destructive endpoint may also call this
     function after performing its additional heartbeat/fence checks."""
     try:
+        from cli_agent_orchestrator.services import callback_recovery
+
+        if callback_recovery.terminal_has_open_recovery(terminal_id, expected_generation):
+            raise TerminalGenerationMismatchError(
+                f"terminal {terminal_id} has an open callback-recovery "
+                "operation; deletion is held until callback completion or "
+                "a terminal refusal/manual disposition"
+            )
         # P1-1 (final conformance §20.2f): expected_session without the exact
         # generation NEVER degrades to ID-only destruction — a session name is
         # not an incarnation identity.
