@@ -140,9 +140,7 @@ def probing_client(shared_tmux, monkeypatch):
 
     monkeypatch.setattr("cli_agent_orchestrator.clients.tmux.subprocess.run", fake_run)
     # Pinned so the reproduction never depends on tmux being installed.
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.clients.tmux.tmux_binary", lambda: "/usr/bin/tmux"
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.clients.tmux.tmux_binary", lambda: "/usr/bin/tmux")
     return client
 
 
