@@ -93,6 +93,10 @@ class Terminal(BaseModel):
     # where there is no provider state to report and "unknown" would read
     # as "alive, not yet detected".
     generation: Optional[str] = Field(None, description="Non-reusable incarnation identifier")
+    callback_target_generation: Optional[str] = Field(
+        None,
+        description="Non-reusable callback-target incarnation identifier",
+    )
     protocol_vintage: Optional[str] = Field(None, description="Which store holds this row (v1/v2)")
     lifecycle_state: Optional[str] = Field(
         None, description="Observed liveness: live/superseded/dead/unknown-liveness"

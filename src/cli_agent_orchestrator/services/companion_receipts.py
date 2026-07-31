@@ -31,10 +31,15 @@ from cli_agent_orchestrator.constants import COMPANION_DIR
 logger = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = 1
+_STRICT_ENVELOPE_SCHEMA = "cao-model-turn-receipt-envelope-v1"
+
+
+class CompanionReceiptInvalid(RuntimeError):
+    """A strict receipt store is malformed or internally contradictory."""
 
 
 def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _record_path(terminal_id: str, generation: str) -> Path:
@@ -61,6 +66,43 @@ def _load(path: Path) -> dict[str, Any]:
     data.setdefault("prompt", None)
     data.setdefault("refusal", None)
     data.setdefault("message_acks", {})
+    return data
+
+
+def _reject_duplicate_pairs(pairs):
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise CompanionReceiptInvalid(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
+
+
+def _load_strict(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw, object_pairs_hook=_reject_duplicate_pairs)
+    except CompanionReceiptInvalid:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CompanionReceiptInvalid("strict companion receipt store is unreadable") from exc
+    allowed = {
+        "schema_version",
+        "route",
+        "prompt",
+        "refusal",
+        "message_acks",
+        "terminal_id",
+        "generation",
+    }
+    if (
+        not isinstance(data, dict)
+        or set(data) - allowed
+        or data.get("schema_version") != _SCHEMA_VERSION
+    ):
+        raise CompanionReceiptInvalid("strict companion receipt store has an unknown shape")
+    if not isinstance(data.get("message_acks"), dict):
+        raise CompanionReceiptInvalid("strict companion receipt map is malformed")
     return data
 
 
@@ -213,10 +255,79 @@ def record_message_ack(
     def mutate(record: dict[str, Any]) -> None:
         acks = record.setdefault("message_acks", {})
         if key in acks:
-            return  # no replay: the first exact acknowledgement stands
-        acks[key] = {**ack, "recorded_at": _utcnow()}
+            return  # legacy envelopes retain their historical first-write rule
+        if ack.get("schema") == "cao-model-turn-receipt-v1":
+            from cli_agent_orchestrator.services import model_turn_receipt_contract
 
-    _mutate(terminal_id, generation, mutate)
+            strict = model_turn_receipt_contract.validate_receipt(ack)
+            acks[key] = {
+                "schema": _STRICT_ENVELOPE_SCHEMA,
+                "receipt": strict,
+                "recorded_at": _utcnow(),
+            }
+        else:
+            acks[key] = {**ack, "recorded_at": _utcnow()}
+
+    if ack.get("schema") != "cao-model-turn-receipt-v1":
+        _mutate(terminal_id, generation, mutate)
+        return
+
+    from cli_agent_orchestrator.services import model_turn_receipt_contract
+
+    strict = model_turn_receipt_contract.validate_receipt(ack)
+    path = _record_path(terminal_id, generation)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            if path.exists():
+                record = _load_strict(path)
+            else:
+                record = {
+                    "schema_version": _SCHEMA_VERSION,
+                    "route": None,
+                    "prompt": None,
+                    "refusal": None,
+                    "message_acks": {},
+                }
+            for field, expected in (
+                ("terminal_id", terminal_id),
+                ("generation", generation),
+            ):
+                observed = record.get(field)
+                if observed not in (None, expected):
+                    raise CompanionReceiptInvalid(f"strict companion receipt store {field} changed")
+                record[field] = expected
+            acks = record["message_acks"]
+            existing = acks.get(key)
+            if existing is not None:
+                if (
+                    not isinstance(existing, dict)
+                    or set(existing) != {"schema", "receipt", "recorded_at"}
+                    or existing.get("schema") != _STRICT_ENVELOPE_SCHEMA
+                    or existing.get("receipt") != strict
+                    or not isinstance(existing.get("recorded_at"), str)
+                    or not existing["recorded_at"].endswith("Z")
+                ):
+                    raise CompanionReceiptInvalid(
+                        "strict acknowledgement replay contradicts stored envelope"
+                    )
+                try:
+                    datetime.fromisoformat(existing["recorded_at"].removesuffix("Z") + "+00:00")
+                except ValueError as exc:
+                    raise CompanionReceiptInvalid(
+                        "strict acknowledgement envelope timestamp is malformed"
+                    ) from exc
+                return
+            acks[key] = {
+                "schema": _STRICT_ENVELOPE_SCHEMA,
+                "receipt": strict,
+                "recorded_at": _utcnow(),
+            }
+            _atomic_write(path, record)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 # -- readers (generation-bound; stale/wrong generation is never served) --------
@@ -253,4 +364,51 @@ def get_message_ack(
     if record is None:
         return None
     ack = (record.get("message_acks") or {}).get(str(message_id))
-    return ack if isinstance(ack, dict) else None
+    if not isinstance(ack, dict):
+        return None
+    if ack.get("schema") == _STRICT_ENVELOPE_SCHEMA:
+        receipt = ack.get("receipt")
+        return receipt if isinstance(receipt, dict) else None
+    return ack
+
+
+def get_strict_message_ack(
+    terminal_id: str, generation: Optional[str], message_id: Any
+) -> Optional[dict[str, str]]:
+    """Return the exact 14-field receipt, never its storage metadata envelope."""
+    if not generation:
+        return None
+    path = _record_path(terminal_id, generation)
+    if not path.exists():
+        return None
+    record = _load_strict(path)
+    if record.get("terminal_id") != terminal_id or record.get("generation") != generation:
+        raise CompanionReceiptInvalid("strict companion receipt store identity is malformed")
+    stored = record["message_acks"].get(str(message_id))
+    if stored is None:
+        return None
+    if (
+        not isinstance(stored, dict)
+        or set(stored) != {"schema", "receipt", "recorded_at"}
+        or stored.get("schema") != _STRICT_ENVELOPE_SCHEMA
+        or not isinstance(stored.get("recorded_at"), str)
+        or not stored["recorded_at"]
+    ):
+        raise CompanionReceiptInvalid("strict receipt storage envelope is malformed")
+    from cli_agent_orchestrator.services import model_turn_receipt_contract
+
+    try:
+        recorded_at = stored["recorded_at"]
+        if not recorded_at.endswith("Z"):
+            raise ValueError("recorded_at is not canonical UTC Z")
+        recorded = datetime.fromisoformat(recorded_at.removesuffix("Z") + "+00:00")
+        receipt = model_turn_receipt_contract.validate_receipt(stored.get("receipt"))
+        submitted = datetime.fromisoformat(receipt["submitted_at"].removesuffix("Z") + "+00:00")
+        if recorded < submitted:
+            raise ValueError("receipt envelope predates provider submission")
+        return receipt
+    except (
+        ValueError,
+        model_turn_receipt_contract.ReceiptValidationError,
+    ) as exc:
+        raise CompanionReceiptInvalid("stored strict receipt is invalid") from exc

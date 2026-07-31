@@ -1251,6 +1251,13 @@ def deliver_inbox_via_bridge(
     message_id: Any,
     message: str,
     sender_id: Optional[str],
+    sender_generation: Optional[str] = None,
+    message_created_at: Optional[datetime] = None,
+    expected_generation: Optional[str] = None,
+    expected_provider: Optional[str] = None,
+    expected_provider_session_id: Optional[str] = None,
+    expected_execution_mode: Optional[str] = None,
+    recovery_operation_key: Optional[str] = None,
 ) -> bool:
     """P1-7 (final conformance §20.2f): deliver one exact queued inbox message
     through the receiver's live managed provider bridge, producing the
@@ -1268,6 +1275,36 @@ def deliver_inbox_via_bridge(
         identity = managed_control_identity(terminal_id)
         if identity is None or identity["state"] != "admitted":
             return False
+        strict_expected = (
+            expected_provider,
+            expected_provider_session_id,
+            expected_execution_mode,
+        )
+        if expected_generation is not None and (
+            not isinstance(expected_generation, str)
+            or not expected_generation
+            or identity["generation"] != expected_generation
+        ):
+            return False
+        if any(value is not None for value in strict_expected):
+            if expected_generation is None or any(
+                not isinstance(value, str) or not value for value in strict_expected
+            ):
+                return False
+            assert isinstance(expected_generation, str)
+            assert isinstance(expected_provider, str)
+            assert isinstance(expected_provider_session_id, str)
+            assert isinstance(expected_execution_mode, str)
+            from cli_agent_orchestrator.services import callback_recovery
+
+            if not callback_recovery.binding_matches(
+                terminal_id,
+                generation=expected_generation,
+                provider=expected_provider,
+                provider_session_id=expected_provider_session_id,
+                execution_mode=expected_execution_mode,
+            ):
+                return False
         reservation_id = identity["reservation_id"]
         request_bridge(
             reservation_id,
@@ -1277,15 +1314,52 @@ def deliver_inbox_via_bridge(
                 "reservation_id": reservation_id,
                 "terminal_id": identity["terminal_id"],
                 "generation": identity["generation"],
+                "expected_provider": expected_provider,
+                "expected_provider_session_id": expected_provider_session_id,
+                "expected_execution_mode": expected_execution_mode,
+                "recovery_operation_key": recovery_operation_key,
                 "message_id": str(message_id),
                 "message": message,
                 "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
                 "sender_id": sender_id,
+                "sender_generation": sender_generation,
+                "message_created_at": (
+                    message_created_at.isoformat()
+                    if isinstance(message_created_at, datetime)
+                    else None
+                ),
             },
             timeout=30.0,
         )
         return True
-    except Exception:  # noqa: BLE001 - fall back to the ordinary delivery path
+    except Exception as exc:  # noqa: BLE001 - preserve or terminalize by exact outcome
+        detail = str(exc).lower()
+        if recovery_operation_key and "w13-fenced-before-provider-io:" in detail:
+            from cli_agent_orchestrator.services import callback_recovery
+
+            callback_recovery.mark_delivery_refused(
+                recovery_operation_key,
+                reason_code="w13-fenced-before-provider-io",
+                proven_before_provider_io=True,
+            )
+        elif recovery_operation_key and "successor-fenced-before-provider-io:" in detail:
+            from cli_agent_orchestrator.services import callback_recovery
+
+            callback_recovery.mark_delivery_refused(
+                recovery_operation_key,
+                reason_code="source-generation-replaced",
+                proven_before_provider_io=True,
+            )
+        elif recovery_operation_key and "bridge was unavailable:" not in detail:
+            from cli_agent_orchestrator.services import callback_recovery
+
+            # Once a request may have crossed the socket write, lack of a
+            # response is effect-unknown until old-generation receipt/journal
+            # reconciliation. It is never downgraded to refusal on replacement.
+            callback_recovery.mark_delivery_ambiguous(
+                recovery_operation_key,
+                reason_code=("provider-submission-ambiguous-manual-resolution-required"),
+            )
         logger.warning(
             "managed bridge inbox delivery unavailable for %s; using ordinary path",
             terminal_id,

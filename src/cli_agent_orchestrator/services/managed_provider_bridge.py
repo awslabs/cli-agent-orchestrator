@@ -38,7 +38,12 @@ from cli_agent_orchestrator.providers.codex import (
     _validate_config_key,
     render_trusted_project_override,
 )
-from cli_agent_orchestrator.services import actor_broker, companion_receipts, provider_contracts
+from cli_agent_orchestrator.services import (
+    actor_broker,
+    companion_receipts,
+    heartbeat_store,
+    provider_contracts,
+)
 from cli_agent_orchestrator.services.codex_trust import (
     SUPPORTED_CODEX_VERSION,
     _contains_session_flags,
@@ -2217,7 +2222,9 @@ class _ProviderSession:
                 self._scan_companion_events()
                 self._emit_beat(provider_turn_id, f"{kind}:{provider_turn_id}")
         except generation_fence.FencedError as exc:
-            raise BridgeError(str(exc)) from exc
+            raise BridgeError(f"w13-fenced-before-provider-io: {exc}") from exc
+        except heartbeat_store.FencingRefused as exc:
+            raise BridgeError(f"successor-fenced-before-provider-io: {exc}") from exc
         receipt_id = provider_turn_id
         return {
             **self._base_receipt(),
@@ -2266,6 +2273,25 @@ class _ProviderSession:
 
         try:
             with self._admission_critical_section():
+                recovery_operation_key = command.get("recovery_operation_key")
+                if isinstance(recovery_operation_key, str) and recovery_operation_key:
+                    from cli_agent_orchestrator.services import callback_recovery
+
+                    callback_recovery.assert_provider_delivery_admissible(
+                        recovery_operation_key,
+                        terminal_id=self.request["terminal_id"],
+                        generation=self.request["generation"],
+                        message_id=message_id,
+                    )
+                expected_live = {
+                    "expected_provider": self.provider,
+                    "expected_provider_session_id": self.provider_session_id,
+                    "expected_execution_mode": self.request.get("execution_mode") or "acp",
+                }
+                for field, observed in expected_live.items():
+                    declared = command.get(field)
+                    if declared is not None and declared != observed:
+                        raise BridgeError(f"inbox delivery {field} changed at provider admission")
                 provider_turn_id, kind, provider_evidence = self._submit_provider_turn(
                     message,
                     client_message_id=message_id,
@@ -2278,26 +2304,59 @@ class _ProviderSession:
                 self._current_turn_id = provider_turn_id
                 self._scan_companion_events()
                 self._emit_beat(provider_turn_id, f"{kind}:{provider_turn_id}")
+                submitted_at = _now()
+                ack: dict[str, Any]
+                if command.get("sender_generation") and command.get("message_created_at"):
+                    from datetime import datetime, timezone
+
+                    from cli_agent_orchestrator.services import model_turn_receipt_contract
+
+                    created_at = datetime.fromisoformat(
+                        command["message_created_at"].removesuffix("Z") + "+00:00"
+                    )
+                    if created_at.utcoffset() is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    ack = model_turn_receipt_contract.build_receipt(
+                        message_id=message_id,
+                        message_sha256=command["message_sha256"],
+                        message_created_at=created_at,
+                        sender_id=command["sender_id"],
+                        sender_generation=command["sender_generation"],
+                        receiver_id=self.request["terminal_id"],
+                        receiver_generation=self.request["generation"],
+                        provider=self.provider,
+                        provider_session_id=self.provider_session_id,
+                        provider_turn_id=provider_turn_id,
+                        submitted_at=datetime.fromisoformat(
+                            submitted_at.removesuffix("Z") + "+00:00"
+                        ),
+                    )
+                else:
+                    ack = {
+                        "kind": "submitted",
+                        "message_id": message_id,
+                        "message_sha256": command["message_sha256"],
+                        "sender_id": command.get("sender_id"),
+                        "receiver_id": self.request["terminal_id"],
+                        "receiver_generation": self.request["generation"],
+                        "provider": self.provider,
+                        "provider_session_id": self.provider_session_id,
+                        "provider_turn_id": provider_turn_id,
+                        "submitted_at": submitted_at,
+                    }
+                # Receipt publication is part of the same admission critical
+                # section as provider I/O. A zero-effect resolver holding this
+                # lock therefore sees either no effect or the durable receipt.
+                companion_receipts.record_message_ack(
+                    self.request["terminal_id"],
+                    self.request["generation"],
+                    message_id=message_id,
+                    ack=ack,
+                )
         except generation_fence.FencedError as exc:
-            raise BridgeError(str(exc)) from exc
-        submitted_at = _now()
-        companion_receipts.record_message_ack(
-            self.request["terminal_id"],
-            self.request["generation"],
-            message_id=message_id,
-            ack={
-                "kind": "submitted",
-                "message_id": message_id,
-                "message_sha256": command["message_sha256"],
-                "sender_id": command.get("sender_id"),
-                "receiver_id": self.request["terminal_id"],
-                "receiver_generation": self.request["generation"],
-                "provider": self.provider,
-                "provider_session_id": self.provider_session_id,
-                "provider_turn_id": provider_turn_id,
-                "submitted_at": submitted_at,
-            },
-        )
+            raise BridgeError(f"w13-fenced-before-provider-io: {exc}") from exc
+        except heartbeat_store.FencingRefused as exc:
+            raise BridgeError(f"successor-fenced-before-provider-io: {exc}") from exc
         # The per-turn route identity (§18.9) moves to this exact turn.
         companion_receipts.record_route_receipt(
             self.request["terminal_id"],
@@ -2829,14 +2888,48 @@ class _ProviderSession:
         if self.rpc is not None:
             self.rpc.close()
 
+    @contextlib.contextmanager
     def _admission_critical_section(self):
-        """The fence lock held across the final recheck and provider I/O."""
+        """Hold successor and W13 fences across final identity checks and I/O."""
         from cli_agent_orchestrator.constants import COMPANION_DIR
-        from cli_agent_orchestrator.services import generation_fence
-
-        return generation_fence.admission_critical_section(
-            COMPANION_DIR, self.request["terminal_id"], self.request["generation"]
+        from cli_agent_orchestrator.services import (
+            generation_fence,
+            heartbeat_store,
         )
+        from cli_agent_orchestrator.services.destructive_endpoint import (
+            binding_record_path,
+        )
+
+        terminal_id = self.request["terminal_id"]
+        generation = self.request["generation"]
+        with heartbeat_store.successor_critical_section(COMPANION_DIR, terminal_id):
+            if self.request.get("obligation_generation"):
+                binding_path = binding_record_path(COMPANION_DIR, terminal_id, generation)
+                try:
+                    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise BridgeError(
+                        "provider admission cannot revalidate generation binding"
+                    ) from exc
+                expected_binding = {
+                    "terminal_id": terminal_id,
+                    "generation": generation,
+                    "attempt_id": self.request.get("attempt_id"),
+                    "native_session_id": self.provider_session_id,
+                }
+                if {key: binding.get(key) for key in expected_binding} != expected_binding:
+                    raise BridgeError("provider admission generation/session binding changed")
+                heartbeat_store.assert_current_fencing_binding(
+                    COMPANION_DIR,
+                    terminal_id=terminal_id,
+                    generation=generation,
+                    attempt_id=str(self.request.get("attempt_id") or ""),
+                    fencing_token_id=str(binding.get("fencing_token_id") or ""),
+                )
+            with generation_fence.admission_critical_section(
+                COMPANION_DIR, terminal_id, generation
+            ):
+                yield
 
     def _assert_fence_open(self) -> None:
         """Refuse provider-bound input for a sealed (W13-fenced) generation.
@@ -3978,6 +4071,37 @@ def _serve(
                             if existing is not None:
                                 if existing["state"] == "submit-refused":
                                     journal.mark_terminal_queued(obligation, message_id)
+                                elif existing["state"] in {"terminal_queued", "submitted"}:
+                                    journal.mark_submit_ambiguous(
+                                        obligation,
+                                        message_id,
+                                        evidence_digest=_digest(
+                                            {
+                                                "kind": "restart-without-provider-ack",
+                                                "prior_state": existing["state"],
+                                                "command_sha256": _digest(command),
+                                            }
+                                        ),
+                                    )
+                                    recovery_key = command.get("recovery_operation_key")
+                                    if isinstance(recovery_key, str) and recovery_key:
+                                        from cli_agent_orchestrator.services import (
+                                            callback_recovery,
+                                        )
+
+                                        callback_recovery.mark_delivery_ambiguous(
+                                            recovery_key,
+                                            reason_code=(
+                                                "provider-submission-ambiguous-"
+                                                "manual-resolution-required"
+                                            ),
+                                        )
+                                    raise BridgeError(
+                                        "inbox delivery restart found a provider "
+                                        f"boundary state {existing['state']!r} without "
+                                        "an acknowledgement; recorded submit-ambiguous "
+                                        "and manual resolution is required"
+                                    )
                                 else:
                                     raise BridgeError(
                                         "inbox delivery already crossed its durable boundary "
@@ -4016,6 +4140,17 @@ def _serve(
                                             "command_sha256": _digest(command),
                                             "error": str(exc),
                                         }
+                                    ),
+                                )
+                            recovery_key = command.get("recovery_operation_key")
+                            if isinstance(recovery_key, str) and recovery_key:
+                                from cli_agent_orchestrator.services import callback_recovery
+
+                                callback_recovery.mark_delivery_ambiguous(
+                                    recovery_key,
+                                    reason_code=(
+                                        "provider-submission-ambiguous-"
+                                        "manual-resolution-required"
                                     ),
                                 )
                             raise BridgeError(

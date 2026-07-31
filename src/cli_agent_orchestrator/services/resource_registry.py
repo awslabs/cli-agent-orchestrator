@@ -895,7 +895,7 @@ _CS = "src/cli_agent_orchestrator/services/cleanup_service.py"
 _BR = "src/cli_agent_orchestrator/services/managed_provider_bridge.py"
 
 _CREATE = "terminal_service.create_terminal"
-_DELETE = "terminal_service.delete_terminal"
+_DELETE = "terminal_service._delete_terminal_claimed"
 _BRIDGE = "managed_provider_bridge._serve"
 
 # Verified call sites: each names the exact line where the declared API
@@ -925,11 +925,11 @@ _TS_MARK = f"{_TS}:955"  # registry.register_created in _mark_v2_resource_create
 _TS_MONITOR = f"{_TS}:923"  # registry.monitor in _register_v2_terminal_resources
 _TS_REUSE_DELETE = f"{_TS}:1052"  # registry.delete in _retire_reused_tmux_observation
 _TS_DELETE = f"{_TS}:1292"  # registry.delete in _deregister_v2_terminal_resources
-_CS_RESOLVE = f"{_CS}:112"  # registry.resolve_fs_path in cleanup_old_data
-_BR_DECLARE = f"{_BR}:3044"  # registry.declare in _declare_bridge_resources
-_BR_MARK = f"{_BR}:3088"  # registry.register_created in _mark_bridge_resource_created
-_BR_JOURNAL_MARK = f"{_BR}:3112"  # registry.register_created in _mark_bridge_journal_created
-_BR_DELETE = f"{_BR}:3265"  # registry.delete in _deregister_bridge_resources
+_CS_RESOLVE = f"{_CS}:155"  # registry.resolve_fs_path in cleanup_old_data
+_BR_DECLARE = f"{_BR}:3137"  # registry.declare in _declare_bridge_resources
+_BR_MARK = f"{_BR}:3181"  # registry.register_created in _mark_bridge_resource_created
+_BR_JOURNAL_MARK = f"{_BR}:3205"  # registry.register_created in _mark_bridge_journal_created
+_BR_DELETE = f"{_BR}:3358"  # registry.delete in _deregister_bridge_resources
 
 _MANIFEST_SPEC: tuple[tuple[str, str, str, str], ...] = (
     # --- terminal log artifacts (constructor + generation deleter + retention)

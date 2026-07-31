@@ -1,5 +1,7 @@
 """Minimal database client with only terminal metadata."""
 
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -49,6 +51,11 @@ class TerminalModel(Base):
     # operations. Legacy/operator terminals may be NULL; managed terminals
     # always bind the reservation generation here before provider I/O.
     generation = Column(Text, nullable=True, unique=True)
+    # Every callback target has a durable, non-reusable incarnation even when
+    # it is an ordinary operator/supervisor terminal with no managed-launch
+    # generation. This identity is intentionally separate from pane_id:
+    # compact pane ids are backend-local and reusable.
+    callback_target_generation = Column(Text, nullable=True, unique=True)
     # Server-owned immutable pane/window identity (cond-0069 attestation):
     # tmux-assigned ids recorded at creation. Window NAMES are mutable (a
     # worker can rename its own window), pane_id/window_id are not — they are
@@ -118,6 +125,89 @@ class InboxModel(Base):
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(DateTime, default=datetime.now)
+    # Nullable keeps the original generic inbox protocol byte-compatible.
+    # These fields are populated only by the dedicated callback-recovery path.
+    message_sha256 = Column(Text, nullable=True)
+    sender_generation = Column(Text, nullable=True)
+    expected_receiver_generation = Column(Text, nullable=True)
+    expected_provider_session_id = Column(Text, nullable=True)
+    expected_execution_mode = Column(Text, nullable=True)
+    expected_provider = Column(Text, nullable=True)
+    callback_recovery_key = Column(Text, nullable=True, unique=True)
+    callback_completion_key = Column(Text, nullable=True, unique=True)
+
+
+class CallbackRecoveryModel(Base):
+    """One terminal refusal authorizing one exact callback recovery lifecycle."""
+
+    __tablename__ = "callback_recovery_operations"
+    __table_args__ = (
+        UniqueConstraint(
+            "project",
+            "task_id",
+            "run_id",
+            "callback_occurrence_id",
+            name="uq_callback_recovery_occurrence",
+        ),
+    )
+
+    operation_key = Column(Text, primary_key=True)
+    operation_id = Column(Text, nullable=False)
+    workflow_identity_sha256 = Column(Text, nullable=False)
+    recovery_identity_sha256 = Column(Text, nullable=False, unique=True)
+    state = Column(Text, nullable=False)
+    reason_code = Column(Text, nullable=True)
+    project = Column(Text, nullable=False)
+    task_id = Column(Text, nullable=False)
+    run_id = Column(Text, nullable=False)
+    source_terminal_id = Column(Text, nullable=False)
+    source_generation = Column(Text, nullable=False)
+    expected_provider = Column(Text, nullable=False)
+    expected_provider_session_id = Column(Text, nullable=False)
+    expected_execution_mode = Column(Text, nullable=False)
+    supervisor_id = Column(Text, nullable=False)
+    supervisor_session = Column(Text, nullable=False)
+    supervisor_generation = Column(Text, nullable=True)
+    supervisor_pane_id = Column(Text, nullable=True)
+    refusal_control_id = Column(Text, nullable=False)
+    refusal_occurrence_sha256 = Column(Text, nullable=False)
+    refusal_request_sha256 = Column(Text, nullable=False)
+    callback_occurrence_id = Column(Text, nullable=False)
+    callback_status = Column(Text, nullable=True)
+    callback_summary = Column(Text, nullable=True)
+    callback_message_sha256 = Column(Text, nullable=False)
+    report_path = Column(Text, nullable=False)
+    report_sha256 = Column(Text, nullable=False)
+    source_head = Column(Text, nullable=False)
+    publishing_lease_state = Column(Text, nullable=False)
+    publishing_lease_sha256 = Column(Text, nullable=False)
+    manifest_path = Column(Text, nullable=False)
+    manifest_sha256 = Column(Text, nullable=False)
+    finalization_identity_sha256 = Column(Text, nullable=False)
+    request_sha256 = Column(Text, nullable=False)
+    # Lifecycle-v2 stores the complete validated request rather than trying to
+    # reconstruct proof from mutable terminal state on response-loss readback.
+    request_identity_schema = Column(Text, nullable=True)
+    request_json = Column(Text, nullable=True)
+    callback_token_sha256 = Column(Text, nullable=True)
+    inbox_message_id = Column(Integer, nullable=True, unique=True)
+    recovery_prompt_sha256 = Column(Text, nullable=True)
+    message_created_at = Column(Text, nullable=True)
+    sender_generation = Column(Text, nullable=True)
+    admission_response_json = Column(Text, nullable=True)
+    provider_turn_receipt_json = Column(Text, nullable=True)
+    callback_message_id = Column(Integer, nullable=True, unique=True)
+    callback_consumed_at = Column(Text, nullable=True)
+    callback_response_json = Column(Text, nullable=True)
+    callback_attempt_state = Column(Text, nullable=True)
+    callback_registration_receipt_json = Column(Text, nullable=True)
+    callback_effect_receipt_json = Column(Text, nullable=True)
+    callback_disposition_json = Column(Text, nullable=True)
+    callback_admin_disposition_json = Column(Text, nullable=True)
+    completion_json = Column(Text, nullable=True)
+    resolution_json = Column(Text, nullable=True)
+    created_at = Column(Text, nullable=False)
+    updated_at = Column(Text, nullable=False)
 
 
 def _utcnow() -> datetime:
@@ -600,6 +690,16 @@ _ensure_db_dir()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+# This process may advertise or admit callback recovery only after its schema
+# migration has completed.  It is deliberately reset before every migration;
+# a caught DDL/backfill failure can never leave a stale success bit behind.
+_callback_recovery_migration_ready = False
+
+
+def callback_recovery_migration_ready() -> bool:
+    """Whether this process completed the callback-recovery schema migration."""
+    return _callback_recovery_migration_ready
+
 
 def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
@@ -617,6 +717,8 @@ def init_db() -> None:
     )
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
+    inbox_schema_ready = _migrate_callback_recovery_inbox_schema()
+    _migrate_callback_recovery_schema(inbox_schema_ready=inbox_schema_ready)
     _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
@@ -1242,6 +1344,16 @@ def _migrate_terminals_schema() -> None:
             )
             conn.commit()
             logger.info("Migration: added generation column to terminals table")
+        if "callback_target_generation" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN callback_target_generation TEXT")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_terminals_callback_target_generation "
+                "ON terminals(callback_target_generation) "
+                "WHERE callback_target_generation IS NOT NULL"
+            )
+            conn.commit()
+            logger.info("Migration: added callback_target_generation column to terminals table")
         if "pane_id" not in columns:
             conn.execute("ALTER TABLE terminals ADD COLUMN pane_id TEXT")
             conn.commit()
@@ -1296,6 +1408,302 @@ def _migrate_terminals_schema() -> None:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 
 
+_CALLBACK_RECOVERY_INBOX_COLUMNS = (
+    ("message_sha256", "TEXT"),
+    ("sender_generation", "TEXT"),
+    ("expected_receiver_generation", "TEXT"),
+    ("expected_provider_session_id", "TEXT"),
+    ("expected_execution_mode", "TEXT"),
+    ("expected_provider", "TEXT"),
+    ("callback_recovery_key", "TEXT"),
+    ("callback_completion_key", "TEXT"),
+)
+_CALLBACK_RECOVERY_INBOX_INDEXES = {
+    "ix_inbox_callback_recovery_key": "callback_recovery_key",
+    "ix_inbox_callback_completion_key": "callback_completion_key",
+}
+
+
+def _callback_recovery_inbox_schema_verified(conn: Any) -> bool:
+    """Whether the legacy inbox has every exact callback-recovery fence."""
+    present = {row[1] for row in conn.execute("PRAGMA table_info(inbox)")}
+    if not {name for name, _ in _CALLBACK_RECOVERY_INBOX_COLUMNS} <= present:
+        return False
+    indexes = {row[1]: row for row in conn.execute("PRAGMA index_list(inbox)")}
+    for index_name, column in _CALLBACK_RECOVERY_INBOX_INDEXES.items():
+        index = indexes.get(index_name)
+        if index is None or not index[2] or not index[4]:
+            return False
+        columns = [row[2] for row in conn.execute(f"PRAGMA index_info({index_name})")]
+        if columns != [column]:
+            return False
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (index_name,)
+        ).fetchone()
+        expected = (
+            f"create unique index {index_name} on inbox({column}) " f"where {column} is not null"
+        )
+        if row is None or row[0] is None or " ".join(row[0].lower().split()) != expected:
+            return False
+    return True
+
+
+def _callback_recovery_inbox_schema_ready() -> bool:
+    """Read the verified inbox side of the callback-recovery migration unit."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            return _callback_recovery_inbox_schema_verified(conn)
+    except Exception as exc:  # noqa: BLE001 - readiness must fail closed
+        logger.warning("callback-recovery inbox verification failed: %s", exc)
+        return False
+
+
+def _migrate_callback_recovery_inbox_schema() -> bool:
+    """Add dedicated callback-recovery bindings to an existing inbox table."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            present = {row[1] for row in conn.execute("PRAGMA table_info(inbox)")}
+            for name, ddl in _CALLBACK_RECOVERY_INBOX_COLUMNS:
+                if name not in present:
+                    conn.execute(f"ALTER TABLE inbox ADD COLUMN {name} {ddl}")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_inbox_callback_recovery_key "
+                "ON inbox(callback_recovery_key) WHERE callback_recovery_key IS NOT NULL"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_inbox_callback_completion_key "
+                "ON inbox(callback_completion_key) WHERE callback_completion_key IS NOT NULL"
+            )
+            if _callback_recovery_inbox_schema_verified(conn):
+                return True
+            logger.warning("callback-recovery inbox migration left required fences unavailable")
+    except Exception as exc:  # noqa: BLE001 - callback recovery fails closed
+        logger.warning("callback-recovery inbox migration failed: %s", exc)
+    return False
+
+
+def _backup_callback_recovery_rows_before_migration() -> None:
+    """Durably snapshot legacy callback rows before any recovery-row mutation.
+
+    This runs in its own committed SQLite transaction.  The subsequent schema
+    migration can therefore roll back safely without discarding the only
+    recoverable copy of a conflicting legacy row.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    with sqlite3.connect(str(DATABASE_FILE)) as backup:
+        exists = backup.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'callback_recovery_operations'"
+        ).fetchone()
+        if not exists:
+            return
+        backup.execute(
+            "CREATE TABLE IF NOT EXISTS callback_recovery_operations_v2_backup "
+            "AS SELECT * FROM callback_recovery_operations WHERE 0"
+        )
+        source_columns = [
+            row[1] for row in backup.execute("PRAGMA table_info(callback_recovery_operations)")
+        ]
+        backup_columns = {
+            row[1]
+            for row in backup.execute("PRAGMA table_info(callback_recovery_operations_v2_backup)")
+        }
+        # A prior successful migration deliberately retains its historical
+        # snapshot shape.  Do not reinterpret or overwrite that evidence on
+        # later startups merely because the live table has newer columns.
+        if set(source_columns) != backup_columns:
+            return
+        if "operation_key" not in backup_columns:
+            raise RuntimeError("callback-recovery backup lacks operation identity")
+        columns_sql = ", ".join(f'"{column}"' for column in source_columns)
+        backup.execute(
+            "INSERT INTO callback_recovery_operations_v2_backup "
+            f"({columns_sql}) SELECT {columns_sql} FROM callback_recovery_operations AS source "
+            "WHERE NOT EXISTS (SELECT 1 FROM callback_recovery_operations_v2_backup AS saved "
+            "WHERE saved.operation_key = source.operation_key)"
+        )
+
+
+def _migrate_callback_recovery_schema(*, inbox_schema_ready: Optional[bool] = None) -> None:
+    """Create the dedicated refusal/callback recovery operation store."""
+    # Fresh and existing databases are both handled by SQLAlchemy create_all.
+    # This function intentionally remains as a named migration boundary so an
+    # older install that cannot create the table fails the recovery surface
+    # closed instead of silently falling back to ordinary inbox delivery.
+    global _callback_recovery_migration_ready
+    _callback_recovery_migration_ready = False
+    if inbox_schema_ready is None:
+        inbox_schema_ready = _callback_recovery_inbox_schema_ready()
+    if not inbox_schema_ready:
+        logger.warning("callback recovery migration is not ready: inbox fences are unavailable")
+    try:
+        CallbackRecoveryModel.__table__.create(bind=engine, checkfirst=True)
+        import sqlite3
+
+        from cli_agent_orchestrator.constants import DATABASE_FILE
+
+        _backup_callback_recovery_rows_before_migration()
+        columns = (
+            ("supervisor_generation", "TEXT"),
+            ("supervisor_pane_id", "TEXT"),
+            ("callback_consumed_at", "TEXT"),
+            ("callback_token_sha256", "TEXT"),
+            ("recovery_prompt_sha256", "TEXT"),
+            ("message_created_at", "TEXT"),
+            ("sender_generation", "TEXT"),
+            ("admission_response_json", "TEXT"),
+            ("callback_response_json", "TEXT"),
+            ("resolution_json", "TEXT"),
+            ("request_identity_schema", "TEXT"),
+            ("request_json", "TEXT"),
+            ("callback_status", "TEXT"),
+            ("callback_summary", "TEXT"),
+            ("callback_attempt_state", "TEXT"),
+            ("callback_registration_receipt_json", "TEXT"),
+            ("callback_effect_receipt_json", "TEXT"),
+            ("callback_disposition_json", "TEXT"),
+            ("callback_admin_disposition_json", "TEXT"),
+        )
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            present = {
+                row[1] for row in conn.execute("PRAGMA table_info(callback_recovery_operations)")
+            }
+            for name, ddl in columns:
+                if name not in present:
+                    conn.execute(
+                        f"ALTER TABLE callback_recovery_operations ADD COLUMN {name} {ddl}"
+                    )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ix_callback_recovery_occurrence "
+                "ON callback_recovery_operations"
+                "(project, task_id, run_id, callback_occurrence_id)"
+            )
+            request_fields = (
+                "operation_id",
+                "project",
+                "task_id",
+                "run_id",
+                "source_terminal_id",
+                "source_generation",
+                "expected_provider",
+                "expected_provider_session_id",
+                "expected_execution_mode",
+                "supervisor_id",
+                "supervisor_session",
+                "supervisor_generation",
+                "supervisor_pane_id",
+                "refusal_control_id",
+                "refusal_occurrence_sha256",
+                "refusal_request_sha256",
+                "callback_occurrence_id",
+                "callback_status",
+                "callback_summary",
+                "callback_message_sha256",
+                "report_path",
+                "report_sha256",
+                "source_head",
+                "publishing_lease_state",
+                "publishing_lease_sha256",
+                "manifest_path",
+                "manifest_sha256",
+                "finalization_identity_sha256",
+            )
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM callback_recovery_operations").fetchall()
+            for row in rows:
+                if row["request_identity_schema"] == "cao-callback-recovery-request-v1":
+                    try:
+                        request = json.loads(row["request_json"])
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise RuntimeError("v1 callback-recovery request is unreadable") from exc
+                    canonical = json.dumps(request, sort_keys=True, separators=(",", ":"))
+                    if (
+                        not isinstance(request, dict)
+                        or hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                        != row["request_sha256"]
+                        or any(request.get(field) != row[field] for field in request_fields)
+                        or (
+                            row["state"] == "callback-completed"
+                            and not row["callback_effect_receipt_json"]
+                        )
+                    ):
+                        raise RuntimeError(
+                            "v1 callback-recovery row contradicts immutable evidence"
+                        )
+                    continue
+                request = {field: row[field] for field in request_fields}
+                complete = all(value is not None and value != "" for value in request.values())
+                canonical = json.dumps(request, sort_keys=True, separators=(",", ":"))
+                digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                # A legacy optimistic completion was inferred from inbox
+                # delivery.  It is never an effect proof; retain it as a
+                # submitted/ambiguous operation unless an exact durable effect
+                # receipt already exists on the row.
+                indisputable_effect = row["callback_effect_receipt_json"] is not None
+                if (
+                    complete
+                    and digest == row["request_sha256"]
+                    and (row["state"] != "callback-completed" or indisputable_effect)
+                ):
+                    conn.execute(
+                        "UPDATE callback_recovery_operations "
+                        "SET request_identity_schema = ?, request_json = ?, "
+                        "callback_attempt_state = COALESCE(callback_attempt_state, ?) "
+                        "WHERE operation_key = ?",
+                        (
+                            "cao-callback-recovery-request-v1",
+                            canonical,
+                            "not-registered",
+                            row["operation_key"],
+                        ),
+                    )
+                    continue
+                # Rows whose old optimistic completion cannot prove an exact
+                # post-effect receipt are held as submitted/ambiguous rather
+                # than silently released.  Other unverifiable rows remain
+                # explicit retained quarantine.
+                state = (
+                    "recovery-submitted" if row["state"] == "callback-completed" else row["state"]
+                )
+                attempt = (
+                    "effect-ambiguous"
+                    if row["state"] == "callback-completed"
+                    else (row["callback_attempt_state"] or "not-registered")
+                )
+                conn.execute(
+                    "UPDATE callback_recovery_operations "
+                    "SET state = ?, callback_attempt_state = ?, "
+                    "reason_code = ?, updated_at = ? WHERE operation_key = ?",
+                    (
+                        state,
+                        attempt,
+                        "legacy-identity-unverifiable",
+                        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                        row["operation_key"],
+                    ),
+                )
+        if inbox_schema_ready and _callback_recovery_inbox_schema_ready():
+            _callback_recovery_migration_ready = True
+        else:
+            logger.warning(
+                "callback recovery migration remains unavailable: inbox fences are absent"
+            )
+    except Exception as exc:  # noqa: BLE001 - operation reads fail closed
+        logger.warning("callback recovery migration failed: %s", exc)
+
+
 def create_terminal(
     terminal_id: str,
     tmux_session: str,
@@ -1306,6 +1714,7 @@ def create_terminal(
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
     generation: Optional[str] = None,
+    callback_target_generation: Optional[str] = None,
     pane_id: Optional[str] = None,
     window_id: Optional[str] = None,
     server_socket_path: Optional[str] = None,
@@ -1317,6 +1726,7 @@ def create_terminal(
     import json as _json
 
     with SessionLocal() as db:
+        callback_target_generation = callback_target_generation or generation or str(uuid.uuid4())
         terminal = TerminalModel(
             id=terminal_id,
             tmux_session=tmux_session,
@@ -1327,6 +1737,7 @@ def create_terminal(
             shell_command=shell_command,
             caller_id=caller_id,
             generation=generation,
+            callback_target_generation=callback_target_generation,
             pane_id=pane_id,
             window_id=window_id,
             server_socket_path=server_socket_path,
@@ -1346,6 +1757,7 @@ def create_terminal(
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "generation": terminal.generation,
+            "callback_target_generation": terminal.callback_target_generation,
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
             "server_socket_path": terminal.server_socket_path,
@@ -1443,6 +1855,7 @@ def get_terminal_metadata_v2(terminal_id: str) -> Optional[Dict[str, Any]]:
             "shell_command": None,
             "caller_id": terminal.caller_id,
             "generation": terminal.generation,
+            "callback_target_generation": terminal.generation,
             "protocol_vintage": "v2",
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
@@ -1642,6 +2055,17 @@ def get_terminal_metadata(
         if _missing_terminal_logged_at:
             with _missing_terminal_log_lock:
                 _missing_terminal_logged_at.pop(terminal_id, None)
+        if not terminal.callback_target_generation:
+            candidate = terminal.generation or str(uuid.uuid4())
+            db.query(TerminalModel).filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.callback_target_generation.is_(None),
+            ).update(
+                {TerminalModel.callback_target_generation: candidate},
+                synchronize_session=False,
+            )
+            db.commit()
+            db.refresh(terminal)
         logger.debug(
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
         )
@@ -1656,6 +2080,7 @@ def get_terminal_metadata(
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "generation": terminal.generation,
+            "callback_target_generation": terminal.callback_target_generation,
             "pane_id": terminal.pane_id,
             "window_id": terminal.window_id,
             "server_socket_path": terminal.server_socket_path,
@@ -2220,6 +2645,18 @@ def backfill_terminal_identity_if_missing(terminal_id: str, pane_id: str, window
 
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List all terminals in a tmux session."""
+    try:
+        return _list_terminals_by_session(tmux_session)
+    except OperationalError as exc:
+        detail = str(exc).lower()
+        if "no such column" not in detail or "callback_target_generation" not in detail:
+            raise
+        _migrate_terminals_schema()
+        return _list_terminals_by_session(tmux_session)
+
+
+def _list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
+    """Unwrapped cross-vintage query used after schema readiness is proven."""
     with SessionLocal() as db:
         terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
         result = [
@@ -2230,6 +2667,9 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
                 "last_active": t.last_active,
+                "generation": t.generation,
+                "callback_target_generation": (t.callback_target_generation or t.generation),
+                "pane_id": t.pane_id,
             }
             for t in terminals
         ]
@@ -2252,6 +2692,8 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "agent_profile": t.agent_profile,
                 "last_active": t.last_active,
                 "generation": t.generation,
+                "callback_target_generation": t.generation,
+                "pane_id": t.pane_id,
                 "protocol_vintage": "v2",
             }
             for t in managed
@@ -2474,19 +2916,47 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
         db.add(inbox_msg)
         db.commit()
         db.refresh(inbox_msg)
-        return InboxMessage(
-            id=inbox_msg.id,
-            sender_id=inbox_msg.sender_id,
-            receiver_id=inbox_msg.receiver_id,
-            message=inbox_msg.message,
-            status=MessageStatus(inbox_msg.status),
-            created_at=inbox_msg.created_at,
-        )
+        return _inbox_message_from_row(inbox_msg)
+
+
+def _inbox_message_from_row(row: Any) -> InboxMessage:
+    """Project both legacy and identity-bound inbox rows."""
+    return InboxMessage(
+        id=row.id,
+        sender_id=row.sender_id,
+        receiver_id=row.receiver_id,
+        message=row.message,
+        status=MessageStatus(row.status),
+        created_at=row.created_at,
+        message_sha256=getattr(row, "message_sha256", None),
+        sender_generation=getattr(row, "sender_generation", None),
+        expected_receiver_generation=getattr(row, "expected_receiver_generation", None),
+        expected_provider_session_id=getattr(row, "expected_provider_session_id", None),
+        expected_execution_mode=getattr(row, "expected_execution_mode", None),
+        expected_provider=getattr(row, "expected_provider", None),
+        callback_recovery_key=getattr(row, "callback_recovery_key", None),
+        callback_completion_key=getattr(row, "callback_completion_key", None),
+    )
 
 
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
     """Get pending messages ordered by created_at ASC (oldest first)."""
     return get_inbox_messages(receiver_id, limit=limit, status=MessageStatus.PENDING)
+
+
+def get_pending_message(receiver_id: str, message_id: int) -> Optional[InboxMessage]:
+    """Get one exact pending row without oldest-first queue starvation."""
+    with SessionLocal() as db:
+        row = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id == message_id,
+                InboxModel.receiver_id == receiver_id,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .one_or_none()
+        )
+        return _inbox_message_from_row(row) if row is not None else None
 
 
 def is_message_pending(message_id: int) -> bool:
@@ -2524,17 +2994,7 @@ def get_inbox_messages(
 
         messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
 
-        return [
-            InboxMessage(
-                id=msg.id,
-                sender_id=msg.sender_id,
-                receiver_id=msg.receiver_id,
-                message=msg.message,
-                status=MessageStatus(msg.status),
-                created_at=msg.created_at,
-            )
-            for msg in messages
-        ]
+        return [_inbox_message_from_row(msg) for msg in messages]
 
 
 def record_project_alias(project_id: str, alias: str, kind: str) -> None:
@@ -2603,6 +3063,7 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
     """
     with SessionLocal() as db:
         if status == MessageStatus.DELIVERED:
+            message = db.get(InboxModel, message_id)
             updated = (
                 db.query(InboxModel)
                 .filter(
@@ -2614,6 +3075,9 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
                     synchronize_session=False,
                 )
             )
+            # Callback-recovery completion is never inferred from a generic
+            # inbox status change.  Only callback_recovery.commit_callback_effect
+            # can write its post-effect receipt and release terminal retention.
             db.commit()
             return updated == 1
 

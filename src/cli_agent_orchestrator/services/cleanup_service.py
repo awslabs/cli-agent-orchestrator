@@ -4,7 +4,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
+from cli_agent_orchestrator.clients.database import (
+    CallbackRecoveryModel,
+    InboxModel,
+    SessionLocal,
+    TerminalModel,
+)
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
     MEMORY_BASE_DIR,
@@ -16,6 +21,44 @@ from cli_agent_orchestrator.services.memory_format import parse_index_entry
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 logger = logging.getLogger(__name__)
+
+
+def _callback_recovery_table_absent(exc: Exception) -> bool:
+    return "no such table: callback_recovery_operations" in str(exc).lower()
+
+
+def _terminal_has_open_callback_recovery(db, terminal_id, generation) -> bool:
+    query = db.query(CallbackRecoveryModel).filter(
+        CallbackRecoveryModel.source_terminal_id == terminal_id,
+        CallbackRecoveryModel.state.in_(("intent", "pending", "recovery-submitted", "ambiguous")),
+    )
+    if generation is not None:
+        query = query.filter(CallbackRecoveryModel.source_generation == generation)
+    try:
+        return query.first() is not None
+    except Exception as exc:  # old databases legitimately predate this table
+        if _callback_recovery_table_absent(exc):
+            return False
+        raise
+
+
+def _held_callback_recovery_inbox_ids(db) -> set[int]:
+    try:
+        return {
+            row[0]
+            for row in db.query(CallbackRecoveryModel.inbox_message_id)
+            .filter(
+                CallbackRecoveryModel.state.in_(
+                    ("intent", "pending", "recovery-submitted", "ambiguous")
+                )
+                & CallbackRecoveryModel.inbox_message_id.is_not(None)
+            )
+            .all()
+        }
+    except Exception as exc:  # old databases legitimately predate this table
+        if _callback_recovery_table_absent(exc):
+            return set()
+        raise
 
 
 def _v2_terminal_identities(db) -> tuple[set, set]:
@@ -131,31 +174,83 @@ def cleanup_old_data():
         # Clean up old terminals (stop FIFO readers and clear state first).
         # v2-owned/managed rows are invisible to this legacy path: they are
         # skipped, never deleted (zero old-binary visibility into v2 state).
+        # Close the aged-row snapshot before any lifecycle claim.  Retention
+        # must never retain a SQLite/ORM transaction while waiting for a
+        # recovery/session teardown lock.
         with SessionLocal() as db:
             v2_ids, v2_generations = _v2_terminal_identities(db)
-            old_terminals = (
-                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
-            )
-            deleted_terminals = 0
-            for terminal in old_terminals:
-                if _is_v2_owned_row(terminal, v2_ids, v2_generations):
-                    logger.warning(
-                        f"cleanup skipped managed/v2-owned terminal row {terminal.id}; "
-                        "its lifecycle is generation-claimed"
-                    )
-                    continue
-                fifo_manager.stop_reader(terminal.id)
-                status_monitor.clear_terminal(terminal.id)
-                db.delete(terminal)
-                deleted_terminals += 1
+            old_terminals = [
+                {
+                    "id": terminal.id,
+                    "generation": terminal.generation,
+                    "callback_target_generation": terminal.callback_target_generation,
+                    "pane_id": terminal.pane_id,
+                    "last_active": terminal.last_active,
+                }
+                for terminal in db.query(TerminalModel)
+                .filter(TerminalModel.last_active < cutoff_date)
+                .all()
+            ]
+        deleted_terminals = 0
+        from cli_agent_orchestrator.services import callback_recovery
+
+        for snapshot in old_terminals:
+            with callback_recovery.generation_lifecycle_claims(
+                callback_recovery.terminal_lifecycle_claim_set(snapshot)
+            ):
+                with SessionLocal() as db:
+                    # Re-open and revalidate after the claim.  A newer terminal
+                    # incarnation, activity update, or callback operation wins.
+                    terminal = db.get(TerminalModel, snapshot["id"])
+                    if (
+                        terminal is None
+                        or terminal.last_active >= cutoff_date
+                        or callback_recovery.terminal_lifecycle_claim_set(terminal)
+                        != callback_recovery.terminal_lifecycle_claim_set(snapshot)
+                    ):
+                        continue
+                    if callback_recovery.terminal_has_open_recovery(
+                        terminal.id, terminal.generation
+                    ):
+                        logger.warning(
+                            "cleanup skipped terminal %s; callback recovery is open",
+                            terminal.id,
+                        )
+                        continue
+                    if _is_v2_owned_row(terminal, v2_ids, v2_generations):
+                        logger.warning(
+                            f"cleanup skipped managed/v2-owned terminal row {terminal.id}; "
+                            "its lifecycle is generation-claimed"
+                        )
+                        continue
+                    fifo_manager.stop_reader(terminal.id)
+                    status_monitor.clear_terminal(terminal.id)
+                    db.delete(terminal)
+                    db.commit()
+                    deleted_terminals += 1
+        # Preserve the legacy cleanup transaction boundary even when no aged
+        # terminal survived revalidation; inbox retention remains a separate
+        # durable boundary below.
+        with SessionLocal() as db:
             db.commit()
-            logger.info(f"Deleted {deleted_terminals} old terminals from database")
+        logger.info(f"Deleted {deleted_terminals} old terminals from database")
 
         # Clean up old inbox messages
-        with SessionLocal() as db:
-            deleted_messages = (
-                db.query(InboxModel).filter(InboxModel.created_at < cutoff_date).delete()
+        try:
+            held_ids = callback_recovery.held_inbox_ids()
+        except Exception:
+            logger.warning(
+                "callback recovery lifecycle unreadable during retention; "
+                "preserving all inbox rows",
+                exc_info=True,
             )
+            with SessionLocal() as db:
+                held_ids = {row[0] for row in db.query(InboxModel.id).all()}
+        with SessionLocal() as db:
+            query = db.query(InboxModel).filter(InboxModel.created_at < cutoff_date)
+            if held_ids:
+                query = query.filter(InboxModel.id.not_in(held_ids))
+            deleted_messages = query.delete(synchronize_session=False)
             db.commit()
             logger.info(f"Deleted {deleted_messages} old inbox messages from database")
 

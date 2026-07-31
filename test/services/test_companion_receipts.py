@@ -1,9 +1,14 @@
 """Store-level contract for the generation-bound companion receipts
 (final conformance §20.2f P1-7/P1-10)."""
 
+from datetime import datetime, timezone
+
 import pytest
 
-from cli_agent_orchestrator.services import companion_receipts
+from cli_agent_orchestrator.services import (
+    companion_receipts,
+    model_turn_receipt_contract,
+)
 
 GEN = "11111111-1111-4111-8111-111111111111"
 OTHER_GEN = "22222222-2222-4222-8222-222222222222"
@@ -131,3 +136,37 @@ def test_corrupt_record_fails_closed(store):
     # and the store recovers on the next well-formed write
     companion_receipts.record_prompt("term-1", GEN, prompt_id="p", text="t", choices=[])
     assert companion_receipts.get_prompt("term-1", GEN)["prompt_id"] == "p"
+
+
+def test_strict_receipt_producer_never_resets_corrupt_storage(store):
+    receipt = model_turn_receipt_contract.build_receipt(
+        message_id="m1",
+        message_sha256="a" * 64,
+        message_created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        sender_id="supervisor",
+        sender_generation="supervisor-generation",
+        receiver_id="term-1",
+        receiver_generation=GEN,
+        provider="codex",
+        provider_session_id="thread-1",
+        provider_turn_id="turn-1",
+        submitted_at=datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc),
+    )
+    companion_receipts.record_message_ack(
+        "term-1",
+        GEN,
+        message_id="m1",
+        ack=receipt,
+    )
+    path = companion_receipts._record_path("term-1", GEN)
+    corrupt = b'{"schema_version":4,"terminal_id":"other"}'
+    path.write_bytes(corrupt)
+
+    with pytest.raises(companion_receipts.CompanionReceiptInvalid):
+        companion_receipts.record_message_ack(
+            "term-1",
+            GEN,
+            message_id="m2",
+            ack={**receipt, "message_id": "m2"},
+        )
+    assert path.read_bytes() == corrupt

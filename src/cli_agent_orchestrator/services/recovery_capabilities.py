@@ -22,6 +22,10 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from cli_agent_orchestrator.constants import (
+    INBOX_RECONCILE_GRACE_SECONDS,
+    INBOX_RECONCILE_INTERVAL,
+)
 from cli_agent_orchestrator.services import actor_broker, provider_contracts
 from cli_agent_orchestrator.services.containment import ContainmentComposition
 from cli_agent_orchestrator.services.resource_registry import REGISTRY_SCHEMA_VERSION
@@ -37,6 +41,16 @@ RECEIPT_SCHEMAS = [
     "cao-destructive-receipt-v1",
     "cao-containment-proof-v1",
 ]
+
+
+def callback_recovery_admission_allowed(expected_provider: str) -> bool:
+    """Recompute the exact live authority intersection for a start request."""
+    callback = build_capabilities()["callback_recovery"]
+    return bool(
+        callback["enabled"]
+        and callback["pending_sweep"]["enabled"]
+        and expected_provider in callback["providers"]
+    )
 
 
 def build_capabilities(
@@ -121,6 +135,17 @@ def build_capabilities(
         if status.authority_supported
     ]
     zero_proven = not enabled_providers or containment_status != "proven"
+    from cli_agent_orchestrator.services import callback_recovery
+
+    # The lifecycle API uses ``kimi_cli`` on the wire, while the authority
+    # surface calls the same provider ``kimi``.  Never advertise a callback
+    # provider outside the proven outer authority intersection.
+    callback_providers = [
+        wire_name
+        for provider, wire_name in (("codex", "codex"), ("kimi", "kimi_cli"))
+        if provider in enabled_providers
+    ]
+
     return {
         "schema_version": CAPABILITY_SCHEMA_VERSION,
         "protocol": CAPABILITY_PROTOCOL,
@@ -152,6 +177,22 @@ def build_capabilities(
             "recovery": not zero_proven,
             "finalization": not zero_proven,
             "destructive": not zero_proven,
+        },
+        # This additive block is the only lifecycle-v2 negotiation surface.
+        # It remains visible while disabled so callers can distinguish an old
+        # fork from a deliberate safe rollout hold.
+        "callback_recovery": {
+            "lifecycle_version": 2,
+            "enabled": callback_recovery.lifecycle_v2_enabled() and bool(callback_providers),
+            "request_schema": callback_recovery.REQUEST_SCHEMA,
+            "operation_schema": callback_recovery.OPERATION_SCHEMA,
+            "callback_lookup_schema": callback_recovery.CALLBACK_LOOKUP_SCHEMA,
+            "providers": callback_providers,
+            "pending_sweep": {
+                "enabled": True,
+                "interval_seconds": INBOX_RECONCILE_INTERVAL,
+                "grace_seconds": INBOX_RECONCILE_GRACE_SECONDS,
+            },
         },
         "delivery_journal": {
             "schema_version": 1,

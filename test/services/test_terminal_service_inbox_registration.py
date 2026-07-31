@@ -23,6 +23,7 @@ import pytest
 
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal
+from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 from cli_agent_orchestrator.services.terminal_service import (
     create_terminal,
     delete_terminal,
@@ -226,7 +227,10 @@ class TestDeleteTerminalHerdrUnregistration:
         result = delete_terminal(TERMINAL_ID)
 
         # Assert
-        m.service.unregister_terminal.assert_called_once_with(TERMINAL_ID)
+        m.service.unregister_terminal.assert_called_once_with(
+            TERMINAL_ID,
+            expected_pane_id=None,
+        )
         assert result is True
 
     def test_delete_terminal_no_unregistration_when_service_none(self, delete_mocks):
@@ -245,3 +249,25 @@ class TestDeleteTerminalHerdrUnregistration:
         # Assert
         m.service.unregister_terminal.assert_not_called()
         assert result is True
+
+    def test_inner_unregister_preserves_same_pane_replacement(self, delete_mocks):
+        """A late teardown of the old terminal cannot remove pane reuse."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal(TERMINAL_ID, PANE_ID)
+        service.register_terminal("term-replacement", PANE_ID)
+        delete_mocks.get_herdr_inbox_service.return_value = service
+
+        assert delete_terminal(TERMINAL_ID) is True
+
+        assert service._pane_to_terminal == {PANE_ID: "term-replacement"}
+        assert service._terminal_to_pane == {"term-replacement": PANE_ID}
+
+    def test_worker_retirement_can_defer_unregister_to_event_loop(self, delete_mocks):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal(TERMINAL_ID, PANE_ID)
+        delete_mocks.get_herdr_inbox_service.return_value = service
+
+        assert delete_terminal(TERMINAL_ID, unregister_inbox=False) is True
+
+        assert service._pane_to_terminal == {PANE_ID: TERMINAL_ID}
+        assert service._terminal_to_pane == {TERMINAL_ID: PANE_ID}

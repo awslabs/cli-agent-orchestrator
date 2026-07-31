@@ -419,6 +419,10 @@ class TestMessagePluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.managed_launch.managed_control_identity",
+        return_value=None,
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
@@ -431,6 +435,7 @@ class TestMessagePluginEvents:
         mock_status_monitor,
         mock_terminal_service,
         mock_update_message_status,
+        _mock_managed_control_identity,
     ):
         """Queued inbox delivery should forward sender context and hardcode send_message."""
         registry = _registry_mock()
@@ -438,6 +443,9 @@ class TestMessagePluginEvents:
         message.id = 17
         message.sender_id = "supervisor-1"
         message.message = "Please review this"
+        # This is an ordinary inbox row, not a callback-recovery obligation.
+        message.callback_recovery_key = None
+        message.callback_completion_key = None
         mock_get_pending_messages.return_value = [message]
         # Status is sourced from the event-driven StatusMonitor, not the provider.
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE

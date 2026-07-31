@@ -1,6 +1,7 @@
 """Tests for the event-driven InboxService."""
 
 import asyncio
+import contextlib
 import os
 import threading
 from datetime import datetime, timedelta
@@ -294,6 +295,82 @@ class TestDeliverPending:
         assert sends == [("term-race", "callback-once")]
         stored = database.get_inbox_messages("term-race", limit=10)
         assert [(row.id, row.status) for row in stored] == [(message.id, MessageStatus.DELIVERED)]
+
+    def test_stale_callback_recovery_cannot_starve_next_exact_row(self, monkeypatch):
+        common = {
+            "sender_id": "supervisor",
+            "receiver_id": "worker",
+            "status": MessageStatus.PENDING,
+            "created_at": datetime.now(),
+            "sender_generation": "supervisor-generation",
+            "expected_receiver_generation": "worker-generation",
+            "expected_provider_session_id": "provider-session",
+            "expected_execution_mode": "acp",
+            "expected_provider": "codex",
+        }
+        stale = InboxMessage(
+            id=1,
+            message="stale",
+            callback_recovery_key="recovery-stale",
+            **common,
+        )
+        current = InboxMessage(
+            id=2,
+            message="current",
+            callback_recovery_key="recovery-current",
+            **common,
+        )
+        monkeypatch.setattr(
+            inbox_service, "get_pending_messages", lambda *_args, **_kwargs: [stale, current]
+        )
+        monkeypatch.setattr(inbox_service, "is_message_pending", lambda _id: True)
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "managed_control_identity",
+            lambda _terminal: {"execution_mode": "acp"},
+        )
+        checks = iter((False, True))
+        monkeypatch.setattr(
+            inbox_service.callback_recovery,
+            "current_delivery_binding_matches",
+            lambda _message: next(checks),
+        )
+        ambiguous = []
+        monkeypatch.setattr(
+            inbox_service.callback_recovery,
+            "turn_receipt",
+            lambda _key: None,
+        )
+        monkeypatch.setattr(
+            inbox_service.callback_recovery,
+            "mark_delivery_ambiguous",
+            lambda key, **kwargs: ambiguous.append((key, kwargs["reason_code"])),
+        )
+        bridged = []
+        monkeypatch.setattr(
+            inbox_service.managed_launch,
+            "deliver_inbox_via_bridge",
+            lambda terminal, **kwargs: bridged.append((terminal, kwargs)) or True,
+        )
+        updates = []
+        monkeypatch.setattr(
+            inbox_service,
+            "update_message_status",
+            lambda message_id, status: updates.append((message_id, status)) or True,
+        )
+
+        # Production calls use the default one-message budget. The scanner
+        # must park the held first row and still reach the later valid row.
+        InboxService().deliver_pending("worker")
+
+        assert ambiguous == [
+            (
+                "recovery-stale",
+                "source-generation-replaced-manual-resolution-required",
+            )
+        ]
+        assert [item[1]["recovery_operation_key"] for item in bridged] == ["recovery-current"]
+        assert updates == [(2, MessageStatus.DELIVERED)]
 
 
 class TestEagerInboxDelivery:
@@ -1301,6 +1378,56 @@ class TestManagedV2InboxDelivery:
         assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
             MessageStatus.PENDING
         )
+
+
+def test_ordinary_callback_completion_never_uses_generic_pane_writer(monkeypatch):
+    message = InboxMessage(
+        id=71,
+        sender_id="worker-1",
+        receiver_id="supervisor-1",
+        message="callback complete",
+        status=MessageStatus.PENDING,
+        created_at=datetime.now(),
+        callback_completion_key="operation-71",
+        expected_receiver_generation="supervisor-generation-1",
+    )
+    claimed = []
+    ambiguous = []
+    committed = []
+    send_input = MagicMock()
+    monkeypatch.setattr(
+        InboxService,
+        "_callback_completion_delivery_claim",
+        staticmethod(lambda _messages: contextlib.nullcontext()),
+    )
+    monkeypatch.setattr(
+        inbox_service.callback_recovery,
+        "claim_callback_effect",
+        lambda *args: claimed.append(args),
+    )
+    monkeypatch.setattr(
+        inbox_service.callback_recovery,
+        "mark_callback_effect_ambiguous",
+        lambda *args: ambiguous.append(args),
+    )
+    monkeypatch.setattr(
+        inbox_service.callback_recovery,
+        "commit_callback_effect",
+        lambda *args: committed.append(args),
+    )
+    monkeypatch.setattr(inbox_service.terminal_service, "send_input", send_input)
+    monkeypatch.setattr(
+        inbox_service.status_monitor, "get_status", lambda _terminal: TerminalStatus.IDLE
+    )
+
+    InboxService()._deliver_callback_completions_via_pane(
+        "supervisor-1", [message], registry=None, native_managed=False, managed_identity=None
+    )
+
+    assert claimed == [("operation-71", 71)]
+    assert ambiguous == [("operation-71",)]
+    assert committed == []
+    send_input.assert_not_called()
 
 
 class TestNativeManagedV2InboxDelivery:

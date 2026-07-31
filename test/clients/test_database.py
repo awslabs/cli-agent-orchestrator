@@ -749,6 +749,104 @@ class TestInitDb:
         mock_base.metadata.create_all.assert_called_once()
 
 
+class TestCallbackRecoveryMigrationReadiness:
+    """Inbox and operation migrations are one fail-closed capability boundary."""
+
+    @pytest.fixture
+    def callback_migration_db(self, tmp_path, monkeypatch):
+        from cli_agent_orchestrator import constants
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "callback-recovery.sqlite"
+        engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
+        monkeypatch.setattr(db_mod, "engine", engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+        monkeypatch.setattr(db_mod, "_callback_recovery_migration_ready", False)
+        monkeypatch.setattr(constants, "DATABASE_FILE", db_file)
+        try:
+            yield db_file
+        finally:
+            engine.dispose()
+
+    @staticmethod
+    def _legacy_inbox(db_file, *, duplicate_callback_keys=False):
+        import sqlite3
+
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE inbox ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id TEXT NOT NULL, "
+                "receiver_id TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, "
+                "created_at TEXT, callback_recovery_key TEXT, callback_completion_key TEXT)"
+            )
+            if duplicate_callback_keys:
+                conn.executemany(
+                    "INSERT INTO inbox "
+                    "(sender_id, receiver_id, message, status, callback_recovery_key) "
+                    "VALUES ('supervisor', 'worker', 'legacy', 'pending', 'duplicate-key')",
+                    [(), ()],
+                )
+
+    @staticmethod
+    def _inbox_indexes(db_file):
+        import sqlite3
+
+        with sqlite3.connect(str(db_file)) as conn:
+            return {row[1] for row in conn.execute("PRAGMA index_list(inbox)")}
+
+    def test_duplicate_legacy_callback_keys_keep_lifecycle_and_admission_disabled(
+        self, callback_migration_db, monkeypatch
+    ):
+        from cli_agent_orchestrator.clients import database as db_mod
+        from cli_agent_orchestrator.services import callback_recovery
+
+        self._legacy_inbox(callback_migration_db, duplicate_callback_keys=True)
+
+        inbox_ready = db_mod._migrate_callback_recovery_inbox_schema()
+        db_mod._migrate_callback_recovery_schema(inbox_schema_ready=inbox_ready)
+
+        monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "true")
+        assert inbox_ready is False
+        assert self._inbox_indexes(callback_migration_db) == set()
+        assert db_mod.callback_recovery_migration_ready() is False
+        assert callback_recovery.lifecycle_v2_enabled() is False
+
+    def test_generic_inbox_ddl_failure_keeps_lifecycle_disabled(
+        self, callback_migration_db, monkeypatch
+    ):
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+        from cli_agent_orchestrator.services import callback_recovery
+
+        with sqlite3.connect(str(callback_migration_db)) as conn:
+            conn.execute("CREATE VIEW inbox AS SELECT 'legacy' AS callback_recovery_key")
+
+        inbox_ready = db_mod._migrate_callback_recovery_inbox_schema()
+        db_mod._migrate_callback_recovery_schema(inbox_schema_ready=inbox_ready)
+
+        monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "true")
+        assert inbox_ready is False
+        assert db_mod.callback_recovery_migration_ready() is False
+        assert callback_recovery.lifecycle_v2_enabled() is False
+
+    def test_normal_upgrade_verifies_both_inbox_fences_idempotently(self, callback_migration_db):
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        self._legacy_inbox(callback_migration_db)
+
+        for _ in range(2):
+            inbox_ready = db_mod._migrate_callback_recovery_inbox_schema()
+            db_mod._migrate_callback_recovery_schema(inbox_schema_ready=inbox_ready)
+            assert inbox_ready is True
+            assert db_mod.callback_recovery_migration_ready() is True
+
+        assert self._inbox_indexes(callback_migration_db) == {
+            "ix_inbox_callback_completion_key",
+            "ix_inbox_callback_recovery_key",
+        }
+
+
 class TestInitDbOldBinaryGate:
     """The configured exact-old-binary gate precedes any v2 surface creation.
 

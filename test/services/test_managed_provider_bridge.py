@@ -331,6 +331,11 @@ def test_deliver_inbox_records_exact_provider_turn_ack(tmp_path, monkeypatch):
         "message": "ping",
         "message_sha256": hashlib.sha256(b"ping").hexdigest(),
         "sender_id": "cafebabe",
+        "sender_generation": "supervisor-generation",
+        "message_created_at": "2026-07-30T12:00:00.000000Z",
+        "expected_provider": "codex",
+        "expected_provider_session_id": "thread_provider_opaque",
+        "expected_execution_mode": "acp",
     }
     receipt = session.deliver_inbox(command)
     assert receipt["provider_turn_id"] == "turn_provider_opaque"
@@ -339,6 +344,9 @@ def test_deliver_inbox_records_exact_provider_turn_ack(tmp_path, monkeypatch):
 
     ack = companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-1")
     assert ack["kind"] == "submitted"
+    assert ack["schema"] == "cao-model-turn-receipt-v1"
+    assert ack["source"] == "provider-adapter"
+    assert ack["sender_generation"] == "supervisor-generation"
     assert ack["message_sha256"] == command["message_sha256"]
     assert ack["receiver_generation"] == request["generation"]
     assert ack["provider_session_id"] == "thread_provider_opaque"
@@ -357,9 +365,25 @@ def test_deliver_inbox_records_exact_provider_turn_ack(tmp_path, monkeypatch):
         session.deliver_inbox({**command, "message_id": "msg-2", "message_sha256": "0" * 64})
     with pytest.raises(bridge.BridgeError):
         session.deliver_inbox({**command, "message_id": "msg-3", "reservation_id": "gen-X"})
+    provider_submissions = []
+    monkeypatch.setattr(
+        session,
+        "_submit_provider_turn",
+        lambda *args, **kwargs: provider_submissions.append((args, kwargs)),
+    )
+    with pytest.raises(bridge.BridgeError, match="provider_session_id changed"):
+        session.deliver_inbox(
+            {
+                **command,
+                "message_id": "msg-4",
+                "expected_provider_session_id": "replacement-session",
+            }
+        )
+    assert provider_submissions == []
     # the refused messages recorded no ack
     assert companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-2") is None
     assert companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-3") is None
+    assert companion_receipts.get_message_ack("deadbeef", request["generation"], "msg-4") is None
 
 
 def test_reverse_request_prompt_lifecycle_is_observation_only(tmp_path, monkeypatch):
@@ -558,6 +582,7 @@ def _v2_session(tmp_path, monkeypatch):
             "project": "cao-conductor-self-heal",
             "task_id": "self-heal-demo-task",
             "run_id": "run-0001",
+            "attempt_id": "attempt-1",
             "obligation_generation": "obgen-7c2e4a1b",
             "assigned_policy_sha256": "7" * 64,
         }
@@ -646,6 +671,7 @@ def test_admission_holds_fence_lock_across_provider_io(tmp_path, monkeypatch):
     from cli_agent_orchestrator.services import generation_fence as gf
 
     session, companion, request = _v2_session(tmp_path, monkeypatch)
+    _bound_generation(companion, request)
     submitted: list = []
 
     def fake_submit(message, **_kwargs):
@@ -716,6 +742,61 @@ def test_admission_holds_fence_lock_across_provider_io(tmp_path, monkeypatch):
     import pytest
 
     with pytest.raises(bridge.BridgeError, match="sealed"):
+        session.admit(admission)
+    assert submitted == [admission["message"]]
+
+
+def test_successor_fencing_cannot_interleave_with_provider_io(tmp_path, monkeypatch):
+    import threading
+
+    from cli_agent_orchestrator.services import heartbeat_store as hb
+
+    session, companion, request = _v2_session(tmp_path, monkeypatch)
+    _bound_generation(companion, request)
+    entered_io = threading.Event()
+    finish_io = threading.Event()
+    submitted = []
+
+    def fake_submit(message, **_kwargs):
+        entered_io.set()
+        assert finish_io.wait(timeout=10)
+        submitted.append(message)
+        return "turn-successor-race", "codex-turn-start", {"source": "test"}
+
+    session._submit_provider_turn = fake_submit
+    session._scan_companion_events = lambda: None
+    session._emit_beat = lambda *_args: None
+    admission = _admission(request)
+    outcome = []
+    worker = threading.Thread(target=lambda: outcome.append(session.admit(admission)))
+    worker.start()
+    assert entered_io.wait(timeout=10)
+
+    successor = []
+    issuer = threading.Thread(
+        target=lambda: successor.append(
+            hb.issue_fencing_token(
+                companion,
+                request["terminal_id"],
+                "successor-generation",
+                "attempt-2",
+            )
+        )
+    )
+    issuer.start()
+    issuer.join(timeout=0.1)
+    assert issuer.is_alive()
+    finish_io.set()
+    worker.join(timeout=10)
+    issuer.join(timeout=10)
+
+    assert submitted == [admission["message"]]
+    assert outcome[0]["provider_turn_id"] == "turn-successor-race"
+    assert (
+        hb.current_fencing_record(companion, request["terminal_id"])["generation"]
+        == "successor-generation"
+    )
+    with pytest.raises(bridge.BridgeError, match="successor-fenced-before-provider-io"):
         session.admit(admission)
     assert submitted == [admission["message"]]
 

@@ -1,4 +1,43 @@
+---
+created: 2026-05-30
+lastUpdated: 2026-07-30
+summary: "Reference for ordinary inbox delivery and the dedicated refusal-bound callback recovery protocol."
+category: REFERENCE
+status: CURRENT
+note: "Current fork contract; callback recovery is not a general managed-message API."
+changelog:
+  - "2026-07-30: Replaced generic bound messages with one-shot refusal/callback recovery."
+  - "2026-07-30: Added exact-generation managed message binding."
+---
+
 # Inbox Delivery
+
+## Refusal-bound callback recovery
+
+`POST /terminals/{source}/callback-recoveries` is dedicated to recovering one
+already-authored callback after an exact durable `managed-acp-pane` zero-byte
+control refusal. It is not an ordinary message surface. Unknown request fields
+are rejected. Admission binds project/run/task, source terminal/generation,
+Codex provider and bridge session, supervisor caller/session, the refusal
+occurrence, callback occurrence, report/source-head/manifest/finalization
+digests, and publishing-lease state or absence inside one SQLite writer
+transaction.
+
+The refusal/callback identity has a unique one-shot key independent of the
+caller operation id, so another id cannot repeat recovery. Refusals and
+provider ambiguity are durable terminal outcomes. The exact provider and
+session are checked again inside the generation-fence admission critical
+section. A replaced generation is terminalized without bridge or pane
+fallback, and stale rows do not starve later inbox work.
+
+The recovery prompt's strict 14-field provider receipt is stored inside a
+separate metadata envelope and revalidated against the immutable operation and
+inbox row on every read. `POST /callback-recoveries/{key}/complete` closes the
+operation only with the exact original callback inbox row. Open operations hold
+terminal deletion and retention cleanup. Blocking database and bridge work is
+offloaded from FastAPI's event loop.
+
+The existing generic `/inbox/messages` contract is unchanged.
 
 ## Overview
 

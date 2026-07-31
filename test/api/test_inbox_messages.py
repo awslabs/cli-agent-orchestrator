@@ -93,7 +93,7 @@ class TestGetInboxMessagesEndpoint:
             assert response.status_code == 200
             data = response.json()
             assert len(data) == 2
-            mock_get.assert_called_once_with("abcdef12", limit=2, status=None)
+            mock_get.assert_called_once_with("abcdef12", limit=100, status=None)
 
     def test_get_messages_with_status_and_limit(self, client, sample_inbox_messages):
         """Test getting messages with both status and limit parameters."""
@@ -105,7 +105,56 @@ class TestGetInboxMessagesEndpoint:
             assert response.status_code == 200
             data = response.json()
             assert len(data) == 1
-            mock_get.assert_called_once_with("abcdef12", limit=5, status=MessageStatus.PENDING)
+            mock_get.assert_called_once_with("abcdef12", limit=100, status=MessageStatus.PENDING)
+
+    def test_auth_read_projection_omits_dedicated_recovery_secrets(self, client, monkeypatch):
+        monkeypatch.setenv("AUTH0_DOMAIN", "test.local")
+        monkeypatch.setenv("AUTH0_AUDIENCE", "cao://test")
+        recovery = InboxMessage(
+            id=1,
+            sender_id="supervisor",
+            receiver_id="abcdef12",
+            message=(
+                "recover with CAO_CALLBACK_RECOVERY_TOKEN=secret-token "
+                "report=/private/worktree/report.md"
+            ),
+            status=MessageStatus.PENDING,
+            created_at=datetime(2026, 7, 30, 12, 0, 0),
+            callback_recovery_key="recovery-key",
+        )
+        ordinary = InboxMessage(
+            id=2,
+            sender_id="supervisor",
+            receiver_id="abcdef12",
+            message="ordinary status update",
+            status=MessageStatus.PENDING,
+            created_at=datetime(2026, 7, 30, 12, 1, 0),
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.security.auth.extract_scopes_from_token",
+            lambda _token: ["cao:read"],
+        )
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
+            mock_get.return_value = [recovery, ordinary]
+            assert client.get("/terminals/abcdef12/inbox/messages").status_code == 401
+            response = client.get(
+                "/terminals/abcdef12/inbox/messages",
+                headers={"Authorization": "Bearer read-token"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == [
+            {
+                "id": 2,
+                "sender_id": "supervisor",
+                "receiver_id": "abcdef12",
+                "message": "ordinary status update",
+                "status": "pending",
+                "created_at": "2026-07-30T12:01:00",
+            }
+        ]
+        assert "secret-token" not in response.text
+        assert "/private/worktree" not in response.text
 
     def test_invalid_status_parameter(self, client):
         """Test error handling for invalid status parameter."""

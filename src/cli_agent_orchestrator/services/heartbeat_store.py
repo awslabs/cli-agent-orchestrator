@@ -264,6 +264,42 @@ def current_fencing_record(companion_dir: Path, terminal_id: str) -> Optional[di
     return _read_json(_fencing_path(companion_dir, terminal_id))
 
 
+@contextmanager
+def successor_critical_section(companion_dir: Path, terminal_id: str) -> Iterator[None]:
+    """Serialize provider admission with successor/resume token issuance."""
+    with _terminal_lock(companion_dir, terminal_id):
+        yield
+
+
+def assert_current_fencing_binding(
+    companion_dir: Path,
+    *,
+    terminal_id: str,
+    generation: str,
+    attempt_id: str,
+    fencing_token_id: str,
+) -> None:
+    """Revalidate the exact current producer token while successor lock is held."""
+    record = current_fencing_record(companion_dir, terminal_id)
+    token = (record or {}).get("current_token") or {}
+    expected = {
+        "terminal_id": terminal_id,
+        "generation": generation,
+        "attempt_id": attempt_id,
+        "token_id": fencing_token_id,
+    }
+    observed = {
+        "terminal_id": (record or {}).get("terminal_id"),
+        "generation": (record or {}).get("generation"),
+        "attempt_id": (record or {}).get("attempt_id"),
+        "token_id": token.get("id"),
+    }
+    if observed != expected:
+        raise FencingRefused(
+            "provider admission lost the current successor/heartbeat fencing token"
+        )
+
+
 def current_fencing_token(companion_dir: Path, terminal_id: str) -> Optional[FencingToken]:
     record = _read_json(_fencing_path(companion_dir, terminal_id))
     if record is None:

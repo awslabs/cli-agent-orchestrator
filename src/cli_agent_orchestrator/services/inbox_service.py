@@ -4,6 +4,7 @@ Consumer: terminal.{id}.status
 """
 
 import asyncio
+import contextlib
 import logging
 import threading
 import time
@@ -13,6 +14,7 @@ from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
+    get_pending_message,
     get_pending_messages,
     is_message_pending,
     list_pending_receiver_ids_by_provider,
@@ -23,12 +25,13 @@ from cli_agent_orchestrator.constants import (
     EAGER_INBOX_DELIVERY,
     INBOX_RECONCILE_GRACE_SECONDS,
 )
-from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
+    callback_recovery,
     control_input_service,
     managed_launch,
     terminal_service,
@@ -81,6 +84,10 @@ class _NativeManagedSendUndeliverable(RuntimeError):
     """
 
 
+class _CallbackCompletionGenerationReplaced(RuntimeError):
+    """The callback receiver changed before any generic delivery effect."""
+
+
 # Statuses that mean "still parked": a transition to anything else is a wake.
 _PARKED_STATUSES = frozenset(
     {TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value, TerminalStatus.IDLE}
@@ -99,6 +106,97 @@ class _WakePreparation:
 
 
 class InboxService:
+    @staticmethod
+    @contextlib.contextmanager
+    def _callback_completion_delivery_claim(messages):
+        """Hold exact supervisor generations across the final pane send."""
+        bound = [message for message in messages if message.callback_completion_key is not None]
+        keys = {
+            (
+                message.receiver_id,
+                "callback-target-generation",
+                message.expected_receiver_generation,
+            )
+            for message in bound
+        }
+        if any(not generation for _terminal_id, _kind, generation in keys):
+            raise _CallbackCompletionGenerationReplaced(
+                "callback completion lacks its receiver generation"
+            )
+        with callback_recovery.generation_lifecycle_claims(keys):
+            if any(
+                not callback_recovery.current_delivery_binding_matches(message) for message in bound
+            ):
+                raise _CallbackCompletionGenerationReplaced(
+                    "the original supervisor generation was replaced"
+                )
+            yield
+
+    def _deliver_callback_completions_via_pane(
+        self,
+        terminal_id: str,
+        messages: list[InboxMessage],
+        *,
+        registry,
+        native_managed: bool,
+        managed_identity,
+    ) -> None:
+        """Deliver completion rows through the governed pane/native adapter.
+
+        Ordinary supervisors are intentionally not managed-launch reservations;
+        they still need a callback route.  These rows never use the generic
+        inbox status claim: the callback lifecycle claim and post-effect receipt
+        are the only completion authority.
+        """
+        if not messages:
+            return
+        if not native_managed and status_monitor.get_status(terminal_id) not in (
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+        ):
+            return
+        for message in messages:
+            try:
+                with self._callback_completion_delivery_claim([message]):
+                    callback_recovery.claim_callback_effect(
+                        message.callback_completion_key,
+                        message.id,
+                    )
+                    if native_managed:
+                        self._send_native_managed_text(
+                            terminal_id, message.message, managed_identity
+                        )
+                    else:
+                        # The generic pane writer is neither a provider-native
+                        # acknowledgement nor byte-for-byte callback proof.
+                        # Retain the claimed attempt for ADMIN disposition
+                        # until this target has a receipt-bearing adapter.
+                        callback_recovery.mark_callback_effect_ambiguous(
+                            message.callback_completion_key
+                        )
+                        continue
+                    callback_recovery.commit_callback_effect(
+                        message.callback_completion_key,
+                        message.id,
+                    )
+            except callback_recovery.CallbackRecoveryRefused:
+                # The claim function has durably recorded the exact pre-I/O
+                # replacement fence; the ADMIN disposition owns any release.
+                continue
+            except Exception as exc:  # noqa: BLE001 - effect result is unknowable
+                logger.warning(
+                    "Callback completion pane delivery is ambiguous for %s/%s: %s",
+                    terminal_id,
+                    message.id,
+                    exc,
+                )
+                try:
+                    callback_recovery.mark_callback_effect_ambiguous(
+                        message.callback_completion_key
+                    )
+                except callback_recovery.CallbackRecoveryError:
+                    pass
+
     """Delivers one pending message per terminal per IDLE cycle.
 
     Also owns the unmanaged wake-confirmation watcher (cond-0072 scoped half):
@@ -571,6 +669,7 @@ class InboxService:
         terminal_id: str,
         num_messages: int = 1,
         registry: PluginRegistry | None = None,
+        required_message_id: int | None = None,
     ) -> None:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
@@ -582,8 +681,20 @@ class InboxService:
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
         """
-        limit = num_messages if num_messages > 0 else 100
-        messages = get_pending_messages(terminal_id, limit=limit)
+        managed_identity = managed_launch.managed_control_identity(terminal_id)
+        native_managed = (
+            managed_identity is not None and managed_identity.get("execution_mode") == NATIVE_TUI
+        )
+        if required_message_id is not None:
+            exact = get_pending_message(terminal_id, required_message_id)
+            messages = [exact] if exact is not None else []
+        else:
+            # Scan past parked identity-bound rows. With the production default
+            # of one message, selecting only the oldest row lets one stale
+            # recovery callback starve every later valid message forever.
+            scan_parked = managed_identity is not None and not native_managed
+            limit = 100 if scan_parked else (num_messages if num_messages > 0 else 100)
+            messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:
             return
 
@@ -604,14 +715,17 @@ class InboxService:
         # generation-bound native text delivery rather than the unmanaged
         # paste (which hard-refuses managed identities anyway).
         remaining = []
-        managed_identity = managed_launch.managed_control_identity(terminal_id)
-        native_managed = (
-            managed_identity is not None and managed_identity.get("execution_mode") == NATIVE_TUI
-        )
         if managed_identity is None or native_managed:
             remaining = messages
         else:
+            eligible_attempts = 0
             for message in messages:
+                if (
+                    num_messages > 0
+                    and required_message_id is None
+                    and eligible_attempts >= num_messages
+                ):
+                    break
                 lock = self._managed_delivery_lock(message.id)
                 if not lock.acquire(timeout=MANAGED_DELIVERY_LOCK_TIMEOUT_SECONDS):
                     logger.info(
@@ -629,14 +743,90 @@ class InboxService:
                     # the provider's durable message-id journal.
                     if not is_message_pending(message.id):
                         continue
-                    bridged = managed_launch.deliver_inbox_via_bridge(
-                        terminal_id,
-                        message_id=message.id,
-                        message=message.message,
-                        sender_id=message.sender_id,
-                    )
+                    if (
+                        message.is_identity_bound is True
+                        and not callback_recovery.current_delivery_binding_matches(message)
+                    ):
+                        if message.callback_completion_key is not None:
+                            logger.warning(
+                                "Preserving generation-bound recovery callback %s for %s: "
+                                "the original supervisor generation is no longer live",
+                                message.id,
+                                terminal_id,
+                            )
+                            continue
+                        receipt = None
+                        try:
+                            receipt = callback_recovery.turn_receipt(message.callback_recovery_key)
+                        except callback_recovery.CallbackRecoveryError:
+                            callback_recovery.mark_delivery_ambiguous(
+                                message.callback_recovery_key,
+                                reason_code=(
+                                    "stale-binding-reconciliation-failed-"
+                                    "manual-resolution-required"
+                                ),
+                            )
+                        if receipt is not None:
+                            update_message_status(message.id, MessageStatus.DELIVERED)
+                            eligible_attempts += 1
+                            continue
+                        logger.warning(
+                            "Preserving identity-bound inbox message %s for %s: "
+                            "the persisted managed generation/session/mode no "
+                            "longer matches the live receiver",
+                            message.id,
+                            terminal_id,
+                        )
+                        callback_recovery.mark_delivery_ambiguous(
+                            message.callback_recovery_key,
+                            reason_code=(
+                                "source-generation-replaced-" "manual-resolution-required"
+                            ),
+                        )
+                        continue
+                    eligible_attempts += 1
+                    if message.callback_recovery_key is not None:
+                        bridged = managed_launch.deliver_inbox_via_bridge(
+                            terminal_id,
+                            message_id=message.id,
+                            message=message.message,
+                            sender_id=message.sender_id,
+                            sender_generation=message.sender_generation,
+                            message_created_at=message.created_at,
+                            expected_generation=message.expected_receiver_generation,
+                            expected_provider=message.expected_provider,
+                            expected_provider_session_id=(message.expected_provider_session_id),
+                            expected_execution_mode=message.expected_execution_mode,
+                            recovery_operation_key=message.callback_recovery_key,
+                        )
+                    else:
+                        bridge_kwargs = {}
+                        if message.callback_completion_key is not None:
+                            bridge_kwargs["expected_generation"] = (
+                                message.expected_receiver_generation
+                            )
+                            # Own the single provider bridge attempt before it
+                            # can emit bytes.  A crash after this point is
+                            # intentionally ambiguous and is never retried by
+                            # a later inbox sweep.
+                            callback_recovery.claim_callback_effect(
+                                message.callback_completion_key,
+                                message.id,
+                            )
+                        bridged = managed_launch.deliver_inbox_via_bridge(
+                            terminal_id,
+                            message_id=message.id,
+                            message=message.message,
+                            sender_id=message.sender_id,
+                            **bridge_kwargs,
+                        )
                     if bridged:
-                        if update_message_status(message.id, MessageStatus.DELIVERED) is False:
+                        if message.callback_completion_key is not None:
+                            callback_recovery.commit_callback_effect(
+                                message.callback_completion_key,
+                                message.id,
+                            )
+                        elif update_message_status(message.id, MessageStatus.DELIVERED) is False:
                             logger.warning(
                                 "Managed bridge accepted inbox message %s for %s, but its "
                                 "still-pending row could not be terminalized",
@@ -652,7 +842,12 @@ class InboxService:
                         # the exact-message-id bridge journal, which adopts an
                         # existing acknowledgement and refuses blind replay
                         # after ambiguity.
-                        remaining.append(message)
+                        if message.callback_completion_key is not None:
+                            callback_recovery.mark_callback_effect_ambiguous(
+                                message.callback_completion_key
+                            )
+                        else:
+                            remaining.append(message)
                 except Exception as exc:  # noqa: BLE001 - no duplicate effect
                     logger.error(
                         "Failed to deliver message %s to managed terminal %s: %s",
@@ -660,11 +855,53 @@ class InboxService:
                         terminal_id,
                         exc,
                     )
-                    remaining.append(message)
+                    if message.callback_completion_key is not None:
+                        try:
+                            callback_recovery.mark_callback_effect_ambiguous(
+                                message.callback_completion_key
+                            )
+                        except callback_recovery.CallbackRecoveryError:
+                            pass
+                    else:
+                        remaining.append(message)
                     continue
                 finally:
                     lock.release()
         messages = remaining
+        if not messages:
+            return
+        # A callback-recovery operation belongs exclusively to the ACP provider
+        # bridge. If its exact managed identity disappeared or changed,
+        # preserving the row is the only safe outcome; it must never fall
+        # through to native or unmanaged pane delivery.
+        callback_completions = [
+            message for message in messages if message.callback_completion_key is not None
+        ]
+        recovery_prompts = [
+            message for message in messages if message.callback_recovery_key is not None
+        ]
+        if callback_completions:
+            self._deliver_callback_completions_via_pane(
+                terminal_id,
+                callback_completions,
+                registry=registry,
+                native_managed=native_managed,
+                managed_identity=managed_identity,
+            )
+        if recovery_prompts:
+            messages = [
+                message
+                for message in messages
+                if message.callback_recovery_key is None and message.callback_completion_key is None
+            ]
+            logger.info(
+                "Preserving %d recovery prompt message(s) for %s; no generic "
+                "delivery fallback is permitted",
+                len(recovery_prompts),
+                terminal_id,
+            )
+        elif callback_completions:
+            messages = [message for message in messages if message.callback_completion_key is None]
         if not messages:
             return
         if managed_identity is not None and not native_managed:
@@ -752,18 +989,19 @@ class InboxService:
                             )
                             if preparation is not None:
                                 preparations.append(preparation)
-                if native_managed:
-                    self._send_native_managed_text(terminal_id, combined, managed_identity)
-                elif registry is None:
-                    terminal_service.send_input(terminal_id, combined)
-                else:
-                    terminal_service.send_input(
-                        terminal_id,
-                        combined,
-                        registry=registry,
-                        sender_id=sender_id,
-                        orchestration_type=OrchestrationType.SEND_MESSAGE,
-                    )
+                with self._callback_completion_delivery_claim(batch):
+                    if native_managed:
+                        self._send_native_managed_text(terminal_id, combined, managed_identity)
+                    elif registry is None:
+                        terminal_service.send_input(terminal_id, combined)
+                    else:
+                        terminal_service.send_input(
+                            terminal_id,
+                            combined,
+                            registry=registry,
+                            sender_id=sender_id,
+                            orchestration_type=OrchestrationType.SEND_MESSAGE,
+                        )
                 logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
             except TerminalNotFoundError as e:
                 for preparation in preparations:
@@ -810,6 +1048,18 @@ class InboxService:
                     f"v1 send for terminal {terminal_id} refused "
                     f"({e.reason_code}) with zero bytes proven; leaving "
                     f"{len(batch)} message(s) pending: {e.detail}"
+                )
+            except _CallbackCompletionGenerationReplaced as e:
+                for preparation in preparations:
+                    self._abort_wake_confirmation(preparation)
+                for message in batch:
+                    update_message_status(message.id, MessageStatus.PENDING)
+                logger.info(
+                    "Callback completion delivery to %s was fenced before pane "
+                    "I/O; leaving %d message(s) pending: %s",
+                    terminal_id,
+                    len(batch),
+                    e,
                 )
             except Exception as e:
                 for preparation in preparations:
