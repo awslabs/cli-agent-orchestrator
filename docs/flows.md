@@ -113,3 +113,10 @@ cao schedule run daily-standup
 # Remove a flow
 cao schedule remove daily-standup
 ```
+
+## Workflow scheduling example
+
+[`examples/workflows/pr-health/`](../examples/workflows/pr-health/) combines a
+parameterized Python workflow with a scheduled flow. Its weekly cron entry uses
+a deterministic guard to produce an exact 14-day cadence across month
+boundaries. Scheduled runs default to non-mutating dry-run mode.
