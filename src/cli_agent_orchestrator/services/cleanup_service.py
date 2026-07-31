@@ -174,19 +174,41 @@ def cleanup_old_data():
         # Clean up old terminals (stop FIFO readers and clear state first).
         # v2-owned/managed rows are invisible to this legacy path: they are
         # skipped, never deleted (zero old-binary visibility into v2 state).
+        # Close the aged-row snapshot before any lifecycle claim.  Retention
+        # must never retain a SQLite/ORM transaction while waiting for a
+        # recovery/session teardown lock.
         with SessionLocal() as db:
             v2_ids, v2_generations = _v2_terminal_identities(db)
-            old_terminals = (
-                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
-            )
-            deleted_terminals = 0
-            from cli_agent_orchestrator.services import callback_recovery
+            old_terminals = [
+                {
+                    "id": terminal.id,
+                    "generation": terminal.generation,
+                    "callback_target_generation": terminal.callback_target_generation,
+                    "pane_id": terminal.pane_id,
+                    "last_active": terminal.last_active,
+                }
+                for terminal in db.query(TerminalModel)
+                .filter(TerminalModel.last_active < cutoff_date)
+                .all()
+            ]
+        deleted_terminals = 0
+        from cli_agent_orchestrator.services import callback_recovery
 
-            for terminal in old_terminals:
-                with callback_recovery.generation_lifecycle_claim(
-                    terminal.id,
-                    terminal.generation or "legacy-unversioned",
-                ):
+        for snapshot in old_terminals:
+            with callback_recovery.generation_lifecycle_claims(
+                callback_recovery.terminal_lifecycle_claim_set(snapshot)
+            ):
+                with SessionLocal() as db:
+                    # Re-open and revalidate after the claim.  A newer terminal
+                    # incarnation, activity update, or callback operation wins.
+                    terminal = db.get(TerminalModel, snapshot["id"])
+                    if (
+                        terminal is None
+                        or terminal.last_active >= cutoff_date
+                        or callback_recovery.terminal_lifecycle_claim_set(terminal)
+                        != callback_recovery.terminal_lifecycle_claim_set(snapshot)
+                    ):
+                        continue
                     if callback_recovery.terminal_has_open_recovery(
                         terminal.id, terminal.generation
                     ):
@@ -204,21 +226,27 @@ def cleanup_old_data():
                     fifo_manager.stop_reader(terminal.id)
                     status_monitor.clear_terminal(terminal.id)
                     db.delete(terminal)
+                    db.commit()
                     deleted_terminals += 1
+        # Preserve the legacy cleanup transaction boundary even when no aged
+        # terminal survived revalidation; inbox retention remains a separate
+        # durable boundary below.
+        with SessionLocal() as db:
             db.commit()
-            logger.info(f"Deleted {deleted_terminals} old terminals from database")
+        logger.info(f"Deleted {deleted_terminals} old terminals from database")
 
         # Clean up old inbox messages
-        with SessionLocal() as db:
-            try:
-                held_ids = callback_recovery.held_inbox_ids()
-            except Exception:
-                logger.warning(
-                    "callback recovery lifecycle unreadable during retention; "
-                    "preserving all inbox rows",
-                    exc_info=True,
-                )
+        try:
+            held_ids = callback_recovery.held_inbox_ids()
+        except Exception:
+            logger.warning(
+                "callback recovery lifecycle unreadable during retention; "
+                "preserving all inbox rows",
+                exc_info=True,
+            )
+            with SessionLocal() as db:
                 held_ids = {row[0] for row in db.query(InboxModel.id).all()}
+        with SessionLocal() as db:
             query = db.query(InboxModel).filter(InboxModel.created_at < cutoff_date)
             if held_ids:
                 query = query.filter(InboxModel.id.not_in(held_ids))

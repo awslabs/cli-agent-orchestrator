@@ -934,12 +934,8 @@ class TestHerdrInboxServiceLifecycleEvents:
         return_value=True,
     )
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
-    def test_pane_closed_deletes_when_herdr_query_fails(self, mock_meta, mock_delete, mock_run):
-        """If herdr cannot be queried, fall back to deleting (fail toward cleanup).
-
-        We must never leave a terminal we believe is open when it may be closed,
-        so an unreachable herdr makes the liveness check fail toward delete.
-        """
+    def test_pane_closed_preserves_when_herdr_query_fails(self, mock_meta, mock_delete, mock_run):
+        """An unknown liveness query must never authorize a reused-pane delete."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.register_terminal("9d00610c", "pane-3", is_kiro=False)
         mock_meta.return_value = {
@@ -958,12 +954,8 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-3"})
 
-        mock_delete.assert_called_once_with(
-            "9d00610c",
-            expected_session="cao-investigation",
-            expected_pane_id="pane-3",
-        )
-        assert "pane-3" not in service._pane_to_terminal
+        mock_delete.assert_not_called()
+        assert service._pane_to_terminal["pane-3"] == "9d00610c"
 
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     @patch("cli_agent_orchestrator.services.terminal_service.retire_closed_workspace_session")
@@ -1159,7 +1151,9 @@ class TestHerdrInboxServiceLifecycleEvents:
         def slow_probe(_window_name):
             blocked.set()
             assert release.wait(timeout=3)
-            return False
+            from cli_agent_orchestrator.services.herdr_inbox_service import PaneLiveness
+
+            return PaneLiveness.ABSENT
 
         service._label_still_live = slow_probe
         events = (

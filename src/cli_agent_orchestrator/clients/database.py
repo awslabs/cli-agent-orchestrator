@@ -1,5 +1,7 @@
 """Minimal database client with only terminal metadata."""
 
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -201,6 +203,7 @@ class CallbackRecoveryModel(Base):
     callback_registration_receipt_json = Column(Text, nullable=True)
     callback_effect_receipt_json = Column(Text, nullable=True)
     callback_disposition_json = Column(Text, nullable=True)
+    callback_admin_disposition_json = Column(Text, nullable=True)
     completion_json = Column(Text, nullable=True)
     resolution_json = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
@@ -1460,6 +1463,7 @@ def _migrate_callback_recovery_schema() -> None:
             ("callback_registration_receipt_json", "TEXT"),
             ("callback_effect_receipt_json", "TEXT"),
             ("callback_disposition_json", "TEXT"),
+            ("callback_admin_disposition_json", "TEXT"),
         )
         with sqlite3.connect(str(DATABASE_FILE)) as conn:
             present = {
@@ -1476,6 +1480,113 @@ def _migrate_callback_recovery_schema() -> None:
                 "ON callback_recovery_operations"
                 "(project, task_id, run_id, callback_occurrence_id)"
             )
+            # Lifecycle-v2 can only trust an old row when every immutable
+            # request field can be reconstructed *and* its canonical digest
+            # agrees with the stored address proof.  Preserve a backup before
+            # the first mutation so a future migration conflict is recoverable.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS callback_recovery_operations_v2_backup "
+                "AS SELECT * FROM callback_recovery_operations WHERE 0"
+            )
+            request_fields = (
+                "operation_id",
+                "project",
+                "task_id",
+                "run_id",
+                "source_terminal_id",
+                "source_generation",
+                "expected_provider",
+                "expected_provider_session_id",
+                "expected_execution_mode",
+                "supervisor_id",
+                "supervisor_session",
+                "supervisor_generation",
+                "supervisor_pane_id",
+                "refusal_control_id",
+                "refusal_occurrence_sha256",
+                "refusal_request_sha256",
+                "callback_occurrence_id",
+                "callback_status",
+                "callback_summary",
+                "callback_message_sha256",
+                "report_path",
+                "report_sha256",
+                "source_head",
+                "publishing_lease_state",
+                "publishing_lease_sha256",
+                "manifest_path",
+                "manifest_sha256",
+                "finalization_identity_sha256",
+            )
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM callback_recovery_operations").fetchall()
+            for row in rows:
+                if row["request_identity_schema"] == "cao-callback-recovery-request-v1":
+                    continue
+                backup_count = conn.execute(
+                    "SELECT COUNT(*) FROM callback_recovery_operations_v2_backup "
+                    "WHERE operation_key = ?",
+                    (row["operation_key"],),
+                ).fetchone()[0]
+                if not backup_count:
+                    columns_sql = ", ".join(f'"{column}"' for column in row.keys())
+                    placeholders = ", ".join("?" for _ in row.keys())
+                    conn.execute(
+                        "INSERT INTO callback_recovery_operations_v2_backup "
+                        f"({columns_sql}) VALUES ({placeholders})",
+                        tuple(row),
+                    )
+                request = {field: row[field] for field in request_fields}
+                complete = all(value is not None and value != "" for value in request.values())
+                canonical = json.dumps(request, sort_keys=True, separators=(",", ":"))
+                digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                # A legacy optimistic completion was inferred from inbox
+                # delivery.  It is never an effect proof; retain it as a
+                # submitted/ambiguous operation unless an exact durable effect
+                # receipt already exists on the row.
+                indisputable_effect = row["callback_effect_receipt_json"] is not None
+                if (
+                    complete
+                    and digest == row["request_sha256"]
+                    and (row["state"] != "callback-completed" or indisputable_effect)
+                ):
+                    conn.execute(
+                        "UPDATE callback_recovery_operations "
+                        "SET request_identity_schema = ?, request_json = ?, "
+                        "callback_attempt_state = COALESCE(callback_attempt_state, ?) "
+                        "WHERE operation_key = ?",
+                        (
+                            "cao-callback-recovery-request-v1",
+                            canonical,
+                            "not-registered",
+                            row["operation_key"],
+                        ),
+                    )
+                    continue
+                # Rows whose old optimistic completion cannot prove an exact
+                # post-effect receipt are held as submitted/ambiguous rather
+                # than silently released.  Other unverifiable rows remain
+                # explicit retained quarantine.
+                state = (
+                    "recovery-submitted" if row["state"] == "callback-completed" else row["state"]
+                )
+                attempt = (
+                    "effect-ambiguous"
+                    if row["state"] == "callback-completed"
+                    else (row["callback_attempt_state"] or "not-registered")
+                )
+                conn.execute(
+                    "UPDATE callback_recovery_operations "
+                    "SET state = ?, callback_attempt_state = ?, "
+                    "reason_code = ?, updated_at = ? WHERE operation_key = ?",
+                    (
+                        state,
+                        attempt,
+                        "legacy-identity-unverifiable",
+                        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                        row["operation_key"],
+                    ),
+                )
     except Exception as exc:  # noqa: BLE001 - operation reads fail closed
         logger.warning("callback recovery migration failed: %s", exc)
 

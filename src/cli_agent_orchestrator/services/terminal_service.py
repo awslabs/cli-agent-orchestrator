@@ -1411,6 +1411,7 @@ async def create_terminal(
         clear_session_env(session_name)
 
     session_created = False  # tracks whether THIS call created the tmux session
+    session_claim = None
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
     # already-existing session (the `new_session=False` branch below — what
     # every MCP spawn/assign-into-existing-session call does). Independent of
@@ -1460,6 +1461,17 @@ async def create_terminal(
 
         if not session_name:
             session_name = generate_session_name()
+
+        # Creation and teardown share this exact backend/session claim.  It
+        # covers the final existence check, physical pane/session effect, DB
+        # persistence, and rollback so a stale delete cannot kill a new window
+        # in a reused session name.
+        from cli_agent_orchestrator.services import callback_recovery
+
+        session_claim = callback_recovery.session_lifecycle_claim(
+            type(get_backend()).__name__, session_name
+        )
+        session_claim.__enter__()
 
         window_name = (
             managed_window_name(terminal_id, terminal_generation)
@@ -1976,6 +1988,9 @@ async def create_terminal(
             except Exception:
                 logger.warning("v2 registry rollback failed for %s", terminal_id, exc_info=True)
         raise
+    finally:
+        if session_claim is not None:
+            session_claim.__exit__(None, None, None)
 
 
 def _notify_caller_of_deferred_failure(

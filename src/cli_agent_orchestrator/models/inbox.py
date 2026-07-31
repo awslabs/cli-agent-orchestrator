@@ -133,3 +133,13 @@ class CallbackRecoveryResolutionRequest(BaseModel):
     outcome: Literal["proven-zero-provider-effect"]
     evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     detail: str = Field(min_length=1, max_length=500)
+
+
+class CallbackRecoveryDispositionRequest(BaseModel):
+    """ADMIN-only terminal disposition for an undeliverable callback."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    outcome: Literal["callback-undeliverable"]
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    detail: str = Field(min_length=1, max_length=500)

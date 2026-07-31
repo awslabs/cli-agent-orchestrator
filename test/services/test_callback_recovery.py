@@ -249,6 +249,15 @@ def _publish_callback(admission):
 def _commit_callback(admission, callback):
     """Model the delivery adapter's exact post-effect journal transition."""
     key = admission.operation["operation_key"]
+    callback_recovery.complete(
+        key,
+        CallbackRecoveryCompletionRequest(
+            callback_message_id=callback["message_id"],
+            callback_message_sha256=admission.operation["callback_message_sha256"],
+            callback_created_at=callback["created_at"],
+            finalization_identity_sha256=admission.operation["finalization_identity_sha256"],
+        ),
+    )
     callback_recovery.claim_callback_effect(key, callback["message_id"])
     return callback_recovery.commit_callback_effect(key, callback["message_id"])
 
@@ -647,17 +656,109 @@ def test_claimed_callback_effect_is_ambiguous_and_never_auto_replayed(recovery_c
     _record_turn(admission)
     callback = _publish_callback(admission)
     key = admission.operation["operation_key"]
+    callback_recovery.complete(
+        key,
+        CallbackRecoveryCompletionRequest(
+            callback_message_id=callback["message_id"],
+            callback_message_sha256=recovery_context.callback_message_sha256,
+            callback_created_at=callback["created_at"],
+            finalization_identity_sha256=recovery_context.finalization_identity_sha256,
+        ),
+    )
 
     callback_recovery.claim_callback_effect(key, callback["message_id"])
     callback_recovery.mark_callback_effect_ambiguous(key)
 
     operation = callback_recovery.get(key)
-    assert operation["state"] == callback_recovery.STATE_AMBIGUOUS
+    assert operation["state"] == callback_recovery.STATE_SUBMITTED
     assert operation["callback_attempt_state"] == (
         callback_recovery.CALLBACK_ATTEMPT_EFFECT_AMBIGUOUS
     )
     with pytest.raises(callback_recovery.CallbackRecoveryConflict, match="not eligible"):
         callback_recovery.claim_callback_effect(key, callback["message_id"])
+
+
+def test_callback_effect_requires_durable_completion_intent(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+    _record_turn(admission)
+    callback = _publish_callback(admission)
+    key = admission.operation["operation_key"]
+
+    with pytest.raises(callback_recovery.CallbackRecoveryConflict, match="completion intent"):
+        callback_recovery.claim_callback_effect(key, callback["message_id"])
+
+    callback_recovery.complete(
+        key,
+        CallbackRecoveryCompletionRequest(
+            callback_message_id=callback["message_id"],
+            callback_message_sha256=recovery_context.callback_message_sha256,
+            callback_created_at=callback["created_at"],
+            finalization_identity_sha256=recovery_context.finalization_identity_sha256,
+        ),
+    )
+    callback_recovery.claim_callback_effect(key, callback["message_id"])
+
+
+def test_post_registration_supervisor_replacement_is_durable_zero_effect(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+    _record_turn(admission)
+    callback = _publish_callback(admission)
+    key = admission.operation["operation_key"]
+    callback_recovery.complete(
+        key,
+        CallbackRecoveryCompletionRequest(
+            callback_message_id=callback["message_id"],
+            callback_message_sha256=recovery_context.callback_message_sha256,
+            callback_created_at=callback["created_at"],
+            finalization_identity_sha256=recovery_context.finalization_identity_sha256,
+        ),
+    )
+    with database.SessionLocal() as db:
+        db.get(database.TerminalModel, SUPERVISOR).pane_id = "replacement-pane"
+        db.commit()
+
+    with pytest.raises(callback_recovery.CallbackRecoveryRefused, match="no longer live"):
+        callback_recovery.claim_callback_effect(key, callback["message_id"])
+
+    operation = callback_recovery.get(key)
+    assert operation["state"] == callback_recovery.STATE_SUBMITTED
+    assert operation["callback_attempt_state"] == (
+        callback_recovery.CALLBACK_ATTEMPT_ZERO_EFFECT_REFUSED
+    )
+
+
+def test_admin_disposition_releases_exact_undeliverable_callback(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+    _record_turn(admission)
+    callback = _publish_callback(admission)
+    key = admission.operation["operation_key"]
+    callback_recovery.complete(
+        key,
+        CallbackRecoveryCompletionRequest(
+            callback_message_id=callback["message_id"],
+            callback_message_sha256=recovery_context.callback_message_sha256,
+            callback_created_at=callback["created_at"],
+            finalization_identity_sha256=recovery_context.finalization_identity_sha256,
+        ),
+    )
+    with database.SessionLocal() as db:
+        db.get(database.TerminalModel, SUPERVISOR).pane_id = "replacement-pane"
+        db.commit()
+    with pytest.raises(callback_recovery.CallbackRecoveryRefused):
+        callback_recovery.claim_callback_effect(key, callback["message_id"])
+
+    disposed = callback_recovery.dispose_callback_undeliverable(
+        key,
+        callback_recovery.CallbackRecoveryDispositionRequest(
+            outcome="callback-undeliverable",
+            evidence_sha256="a" * 64,
+            detail="admin verified callback cannot reach the original supervisor",
+        ),
+    )
+    assert disposed["state"] == callback_recovery.STATE_CALLBACK_UNDELIVERABLE
+    assert disposed["callback_admin_disposition"]["outcome"] == "callback-undeliverable"
+    assert callback_recovery.get(key)["state"] == callback_recovery.STATE_CALLBACK_UNDELIVERABLE
+    assert not callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION)
 
 
 def test_closed_workspace_retirement_holds_source_and_supervisor_rows(

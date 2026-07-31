@@ -122,7 +122,7 @@ def test_lifecycle_v2_is_visible_but_default_off_and_refuses_before_admission(cl
         "request_schema": "cao-callback-recovery-request-v1",
         "operation_schema": "cao-callback-recovery-operation-v2",
         "callback_lookup_schema": "cao-callback-recovery-callback-lookup-v1",
-        "providers": ["codex", "kimi_cli"],
+        "providers": [],
         "pending_sweep": {
             "enabled": True,
             "interval_seconds": 30,
@@ -343,7 +343,7 @@ def test_real_http_handler_admits_authoritative_reservation(
         assert db.query(database.InboxModel).count() == 1
 
 
-def test_dedicated_callback_handler_delivers_exact_created_row(
+def test_dedicated_callback_handler_registers_without_delivery(
     client,
     monkeypatch,
 ):
@@ -379,8 +379,7 @@ def test_dedicated_callback_handler_delivers_exact_created_row(
     )
     assert response.status_code == 200
     assert response.json()["message_id"] == 777
-    assert deliveries[0][0][:2] == ("1234abcd", 0)
-    assert deliveries[0][1]["required_message_id"] == 777
+    assert deliveries == []
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ import re
 import subprocess
 import threading
 import time
+from enum import Enum
 from typing import Callable, Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,14 @@ _BACKOFF_MULTIPLIER = 2.0
 
 # Kiro supplement check: how long in "working" before we check pane read
 _KIRO_WORKING_THRESHOLD = 30.0  # seconds
+
+
+class PaneLiveness(str, Enum):
+    """Authoritative liveness observation for a reused Herdr pane label."""
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
 
 
 class HerdrInboxService:
@@ -454,7 +463,11 @@ class HerdrInboxService:
             # label means the pane_id was renumbered, not closed: re-resolve the
             # current pane_id and update both maps. Only when re-resolution fails
             # do we fall through to the delete path.
-            if term_window and self._label_still_live(term_window):
+            liveness = self._label_still_live(term_window) if term_window else PaneLiveness.ABSENT
+            if liveness == PaneLiveness.UNKNOWN:
+                logger.warning("Reconcile: preserving %s; Herdr liveness is unknown", terminal_id)
+                continue
+            if liveness == PaneLiveness.PRESENT:
                 try:
                     # Invalidate pane cache so get_pane_id does a fresh label-based
                     # lookup instead of returning the stale pane_id we just proved
@@ -673,15 +686,15 @@ class HerdrInboxService:
 
         task.add_done_callback(completed)
 
-    def _label_still_live(self, window_name: str) -> bool:
-        """Return True if a tab with this label is still live in herdr.
+    def _label_still_live(self, window_name: str) -> PaneLiveness:
+        """Return the strict liveness state of a tab label in Herdr.
 
         Used to disambiguate herdr's reused compact pane_ids on replayed
         pane_closed events. The tab label is unique per incarnation, so a live
         label means the close event refers to an older incarnation and is stale.
 
-        Fails toward False (not live) when herdr can't be queried, so the caller
-        proceeds with cleanup rather than leaving a possibly-closed terminal.
+        A failed query is ``UNKNOWN``, never absence. Only a uniquely parsed
+        ``ABSENT`` observation may authorize retirement of a reused pane.
         """
         try:
             result = subprocess.run(
@@ -696,14 +709,16 @@ class HerdrInboxService:
                     result.returncode,
                     result.stderr.strip(),
                 )
-                return False
+                return PaneLiveness.UNKNOWN
             tab_data = json.loads(result.stdout)
-            tabs = tab_data.get("result", {}).get("tabs", [])
+            tabs = tab_data["result"]["tabs"]
+            if not isinstance(tabs, list) or any(not isinstance(tab, dict) for tab in tabs):
+                return PaneLiveness.UNKNOWN
             live_labels = {tab.get("label", "") for tab in tabs}
-            return window_name in live_labels
+            return PaneLiveness.PRESENT if window_name in live_labels else PaneLiveness.ABSENT
         except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, OSError) as e:
             logger.warning("_label_still_live: could not query herdr (%s)", e)
-            return False
+            return PaneLiveness.UNKNOWN
 
     def _workspace_sessions_from_herdr(self) -> Dict[str, str]:
         """Read workspace identities without touching event-loop-owned maps."""
@@ -760,10 +775,15 @@ class HerdrInboxService:
             meta = await asyncio.to_thread(get_terminal_metadata, terminal_id)
             session_name = meta["tmux_session"] if meta else None
             window_name = meta["tmux_window"] if meta else None
-            if window_name and await asyncio.to_thread(
-                self._label_still_live,
-                window_name,
-            ):
+            liveness = (
+                await asyncio.to_thread(self._label_still_live, window_name)
+                if window_name
+                else PaneLiveness.ABSENT
+            )
+            if liveness == PaneLiveness.UNKNOWN:
+                logger.warning("pane.closed: preserving %s; Herdr liveness is unknown", terminal_id)
+                return
+            if liveness == PaneLiveness.PRESENT:
                 logger.info(
                     "pane.closed: ignoring stale close for %s (pane=%s) — "
                     "label %s still live in herdr (compact pane_id reused)",
@@ -909,7 +929,11 @@ class HerdrInboxService:
             # If herdr can't be queried, fall toward delete: never leave a
             # terminal we think is open when it may actually be closed.
             window_name = meta["tmux_window"] if meta else None
-            if window_name and self._label_still_live(window_name):
+            liveness = self._label_still_live(window_name) if window_name else PaneLiveness.ABSENT
+            if liveness == PaneLiveness.UNKNOWN:
+                logger.warning("pane.closed: preserving %s; Herdr liveness is unknown", terminal_id)
+                return
+            if liveness == PaneLiveness.PRESENT:
                 logger.info(
                     "pane.closed: ignoring stale close for %s (pane=%s) — "
                     "label %s still live in herdr (compact pane_id reused)",

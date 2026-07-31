@@ -315,6 +315,8 @@ def test_zero_proven_providers_advertised_truthfully():
     assert payload["resource_registry_version"] == 1
     assert payload["delivery_journal"]["at_most_once_honest"] is True
     assert "cao-w13-fence-receipt-v1" in payload["receipts"]
+    assert payload["callback_recovery"]["providers"] == []
+    assert payload["callback_recovery"]["enabled"] is False
 
 
 def test_capability_claims_derive_from_receipts_never_caller_booleans():
@@ -415,3 +417,21 @@ def test_capability_claims_derive_from_receipts_never_caller_booleans():
         deployment_generation=3,
     )
     assert build_capabilities(containment=dead)["containment"] == "unproven"
+
+
+def test_callback_capability_is_the_proven_outer_authority_intersection(monkeypatch):
+    monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "yes")
+    composition = ContainmentComposition(
+        authorization=_authorization(),
+        live_proof_receipt=_receipt(),
+        deployment_generation=3,
+    )
+    payload = build_capabilities(
+        containment=composition,
+        provider_versions={"codex": "codex 0.146.0", "kimi": "kimi 0.29.0"},
+        kimi_acp_proof={"schema": "cao-kimi-acp-proof-v1"},
+        route_proofs={"codex": _valid_route_proof("codex")},
+    )
+    assert payload["enabled_providers"] == ["codex"]
+    assert payload["callback_recovery"]["providers"] == ["codex"]
+    assert payload["callback_recovery"]["enabled"] is True

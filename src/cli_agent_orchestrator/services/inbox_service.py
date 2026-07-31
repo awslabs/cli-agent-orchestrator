@@ -25,7 +25,7 @@ from cli_agent_orchestrator.constants import (
     EAGER_INBOX_DELIVERY,
     INBOX_RECONCILE_GRACE_SECONDS,
 )
-from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
@@ -111,8 +111,15 @@ class InboxService:
     def _callback_completion_delivery_claim(messages):
         """Hold exact supervisor generations across the final pane send."""
         bound = [message for message in messages if message.callback_completion_key is not None]
-        keys = {(message.receiver_id, message.expected_receiver_generation) for message in bound}
-        if any(not generation for _terminal_id, generation in keys):
+        keys = {
+            (
+                message.receiver_id,
+                "callback-target-generation",
+                message.expected_receiver_generation,
+            )
+            for message in bound
+        }
+        if any(not generation for _terminal_id, _kind, generation in keys):
             raise _CallbackCompletionGenerationReplaced(
                 "callback completion lacks its receiver generation"
             )
@@ -124,6 +131,72 @@ class InboxService:
                     "the original supervisor generation was replaced"
                 )
             yield
+
+    def _deliver_callback_completions_via_pane(
+        self,
+        terminal_id: str,
+        messages: list[InboxMessage],
+        *,
+        registry,
+        native_managed: bool,
+        managed_identity,
+    ) -> None:
+        """Deliver completion rows through the governed pane/native adapter.
+
+        Ordinary supervisors are intentionally not managed-launch reservations;
+        they still need a callback route.  These rows never use the generic
+        inbox status claim: the callback lifecycle claim and post-effect receipt
+        are the only completion authority.
+        """
+        if not messages:
+            return
+        if not native_managed and status_monitor.get_status(terminal_id) not in (
+            TerminalStatus.IDLE,
+            TerminalStatus.COMPLETED,
+        ):
+            return
+        for message in messages:
+            try:
+                with self._callback_completion_delivery_claim([message]):
+                    callback_recovery.claim_callback_effect(
+                        message.callback_completion_key,
+                        message.id,
+                    )
+                    if native_managed:
+                        self._send_native_managed_text(
+                            terminal_id, message.message, managed_identity
+                        )
+                    elif registry is None:
+                        terminal_service.send_input(terminal_id, message.message)
+                    else:
+                        terminal_service.send_input(
+                            terminal_id,
+                            message.message,
+                            registry=registry,
+                            sender_id=message.sender_id,
+                            orchestration_type=OrchestrationType.SEND_MESSAGE,
+                        )
+                    callback_recovery.commit_callback_effect(
+                        message.callback_completion_key,
+                        message.id,
+                    )
+            except callback_recovery.CallbackRecoveryRefused:
+                # The claim function has durably recorded the exact pre-I/O
+                # replacement fence; the ADMIN disposition owns any release.
+                continue
+            except Exception as exc:  # noqa: BLE001 - effect result is unknowable
+                logger.warning(
+                    "Callback completion pane delivery is ambiguous for %s/%s: %s",
+                    terminal_id,
+                    message.id,
+                    exc,
+                )
+                try:
+                    callback_recovery.mark_callback_effect_ambiguous(
+                        message.callback_completion_key
+                    )
+                except callback_recovery.CallbackRecoveryError:
+                    pass
 
     """Delivers one pending message per terminal per IDLE cycle.
 
@@ -802,24 +875,34 @@ class InboxService:
         # bridge. If its exact managed identity disappeared or changed,
         # preserving the row is the only safe outcome; it must never fall
         # through to native or unmanaged pane delivery.
-        bound_pending = [
-            message
-            for message in messages
-            if message.callback_recovery_key is not None
-            or message.callback_completion_key is not None
+        callback_completions = [
+            message for message in messages if message.callback_completion_key is not None
         ]
-        if bound_pending:
+        recovery_prompts = [
+            message for message in messages if message.callback_recovery_key is not None
+        ]
+        if callback_completions:
+            self._deliver_callback_completions_via_pane(
+                terminal_id,
+                callback_completions,
+                registry=registry,
+                native_managed=native_managed,
+                managed_identity=managed_identity,
+            )
+        if recovery_prompts:
             messages = [
                 message
                 for message in messages
                 if message.callback_recovery_key is None and message.callback_completion_key is None
             ]
             logger.info(
-                "Preserving %d callback-recovery message(s) for %s; no generic "
+                "Preserving %d recovery prompt message(s) for %s; no generic "
                 "delivery fallback is permitted",
-                len(bound_pending),
+                len(recovery_prompts),
                 terminal_id,
             )
+        elif callback_completions:
+            messages = [message for message in messages if message.callback_completion_key is None]
         if not messages:
             return
         if managed_identity is not None and not native_managed:

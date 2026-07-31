@@ -81,6 +81,7 @@ from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import (
     CallbackRecoveryCallbackRequest,
     CallbackRecoveryCompletionRequest,
+    CallbackRecoveryDispositionRequest,
     CallbackRecoveryRequest,
     CallbackRecoveryResolutionRequest,
     MessageStatus,
@@ -4339,18 +4340,43 @@ async def get_callback_recovery_turn_receipt(
 
 @app.post("/callback-recoveries/{operation_key}/complete")
 async def complete_callback_recovery_endpoint(
+    request: Request,
     operation_key: str,
     body: CallbackRecoveryCompletionRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
     try:
-        return await asyncio.to_thread(callback_recovery.complete, operation_key, body)
+        result = await asyncio.to_thread(callback_recovery.complete, operation_key, body)
     except callback_recovery.CallbackRecoveryNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except callback_recovery.CallbackRecoveryPending as exc:
         raise HTTPException(status_code=status.HTTP_425_TOO_EARLY, detail=str(exc))
     except callback_recovery.CallbackRecoveryConflict as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    # Completion is the sole delivery arm.  A worker callback POST only
+    # registers immutable callback bytes; it cannot race finalization by
+    # causing a supervisor effect before this exact intent is durable.
+    if (
+        result["state"] == callback_recovery.STATE_SUBMITTED
+        and result["callback_attempt_state"] == callback_recovery.CALLBACK_ATTEMPT_REGISTERED
+        and result["callback_message_id"] is not None
+    ):
+        try:
+            await asyncio.to_thread(
+                inbox_service.deliver_pending,
+                result["supervisor_id"],
+                0,
+                get_plugin_registry(request),
+                required_message_id=result["callback_message_id"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "Completion-armed recovery callback delivery failed for %s/%s: %s",
+                result["supervisor_id"],
+                result["callback_message_id"],
+                exc,
+            )
+    return result
 
 
 @app.post("/callback-recoveries/{operation_key}/callback")
@@ -4376,21 +4402,6 @@ async def create_callback_recovery_callback_endpoint(
         callback_recovery.CallbackRecoveryRefused,
     ) as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
-    try:
-        await asyncio.to_thread(
-            inbox_service.deliver_pending,
-            body.receiver_id,
-            0,
-            get_plugin_registry(request),
-            required_message_id=result["message_id"],
-        )
-    except Exception as exc:
-        logger.warning(
-            "Immediate recovery callback delivery failed for %s/%s: %s",
-            body.receiver_id,
-            result["message_id"],
-            exc,
-        )
     return result
 
 
@@ -4418,6 +4429,25 @@ async def resolve_callback_recovery_endpoint(
     """Apply an evidence-bound governed disposition to an ambiguity."""
     try:
         return await asyncio.to_thread(callback_recovery.resolve_ambiguity, operation_key, body)
+    except callback_recovery.CallbackRecoveryNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except callback_recovery.CallbackRecoveryConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@app.post("/callback-recoveries/{operation_key}/dispose-callback-undeliverable")
+async def dispose_callback_recovery_undeliverable_endpoint(
+    operation_key: str,
+    body: CallbackRecoveryDispositionRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Apply the evidence-bound ADMIN terminal for an undeliverable callback."""
+    try:
+        return await asyncio.to_thread(
+            callback_recovery.dispose_callback_undeliverable,
+            operation_key,
+            body,
+        )
     except callback_recovery.CallbackRecoveryNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except callback_recovery.CallbackRecoveryConflict as exc:

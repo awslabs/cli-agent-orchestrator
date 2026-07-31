@@ -22,6 +22,10 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from cli_agent_orchestrator.constants import (
+    INBOX_RECONCILE_GRACE_SECONDS,
+    INBOX_RECONCILE_INTERVAL,
+)
 from cli_agent_orchestrator.services import actor_broker, provider_contracts
 from cli_agent_orchestrator.services.containment import ContainmentComposition
 from cli_agent_orchestrator.services.resource_registry import REGISTRY_SCHEMA_VERSION
@@ -123,6 +127,15 @@ def build_capabilities(
     zero_proven = not enabled_providers or containment_status != "proven"
     from cli_agent_orchestrator.services import callback_recovery
 
+    # The lifecycle API uses ``kimi_cli`` on the wire, while the authority
+    # surface calls the same provider ``kimi``.  Never advertise a callback
+    # provider outside the proven outer authority intersection.
+    callback_providers = [
+        wire_name
+        for provider, wire_name in (("codex", "codex"), ("kimi", "kimi_cli"))
+        if provider in enabled_providers
+    ]
+
     return {
         "schema_version": CAPABILITY_SCHEMA_VERSION,
         "protocol": CAPABILITY_PROTOCOL,
@@ -160,15 +173,15 @@ def build_capabilities(
         # fork from a deliberate safe rollout hold.
         "callback_recovery": {
             "lifecycle_version": 2,
-            "enabled": callback_recovery.lifecycle_v2_enabled(),
+            "enabled": callback_recovery.lifecycle_v2_enabled() and bool(callback_providers),
             "request_schema": callback_recovery.REQUEST_SCHEMA,
             "operation_schema": callback_recovery.OPERATION_SCHEMA,
             "callback_lookup_schema": callback_recovery.CALLBACK_LOOKUP_SCHEMA,
-            "providers": ["codex", "kimi_cli"],
+            "providers": callback_providers,
             "pending_sweep": {
                 "enabled": True,
-                "interval_seconds": 30,
-                "grace_seconds": 30,
+                "interval_seconds": INBOX_RECONCILE_INTERVAL,
+                "grace_seconds": INBOX_RECONCILE_GRACE_SECONDS,
             },
         },
         "delivery_journal": {
