@@ -751,6 +751,62 @@ def _provider_turn_receipt_expected(row: Any) -> dict[str, str]:
     }
 
 
+def _validate_callback_registration_receipt(row: Any) -> None:
+    """Reject a callback registration receipt that is not this recovery's immutable record."""
+    registration = _strict_json_object(
+        row.callback_registration_receipt_json, field="callback registration receipt"
+    )
+    required = {
+        "schema",
+        "operation_key",
+        "request_sha256",
+        "callback_message_id",
+        "callback_message_sha256",
+        "callback_created_at",
+        "sender_id",
+        "receiver_id",
+        "source_generation",
+        "supervisor_generation",
+        "supervisor_pane_id",
+        "callback_occurrence_id",
+        "registered_at",
+    }
+    expected = {
+        "schema": "cao-callback-registration-receipt-v1",
+        "operation_key": row.operation_key,
+        "request_sha256": row.request_sha256,
+        "callback_message_id": row.callback_message_id,
+        "callback_message_sha256": row.callback_message_sha256,
+        "sender_id": row.source_terminal_id,
+        "receiver_id": row.supervisor_id,
+        "source_generation": row.source_generation,
+        "supervisor_generation": row.supervisor_generation,
+        "supervisor_pane_id": row.supervisor_pane_id,
+        "callback_occurrence_id": row.callback_occurrence_id,
+    }
+    if (
+        set(registration) != required
+        or {key: registration.get(key) for key in expected} != expected
+    ):
+        raise CallbackRecoveryConflict(
+            "callback registration receipt contradicts recovery identity"
+        )
+    response = _strict_json_object(row.callback_response_json, field="callback response")
+    if registration["callback_created_at"] != response.get("created_at"):
+        raise CallbackRecoveryConflict(
+            "callback registration receipt contradicts callback timestamp"
+        )
+    registered_at = registration["registered_at"]
+    try:
+        if not isinstance(registered_at, str) or not registered_at.endswith("Z"):
+            raise ValueError("registration timestamp is not canonical UTC Z")
+        datetime.fromisoformat(registered_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise CallbackRecoveryConflict(
+            "callback registration receipt has invalid registration time"
+        ) from exc
+
+
 def _validate_lifecycle_row(row: Any) -> None:
     """Reject malformed or contradictory lifecycle storage on every read."""
     if row.state not in KNOWN_STATES:
@@ -860,11 +916,6 @@ def _validate_lifecycle_row(row: Any) -> None:
     }:
         if row.callback_message_id is None or row.callback_response_json is None:
             raise CallbackRecoveryConflict("callback attempt lacks immutable registration identity")
-        registration = _strict_json_object(
-            row.callback_registration_receipt_json, field="callback registration receipt"
-        )
-        if registration.get("schema") != "cao-callback-registration-receipt-v1":
-            raise CallbackRecoveryConflict("callback attempt lacks registration receipt")
     elif (
         callback_attempt != CALLBACK_ATTEMPT_ZERO_EFFECT_REFUSED
         and row.callback_registration_receipt_json is not None
@@ -922,6 +973,8 @@ def _validate_lifecycle_row(row: Any) -> None:
         }
         if set(response) != required:
             raise CallbackRecoveryConflict("stored callback response has an unknown shape")
+    if row.callback_registration_receipt_json is not None:
+        _validate_callback_registration_receipt(row)
     if row.callback_disposition_json is not None:
         intent = _strict_json_object(
             row.callback_disposition_json, field="callback delivery intent"
@@ -1764,11 +1817,10 @@ def callback_lookup(operation_key: str) -> dict[str, Any]:
             raise CallbackRecoveryNotFound(operation_key)
         _validate_lifecycle_row(row)
         callback = None
-        if row.callback_response_json is not None:
-            callback = {
-                **_strict_json_object(row.callback_response_json, field="callback response"),
-                "replayed": True,
-            }
+        if row.callback_registration_receipt_json is not None:
+            callback = _strict_json_object(
+                row.callback_registration_receipt_json, field="callback registration receipt"
+            )
         return {
             "schema": CALLBACK_LOOKUP_SCHEMA,
             "operation_key": row.operation_key,

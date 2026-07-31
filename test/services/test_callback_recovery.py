@@ -515,6 +515,35 @@ def test_turn_receipt_is_strict_revalidated_and_completion_binds_callback_row(
     assert replay["state"] == callback_recovery.STATE_COMPLETED
 
 
+def test_callback_lookup_returns_immutable_registration_receipt(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+    _record_turn(admission)
+    callback = _publish_callback(admission)
+
+    lookup = callback_recovery.callback_lookup(admission.operation["operation_key"])
+
+    assert lookup["schema"] == callback_recovery.CALLBACK_LOOKUP_SCHEMA
+    assert lookup["operation_key"] == admission.operation["operation_key"]
+    assert lookup["request_sha256"] == admission.operation["request_sha256"]
+    registration = lookup["callback"]
+    assert {key: value for key, value in registration.items() if key != "registered_at"} == {
+        "schema": "cao-callback-registration-receipt-v1",
+        "operation_key": admission.operation["operation_key"],
+        "request_sha256": admission.operation["request_sha256"],
+        "callback_message_id": callback["message_id"],
+        "callback_message_sha256": recovery_context.callback_message_sha256,
+        "callback_created_at": callback["created_at"],
+        "sender_id": SOURCE,
+        "receiver_id": SUPERVISOR,
+        "source_generation": GENERATION,
+        "supervisor_generation": SUPERVISOR_GENERATION,
+        "supervisor_pane_id": SUPERVISOR_PANE_ID,
+        "callback_occurrence_id": recovery_context.callback_occurrence_id,
+    }
+    assert isinstance(registration["registered_at"], str)
+    assert registration["registered_at"].endswith("Z")
+
+
 def test_completed_delivery_remains_closed_after_inbox_retention(
     recovery_context,
 ):
