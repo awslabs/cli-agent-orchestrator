@@ -1279,28 +1279,49 @@ class TestHerdrInboxServiceLifecycleEvents:
         assert service._delivery_tasks == {}
         assert "Delivery task failed for terminal tid-failing" in caplog.messages
 
-    def test_shutdown_cancels_and_drains_tracked_delivery_tasks(self):
-        service = HerdrInboxService(socket_path="/tmp/test.sock")
+    def test_shutdown_awaits_real_blocking_delivery_thread_before_untracking(self):
+        """A30 shutdown: real to_thread work stays tracked until it completes."""
+        delivery_started = threading.Event()
+        release_delivery = threading.Event()
+        delivery_finished = threading.Event()
+        deliveries = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock",
+            delivery_callback=lambda terminal_id: (
+                deliveries.append(terminal_id),
+                delivery_started.set(),
+                release_delivery.wait(timeout=3),
+                delivery_finished.set(),
+            ),
+        )
         service.register_terminal("tid-shutdown", "pane-shutdown")
-        delivery_started = asyncio.Event()
-        never_release = asyncio.Event()
-
-        async def blocked_delivery(_terminal_id):
-            delivery_started.set()
-            await never_release.wait()
-
-        service._deliver_off_loop = blocked_delivery
 
         async def run():
             service._schedule_delivery("tid-shutdown")
             task = service._delivery_tasks["tid-shutdown"]
-            await delivery_started.wait()
+            assert await asyncio.wait_for(asyncio.to_thread(delivery_started.wait, 1), timeout=2)
             service._schedule_delivery("tid-shutdown")
             assert service._delivery_reruns == {"tid-shutdown": "pane-shutdown"}
-            await service._shutdown_delivery_tasks()
-            assert task.cancelled()
+
+            shutdown = asyncio.create_task(service._shutdown_delivery_tasks())
+            try:
+                await asyncio.sleep(0.1)
+                assert service._delivery_shutdown is True
+                assert service._delivery_reruns == {}
+                assert shutdown.done() is False
+                assert service._delivery_tasks == {"tid-shutdown": task}
+                assert delivery_finished.is_set() is False
+
+                release_delivery.set()
+                await asyncio.wait_for(shutdown, timeout=2)
+            finally:
+                release_delivery.set()
+                await asyncio.wait_for(asyncio.to_thread(delivery_finished.wait, 1), timeout=2)
+                if not shutdown.done():
+                    await shutdown
 
         _run_async(run())
+        assert deliveries == ["tid-shutdown"]
         assert service._delivery_tasks == {}
         assert service._delivery_reruns == {}
 

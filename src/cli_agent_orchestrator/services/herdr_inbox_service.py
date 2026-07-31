@@ -749,12 +749,10 @@ class HerdrInboxService:
             self._schedule_delivery(terminal_id, expected_pane_id)
 
     async def _shutdown_delivery_tasks(self) -> None:
-        """Cancel and observe every tracked delivery task before shutdown."""
+        """Await every tracked delivery task before shutdown."""
         self._delivery_shutdown = True
         self._delivery_reruns.clear()
         tasks = tuple(self._delivery_tasks.values())
-        for task in tasks:
-            task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._delivery_tasks.clear()
