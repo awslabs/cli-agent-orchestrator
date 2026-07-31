@@ -3059,6 +3059,25 @@ def delete_terminal(
     """Delete under the same exact-generation claim recovery admission uses."""
     from cli_agent_orchestrator.services import callback_recovery
 
+    if expected_generation is not None:
+        expected_claim = (terminal_id, "model-generation", expected_generation)
+        held = getattr(callback_recovery._LIFECYCLE_CLAIMS, "held", set())
+        if expected_claim not in held:
+            # Preserve the first durable row observation for the claimed
+            # teardown itself.  An eager metadata probe changes the meaning of
+            # the row-absent and replacement-race paths before they can record
+            # their required specialized refusal.
+            with callback_recovery.generation_lifecycle_claim(terminal_id, expected_generation):
+                return _delete_terminal_claimed(
+                    terminal_id,
+                    registry=registry,
+                    expected_generation=expected_generation,
+                    expected_session=expected_session,
+                    via_destructive_endpoint=via_destructive_endpoint,
+                    backend_already_closed=backend_already_closed,
+                    unregister_inbox=unregister_inbox,
+                )
+
     metadata = get_terminal_metadata(terminal_id)
     if metadata is None:
         metadata = get_terminal_metadata_v2(terminal_id)
