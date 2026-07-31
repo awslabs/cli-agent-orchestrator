@@ -732,3 +732,136 @@ def import_cmd(path, fmt, scope, conflict, dry_run):
     )
     for rel, reason in sorted(report.errors.items()):
         click.echo(f"  rejected '{rel}': {reason}")
+
+
+def _resolve_profile_path(agent_name: str) -> Path:
+    """Locate the writable profile .md file for ``agent_name``.
+
+    Searches the configured agent dirs (flat ``<name>.md`` and nested
+    ``<name>/agent.md`` layouts, same order as profile loading). The built-in
+    package store is deliberately NOT searched: promotion mutates files, and
+    installed-package contents are not a writable store — copy the profile
+    into an agent dir first.
+    """
+    from cli_agent_orchestrator.services.settings_service import (
+        get_agent_dirs,
+        get_extra_agent_dirs,
+    )
+
+    search_dirs = list(dict.fromkeys(get_agent_dirs().values())) + list(get_extra_agent_dirs())
+    for dir_path in search_dirs:
+        base = Path(dir_path)
+        for candidate in (base / f"{agent_name}.md", base / agent_name / "agent.md"):
+            if candidate.is_file():
+                return candidate
+    raise click.ClickException(
+        f"No writable profile found for agent '{agent_name}' in configured agent dirs. "
+        "Built-in profiles cannot be promoted into — copy the profile into an agent "
+        "directory first."
+    )
+
+
+def _reject_builtin_profile_path(path: Path) -> None:
+    """Refuse promotion into the built-in package agent store.
+
+    The default lookup (``_resolve_profile_path``) never returns built-in
+    profiles, but ``--profile-path`` accepts any existing file — without
+    this check the explicit route could mutate a bundled package profile,
+    which is not a writable store (edits are shared by every session and
+    silently lost on upgrade).
+    """
+    import cli_agent_orchestrator.agent_store as _agent_store_pkg
+
+    try:
+        # __path__ covers namespace/multiplexed layouts where
+        # ``str(resources.files(...))`` is not a usable filesystem path.
+        store_roots = [Path(p).resolve() for p in _agent_store_pkg.__path__]
+    except Exception:  # pragma: no cover — non-filesystem package layouts
+        return
+    resolved = path.resolve()
+    for store_root in store_roots:
+        try:
+            resolved.relative_to(store_root)
+        except ValueError:
+            continue
+        raise click.ClickException(
+            f"Refusing to promote into built-in package profile: {path}. "
+            "Built-in profiles are not a writable store — copy the profile into "
+            "an agent directory first."
+        )
+
+
+@memory.command(name="promote")
+@click.argument("agent_name")
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    default=False,
+    help="Apply the promotion. Without this flag, prints a dry-run plan only.",
+)
+@click.option(
+    "--min-recalls",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Minimum recall count for a lesson to qualify (default: 3).",
+)
+@click.option(
+    "--profile-path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Explicit profile .md path (overrides agent-dir lookup).",
+)
+def promote_cmd(agent_name, do_apply, min_recalls, profile_path):
+    """Promote reinforced agent-scope lessons into AGENT_NAME's profile file.
+
+    Reads agent-scope memories (feedback/project types) recalled at least
+    --min-recalls times and writes them as itemized entries in the profile's
+    delimited '## Learned Patterns' block. Dry-run by DEFAULT — pass --apply
+    to mutate. Requires memory.instruction_promotion_enabled=true.
+    """
+    from cli_agent_orchestrator.services.learned_patterns import MAX_LESSONS
+    from cli_agent_orchestrator.services.promotion_service import (
+        DEFAULT_MIN_ACCESS_COUNT,
+        PromotionDisabledError,
+        PromotionService,
+    )
+
+    target = profile_path if profile_path is not None else _resolve_profile_path(agent_name)
+    if not target.is_file():
+        raise click.ClickException(f"Profile file not found: {target}")
+    # The default lookup never returns built-in profiles; enforce the same
+    # refusal on the explicit --profile-path route.
+    _reject_builtin_profile_path(target)
+
+    svc = PromotionService()
+    plan = svc.plan(
+        agent_profile=agent_name,
+        profile_path=target,
+        min_access_count=min_recalls if min_recalls is not None else DEFAULT_MIN_ACCESS_COUNT,
+    )
+
+    if plan.empty:
+        click.echo(f"No promotable lessons for '{agent_name}' (profile: {target}).")
+        return
+
+    click.echo(f"Promotion plan for '{agent_name}' -> {target}:")
+    for cand in plan.candidates:
+        click.echo(f"  [{cand.action}] {cand.key} (recalled {cand.access_count}x)")
+        click.echo(f"      {cand.text}")
+
+    if not do_apply:
+        click.echo("\nDRY RUN — nothing written. Pass --apply to promote.")
+        return
+
+    try:
+        report = svc.apply(plan)
+    except PromotionDisabledError as e:
+        raise click.ClickException(str(e))
+
+    click.echo(
+        f"\nPromoted: added={len(report.added)} updated={len(report.updated)} "
+        f"skipped={len(report.skipped)}"
+    )
+    if report.skipped:
+        click.echo(f"  skipped (at {MAX_LESSONS}-lesson cap): {', '.join(report.skipped)}")

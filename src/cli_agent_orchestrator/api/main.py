@@ -121,6 +121,9 @@ from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxServic
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
+from cli_agent_orchestrator.services.profile_search import (
+    DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
@@ -480,6 +483,50 @@ class InstallAgentProfileRequest(BaseModel):
     source: str
     provider: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
+
+
+# Scaffold templates are identified as ``category/name`` (e.g.
+# ``aws/stepfunction``). Constraining that identifier with an allowlist pattern
+# at the API boundary rejects traversal attempts before they reach the scaffold
+# service — which independently re-checks containment via ``_check_containment``.
+# Allowlist rather than denylist is deliberate: a denylist of dot sequences is
+# always incomplete.
+TEMPLATE_NAME_PATTERN = r"^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$"
+
+
+class TemplateConfigRequest(BaseModel):
+    """Request body for the non-mutating template validate and preview routes."""
+
+    template: str = Field(
+        pattern=TEMPLATE_NAME_PATTERN,
+        max_length=128,
+        description="Template identifier in 'category/name' form, e.g. 'aws/stepfunction'",
+    )
+    config: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Flat config values matching the template's JSON-Schema",
+    )
+
+
+class TemplateSummary(BaseModel):
+    """Public template metadata. Excludes the internal filesystem path."""
+
+    name: str
+    description: str
+
+
+class ValidateTemplateConfigResponse(BaseModel):
+    """Outcome of validating a config against a template's JSON-Schema."""
+
+    valid: bool
+    errors: List[str] = Field(default_factory=list)
+
+
+class PreviewTemplateResponse(BaseModel):
+    """A rendered profile. Returned to the caller and never written to disk."""
+
+    template: str
+    content: str
 
 
 class MemorySummary(BaseModel):
@@ -1499,6 +1546,153 @@ async def list_agent_profiles_endpoint() -> List[Dict]:
         )
 
 
+def _resolve_template_name(template: str) -> str:
+    """Map a caller-supplied template id onto an enumerated template name.
+
+    Returns the matching value from ``list_templates()`` (built from filesystem
+    enumeration), never the caller's own string, so the identifier handed to the
+    scaffold service — and thence to ``Path`` — is not derived from request
+    data. This is the sanitizer that removes the taint CodeQL flags on the
+    scaffold path expressions; the allowlist regex and ``_check_containment``
+    remain as additional layers. Raises 404 for an unknown template.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import list_templates
+
+    for known in list_templates():
+        if known["name"] == template:
+            return str(known["name"])
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Template not found: {template}",
+    )
+
+
+# The static sub-paths below (`/search`, `/templates`, and the template schema
+# route) MUST stay declared ABOVE `/agents/profiles/{name}`. FastAPI resolves in
+# declaration order, so moving them below would let the `{name}` route capture
+# "search" and "templates" as profile names. test_api_profile_surface.py pins
+# this ordering.
+@app.get("/agents/profiles/search")
+async def search_agent_profiles_endpoint(
+    q: str = Query(description="Free-text capability keywords, e.g. 'monitor sqs'"),
+    limit: int = Query(default=PROFILE_SEARCH_DEFAULT_LIMIT, ge=1, le=100),
+) -> List[Dict]:
+    """Rank installed agent profiles against ``q``.
+
+    Delegates to ``services.profile_search.search_profiles`` so HTTP, the CLI
+    (``cao profile find``) and the ``find_profiles`` MCP tool return identical
+    ordering and scores — no ranking logic lives here. The service excludes
+    profiles that ``load_agent_profile()`` would reject, and results are
+    metadata-only: the profile prompt body is never returned.
+    """
+    from cli_agent_orchestrator.services.profile_search import search_profiles
+
+    try:
+        return search_profiles(q, limit=limit)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to search agent profiles: {str(e)}",
+        )
+
+
+@app.get("/agents/profiles/templates")
+async def list_profile_templates_endpoint() -> List[TemplateSummary]:
+    """List public scaffold-template metadata for profile creation."""
+    from cli_agent_orchestrator.services.agent_scaffold import list_templates
+
+    try:
+        return [
+            TemplateSummary(
+                name=template["name"],
+                description=template.get("description", ""),
+            )
+            for template in list_templates()
+        ]
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list profile templates: {str(e)}",
+        )
+
+
+@app.get("/agents/profiles/templates/{category}/{name}/schema")
+async def get_profile_template_schema_endpoint(category: str, name: str) -> Dict:
+    """Return the JSON-Schema for one scaffold template.
+
+    ``category`` and ``name`` are two path segments rather than one so the
+    ``category/name`` template identifier survives routing without a
+    percent-encoded slash. The pair is allowlist-validated here and the scaffold
+    service re-checks containment independently.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import get_template_schema
+
+    template = f"{category}/{name}"
+    if not re.fullmatch(TEMPLATE_NAME_PATTERN, template):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid template name: {template}",
+        )
+
+    resolved = _resolve_template_name(template)
+    try:
+        schema = get_template_schema(resolved)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    if schema is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No schema found for template '{template}'",
+        )
+    return schema
+
+
+@app.post("/agents/profiles/templates/validate")
+async def validate_profile_template_config_endpoint(
+    request: TemplateConfigRequest,
+) -> ValidateTemplateConfigResponse:
+    """Validate a config against a template's JSON-Schema. Writes nothing.
+
+    Deliberately NOT guarded by ``SCOPE_WRITE``. This is a POST only because the
+    config travels in a JSON body rather than a query string; it mutates no
+    state. The write-scope guard belongs on the create/edit routes that persist
+    a profile, not on validation.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import validate_config
+
+    resolved = _resolve_template_name(request.template)
+    try:
+        errors = validate_config(resolved, request.config)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return ValidateTemplateConfigResponse(valid=not errors, errors=errors)
+
+
+@app.post("/agents/profiles/templates/preview")
+async def preview_profile_template_endpoint(
+    request: TemplateConfigRequest,
+) -> PreviewTemplateResponse:
+    """Render a template to markdown and return it. Writes nothing.
+
+    Same non-mutating rationale as template validation: rendering is a pure function of
+    the template and the supplied config. ``render_template`` validates the
+    config first, so an invalid config returns 400 rather than partial output.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import render_template
+
+    resolved = _resolve_template_name(request.template)
+    try:
+        content = render_template(resolved, request.config)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return PreviewTemplateResponse(template=request.template, content=content)
+
+
 @app.get("/agents/profiles/{name}")
 async def get_agent_profile_endpoint(name: str) -> Dict:
     """Return the full parsed content of a named agent profile."""
@@ -1591,9 +1785,12 @@ class AgentDirsUpdate(BaseModel):
 @app.get("/settings/memory")
 async def get_memory_settings_endpoint() -> Dict:
     """Return whether the memory subsystem is enabled (for UI feature discovery)."""
-    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+    from cli_agent_orchestrator.services.settings_service import (
+        is_learning_enabled,
+        is_memory_enabled,
+    )
 
-    return {"enabled": is_memory_enabled()}
+    return {"enabled": is_memory_enabled(), "learning_enabled": is_learning_enabled()}
 
 
 @app.post("/settings/agent-dirs")
@@ -3624,6 +3821,90 @@ async def clear_memories_endpoint(
         except Exception as e:
             logger.warning("Failed to delete memory %r during clear: %s", mem.key, e)
     return {"success": True, "deleted_count": deleted_count}
+
+
+# =============================================================================
+# Workflow outcome endpoints (self-learning Phase 1)
+# =============================================================================
+
+
+class OutcomeCreateBody(BaseModel):
+    session_name: str
+    task_label: str
+    success: bool
+    workflow_name: Optional[str] = None
+    agent_profile: Optional[str] = None
+    source_terminal_id: Optional[str] = None
+    score: Optional[int] = None
+    friction_notes: str = ""
+
+
+def _require_learning_enabled() -> None:
+    """Raise 404 when workflow self-learning is disabled.
+
+    list_outcomes() silently returns [] when disabled, so the gate must be
+    explicit rather than inferred from empty results (same reasoning as
+    ``_require_memory_enabled``).
+    """
+    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
+
+    if not is_learning_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
+        )
+
+
+@app.post("/outcomes")
+async def create_outcome_endpoint(
+    body: OutcomeCreateBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Record a workflow outcome (self-learning signal)."""
+    from cli_agent_orchestrator.services.outcome_service import (
+        LearningDisabledError,
+        OutcomeService,
+    )
+
+    _require_learning_enabled()
+    try:
+        outcome = OutcomeService().record_outcome(
+            session_name=body.session_name,
+            task_label=body.task_label,
+            success=body.success,
+            workflow_name=body.workflow_name,
+            agent_profile=body.agent_profile,
+            source_terminal_id=body.source_terminal_id,
+            score=body.score,
+            friction_notes=body.friction_notes,
+        )
+    except LearningDisabledError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Workflow self-learning is disabled"
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"success": True, "outcome": outcome}
+
+
+@app.get("/outcomes")
+async def list_outcomes_endpoint(
+    session_name: Optional[str] = None,
+    agent_profile: Optional[str] = None,
+    workflow_name: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """List recorded workflow outcomes newest-first (retrospector read path)."""
+    from cli_agent_orchestrator.services.outcome_service import OutcomeService
+
+    _require_learning_enabled()
+    outcomes = OutcomeService().list_outcomes(
+        session_name=session_name,
+        agent_profile=agent_profile,
+        workflow_name=workflow_name,
+        limit=limit,
+    )
+    return {"outcomes": outcomes, "count": len(outcomes)}
 
 
 # Static file serving for built web UI.

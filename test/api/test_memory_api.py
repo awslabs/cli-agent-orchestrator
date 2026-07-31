@@ -69,13 +69,18 @@ class TestMemorySettingsEndpoint:
         with patch(ENABLED_TARGET, return_value=True):
             response = client.get("/settings/memory")
         assert response.status_code == 200
-        assert response.json() == {"enabled": True}
+        body = response.json()
+        assert body["enabled"] is True
+        assert "learning_enabled" in body
 
     def test_disabled(self, client):
         with patch(ENABLED_TARGET, return_value=False):
             response = client.get("/settings/memory")
         assert response.status_code == 200
-        assert response.json() == {"enabled": False}
+        body = response.json()
+        assert body["enabled"] is False
+        # learning is a child of memory: disabled memory forces it off
+        assert body["learning_enabled"] is False
 
 
 class TestListMemories:

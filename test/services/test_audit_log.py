@@ -416,6 +416,8 @@ class TestT9SyncVsNowait:
                 "compile_stale_dropped",
                 "compile_error",
                 "find_related_completed",
+                # Self-learning instruction promotion (CLI/apply path).
+                "instruction_promotion",
             }
         )
 

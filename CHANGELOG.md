@@ -10,7 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - add Phase 0 Kiro engine selection (`v2` default; `kas` capability-probed and rejected before terminal allocation)
+- Read-only profile HTTP routes for capability search, template discovery and schema retrieval, template-config validation, and rendered previews (#523)
 - `CAO_HOME_DIR` environment variable to relocate CAO's entire data directory outside `~/.aws` (#467)
+- **Self-learning loop** (opt-in, off by default; see `docs/self-learning.md`):
+  - Phase 1 — outcome capture: `memory.learning_enabled` setting (`CAO_MEMORY_LEARNING_ENABLED`), `workflow_outcomes` table, `report_outcome`/`list_outcomes`/`store_lesson` MCP tools (the latter targets a named worker profile's agent scope so retrospective lessons reach the worker), scope-gated `POST/GET /outcomes` endpoints, and a built-in `retrospector` agent profile that distills session outcomes into worker-scoped memory lessons
+  - Phase 2 — instruction promotion: `memory.instruction_promotion_enabled` setting (`CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED`; promotion ⊂ learning ⊂ memory), itemized-delta editing of a delimited `## Learned Patterns` block in profile files, `cao memory promote <agent>` CLI (dry-run by default, `--apply` to mutate), recall-count promotion gate, content-free audit logging
+  - `cao-learning` shipped skill teaching supervisors/workers the outcome-reporting and lesson-storage habits
+  - Validated by a 20-package controlled A/B experiment: +11 mean points on work items with headroom (6/6 wins, sign test p = 0.016), neutral at the ceiling — `docs/self-learning-validation.md`
 - `cao profile find <query>` CLI verb and `find_profiles` MCP tool for keyword/BM25 profile discovery over metadata (name, description, tags, capabilities); metadata-only, never exposes prompt bodies (#340)
 - Optional `capabilities` and `tags` arrays in the agent profile frontmatter schema (#340)
 

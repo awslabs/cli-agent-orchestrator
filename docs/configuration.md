@@ -150,6 +150,8 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `compile_mode` | `"llm"` | `llm` or `append`. `append` skips the LLM wiki-compiler entirely. |
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush. |
 | `compile_timeout_s` | `120.0` | Wall-clock timeout for the wiki compile call. |
+| `learning_enabled` | `false` | Opt-in switch for workflow self-learning (outcome capture via `report_outcome` / `/outcomes`). Requires `enabled=true` — a disabled memory subsystem forces learning off. Env override: `CAO_MEMORY_LEARNING_ENABLED`. See [Self-Learning](self-learning.md). |
+| `instruction_promotion_enabled` | `false` | Opt-in switch for promoting reinforced lessons into agent profile files (`cao memory promote --apply`). Requires `learning_enabled=true` (promotion ⊂ learning ⊂ memory). Env override: `CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED`. ⚠️ Promoted lesson text is agent-generated: review every promote diff as an untrusted-instruction change before applying — see [Self-Learning](self-learning.md#phase-2--instruction-promotion). |
 
 ### Terminal backend (`terminal`)
 

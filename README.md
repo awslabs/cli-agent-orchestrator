@@ -106,6 +106,9 @@ provider override while keeping the same sequence.
 - [Flows](docs/flows.md) and [workflows](docs/workflows.md): scheduled runs and
   multi-step pipelines.
 - [Skills](docs/skills.md): install, scope, and author reusable agent guidance.
+- [Memory](docs/memory.md) and [self-learning](docs/self-learning.md):
+  persistent cross-session memory, and the opt-in loop that turns workflow
+  outcomes into lessons and promoted instructions.
 - [Tool restrictions](docs/tool-restrictions.md): roles, allowlists, and
   provider enforcement.
 - [Updating CAO](docs/updating.md): update an installed uv tool.
