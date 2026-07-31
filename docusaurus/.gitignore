@@ -8,6 +8,12 @@
 .docusaurus
 .cache-loader
 
+# Interactive courses assembled from course-src/ by course-src/build.sh
+# (runs automatically via the prebuild/prestart npm scripts)
+/static/course/
+/static/course-advanced/
+/static/course-assets/
+
 # Misc
 .DS_Store
 .env.local

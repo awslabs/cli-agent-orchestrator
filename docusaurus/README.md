@@ -41,8 +41,27 @@ docusaurus/
 │   ├── features/
 │   ├── guides/
 │   └── reference/
+├── course-src/            # Interactive course sources (assembled into static/)
+│   ├── build.sh           # Concatenates each course into a single page
+│   ├── shared/            # styles.css + main.js shared by both courses
+│   ├── fundamentals/      # _base.html, _footer.html, modules/
+│   └── advanced/          # _base.html, _footer.html, modules/
 ├── src/                   # Custom React components and pages
-├── static/                # Static assets (images, favicon)
+├── static/                # Static assets, plus the generated courses
 ├── docusaurus.config.ts   # Main site configuration
 └── sidebars.ts            # Sidebar navigation structure
+```
+
+## Interactive Courses
+
+The two courses under `course-src/` are plain HTML assembled by
+`course-src/build.sh` into `static/course/`, `static/course-advanced/`, and
+`static/course-assets/`. That output is gitignored and rebuilt automatically by
+the `prebuild` and `prestart` npm scripts, so edit the sources in `course-src/`
+and never the assembled pages.
+
+To rebuild them without a full site build:
+
+```bash
+npm run build-courses
 ```

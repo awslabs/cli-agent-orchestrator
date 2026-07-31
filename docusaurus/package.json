@@ -4,7 +4,10 @@
   "private": true,
   "scripts": {
     "docusaurus": "docusaurus",
+    "build-courses": "bash course-src/build.sh",
+    "prestart": "npm run build-courses",
     "start": "docusaurus start",
+    "prebuild": "npm run build-courses",
     "build": "docusaurus build",
     "swizzle": "docusaurus swizzle",
     "deploy": "docusaurus deploy",

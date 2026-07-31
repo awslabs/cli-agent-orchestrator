@@ -1,5 +1,6 @@
 import React from 'react';
 import Link from '@docusaurus/Link';
+import useBaseUrl from '@docusaurus/useBaseUrl';
 import Layout from '@theme/Layout';
 import styles from './index.module.css';
 
@@ -78,6 +79,11 @@ function HeroSection() {
           <Link className={styles.btnPrimary} to="/docs/intro">
             Get Started →
           </Link>
+          <a
+            className={styles.btnSecondary}
+            href={useBaseUrl('/course/index.html')}>
+            Interactive Course
+          </a>
           <Link
             className={styles.btnSecondary}
             to="https://github.com/awslabs/cli-agent-orchestrator">
