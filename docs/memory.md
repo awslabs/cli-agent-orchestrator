@@ -466,3 +466,13 @@ Use `memory_recall` to check if you already know something before asking the use
 Note: `memory_store` and `memory_recall` are CAO's cross-provider memory tools, distinct from
 any provider-native memory system.
 ```
+
+## Self-Learning (builds on memory)
+
+The opt-in self-learning loop uses agent-scope memory as its lesson store:
+agents report task outcomes, a retrospector agent distills them into
+agent-scope `feedback` memories with `Applies when:` trigger clauses, and
+recall-reinforced lessons can be promoted into agent profile files. Every
+memory capability on this page — injection, recall/`access_count`, lint,
+retention, the audit log — applies to those lessons unchanged. See
+[Self-Learning](self-learning.md).

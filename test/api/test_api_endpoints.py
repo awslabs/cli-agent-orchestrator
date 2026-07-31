@@ -17,6 +17,7 @@ from cli_agent_orchestrator.api.main import (
     inbox_reconciliation_daemon,
     opencode_inbox_delivery_daemon,
 )
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.utils.skills import SkillNameError
@@ -291,7 +292,124 @@ class TestCreateSession:
             allowed_tools=None,
             registry=ANY,
             env_vars=None,
+            initial_message=None,
+            initial_message_orchestration_type=None,
+            model=None,
         )
+
+    def test_create_session_passes_model_and_initial_message(self, client):
+        """The launch override and first task reach the session service, while
+        the task remains in the JSON body rather than the request URL."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="codex",
+            agent_profile="developer",
+        )
+        initial_message = "Review the current change"
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "codex",
+                    "agent_profile": "developer",
+                    "model": "gpt-5.1-codex",
+                },
+                json={
+                    "initial_message": initial_message,
+                    "initial_message_orchestration_type": "send_message",
+                },
+            )
+
+        assert response.status_code == 201
+        assert initial_message not in str(response.request.url)
+        call_kwargs = mock_svc.create_session.call_args.kwargs
+        assert call_kwargs["model"] == "gpt-5.1-codex"
+        assert call_kwargs["initial_message"] == initial_message
+        assert call_kwargs["initial_message_orchestration_type"] == OrchestrationType.SEND_MESSAGE
+
+    def test_create_session_preserves_env_vars_body_shape(self, client):
+        """Existing cao launch --env callers keep using {"env_vars": {...}}."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json={"env_vars": {"FEATURE_MODE": "enabled"}},
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["env_vars"] == {"FEATURE_MODE": "enabled"}
+
+    def test_create_session_rejects_malformed_model(self, client):
+        """Malformed model IDs fail before any session is created."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={
+                    "agent_profile": "developer",
+                    "model": "invalid;model",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "model" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_rejects_empty_initial_message(self, client):
+        """An explicitly supplied but undeliverable empty task is not ignored."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json={"initial_message": ""},
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "initial_message must not be empty"
+        mock_svc.create_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_detail"),
+        [
+            (
+                {"initial_message_orchestration_type": "send_message"},
+                "initial_message_orchestration_type requires initial_message",
+            ),
+            (
+                {
+                    "initial_message": "Review the current change",
+                    "initial_message_orchestration_type": "invalid",
+                },
+                "invalid initial_message_orchestration_type: 'invalid'",
+            ),
+        ],
+    )
+    def test_create_session_rejects_invalid_initial_message_orchestration(
+        self, client, payload, expected_detail
+    ):
+        """Invalid initial-message orchestration fails at the API boundary."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "developer"},
+                json=payload,
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == expected_detail
+        mock_svc.create_session.assert_not_called()
 
     def test_create_session_with_session_name(self, client):
         """POST /sessions with explicit session_name."""

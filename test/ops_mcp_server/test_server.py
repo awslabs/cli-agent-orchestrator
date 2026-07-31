@@ -346,6 +346,63 @@ class TestSessionLifecycleTools:
             json=None,
         )
 
+    async def test_launch_session_passes_model_and_initial_message(self) -> None:
+        """The model stays in routing params and the first task stays in JSON."""
+        initial_message = "Review the current change"
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"id": "term-789"}),
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                provider="codex",
+                session_name="model-session",
+                model="gpt-5.1-codex",
+                initial_message=initial_message,
+            )
+
+        assert result == LaunchResult(
+            success=True,
+            message=(
+                "Session 'model-session' launched; " "initial message delivery is in progress"
+            ),
+            session_name="model-session",
+            terminal_id="term-789",
+        )
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/sessions",
+            params={
+                "provider": "codex",
+                "agent_profile": "developer",
+                "session_name": "model-session",
+                "model": "gpt-5.1-codex",
+            },
+            json={"initial_message": initial_message},
+        )
+        request_url = mock_request.call_args.args[1]
+        request_params = mock_request.call_args.kwargs["params"]
+        assert initial_message not in request_url
+        assert initial_message not in str(request_params)
+
+    async def test_launch_session_returns_invalid_model_error(self) -> None:
+        """Request-boundary model errors are returned instead of ignored."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(
+                status_code=400,
+                json_data={"detail": "model 'invalid;model' is invalid"},
+            ),
+        ):
+            result = await launch_session(
+                agent_profile="developer",
+                model="invalid;model",
+            )
+
+        assert result.success is False
+        assert result.message == ("Launch session failed: model 'invalid;model' is invalid")
+        assert result.terminal_id is None
+
     async def test_launch_session_returns_failure_on_api_error(self) -> None:
         """Session API errors should return failed LaunchResults."""
         with patch(

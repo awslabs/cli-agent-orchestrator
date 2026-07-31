@@ -38,7 +38,21 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 
 ### Profiles, providers, and settings
 
-- `/agents/profiles*` lists, reads, and installs profiles.
+- `GET /agents/profiles` and `GET /agents/profiles/{name}` list and inspect
+  installed profiles.
+- `GET /agents/profiles/search` ranks installed, loadable profiles by capability
+  using the same service as `cao profile find`.
+- `GET /agents/profiles/templates` lists public template metadata (`name` and
+  `description` only); internal template filesystem paths are never returned.
+- `GET /agents/profiles/templates/{category}/{name}/schema` returns a template's
+  JSON-Schema.
+- `POST /agents/profiles/templates/validate` validates a config object against
+  a template's JSON-Schema without writing a profile.
+- `POST /agents/profiles/templates/preview` validates and renders a template to
+  Markdown without writing a profile.
+- `POST /agents/profiles/install` installs a profile.
+- Template validation and preview require the selected template to include a
+  `schema.json` file.
 - `/agents/providers` reports provider availability.
 - `/settings/*` exposes supported agent-directory, skill-directory, and memory
   settings.
@@ -58,6 +72,11 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 - `/sessions/{session_name}/terminals*` creates and lists session terminals.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
+- `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
+  rolling buffer (most recent `state_buffer_max` bytes of streamed output —
+  server setting, 32KB by default, see [Configuration](configuration.md)),
+  not unbounded scrollback. Long sessions are truncated to the tail; use the
+  on-disk terminal log for complete history.
 
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.
@@ -81,11 +100,14 @@ See [Workflows](workflows.md).
 
 ### Memory and graph
 
-- `/settings/memory` reports memory enablement.
+- `/settings/memory` reports memory enablement (including `learning_enabled`).
 - `/memory*` lists, reads, exports, and deletes memories.
 - `/graph/{provider}*` projects and exports graph views.
+- `/outcomes` records (`POST`, write-scope) and lists (`GET`) workflow
+  outcomes for the self-learning loop. Both return 404 while
+  `memory.learning_enabled` is false.
 
-See [Memory](memory.md) and
+See [Memory](memory.md), [Self-Learning](self-learning.md), and
 [Knowledge Graph Viewing](knowledge-graph-viewing.md).
 
 ### Flows

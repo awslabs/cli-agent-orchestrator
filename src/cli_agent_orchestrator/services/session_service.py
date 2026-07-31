@@ -25,6 +25,7 @@ from typing import Dict, List
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.constants import SESSION_PREFIX
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
@@ -47,13 +48,28 @@ async def create_session(
     allowed_tools: list[str] | None = None,
     registry: PluginRegistry | None = None,
     env_vars: dict[str, str] | None = None,
+    initial_message: str | None = None,
+    initial_message_orchestration_type: OrchestrationType | None = None,
+    model: str | None = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
     ``env_vars`` are operator-forwarded env vars from ``cao launch --env``.
     They are persisted on the session record so every worker spawned later
     in the same session inherits them. See issue #248.
+
+    When ``initial_message`` is provided, the initial terminal uses the
+    existing deferred-init path so provider initialization and delivery can
+    continue after the session response. Omitting it preserves the synchronous
+    initialization behavior used by existing callers.
+    On the deferred path, the ``post_create_session`` plugin event is dispatched
+    before provider initialization and message delivery finish.
     """
+    if initial_message == "":
+        raise ValueError("initial_message must not be empty")
+    if initial_message is None and initial_message_orchestration_type is not None:
+        raise ValueError("initial_message_orchestration_type requires initial_message")
+
     if provider is None:
         resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
     else:
@@ -68,6 +84,10 @@ async def create_session(
         allowed_tools=allowed_tools,
         registry=registry,
         env_vars=env_vars,
+        defer_init=initial_message is not None,
+        initial_message=initial_message,
+        initial_message_orchestration_type=initial_message_orchestration_type,
+        model=model,
     )
     dispatch_plugin_event(
         registry,

@@ -88,8 +88,31 @@ BRACKETED_PASTE_INCOMPATIBLE_SHELLS = frozenset(
 # =============================================================================
 # Application Directory Structure
 # =============================================================================
-# Base directory for all CAO data (~/.aws/cli-agent-orchestrator)
-CAO_HOME_DIR = Path.home() / ".aws" / "cli-agent-orchestrator"
+# Base directory for all CAO data. Defaults to ``~/.aws/cli-agent-orchestrator``,
+# overridable via the ``CAO_HOME_DIR`` env var (read at import, mirroring the
+# ``CAO_AGENTS_DIR`` / ``CAO_GRAPH_EXPORT_ROOT`` convention). Every path below
+# derives from it, so one override relocates the whole tree. Motivating case:
+# environments that restrict reads under ``~/.aws`` at the OS level (e.g.
+# AppArmor, mount namespaces, or similar path-based sandboxing) to protect
+# credentials; pointing this outside ``~/.aws`` keeps the sandbox enabled.
+# Must be set before this module is first imported. Empty or whitespace-only
+# values are treated as unset; tilde is expanded and the result is resolved to
+# an absolute path.
+_cao_home_raw = os.environ.get("CAO_HOME_DIR", "").strip()
+CAO_HOME_DIR = (
+    Path(_cao_home_raw).expanduser().resolve()
+    if _cao_home_raw
+    else Path.home() / ".aws" / "cli-agent-orchestrator"
+)
+
+# Ensure the base directory exists with owner-only permissions. When relocated
+# outside ~/.aws there is no parent permission umbrella protecting the DB,
+# memory, agent-store, and terminal logs from other local users.
+CAO_HOME_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+try:
+    os.chmod(CAO_HOME_DIR, 0o700)
+except OSError:
+    pass  # best-effort: may fail on read-only mounts or non-owned dirs
 
 # Managed environment variable file
 CAO_ENV_FILE = CAO_HOME_DIR / ".env"
@@ -100,18 +123,29 @@ DB_DIR = CAO_HOME_DIR / "db"
 # Log file directory structure
 LOG_DIR = CAO_HOME_DIR / "logs"
 TERMINAL_LOG_DIR = LOG_DIR / "terminal"  # Per-terminal log files for pipe-pane output
-TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 # FIFO directory for event-driven terminal output streaming
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
-FIFO_DIR.mkdir(parents=True, exist_ok=True)
+FIFO_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+# Sidecar lock directory for utils/atomic_file.locked_atomic_rewrite. The
+# targets it serializes (AGENTS.md / .claude/CLAUDE.md / dev.agent.md) live in
+# the USER's working tree, so a lock file placed beside each target would leave
+# permanent untracked ``*.lock`` files polluting the user's repo. Keeping the
+# lock files here — under CAO's own home dir, keyed by a hash of the target's
+# resolved absolute path — means every process (CLI and cao-server) that locks
+# the same target agrees on the same lock file while the user's tree gains ZERO
+# new files. Created lazily (0o700) on first use by the lock helper.
+LOCK_DIR = CAO_HOME_DIR / "locks"
 
 # =============================================================================
 # Event-Driven State Detection Configuration
 # =============================================================================
-# Rolling buffer size for state detection (8KB)
-# Keeps trailing 8KB of terminal output for pattern matching
-STATE_BUFFER_MAX = 8192
+# The rolling per-terminal raw-output buffer StatusMonitor keeps for raw-path
+# status detection and GET /terminals/{id}/output (mode=full) is a server
+# tuning value, not a fixed constant -- see settings_service.py's
+# ``_SERVER_DEFAULTS["state_buffer_max"]`` / ``get_server_settings()``.
 
 # Max events buffered per subscriber queue before dropping. Claude's TUI startup
 # can emit thousands of small chunks in a short burst, so keep this comfortably

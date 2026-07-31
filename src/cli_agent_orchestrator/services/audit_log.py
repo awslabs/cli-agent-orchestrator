@@ -86,6 +86,10 @@ NOWAIT_AUDIT_EVENTS: frozenset = frozenset(
         "compile_stale_dropped",
         "compile_error",
         "find_related_completed",
+        # Self-learning instruction promotion (Phase 2). NOWAIT: emitted from
+        # the CLI/apply path after the profile write completes; content-free
+        # (profile name + lesson keys only).
+        "instruction_promotion",
     }
 )
 AUDIT_EVENT_WHITELIST: frozenset = SYNC_AUDIT_EVENTS | NOWAIT_AUDIT_EVENTS

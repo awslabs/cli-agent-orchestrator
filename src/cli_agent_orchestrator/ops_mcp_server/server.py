@@ -30,8 +30,8 @@ mcp = FastMCP(
     1. list_profiles to inspect available profiles
     2. get_profile_details to review a profile's full prompt and metadata
     3. install_profile to install a profile for a target provider
-    4. launch_session to start a new CAO session
-    5. send_session_message to deliver a prompt to a running terminal
+    4. launch_session to start a new CAO session, optionally with its first task
+    5. send_session_message to deliver later prompts to a running terminal
     6. get_terminal_status to poll a worker until it finishes a task
     7. get_terminal_output to read a worker's result (or review its files/git diff)
     8. read_session_output to read a terminal's captured output by session name
@@ -99,6 +99,8 @@ async def _launch_session_impl(
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[List[str]] = None,
+    model: Optional[str] = None,
+    initial_message: Optional[str] = None,
 ) -> LaunchResult:
     """Create a new CAO session and return the session identifiers."""
     resolved_session_name = session_name or generate_session_name()
@@ -110,13 +112,16 @@ async def _launch_session_impl(
         params["provider"] = provider
     if working_directory:
         params["working_directory"] = working_directory
+    if model is not None:
+        params["model"] = model
 
     serialized_allowed_tools = _serialize_allowed_tools(allowed_tools)
     if serialized_allowed_tools:
         params["allowed_tools"] = serialized_allowed_tools
 
+    body = {"initial_message": initial_message} if initial_message is not None else None
     session_data, error = _request_json(
-        "post", "/sessions", params=params, operation="Launch session"
+        "post", "/sessions", params=params, json=body, operation="Launch session"
     )
     if error:
         return LaunchResult(
@@ -135,9 +140,14 @@ async def _launch_session_impl(
         )
 
     terminal_id = str(session_data["id"])
+    message = (
+        f"Session '{resolved_session_name}' launched; initial message delivery is in progress"
+        if initial_message is not None
+        else f"Session '{resolved_session_name}' launched successfully"
+    )
     return LaunchResult(
         success=True,
-        message=f"Session '{resolved_session_name}' launched successfully",
+        message=message,
         session_name=resolved_session_name,
         terminal_id=terminal_id,
     )
@@ -275,12 +285,32 @@ async def launch_session(
         Optional[List[str]],
         Field(description="Optional list of allowed tool restrictions"),
     ] = None,
+    model: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional per-launch model override accepted by the resolved provider; "
+                "takes precedence over the profile model"
+            )
+        ),
+    ] = None,
+    initial_message: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional first task to deliver after provider initialization; "
+                "sent in the JSON request body"
+            )
+        ),
+    ] = None,
 ) -> LaunchResult:
     """Create a new CAO session with the given provider and agent profile.
 
-    Returns immediately with session_name and terminal_id. Use
-    send_session_message to deliver an initial prompt once the session is
-    running, and get_session_info or list_sessions to monitor progress.
+    Returns immediately with session_name and terminal_id. When
+    ``initial_message`` is provided, provider initialization and delivery
+    continue in the background; use get_terminal_status or get_session_info to
+    observe the result. Without it, use send_session_message to deliver work
+    later.
 
     Args:
         agent_profile: Agent profile for the new session
@@ -288,6 +318,8 @@ async def launch_session(
         session_name: Optional custom session name (auto-generated if omitted)
         working_directory: Optional working directory for the session
         allowed_tools: Optional list of tool restrictions
+        model: Optional per-launch model override
+        initial_message: Optional first task, carried in the JSON request body
 
     Returns:
         LaunchResult with success status, session_name, and terminal_id
@@ -298,6 +330,8 @@ async def launch_session(
         session_name=session_name,
         working_directory=working_directory,
         allowed_tools=allowed_tools,
+        model=model,
+        initial_message=initial_message,
     )
 
 
