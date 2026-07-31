@@ -194,7 +194,24 @@ class TestBuiltins:
         assert builtins[1]["events"] == [{"type": "key", "key": "Escape"}]
 
     def test_no_registry_entry_synthesizes_nothing(self):
-        assert builtin_macros_for_provider("codex") == []
+        # The provider is looked up rather than named, so this keeps asserting
+        # what it means. It named "codex" when Codex had no registry row; the
+        # evidence-pinned `_codex_entry` (compact + stop) later gave it one,
+        # and the assertion then failed on a provider that is behaving
+        # correctly. Resolving an absent provider from the registry itself
+        # cannot drift that way — and if every known provider ever advertises
+        # controls, this skips loudly instead of silently asserting nothing.
+        from cli_agent_orchestrator.models.provider import ProviderType
+        from cli_agent_orchestrator.services.provider_controls import (
+            advertised_provider_controls,
+        )
+
+        advertised = advertised_provider_controls()
+        unregistered = next((p.value for p in ProviderType if p.value not in advertised), None)
+        if unregistered is None:
+            pytest.skip("every known provider now advertises controls")
+
+        assert builtin_macros_for_provider(unregistered) == []
         assert builtin_macros_for_provider(None) == []
 
     def test_builtins_merge_into_the_visible_set(self, store):
