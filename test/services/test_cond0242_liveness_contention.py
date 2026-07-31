@@ -43,6 +43,7 @@ import logging
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from unittest.mock import MagicMock
 
 import pytest
@@ -131,7 +132,10 @@ def probing_client(shared_tmux, monkeypatch):
     def fake_run(cmd, *args, **kwargs):
         argv = list(cmd)
         if "list-panes" in argv:
-            out = shared_tmux.single_pane_observation("%0\n")
+            # The row real tmux returns: pane id and the window's own name,
+            # which the resolver checks against the name it asked for.
+            window = argv[argv.index("-t") + 1].split(":=", 1)[1]
+            out = shared_tmux.single_pane_observation(f"%0\t{window}\n")
         elif "capture-pane" in argv:
             out = shared_tmux.single_pane_observation("pane tail line\n")
         else:  # pragma: no cover - the probe must not reach any other command
@@ -445,7 +449,7 @@ class TestObservationIsBoundedAndConservative:
         def recording_run(cmd, *args, **kwargs):
             timeouts.append(kwargs.get("timeout"))
             argv = list(cmd)
-            out = "%0\n" if "list-panes" in argv else "tail\n"
+            out = "%0\twin\n" if "list-panes" in argv else "tail\n"
             return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
         monkeypatch.setattr(tmux_module.subprocess, "run", recording_run)
@@ -466,7 +470,7 @@ class TestMissingTerminalWarningStorm:
     def test_repeated_missing_terminal_lookups_log_once_per_interval(self, monkeypatch):
         from cli_agent_orchestrator.clients import database as db
 
-        monkeypatch.setattr(db, "_missing_terminal_logged_at", {})
+        monkeypatch.setattr(db, "_missing_terminal_logged_at", OrderedDict())
         reported = [db._should_report_missing_terminal("7864d54f") for _ in range(50)]
 
         assert reported[0] is True, "the first observation must stay loud"
@@ -475,7 +479,7 @@ class TestMissingTerminalWarningStorm:
     def test_each_terminal_is_reported_on_its_own_first_observation(self, monkeypatch):
         from cli_agent_orchestrator.clients import database as db
 
-        monkeypatch.setattr(db, "_missing_terminal_logged_at", {})
+        monkeypatch.setattr(db, "_missing_terminal_logged_at", OrderedDict())
 
         assert db._should_report_missing_terminal("c736df05") is True
         assert db._should_report_missing_terminal("b503a93e") is True, (
@@ -493,3 +497,236 @@ class TestMissingTerminalWarningStorm:
         assert db._should_report_missing_terminal("87abc952") is False
         logged.pop("87abc952")  # what a successful lookup does
         assert db._should_report_missing_terminal("87abc952") is True
+
+
+# ── Round 2: exact-head review findings ──────────────────────────────────
+#
+# Four defects found by the two independent exact-head reviews of PR #57.
+# Each test below fails at 91addd2 and passes after its fix.
+
+
+class TestCapturedPaneShape:
+    """P1 (Opus F-1). The observation rewrite changed what `get_history`
+    returns, and the comment claiming otherwise was wrong.
+
+    libtmux's `tmux_cmd` popped **every** strictly-empty trailing line:
+
+        stdout_split = stdout.split("\\n")
+        while stdout_split and stdout_split[-1] == "":
+            stdout_split.pop()
+
+    `capture-pane -p` emits the whole visible pane region, so a TUI rendering
+    in a viewport at the top of a 30-row pane returns 28 blank rows below it
+    (measured against real tmux 3.7b). Returning those blanks silently breaks
+    every fixed-size tail window over the result.
+    """
+
+    def test_copilot_stays_waiting_on_a_blank_padded_pane(self, probing_client, monkeypatch):
+        """The operational consequence, end to end through the real provider.
+
+        `CopilotCliProvider.get_status` falls back to `_history()` whenever the
+        FIFO buffer has no visible text — its own comment documents that as the
+        normal case for a TUI — and then scores `"\\n".join(lines[-40:])`. With
+        the blank tail retained that window is empty, `waiting_matches` is
+        empty, and the WAITING_USER_ANSWER branch is unreachable: a terminal
+        blocked on a trust prompt reports PROCESSING and stalls forever while
+        looking healthy.
+        """
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        # 50 rows is the pane geometry `TmuxClient.create_session` pins, so the
+        # blank tail is longer than the provider's 40-line scoring window —
+        # which is precisely what makes the retained blanks fatal rather than
+        # merely untidy.
+        pane = (
+            "GitHub Copilot v0.0.415\n"
+            "Do you trust the contents of this directory? [y/n]\n" + "\n" * 48
+        )
+
+        from cli_agent_orchestrator.clients import tmux as tmux_module
+
+        def blank_padded(cmd, *args, **kwargs):
+            argv = list(cmd)
+            window = argv[argv.index("-t") + 1].split(":=", 1)[1] if "list-panes" in argv else ""
+            out = f"%0\t{window}\n" if "list-panes" in argv else pane
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+        monkeypatch.setattr(tmux_module.subprocess, "run", blank_padded)
+
+        backend = MagicMock()
+        backend.get_history.side_effect = lambda s, w, **kw: probing_client.get_history(s, w, **kw)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.copilot_cli.get_backend", lambda: backend
+        )
+
+        provider = CopilotCliProvider("test1234", "cao-p1-closure", "win")
+        assert provider.get_status("") == TerminalStatus.WAITING_USER_ANSWER
+
+
+class TestFirstPaneResolution:
+    """P2 (Sol P2-1). The resolver documents that it preserves
+    `window.panes[0]` and that "partial identity is worse than absent
+    identity", then loops until *some* row parses — so a malformed first row
+    silently retargets the read at a sibling pane.
+
+    `get_history` supplies FIFO liveness truth and Output/history reads, so a
+    sibling's screen can fabricate a divergence, trigger a re-arm, and be
+    replayed under the wrong terminal's identity.
+    """
+
+    @staticmethod
+    def _resolver(monkeypatch, listing):
+        from cli_agent_orchestrator.clients import tmux as tmux_module
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        client = TmuxClient.__new__(TmuxClient)
+        client.server = MagicMock()
+        calls: list = []
+
+        def run(cmd, *args, **kwargs):
+            argv = list(cmd)
+            calls.append(argv)
+            stdout = listing if "list-panes" in argv else "sibling pane output\n"
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(tmux_module.subprocess, "run", run)
+        monkeypatch.setattr(tmux_module, "tmux_binary", lambda: "/usr/bin/tmux")
+        return client, calls
+
+    def test_malformed_first_row_fails_without_capturing_a_sibling(self, monkeypatch):
+        client, calls = self._resolver(monkeypatch, "malformed-first-row\twin\n%2\twin\n")
+
+        with pytest.raises(ValueError):
+            client.get_history("ses", "win", tail_lines=80)
+
+        assert not any(
+            "capture-pane" in argv for argv in calls
+        ), "an unresolvable first pane must never fall through to a sibling's screen"
+
+    def test_a_window_tmux_resolved_by_index_is_refused(self, monkeypatch):
+        """P3 (Opus F-3), reproduced against real tmux 3.7b.
+
+        `=` suppresses tmux's prefix match but not index resolution: with a
+        window literally named "0", `-t =sess:=0` answers with window *index*
+        0 — a different window — where libtmux's `windows.get(window_name="0")`
+        matched by name. At the previous head this silently returned an
+        unrelated terminal's screen.
+
+        Carrying `#{window_name}` back makes the resolver self-verifying at no
+        extra call, so the mismatch fails closed. Actually *reaching* a
+        numerically-named window would need a session-wide listing — scope this
+        repair deliberately does not expand — so that remainder is backlog.
+        """
+        client, calls = self._resolver(monkeypatch, "%0\tmanaged-abc123\n")
+
+        with pytest.raises(ValueError, match="did not name"):
+            client.get_history("cao", "0", tail_lines=80)
+
+        assert not any(
+            "capture-pane" in argv for argv in calls
+        ), "a window the caller did not name must never be captured"
+
+    def test_a_valid_first_row_still_wins(self, monkeypatch):
+        """The conservative rule must not become "reject anything unusual":
+        the first pane is still the target, and a malformed *later* row is
+        someone else's problem — exactly what `window.panes[0]` meant."""
+        client, calls = self._resolver(monkeypatch, "%0\twin\nmalformed-second-row\twin\n")
+
+        assert client.get_history("ses", "win", tail_lines=80) == "sibling pane output"
+        capture = next(argv for argv in calls if "capture-pane" in argv)
+        assert capture[capture.index("-t") + 1] == "%0"
+
+
+class TestMissingTerminalLimiterIsBounded:
+    """P2 (Sol P2-2 / Opus F-6). The table comment claims a bound it does not
+    have: it prunes only entries already older than the interval, and only
+    once past 512. More than 512 distinct ids missing inside one interval
+    means nothing is stale, so the table grows without limit and every later
+    report pays an O(n) scan under the lock — on a hot lookup path.
+    """
+
+    CAP = 512
+
+    def test_distinct_ids_beyond_capacity_do_not_grow_the_table(self, monkeypatch):
+        from cli_agent_orchestrator.clients import database as db
+
+        monkeypatch.setattr(db, "_missing_terminal_logged_at", OrderedDict())
+        for i in range(600):
+            assert db._should_report_missing_terminal(f"{i:08x}") is True
+
+        assert len(db._missing_terminal_logged_at) <= self.CAP, (
+            f"{len(db._missing_terminal_logged_at)} entries retained for 600 distinct "
+            f"ids — the claimed {self.CAP}-entry bound is not a bound"
+        )
+
+    def test_eviction_is_oldest_first_and_suppression_survives_it(self, monkeypatch):
+        from cli_agent_orchestrator.clients import database as db
+
+        monkeypatch.setattr(db, "_missing_terminal_logged_at", OrderedDict())
+        db._should_report_missing_terminal("oldest01")
+        for i in range(self.CAP + 10):
+            db._should_report_missing_terminal(f"f{i:07x}")
+
+        assert "oldest01" not in db._missing_terminal_logged_at, "eviction must be oldest-first"
+        newest = f"f{self.CAP + 9:07x}"
+        assert (
+            db._should_report_missing_terminal(newest) is False
+        ), "a retained id must still be suppressed after eviction pressure"
+
+
+class TestV1TierProbeIsSilent:
+    """P2 (Opus F-2). The rate limiter fixed the volume of the
+    `Terminal metadata not found` burst but not its truthfulness.
+
+    `get_terminal_metadata` is the *first tier* of a two-tier probe
+    (`_get_terminal_metadata_any`, `project_terminal`: v1 then v2), so a
+    perfectly healthy v2-only terminal takes an expected v1 miss on every hot
+    call. The clear-on-success path can never fire for it — the v1 lookup
+    never succeeds — so it emits a false WARNING every 300s for as long as it
+    lives, on the exact log surface this campaign exists to keep readable.
+    """
+
+    @staticmethod
+    def _records(caplog):
+        return [r for r in caplog.records if "Terminal metadata not found" in r.getMessage()]
+
+    def test_a_healthy_v2_terminal_warns_about_nothing(
+        self, monkeypatch, caplog, isolated_memory_db
+    ):
+        from cli_agent_orchestrator.clients import database as db
+        from cli_agent_orchestrator.services import terminal_service
+
+        # The real v1 lookup runs against a real, empty terminals table — that
+        # miss is the whole point. Only the second tier is stubbed.
+        monkeypatch.setattr(db, "_missing_terminal_logged_at", OrderedDict())
+        monkeypatch.setattr(
+            terminal_service, "get_terminal_metadata_v2", lambda tid: {"id": tid, "vintage": "v2"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                assert terminal_service._get_terminal_metadata_any("deadbeef") is not None
+
+        assert self._records(caplog) == [], (
+            "an expected first-tier miss on a terminal the second tier resolves "
+            "is not a missing terminal"
+        )
+
+    def test_a_genuine_miss_in_both_tiers_is_still_reported_once(
+        self, monkeypatch, caplog, isolated_memory_db
+    ):
+        from cli_agent_orchestrator.clients import database as db
+        from cli_agent_orchestrator.services import terminal_service
+
+        monkeypatch.setattr(db, "_missing_terminal_logged_at", OrderedDict())
+        monkeypatch.setattr(terminal_service, "get_terminal_metadata_v2", lambda tid: None)
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(5):
+                assert terminal_service._get_terminal_metadata_any("c736df05") is None
+
+        assert len(self._records(caplog)) == 1, (
+            "a terminal neither tier can resolve must still be reported — once, "
+            "then rate-limited"
+        )

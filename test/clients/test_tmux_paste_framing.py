@@ -65,7 +65,8 @@ def tmux_calls():
         def run(cmd, *args, **kwargs):
             argv = list(cmd)
             if "list-panes" in argv:
-                return subprocess.CompletedProcess(argv, 0, stdout="%0\n", stderr="")
+                window = argv[argv.index("-t") + 1].split(":=", 1)[1]
+                return subprocess.CompletedProcess(argv, 0, stdout=f"%0\t{window}\n", stderr="")
             if "capture-pane" in argv:
                 return subprocess.CompletedProcess(argv, 0, stdout="pane tail\n", stderr="")
             return None

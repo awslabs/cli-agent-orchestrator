@@ -502,14 +502,28 @@ class TestGetHistory:
     TMUX = "/usr/bin/tmux"
 
     @staticmethod
-    def _fake_tmux(*, panes="%0\n", capture=""):
-        """Record the argv of every tmux observation and answer it."""
+    def _window_of(argv):
+        """The window name the resolver asked tmux for, from its own argv."""
+        target = argv[argv.index("-t") + 1]
+        return target.split(":=", 1)[1]
+
+    @classmethod
+    def _fake_tmux(cls, *, panes=None, capture=""):
+        """Record the argv of every tmux observation and answer it.
+
+        ``panes=None`` synthesizes the row real tmux would return for the
+        window that was actually asked for — pane id and window name — so the
+        resolver's self-verification is exercised rather than bypassed.
+        """
         calls: list = []
 
         def run(cmd, *args, **kwargs):
             argv = list(cmd)
             calls.append(argv)
-            stdout = panes if "list-panes" in argv else capture
+            if "list-panes" in argv:
+                stdout = panes if panes is not None else f"%0\t{cls._window_of(argv)}\n"
+            else:
+                stdout = capture
             return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
         return run, calls
@@ -580,6 +594,37 @@ class TestGetHistory:
         # full_history uses "-S" "-" (no line count), strip_escapes omits "-e"
         assert capture[1:] == ["capture-pane", "-p", "-S", "-", "-t", "%0"]
 
+    def test_get_history_strips_every_trailing_blank_pane_row(self, tmux):
+        """`capture-pane -p` returns the whole visible pane region, so a TUI
+        that renders in a viewport at the top leaves every row below it blank.
+        libtmux popped all strictly-empty trailing lines; this must too.
+
+        It matters beyond cosmetics: `CopilotCliProvider.get_status` scores
+        `"\n".join(lines[-40:])`, so ~40 blank rows empty that window and the
+        WAITING_USER_ANSWER branch becomes unreachable — a terminal blocked on
+        a [y/n] prompt reports PROCESSING forever.
+        """
+        pane = "TOP LINE\nDo you trust the contents of this directory? [y/n]\n" + "\n" * 28
+        run, _ = self._fake_tmux(capture=pane)
+        with self._observing(run):
+            result = tmux.get_history("ses", "win")
+
+        assert result == "TOP LINE\nDo you trust the contents of this directory? [y/n]"
+
+    def test_get_history_preserves_interior_blank_lines(self, tmux):
+        """Only the trailing run goes. An interior blank is pane content."""
+        run, _ = self._fake_tmux(capture="a\n\nb\n\n\n")
+        with self._observing(run):
+            assert tmux.get_history("ses", "win") == "a\n\nb"
+
+    def test_get_history_splits_only_on_newline(self, tmux):
+        """`splitlines()` also breaks on \v, \f, \x85 and U+2028/U+2029, which
+        the libtmux path never did — agent output carrying one would gain line
+        breaks that no tail window expects."""
+        run, _ = self._fake_tmux(capture="a\u2028b\n")
+        with self._observing(run):
+            assert tmux.get_history("ses", "win") == "a\u2028b"
+
     def test_get_history_addresses_the_window_exactly(self, tmux):
         """``=`` on each name component forbids tmux's default prefix match,
         preserving what ``windows.get(window_name=...)`` meant: this window,
@@ -590,6 +635,10 @@ class TestGetHistory:
 
         listing = next(c for c in calls if "list-panes" in c)
         assert listing[listing.index("-t") + 1] == "=ses:=win"
+        # The format carries the window name back so the resolver can prove
+        # tmux answered for the window it named (a numeric name resolves as an
+        # index first, which "=" does not suppress).
+        assert listing[listing.index("-F") + 1] == "#{pane_id}\t#{window_name}"
 
 
 # ── list_sessions ────────────────────────────────────────────────────

@@ -54,6 +54,7 @@ from cli_agent_orchestrator.clients.database import (
     refresh_terminal_window_names,
     register_terminal_incarnation_outcome,
     register_v2_terminal_incarnation_outcome,
+    report_terminal_missing_from_every_store,
     set_terminal_native_session_id,
     update_last_active,
     update_terminal_shell_command,
@@ -679,16 +680,25 @@ _SHELL_COMMANDS = frozenset({"sh", "bash", "zsh", "dash", "fish", "csh", "tcsh",
 
 
 def _get_terminal_metadata_any(terminal_id: str) -> Optional[Dict[str, Any]]:
-    """Resolve legacy or v2 metadata; an uninstalled v2 surface is absent."""
-    metadata = get_terminal_metadata(terminal_id)
+    """Resolve legacy or v2 metadata; an uninstalled v2 surface is absent.
+
+    The v1 probe is silent: for a healthy v2-only terminal its miss is the
+    expected first-tier outcome, and warning there reported a live terminal as
+    missing on every hot call (COND-0242). The miss is worth saying only when
+    the v2 tier comes up empty too, which is what actually means "gone".
+    """
+    metadata = get_terminal_metadata(terminal_id, warn_if_missing=False)
     if metadata is not None:
         return metadata
     try:
-        return get_terminal_metadata_v2(terminal_id)
+        v2_metadata = get_terminal_metadata_v2(terminal_id)
     except OperationalError as exc:
         if "no such table" not in str(exc).lower():
             raise
-        return None
+        v2_metadata = None
+    if v2_metadata is None:
+        report_terminal_missing_from_every_store(terminal_id)
+    return v2_metadata
 
 
 def _verify_managed_pane_process(session_name: str, window_name: str) -> None:
