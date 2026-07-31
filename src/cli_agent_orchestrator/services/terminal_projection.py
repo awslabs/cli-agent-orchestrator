@@ -38,6 +38,7 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     get_terminal_metadata_v2,
     list_terminals_by_session,
+    report_terminal_missing_from_every_store,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import terminal_service
@@ -306,9 +307,16 @@ def project_session(session_name: str) -> List[Dict[str, Any]]:
 
 
 def project_terminal(terminal_id: str) -> Optional[Dict[str, Any]]:
-    """One terminal by id, from whichever store holds it."""
+    """One terminal by id, from whichever store holds it.
+
+    The v1 probe is silent: this is a two-tier resolver on a dashboard-refresh
+    hot path, so for a healthy v2-only terminal the v1 miss is the expected
+    first-tier outcome. Warning there reported live terminals as missing on
+    every card refresh (COND-0242). The miss is reported once, rate-limited,
+    only when no store holds the terminal.
+    """
     panes = _observed_panes()
-    row = get_terminal_metadata(terminal_id)
+    row = get_terminal_metadata(terminal_id, warn_if_missing=False)
     if row is not None:
         return project_row(row, panes, vintage="v1")
     try:
@@ -317,6 +325,7 @@ def project_terminal(terminal_id: str) -> Optional[Dict[str, Any]]:
         logger.debug("v2 terminal lookup unavailable for %s: %s", terminal_id, exc)
         return None
     if row is None:
+        report_terminal_missing_from_every_store(terminal_id)
         return None
     return project_row(row, panes, vintage="v2")
 

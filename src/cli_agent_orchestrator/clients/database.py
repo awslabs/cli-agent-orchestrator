@@ -2,7 +2,10 @@
 
 import logging
 import os
+import threading
+import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, cast
 
@@ -1732,15 +1735,84 @@ def v2_cleanup_record(reservation_id: str) -> Optional[str]:
         return None if row is None else row.cleanup_json
 
 
-def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
-    """Get terminal metadata by ID."""
+# COND-0242: `get_terminal_metadata` is called from hot paths (status
+# projection, output reads, inbox delivery, recovery consideration), so a
+# terminal whose row is gone produced one WARNING per call. In production
+# several such terminals at once turned that into a sustained warning storm
+# that amplified an unrelated failure into log pressure and buried the one
+# error that mattered. The first observation per terminal stays loud; only the
+# repeats are rate-limited, and a terminal that comes back clears its entry so
+# a later disappearance is reported again.
+_MISSING_TERMINAL_LOG_INTERVAL_S = 300.0
+# A hard cap, not a prune threshold. Dropping only entries already older than
+# the interval is no bound at all: more than this many distinct ids missing
+# inside one interval leaves nothing stale to drop, so the table grows without
+# limit and every later report pays an O(n) scan under the lock — on a hot
+# lookup path. Evicting the oldest insertion once full keeps the table at
+# exactly this size. Losing the oldest entry only costs one extra WARNING for
+# an id that has not been seen in a while, which is the right thing to spend.
+_MISSING_TERMINAL_LOG_CAPACITY = 512
+# Insertion-ordered, so the first key is always the oldest recorded report.
+_missing_terminal_logged_at: "OrderedDict[str, float]" = OrderedDict()
+_missing_terminal_log_lock = threading.Lock()
+
+
+def _should_report_missing_terminal(terminal_id: str) -> bool:
+    now = time.monotonic()
+    with _missing_terminal_log_lock:
+        last = _missing_terminal_logged_at.get(terminal_id)
+        if last is not None and now - last < _MISSING_TERMINAL_LOG_INTERVAL_S:
+            return False
+        # Re-report: drop the stale entry so it re-enters at the newest end
+        # and cannot be evicted ahead of ids reported longer ago.
+        _missing_terminal_logged_at.pop(terminal_id, None)
+        while len(_missing_terminal_logged_at) >= _MISSING_TERMINAL_LOG_CAPACITY:
+            _missing_terminal_logged_at.popitem(last=False)
+        _missing_terminal_logged_at[terminal_id] = now
+        return True
+
+
+def report_terminal_missing_from_every_store(terminal_id: str) -> None:
+    """Report a terminal that no store could resolve, rate-limited per terminal.
+
+    The counterpart to ``warn_if_missing=False``: a two-tier resolver silences
+    its v1 probe and calls this only once every tier has missed, so the warning
+    keeps meaning what it says.
+    """
+    if _should_report_missing_terminal(terminal_id):
+        logger.warning(
+            f"Terminal metadata not found for terminal_id: {terminal_id} "
+            f"(repeats suppressed for {_MISSING_TERMINAL_LOG_INTERVAL_S:.0f}s)"
+        )
+
+
+def get_terminal_metadata(
+    terminal_id: str, *, warn_if_missing: bool = True
+) -> Optional[Dict[str, Any]]:
+    """Get terminal metadata by ID.
+
+    ``warn_if_missing=False`` is for callers that use this as the FIRST TIER of
+    a two-tier v1-then-v2 probe. For a healthy v2-only terminal the v1 miss is
+    the expected outcome, not a fault, and the clear-on-success path below can
+    never fire for it — the v1 lookup never succeeds — so warning here produced
+    a permanent recurring false alarm about a live terminal, on the exact log
+    surface COND-0242 exists to keep readable. Such callers report the miss
+    themselves, once, only when BOTH tiers come up empty.
+    """
     import json as _json
 
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
-            logger.warning(f"Terminal metadata not found for terminal_id: {terminal_id}")
+            if warn_if_missing and _should_report_missing_terminal(terminal_id):
+                logger.warning(
+                    f"Terminal metadata not found for terminal_id: {terminal_id} "
+                    f"(repeats suppressed for {_MISSING_TERMINAL_LOG_INTERVAL_S:.0f}s)"
+                )
             return None
+        if _missing_terminal_logged_at:
+            with _missing_terminal_log_lock:
+                _missing_terminal_logged_at.pop(terminal_id, None)
         if not terminal.callback_target_generation:
             candidate = terminal.generation or str(uuid.uuid4())
             db.query(TerminalModel).filter(

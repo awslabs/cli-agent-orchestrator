@@ -36,7 +36,9 @@ class TestTerminalServiceWorkingDirectory:
 
         # Assert
         assert result == expected_dir
-        mock_get_metadata.assert_called_once_with(terminal_id)
+        # The v1 lookup here is the first tier of a v1-then-v2 probe, so it
+        # must not warn about a miss the v2 tier may well resolve (COND-0242).
+        mock_get_metadata.assert_called_once_with(terminal_id, warn_if_missing=False)
         mock_tmux_client.get_pane_working_directory.assert_called_once_with(
             "test-session", "test-window"
         )
@@ -53,7 +55,9 @@ class TestTerminalServiceWorkingDirectory:
         with pytest.raises(ValueError, match="Terminal 'nonexistent-terminal' not found"):
             get_working_directory(terminal_id)
 
-        mock_get_metadata.assert_called_once_with(terminal_id)
+        # The v1 lookup here is the first tier of a v1-then-v2 probe, so it
+        # must not warn about a miss the v2 tier may well resolve (COND-0242).
+        mock_get_metadata.assert_called_once_with(terminal_id, warn_if_missing=False)
         mock_tmux_client.get_pane_working_directory.assert_not_called()
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -73,7 +77,9 @@ class TestTerminalServiceWorkingDirectory:
 
         # Assert
         assert result is None
-        mock_get_metadata.assert_called_once_with(terminal_id)
+        # The v1 lookup here is the first tier of a v1-then-v2 probe, so it
+        # must not warn about a miss the v2 tier may well resolve (COND-0242).
+        mock_get_metadata.assert_called_once_with(terminal_id, warn_if_missing=False)
         mock_tmux_client.get_pane_working_directory.assert_called_once_with(
             "test-session", "test-window"
         )
