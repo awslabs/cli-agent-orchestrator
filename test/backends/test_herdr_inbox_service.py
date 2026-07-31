@@ -1164,6 +1164,7 @@ class TestHerdrInboxServiceLifecycleEvents:
             except ConnectionError:
                 pass
             assert await asyncio.wait_for(asyncio.to_thread(blocked.wait, 1), timeout=2)
+            await asyncio.gather(*tuple(service._delivery_tasks.values()))
             assert delivered == ["tid-live"]
             release.set()
             await asyncio.gather(*tuple(service._lifecycle_tasks))
