@@ -2311,7 +2311,9 @@ class _ProviderSession:
 
                     from cli_agent_orchestrator.services import model_turn_receipt_contract
 
-                    created_at = datetime.fromisoformat(command["message_created_at"])
+                    created_at = datetime.fromisoformat(
+                        command["message_created_at"].removesuffix("Z") + "+00:00"
+                    )
                     if created_at.utcoffset() is None:
                         created_at = created_at.replace(tzinfo=timezone.utc)
                     ack = model_turn_receipt_contract.build_receipt(
