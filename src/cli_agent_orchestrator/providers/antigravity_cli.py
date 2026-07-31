@@ -74,6 +74,13 @@ logger = logging.getLogger(__name__)
 _MCP_CONFIG_WRITE_LOCK = threading.Lock()
 
 
+def _log_cleanup_exception(fut: asyncio.Future) -> None:
+    """Done-callback for the offloaded _unregister_mcp_servers future."""
+    exc = fut.exception()
+    if exc is not None:
+        logger.error("_unregister_mcp_servers raised during cleanup: %s", exc, exc_info=exc)
+
+
 class ProviderError(Exception):
     """Exception raised for Antigravity CLI provider-specific errors."""
 
@@ -375,6 +382,12 @@ class AntigravityCliProvider(BaseProvider):
                 )
                 servers = {}
                 config["mcpServers"] = servers
+
+            # GC: prune entries left by terminals that crashed/were killed
+            # without a graceful cleanup(). We're already holding the lock and
+            # about to write — cheap to check liveness now.
+            self._prune_stale_mcp_entries(servers)
+
             for server_name, server_config in mcp_servers.items():
                 if isinstance(server_config, dict):
                     cfg = dict(server_config)
@@ -454,6 +467,26 @@ class AntigravityCliProvider(BaseProvider):
                 # Always clear our state so a malformed config can never leave
                 # stale names behind and block terminal teardown.
                 self._mcp_server_names = []
+
+    def _prune_stale_mcp_entries(self, servers: dict) -> None:
+        """Remove entries whose CAO_TERMINAL_ID no longer maps to a live terminal.
+
+        Called inside _register_mcp_servers while holding _MCP_CONFIG_WRITE_LOCK.
+        Uses the database client directly (sync, safe — we're on a worker thread).
+        """
+        from cli_agent_orchestrator.clients import database as _db
+
+        stale_keys: list[str] = []
+        for key, entry in servers.items():
+            tid = entry.get("env", {}).get("CAO_TERMINAL_ID") if isinstance(entry, dict) else None
+            if tid is None:
+                continue  # not a CAO-managed entry — leave it
+            if _db.get_terminal_metadata(tid) is None:
+                stale_keys.append(key)
+        for key in stale_keys:
+            del servers[key]
+        if stale_keys:
+            logger.info("Pruned %d stale MCP config entries: %s", len(stale_keys), stale_keys)
 
     async def _handle_startup_dialog(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
@@ -856,7 +889,9 @@ class AntigravityCliProvider(BaseProvider):
             loop = None
         if loop and loop.is_running():
             # On the event-loop thread — offload blocking I/O + lock to a worker.
-            loop.run_in_executor(None, self._unregister_mcp_servers)
+            # Retain the future so exceptions are surfaced (not silently swallowed).
+            fut = loop.run_in_executor(None, self._unregister_mcp_servers)
+            fut.add_done_callback(_log_cleanup_exception)
         else:
             # Already on a worker thread (e.g. api delete_terminal path) — safe
             # to run inline.

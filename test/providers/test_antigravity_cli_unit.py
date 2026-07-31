@@ -16,13 +16,21 @@ from cli_agent_orchestrator.providers.antigravity_cli import (
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
+# Save before autouse replaces it with a MagicMock
+_real_prune_stale_mcp_entries = AntigravityCliProvider._prune_stale_mcp_entries
+
 
 @pytest.fixture(autouse=True)
 def _skip_startup_dialog():
     # initialize() polls the pane to accept agy's workspace-trust dialog; that
     # path is exercised separately. Stub it so the init tests stay fast and
     # independent of the (mocked) get_history return type.
-    with patch.object(AntigravityCliProvider, "_handle_startup_dialog", return_value=None):
+    # Also stub GC pruning — exercised in its own dedicated test; other tests
+    # use fake terminal IDs that don't exist in the DB and would be pruned.
+    with (
+        patch.object(AntigravityCliProvider, "_handle_startup_dialog", return_value=None),
+        patch.object(AntigravityCliProvider, "_prune_stale_mcp_entries"),
+    ):
         yield
 
 
@@ -845,3 +853,114 @@ async def test_initialize_raises_when_agy_times_out(monkeypatch):
     )
     with pytest.raises(TimeoutError, match="initialization timed out"):
         await make_provider().initialize()
+
+
+# --------------------------------------------------------------------------- #
+# GC: prune stale MCP config entries (finding 2)
+# --------------------------------------------------------------------------- #
+
+
+def test_prune_stale_mcp_entries_on_register(tmp_path):
+    """_register_mcp_servers prunes entries whose terminal is no longer live,
+    preserves entries for live terminals and non-CAO entries, and adds the
+    new terminal's entry."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    # Entry for a dead terminal — should be pruned
+                    "cao-mcp-server-dead-tid": {
+                        "command": "cao-mcp-server",
+                        "args": [],
+                        "env": {"CAO_TERMINAL_ID": "dead-tid"},
+                    },
+                    # Entry for a live terminal — should survive
+                    "cao-mcp-server-live-tid": {
+                        "command": "cao-mcp-server",
+                        "args": [],
+                        "env": {"CAO_TERMINAL_ID": "live-tid"},
+                    },
+                    # Non-CAO entry (no CAO_TERMINAL_ID) — should survive
+                    "user-custom-server": {
+                        "command": "my-server",
+                        "args": [],
+                    },
+                }
+            }
+        )
+    )
+    profile = AgentProfile(
+        name="dev_gemini",
+        description="Dev",
+        system_prompt="You develop.",
+        mcpServers={"cao-mcp-server": {"command": "uvx", "args": ["cao-mcp-server"]}},
+    )
+    p = make_provider(terminal_id="new-tid", agent_profile="dev_gemini")
+
+    def fake_get_terminal_metadata(tid):
+        # live-tid exists, dead-tid does not, new-tid is "us" (would also
+        # return truthy from a real DB since we're registering it).
+        return {"id": tid} if tid in ("live-tid", "new-tid") else None
+
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+        # Override the autouse no-op to let the real prune logic run
+        patch.object(
+            AntigravityCliProvider,
+            "_prune_stale_mcp_entries",
+            _real_prune_stale_mcp_entries,
+        ),
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            side_effect=fake_get_terminal_metadata,
+        ),
+    ):
+        p._build_agy_command()
+
+    data = json.loads(cfg.read_text())
+    servers = data["mcpServers"]
+    # Dead entry pruned
+    assert "cao-mcp-server-dead-tid" not in servers
+    # Live entry preserved
+    assert "cao-mcp-server-live-tid" in servers
+    # Non-CAO entry preserved
+    assert "user-custom-server" in servers
+    # New entry added
+    assert "cao-mcp-server-new-tid" in servers
+    assert servers["cao-mcp-server-new-tid"]["env"]["CAO_TERMINAL_ID"] == "new-tid"
+
+
+# --------------------------------------------------------------------------- #
+# Cleanup future exception surfacing (finding 3)
+# --------------------------------------------------------------------------- #
+
+
+def test_cleanup_logs_unregister_exception(caplog):
+    """When _unregister_mcp_servers raises on a worker thread, the exception
+    is logged (not silently swallowed)."""
+    import asyncio
+
+    from cli_agent_orchestrator.providers.antigravity_cli import _log_cleanup_exception
+
+    # Simulate a future that completed with an exception
+    loop = asyncio.new_event_loop()
+    fut = loop.create_future()
+    fut.set_exception(OSError("disk full"))
+
+    with caplog.at_level("ERROR", logger="cli_agent_orchestrator.providers.antigravity_cli"):
+        _log_cleanup_exception(fut)
+
+    assert "disk full" in caplog.text
+    assert "_unregister_mcp_servers" in caplog.text
+    loop.close()
