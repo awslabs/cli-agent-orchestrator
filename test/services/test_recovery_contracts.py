@@ -9,6 +9,7 @@ import pytest
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services import provider_contracts as pc
+from cli_agent_orchestrator.services import recovery_capabilities
 from cli_agent_orchestrator.services.containment import (
     ArtifactAuthorization,
     ContainmentComposition,
@@ -437,3 +438,23 @@ def test_callback_capability_is_the_proven_outer_authority_intersection(monkeypa
     assert payload["enabled_providers"] == ["codex"]
     assert payload["callback_recovery"]["providers"] == ["codex"]
     assert payload["callback_recovery"]["enabled"] is True
+
+
+def test_callback_capability_and_admission_stay_disabled_when_migration_is_unready(monkeypatch):
+    monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "yes")
+    monkeypatch.setattr(database, "callback_recovery_migration_ready", lambda: False)
+    composition = ContainmentComposition(
+        authorization=_authorization(),
+        live_proof_receipt=_receipt(),
+        deployment_generation=3,
+    )
+    payload = build_capabilities(
+        containment=composition,
+        provider_versions={"codex": "codex 0.146.0"},
+        route_proofs={"codex": _valid_route_proof("codex")},
+    )
+
+    assert payload["callback_recovery"]["providers"] == ["codex"]
+    assert payload["callback_recovery"]["enabled"] is False
+    monkeypatch.setattr(recovery_capabilities, "build_capabilities", lambda: payload)
+    assert recovery_capabilities.callback_recovery_admission_allowed("codex") is False

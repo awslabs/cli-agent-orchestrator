@@ -717,8 +717,8 @@ def init_db() -> None:
     )
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
-    _migrate_callback_recovery_inbox_schema()
-    _migrate_callback_recovery_schema()
+    inbox_schema_ready = _migrate_callback_recovery_inbox_schema()
+    _migrate_callback_recovery_schema(inbox_schema_ready=inbox_schema_ready)
     _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
@@ -1408,26 +1408,70 @@ def _migrate_terminals_schema() -> None:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 
 
-def _migrate_callback_recovery_inbox_schema() -> None:
+_CALLBACK_RECOVERY_INBOX_COLUMNS = (
+    ("message_sha256", "TEXT"),
+    ("sender_generation", "TEXT"),
+    ("expected_receiver_generation", "TEXT"),
+    ("expected_provider_session_id", "TEXT"),
+    ("expected_execution_mode", "TEXT"),
+    ("expected_provider", "TEXT"),
+    ("callback_recovery_key", "TEXT"),
+    ("callback_completion_key", "TEXT"),
+)
+_CALLBACK_RECOVERY_INBOX_INDEXES = {
+    "ix_inbox_callback_recovery_key": "callback_recovery_key",
+    "ix_inbox_callback_completion_key": "callback_completion_key",
+}
+
+
+def _callback_recovery_inbox_schema_verified(conn: Any) -> bool:
+    """Whether the legacy inbox has every exact callback-recovery fence."""
+    present = {row[1] for row in conn.execute("PRAGMA table_info(inbox)")}
+    if not {name for name, _ in _CALLBACK_RECOVERY_INBOX_COLUMNS} <= present:
+        return False
+    indexes = {row[1]: row for row in conn.execute("PRAGMA index_list(inbox)")}
+    for index_name, column in _CALLBACK_RECOVERY_INBOX_INDEXES.items():
+        index = indexes.get(index_name)
+        if index is None or not index[2] or not index[4]:
+            return False
+        columns = [row[2] for row in conn.execute(f"PRAGMA index_info({index_name})")]
+        if columns != [column]:
+            return False
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (index_name,)
+        ).fetchone()
+        expected = (
+            f"create unique index {index_name} on inbox({column}) " f"where {column} is not null"
+        )
+        if row is None or row[0] is None or " ".join(row[0].lower().split()) != expected:
+            return False
+    return True
+
+
+def _callback_recovery_inbox_schema_ready() -> bool:
+    """Read the verified inbox side of the callback-recovery migration unit."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            return _callback_recovery_inbox_schema_verified(conn)
+    except Exception as exc:  # noqa: BLE001 - readiness must fail closed
+        logger.warning("callback-recovery inbox verification failed: %s", exc)
+        return False
+
+
+def _migrate_callback_recovery_inbox_schema() -> bool:
     """Add dedicated callback-recovery bindings to an existing inbox table."""
     import sqlite3
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
-    columns = (
-        ("message_sha256", "TEXT"),
-        ("sender_generation", "TEXT"),
-        ("expected_receiver_generation", "TEXT"),
-        ("expected_provider_session_id", "TEXT"),
-        ("expected_execution_mode", "TEXT"),
-        ("expected_provider", "TEXT"),
-        ("callback_recovery_key", "TEXT"),
-        ("callback_completion_key", "TEXT"),
-    )
     try:
         with sqlite3.connect(str(DATABASE_FILE)) as conn:
             present = {row[1] for row in conn.execute("PRAGMA table_info(inbox)")}
-            for name, ddl in columns:
+            for name, ddl in _CALLBACK_RECOVERY_INBOX_COLUMNS:
                 if name not in present:
                     conn.execute(f"ALTER TABLE inbox ADD COLUMN {name} {ddl}")
             conn.execute(
@@ -1438,8 +1482,12 @@ def _migrate_callback_recovery_inbox_schema() -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_inbox_callback_completion_key "
                 "ON inbox(callback_completion_key) WHERE callback_completion_key IS NOT NULL"
             )
+            if _callback_recovery_inbox_schema_verified(conn):
+                return True
+            logger.warning("callback-recovery inbox migration left required fences unavailable")
     except Exception as exc:  # noqa: BLE001 - callback recovery fails closed
         logger.warning("callback-recovery inbox migration failed: %s", exc)
+    return False
 
 
 def _backup_callback_recovery_rows_before_migration() -> None:
@@ -1487,7 +1535,7 @@ def _backup_callback_recovery_rows_before_migration() -> None:
         )
 
 
-def _migrate_callback_recovery_schema() -> None:
+def _migrate_callback_recovery_schema(*, inbox_schema_ready: Optional[bool] = None) -> None:
     """Create the dedicated refusal/callback recovery operation store."""
     # Fresh and existing databases are both handled by SQLAlchemy create_all.
     # This function intentionally remains as a named migration boundary so an
@@ -1495,6 +1543,10 @@ def _migrate_callback_recovery_schema() -> None:
     # closed instead of silently falling back to ordinary inbox delivery.
     global _callback_recovery_migration_ready
     _callback_recovery_migration_ready = False
+    if inbox_schema_ready is None:
+        inbox_schema_ready = _callback_recovery_inbox_schema_ready()
+    if not inbox_schema_ready:
+        logger.warning("callback recovery migration is not ready: inbox fences are unavailable")
     try:
         CallbackRecoveryModel.__table__.create(bind=engine, checkfirst=True)
         import sqlite3
@@ -1642,7 +1694,12 @@ def _migrate_callback_recovery_schema() -> None:
                         row["operation_key"],
                     ),
                 )
-        _callback_recovery_migration_ready = True
+        if inbox_schema_ready and _callback_recovery_inbox_schema_ready():
+            _callback_recovery_migration_ready = True
+        else:
+            logger.warning(
+                "callback recovery migration remains unavailable: inbox fences are absent"
+            )
     except Exception as exc:  # noqa: BLE001 - operation reads fail closed
         logger.warning("callback recovery migration failed: %s", exc)
 
