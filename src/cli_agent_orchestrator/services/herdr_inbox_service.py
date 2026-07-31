@@ -85,6 +85,12 @@ class HerdrInboxService:
         self._backoff = _BACKOFF_BASE
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._lifecycle_tasks: Set[asyncio.Task] = set()
+        # Delivery callbacks may block on native inbox I/O. Keep their work out
+        # of the socket loop, but retain one loop-owned task and one latest
+        # trailing pane snapshot per terminal to preserve delivery ordering.
+        self._delivery_tasks: Dict[str, asyncio.Task] = {}
+        self._delivery_reruns: Dict[str, str] = {}
+        self._delivery_shutdown = False
 
     @staticmethod
     def _default_socket_path(session_name: str = "cao") -> str:
@@ -201,6 +207,7 @@ class HerdrInboxService:
             await self._socket_loop()
         finally:
             kiro_task.cancel()
+            await self._shutdown_delivery_tasks()
             if self._lifecycle_tasks:
                 await asyncio.gather(*tuple(self._lifecycle_tasks), return_exceptions=True)
 
@@ -664,7 +671,7 @@ class HerdrInboxService:
                 with self._ownership_lock:
                     self._working_since.pop(terminal_id, None)
                 # Trigger delivery
-                self._deliver(terminal_id)
+                self._schedule_delivery(terminal_id)
 
             elif status == "working":
                 # Track working start for kiro supplement check
@@ -674,6 +681,83 @@ class HerdrInboxService:
                         and terminal_id not in self._working_since
                     ):
                         self._working_since[terminal_id] = time.time()
+
+    def _schedule_delivery(self, terminal_id: str, expected_pane_id: str | None = None) -> None:
+        """Schedule one off-loop delivery and coalesce one trailing trigger.
+
+        This method runs on the service event loop. It snapshots the current
+        terminal/pane ownership before scheduling and never lets the worker
+        touch loop-owned ownership maps.
+        """
+        if self._delivery_shutdown:
+            return
+
+        with self._ownership_lock:
+            pane_id = self._terminal_to_pane.get(terminal_id)
+            if (
+                pane_id is None
+                or (expected_pane_id is not None and pane_id != expected_pane_id)
+                or self._pane_to_terminal.get(pane_id) != terminal_id
+            ):
+                return
+
+        task = self._delivery_tasks.get(terminal_id)
+        if task is not None:
+            # A single value means duplicate triggers coalesce into at most one
+            # trailing rerun, retaining the newest ownership snapshot. Keep a
+            # just-finished task here until its loop-side completion callback
+            # has observed it and cleared the map.
+            self._delivery_reruns[terminal_id] = pane_id
+            return
+
+        task = asyncio.create_task(
+            self._deliver_off_loop(terminal_id),
+            name=f"herdr-delivery-{terminal_id}",
+        )
+        self._delivery_tasks[terminal_id] = task
+
+        def completed(done: asyncio.Task) -> None:
+            self._delivery_completed(terminal_id, done)
+
+        task.add_done_callback(completed)
+
+    async def _deliver_off_loop(self, terminal_id: str) -> None:
+        """Run the synchronous delivery callback without blocking socket reads."""
+        await asyncio.to_thread(self._deliver, terminal_id)
+
+    def _delivery_completed(self, terminal_id: str, done: asyncio.Task) -> None:
+        """Observe delivery completion and safely schedule one valid rerun."""
+        if self._delivery_tasks.get(terminal_id) is not done:
+            return
+        self._delivery_tasks.pop(terminal_id, None)
+
+        if done.cancelled():
+            logger.warning("Delivery for terminal %s was cancelled", terminal_id)
+        else:
+            error = done.exception()
+            if error is not None:
+                logger.error(
+                    "Delivery task failed for terminal %s",
+                    terminal_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        expected_pane_id = self._delivery_reruns.pop(terminal_id, None)
+        if expected_pane_id is not None and not self._delivery_shutdown:
+            # Compare the loop-side snapshot before starting the trailing run.
+            # A reused pane or replaced terminal is preserved, never redirected.
+            self._schedule_delivery(terminal_id, expected_pane_id)
+
+    async def _shutdown_delivery_tasks(self) -> None:
+        """Cancel and observe every tracked delivery task before shutdown."""
+        self._delivery_shutdown = True
+        self._delivery_reruns.clear()
+        tasks = tuple(self._delivery_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._delivery_tasks.clear()
 
     def _schedule_lifecycle_retirement(self, event_type: str, data: dict) -> None:
         """Track one off-loop retirement whose map commit returns to this loop."""
@@ -1106,7 +1190,7 @@ class HerdrInboxService:
                     f"Kiro permission prompt detected for {terminal_id} "
                     f"(working for {working_duration:.0f}s)"
                 )
-                self._deliver(terminal_id)
+                self._schedule_delivery(terminal_id)
                 # Reset the timer so we don't spam
                 with self._ownership_lock:
                     if self._working_since.get(terminal_id) == working_since:

@@ -1170,6 +1170,139 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         _run_async(run())
 
+    def test_delivery_is_off_loop_coalesced_and_preserves_replacement_owner(self):
+        """A30: blocked delivery cannot stall socket events or erase a replacement."""
+        first_delivery_started = threading.Event()
+        second_delivery_started = threading.Event()
+        release_first = threading.Event()
+        release_second = threading.Event()
+        lifecycle_seen = threading.Event()
+        first_delivery_at = []
+        lifecycle_at = []
+        deliveries = []
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid-old", "pane-reused")
+
+        def blocking_delivery(terminal_id):
+            deliveries.append(terminal_id)
+            if len(deliveries) == 1:
+                first_delivery_at.append(time.monotonic())
+                first_delivery_started.set()
+                assert release_first.wait(timeout=3)
+            elif len(deliveries) == 2:
+                second_delivery_started.set()
+                assert release_second.wait(timeout=3)
+            else:
+                raise AssertionError("delivery triggers must coalesce to one trailing rerun")
+
+        async def observe_lifecycle(event_type, data):
+            assert event_type == "workspace.closed"
+            assert data == {"workspace_id": "ws-later"}
+            lifecycle_at.append(time.monotonic())
+            lifecycle_seen.set()
+
+        service._delivery_callback = blocking_delivery
+        service._handle_lifecycle_event_async = observe_lifecycle
+        status = (
+            json.dumps(
+                {
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": "pane-reused", "agent_status": "idle"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        lifecycle = (
+            json.dumps({"event": "workspace_closed", "data": {"workspace_id": "ws-later"}}).encode()
+            + b"\n"
+        )
+
+        async def run():
+            reader = asyncio.StreamReader()
+            service._reader = reader
+            reader.feed_data(status + lifecycle + status + status)
+            reader.feed_eof()
+            timed_release = threading.Timer(0.25, release_first.set)
+            timed_second_release = threading.Timer(0.3, release_second.set)
+            timed_release.start()
+            timed_second_release.start()
+            try:
+                with contextlib.suppress(ConnectionError):
+                    await service._event_loop()
+                assert await asyncio.wait_for(asyncio.to_thread(first_delivery_started.wait, 1), 2)
+                await asyncio.sleep(0)
+                # The later lifecycle event must pass through the real socket seam
+                # while the first delivery callback remains blocked in a worker.
+                assert lifecycle_seen.is_set()
+                assert lifecycle_at[0] - first_delivery_at[0] < 0.15
+                assert set(service._delivery_tasks) == {"tid-old"}
+                assert service._delivery_reruns == {"tid-old": "pane-reused"}
+
+                release_first.set()
+                assert await asyncio.wait_for(
+                    asyncio.to_thread(second_delivery_started.wait, 1), timeout=2
+                )
+                service.register_terminal("tid-replacement", "pane-reused")
+                release_second.set()
+            finally:
+                timed_release.cancel()
+                timed_second_release.cancel()
+                release_first.set()
+                release_second.set()
+                await asyncio.gather(*tuple(getattr(service, "_delivery_tasks", {}).values()))
+                await asyncio.gather(*tuple(service._lifecycle_tasks))
+
+        _run_async(run())
+        assert deliveries == ["tid-old", "tid-old"]
+        assert service._pane_to_terminal == {"pane-reused": "tid-replacement"}
+        assert service._terminal_to_pane == {"tid-replacement": "pane-reused"}
+
+    def test_delivery_task_exception_is_observed(self, caplog):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid-failing", "pane-failing")
+
+        async def fail_delivery(_terminal_id):
+            raise RuntimeError("delivery task boom")
+
+        service._deliver_off_loop = fail_delivery
+
+        async def run():
+            service._schedule_delivery("tid-failing")
+            await asyncio.gather(
+                service._delivery_tasks["tid-failing"],
+                return_exceptions=True,
+            )
+            await asyncio.sleep(0)
+
+        _run_async(run())
+        assert service._delivery_tasks == {}
+        assert "Delivery task failed for terminal tid-failing" in caplog.messages
+
+    def test_shutdown_cancels_and_drains_tracked_delivery_tasks(self):
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid-shutdown", "pane-shutdown")
+        delivery_started = asyncio.Event()
+        never_release = asyncio.Event()
+
+        async def blocked_delivery(_terminal_id):
+            delivery_started.set()
+            await never_release.wait()
+
+        service._deliver_off_loop = blocked_delivery
+
+        async def run():
+            service._schedule_delivery("tid-shutdown")
+            task = service._delivery_tasks["tid-shutdown"]
+            await delivery_started.wait()
+            service._schedule_delivery("tid-shutdown")
+            assert service._delivery_reruns == {"tid-shutdown": "pane-shutdown"}
+            await service._shutdown_delivery_tasks()
+            assert task.cancelled()
+
+        _run_async(run())
+        assert service._delivery_tasks == {}
+        assert service._delivery_reruns == {}
+
     def test_pane_retirement_does_not_block_socket_status_delivery(self):
         blocked = threading.Event()
         release = threading.Event()
