@@ -2,6 +2,8 @@
 
 import logging
 import os
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, cast
@@ -1561,6 +1563,36 @@ def v2_cleanup_record(reservation_id: str) -> Optional[str]:
         return None if row is None else row.cleanup_json
 
 
+# COND-0242: `get_terminal_metadata` is called from hot paths (status
+# projection, output reads, inbox delivery, recovery consideration), so a
+# terminal whose row is gone produced one WARNING per call. In production
+# several such terminals at once turned that into a sustained warning storm
+# that amplified an unrelated failure into log pressure and buried the one
+# error that mattered. The first observation per terminal stays loud; only the
+# repeats are rate-limited, and a terminal that comes back clears its entry so
+# a later disappearance is reported again.
+_MISSING_TERMINAL_LOG_INTERVAL_S = 300.0
+_missing_terminal_logged_at: Dict[str, float] = {}
+_missing_terminal_log_lock = threading.Lock()
+
+
+def _should_report_missing_terminal(terminal_id: str) -> bool:
+    now = time.monotonic()
+    with _missing_terminal_log_lock:
+        last = _missing_terminal_logged_at.get(terminal_id)
+        if last is not None and now - last < _MISSING_TERMINAL_LOG_INTERVAL_S:
+            return False
+        # Bound the table: entries older than the interval can never suppress
+        # anything again, so a long-lived process cannot accumulate one per
+        # terminal id it has ever been asked about.
+        if len(_missing_terminal_logged_at) > 512:
+            for stale_id, stamp in list(_missing_terminal_logged_at.items()):
+                if now - stamp >= _MISSING_TERMINAL_LOG_INTERVAL_S:
+                    _missing_terminal_logged_at.pop(stale_id, None)
+        _missing_terminal_logged_at[terminal_id] = now
+        return True
+
+
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
     """Get terminal metadata by ID."""
     import json as _json
@@ -1568,8 +1600,15 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
-            logger.warning(f"Terminal metadata not found for terminal_id: {terminal_id}")
+            if _should_report_missing_terminal(terminal_id):
+                logger.warning(
+                    f"Terminal metadata not found for terminal_id: {terminal_id} "
+                    f"(repeats suppressed for {_MISSING_TERMINAL_LOG_INTERVAL_S:.0f}s)"
+                )
             return None
+        if _missing_terminal_logged_at:
+            with _missing_terminal_log_lock:
+                _missing_terminal_logged_at.pop(terminal_id, None)
         logger.debug(
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
         )

@@ -797,6 +797,77 @@ class TmuxClient:
             logger.error(f"Failed to send special key to {session_name}:{window_name}: {e}")
             raise
 
+    def _run_bounded_observation(
+        self, argv: List[str], *, session_name: str, window_name: str
+    ) -> str:
+        """Run one read-only tmux observation under a hard per-call bound.
+
+        Every failure mode leaves as an exception, never as a value.  An
+        observation that could not be made must not be indistinguishable from
+        an observation of an empty pane: the FIFO liveness watchdog treats
+        returned content as ground truth about whether a pane advanced, so a
+        swallowed timeout would let it fabricate a stall (or mask a real one)
+        out of a read that never happened (COND-0242).
+        """
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=TMUX_CALL_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except _SUBPROCESS_TIMEOUT as exc:
+            raise TimeoutError(
+                f"tmux observation of {session_name}:{window_name} exceeded "
+                f"{TMUX_CALL_TIMEOUT_SECONDS}s"
+            ) from exc
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            lowered = stderr.lower()
+            if "can't find session" in lowered:
+                raise ValueError(f"Session '{session_name}' not found")
+            if "can't find window" in lowered:
+                raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+            if "can't find pane" in lowered:
+                raise ValueError(f"Pane not found in {session_name}:{window_name}")
+            raise RuntimeError(f"tmux observation failed: {stderr or '(no stderr)'}")
+        return proc.stdout or ""
+
+    def _resolve_observation_pane(self, session_name: str, window_name: str) -> str:
+        """The pane a history read observes, resolved one window at a time.
+
+        ``=`` makes each name component an exact match, so this addresses the
+        same window ``session.windows.get(window_name=...)`` did rather than
+        tmux's default prefix match, and the first listed pane is the same
+        ``window.panes[0]`` the previous implementation captured.
+
+        A row that does not parse is dropped rather than repaired — the same
+        rule the control-path identity parser follows.  Partial identity is
+        worse than absent identity, and unlike libtmux's server-wide
+        ``fetch_objs`` this never lets one malformed row anywhere on the
+        server fail an unrelated window's observation.
+        """
+        stdout = self._run_bounded_observation(
+            [
+                tmux_binary(),
+                "list-panes",
+                "-t",
+                f"={session_name}:={window_name}",
+                "-F",
+                "#{pane_id}",
+            ],
+            session_name=session_name,
+            window_name=window_name,
+        )
+        for line in stdout.splitlines():
+            candidate = line.strip()
+            if is_valid_pane_id(candidate):
+                return candidate
+        raise ValueError(
+            f"Window '{window_name}' in session '{session_name}' reported no usable pane"
+        )
+
     def get_history(
         self,
         session_name: str,
@@ -807,6 +878,24 @@ class TmuxClient:
     ) -> str:
         """Get window history.
 
+        Observation is deliberately narrow: one single-window ``list-panes``
+        to name the pane, then ``capture-pane`` against that exact pane id.
+
+        The previous implementation reached the same pane through libtmux's
+        ``server.sessions`` and ``session.windows``, which issue a SERVER-WIDE
+        ``list-sessions`` and then a whole-session ``list-windows``, each
+        rendered with a 136-field format that libtmux parses with a strict
+        field-count ``zip``.  In production that made every history read — and
+        every FIFO liveness probe, which runs one per enrolled terminal every
+        few seconds — both fail on any single malformed row anywhere on the
+        server (``ValueError: zip() argument 2 is shorter than argument 1``)
+        and contend for the shared tmux server against ordinary API work, up
+        to sustained control-plane unavailability (COND-0242).  Reading one
+        pane never needed to observe the whole server.
+
+        This is an observation path only.  Write and control paths keep their
+        existing identity guarantees untouched.
+
         Args:
             session_name: Name of tmux session
             window_name: Name of window in session
@@ -815,16 +904,7 @@ class TmuxClient:
             full_history: If True, capture entire scrollback buffer (overrides tail_lines)
         """
         try:
-            session = self.server.sessions.get(session_name=session_name)
-            if not session:
-                raise ValueError(f"Session '{session_name}' not found")
-
-            window = session.windows.get(window_name=window_name)
-            if not window:
-                raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
-
-            # Use cmd to run capture-pane with -e (escape sequences) and -p (print) flags
-            pane = window.panes[0]
+            pane_target = self._resolve_observation_pane(session_name, window_name)
             if full_history:
                 # "-S -" captures from the start of the scrollback buffer
                 flags = ["-p", "-S", "-"]
@@ -833,9 +913,14 @@ class TmuxClient:
                 flags = ["-p", "-S", f"-{lines}"]
             if not strip_escapes:
                 flags = ["-e"] + flags
-            result = pane.cmd("capture-pane", *flags)
-            # Join all lines with newlines to get complete output
-            return "\n".join(result.stdout) if result.stdout else ""
+            stdout = self._run_bounded_observation(
+                [tmux_binary(), "capture-pane", *flags, "-t", pane_target],
+                session_name=session_name,
+                window_name=window_name,
+            )
+            # Same shape the libtmux path returned: capture-pane's own
+            # trailing newline is not a final empty line of pane content.
+            return "\n".join(stdout.splitlines())
         except Exception as e:
             logger.error(f"Failed to get history from {session_name}:{window_name}: {e}")
             raise

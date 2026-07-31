@@ -239,6 +239,30 @@ PIPE_LIVENESS_COLD_START_GRACE_S = _env_float("CAO_PIPE_LIVENESS_COLD_START_GRAC
 # After this many attempts, give up loudly and drop the terminal from the
 # watchdog, exactly like the rearm()-exception path already does.
 PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS = _env_int("CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS", 5)
+# COND-0242. The two constants above bound what happens once a pane HAS been
+# observed; these bound the observation itself failing. In production an
+# intermittent malformed tmux listing made every probe raise, and the watchdog
+# re-issued the identical observation on the very next tick, per enrolled
+# terminal, each time logging a full traceback — a retry storm and a log storm
+# on top of whatever caused the first failure.
+#
+# Backoff is exponential from this base and capped, so a persistent failure
+# settles to one cheap attempt per cap interval instead of one per tick. The
+# terminal is deliberately NOT dropped: the observed failure was intermittent,
+# and silently un-enrolling a live terminal from the liveness watchdog would
+# trade a noisy bounded failure for an invisible unbounded one.
+PIPE_LIVENESS_PROBE_BACKOFF_BASE_S = _env_positive_float(
+    "CAO_PIPE_LIVENESS_PROBE_BACKOFF_BASE_S", 5.0
+)
+PIPE_LIVENESS_PROBE_BACKOFF_MAX_S = _env_positive_float(
+    "CAO_PIPE_LIVENESS_PROBE_BACKOFF_MAX_S", 120.0
+)
+# Consecutive identical observation failures are logged at most this often per
+# terminal. The first failure and the recovery are always logged, so nothing
+# becomes invisible — only the repeats stop being re-narrated.
+PIPE_LIVENESS_PROBE_ERROR_LOG_INTERVAL_S = _env_positive_float(
+    "CAO_PIPE_LIVENESS_PROBE_ERROR_LOG_INTERVAL_S", 300.0
+)
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against

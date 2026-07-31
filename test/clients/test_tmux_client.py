@@ -1,5 +1,6 @@
 """Tests for TmuxClient methods (mocked libtmux — no real tmux required)."""
 
+import contextlib
 import io
 import os
 import subprocess
@@ -489,81 +490,106 @@ class TestSendSpecialKey:
 
 
 class TestGetHistory:
-    def test_get_history_success(self, tmux):
-        mock_pane = MagicMock()
-        mock_result = MagicMock()
-        mock_result.stdout = ["line1", "line2", "line3"]
-        mock_pane.cmd.return_value = mock_result
-        mock_window = MagicMock()
-        mock_window.panes = [mock_pane]
-        mock_session = MagicMock()
-        mock_session.windows.get.return_value = mock_window
-        tmux.server.sessions.get.return_value = mock_session
+    """History/liveness observation is narrow and bounded (COND-0242).
 
-        result = tmux.get_history("ses", "win")
+    It resolves one window's panes and captures that exact pane id. It must
+    never reach libtmux's ``server.sessions`` / ``session.windows``, whose
+    server-wide 136-field listings made one malformed row anywhere on the
+    server fail an unrelated window's read and put every read in contention
+    with ordinary API work.
+    """
+
+    TMUX = "/usr/bin/tmux"
+
+    @staticmethod
+    def _fake_tmux(*, panes="%0\n", capture=""):
+        """Record the argv of every tmux observation and answer it."""
+        calls: list = []
+
+        def run(cmd, *args, **kwargs):
+            argv = list(cmd)
+            calls.append(argv)
+            stdout = panes if "list-panes" in argv else capture
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+        return run, calls
+
+    @classmethod
+    @contextlib.contextmanager
+    def _observing(cls, run):
+        """Every observation answered by ``run``, against a pinned tmux path so
+        the test never depends on tmux being installed."""
+        with (
+            patch("cli_agent_orchestrator.clients.tmux.subprocess.run", run),
+            patch("cli_agent_orchestrator.clients.tmux.tmux_binary", return_value=cls.TMUX),
+        ):
+            yield
+
+    def test_get_history_success(self, tmux):
+        run, calls = self._fake_tmux(capture="line1\nline2\nline3\n")
+        with self._observing(run):
+            result = tmux.get_history("ses", "win")
 
         assert result == "line1\nline2\nline3"
+        tmux.server.sessions.get.assert_not_called()
+        assert [c for c in calls if "list-panes" in c], "the pane is resolved one window at a time"
+        assert not any(
+            "list-sessions" in c or "-a" in c for c in calls
+        ), "no server-wide observation may be issued to read one pane"
 
     def test_get_history_empty_output(self, tmux):
-        mock_pane = MagicMock()
-        mock_result = MagicMock()
-        mock_result.stdout = []
-        mock_pane.cmd.return_value = mock_result
-        mock_window = MagicMock()
-        mock_window.panes = [mock_pane]
-        mock_session = MagicMock()
-        mock_session.windows.get.return_value = mock_window
-        tmux.server.sessions.get.return_value = mock_session
-
-        result = tmux.get_history("ses", "win")
-
-        assert result == ""
+        run, _ = self._fake_tmux(capture="")
+        with self._observing(run):
+            assert tmux.get_history("ses", "win") == ""
 
     def test_get_history_session_not_found(self, tmux):
-        tmux.server.sessions.get.return_value = None
+        def run(cmd, *args, **kwargs):
+            return subprocess.CompletedProcess(
+                list(cmd), 1, stdout="", stderr="can't find session: nonexistent\n"
+            )
 
-        with pytest.raises(ValueError, match="not found"):
-            tmux.get_history("nonexistent", "win")
+        with self._observing(run):
+            with pytest.raises(ValueError, match="not found"):
+                tmux.get_history("nonexistent", "win")
 
     def test_get_history_window_not_found(self, tmux):
-        mock_session = MagicMock()
-        mock_session.windows.get.return_value = None
-        tmux.server.sessions.get.return_value = mock_session
+        def run(cmd, *args, **kwargs):
+            return subprocess.CompletedProcess(
+                list(cmd), 1, stdout="", stderr="can't find window: nonexistent\n"
+            )
 
-        with pytest.raises(ValueError, match="not found"):
-            tmux.get_history("ses", "nonexistent")
+        with self._observing(run):
+            with pytest.raises(ValueError, match="not found"):
+                tmux.get_history("ses", "nonexistent")
 
     def test_get_history_custom_tail_lines(self, tmux):
-        mock_pane = MagicMock()
-        mock_result = MagicMock()
-        mock_result.stdout = ["line"]
-        mock_pane.cmd.return_value = mock_result
-        mock_window = MagicMock()
-        mock_window.panes = [mock_pane]
-        mock_session = MagicMock()
-        mock_session.windows.get.return_value = mock_window
-        tmux.server.sessions.get.return_value = mock_session
+        run, calls = self._fake_tmux(capture="line\n")
+        with self._observing(run):
+            tmux.get_history("ses", "win", tail_lines=50)
 
-        tmux.get_history("ses", "win", tail_lines=50)
-
-        mock_pane.cmd.assert_called_once_with("capture-pane", "-e", "-p", "-S", "-50")
+        capture = next(c for c in calls if "capture-pane" in c)
+        assert capture[1:] == ["capture-pane", "-e", "-p", "-S", "-50", "-t", "%0"]
 
     def test_get_history_full_history(self, tmux):
-        mock_pane = MagicMock()
-        mock_result = MagicMock()
-        mock_result.stdout = ["line1", "line2"]
-        mock_pane.cmd.return_value = mock_result
-        mock_window = MagicMock()
-        mock_window.panes = [mock_pane]
-        mock_session = MagicMock()
-        mock_session.windows.get.return_value = mock_window
-        tmux.server.sessions.get.return_value = mock_session
-
-        result = tmux.get_history("ses", "win", strip_escapes=True, full_history=True)
+        run, calls = self._fake_tmux(capture="line1\nline2\n")
+        with self._observing(run):
+            result = tmux.get_history("ses", "win", strip_escapes=True, full_history=True)
 
         assert result == "line1\nline2"
+        capture = next(c for c in calls if "capture-pane" in c)
         # full_history uses "-S" "-" (no line count), strip_escapes omits "-e"
-        mock_pane.cmd.assert_called_once_with("capture-pane", "-p", "-S", "-")
+        assert capture[1:] == ["capture-pane", "-p", "-S", "-", "-t", "%0"]
+
+    def test_get_history_addresses_the_window_exactly(self, tmux):
+        """``=`` on each name component forbids tmux's default prefix match,
+        preserving what ``windows.get(window_name=...)`` meant: this window,
+        not whichever one happens to share a prefix with it."""
+        run, calls = self._fake_tmux(capture="tail\n")
+        with self._observing(run):
+            tmux.get_history("ses", "win")
+
+        listing = next(c for c in calls if "list-panes" in c)
+        assert listing[listing.index("-t") + 1] == "=ses:=win"
 
 
 # ── list_sessions ────────────────────────────────────────────────────
