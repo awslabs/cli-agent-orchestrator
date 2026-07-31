@@ -1,6 +1,7 @@
 """Unit tests for HerdrInboxService — event delivery, reconnect, kiro supplement."""
 
 import asyncio
+import contextlib
 import inspect
 import json
 import threading
@@ -13,6 +14,38 @@ from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxServic
 def _run_async(coro):
     """Run an async coroutine synchronously."""
     return asyncio.run(coro)
+
+
+def test_async_pane_close_rechecks_and_kills_only_through_session_claim(monkeypatch):
+    """The production async path delegates the final empty decision atomically."""
+    from cli_agent_orchestrator.backends import registry
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import callback_recovery, terminal_service
+
+    service = HerdrInboxService(socket_path="/tmp/test.sock")
+    service.register_terminal("tid-1", "pane-1")
+    monkeypatch.setattr(
+        database,
+        "get_terminal_metadata",
+        lambda _terminal: {"tmux_session": "workspace-1", "tmux_window": None},
+    )
+    monkeypatch.setattr(
+        terminal_service, "retire_observed_terminal", lambda *_args, **_kwargs: True
+    )
+    calls = []
+    backend = MagicMock()
+    monkeypatch.setattr(registry, "get_backend", lambda: backend)
+    monkeypatch.setattr(database, "list_terminals_by_session", lambda _session: [])
+    monkeypatch.setattr(
+        callback_recovery,
+        "session_lifecycle_claim",
+        lambda kind, session: calls.append((kind, session)) or contextlib.nullcontext(),
+    )
+
+    _run_async(service._handle_lifecycle_event_async("pane.closed", {"pane_id": "pane-1"}))
+
+    assert calls == [(type(backend).__name__, "workspace-1")]
+    backend.kill_session.assert_called_once_with("workspace-1")
 
 
 class TestHerdrInboxServiceRegistration:

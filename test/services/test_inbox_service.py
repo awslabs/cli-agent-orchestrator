@@ -1,6 +1,7 @@
 """Tests for the event-driven InboxService."""
 
 import asyncio
+import contextlib
 import os
 import threading
 from datetime import datetime, timedelta
@@ -1377,6 +1378,56 @@ class TestManagedV2InboxDelivery:
         assert database.get_inbox_messages(terminal_id, limit=1)[0].status == (
             MessageStatus.PENDING
         )
+
+
+def test_ordinary_callback_completion_never_uses_generic_pane_writer(monkeypatch):
+    message = InboxMessage(
+        id=71,
+        sender_id="worker-1",
+        receiver_id="supervisor-1",
+        message="callback complete",
+        status=MessageStatus.PENDING,
+        created_at=datetime.now(),
+        callback_completion_key="operation-71",
+        expected_receiver_generation="supervisor-generation-1",
+    )
+    claimed = []
+    ambiguous = []
+    committed = []
+    send_input = MagicMock()
+    monkeypatch.setattr(
+        InboxService,
+        "_callback_completion_delivery_claim",
+        staticmethod(lambda _messages: contextlib.nullcontext()),
+    )
+    monkeypatch.setattr(
+        inbox_service.callback_recovery,
+        "claim_callback_effect",
+        lambda *args: claimed.append(args),
+    )
+    monkeypatch.setattr(
+        inbox_service.callback_recovery,
+        "mark_callback_effect_ambiguous",
+        lambda *args: ambiguous.append(args),
+    )
+    monkeypatch.setattr(
+        inbox_service.callback_recovery,
+        "commit_callback_effect",
+        lambda *args: committed.append(args),
+    )
+    monkeypatch.setattr(inbox_service.terminal_service, "send_input", send_input)
+    monkeypatch.setattr(
+        inbox_service.status_monitor, "get_status", lambda _terminal: TerminalStatus.IDLE
+    )
+
+    InboxService()._deliver_callback_completions_via_pane(
+        "supervisor-1", [message], registry=None, native_managed=False, managed_identity=None
+    )
+
+    assert claimed == [("operation-71", 71)]
+    assert ambiguous == [("operation-71",)]
+    assert committed == []
+    send_input.assert_not_called()
 
 
 class TestNativeManagedV2InboxDelivery:

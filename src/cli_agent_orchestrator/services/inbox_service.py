@@ -166,16 +166,15 @@ class InboxService:
                         self._send_native_managed_text(
                             terminal_id, message.message, managed_identity
                         )
-                    elif registry is None:
-                        terminal_service.send_input(terminal_id, message.message)
                     else:
-                        terminal_service.send_input(
-                            terminal_id,
-                            message.message,
-                            registry=registry,
-                            sender_id=message.sender_id,
-                            orchestration_type=OrchestrationType.SEND_MESSAGE,
+                        # The generic pane writer is neither a provider-native
+                        # acknowledgement nor byte-for-byte callback proof.
+                        # Retain the claimed attempt for ADMIN disposition
+                        # until this target has a receipt-bearing adapter.
+                        callback_recovery.mark_callback_effect_ambiguous(
+                            message.callback_completion_key
                         )
+                        continue
                     callback_recovery.commit_callback_effect(
                         message.callback_completion_key,
                         message.id,

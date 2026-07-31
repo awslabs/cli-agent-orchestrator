@@ -136,6 +136,7 @@ from cli_agent_orchestrator.services import (
     managed_launch_v2,
     model_turn_receipt_contract,
     operator_message_service,
+    recovery_capabilities,
     secret_gate,
     session_env,
     session_service,
@@ -4219,7 +4220,7 @@ async def create_callback_recovery_endpoint(
             },
         )
     operation_key, request_sha256 = callback_recovery.operation_identity(body)
-    if not callback_recovery.lifecycle_v2_enabled():
+    if not recovery_capabilities.callback_recovery_admission_allowed(body.expected_provider):
         # This strict request-bound response is intentionally before any
         # operation/inbox mutation or provider bridge attempt.
         return JSONResponse(

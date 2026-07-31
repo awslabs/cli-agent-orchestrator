@@ -775,6 +775,26 @@ class HerdrInboxService:
             logger.warning("_resolve_session_from_herdr: could not query herdr (%s)", e)
             return None
 
+    @staticmethod
+    def _kill_empty_workspace_claimed(session_name: str) -> bool:
+        """Re-read and remove one empty workspace under the shared session claim.
+
+        The last terminal retirement releases its terminal claim before this
+        cleanup runs.  A session claim closes that handoff race with a new
+        terminal creation using the same reusable workspace name.
+        """
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.services import callback_recovery
+
+        backend = get_backend()
+        with callback_recovery.session_lifecycle_claim(type(backend).__name__, session_name):
+            if list_terminals_by_session(session_name):
+                return False
+            backend.kill_session(session_name)
+            logger.info("pane.closed: killed empty workspace %s", session_name)
+            return True
+
     async def _handle_lifecycle_event_async(self, event_type: str, data: dict) -> None:
         """Retire off-loop, then commit ownership-map changes on the event loop."""
         from cli_agent_orchestrator.backends.registry import get_backend
@@ -832,22 +852,17 @@ class HerdrInboxService:
             # reuse registered while retirement was running survives.
             self.unregister_terminal(terminal_id, expected_pane_id=pane_id)
             if session_name:
-                remaining = await asyncio.to_thread(
-                    list_terminals_by_session,
-                    session_name,
-                )
-                if not remaining:
-                    try:
-                        await asyncio.to_thread(
-                            get_backend().kill_session,
-                            session_name,
-                        )
-                    except Exception as exc:  # noqa: BLE001 - best-effort backend cleanup
-                        logger.warning(
-                            "pane.closed: failed to kill workspace %s: %s",
-                            session_name,
-                            exc,
-                        )
+                try:
+                    await asyncio.to_thread(
+                        self._kill_empty_workspace_claimed,
+                        session_name,
+                    )
+                except Exception as exc:  # noqa: BLE001 - best-effort backend cleanup
+                    logger.warning(
+                        "pane.closed: failed to kill workspace %s: %s",
+                        session_name,
+                        exc,
+                    )
             return
 
         if event_type != "workspace.closed":

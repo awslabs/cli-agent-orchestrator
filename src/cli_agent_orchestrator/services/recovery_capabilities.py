@@ -43,6 +43,16 @@ RECEIPT_SCHEMAS = [
 ]
 
 
+def callback_recovery_admission_allowed(expected_provider: str) -> bool:
+    """Recompute the exact live authority intersection for a start request."""
+    callback = build_capabilities()["callback_recovery"]
+    return bool(
+        callback["enabled"]
+        and callback["pending_sweep"]["enabled"]
+        and expected_provider in callback["providers"]
+    )
+
+
 def build_capabilities(
     *,
     containment: Optional[ContainmentComposition] = None,

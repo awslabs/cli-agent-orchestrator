@@ -690,6 +690,16 @@ _ensure_db_dir()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+# This process may advertise or admit callback recovery only after its schema
+# migration has completed.  It is deliberately reset before every migration;
+# a caught DDL/backfill failure can never leave a stale success bit behind.
+_callback_recovery_migration_ready = False
+
+
+def callback_recovery_migration_ready() -> bool:
+    """Whether this process completed the callback-recovery schema migration."""
+    return _callback_recovery_migration_ready
+
 
 def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
@@ -1432,18 +1442,66 @@ def _migrate_callback_recovery_inbox_schema() -> None:
         logger.warning("callback-recovery inbox migration failed: %s", exc)
 
 
+def _backup_callback_recovery_rows_before_migration() -> None:
+    """Durably snapshot legacy callback rows before any recovery-row mutation.
+
+    This runs in its own committed SQLite transaction.  The subsequent schema
+    migration can therefore roll back safely without discarding the only
+    recoverable copy of a conflicting legacy row.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    with sqlite3.connect(str(DATABASE_FILE)) as backup:
+        exists = backup.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'callback_recovery_operations'"
+        ).fetchone()
+        if not exists:
+            return
+        backup.execute(
+            "CREATE TABLE IF NOT EXISTS callback_recovery_operations_v2_backup "
+            "AS SELECT * FROM callback_recovery_operations WHERE 0"
+        )
+        source_columns = [
+            row[1] for row in backup.execute("PRAGMA table_info(callback_recovery_operations)")
+        ]
+        backup_columns = {
+            row[1]
+            for row in backup.execute("PRAGMA table_info(callback_recovery_operations_v2_backup)")
+        }
+        # A prior successful migration deliberately retains its historical
+        # snapshot shape.  Do not reinterpret or overwrite that evidence on
+        # later startups merely because the live table has newer columns.
+        if set(source_columns) != backup_columns:
+            return
+        if "operation_key" not in backup_columns:
+            raise RuntimeError("callback-recovery backup lacks operation identity")
+        columns_sql = ", ".join(f'"{column}"' for column in source_columns)
+        backup.execute(
+            "INSERT INTO callback_recovery_operations_v2_backup "
+            f"({columns_sql}) SELECT {columns_sql} FROM callback_recovery_operations AS source "
+            "WHERE NOT EXISTS (SELECT 1 FROM callback_recovery_operations_v2_backup AS saved "
+            "WHERE saved.operation_key = source.operation_key)"
+        )
+
+
 def _migrate_callback_recovery_schema() -> None:
     """Create the dedicated refusal/callback recovery operation store."""
     # Fresh and existing databases are both handled by SQLAlchemy create_all.
     # This function intentionally remains as a named migration boundary so an
     # older install that cannot create the table fails the recovery surface
     # closed instead of silently falling back to ordinary inbox delivery.
+    global _callback_recovery_migration_ready
+    _callback_recovery_migration_ready = False
     try:
         CallbackRecoveryModel.__table__.create(bind=engine, checkfirst=True)
         import sqlite3
 
         from cli_agent_orchestrator.constants import DATABASE_FILE
 
+        _backup_callback_recovery_rows_before_migration()
         columns = (
             ("supervisor_generation", "TEXT"),
             ("supervisor_pane_id", "TEXT"),
@@ -1480,14 +1538,6 @@ def _migrate_callback_recovery_schema() -> None:
                 "ON callback_recovery_operations"
                 "(project, task_id, run_id, callback_occurrence_id)"
             )
-            # Lifecycle-v2 can only trust an old row when every immutable
-            # request field can be reconstructed *and* its canonical digest
-            # agrees with the stored address proof.  Preserve a backup before
-            # the first mutation so a future migration conflict is recoverable.
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS callback_recovery_operations_v2_backup "
-                "AS SELECT * FROM callback_recovery_operations WHERE 0"
-            )
             request_fields = (
                 "operation_id",
                 "project",
@@ -1522,20 +1572,25 @@ def _migrate_callback_recovery_schema() -> None:
             rows = conn.execute("SELECT * FROM callback_recovery_operations").fetchall()
             for row in rows:
                 if row["request_identity_schema"] == "cao-callback-recovery-request-v1":
+                    try:
+                        request = json.loads(row["request_json"])
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise RuntimeError("v1 callback-recovery request is unreadable") from exc
+                    canonical = json.dumps(request, sort_keys=True, separators=(",", ":"))
+                    if (
+                        not isinstance(request, dict)
+                        or hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                        != row["request_sha256"]
+                        or any(request.get(field) != row[field] for field in request_fields)
+                        or (
+                            row["state"] == "callback-completed"
+                            and not row["callback_effect_receipt_json"]
+                        )
+                    ):
+                        raise RuntimeError(
+                            "v1 callback-recovery row contradicts immutable evidence"
+                        )
                     continue
-                backup_count = conn.execute(
-                    "SELECT COUNT(*) FROM callback_recovery_operations_v2_backup "
-                    "WHERE operation_key = ?",
-                    (row["operation_key"],),
-                ).fetchone()[0]
-                if not backup_count:
-                    columns_sql = ", ".join(f'"{column}"' for column in row.keys())
-                    placeholders = ", ".join("?" for _ in row.keys())
-                    conn.execute(
-                        "INSERT INTO callback_recovery_operations_v2_backup "
-                        f"({columns_sql}) VALUES ({placeholders})",
-                        tuple(row),
-                    )
                 request = {field: row[field] for field in request_fields}
                 complete = all(value is not None and value != "" for value in request.values())
                 canonical = json.dumps(request, sort_keys=True, separators=(",", ":"))
@@ -1587,6 +1642,7 @@ def _migrate_callback_recovery_schema() -> None:
                         row["operation_key"],
                     ),
                 )
+        _callback_recovery_migration_ready = True
     except Exception as exc:  # noqa: BLE001 - operation reads fail closed
         logger.warning("callback recovery migration failed: %s", exc)
 

@@ -327,11 +327,15 @@ def lifecycle_v2_enabled() -> bool:
     deployment contract requires a restart for a changed value, so no request
     can observe an in-process cache that differs from capability advertisement.
     """
-    return os.environ.get("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+    return (
+        os.environ.get("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "").lower()
+        in {
+            "1",
+            "true",
+            "yes",
+        }
+        and database.callback_recovery_migration_ready()
+    )
 
 
 def operation_identity(body: CallbackRecoveryRequest) -> tuple[str, str]:
@@ -732,6 +736,21 @@ def _strict_json_object(raw: Optional[str], *, field: str) -> dict[str, Any]:
     return value
 
 
+def _provider_turn_receipt_expected(row: Any) -> dict[str, str]:
+    """Return the immutable admission context for one provider receipt."""
+    return {
+        "message_id": str(row.inbox_message_id),
+        "message_sha256": str(row.recovery_prompt_sha256),
+        "message_created_at": str(row.message_created_at),
+        "sender_id": str(row.supervisor_id),
+        "sender_generation": str(row.sender_generation),
+        "receiver_id": str(row.source_terminal_id),
+        "receiver_generation": str(row.source_generation),
+        "provider": str(row.expected_provider),
+        "provider_session_id": str(row.expected_provider_session_id),
+    }
+
+
 def _validate_lifecycle_row(row: Any) -> None:
     """Reject malformed or contradictory lifecycle storage on every read."""
     if row.state not in KNOWN_STATES:
@@ -820,8 +839,18 @@ def _validate_lifecycle_row(row: Any) -> None:
         }
         if {key: response.get(key) for key in expected_response} != expected_response:
             raise CallbackRecoveryConflict("stored admission response changed identity")
-    if row.state == STATE_SUBMITTED and not row.provider_turn_receipt_json:
-        raise CallbackRecoveryConflict("submitted callback recovery lacks provider receipt")
+    if row.state == STATE_SUBMITTED:
+        if not row.provider_turn_receipt_json:
+            raise CallbackRecoveryConflict("submitted callback recovery lacks provider receipt")
+        try:
+            model_turn_receipt_contract.validate_receipt(
+                _strict_json_object(row.provider_turn_receipt_json, field="provider turn receipt"),
+                expected=_provider_turn_receipt_expected(row),
+            )
+        except CallbackRecoveryConflict as exc:
+            raise CallbackRecoveryConflict("stored provider receipt is malformed") from exc
+        except model_turn_receipt_contract.ReceiptValidationError as exc:
+            raise CallbackRecoveryConflict("stored provider receipt contradicts recovery") from exc
     callback_attempt = row.callback_attempt_state
     if callback_attempt in {
         CALLBACK_ATTEMPT_REGISTERED,
@@ -926,8 +955,12 @@ def _validate_lifecycle_row(row: Any) -> None:
             "outcome",
             "operation_key",
             "request_sha256",
+            "provider_turn_receipt_sha256",
+            "callback_registration_receipt_sha256",
+            "callback_effect_receipt_sha256",
             "callback_attempt_state",
             "certainty",
+            "actor_scope",
             "evidence_sha256",
             "detail",
             "disposed_at",
@@ -945,12 +978,40 @@ def _validate_lifecycle_row(row: Any) -> None:
             }
             or disposition.get("certainty")
             not in {"proven-zero-callback-effect", "callback-effect-unknown"}
+            or disposition.get("actor_scope") != "ADMIN"
         ):
             raise CallbackRecoveryConflict("callback ADMIN disposition contradicts recovery")
         if row.provider_turn_receipt_json is None or row.callback_effect_receipt_json is not None:
             raise CallbackRecoveryConflict(
                 "callback-undeliverable lacks exact effect preconditions"
             )
+        try:
+            receipt = model_turn_receipt_contract.validate_receipt(
+                _strict_json_object(row.provider_turn_receipt_json, field="provider turn receipt"),
+                expected=_provider_turn_receipt_expected(row),
+            )
+        except model_turn_receipt_contract.ReceiptValidationError as exc:
+            raise CallbackRecoveryConflict(
+                "callback-undeliverable has an invalid provider receipt"
+            ) from exc
+        if disposition.get("provider_turn_receipt_sha256") != _digest(receipt):
+            raise CallbackRecoveryConflict("callback-undeliverable provider receipt changed")
+        registration = (
+            _strict_json_object(
+                row.callback_registration_receipt_json,
+                field="callback registration receipt",
+            )
+            if row.callback_registration_receipt_json is not None
+            else None
+        )
+        if (
+            disposition.get("callback_registration_receipt_sha256")
+            != (_digest(registration) if registration is not None else None)
+            or disposition.get("callback_effect_receipt_sha256") is not None
+        ):
+            raise CallbackRecoveryConflict("callback-undeliverable callback observations changed")
+        if disposition.get("actor_scope") != "ADMIN":
+            raise CallbackRecoveryConflict("callback-undeliverable lacks ADMIN authority")
     elif row.callback_admin_disposition_json is not None:
         raise CallbackRecoveryConflict("non-terminal recovery carries an ADMIN disposition")
     if row.state == STATE_RESOLVED:
@@ -1415,17 +1476,7 @@ def turn_receipt(operation_key: str) -> Optional[dict[str, str]]:
         if receipt is None:
             db.commit()
             return None
-        expected = {
-            "message_id": str(inbox.id),
-            "message_sha256": inbox.message_sha256,
-            "message_created_at": inbox.created_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-            "sender_id": row.supervisor_id,
-            "sender_generation": inbox.sender_generation,
-            "receiver_id": row.source_terminal_id,
-            "receiver_generation": row.source_generation,
-            "provider": row.expected_provider,
-            "provider_session_id": row.expected_provider_session_id,
-        }
+        expected = _provider_turn_receipt_expected(row)
         strict = model_turn_receipt_contract.validate_receipt(receipt, expected=expected)
         if row.provider_turn_receipt_json is not None:
             try:
@@ -2131,18 +2182,45 @@ def dispose_callback_undeliverable(
                 CALLBACK_ATTEMPT_EFFECT_AMBIGUOUS,
             }:
                 raise CallbackRecoveryConflict("callback attempt is not disposable")
+            if db.get(database.InboxModel, row.inbox_message_id) is None:
+                raise CallbackRecoveryConflict("callback-undeliverable recovery inbox is absent")
+            try:
+                receipt = model_turn_receipt_contract.validate_receipt(
+                    _strict_json_object(
+                        row.provider_turn_receipt_json, field="provider turn receipt"
+                    ),
+                    expected=_provider_turn_receipt_expected(row),
+                )
+            except model_turn_receipt_contract.ReceiptValidationError as exc:
+                raise CallbackRecoveryConflict(
+                    "callback-undeliverable has an invalid provider receipt"
+                ) from exc
+            registration = (
+                _strict_json_object(
+                    row.callback_registration_receipt_json,
+                    field="callback registration receipt",
+                )
+                if row.callback_registration_receipt_json is not None
+                else None
+            )
             disposed_at = _now()
             disposition = {
                 "schema": "cao-callback-recovery-disposition-v1",
                 "outcome": "provider-effect-proven-callback-undeliverable",
                 "operation_key": row.operation_key,
                 "request_sha256": row.request_sha256,
+                "provider_turn_receipt_sha256": _digest(receipt),
+                "callback_registration_receipt_sha256": (
+                    _digest(registration) if registration is not None else None
+                ),
+                "callback_effect_receipt_sha256": None,
                 "callback_attempt_state": row.callback_attempt_state,
                 "certainty": (
                     "proven-zero-callback-effect"
                     if row.callback_attempt_state == CALLBACK_ATTEMPT_ZERO_EFFECT_REFUSED
                     else "callback-effect-unknown"
                 ),
+                "actor_scope": "ADMIN",
                 **body.model_dump(mode="json"),
                 "disposed_at": disposed_at,
             }

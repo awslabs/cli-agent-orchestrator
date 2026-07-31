@@ -762,6 +762,40 @@ def test_admin_disposition_releases_exact_undeliverable_callback(recovery_contex
     assert not callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION)
 
 
+def test_admin_disposition_retains_malformed_provider_receipt(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+    _record_turn(admission)
+    callback = _publish_callback(admission)
+    key = admission.operation["operation_key"]
+    callback_recovery.complete(
+        key,
+        CallbackRecoveryCompletionRequest(
+            callback_message_id=callback["message_id"],
+            callback_message_sha256=recovery_context.callback_message_sha256,
+            callback_created_at=callback["created_at"],
+            finalization_identity_sha256=recovery_context.finalization_identity_sha256,
+        ),
+    )
+    with database.SessionLocal() as db:
+        row = db.get(database.CallbackRecoveryModel, key)
+        db.get(database.TerminalModel, SUPERVISOR).pane_id = "replacement-pane"
+        row.provider_turn_receipt_json = '{"schema":"fabricated"}'
+        db.commit()
+    with pytest.raises(callback_recovery.CallbackRecoveryConflict, match="provider receipt"):
+        callback_recovery.dispose_callback_undeliverable(
+            key,
+            callback_recovery.CallbackRecoveryDispositionRequest(
+                outcome="provider-effect-proven-callback-undeliverable",
+                evidence_sha256="a" * 64,
+                detail="must retain malformed provider evidence",
+            ),
+        )
+    with database.SessionLocal() as db:
+        row = db.get(database.CallbackRecoveryModel, key)
+        assert row.state == callback_recovery.STATE_SUBMITTED
+        assert row.callback_admin_disposition_json is None
+
+
 def test_closed_workspace_retirement_holds_source_and_supervisor_rows(
     recovery_context,
     monkeypatch,

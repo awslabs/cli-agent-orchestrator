@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services import provider_contracts as pc
 from cli_agent_orchestrator.services.containment import (
     ArtifactAuthorization,
@@ -421,6 +422,7 @@ def test_capability_claims_derive_from_receipts_never_caller_booleans():
 
 def test_callback_capability_is_the_proven_outer_authority_intersection(monkeypatch):
     monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "yes")
+    monkeypatch.setattr(database, "callback_recovery_migration_ready", lambda: True)
     composition = ContainmentComposition(
         authorization=_authorization(),
         live_proof_receipt=_receipt(),

@@ -146,6 +146,9 @@ def test_lifecycle_v2_is_visible_but_default_off_and_refuses_before_admission(cl
 @pytest.mark.parametrize("value", ["1", "TRUE", "yes"])
 def test_lifecycle_v2_enable_values_admit(value, client, monkeypatch):
     monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", value)
+    monkeypatch.setattr(
+        main.recovery_capabilities, "callback_recovery_admission_allowed", lambda _provider: True
+    )
     body = _body()
     body["source_terminal_id"] = "abcdef12"
     called = []
@@ -160,8 +163,26 @@ def test_lifecycle_v2_enable_values_admit(value, client, monkeypatch):
     assert called
 
 
+def test_live_provider_authority_refuses_before_admission(client, monkeypatch):
+    monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "true")
+    monkeypatch.setattr(database, "callback_recovery_migration_ready", lambda: True)
+    body = _body()
+    body["source_terminal_id"] = "abcdef12"
+    called = []
+    monkeypatch.setattr(callback_recovery, "admit", lambda *_args: called.append(True))
+
+    response = client.post("/terminals/abcdef12/callback-recoveries", json=body)
+
+    assert response.status_code == 503
+    assert response.json()["reason_code"] == "lifecycle-capability-disabled"
+    assert called == []
+
+
 def test_rebind_conflict_never_claims_zero_bytes(client, monkeypatch):
     monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "true")
+    monkeypatch.setattr(
+        main.recovery_capabilities, "callback_recovery_admission_allowed", lambda _provider: True
+    )
 
     def conflict(_body):
         raise callback_recovery.CallbackRecoveryConflict("already used")
@@ -177,6 +198,9 @@ def test_rebind_conflict_never_claims_zero_bytes(client, monkeypatch):
 
 def test_ambiguous_replay_never_claims_zero_bytes(client, monkeypatch):
     monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "true")
+    monkeypatch.setattr(
+        main.recovery_capabilities, "callback_recovery_admission_allowed", lambda _provider: True
+    )
 
     def ambiguous(_body):
         raise callback_recovery.CallbackRecoveryAmbiguous("provider effect remains possible")
@@ -253,6 +277,9 @@ def test_real_http_handler_admits_authoritative_reservation(
     monkeypatch,
 ):
     monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "true")
+    monkeypatch.setattr(
+        main.recovery_capabilities, "callback_recovery_admission_allowed", lambda _provider: True
+    )
     now = "2026-07-30T12:00:00Z"
     with database.SessionLocal() as db:
         db.add_all(
@@ -385,6 +412,9 @@ def test_dedicated_callback_handler_registers_without_delivery(
 @pytest.mark.asyncio
 async def test_slow_bridge_delivery_is_offloaded_from_event_loop(monkeypatch):
     monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "true")
+    monkeypatch.setattr(
+        main.recovery_capabilities, "callback_recovery_admission_allowed", lambda _provider: True
+    )
     entered = threading.Event()
     release = threading.Event()
 
