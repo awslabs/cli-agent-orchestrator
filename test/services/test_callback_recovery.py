@@ -48,6 +48,55 @@ REPORT_PATH = "/tmp/worktree/report.md"
 CALLBACK_LINE = (
     f"[conduct-report] status=done task=task-1 report={REPORT_PATH} " f"summary={SUMMARY}"
 )
+PAIRED_TOP_LEVEL_REQUEST_FIELDS = frozenset(
+    {
+        "operation_id",
+        "project",
+        "task_id",
+        "run_id",
+        "source_terminal_id",
+        "source_generation",
+        "expected_provider",
+        "expected_provider_session_id",
+        "expected_execution_mode",
+        "supervisor_id",
+        "supervisor_session",
+        "supervisor_generation",
+        "supervisor_pane_id",
+        "callback_occurrence_id",
+        "refusal_control_id",
+        "refusal_occurrence_sha256",
+        "refusal_request_sha256",
+        "callback_status",
+        "callback_summary",
+        "callback_message_sha256",
+        "report_path",
+        "report_sha256",
+        "source_head",
+        "publishing_lease_state",
+        "publishing_lease_sha256",
+        "manifest_path",
+        "manifest_sha256",
+        "finalization_identity_sha256",
+    }
+)
+
+
+def _response_loss_readback_is_adoptable(body, operation):
+    """Mirror the paired strict identity proof without any nested-data fallback."""
+    request = body.model_dump(mode="json")
+    nested = operation.get("request") if isinstance(operation, dict) else None
+    return (
+        isinstance(nested, dict)
+        and operation.get("schema") == callback_recovery.OPERATION_SCHEMA
+        and operation.get("request_identity_schema") == callback_recovery.REQUEST_SCHEMA
+        and nested == request
+        and hashlib.sha256(
+            json.dumps(nested, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        == operation.get("request_sha256")
+        and {field: operation.get(field) for field in PAIRED_TOP_LEVEL_REQUEST_FIELDS} == request
+    )
 
 
 @pytest.mark.parametrize(
@@ -305,6 +354,39 @@ def test_operation_readback_echoes_the_immutable_canonical_request(recovery_cont
             json.dumps(operation["request"], sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
     )
+    assert set(operation["request"]) == PAIRED_TOP_LEVEL_REQUEST_FIELDS
+    assert {field: operation.get(field) for field in PAIRED_TOP_LEVEL_REQUEST_FIELDS} == operation[
+        "request"
+    ]
+
+
+def test_response_loss_readback_is_adoptable_only_with_exact_identity(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+    key = admission.operation["operation_key"]
+
+    readback = callback_recovery.get(key)
+
+    assert _response_loss_readback_is_adoptable(recovery_context, readback)
+    replay = callback_recovery.admit(recovery_context)
+    assert replay.replayed is True
+    assert _response_loss_readback_is_adoptable(recovery_context, callback_recovery.get(key))
+    assert not _response_loss_readback_is_adoptable(
+        recovery_context, {**readback, "callback_summary": "changed"}
+    )
+    assert not _response_loss_readback_is_adoptable(
+        recovery_context,
+        {key: value for key, value in readback.items() if key != "callback_status"},
+    )
+
+    changed = recovery_context.model_copy(update={"report_sha256": "9" * 64})
+    with pytest.raises(callback_recovery.CallbackRecoveryIdentityConflict):
+        callback_recovery.admit(changed)
+    with database.SessionLocal() as db:
+        row = db.get(database.CallbackRecoveryModel, key)
+        assert db.query(database.CallbackRecoveryModel).count() == 1
+        assert db.query(database.InboxModel).count() == 1
+        assert row.provider_turn_receipt_json is None
+        assert row.callback_message_id is None
 
 
 def test_request_storage_tampering_quarantines_the_operation(recovery_context):
