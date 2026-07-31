@@ -101,6 +101,12 @@ cao launch "Research this codebase" --agents explorer --memory
 
 Manage active CAO sessions.
 
+:::note Session names include the `cao-` prefix
+`cao launch --session-name my-session` creates a session named `cao-my-session`.
+The subcommands below take the full prefixed name; `cao session list` shows the
+exact values.
+:::
+
 ### cao session list
 
 List all active sessions.
@@ -151,22 +157,22 @@ cao session list
 cao session list --json
 
 # Check status of a session
-cao session status my-session
+cao session status cao-my-session
 
 # Check status including workers
-cao session status my-session --workers
+cao session status cao-my-session --workers
 
 # Send a follow-up message to a session
-cao session send my-session "Now run the integration tests"
+cao session send cao-my-session "Now run the integration tests"
 
 # Send a message to a specific terminal
-cao session send my-session "Check the logs" --terminal a1b2c3d4
+cao session send cao-my-session "Check the logs" --terminal a1b2c3d4
 
 # Send asynchronously
-cao session send my-session "Generate the report" --async
+cao session send cao-my-session "Generate the report" --async
 
 # Send with a timeout
-cao session send my-session "Run benchmarks" --timeout 300
+cao session send cao-my-session "Run benchmarks" --timeout 300
 ```
 
 ---
@@ -192,7 +198,7 @@ cao shutdown --session NAME
 cao shutdown --all
 
 # Shutdown a specific session
-cao shutdown --session staging-deploy
+cao shutdown --session cao-staging-deploy
 ```
 
 ---

@@ -48,7 +48,7 @@ cao-server
 cao launch --agents code_supervisor --session-name my-session
 
 # Send a follow-up message to the session
-cao session send my-session "Start the code review workflow"
+cao session send cao-my-session "Start the code review workflow"
 
 # Shut down when done
 cao shutdown --all

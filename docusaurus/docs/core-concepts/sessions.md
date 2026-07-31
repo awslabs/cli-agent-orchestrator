@@ -36,7 +36,7 @@ cao launch ──▶ Session Created ──▶ Active (agents running)
 
 1. **Created** -- `cao launch --agents <profile>` spawns a tmux session and initializes the supervisor terminal.
 2. **Active** -- the supervisor is running, can spawn workers via `handoff`/`assign`, and processes tasks.
-3. **Terminated** -- `cao shutdown --session <name>` kills the tmux session and cleans up resources.
+3. **Terminated** -- `cao shutdown --session cao-<name>` kills the tmux session and cleans up resources.
 
 ## Terminal Status Detection
 
@@ -64,19 +64,19 @@ Once a terminal reaches a "ready" state (IDLE, COMPLETED, WAITING_USER_ANSWER, E
 cao session list
 
 # Show conductor status and last output
-cao session status <session-name>
+cao session status cao-<session-name>
 
 # Include worker terminal statuses
-cao session status <session-name> --workers
+cao session status cao-<session-name> --workers
 
 # Send a message and wait for completion
-cao session send <session-name> "Implement the login page"
+cao session send cao-<session-name> "Implement the login page"
 
 # Fire-and-forget (don't wait)
-cao session send <session-name> "Run the tests" --async
+cao session send cao-<session-name> "Run the tests" --async
 
 # Wait with timeout
-cao session send <session-name> "Deploy to staging" --timeout 120
+cao session send cao-<session-name> "Deploy to staging" --timeout 120
 
 # Launch a new session
 cao launch --agents code_supervisor

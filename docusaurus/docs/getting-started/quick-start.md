@@ -36,6 +36,14 @@ This will:
 2. After you confirm, open a tmux window with the agent running
 3. The agent starts processing in its terminal
 
+:::info The `cao-` prefix
+CAO prefixes every session with `cao-`, so `--session-name my-session` creates a
+session named **`cao-my-session`**. Later commands (`cao session status`,
+`cao session send`, `cao shutdown --session`) take the full prefixed name — pass
+`my-session` and you'll get `No terminals found for session 'my-session'`. Run
+`cao session list` any time you need the exact name.
+:::
+
 :::tip Choosing a provider
 The `--provider` flag tells CAO which AI CLI to use. If you omit `--provider`, CAO uses the profile's `provider:` field, falling back to `kiro_cli`. Otherwise, specify whichever CLI you have installed:
 - `--provider claude_code` — for Claude Code
@@ -64,12 +72,12 @@ Run `cao profile list` to see all available profiles.
 ## 3. Check session status
 
 ```bash
-cao session status my-session
+cao session status cao-my-session
 ```
 
 Expected output:
 ```
-Session:  my-session
+Session:  cao-my-session
 Terminal: a1b2c3d4
 Agent:    code_supervisor
 Provider: claude_code
@@ -87,7 +95,7 @@ cao session list
 ## 5. Send a follow-up message
 
 ```bash
-cao session send my-session "Add OAuth2 support to the auth module"
+cao session send cao-my-session "Add OAuth2 support to the auth module"
 ```
 
 This sends the message to the session's conductor (the first terminal — typically your supervisor agent). The command waits for the agent to finish processing and prints its response.
@@ -98,7 +106,7 @@ Use `--async` to send without waiting, or `--timeout 120` to set a custom wait t
 
 ```bash
 # Shut down a specific session
-cao shutdown --session my-session
+cao shutdown --session cao-my-session
 
 # Or shut down all sessions
 cao shutdown --all
