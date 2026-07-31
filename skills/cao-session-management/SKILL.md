@@ -16,7 +16,22 @@ session orchestrates the work.
 
 - **Session**: A group of agent terminals working together
 - **Conductor**: The supervisor terminal — receives instructions, delegates to workers
-- **Provider**: LLM backend. Default `kiro_cli`, override with `--provider`
+- **Provider**: LLM backend. Generic CAO launches default to `kiro_cli` when no
+  profile or caller resolves a provider; conductor-managed launches must not rely
+  on that default.
+
+## Conductor-managed routing boundary
+
+For conductor-managed sessions, defer route and profile selection to the
+conductor's exact routing/bootstrap skills and managed launch surfaces. Resolve
+and attest the profile, provider, model, and effort before launch; do not inherit
+ambient routing or silently approximate a missing route.
+
+If a supported role/model combination lacks a suitable profile, treat that as a
+provisioning task: at a durable boundary, create and validate a reusable,
+project-agnostic profile, install it, and then retry the exact route. The direct
+`cao` commands, Kiro default, and Kiro-specific SOP flow in this skill are generic
+CAO examples, not conductor routing recommendations.
 
 ## Prerequisites
 
@@ -43,11 +58,16 @@ Profiles are CAO-level entities, installed with `cao install` regardless of whic
 
 The HTTP endpoint is the recommended check: it scans the built-in packaged store, the local store (`agent-store/`), and provider-specific directories (including `agent-context/`), then returns a deduplicated list (by profile name, built-in wins) with a `source` label on each entry.
 
-If unsure which profile to use, ask the user rather than guessing.
+For generic CAO use, ask the user rather than guessing. For conductor-managed
+use, follow the already-resolved, attested route.
 
 ## Quick Example
 
-A complete, copy-pasteable supervisor launch. The default provider is `kiro_cli`; pass `--provider <name>` to use another (`claude_code`, `codex`, `antigravity_cli`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`).
+A complete, copy-pasteable generic CAO supervisor launch. Discover supported
+provider identifiers and local installation status with
+`curl -sf http://localhost:9889/agents/providers`; do not copy a static provider
+list into routing policy. Conductor-managed launches use the conductor's managed
+surfaces instead of this example.
 
 This example assumes a configured CAO setup (server running, profiles installed). On an already-configured host you can skip straight to `cao launch`. The `cao install` lines below are only for first-time setup; remove them if your CAO is already configured.
 
@@ -63,8 +83,8 @@ cao launch --agents code_supervisor --headless --yolo \
   --session-name my-task --working-directory '/path/to/project' \
   "Build a hello-world Python script. Delegate to developer, then reviewer."
 
-# Same launch on a different provider
-# cao launch --agents code_supervisor --provider claude_code --headless --yolo \
+# Same generic launch on an explicitly resolved provider
+# cao launch --agents code_supervisor --provider <resolved-provider> --headless --yolo \
 #   --session-name my-task --working-directory '/path/to/project' "..."
 
 # Check progress / final output
@@ -95,7 +115,7 @@ cao launch --agents <profile> --headless --yolo \
 `--yolo` skips confirmation prompts. Required when launching from an agent — interactive
 prompts will stall the session.
 
-For SOP-driven workflows (Kiro provider): launch with `/prompts` to discover
+For generic SOP-driven workflows on the Kiro provider: launch with `/prompts` to discover
 available SOPs, then send the matched SOP name prefixed with `@` (e.g.,
 `@my-sop-name`), then send the task — each as separate messages after
 polling for `completed` status.

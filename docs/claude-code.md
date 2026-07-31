@@ -125,6 +125,12 @@ When a CAO profile specifies a `native_agent` field, the provider passes `--agen
 
 If no CAO profile is found for the given agent name, the provider also falls back to `--agent <name>`, assuming it exists in the native store.
 
+> **Conductor-managed boundary:** This missing-profile native-agent fallback is a
+> generic legacy convenience and must not be used for conductor-managed launches.
+> The conductor must resolve and attest an exact CAO profile and route. If a
+> supported role/model profile is missing, provision and validate a reusable,
+> project-agnostic profile rather than inheriting ambient Claude routing.
+
 ```markdown
 ---
 name: my-wrapper

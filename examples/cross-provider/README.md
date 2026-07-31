@@ -142,8 +142,10 @@ mcpServers:
 ---
 ```
 
-Valid provider values: `kiro_cli`, `claude_code`, `codex`, `antigravity_cli`,
-`kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`.
+Discover canonical provider identifiers and local installation status with
+`curl -sf http://localhost:9889/agents/providers`. Do not treat this example's
+profiles as an exhaustive provider list; current CAO releases also support
+`hermes`.
 
 ## E2E Tests
 

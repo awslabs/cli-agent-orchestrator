@@ -102,6 +102,13 @@ Agent profiles can declare which provider they should run on via the `provider` 
 
 When the supervisor calls `assign` or `handoff`, CAO reads the worker's agent profile and uses the declared `provider` if it is a valid value. If the key is missing or the value is not recognized, the worker inherits the supervisor's provider.
 
+> **Conductor-managed boundary:** Provider inheritance and the unrecognized-value
+> fallback are generic legacy conveniences, not valid conductor routing. A
+> conductor must resolve and attest an exact CAO profile and route before launch.
+> A missing supported role/model profile is a provisioning task: create, validate,
+> and install a reusable project-agnostic profile instead of inheriting ambient
+> routing or silently substituting another provider/model.
+
 Valid values: `kiro_cli`, `claude_code`, `codex`, `antigravity_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`.
 
 ### Example

@@ -16,6 +16,13 @@ registry, then the server list matches your nodes exactly.
 
 ## Patterns
 
+The fixed `developer` / `claude_code` values below illustrate MCP argument
+syntax only; they are not routing defaults or recommendations. Real deployments
+must discover the node's exact profiles and providers, apply their routing policy,
+and pass an explicitly resolved combination. If a supported combination lacks a
+profile, provision and validate a reusable project-agnostic profile rather than
+silently substituting another route.
+
 - **"Launch a developer on `<node>` to do X"** → call `cao-<node>.launch_session`
   with `agent_profile=developer`, `provider=claude_code`, the task, and a
   `working_directory`.

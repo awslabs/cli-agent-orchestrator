@@ -1,6 +1,6 @@
 ---
 name: reviewer-opus
-description: Independent read-only code reviewer on Claude Code (Opus) — optional heavyweight judge
+description: Model-override mechanics fixture for a Claude Code (Opus) reviewer, not routing guidance
 provider: claude_code
 model: opus
 role: reviewer
@@ -12,6 +12,11 @@ mcpServers:
 ---
 
 # CODE REVIEWER (Opus)
+
+> **Fixture only:** This profile demonstrates `provider` and `model` override
+> mechanics. It is not an operational routing recommendation. Conductor-managed
+> sessions must use an exact version/effort-attested reusable profile selected by
+> their current routing policy.
 
 You are an independent code reviewer in a multi-agent system. You are READ-ONLY
 — you do not edit files; you assess work another agent produced and report a
