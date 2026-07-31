@@ -171,6 +171,8 @@ class CallbackRecoveryModel(Base):
     refusal_occurrence_sha256 = Column(Text, nullable=False)
     refusal_request_sha256 = Column(Text, nullable=False)
     callback_occurrence_id = Column(Text, nullable=False)
+    callback_status = Column(Text, nullable=True)
+    callback_summary = Column(Text, nullable=True)
     callback_message_sha256 = Column(Text, nullable=False)
     report_path = Column(Text, nullable=False)
     report_sha256 = Column(Text, nullable=False)
@@ -181,6 +183,10 @@ class CallbackRecoveryModel(Base):
     manifest_sha256 = Column(Text, nullable=False)
     finalization_identity_sha256 = Column(Text, nullable=False)
     request_sha256 = Column(Text, nullable=False)
+    # Lifecycle-v2 stores the complete validated request rather than trying to
+    # reconstruct proof from mutable terminal state on response-loss readback.
+    request_identity_schema = Column(Text, nullable=True)
+    request_json = Column(Text, nullable=True)
     callback_token_sha256 = Column(Text, nullable=True)
     inbox_message_id = Column(Integer, nullable=True, unique=True)
     recovery_prompt_sha256 = Column(Text, nullable=True)
@@ -191,6 +197,10 @@ class CallbackRecoveryModel(Base):
     callback_message_id = Column(Integer, nullable=True, unique=True)
     callback_consumed_at = Column(Text, nullable=True)
     callback_response_json = Column(Text, nullable=True)
+    callback_attempt_state = Column(Text, nullable=True)
+    callback_registration_receipt_json = Column(Text, nullable=True)
+    callback_effect_receipt_json = Column(Text, nullable=True)
+    callback_disposition_json = Column(Text, nullable=True)
     completion_json = Column(Text, nullable=True)
     resolution_json = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
@@ -1442,6 +1452,14 @@ def _migrate_callback_recovery_schema() -> None:
             ("admission_response_json", "TEXT"),
             ("callback_response_json", "TEXT"),
             ("resolution_json", "TEXT"),
+            ("request_identity_schema", "TEXT"),
+            ("request_json", "TEXT"),
+            ("callback_status", "TEXT"),
+            ("callback_summary", "TEXT"),
+            ("callback_attempt_state", "TEXT"),
+            ("callback_registration_receipt_json", "TEXT"),
+            ("callback_effect_receipt_json", "TEXT"),
+            ("callback_disposition_json", "TEXT"),
         )
         with sqlite3.connect(str(DATABASE_FILE)) as conn:
             present = {
@@ -2833,15 +2851,9 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
                     synchronize_session=False,
                 )
             )
-            if updated == 1 and message is not None and message.callback_completion_key is not None:
-                recovery = db.get(
-                    CallbackRecoveryModel,
-                    message.callback_completion_key,
-                )
-                if recovery is not None and recovery.callback_consumed_at is None:
-                    recovery.callback_consumed_at = datetime.now(timezone.utc).strftime(
-                        "%Y-%m-%dT%H:%M:%S.%fZ"
-                    )
+            # Callback-recovery completion is never inferred from a generic
+            # inbox status change.  Only callback_recovery.commit_callback_effect
+            # can write its post-effect receipt and release terminal retention.
             db.commit()
             return updated == 1
 

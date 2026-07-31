@@ -246,6 +246,13 @@ def _publish_callback(admission):
     )
 
 
+def _commit_callback(admission, callback):
+    """Model the delivery adapter's exact post-effect journal transition."""
+    key = admission.operation["operation_key"]
+    callback_recovery.claim_callback_effect(key, callback["message_id"])
+    return callback_recovery.commit_callback_effect(key, callback["message_id"])
+
+
 def test_generated_recovery_command_is_exact_and_route_unattested(
     recovery_context,
 ):
@@ -273,6 +280,50 @@ def test_generated_recovery_command_is_exact_and_route_unattested(
         SUMMARY,
     ]
     assert {"--model", "--effort", "--route-evidence"}.isdisjoint(argv)
+
+
+def test_operation_readback_echoes_the_immutable_canonical_request(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+
+    operation = callback_recovery.get(admission.operation["operation_key"])
+
+    assert operation["schema"] == "cao-callback-recovery-operation-v2"
+    assert operation["request_identity_schema"] == "cao-callback-recovery-request-v1"
+    assert operation["request"] == recovery_context.model_dump(mode="json")
+    assert (
+        operation["request_sha256"]
+        == hashlib.sha256(
+            json.dumps(operation["request"], sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    )
+
+
+def test_request_storage_tampering_quarantines_the_operation(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+    key = admission.operation["operation_key"]
+    with database.SessionLocal() as db:
+        row = db.get(database.CallbackRecoveryModel, key)
+        row.request_json = json.dumps({"foreign": True})
+        db.commit()
+
+    with pytest.raises(callback_recovery.CallbackRecoveryConflict, match="canonical request"):
+        callback_recovery.get(key)
+
+
+def test_operation_key_owner_conflict_returns_the_durable_owner_proof(recovery_context):
+    admitted = callback_recovery.admit(recovery_context)
+    conflicting = recovery_context.model_copy(update={"report_sha256": "9" * 64})
+
+    with pytest.raises(callback_recovery.CallbackRecoveryIdentityConflict) as raised:
+        callback_recovery.admit(conflicting)
+
+    proof = raised.value.response
+    assert proof["schema"] == "cao-callback-recovery-identity-conflict-v1"
+    assert proof["reason_code"] == "operation-key-owned"
+    assert proof["submitted_operation_key"] == admitted.operation["operation_key"]
+    assert proof["owner_operation_key"] == admitted.operation["operation_key"]
+    assert proof["owner_request_sha256"] == admitted.operation["request_sha256"]
+    assert proof["proven_zero_provider_bytes_for_submitted_request"] is True
 
 
 def test_exact_retry_is_one_row_and_different_operation_cannot_repeat(recovery_context):
@@ -427,7 +478,7 @@ def test_turn_receipt_is_strict_revalidated_and_completion_binds_callback_row(
     callback = _publish_callback(admission)
     callback_id = callback["message_id"]
     callback_created = callback["created_at"]
-    completed = callback_recovery.complete(
+    intent = callback_recovery.complete(
         admission.operation["operation_key"],
         CallbackRecoveryCompletionRequest(
             callback_message_id=callback_id,
@@ -436,23 +487,12 @@ def test_turn_receipt_is_strict_revalidated_and_completion_binds_callback_row(
             finalization_identity_sha256=recovery_context.finalization_identity_sha256,
         ),
     )
+    assert intent["state"] == callback_recovery.STATE_SUBMITTED
+    assert intent["callback_attempt_state"] == callback_recovery.CALLBACK_ATTEMPT_REGISTERED
+    completed = _commit_callback(admission, callback)
     assert completed["state"] == callback_recovery.STATE_COMPLETED
     assert completed["callback_message_id"] == callback_id
-    assert completed["callback_consumed"] is False
-    assert callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION)
-    with pytest.raises(
-        terminal_service.TerminalGenerationMismatchError,
-        match="open callback-recovery",
-    ):
-        terminal_service.retire_observed_terminal(
-            SOURCE,
-            expected_session=SESSION_NAME,
-        )
-    with database.SessionLocal() as db:
-        callback_row = db.get(database.InboxModel, callback_id)
-        callback_row.status = MessageStatus.DELIVERED.value
-        db.commit()
-    assert callback_recovery.get(admission.operation["operation_key"])["callback_consumed"] is True
+    assert completed["callback_consumed"] is True
     assert callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION) is False
     replay = callback_recovery.complete(
         admission.operation["operation_key"],
@@ -472,19 +512,7 @@ def test_completed_delivery_remains_closed_after_inbox_retention(
     admission = callback_recovery.admit(recovery_context)
     _record_turn(admission)
     callback = _publish_callback(admission)
-    callback_recovery.complete(
-        admission.operation["operation_key"],
-        CallbackRecoveryCompletionRequest(
-            callback_message_id=callback["message_id"],
-            callback_message_sha256=recovery_context.callback_message_sha256,
-            callback_created_at=callback["created_at"],
-            finalization_identity_sha256=recovery_context.finalization_identity_sha256,
-        ),
-    )
-    assert database.update_message_status(
-        callback["message_id"],
-        MessageStatus.DELIVERED,
-    )
+    _commit_callback(admission, callback)
     assert not callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION)
     with database.SessionLocal() as db:
         row = db.get(
@@ -534,7 +562,7 @@ def test_generic_inbox_row_cannot_complete_recovery(recovery_context):
         db.refresh(generic)
         created = generic.created_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         callback_id = generic.id
-    with pytest.raises(callback_recovery.CallbackRecoveryConflict, match="contradicts"):
+    with pytest.raises(callback_recovery.CallbackRecoveryPending, match="not registered"):
         callback_recovery.complete(
             admission.operation["operation_key"],
             CallbackRecoveryCompletionRequest(
@@ -587,8 +615,49 @@ def test_callback_token_and_original_supervisor_generation_are_mandatory(
                 message=CALLBACK_LINE,
             ),
         )
+    operation = callback_recovery.get(key)
+    assert operation["callback_attempt_state"] == (
+        callback_recovery.CALLBACK_ATTEMPT_ZERO_EFFECT_REFUSED
+    )
+    assert callback_recovery.callback_lookup(key)["callback"] is None
+    with database.SessionLocal() as db:
+        assert (
+            db.query(database.InboxModel)
+            .filter(database.InboxModel.callback_completion_key == key)
+            .count()
+            == 0
+        )
+    with pytest.raises(callback_recovery.CallbackRecoveryRefused, match="already refused"):
+        callback_recovery.create_callback(
+            key,
+            CallbackRecoveryCallbackRequest(
+                callback_token=token,
+                sender_id=SOURCE,
+                receiver_id=SUPERVISOR,
+                callback_occurrence_id="task-1-r1",
+                message=CALLBACK_LINE,
+            ),
+        )
     assert callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION)
     assert callback_recovery.terminal_has_open_recovery(SUPERVISOR, SUPERVISOR_GENERATION)
+
+
+def test_claimed_callback_effect_is_ambiguous_and_never_auto_replayed(recovery_context):
+    admission = callback_recovery.admit(recovery_context)
+    _record_turn(admission)
+    callback = _publish_callback(admission)
+    key = admission.operation["operation_key"]
+
+    callback_recovery.claim_callback_effect(key, callback["message_id"])
+    callback_recovery.mark_callback_effect_ambiguous(key)
+
+    operation = callback_recovery.get(key)
+    assert operation["state"] == callback_recovery.STATE_AMBIGUOUS
+    assert operation["callback_attempt_state"] == (
+        callback_recovery.CALLBACK_ATTEMPT_EFFECT_AMBIGUOUS
+    )
+    with pytest.raises(callback_recovery.CallbackRecoveryConflict, match="not eligible"):
+        callback_recovery.claim_callback_effect(key, callback["message_id"])
 
 
 def test_closed_workspace_retirement_holds_source_and_supervisor_rows(
@@ -670,15 +739,7 @@ def test_completed_replay_survives_prompt_inbox_retention(recovery_context):
     admission = callback_recovery.admit(recovery_context)
     _record_turn(admission)
     callback = _publish_callback(admission)
-    callback_recovery.complete(
-        admission.operation["operation_key"],
-        CallbackRecoveryCompletionRequest(
-            callback_message_id=callback["message_id"],
-            callback_message_sha256=recovery_context.callback_message_sha256,
-            callback_created_at=callback["created_at"],
-            finalization_identity_sha256=recovery_context.finalization_identity_sha256,
-        ),
-    )
+    _commit_callback(admission, callback)
     with database.SessionLocal() as db:
         db.query(database.InboxModel).filter(
             database.InboxModel.id.in_([admission.message.id, callback["message_id"]])
@@ -923,15 +984,7 @@ def test_kimi_acp_reservation_is_eligible(recovery_context):
     admission = callback_recovery.admit(body)
     _record_turn(admission, provider="kimi_cli")
     callback = _publish_callback(admission)
-    completed = callback_recovery.complete(
-        admission.operation["operation_key"],
-        CallbackRecoveryCompletionRequest(
-            callback_message_id=callback["message_id"],
-            callback_message_sha256=body.callback_message_sha256,
-            callback_created_at=callback["created_at"],
-            finalization_identity_sha256=body.finalization_identity_sha256,
-        ),
-    )
+    completed = _commit_callback(admission, callback)
     assert completed["state"] == callback_recovery.STATE_COMPLETED
 
 
@@ -1089,13 +1142,5 @@ def test_v2_reservation_and_terminal_are_authoritative(recovery_context):
     admitted = callback_recovery.admit(recovery_context)
     _record_turn(admitted)
     callback = _publish_callback(admitted)
-    completed = callback_recovery.complete(
-        admitted.operation["operation_key"],
-        CallbackRecoveryCompletionRequest(
-            callback_message_id=callback["message_id"],
-            callback_message_sha256=recovery_context.callback_message_sha256,
-            callback_created_at=callback["created_at"],
-            finalization_identity_sha256=recovery_context.finalization_identity_sha256,
-        ),
-    )
+    completed = _commit_callback(admitted, callback)
     assert completed["state"] == callback_recovery.STATE_COMPLETED

@@ -75,7 +75,10 @@ class CallbackRecoveryRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=300)
     source_terminal_id: str = Field(min_length=1)
     source_generation: str = Field(min_length=1)
-    expected_provider: Literal["codex", "kimi_cli", "claude_code"]
+    # Lifecycle-v2 is deliberately narrower than the generic provider
+    # surface.  A stale client must fail Pydantic validation before this request
+    # reaches the operation store, inbox, or any provider bridge.
+    expected_provider: Literal["codex", "kimi_cli"]
     expected_provider_session_id: str = Field(min_length=1)
     expected_execution_mode: Literal["acp"]
     supervisor_id: str = Field(min_length=1)

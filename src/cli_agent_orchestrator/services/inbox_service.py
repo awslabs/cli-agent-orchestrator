@@ -733,6 +733,14 @@ class InboxService:
                             bridge_kwargs["expected_generation"] = (
                                 message.expected_receiver_generation
                             )
+                            # Own the single provider bridge attempt before it
+                            # can emit bytes.  A crash after this point is
+                            # intentionally ambiguous and is never retried by
+                            # a later inbox sweep.
+                            callback_recovery.claim_callback_effect(
+                                message.callback_completion_key,
+                                message.id,
+                            )
                         bridged = managed_launch.deliver_inbox_via_bridge(
                             terminal_id,
                             message_id=message.id,
@@ -741,7 +749,12 @@ class InboxService:
                             **bridge_kwargs,
                         )
                     if bridged:
-                        if update_message_status(message.id, MessageStatus.DELIVERED) is False:
+                        if message.callback_completion_key is not None:
+                            callback_recovery.commit_callback_effect(
+                                message.callback_completion_key,
+                                message.id,
+                            )
+                        elif update_message_status(message.id, MessageStatus.DELIVERED) is False:
                             logger.warning(
                                 "Managed bridge accepted inbox message %s for %s, but its "
                                 "still-pending row could not be terminalized",
@@ -757,7 +770,12 @@ class InboxService:
                         # the exact-message-id bridge journal, which adopts an
                         # existing acknowledgement and refuses blind replay
                         # after ambiguity.
-                        remaining.append(message)
+                        if message.callback_completion_key is not None:
+                            callback_recovery.mark_callback_effect_ambiguous(
+                                message.callback_completion_key
+                            )
+                        else:
+                            remaining.append(message)
                 except Exception as exc:  # noqa: BLE001 - no duplicate effect
                     logger.error(
                         "Failed to deliver message %s to managed terminal %s: %s",
@@ -765,7 +783,15 @@ class InboxService:
                         terminal_id,
                         exc,
                     )
-                    remaining.append(message)
+                    if message.callback_completion_key is not None:
+                        try:
+                            callback_recovery.mark_callback_effect_ambiguous(
+                                message.callback_completion_key
+                            )
+                        except callback_recovery.CallbackRecoveryError:
+                            pass
+                    else:
+                        remaining.append(message)
                     continue
                 finally:
                     lock.release()
@@ -777,10 +803,17 @@ class InboxService:
         # preserving the row is the only safe outcome; it must never fall
         # through to native or unmanaged pane delivery.
         bound_pending = [
-            message for message in messages if message.callback_recovery_key is not None
+            message
+            for message in messages
+            if message.callback_recovery_key is not None
+            or message.callback_completion_key is not None
         ]
         if bound_pending:
-            messages = [message for message in messages if message.callback_recovery_key is None]
+            messages = [
+                message
+                for message in messages
+                if message.callback_recovery_key is None and message.callback_completion_key is None
+            ]
             logger.info(
                 "Preserving %d callback-recovery message(s) for %s; no generic "
                 "delivery fallback is permitted",

@@ -121,6 +121,8 @@ def build_capabilities(
         if status.authority_supported
     ]
     zero_proven = not enabled_providers or containment_status != "proven"
+    from cli_agent_orchestrator.services import callback_recovery
+
     return {
         "schema_version": CAPABILITY_SCHEMA_VERSION,
         "protocol": CAPABILITY_PROTOCOL,
@@ -152,6 +154,22 @@ def build_capabilities(
             "recovery": not zero_proven,
             "finalization": not zero_proven,
             "destructive": not zero_proven,
+        },
+        # This additive block is the only lifecycle-v2 negotiation surface.
+        # It remains visible while disabled so callers can distinguish an old
+        # fork from a deliberate safe rollout hold.
+        "callback_recovery": {
+            "lifecycle_version": 2,
+            "enabled": callback_recovery.lifecycle_v2_enabled(),
+            "request_schema": callback_recovery.REQUEST_SCHEMA,
+            "operation_schema": callback_recovery.OPERATION_SCHEMA,
+            "callback_lookup_schema": callback_recovery.CALLBACK_LOOKUP_SCHEMA,
+            "providers": ["codex", "kimi_cli"],
+            "pending_sweep": {
+                "enabled": True,
+                "interval_seconds": 30,
+                "grace_seconds": 30,
+            },
         },
         "delivery_journal": {
             "schema_version": 1,

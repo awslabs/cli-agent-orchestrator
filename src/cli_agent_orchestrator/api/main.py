@@ -4217,6 +4217,21 @@ async def create_callback_recovery_endpoint(
                 "proven_zero_bytes": True,
             },
         )
+    operation_key, request_sha256 = callback_recovery.operation_identity(body)
+    if not callback_recovery.lifecycle_v2_enabled():
+        # This strict request-bound response is intentionally before any
+        # operation/inbox mutation or provider bridge attempt.
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "schema": "cao-callback-recovery-lifecycle-disabled-v1",
+                "outcome": "callback-recovery-disabled",
+                "reason_code": "lifecycle-capability-disabled",
+                "operation_key": operation_key,
+                "request_sha256": request_sha256,
+                "proven_zero_bytes": True,
+            },
+        )
     try:
         result = await asyncio.to_thread(callback_recovery.admit, body)
     except callback_recovery.CallbackRecoveryRefused as exc:
@@ -4243,6 +4258,8 @@ async def create_callback_recovery_endpoint(
                 "detail": str(exc),
             },
         )
+    except callback_recovery.CallbackRecoveryIdentityConflict as exc:
+        return JSONResponse(status_code=status.HTTP_409_CONFLICT, content=exc.response)
     except callback_recovery.CallbackRecoveryConflict as exc:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
@@ -4384,16 +4401,11 @@ async def get_callback_recovery_callback_endpoint(
 ) -> Any:
     """Reconcile a dedicated callback POST by immutable completion key."""
     try:
-        result = await asyncio.to_thread(
-            callback_recovery.callback_receipt,
-            operation_key,
-        )
+        result = await asyncio.to_thread(callback_recovery.callback_lookup, operation_key)
     except callback_recovery.CallbackRecoveryNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except callback_recovery.CallbackRecoveryConflict as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
-    if result is None:
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
     return result
 
 

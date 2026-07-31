@@ -104,7 +104,65 @@ def test_source_path_mismatch_is_a_zero_byte_refusal(client, monkeypatch):
     assert called == []
 
 
+def test_lifecycle_v2_is_visible_but_default_off_and_refuses_before_admission(client, monkeypatch):
+    """The rollout gate is a request-bound, pre-row zero-byte refusal."""
+    monkeypatch.delenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", raising=False)
+    body = _body()
+    body["source_terminal_id"] = "abcdef12"
+    request = CallbackRecoveryRequest(**body)
+    expected_key, expected_digest = callback_recovery.operation_identity(request)
+    called = []
+    monkeypatch.setattr(callback_recovery, "admit", lambda *_args: called.append(True))
+
+    capability = client.get("/managed/recovery-capabilities")
+    assert capability.status_code == 200
+    assert capability.json()["callback_recovery"] == {
+        "lifecycle_version": 2,
+        "enabled": False,
+        "request_schema": "cao-callback-recovery-request-v1",
+        "operation_schema": "cao-callback-recovery-operation-v2",
+        "callback_lookup_schema": "cao-callback-recovery-callback-lookup-v1",
+        "providers": ["codex", "kimi_cli"],
+        "pending_sweep": {
+            "enabled": True,
+            "interval_seconds": 30,
+            "grace_seconds": 30,
+        },
+    }
+    response = client.post("/terminals/abcdef12/callback-recoveries", json=body)
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "schema": "cao-callback-recovery-lifecycle-disabled-v1",
+        "outcome": "callback-recovery-disabled",
+        "reason_code": "lifecycle-capability-disabled",
+        "operation_key": expected_key,
+        "request_sha256": expected_digest,
+        "proven_zero_bytes": True,
+    }
+    assert called == []
+
+
+@pytest.mark.parametrize("value", ["1", "TRUE", "yes"])
+def test_lifecycle_v2_enable_values_admit(value, client, monkeypatch):
+    monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", value)
+    body = _body()
+    body["source_terminal_id"] = "abcdef12"
+    called = []
+    monkeypatch.setattr(
+        callback_recovery, "admit", lambda *_args: called.append(True) or _admission()
+    )
+    monkeypatch.setattr(main.inbox_service, "deliver_pending", lambda *_args, **_kwargs: None)
+
+    response = client.post("/terminals/abcdef12/callback-recoveries", json=body)
+
+    assert response.status_code == 200
+    assert called
+
+
 def test_rebind_conflict_never_claims_zero_bytes(client, monkeypatch):
+    monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "true")
+
     def conflict(_body):
         raise callback_recovery.CallbackRecoveryConflict("already used")
 
@@ -118,6 +176,8 @@ def test_rebind_conflict_never_claims_zero_bytes(client, monkeypatch):
 
 
 def test_ambiguous_replay_never_claims_zero_bytes(client, monkeypatch):
+    monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "true")
+
     def ambiguous(_body):
         raise callback_recovery.CallbackRecoveryAmbiguous("provider effect remains possible")
 
@@ -134,9 +194,29 @@ def test_callback_receipt_lookup_is_read_only(client, monkeypatch):
     calls = []
     monkeypatch.setattr(
         callback_recovery,
-        "callback_receipt",
+        "callback_lookup",
         lambda key: calls.append(key)
         or {
+            "schema": "cao-callback-recovery-callback-lookup-v1",
+            "operation_key": "operation-key",
+            "request_sha256": "a" * 64,
+            "callback": {
+                "message_id": 777,
+                "sender_id": "abcdef12",
+                "receiver_id": "1234abcd",
+                "created_at": "2026-07-30T12:00:00.000000Z",
+                "callback_occurrence_id": "task-1-r1",
+                "replayed": True,
+            },
+        },
+    )
+    response = client.get("/callback-recoveries/operation-key/callback")
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema": "cao-callback-recovery-callback-lookup-v1",
+        "operation_key": "operation-key",
+        "request_sha256": "a" * 64,
+        "callback": {
             "message_id": 777,
             "sender_id": "abcdef12",
             "receiver_id": "1234abcd",
@@ -144,11 +224,26 @@ def test_callback_receipt_lookup_is_read_only(client, monkeypatch):
             "callback_occurrence_id": "task-1-r1",
             "replayed": True,
         },
-    )
-    response = client.get("/callback-recoveries/operation-key/callback")
-    assert response.status_code == 200
-    assert response.json()["message_id"] == 777
+    }
     assert calls == ["operation-key"]
+
+
+def test_callback_receipt_lookup_returns_typed_null_not_204(client, monkeypatch):
+    monkeypatch.setattr(
+        callback_recovery,
+        "callback_lookup",
+        lambda _key: {
+            "schema": "cao-callback-recovery-callback-lookup-v1",
+            "operation_key": "operation-key",
+            "request_sha256": "b" * 64,
+            "callback": None,
+        },
+    )
+
+    response = client.get("/callback-recoveries/operation-key/callback")
+
+    assert response.status_code == 200
+    assert response.json()["callback"] is None
 
 
 def test_real_http_handler_admits_authoritative_reservation(
@@ -157,6 +252,7 @@ def test_real_http_handler_admits_authoritative_reservation(
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "true")
     now = "2026-07-30T12:00:00Z"
     with database.SessionLocal() as db:
         db.add_all(
@@ -289,6 +385,7 @@ def test_dedicated_callback_handler_delivers_exact_created_row(
 
 @pytest.mark.asyncio
 async def test_slow_bridge_delivery_is_offloaded_from_event_loop(monkeypatch):
+    monkeypatch.setenv("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "true")
     entered = threading.Event()
     release = threading.Event()
 

@@ -44,6 +44,7 @@ STATE_COMPLETED = "callback-completed"
 STATE_REFUSED = "refused"
 STATE_AMBIGUOUS = "ambiguous"
 STATE_RESOLVED = "manual-resolved"
+STATE_CALLBACK_UNDELIVERABLE = "callback-undeliverable"
 KNOWN_STATES = frozenset(
     {
         STATE_INTENT,
@@ -53,9 +54,12 @@ KNOWN_STATES = frozenset(
         STATE_REFUSED,
         STATE_AMBIGUOUS,
         STATE_RESOLVED,
+        STATE_CALLBACK_UNDELIVERABLE,
     }
 )
-RELEASABLE_STATES = frozenset({STATE_COMPLETED, STATE_REFUSED, STATE_RESOLVED})
+RELEASABLE_STATES = frozenset(
+    {STATE_COMPLETED, STATE_REFUSED, STATE_RESOLVED, STATE_CALLBACK_UNDELIVERABLE}
+)
 TERMINAL_STATES = RELEASABLE_STATES
 _ZERO_EFFECT_REFUSAL_REASONS = frozenset(
     {
@@ -85,6 +89,16 @@ class CallbackRecoveryError(RuntimeError):
 
 class CallbackRecoveryConflict(CallbackRecoveryError):
     reason_code = "callback-recovery-conflict"
+
+
+class CallbackRecoveryIdentityConflict(CallbackRecoveryConflict):
+    """A typed, rowless submitted-request ownership conflict."""
+
+    reason_code = "identity-owned-elsewhere"
+
+    def __init__(self, response: dict[str, Any], *, detail: str) -> None:
+        super().__init__(detail)
+        self.response = response
 
 
 class CallbackRecoveryAmbiguous(CallbackRecoveryConflict):
@@ -148,9 +162,12 @@ def generation_lifecycle_claims(keys):
 
     with ExitStack() as stack:
         for terminal_id, generation in missing:
-            safe_terminal = re.sub(r"[^A-Za-z0-9._-]", "-", terminal_id)
-            safe_generation = re.sub(r"[^A-Za-z0-9._-]", "-", generation)
-            directory = Path(COMPANION_DIR) / safe_terminal / safe_generation
+            # Do not lossy-sanitize lifecycle identities: e.g. ``a/b`` and
+            # ``a-b`` must never share a teardown lock.  Hex is a reversible,
+            # filename-safe encoding of the exact UTF-8 identity.
+            encoded_terminal = terminal_id.encode("utf-8").hex()
+            encoded_generation = generation.encode("utf-8").hex()
+            directory = Path(COMPANION_DIR) / encoded_terminal / encoded_generation
             directory.mkdir(parents=True, exist_ok=True)
             descriptor = os.open(
                 directory / ".callback-recovery-lifecycle.lock",
@@ -222,6 +239,103 @@ def _operation_key(body: CallbackRecoveryRequest) -> str:
             "workflow": _workflow_identity(body),
             "operation_id": body.operation_id,
         }
+    )
+
+
+REQUEST_SCHEMA = "cao-callback-recovery-request-v1"
+OPERATION_SCHEMA = "cao-callback-recovery-operation-v2"
+CALLBACK_LOOKUP_SCHEMA = "cao-callback-recovery-callback-lookup-v1"
+CALLBACK_ATTEMPT_NOT_REGISTERED = "not-registered"
+CALLBACK_ATTEMPT_REGISTERED = "registered"
+CALLBACK_ATTEMPT_EFFECT_CLAIMED = "effect-claimed"
+CALLBACK_ATTEMPT_EFFECT_AMBIGUOUS = "effect-ambiguous"
+CALLBACK_ATTEMPT_ZERO_EFFECT_REFUSED = "zero-effect-refused"
+CALLBACK_ATTEMPT_EFFECT_COMMITTED = "effect-committed"
+_CALLBACK_ATTEMPT_STATES = frozenset(
+    {
+        CALLBACK_ATTEMPT_NOT_REGISTERED,
+        CALLBACK_ATTEMPT_REGISTERED,
+        CALLBACK_ATTEMPT_EFFECT_CLAIMED,
+        CALLBACK_ATTEMPT_EFFECT_AMBIGUOUS,
+        CALLBACK_ATTEMPT_ZERO_EFFECT_REFUSED,
+        CALLBACK_ATTEMPT_EFFECT_COMMITTED,
+    }
+)
+
+
+def lifecycle_v2_enabled() -> bool:
+    """Read the process-local lifecycle-v2 rollout toggle strictly.
+
+    Configuration is intentionally evaluated per process invocation.  The
+    deployment contract requires a restart for a changed value, so no request
+    can observe an in-process cache that differs from capability advertisement.
+    """
+    return os.environ.get("CAO_CALLBACK_RECOVERY_LIFECYCLE_V2_ENABLED", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def operation_identity(body: CallbackRecoveryRequest) -> tuple[str, str]:
+    """Return the address key and complete canonical request proof."""
+    return _operation_key(body), _digest(_request_payload(body))
+
+
+def _identity_conflict(
+    body: CallbackRecoveryRequest, owner: Any, *, reason_code: str
+) -> CallbackRecoveryIdentityConflict:
+    """Build a strict conflict proof while the detecting write lock is held."""
+    submitted_operation_key, submitted_request_sha256 = operation_identity(body)
+    owner_request = _stored_request(owner)
+    owner_request_sha256 = str(owner.request_sha256)
+    if reason_code == "operation-key-owned":
+        relation = {
+            "operation_key": {
+                "submitted": submitted_operation_key,
+                "owner": owner.operation_key,
+            }
+        }
+    elif reason_code == "refusal-occurrence-owned":
+        relation = {"refusal": _recovery_identity(body)}
+    elif reason_code == "callback-occurrence-owned":
+        relation = {
+            "callback_occurrence": {
+                "project": body.project,
+                "task_id": body.task_id,
+                "run_id": body.run_id,
+                "callback_occurrence_id": body.callback_occurrence_id,
+            }
+        }
+    else:  # Keep a future caller fail closed rather than inventing a proof.
+        raise CallbackRecoveryConflict("unknown identity ownership relation")
+    ownership_identity_sha256 = _digest(
+        {
+            "schema": "cao-callback-recovery-ownership-identity-v1",
+            "reason_code": reason_code,
+            "submitted_request": _request_payload(body),
+            "owner_request": owner_request,
+            "relation": relation,
+        }
+    )
+    detail = {
+        "operation-key-owned": "operation id is already bound to different workflow or recovery bytes",
+        "refusal-occurrence-owned": "this refusal occurrence already has a one-shot recovery operation",
+        "callback-occurrence-owned": "this callback occurrence already has a one-shot recovery operation",
+    }[reason_code]
+    return CallbackRecoveryIdentityConflict(
+        {
+            "schema": "cao-callback-recovery-identity-conflict-v1",
+            "outcome": "identity-owned-elsewhere",
+            "reason_code": reason_code,
+            "submitted_operation_key": submitted_operation_key,
+            "submitted_request_sha256": submitted_request_sha256,
+            "owner_operation_key": owner.operation_key,
+            "owner_request_sha256": owner_request_sha256,
+            "ownership_identity_sha256": ownership_identity_sha256,
+            "proven_zero_provider_bytes_for_submitted_request": True,
+        },
+        detail=detail,
     )
 
 
@@ -414,9 +528,14 @@ def _operation_dict(row: Any) -> dict[str, Any]:
     callback_consumed = bool(row.callback_consumed_at) or (
         callback_delivery_status == MessageStatus.DELIVERED.value
     )
+    request = _stored_request(row)
     operation = {
+        "schema": OPERATION_SCHEMA,
         "operation_key": row.operation_key,
         "operation_id": row.operation_id,
+        "request_identity_schema": REQUEST_SCHEMA,
+        "request_sha256": row.request_sha256,
+        "request": request,
         "state": row.state,
         "reason_code": row.reason_code,
         "proven_zero_bytes": row.state in {STATE_REFUSED, STATE_RESOLVED},
@@ -452,6 +571,7 @@ def _operation_dict(row: Any) -> dict[str, Any]:
         "callback_delivery_status": callback_delivery_status,
         "callback_consumed_at": row.callback_consumed_at,
         "callback_consumed": callback_consumed,
+        "callback_attempt_state": row.callback_attempt_state,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -459,7 +579,34 @@ def _operation_dict(row: Any) -> dict[str, Any]:
         operation["admission_response"] = _strict_json_object(
             row.admission_response_json, field="admission response"
         )
+    for name, raw in (
+        ("provider_turn_receipt", row.provider_turn_receipt_json),
+        ("callback_registration_receipt", row.callback_registration_receipt_json),
+        ("callback_effect_receipt", row.callback_effect_receipt_json),
+        ("callback_disposition", row.callback_disposition_json),
+    ):
+        if raw is not None:
+            operation[name] = _strict_json_object(raw, field=name)
     return operation
+
+
+def _stored_request(row: Any) -> dict[str, Any]:
+    """Load and prove the persisted canonical start request on every read."""
+    if getattr(row, "request_identity_schema", None) != REQUEST_SCHEMA:
+        raise CallbackRecoveryConflict("canonical request schema is absent or unsupported")
+    request = _strict_json_object(getattr(row, "request_json", None), field="canonical request")
+    try:
+        normalized = CallbackRecoveryRequest.model_validate(request).model_dump(mode="json")
+    except Exception as exc:  # Pydantic error details are not durable evidence.
+        raise CallbackRecoveryConflict("canonical request is malformed") from exc
+    if normalized != request:
+        raise CallbackRecoveryConflict("canonical request is not normalized")
+    if _digest(request) != row.request_sha256:
+        raise CallbackRecoveryConflict("canonical request digest contradicts operation")
+    column_projection = {field: getattr(row, field) for field in request if hasattr(row, field)}
+    if column_projection != request:
+        raise CallbackRecoveryConflict("canonical request contradicts projected operation fields")
+    return request
 
 
 def _admission_response(row: Any, inbox: Any, *, replayed: bool) -> dict[str, Any]:
@@ -559,6 +706,9 @@ def _validate_lifecycle_row(row: Any) -> None:
         value = getattr(row, field, None)
         if not isinstance(value, str) or not value:
             raise CallbackRecoveryConflict(f"callback recovery field {field!r} is malformed")
+    _stored_request(row)
+    if getattr(row, "callback_attempt_state", None) not in _CALLBACK_ATTEMPT_STATES:
+        raise CallbackRecoveryConflict("callback recovery has an invalid delivery attempt state")
     if row.state != STATE_REFUSED:
         for field in (
             "supervisor_generation",
@@ -606,6 +756,27 @@ def _validate_lifecycle_row(row: Any) -> None:
             raise CallbackRecoveryConflict("stored admission response changed identity")
     if row.state == STATE_SUBMITTED and not row.provider_turn_receipt_json:
         raise CallbackRecoveryConflict("submitted callback recovery lacks provider receipt")
+    callback_attempt = row.callback_attempt_state
+    if callback_attempt in {
+        CALLBACK_ATTEMPT_REGISTERED,
+        CALLBACK_ATTEMPT_EFFECT_CLAIMED,
+        CALLBACK_ATTEMPT_EFFECT_AMBIGUOUS,
+        CALLBACK_ATTEMPT_EFFECT_COMMITTED,
+    }:
+        if row.callback_message_id is None or row.callback_response_json is None:
+            raise CallbackRecoveryConflict("callback attempt lacks immutable registration identity")
+        registration = _strict_json_object(
+            row.callback_registration_receipt_json, field="callback registration receipt"
+        )
+        if registration.get("schema") != "cao-callback-registration-receipt-v1":
+            raise CallbackRecoveryConflict("callback attempt lacks registration receipt")
+    elif row.callback_registration_receipt_json is not None:
+        raise CallbackRecoveryConflict("unregistered callback attempt carries a receipt")
+    if callback_attempt == CALLBACK_ATTEMPT_ZERO_EFFECT_REFUSED:
+        if row.callback_message_id is not None or row.callback_response_json is not None:
+            raise CallbackRecoveryConflict("zero-effect callback refusal carries a callback row")
+        if row.reason_code not in _ZERO_EFFECT_REFUSAL_REASONS:
+            raise CallbackRecoveryConflict("zero-effect callback refusal lacks a refusal reason")
     if row.state == STATE_COMPLETED:
         completion = _strict_json_object(row.completion_json, field="completion")
         required = {
@@ -624,7 +795,14 @@ def _validate_lifecycle_row(row: Any) -> None:
         }
         if set(completion) != required:
             raise CallbackRecoveryConflict("stored callback completion has an unknown shape")
-    elif row.completion_json is not None or row.callback_message_id is not None:
+        effect = _strict_json_object(
+            row.callback_effect_receipt_json, field="callback effect receipt"
+        )
+        if effect.get("schema") != "cao-callback-effect-receipt-v1":
+            raise CallbackRecoveryConflict("completed recovery lacks callback effect receipt")
+        if row.callback_attempt_state != CALLBACK_ATTEMPT_EFFECT_COMMITTED:
+            raise CallbackRecoveryConflict("completed recovery has non-committed callback attempt")
+    elif row.completion_json is not None:
         raise CallbackRecoveryConflict("non-completed callback recovery carries completion state")
     if row.callback_response_json is not None:
         response = _strict_json_object(row.callback_response_json, field="callback response")
@@ -638,6 +816,30 @@ def _validate_lifecycle_row(row: Any) -> None:
         }
         if set(response) != required:
             raise CallbackRecoveryConflict("stored callback response has an unknown shape")
+    if row.callback_disposition_json is not None:
+        intent = _strict_json_object(
+            row.callback_disposition_json, field="callback delivery intent"
+        )
+        required = {
+            "schema",
+            "operation_key",
+            "request_sha256",
+            "callback_message_id",
+            "callback_message_sha256",
+            "callback_created_at",
+            "finalization_identity_sha256",
+            "registered_at",
+        }
+        if set(intent) != required or intent.get("schema") != "cao-callback-delivery-intent-v1":
+            raise CallbackRecoveryConflict("callback delivery intent has an unknown shape")
+        if (
+            intent["operation_key"] != row.operation_key
+            or intent["request_sha256"] != row.request_sha256
+            or intent["callback_message_id"] != row.callback_message_id
+            or intent["callback_message_sha256"] != row.callback_message_sha256
+            or intent["finalization_identity_sha256"] != row.finalization_identity_sha256
+        ):
+            raise CallbackRecoveryConflict("callback delivery intent contradicts recovery identity")
     if row.state == STATE_RESOLVED:
         resolution = _strict_json_object(row.resolution_json, field="resolution")
         if set(resolution) != {
@@ -655,7 +857,11 @@ def _validate_lifecycle_row(row: Any) -> None:
             raise CallbackRecoveryConflict(
                 "refused callback recovery lacks a proven zero-effect reason"
             )
-    elif row.state != STATE_AMBIGUOUS and row.reason_code is not None:
+    elif (
+        row.state != STATE_AMBIGUOUS
+        and row.callback_attempt_state != CALLBACK_ATTEMPT_ZERO_EFFECT_REFUSED
+        and row.reason_code is not None
+    ):
         raise CallbackRecoveryConflict("callback recovery reason is inconsistent with its state")
 
 
@@ -704,9 +910,7 @@ def _admit_locked(body: CallbackRecoveryRequest) -> RecoveryAdmission:
         if existing is not None:
             _validate_lifecycle_row(existing)
             if existing.request_sha256 != request_sha256:
-                raise CallbackRecoveryConflict(
-                    "operation id is already bound to different workflow or recovery bytes"
-                )
+                raise _identity_conflict(body, existing, reason_code="operation-key-owned")
             if existing.state == STATE_REFUSED:
                 raise CallbackRecoveryRefused(
                     "this recovery operation is durably refused",
@@ -741,9 +945,8 @@ def _admit_locked(body: CallbackRecoveryRequest) -> RecoveryAdmission:
             .one_or_none()
         )
         if consumed is not None:
-            raise CallbackRecoveryConflict(
-                "this refusal occurrence already has a one-shot recovery operation"
-            )
+            _validate_lifecycle_row(consumed)
+            raise _identity_conflict(body, consumed, reason_code="refusal-occurrence-owned")
         consumed_occurrence = (
             db.query(database.CallbackRecoveryModel)
             .filter(
@@ -756,8 +959,9 @@ def _admit_locked(body: CallbackRecoveryRequest) -> RecoveryAdmission:
             .one_or_none()
         )
         if consumed_occurrence is not None:
-            raise CallbackRecoveryConflict(
-                "this callback occurrence already has a one-shot recovery operation"
+            _validate_lifecycle_row(consumed_occurrence)
+            raise _identity_conflict(
+                body, consumed_occurrence, reason_code="callback-occurrence-owned"
             )
         moment = _now()
         row = database.CallbackRecoveryModel(
@@ -782,6 +986,8 @@ def _admit_locked(body: CallbackRecoveryRequest) -> RecoveryAdmission:
             refusal_occurrence_sha256=body.refusal_occurrence_sha256,
             refusal_request_sha256=body.refusal_request_sha256,
             callback_occurrence_id=body.callback_occurrence_id,
+            callback_status=body.callback_status,
+            callback_summary=body.callback_summary,
             callback_message_sha256=body.callback_message_sha256,
             report_path=body.report_path,
             report_sha256=body.report_sha256,
@@ -792,6 +998,9 @@ def _admit_locked(body: CallbackRecoveryRequest) -> RecoveryAdmission:
             manifest_sha256=body.manifest_sha256,
             finalization_identity_sha256=body.finalization_identity_sha256,
             request_sha256=request_sha256,
+            request_identity_schema=REQUEST_SCHEMA,
+            request_json=_canonical(payload).decode("utf-8"),
+            callback_attempt_state=CALLBACK_ATTEMPT_NOT_REGISTERED,
             created_at=moment,
             updated_at=moment,
         )
@@ -1186,6 +1395,11 @@ def _committed_callback_replay(
         if row is None:
             raise CallbackRecoveryNotFound(operation_key)
         _validate_lifecycle_row(row)
+        if row.callback_attempt_state == CALLBACK_ATTEMPT_ZERO_EFFECT_REFUSED:
+            raise CallbackRecoveryRefused(
+                "the callback was already refused before registration",
+                reason_code=str(row.reason_code),
+            )
         supplied_token = hashlib.sha256(body.callback_token.encode("utf-8")).hexdigest()
         if not secrets.compare_digest(supplied_token, str(row.callback_token_sha256 or "")):
             raise CallbackRecoveryConflict("callback recovery producer token is invalid")
@@ -1296,6 +1510,13 @@ def _create_callback_locked(
             "caller_id": "",
         }
         if live_supervisor != expected_supervisor:
+            # This is the one refusal that is proved before a callback inbox
+            # row or any delivery adapter call exists.  Preserve it durably so
+            # a lost response cannot be mistaken for a future eligible retry.
+            row.callback_attempt_state = CALLBACK_ATTEMPT_ZERO_EFFECT_REFUSED
+            row.reason_code = "supervisor-generation-mismatch"
+            row.updated_at = _now()
+            db.commit()
             raise CallbackRecoveryRefused(
                 "the original supervisor generation was replaced; callback remains held",
                 reason_code="supervisor-generation-mismatch",
@@ -1321,7 +1542,27 @@ def _create_callback_locked(
             "callback_occurrence_id": row.callback_occurrence_id,
             "replayed": False,
         }
+        registration = {
+            "schema": "cao-callback-registration-receipt-v1",
+            "operation_key": row.operation_key,
+            "request_sha256": row.request_sha256,
+            "callback_message_id": callback.id,
+            "callback_message_sha256": callback.message_sha256,
+            "callback_created_at": response["created_at"],
+            "sender_id": callback.sender_id,
+            "receiver_id": callback.receiver_id,
+            "source_generation": row.source_generation,
+            "supervisor_generation": row.supervisor_generation,
+            "supervisor_pane_id": row.supervisor_pane_id,
+            "callback_occurrence_id": row.callback_occurrence_id,
+            "registered_at": _now(),
+        }
+        row.callback_message_id = callback.id
         row.callback_response_json = json.dumps(response, sort_keys=True)
+        row.callback_registration_receipt_json = json.dumps(registration, sort_keys=True)
+        row.callback_attempt_state = CALLBACK_ATTEMPT_REGISTERED
+        row.reason_code = None
+        row.updated_at = registration["registered_at"]
         db.commit()
         return response
 
@@ -1339,8 +1580,82 @@ def callback_receipt(operation_key: str) -> Optional[dict[str, Any]]:
         return {**response, "replayed": True}
 
 
+def callback_lookup(operation_key: str) -> dict[str, Any]:
+    """Return the strict nullable callback-registration lookup surface."""
+    with database.SessionLocal() as db:
+        row = db.get(database.CallbackRecoveryModel, operation_key)
+        if row is None:
+            raise CallbackRecoveryNotFound(operation_key)
+        _validate_lifecycle_row(row)
+        callback = None
+        if row.callback_response_json is not None:
+            callback = {
+                **_strict_json_object(row.callback_response_json, field="callback response"),
+                "replayed": True,
+            }
+        return {
+            "schema": CALLBACK_LOOKUP_SCHEMA,
+            "operation_key": row.operation_key,
+            "request_sha256": row.request_sha256,
+            "callback": callback,
+        }
+
+
+def _validated_callback_completion(
+    db: Any, row: Any, body: CallbackRecoveryCompletionRequest
+) -> Any:
+    """Return the exact registered callback row after validating a v2 intent."""
+    if body.finalization_identity_sha256 != row.finalization_identity_sha256:
+        raise CallbackRecoveryConflict("finalization identity changed")
+    callback = db.get(database.InboxModel, body.callback_message_id)
+    if callback is None:
+        raise CallbackRecoveryConflict("callback inbox row is absent")
+    observed_digest = hashlib.sha256(str(callback.message).encode("utf-8")).hexdigest()
+    try:
+        if not body.callback_created_at.endswith("Z"):
+            raise ValueError("callback timestamp is not canonical UTC Z")
+        supplied_created = datetime.fromisoformat(body.callback_created_at.replace("Z", "+00:00"))
+        stored_created = callback.created_at
+        if stored_created.tzinfo is None:
+            stored_created = stored_created.replace(tzinfo=timezone.utc)
+        created_matches = supplied_created.astimezone(timezone.utc) == stored_created.astimezone(
+            timezone.utc
+        )
+    except (TypeError, ValueError):
+        created_matches = False
+    expected_callback = {
+        "id": row.callback_message_id,
+        "sender_id": row.source_terminal_id,
+        "receiver_id": row.supervisor_id,
+        "message_sha256": row.callback_message_sha256,
+        "callback_completion_key": row.operation_key,
+        "expected_receiver_generation": row.supervisor_generation,
+    }
+    observed_callback = {
+        "id": callback.id,
+        "sender_id": callback.sender_id,
+        "receiver_id": callback.receiver_id,
+        "message_sha256": observed_digest,
+        "callback_completion_key": callback.callback_completion_key,
+        "expected_receiver_generation": callback.expected_receiver_generation,
+    }
+    if (
+        observed_callback != expected_callback
+        or body.callback_message_sha256 != observed_digest
+        or not created_matches
+    ):
+        raise CallbackRecoveryConflict("callback row contradicts recovery identity")
+    return callback
+
+
 def complete(operation_key: str, body: CallbackRecoveryCompletionRequest) -> dict[str, Any]:
-    """Bind the original callback row and close the recovery exactly once."""
+    """Register a completion intent; delivery itself owns terminal completion.
+
+    The producer endpoint proves which immutable callback is intended, but it
+    cannot assert that the supervisor pane observed bytes.  The delivery path
+    calls :func:`claim_callback_effect` immediately before its native bridge
+    send and :func:`commit_callback_effect` only after that bridge succeeds.
+    """
     with database.SessionLocal() as db:
         db.execute(text("BEGIN IMMEDIATE"))
         row = db.get(database.CallbackRecoveryModel, operation_key)
@@ -1358,64 +1673,181 @@ def complete(operation_key: str, body: CallbackRecoveryCompletionRequest) -> dic
             raise CallbackRecoveryPending(
                 f"recovery prompt is {row.state!r}; callback completion is not admissible"
             )
-        if body.finalization_identity_sha256 != row.finalization_identity_sha256:
-            raise CallbackRecoveryConflict("finalization identity changed")
-        callback = db.get(database.InboxModel, body.callback_message_id)
-        if callback is None:
-            raise CallbackRecoveryConflict("callback inbox row is absent")
-        observed_digest = hashlib.sha256(str(callback.message).encode("utf-8")).hexdigest()
-        try:
-            if not body.callback_created_at.endswith("Z"):
-                raise ValueError("callback timestamp is not canonical UTC Z")
-            supplied_created = datetime.fromisoformat(
-                body.callback_created_at.replace("Z", "+00:00")
+        if row.callback_attempt_state not in {
+            CALLBACK_ATTEMPT_REGISTERED,
+            CALLBACK_ATTEMPT_EFFECT_CLAIMED,
+        }:
+            raise CallbackRecoveryPending("callback delivery is not registered for an exact effect")
+        callback = _validated_callback_completion(db, row, body)
+        intent = {
+            "schema": "cao-callback-delivery-intent-v1",
+            "operation_key": row.operation_key,
+            "request_sha256": row.request_sha256,
+            "callback_message_id": callback.id,
+            "callback_message_sha256": callback.message_sha256,
+            "callback_created_at": body.callback_created_at,
+            "finalization_identity_sha256": body.finalization_identity_sha256,
+            "registered_at": _now(),
+        }
+        if row.callback_disposition_json is not None:
+            stored_intent = _strict_json_object(
+                row.callback_disposition_json, field="callback delivery intent"
             )
-            stored_created = callback.created_at
-            if stored_created.tzinfo is None:
-                stored_created = stored_created.replace(tzinfo=timezone.utc)
-            created_matches = supplied_created.astimezone(
-                timezone.utc
-            ) == stored_created.astimezone(timezone.utc)
-        except (TypeError, ValueError):
-            created_matches = False
-        expected_callback = {
-            "sender_id": row.source_terminal_id,
-            "receiver_id": row.supervisor_id,
-            "message_sha256": row.callback_message_sha256,
-            "callback_completion_key": operation_key,
-            "expected_receiver_generation": row.supervisor_generation,
-        }
-        observed_callback = {
-            "sender_id": callback.sender_id,
-            "receiver_id": callback.receiver_id,
-            "message_sha256": observed_digest,
-            "callback_completion_key": callback.callback_completion_key,
-            "expected_receiver_generation": callback.expected_receiver_generation,
-        }
+            stable_keys = tuple(key for key in intent if key != "registered_at")
+            if {key: stored_intent.get(key) for key in stable_keys} != {
+                key: intent[key] for key in stable_keys
+            }:
+                raise CallbackRecoveryConflict(
+                    "callback delivery intent replay contradicts storage"
+                )
+        else:
+            row.callback_disposition_json = json.dumps(intent, sort_keys=True)
+            row.updated_at = intent["registered_at"]
+        db.commit()
+        return _operation_dict(row)
+
+
+def claim_callback_effect(operation_key: str, callback_message_id: int) -> None:
+    """Durably claim the one allowed callback adapter attempt before I/O."""
+    with database.SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
+        row = db.get(database.CallbackRecoveryModel, operation_key)
+        if row is None:
+            raise CallbackRecoveryNotFound(operation_key)
+        _validate_lifecycle_row(row)
         if (
-            observed_callback != expected_callback
-            or body.callback_message_sha256 != observed_digest
-            or not created_matches
+            row.state != STATE_SUBMITTED
+            or row.callback_attempt_state != CALLBACK_ATTEMPT_REGISTERED
         ):
-            raise CallbackRecoveryConflict("callback row contradicts recovery identity")
+            raise CallbackRecoveryConflict(
+                "callback effect is not eligible for a first adapter attempt"
+            )
+        if row.callback_message_id != callback_message_id:
+            raise CallbackRecoveryConflict("callback effect message contradicts registration")
+        callback = db.get(database.InboxModel, callback_message_id)
+        if callback is None or callback.status != MessageStatus.PENDING.value:
+            raise CallbackRecoveryConflict("callback effect message is not pending")
+        if (
+            callback.callback_completion_key != row.operation_key
+            or callback.message_sha256 != row.callback_message_sha256
+            or callback.sender_id != row.source_terminal_id
+            or callback.receiver_id != row.supervisor_id
+            or callback.expected_receiver_generation != row.supervisor_generation
+        ):
+            raise CallbackRecoveryConflict("callback effect message contradicts registration")
+        terminal = _terminal_row(db, row.supervisor_id)
+        if (
+            str(
+                getattr(terminal, "callback_target_generation", None)
+                or getattr(terminal, "generation", None)
+                or ""
+            )
+            != row.supervisor_generation
+            or str(getattr(terminal, "pane_id", None) or "") != row.supervisor_pane_id
+            or str(terminal.tmux_session) != row.supervisor_session
+            or getattr(terminal, "caller_id", None)
+        ):
+            raise CallbackRecoveryRefused(
+                "the original supervisor generation is no longer live",
+                reason_code="supervisor-generation-mismatch",
+            )
+        row.callback_attempt_state = CALLBACK_ATTEMPT_EFFECT_CLAIMED
+        row.updated_at = _now()
+        db.commit()
+
+
+def mark_callback_effect_ambiguous(operation_key: str) -> None:
+    """Stop automatic callback replay when an adapter result is unknowable."""
+    with database.SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
+        row = db.get(database.CallbackRecoveryModel, operation_key)
+        if row is None:
+            raise CallbackRecoveryNotFound(operation_key)
+        _validate_lifecycle_row(row)
+        if row.callback_attempt_state == CALLBACK_ATTEMPT_EFFECT_AMBIGUOUS:
+            db.commit()
+            return
+        if (
+            row.state != STATE_SUBMITTED
+            or row.callback_attempt_state != CALLBACK_ATTEMPT_EFFECT_CLAIMED
+        ):
+            raise CallbackRecoveryConflict("callback effect ambiguity has no owned adapter attempt")
+        row.callback_attempt_state = CALLBACK_ATTEMPT_EFFECT_AMBIGUOUS
+        row.state = STATE_AMBIGUOUS
+        row.reason_code = "callback-effect-ambiguous-manual-resolution-required"
+        row.updated_at = _now()
+        db.commit()
+
+
+def commit_callback_effect(operation_key: str, callback_message_id: int) -> dict[str, Any]:
+    """Commit the post-effect receipt and terminal transition atomically."""
+    with database.SessionLocal() as db:
+        db.execute(text("BEGIN IMMEDIATE"))
+        row = db.get(database.CallbackRecoveryModel, operation_key)
+        if row is None:
+            raise CallbackRecoveryNotFound(operation_key)
+        _validate_lifecycle_row(row)
+        if row.state == STATE_COMPLETED:
+            if row.callback_message_id != callback_message_id:
+                raise CallbackRecoveryConflict("callback effect replay contradicts completion")
+            db.commit()
+            return _operation_dict(row)
+        if (
+            row.state != STATE_SUBMITTED
+            or row.callback_attempt_state != CALLBACK_ATTEMPT_EFFECT_CLAIMED
+        ):
+            raise CallbackRecoveryConflict("callback effect has no claimed adapter attempt")
+        callback = db.get(database.InboxModel, callback_message_id)
+        if callback is None or row.callback_message_id != callback.id:
+            raise CallbackRecoveryConflict("callback effect row is absent or contradictory")
+        if (
+            callback.callback_completion_key != row.operation_key
+            or callback.message_sha256 != row.callback_message_sha256
+            or callback.sender_id != row.source_terminal_id
+            or callback.receiver_id != row.supervisor_id
+            or callback.expected_receiver_generation != row.supervisor_generation
+        ):
+            raise CallbackRecoveryConflict("callback effect row contradicts registration")
+        completed_at = _now()
+        created_at = callback.created_at.replace(tzinfo=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ"
+        )
         completion = {
-            **body.model_dump(mode="json"),
             "schema": "cao-callback-recovery-completion-v1",
+            "callback_message_id": callback.id,
+            "callback_message_sha256": callback.message_sha256,
+            "callback_created_at": created_at,
+            "finalization_identity_sha256": row.finalization_identity_sha256,
             "source_terminal_id": row.source_terminal_id,
             "source_generation": row.source_generation,
             "supervisor_id": row.supervisor_id,
             "supervisor_generation": row.supervisor_generation,
             "supervisor_pane_id": row.supervisor_pane_id,
             "callback_occurrence_id": row.callback_occurrence_id,
-            "completed_at": _now(),
+            "completed_at": completed_at,
         }
-        row.callback_message_id = callback.id
-        if callback.status == MessageStatus.DELIVERED.value:
-            row.callback_consumed_at = _now()
+        effect = {
+            "schema": "cao-callback-effect-receipt-v1",
+            "operation_key": row.operation_key,
+            "request_sha256": row.request_sha256,
+            "callback_message_id": callback.id,
+            "callback_message_sha256": callback.message_sha256,
+            "callback_occurrence_id": row.callback_occurrence_id,
+            "supervisor_id": row.supervisor_id,
+            "supervisor_session": row.supervisor_session,
+            "supervisor_generation": row.supervisor_generation,
+            "supervisor_pane_id": row.supervisor_pane_id,
+            "delivery_adapter": "managed-provider-bridge",
+            "effect_at": completed_at,
+        }
+        callback.status = MessageStatus.DELIVERED.value
+        row.callback_consumed_at = completed_at
+        row.callback_effect_receipt_json = json.dumps(effect, sort_keys=True)
         row.completion_json = json.dumps(completion, sort_keys=True)
+        row.callback_attempt_state = CALLBACK_ATTEMPT_EFFECT_COMMITTED
         row.state = STATE_COMPLETED
         row.reason_code = None
-        row.updated_at = completion["completed_at"]
+        row.updated_at = completed_at
         db.commit()
         db.refresh(row)
         return _operation_dict(row)
@@ -1545,13 +1977,11 @@ def terminal_has_open_recovery(
                 if row.state not in RELEASABLE_STATES:
                     return True
                 if row.state == STATE_COMPLETED:
-                    if row.callback_consumed_at:
-                        continue
-                    callback = db.get(database.InboxModel, row.callback_message_id)
-                    if callback is None or callback.status != MessageStatus.DELIVERED.value:
+                    if (
+                        row.callback_attempt_state != CALLBACK_ATTEMPT_EFFECT_COMMITTED
+                        or row.callback_effect_receipt_json is None
+                    ):
                         return True
-                    row.callback_consumed_at = _now()
-                    db.commit()
             return False
     except OperationalError as exc:
         if "no such table: callback_recovery_operations" in str(exc):
@@ -1576,16 +2006,10 @@ def held_inbox_ids() -> set[int]:
                     _validate_lifecycle_row(row)
                     open_state = row.state not in RELEASABLE_STATES
                     if row.state == STATE_COMPLETED:
-                        if row.callback_consumed_at:
-                            open_state = False
-                        else:
-                            callback = db.get(database.InboxModel, row.callback_message_id)
-                            open_state = (
-                                callback is None or callback.status != MessageStatus.DELIVERED.value
-                            )
-                            if not open_state:
-                                row.callback_consumed_at = _now()
-                                db.commit()
+                        open_state = (
+                            row.callback_attempt_state != CALLBACK_ATTEMPT_EFFECT_COMMITTED
+                            or row.callback_effect_receipt_json is None
+                        )
                 except CallbackRecoveryError:
                     open_state = True
                 if open_state and row.inbox_message_id is not None:
@@ -1624,7 +2048,12 @@ def current_delivery_binding_matches(message: InboxMessage) -> bool:
                 )
                 live_pane_id = str(getattr(terminal, "pane_id", None) or "")
                 return (
-                    recovery.state in {STATE_SUBMITTED, STATE_COMPLETED}
+                    recovery.state == STATE_SUBMITTED
+                    and recovery.callback_attempt_state
+                    in {
+                        CALLBACK_ATTEMPT_REGISTERED,
+                        CALLBACK_ATTEMPT_EFFECT_CLAIMED,
+                    }
                     and message.receiver_id == recovery.supervisor_id
                     and message.sender_id == recovery.source_terminal_id
                     and message.expected_receiver_generation == recovery.supervisor_generation
