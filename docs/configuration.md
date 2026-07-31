@@ -233,7 +233,7 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 
 A number of other `CAO_*` variables (runtime/process-identity vars like `CAO_TERMINAL_ID`, `CAO_SESSION_NAME`, `CAO_WORKFLOW_RUN_ID`; provider-tuning vars like `CAO_HERMES_*`, `CAO_AGENTS_DIR`, `CAO_API_HOST`/`CAO_API_PORT`, `CAO_PYTE_STATUS`, `CAO_EAGER_INBOX_DELIVERY`; and `CAO_AUTH_LOCAL_TOKEN`) are still read ad hoc via `os.getenv` at their call sites, mostly in `constants.py`, `mcp_server/server.py`, `security/auth.py`, and the `providers/*` modules. These were deliberately left out of this pass to keep the diff scoped to the two surfaces issue #357 named explicitly (`settings.json` + `config.json`); folding them into the registry is a natural follow-up but not required for config unification.
 
-The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` — they have no `settings.json` mapping like the rows in the table above:
+The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds nine more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` — they have no `settings.json` mapping like the rows in the table above:
 
 | Env var | Default | Type | Purpose |
 |---|---|---|---|
@@ -243,6 +243,9 @@ The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six
 | `CAO_PIPE_LIVENESS_MAX_REARM_FAILURES` | `5` | int | Consecutive failed re-arm attempts before the watchdog gives up on a terminal. |
 | `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` | `3.0` | float | Grace period after a terminal is registered before a FIFO that has never delivered a single byte is treated as a cold-start stall (harness-control#93) instead of "still booting". |
 | `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` | `5` | int | Consecutive cold-start re-arm attempts (rearm() succeeded but the pipe still never delivered) before the watchdog gives up on a terminal — a separate failure class and counter from `CAO_PIPE_LIVENESS_MAX_REARM_FAILURES`, which only counts rearm() raising. |
+| `CAO_PIPE_LIVENESS_PROBE_BACKOFF_BASE_S` | `5.0` | float | First backoff delay after the pane could not be **observed at all** (COND-0242) — a third failure class, distinct from the two counters above, which both presuppose a successful observation. Doubles per consecutive failure. |
+| `CAO_PIPE_LIVENESS_PROBE_BACKOFF_MAX_S` | `120.0` | float | Cap on that backoff, so a persistent observation failure settles to one cheap attempt per interval instead of one per check. The terminal stays enrolled — the observed failure was intermittent. |
+| `CAO_PIPE_LIVENESS_PROBE_ERROR_LOG_INTERVAL_S` | `300.0` | float | How often consecutive identical observation failures may be logged, per terminal. The first failure and the recovery are always logged. |
 
 ### State root (`CAO_STATE_ROOT`)
 

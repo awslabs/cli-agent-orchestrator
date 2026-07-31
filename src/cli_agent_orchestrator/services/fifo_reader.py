@@ -16,6 +16,9 @@ from cli_agent_orchestrator.constants import (
     PIPE_LIVENESS_COLD_START_GRACE_S,
     PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS,
     PIPE_LIVENESS_MAX_REARM_FAILURES,
+    PIPE_LIVENESS_PROBE_BACKOFF_BASE_S,
+    PIPE_LIVENESS_PROBE_BACKOFF_MAX_S,
+    PIPE_LIVENESS_PROBE_ERROR_LOG_INTERVAL_S,
     PIPE_LIVENESS_STALL_CHECKS,
 )
 from cli_agent_orchestrator.services.event_bus import bus
@@ -136,6 +139,14 @@ class FifoManager:
         # any successful re-arm; once it hits PIPE_LIVENESS_MAX_REARM_FAILURES
         # the terminal is dropped from the watchdog instead of retrying forever.
         self._rearm_failures: Dict[str, int] = {}
+        # COND-0242 observation-failure bookkeeping: consecutive failures of
+        # probe() ITSELF (the pane could not be observed), the monotonic time
+        # the next attempt becomes due under exponential backoff, and when this
+        # terminal's failure was last logged. Distinct from _rearm_failures,
+        # which counts conclusions acted on after a successful observation.
+        self._probe_failures: Dict[str, int] = {}
+        self._probe_retry_at: Dict[str, float] = {}
+        self._probe_logged_at: Dict[str, float] = {}
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
 
@@ -212,6 +223,9 @@ class FifoManager:
             self._registered_at.pop(terminal_id, None)
             self._ever_delivered.pop(terminal_id, None)
             self._cold_start_attempts.pop(terminal_id, None)
+            self._probe_failures.pop(terminal_id, None)
+            self._probe_retry_at.pop(terminal_id, None)
+            self._probe_logged_at.pop(terminal_id, None)
 
         # Deliberately NOT stopping the watchdog thread here even when this was
         # the last enrolled terminal: doing it under a "now idle" check raced
@@ -399,20 +413,97 @@ class FifoManager:
 
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.wait(PIPE_LIVENESS_CHECK_INTERVAL_S):
-            # Snapshot under _lock: create_reader()/stop_reader() mutate
-            # _pane_probe concurrently (enroll/unenroll), and iterating a dict
-            # while it's being resized raises RuntimeError — which would kill
-            # this thread and permanently disable the watchdog (round-3
-            # Copilot review on #397). The lock is released before calling
-            # _check_pipe_liveness(), which takes it again itself per-terminal
-            # — so no lock is held across the slow probe()/rearm() calls.
-            with self._lock:
-                terminal_ids = list(self._pane_probe.keys())
-            for terminal_id in terminal_ids:
-                try:
-                    self._check_pipe_liveness(terminal_id)
-                except Exception:
-                    logger.exception("pipe-pane liveness check failed for terminal %s", terminal_id)
+            self._run_liveness_sweep()
+
+    def _run_liveness_sweep(self) -> None:
+        """One watchdog pass over every enrolled terminal that is due a check.
+
+        Split out of ``_watchdog_loop`` so the bounded-failure behavior below
+        is exercisable without a thread or wall-clock timing (COND-0242).
+        """
+        # Snapshot under _lock: create_reader()/stop_reader() mutate
+        # _pane_probe concurrently (enroll/unenroll), and iterating a dict
+        # while it's being resized raises RuntimeError — which would kill
+        # this thread and permanently disable the watchdog (round-3
+        # Copilot review on #397). The lock is released before calling
+        # _check_pipe_liveness(), which takes it again itself per-terminal
+        # — so no lock is held across the slow probe()/rearm() calls.
+        now = time.monotonic()
+        with self._lock:
+            terminal_ids = [
+                terminal_id
+                for terminal_id in self._pane_probe
+                if self._probe_retry_at.get(terminal_id, 0.0) <= now
+            ]
+        for terminal_id in terminal_ids:
+            try:
+                self._check_pipe_liveness(terminal_id)
+            except Exception as exc:
+                self._record_probe_failure(terminal_id, exc)
+            else:
+                self._record_probe_success(terminal_id)
+
+    def _record_probe_failure(self, terminal_id: str, exc: BaseException) -> None:
+        """Back off and rate-limit a liveness observation that keeps failing.
+
+        The failure this bounds is "the pane could not be observed at all"
+        (COND-0242's malformed tmux listing, or a timed-out capture), which is
+        categorically different from the two failures already bounded here:
+        ``_rearm_failures`` counts a re-arm raising, and
+        ``_cold_start_attempts`` counts a pipe that re-arms fine but never
+        delivers. Both of those are conclusions drawn from a successful
+        observation. This one means no conclusion is available, so it neither
+        re-arms nor drops the terminal — it just stops asking so often, and
+        stops re-narrating the same traceback every time it does.
+        """
+        now = time.monotonic()
+        with self._lock:
+            # stop_reader() may have unenrolled this terminal while the probe
+            # was in flight; do not resurrect bookkeeping for a gone terminal.
+            if terminal_id not in self._pane_probe:
+                return
+            failures = self._probe_failures.get(terminal_id, 0) + 1
+            self._probe_failures[terminal_id] = failures
+            # Clamp the exponent, not just the result: an unclamped shift on a
+            # long-lived failure would build an enormous int before min() ever
+            # saw it.
+            delay = min(
+                PIPE_LIVENESS_PROBE_BACKOFF_BASE_S * (2 ** min(failures - 1, 20)),
+                PIPE_LIVENESS_PROBE_BACKOFF_MAX_S,
+            )
+            self._probe_retry_at[terminal_id] = now + delay
+            last_logged = self._probe_logged_at.get(terminal_id)
+            should_log = (
+                last_logged is None or now - last_logged >= PIPE_LIVENESS_PROBE_ERROR_LOG_INTERVAL_S
+            )
+            if should_log:
+                self._probe_logged_at[terminal_id] = now
+
+        if should_log:
+            logger.error(
+                "pipe-pane liveness observation failed for terminal %s "
+                "(%d consecutive; next attempt in %.0fs, repeats logged at most "
+                "every %.0fs)",
+                terminal_id,
+                failures,
+                delay,
+                PIPE_LIVENESS_PROBE_ERROR_LOG_INTERVAL_S,
+                exc_info=exc,
+            )
+
+    def _record_probe_success(self, terminal_id: str) -> None:
+        """Clear backoff after an observation that actually completed."""
+        with self._lock:
+            failures = self._probe_failures.pop(terminal_id, 0)
+            self._probe_retry_at.pop(terminal_id, None)
+            self._probe_logged_at.pop(terminal_id, None)
+        if failures:
+            logger.info(
+                "pipe-pane liveness observation for terminal %s recovered after "
+                "%d consecutive failures",
+                terminal_id,
+                failures,
+            )
 
     def _check_pipe_liveness(self, terminal_id: str) -> None:
         """One liveness check for a terminal: re-arm a stalled pipe-pane forwarder.
@@ -521,6 +612,9 @@ class FifoManager:
                     self._registered_at.pop(terminal_id, None)
                     self._ever_delivered.pop(terminal_id, None)
                     self._cold_start_attempts.pop(terminal_id, None)
+                    self._probe_failures.pop(terminal_id, None)
+                    self._probe_retry_at.pop(terminal_id, None)
+                    self._probe_logged_at.pop(terminal_id, None)
                 else:
                     self._cold_start_attempts[terminal_id] = attempts
                     # Reset the grace-period clock so the NEXT evaluation is
@@ -664,6 +758,9 @@ class FifoManager:
                     self._registered_at.pop(terminal_id, None)
                     self._ever_delivered.pop(terminal_id, None)
                     self._cold_start_attempts.pop(terminal_id, None)
+                    self._probe_failures.pop(terminal_id, None)
+                    self._probe_retry_at.pop(terminal_id, None)
+                    self._probe_logged_at.pop(terminal_id, None)
             if give_up:
                 # Not a silent retry-forever: a re-arm that keeps failing
                 # (e.g. the tmux pane is gone) previously re-struck and

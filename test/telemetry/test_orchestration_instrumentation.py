@@ -51,7 +51,9 @@ provider_stub.blocks_orchestrated_input_while_waiting_user_answer = False
 provider_stub.paste_enter_count = 1
 provider_stub.paste_submit_delay = 0.3
 
-terminal_service.get_terminal_metadata = lambda tid: {"tmux_session": "cao-s", "tmux_window": "w"}
+# **kwargs: the v1 lookup is the first tier of a two-tier probe and is
+# called with warn_if_missing=False so an expected miss stays quiet.
+terminal_service.get_terminal_metadata = lambda tid, **kw: {"tmux_session": "cao-s", "tmux_window": "w"}
 terminal_service.provider_manager.get_provider = lambda tid: provider_stub
 terminal_service.inject_memory_context = lambda msg, tid: msg
 terminal_service.update_last_active = lambda tid: None

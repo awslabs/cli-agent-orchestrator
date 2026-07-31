@@ -22,6 +22,7 @@ the caller's text and nothing else**, and any framing is requested from
 tmux with ``-p`` rather than typed into the payload.
 """
 
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -40,15 +41,37 @@ BUFFER = "cao_abcd1234"
 
 @pytest.fixture
 def client():
-    with patch("cli_agent_orchestrator.clients.tmux.libtmux"):
-        return TmuxClient()
+    with (
+        patch("cli_agent_orchestrator.clients.tmux.libtmux"),
+        # History reads are bounded tmux subprocesses since COND-0242 and
+        # claude_code re-reads the pane mid-delivery, so the binary is pinned
+        # here rather than resolved from a machine that may not have tmux.
+        patch("cli_agent_orchestrator.clients.tmux.tmux_binary", return_value="/usr/bin/tmux"),
+    ):
+        yield TmuxClient()
 
 
 @pytest.fixture
 def tmux_calls():
-    """Every ``subprocess.run`` the client makes, in order."""
+    """Every ``subprocess.run`` the client makes, in order.
+
+    Read-only observations get a real answer, because history reads run as
+    bounded tmux subprocesses too since COND-0242 and a provider (claude_code)
+    re-reads the pane mid-delivery. Write calls keep returning ``None`` — this
+    suite asserts on their argv, not on their result.
+    """
     with patch("cli_agent_orchestrator.clients.tmux.subprocess") as mock:
-        mock.run.return_value = None
+
+        def run(cmd, *args, **kwargs):
+            argv = list(cmd)
+            if "list-panes" in argv:
+                window = argv[argv.index("-t") + 1].split(":=", 1)[1]
+                return subprocess.CompletedProcess(argv, 0, stdout=f"%0\t{window}\n", stderr="")
+            if "capture-pane" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="pane tail\n", stderr="")
+            return None
+
+        mock.run.side_effect = run
         yield mock.run.call_args_list
 
 
