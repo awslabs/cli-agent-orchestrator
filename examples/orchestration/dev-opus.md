@@ -1,6 +1,6 @@
 ---
 name: dev-opus
-description: Coding worker on Claude Code (Opus) — for harder implementation/refactor tasks
+description: Model-override mechanics fixture for Claude Code (Opus), not a routing recommendation
 provider: claude_code
 model: opus
 role: developer
@@ -12,6 +12,11 @@ mcpServers:
 ---
 
 # CODING WORKER (Opus)
+
+> **Fixture only:** This profile demonstrates `provider` and `model` override
+> mechanics. It is not an operational routing recommendation. Conductor-managed
+> sessions must use an exact version/effort-attested reusable profile selected by
+> their current routing policy.
 
 You are a coding worker in a multi-agent system, used for the harder tasks
 (non-trivial refactors, architecture-sensitive changes, gnarly bugs). A planner

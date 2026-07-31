@@ -1,6 +1,6 @@
 ---
 name: dev-sonnet
-description: Coding worker on Claude Code (Sonnet) — implements features and writes tests
+description: Legacy Sonnet model-override mechanics fixture, not a routing recommendation
 provider: claude_code
 model: sonnet
 role: developer
@@ -12,6 +12,11 @@ mcpServers:
 ---
 
 # CODING WORKER (Sonnet)
+
+> **Legacy fixture only:** The `sonnet` value is retained to demonstrate model
+> override mechanics, not as an operational recommendation. Conductor-managed
+> sessions must use an exact version/effort-attested reusable profile selected by
+> their current routing policy.
 
 You are a coding worker in a multi-agent system. A planner delegates one
 well-scoped task at a time and reviews your work afterward by reading your

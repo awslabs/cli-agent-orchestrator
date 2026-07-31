@@ -147,8 +147,9 @@ explicit, stable `step_id`**. The sequential `call-N` counter fallback is race-f
 deterministic across runs under concurrent scheduling — so resume would replay the wrong
 results. Iterate over `sorted()` inputs so the mapping from item → step_id is stable.
 
-Default `max_workers=2` for `claude_code` (measured: 4 starved the heaviest lens). Expose it as
-a tunable input; higher values are fine when steps are light.
+Start with a conservative `max_workers=2` and expose it as a tunable input. Adjust it for the
+explicitly selected provider, task weight, and measured capacity; higher values are fine when
+steps are light.
 
 ### R2 — Secrets as references, never literals
 
@@ -174,11 +175,17 @@ For large results, have the step **write to a file and return the path** — don
 megabytes inline. Per-step output is `null` for schema-less steps; the files (and the aggregate
 you build) are the source of truth.
 
-### R5 (INTERIM) — Prefer a headless provider
+### R5 (INTERIM) — Resolve an explicit compatible route
 
-Prefer **`claude_code`** as the step provider. `kiro_cli` currently launches an interactive TUI
-that hangs `run_step`. **This is interim guidance** — a kiro mitigation is a tracked follow-up,
-not a permanent verdict — but until it lands, use a headless provider.
+Treat the provider and agent profile as explicit, resolved inputs. In conductor-managed use,
+defer selection to the conductor's authoritative routing/bootstrap skills and pass their exact,
+attested result into the workflow. In generic CAO use, discover provider identifiers and local
+installation status from `GET /agents/providers`, then choose a compatible installed route. Do
+not rely on a default, inheritance, or silent fallback.
+
+`kiro_cli` currently launches an interactive TUI that hangs `run_step`, so it remains excluded
+from workflow steps. This is a real transport compatibility constraint, not a preference for
+any other provider. If the resolved route is incompatible, obtain a new explicit route decision.
 
 ### Projection ranking
 
@@ -214,11 +221,15 @@ from cao_workflow import run_step, emit_output, get_inputs, ShimError
 # Parameterized: author once, invoke with different inputs.
 INPUTS = {
     "target_dir":  {"type": "path", "required": True},
+    "provider": {"type": "string", "required": True},
+    "agent_profile": {"type": "string", "required": True},
     "max_workers": {"type": "int",  "required": False, "default": 2},
 }
 
 inputs = get_inputs()
 target_dir = inputs["target_dir"]
+step_provider = inputs["provider"]
+step_agent = inputs["agent_profile"]
 max_workers = inputs.get("max_workers", 2)
 
 # sorted() → the item→step_id mapping is stable across runs (R1 determinism).
@@ -234,8 +245,8 @@ def summarize(filename: str):
         # Explicit, STABLE step_id per concurrent call (R1). Read-only role
         # RETURNS its summary inline (R3) — it does not write files.
         handle = run_step(
-            provider="claude_code",          # headless (R5)
-            agent="reviewer",
+            provider=step_provider,           # explicit resolved route (R5)
+            agent=step_agent,
             prompt=f"Summarize the file at {path} in 3 bullet points. Return the summary only.",
             step_id=f"summarize:{filename}",
         )
@@ -262,5 +273,8 @@ Validate it, ask the user, then run with a pre-announced run-id:
 ```
 cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/summarize_dir.py
 # fix findings, then — after the user approves:
-cao workflow run summarize_dir --run-id sum-1 --json &
+cao workflow run summarize_dir --run-id sum-1 \
+  --input target_dir=/abs/path/to/reports \
+  --input provider=<resolved-provider> \
+  --input agent_profile=<resolved-profile> --json &
 ```
