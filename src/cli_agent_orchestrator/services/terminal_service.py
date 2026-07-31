@@ -2943,29 +2943,11 @@ def retire_closed_workspace_session(
         if metadata is not None:
             observed.append(metadata)
 
-    claim_keys = {
-        (
-            item["id"],
-            item.get("generation") or "legacy-unversioned",
-        )
-        for item in observed
-    }
-    claim_keys.update(
-        (item["id"], item["pane_id"])
-        for item in observed
-        if item.get("pane_id")
-        and item["pane_id"] != (item.get("generation") or "legacy-unversioned")
-    )
-    claim_keys.update(
-        (item["id"], item["callback_target_generation"])
-        for item in observed
-        if item.get("callback_target_generation")
-        and item["callback_target_generation"]
-        not in {
-            item.get("generation"),
-            item.get("pane_id"),
-        }
-    )
+    claim_keys = callback_recovery.terminal_lifecycle_claim_set(*observed)
+    # A workspace-close event is a destructor too.  Acquire the identical
+    # session claim as creation and explicit deletion before every terminal
+    # claim, so a stale closed-workspace decision cannot win over a new pane.
+    claim_keys.add(("", "session-workspace", f"{type(get_backend()).__name__}:{session_name}"))
 
     with callback_recovery.generation_lifecycle_claims(claim_keys):
 
@@ -3031,17 +3013,10 @@ def retire_observed_terminal(
         raise TerminalGenerationMismatchError(
             f"terminal {terminal_id} pane identity changed before lifecycle retirement"
         )
-    generation = observed.get("generation") or "legacy-unversioned"
-    pane_id = observed.get("pane_id")
-    claim_keys = {(terminal_id, generation)}
-    if pane_id and pane_id != generation:
-        claim_keys.add((terminal_id, pane_id))
-    callback_target_generation = observed.get("callback_target_generation")
-    if callback_target_generation and callback_target_generation not in {
-        generation,
-        pane_id,
-    }:
-        claim_keys.add((terminal_id, callback_target_generation))
+    claim_keys = callback_recovery.terminal_lifecycle_claim_set(observed)
+    session_name = str(observed.get("tmux_session") or "")
+    if session_name:
+        claim_keys.add(("", "session-workspace", f"{type(get_backend()).__name__}:{session_name}"))
 
     with callback_recovery.generation_lifecycle_claims(claim_keys):
         current = _get_terminal_metadata_any(terminal_id)
@@ -3084,32 +3059,12 @@ def delete_terminal(
     """Delete under the same exact-generation claim recovery admission uses."""
     from cli_agent_orchestrator.services import callback_recovery
 
-    if expected_generation is not None:
-        with callback_recovery.generation_lifecycle_claim(terminal_id, expected_generation):
-            return _delete_terminal_claimed(
-                terminal_id,
-                registry=registry,
-                expected_generation=expected_generation,
-                expected_session=expected_session,
-                via_destructive_endpoint=via_destructive_endpoint,
-                backend_already_closed=backend_already_closed,
-                unregister_inbox=unregister_inbox,
-            )
-
     metadata = get_terminal_metadata(terminal_id)
     if metadata is None:
         metadata = get_terminal_metadata_v2(terminal_id)
-    claim_generation = (metadata or {}).get("generation") or "legacy-unversioned"
-    pane_generation = (metadata or {}).get("pane_id")
-    claim_keys = {(terminal_id, claim_generation)}
-    if pane_generation and pane_generation != claim_generation:
-        claim_keys.add((terminal_id, pane_generation))
-    callback_target_generation = (metadata or {}).get("callback_target_generation")
-    if callback_target_generation and callback_target_generation not in {
-        claim_generation,
-        pane_generation,
-    }:
-        claim_keys.add((terminal_id, callback_target_generation))
+    claim_keys = callback_recovery.terminal_lifecycle_claim_set(metadata)
+    if expected_generation and not claim_keys:
+        claim_keys.add((terminal_id, "model-generation", expected_generation))
     with callback_recovery.generation_lifecycle_claims(claim_keys):
         return _delete_terminal_claimed(
             terminal_id,

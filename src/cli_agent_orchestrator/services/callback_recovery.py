@@ -232,7 +232,11 @@ def session_lifecycle_claim(backend_kind: str, session_or_workspace: str):
     terminal claims so a stale destroy cannot race a newly-created window.
     """
     with generation_lifecycle_claims(
-        (("__session__", "session-workspace", f"{backend_kind}:{session_or_workspace}"),)
+        # The empty synthetic terminal identity sorts before every real terminal
+        # id.  Session ownership is therefore always acquired before typed
+        # terminal claims, including ordinary hexadecimal ids beginning with a
+        # digit; ``__session__`` sorted after those ids and inverted the order.
+        ((("", "session-workspace", f"{backend_kind}:{session_or_workspace}"),))
     ):
         yield
 
@@ -641,6 +645,14 @@ def _operation_dict(row: Any) -> dict[str, Any]:
     ):
         if raw is not None:
             operation[name] = _strict_json_object(raw, field=name)
+    # The paired conductor consumes governed terminal evidence through these
+    # stable public names.  Keep the descriptive storage aliases above for
+    # backwards-compatible diagnostics, but never make reconciliation infer a
+    # terminal from an opaque implementation field name.
+    if "callback_admin_disposition" in operation:
+        operation["disposition"] = operation["callback_admin_disposition"]
+    if row.resolution_json is not None:
+        operation["resolution"] = _strict_json_object(row.resolution_json, field="resolution")
     return operation
 
 
@@ -915,6 +927,7 @@ def _validate_lifecycle_row(row: Any) -> None:
             "operation_key",
             "request_sha256",
             "callback_attempt_state",
+            "certainty",
             "evidence_sha256",
             "detail",
             "disposed_at",
@@ -922,7 +935,7 @@ def _validate_lifecycle_row(row: Any) -> None:
         if (
             set(disposition) != required
             or disposition.get("schema") != "cao-callback-recovery-disposition-v1"
-            or disposition.get("outcome") != STATE_CALLBACK_UNDELIVERABLE
+            or disposition.get("outcome") != "provider-effect-proven-callback-undeliverable"
             or disposition.get("operation_key") != row.operation_key
             or disposition.get("request_sha256") != row.request_sha256
             or disposition.get("callback_attempt_state")
@@ -930,6 +943,8 @@ def _validate_lifecycle_row(row: Any) -> None:
                 CALLBACK_ATTEMPT_ZERO_EFFECT_REFUSED,
                 CALLBACK_ATTEMPT_EFFECT_AMBIGUOUS,
             }
+            or disposition.get("certainty")
+            not in {"proven-zero-callback-effect", "callback-effect-unknown"}
         ):
             raise CallbackRecoveryConflict("callback ADMIN disposition contradicts recovery")
         if row.provider_turn_receipt_json is None or row.callback_effect_receipt_json is not None:
@@ -2119,10 +2134,15 @@ def dispose_callback_undeliverable(
             disposed_at = _now()
             disposition = {
                 "schema": "cao-callback-recovery-disposition-v1",
-                "outcome": STATE_CALLBACK_UNDELIVERABLE,
+                "outcome": "provider-effect-proven-callback-undeliverable",
                 "operation_key": row.operation_key,
                 "request_sha256": row.request_sha256,
                 "callback_attempt_state": row.callback_attempt_state,
+                "certainty": (
+                    "proven-zero-callback-effect"
+                    if row.callback_attempt_state == CALLBACK_ATTEMPT_ZERO_EFFECT_REFUSED
+                    else "callback-effect-unknown"
+                ),
                 **body.model_dump(mode="json"),
                 "disposed_at": disposed_at,
             }

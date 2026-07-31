@@ -140,6 +140,6 @@ class CallbackRecoveryDispositionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    outcome: Literal["callback-undeliverable"]
+    outcome: Literal["provider-effect-proven-callback-undeliverable"]
     evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     detail: str = Field(min_length=1, max_length=500)

@@ -4376,7 +4376,11 @@ async def complete_callback_recovery_endpoint(
                 result["callback_message_id"],
                 exc,
             )
-    return result
+    # Synchronous delivery can legally commit the effect before this endpoint
+    # returns.  Return one authoritative post-attempt read, never the stale
+    # pre-delivery completion-intent snapshot that would make a completed
+    # one-shot recovery look failed to its paired conductor.
+    return await asyncio.to_thread(callback_recovery.get, operation_key)
 
 
 @app.post("/callback-recoveries/{operation_key}/callback")

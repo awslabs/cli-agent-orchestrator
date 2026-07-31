@@ -479,11 +479,16 @@ class HerdrInboxService:
                 except Exception as e:
                     logger.warning(
                         "Reconcile: tab %s live but pane re-resolve failed for %s (%s); "
-                        "deleting",
+                        "preserving",
                         term_window,
                         terminal_id,
                         e,
                     )
+                    # A live label proves that the old compact pane id was
+                    # reused; a failed re-resolution is UNKNOWN, not absence.
+                    # Do not let a transient backend error retire that live
+                    # incarnation.
+                    continue
                 else:
                     with self._ownership_lock:
                         if (
@@ -537,8 +542,18 @@ class HerdrInboxService:
             for session_name, remaining in remaining_by_session.items():
                 if remaining == 0 and session_name not in live_workspace_labels:
                     try:
-                        get_backend().kill_session(session_name)
-                        logger.info(f"Reconcile: killed empty workspace {session_name}")
+                        from cli_agent_orchestrator.services import callback_recovery
+
+                        backend = get_backend()
+                        with callback_recovery.session_lifecycle_claim(
+                            type(backend).__name__, session_name
+                        ):
+                            # Re-read while holding the shared create/delete
+                            # claim: an older empty decision must not kill a
+                            # newly persisted session occupant.
+                            if not list_terminals_by_session(session_name):
+                                backend.kill_session(session_name)
+                                logger.info(f"Reconcile: killed empty workspace {session_name}")
                     except Exception as e:
                         logger.warning(f"Reconcile: failed to kill workspace {session_name}: {e}")
 
@@ -714,7 +729,9 @@ class HerdrInboxService:
             tabs = tab_data["result"]["tabs"]
             if not isinstance(tabs, list) or any(not isinstance(tab, dict) for tab in tabs):
                 return PaneLiveness.UNKNOWN
-            live_labels = {tab.get("label", "") for tab in tabs}
+            if any(not isinstance(tab.get("label"), str) or not tab["label"] for tab in tabs):
+                return PaneLiveness.UNKNOWN
+            live_labels = {tab["label"] for tab in tabs}
             return PaneLiveness.PRESENT if window_name in live_labels else PaneLiveness.ABSENT
         except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, OSError) as e:
             logger.warning("_label_still_live: could not query herdr (%s)", e)
@@ -965,8 +982,15 @@ class HerdrInboxService:
             remaining_in_session = list_terminals_by_session(session_name) if session_name else []
             if session_name and not remaining_in_session:
                 try:
-                    get_backend().kill_session(session_name)
-                    logger.info(f"pane.closed: killed empty workspace {session_name}")
+                    from cli_agent_orchestrator.services import callback_recovery
+
+                    backend = get_backend()
+                    with callback_recovery.session_lifecycle_claim(
+                        type(backend).__name__, session_name
+                    ):
+                        if not list_terminals_by_session(session_name):
+                            backend.kill_session(session_name)
+                            logger.info(f"pane.closed: killed empty workspace {session_name}")
                 except Exception as e:
                     logger.warning(f"pane.closed: failed to kill workspace {session_name}: {e}")
 

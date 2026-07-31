@@ -750,13 +750,14 @@ def test_admin_disposition_releases_exact_undeliverable_callback(recovery_contex
     disposed = callback_recovery.dispose_callback_undeliverable(
         key,
         callback_recovery.CallbackRecoveryDispositionRequest(
-            outcome="callback-undeliverable",
+            outcome="provider-effect-proven-callback-undeliverable",
             evidence_sha256="a" * 64,
             detail="admin verified callback cannot reach the original supervisor",
         ),
     )
     assert disposed["state"] == callback_recovery.STATE_CALLBACK_UNDELIVERABLE
-    assert disposed["callback_admin_disposition"]["outcome"] == "callback-undeliverable"
+    assert disposed["disposition"]["outcome"] == "provider-effect-proven-callback-undeliverable"
+    assert disposed["disposition"]["certainty"] == "proven-zero-callback-effect"
     assert callback_recovery.get(key)["state"] == callback_recovery.STATE_CALLBACK_UNDELIVERABLE
     assert not callback_recovery.terminal_has_open_recovery(SOURCE, GENERATION)
 
