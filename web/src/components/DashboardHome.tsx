@@ -8,7 +8,29 @@ import { InboxPanel } from './InboxPanel'
 import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 
-const STATUS_ORDER = ['PROCESSING', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
+// Render/filter order for the per-session status summary and the status filter
+// pills. NOT_FIFO_MONITORED sits second, immediately after PROCESSING, because
+// the two share the `info` semantic role in design-tokens/status.json: both are
+// "this agent is alive" statements, and keeping them adjacent keeps that read at
+// the head of the row. It is not first, because PROCESSING is the stronger claim
+// (a turn is running) while NOT_FIFO_MONITORED is only reachability.
+//
+// Omitting it was a real defect, not a style choice: every managed native-TUI
+// worker reports NOT_FIFO_MONITORED (terminal_projection.project_row assigns it
+// to any lifecycle-live native-TUI row), so on a native-TUI fleet nearly every
+// agent was uncounted by StatusSummary and unreachable from the filter pills.
+//
+// Every entry here MUST have a counterpart in the generated STATUS_CONFIG (or
+// be the hand-added 'UNKNOWN' below): STATUS_META is built only from
+// STATUS_CONFIG, and `STATUS_META[s].dot` is dereferenced unguarded in both
+// StatusSummary and the status-filter pill row, so an entry with no
+// counterpart is a TypeError at render, not a missing dot.
+const STATUS_ORDER = ['PROCESSING', 'NOT_FIFO_MONITORED', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
+
+// The statuses the summary and the filter row can actually draw. Held as a
+// set so the counting site can ask "is this renderable?" against the same list
+// that governs rendering, rather than against a second hand-kept copy.
+const RENDERABLE_STATUSES = new Set(STATUS_ORDER)
 
 function fmtRel(dateStr: string | null | undefined): string | null {
   if (!dateStr) return null
@@ -38,8 +60,18 @@ const STATUS_META: Record<string, { label: string; dot: string; text: string; pu
 )
 STATUS_META['UNKNOWN'] = { label: 'Unknown', dot: 'bg-gray-500', text: 'text-gray-500' }
 
+// Selected-pill backgrounds. Each entry uses the raw Tailwind palette family
+// whose 400 shade IS that status's semantic-role token in tailwind.preset.cjs —
+// success #34d399 = emerald-400, info #60a5fa = blue-400, accent #c084fc =
+// purple-400, warning #fbbf24 = amber-400, danger #f87171 = red-400. Because
+// `Record<string, string>` plus no `noUncheckedIndexedAccess` types a missing
+// key as `string`, a status listed in STATUS_ORDER but absent here compiles
+// cleanly and renders `class="... undefined"` — a selected pill with no
+// selected appearance. NOT_FIFO_MONITORED is `info` in status.json, the same
+// role as PROCESSING, so it takes the blue family.
 const STATUS_ACTIVE_BG: Record<string, string> = {
   PROCESSING: 'bg-blue-900/40 border-blue-500/50 text-blue-300',
+  NOT_FIFO_MONITORED: 'bg-blue-900/40 border-blue-500/50 text-blue-300',
   IDLE: 'bg-emerald-900/40 border-emerald-500/50 text-emerald-300',
   WAITING_USER_ANSWER: 'bg-amber-900/40 border-amber-500/50 text-amber-300',
   ERROR: 'bg-red-900/40 border-red-500/50 text-red-300',
@@ -115,10 +147,24 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
     })
   }, [sessionData, agentTypeFilter, statusFilter, sortOrder, terminalStatuses])
 
+  // Total-preserving by construction: StatusSummary draws only the statuses in
+  // STATUS_ORDER, so a count filed under anything else is drawn by nothing and
+  // silently disappears from the session's totals. That is not hypothetical —
+  // terminal_projection.project_row reports the *lifecycle* vocabulary in
+  // `status` ('superseded' / 'dead' / 'unknown-liveness') for every row whose
+  // recorded identity no longer resolves, and the store uppercases those into
+  // buckets STATUS_ORDER has never contained. Folding any unrecognised status
+  // into UNKNOWN keeps the chips summing to the terminal count: an
+  // unrecognised status must be visibly unknown, never invisible. It is
+  // deliberately not fixed by extending STATUS_ORDER — see the note there.
+  //
+  // The fold is display-only. Filtering still compares the raw status, so a
+  // folded row is counted as Unknown without the Unknown pill claiming it.
   const getStatusCounts = (terminals: TerminalMeta[]) => {
     const counts: Record<string, number> = {}
     terminals.forEach(t => {
-      const s = terminalStatuses[t.id] || 'UNKNOWN'
+      const reported = terminalStatuses[t.id] || 'UNKNOWN'
+      const s = RENDERABLE_STATUSES.has(reported) ? reported : 'UNKNOWN'
       counts[s] = (counts[s] || 0) + 1
     })
     return counts
