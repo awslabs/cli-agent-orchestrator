@@ -3234,11 +3234,15 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # Same-Origin Policy does not block the connection, and Starlette's
     # CORSMiddleware never sees the WebSocket ASGI scope — so without this the
     # attacker page gets full PTY control (keystroke injection = RCE, plus
-    # read-back of everything the terminal renders). The browser does attach an
-    # Origin header on every cross-site handshake, so validate it here against
-    # the same trusted set the HTTP surface already enforces.
+    # read-back of everything the terminal renders). The browser attaches an
+    # Origin header (and a Host it cannot forge) on every cross-site handshake,
+    # so accept the connection only when it is same-origin with the request
+    # Host — the request the bundled viewer makes, and the one an attacker page
+    # cannot spoof — or when the Origin is in the explicit allowlists. Host is
+    # independently validated against ALLOWED_HOSTS by TrustedHostMiddleware on
+    # this same WebSocket scope, so the same-origin match is DNS-rebinding-safe.
     origin = websocket.headers.get("origin")
-    if not is_ws_origin_allowed(origin):
+    if not is_ws_origin_allowed(origin, websocket.headers.get("host")):
         logger.warning(
             "Rejected WebSocket attach for terminal %s: disallowed Origin %r",
             terminal_id,

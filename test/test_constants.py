@@ -98,7 +98,12 @@ class TestNetworkAllowlistEnvOverrides:
         env_copy = os.environ.copy()
         # Strip any pre-set network override vars so the test starts from the
         # documented defaults, then layer the overrides under test on top.
-        for key in ("CAO_CORS_ORIGINS", "CAO_ALLOWED_HOSTS", "CAO_WS_ALLOWED_CLIENTS"):
+        for key in (
+            "CAO_CORS_ORIGINS",
+            "CAO_ALLOWED_HOSTS",
+            "CAO_WS_ALLOWED_CLIENTS",
+            "CAO_WS_ALLOWED_ORIGINS",
+        ):
             env_copy.pop(key, None)
         env_copy.update(env_overrides)
         with patch.dict("os.environ", env_copy, clear=True):
@@ -166,7 +171,12 @@ class TestAddLocalCorsOrigins:
         import os
 
         env_copy = os.environ.copy()
-        for key in ("CAO_CORS_ORIGINS", "CAO_ALLOWED_HOSTS", "CAO_WS_ALLOWED_CLIENTS"):
+        for key in (
+            "CAO_CORS_ORIGINS",
+            "CAO_ALLOWED_HOSTS",
+            "CAO_WS_ALLOWED_CLIENTS",
+            "CAO_WS_ALLOWED_ORIGINS",
+        ):
             env_copy.pop(key, None)
         with patch.dict("os.environ", env_copy, clear=True):
             import cli_agent_orchestrator.constants as constants_module
@@ -302,6 +312,75 @@ class TestIsWsOriginAllowed:
         with patch.object(constants, "CORS_ORIGINS", ["http://localhost:9889"]):
             with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
                 assert constants.is_ws_origin_allowed("null") is False
+
+    def test_same_origin_via_host_match_is_allowed_without_allowlist(self):
+        """Origin authority == request Host is same-origin (the bundled viewer)
+        and passes even when both allowlists are empty — this is what keeps the
+        imported-app / dynamic-proxy deployments working."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed("http://localhost:9889", "localhost:9889")
+                    is True
+                )
+                # Proxied HTTPS at a dynamic hostname, same authority as Host.
+                assert (
+                    constants.is_ws_origin_allowed(
+                        "https://myspace-9889.app.github.dev",
+                        "myspace-9889.app.github.dev",
+                    )
+                    is True
+                )
+
+    def test_origin_authority_mismatch_with_host_is_rejected(self):
+        """A foreign Origin is rejected even when a Host is supplied — the
+        attacker's Origin authority never equals the CAO server's Host."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed("http://evil.example.com", "localhost:9889")
+                    is False
+                )
+
+    def test_null_origin_not_treated_as_same_origin(self):
+        """The opaque ``"null"`` origin has no http/https authority, so it can
+        never satisfy the Host match regardless of the request Host."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("null", "localhost:9889") is False
+
+    def test_non_http_scheme_origin_not_same_origin(self):
+        """A ``file://`` origin whose netloc coincidentally matches the Host
+        must not pass the same-origin branch — the scheme must be http/https."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed("file://localhost:9889", "localhost:9889")
+                    is False
+                )
+
+    def test_userinfo_cannot_smuggle_trusted_host(self):
+        """A crafted Origin that puts the trusted Host in the userinfo segment
+        (``http://localhost:9889@evil.example``) has real authority
+        ``evil.example`` and must be rejected."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed(
+                        "http://localhost:9889@evil.example", "localhost:9889"
+                    )
+                    is False
+                )
 
 
 class TestPipeLivenessCheckIntervalClamp:

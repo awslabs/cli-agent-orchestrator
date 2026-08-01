@@ -10,6 +10,7 @@ for agent management.
 
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cli_agent_orchestrator.models.provider import ProviderType
 
@@ -446,19 +447,35 @@ WS_ALLOWED_CLIENTS = [
 ] + _split_env_list("CAO_WS_ALLOWED_CLIENTS")
 
 # Extra Origin values accepted on the WebSocket PTY attach handshake, on top of
-# the ``CORS_ORIGINS`` list the HTTP surface already trusts. The browser sends
-# ``Origin`` on every cross-site WebSocket handshake, but — unlike ``fetch`` —
-# the Same-Origin Policy does NOT block the connection and Starlette's
-# ``CORSMiddleware`` never runs for the WebSocket ASGI scope, so the handler
-# must validate ``Origin`` itself or any web page the victim visits can drive
-# the local PTY (CWE-1385, cross-site WebSocket hijacking). Operators serving
-# the terminal viewer from an extra origin (custom reverse-proxy hostname,
-# tunnel domain) can allow it here; a literal ``*`` disables the Origin check
-# entirely, mirroring ``CAO_WS_ALLOWED_CLIENTS="*"`` for trusted setups.
+# the same-origin match and the ``CORS_ORIGINS`` list the HTTP surface already
+# trusts. The browser sends ``Origin`` on every cross-site WebSocket handshake,
+# but — unlike ``fetch`` — the Same-Origin Policy does NOT block the connection
+# and Starlette's ``CORSMiddleware`` never runs for the WebSocket ASGI scope,
+# so the handler must validate ``Origin`` itself or any web page the victim
+# visits can drive the local PTY (CWE-1385, cross-site WebSocket hijacking).
+# Operators serving the terminal viewer from a genuinely cross-origin page can
+# allow it here; a literal ``*`` disables the Origin check entirely, mirroring
+# ``CAO_WS_ALLOWED_CLIENTS="*"`` for trusted setups.
 WS_ALLOWED_ORIGINS = _split_env_list("CAO_WS_ALLOWED_ORIGINS")
 
 
-def is_ws_origin_allowed(origin: "str | None") -> bool:
+def _origin_authority(origin: str) -> "str | None":
+    """Return the ``host[:port]`` authority of an http/https ``Origin``.
+
+    ``None`` for anything that is not a plain http/https origin — an opaque
+    ``"null"`` origin, a ``file://``/``data:`` scheme, or a malformed value —
+    so those never satisfy the same-origin match below.
+    """
+    parts = urlsplit(origin)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    # ``netloc`` may carry userinfo (user:pass@host); the authority a browser
+    # actually reports in ``Origin`` never does, but strip it defensively so a
+    # crafted value can't smuggle the trusted host into the userinfo segment.
+    return parts.netloc.rsplit("@", 1)[-1]
+
+
+def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> bool:
     """Whether a WebSocket handshake ``Origin`` header may open a PTY socket.
 
     Rules, tightest-safe first:
@@ -470,9 +487,19 @@ def is_ws_origin_allowed(origin: "str | None") -> bool:
       cross-site-request-forgery threat this guards against is browser-only.
     * A literal ``*`` in ``WS_ALLOWED_ORIGINS`` disables the check (opt-in
       escape hatch for trusted tunnels, matching ``WS_ALLOWED_CLIENTS``).
-    * Otherwise the ``Origin`` must match the trusted set exactly: the same
-      ``CORS_ORIGINS`` list the HTTP API enforces (kept in sync with the
-      runtime ``--host``/``--port`` by ``add_local_cors_origins``) plus any
+    * **Same-origin**: the ``Origin`` authority equals the request ``Host``.
+      This is the request the browser makes when the viewer is served by
+      cao-server itself, and it is exactly what a cross-site attacker CANNOT
+      forge — script-set ``Host`` is forbidden and the real ``Host`` is the
+      CAO server the socket is opened to, not the attacker's page. It is
+      DNS-rebinding-safe because ``TrustedHostMiddleware`` independently
+      validates ``Host`` against ``ALLOWED_HOSTS`` on the same WebSocket scope.
+      Matching on the live ``Host`` is what lets the imported-app deployment
+      (``uvicorn ...:app``, which never runs ``add_local_cors_origins``) and
+      dynamic reverse-proxy / Codespaces hostnames work without pre-registering
+      every origin.
+    * Otherwise the ``Origin`` must appear in the explicit allowlists: the same
+      ``CORS_ORIGINS`` list the HTTP API enforces plus any
       ``CAO_WS_ALLOWED_ORIGINS`` entries. Exact-string match mirrors how the
       browser reports ``Origin`` and how ``CORSMiddleware`` compares it.
     """
@@ -480,6 +507,10 @@ def is_ws_origin_allowed(origin: "str | None") -> bool:
         return True
     if "*" in WS_ALLOWED_ORIGINS:
         return True
+    if host:
+        authority = _origin_authority(origin)
+        if authority is not None and authority == host:
+            return True
     return origin in CORS_ORIGINS or origin in WS_ALLOWED_ORIGINS
 
 
