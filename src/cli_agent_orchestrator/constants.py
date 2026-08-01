@@ -445,6 +445,44 @@ WS_ALLOWED_CLIENTS = [
     "localhost",
 ] + _split_env_list("CAO_WS_ALLOWED_CLIENTS")
 
+# Extra Origin values accepted on the WebSocket PTY attach handshake, on top of
+# the ``CORS_ORIGINS`` list the HTTP surface already trusts. The browser sends
+# ``Origin`` on every cross-site WebSocket handshake, but — unlike ``fetch`` —
+# the Same-Origin Policy does NOT block the connection and Starlette's
+# ``CORSMiddleware`` never runs for the WebSocket ASGI scope, so the handler
+# must validate ``Origin`` itself or any web page the victim visits can drive
+# the local PTY (CWE-1385, cross-site WebSocket hijacking). Operators serving
+# the terminal viewer from an extra origin (custom reverse-proxy hostname,
+# tunnel domain) can allow it here; a literal ``*`` disables the Origin check
+# entirely, mirroring ``CAO_WS_ALLOWED_CLIENTS="*"`` for trusted setups.
+WS_ALLOWED_ORIGINS = _split_env_list("CAO_WS_ALLOWED_ORIGINS")
+
+
+def is_ws_origin_allowed(origin: "str | None") -> bool:
+    """Whether a WebSocket handshake ``Origin`` header may open a PTY socket.
+
+    Rules, tightest-safe first:
+
+    * A missing / empty ``Origin`` is allowed. Browsers *always* send it on a
+      cross-site WebSocket handshake, so its absence means the caller is a
+      non-browser client (native ``websockets`` lib, CLI, tests). Those are
+      still gated by the loopback IP allowlist (``WS_ALLOWED_CLIENTS``); the
+      cross-site-request-forgery threat this guards against is browser-only.
+    * A literal ``*`` in ``WS_ALLOWED_ORIGINS`` disables the check (opt-in
+      escape hatch for trusted tunnels, matching ``WS_ALLOWED_CLIENTS``).
+    * Otherwise the ``Origin`` must match the trusted set exactly: the same
+      ``CORS_ORIGINS`` list the HTTP API enforces (kept in sync with the
+      runtime ``--host``/``--port`` by ``add_local_cors_origins``) plus any
+      ``CAO_WS_ALLOWED_ORIGINS`` entries. Exact-string match mirrors how the
+      browser reports ``Origin`` and how ``CORSMiddleware`` compares it.
+    """
+    if not origin:
+        return True
+    if "*" in WS_ALLOWED_ORIGINS:
+        return True
+    return origin in CORS_ORIGINS or origin in WS_ALLOWED_ORIGINS
+
+
 # Trusted upstream IP allowlist for uvicorn's ``proxy_headers`` and
 # ``forwarded_allow_ips`` settings. When cao-server is bound to a
 # non-loopback address (Codespaces, devcontainer, reverse proxy), uvicorn

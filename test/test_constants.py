@@ -248,6 +248,62 @@ class TestAddLocalCorsOrigins:
         assert "http://2001:db8::1:9889" not in mod.CORS_ORIGINS
 
 
+class TestIsWsOriginAllowed:
+    """Tests for the CWE-1385 cross-site WebSocket hijacking Origin guard.
+
+    ``is_ws_origin_allowed`` decides whether a WebSocket PTY handshake with a
+    given ``Origin`` header may open a socket. It reads the module-level
+    ``CORS_ORIGINS`` / ``WS_ALLOWED_ORIGINS`` lists, so patch those on the
+    module object rather than importing the values by value.
+    """
+
+    def test_missing_origin_is_allowed(self):
+        """Non-browser clients (CLI, websockets lib) send no Origin; the CSRF
+        threat is browser-only, so a missing Origin passes the guard."""
+        from cli_agent_orchestrator import constants
+
+        assert constants.is_ws_origin_allowed(None) is True
+        assert constants.is_ws_origin_allowed("") is True
+
+    def test_origin_in_cors_list_is_allowed(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["http://localhost:9889"]):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("http://localhost:9889") is True
+
+    def test_foreign_origin_is_rejected(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["http://localhost:9889"]):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("http://evil.example.com") is False
+
+    def test_extra_ws_origin_is_allowed(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", ["https://tunnel.example.dev"]):
+                assert constants.is_ws_origin_allowed("https://tunnel.example.dev") is True
+
+    def test_wildcard_disables_check(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", ["*"]):
+                assert constants.is_ws_origin_allowed("http://anything.example") is True
+
+    def test_null_origin_string_is_rejected(self):
+        """Sandboxed iframes and some cross-site contexts send the literal
+        string ``"null"``. It is a real (truthy) Origin, not an absent one, so
+        it must not pass unless explicitly allowlisted."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["http://localhost:9889"]):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("null") is False
+
+
 class TestPipeLivenessCheckIntervalClamp:
     """Regression for the round-3 Copilot review on #397: PIPE_LIVENESS_CHECK_INTERVAL_S
     feeds ``threading.Event.wait(timeout)`` in the watchdog's poll loop

@@ -66,6 +66,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_ENV_VALUE_MAX_LEN,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
+    is_ws_origin_allowed,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
 from cli_agent_orchestrator.graph.models import GraphView
@@ -3203,9 +3204,12 @@ async def get_inbox_messages_endpoint(
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
 
-    Security: This endpoint provides full PTY access with no authentication.
-    It is intended for localhost-only use. Do NOT expose the server to
-    untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
+    Security: This endpoint provides full PTY access with no bearer/token
+    authentication. It is intended for localhost-only use and is gated by two
+    checks before accept: the peer IP must be in ``WS_ALLOWED_CLIENTS`` and,
+    for browser callers, the ``Origin`` header must be in the trusted set
+    (CWE-1385 cross-site WebSocket hijacking guard). Do NOT expose the server
+    to untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
     """
     # Reject connections from clients outside the configured allowlist.
     # Defaults to loopback; operators running cao-server inside a container can
@@ -3221,6 +3225,26 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         and client_host not in WS_ALLOWED_CLIENTS
     ):
         await websocket.close(code=4003, reason="WebSocket access is restricted to allowed clients")
+        return
+
+    # Cross-site WebSocket hijacking (CWE-1385) guard. The loopback IP check
+    # above is NOT sufficient: a WebSocket opened by JavaScript on any site the
+    # victim visits originates from the victim's own browser, so its peer is
+    # 127.0.0.1 and it passes the IP allowlist. Unlike fetch(), the browser's
+    # Same-Origin Policy does not block the connection, and Starlette's
+    # CORSMiddleware never sees the WebSocket ASGI scope — so without this the
+    # attacker page gets full PTY control (keystroke injection = RCE, plus
+    # read-back of everything the terminal renders). The browser does attach an
+    # Origin header on every cross-site handshake, so validate it here against
+    # the same trusted set the HTTP surface already enforces.
+    origin = websocket.headers.get("origin")
+    if not is_ws_origin_allowed(origin):
+        logger.warning(
+            "Rejected WebSocket attach for terminal %s: disallowed Origin %r",
+            terminal_id,
+            origin,
+        )
+        await websocket.close(code=4403, reason="WebSocket Origin not allowed")
         return
 
     await websocket.accept()
