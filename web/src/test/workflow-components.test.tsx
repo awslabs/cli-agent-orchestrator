@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 import { RunList } from '../components/workflow/RunList'
 import { WorkflowTimeline } from '../components/workflow/WorkflowTimeline'
-import { SyncedTerminalPane, hasTerminalOffsets } from '../components/workflow/SyncedTerminalPane'
+import {
+  SyncedTerminalPane,
+  hasTerminalOffsets,
+  canTailTerminal,
+  TAIL_MAX_CHARS,
+} from '../components/workflow/SyncedTerminalPane'
 import { DeleteRunButton } from '../components/workflow/DeleteRunButton'
 import { WorkflowsPanel } from '../components/WorkflowsPanel'
 import { RunDetail } from '../components/workflow/RunDetail'
@@ -116,20 +121,113 @@ describe('SyncedTerminalPane — null-offset graceful-degrade seam (mutation gua
     expect(screen.queryByText(/sync pending/i)).not.toBeInTheDocument()
   })
 
-  it('BRANCH 2 — NULL offsets: shows the degrade state, never crashes/blanks, never fetches', () => {
-    const spy = vi.spyOn(api, 'getTerminalOutputRange')
+  it('BRANCH 2 — NULL offsets: never calls the offset-exact RANGE api', async () => {
+    const rangeSpy = vi.spyOn(api, 'getTerminalOutputRange')
+    vi.spyOn(api, 'getTerminalOutput').mockResolvedValue({ output: 'tail', mode: 'full' })
     render(<SyncedTerminalPane event={nullOffsets} />)
-    expect(screen.getByText(/sync pending/i)).toBeInTheDocument()
-    // No issue link: the pane used to cite a fabricated issue URL (wrong org,
-    // non-existent number), so the degrade state is now plain prose.
-    expect(screen.queryByRole('link')).toBeNull()
-    // The range API is NOT called when offsets are null.
-    expect(spy).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.getByText('tail')).toBeInTheDocument())
+    // The range API is NOT called when offsets are null — there is no window.
+    expect(rangeSpy).not.toHaveBeenCalled()
   })
 
-  it('BRANCH 2 — no selected event: still shows the degrade state, no crash', () => {
+  it('BRANCH 3 — no selected event: shows the degrade state, no crash', () => {
     render(<SyncedTerminalPane event={null} />)
     expect(screen.getByText(/sync pending/i)).toBeInTheDocument()
+    // No issue link: the pane used to cite a fabricated issue URL (wrong org,
+    // non-existent number), so the degrade state is plain prose.
+    expect(screen.queryByRole('link')).toBeNull()
+  })
+})
+
+// PR #526 human review — IMPORTANT: the PR body claimed an 8 KiB terminal tail
+// fallback on the NULL-offset branch, but the branch rendered a static "sync
+// pending" message and fetched nothing. Rather than editing the body down, the
+// fallback is implemented — so these tests pin the behaviour the body describes.
+describe('SyncedTerminalPane — NULL-offset TAIL fallback', () => {
+  const nullOffsetsWithTerminal: WorkflowEvent = {
+    run_id: 'r', seq: 2, event_type: 'step.started', event_schema_version: 1, ts: '',
+    step_id: 'a', terminal_id: 't1', terminal_offset_start: null, terminal_offset_len: null,
+  }
+  const noTerminal: WorkflowEvent = {
+    run_id: 'r', seq: 4, event_type: 'run.started', event_schema_version: 1, ts: '',
+    step_id: null, terminal_id: null, terminal_offset_start: null, terminal_offset_len: null,
+  }
+  const withOffsets: WorkflowEvent = {
+    run_id: 'r', seq: 3, event_type: 'step.output.received', event_schema_version: 1, ts: '',
+    step_id: 'a', terminal_id: 't1', terminal_offset_start: 10, terminal_offset_len: 40,
+  }
+
+  it('canTailTerminal: true only when a terminal_id exists WITHOUT offsets', () => {
+    expect(canTailTerminal(nullOffsetsWithTerminal)).toBe(true)
+    expect(canTailTerminal(noTerminal)).toBe(false)
+    expect(canTailTerminal(null)).toBe(false)
+    // With offsets present it is branch 1's job, not the fallback's.
+    expect(canTailTerminal(withOffsets)).toBe(false)
+  })
+
+  it('fetches the terminal tail and RENDERS it when offsets are null', async () => {
+    const spy = vi
+      .spyOn(api, 'getTerminalOutput')
+      .mockResolvedValue({ output: 'recent terminal tail text', mode: 'full' })
+
+    render(<SyncedTerminalPane event={nullOffsetsWithTerminal} />)
+
+    await waitFor(() =>
+      expect(screen.getByText('recent terminal tail text')).toBeInTheDocument()
+    )
+    expect(spy).toHaveBeenCalledWith('t1')
+    // It is no longer the do-nothing pending state.
+    expect(screen.queryByText(/sync pending/i)).not.toBeInTheDocument()
+  })
+
+  it('labels the tail as NOT synced to the event (the degrade must be visible)', async () => {
+    vi.spyOn(api, 'getTerminalOutput').mockResolvedValue({ output: 'x', mode: 'full' })
+    render(<SyncedTerminalPane event={nullOffsetsWithTerminal} />)
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+
+    const notice = screen.getByTestId('terminal-tail-notice')
+    expect(notice).toHaveTextContent(/recent tail \(not synced to this event\)/i)
+    // And it must NOT claim a byte range it does not have.
+    expect(screen.queryByText(/^bytes /)).not.toBeInTheDocument()
+  })
+
+  it('caps the rendered tail at TAIL_MAX_CHARS, keeping the END of the output', async () => {
+    const long = 'A'.repeat(TAIL_MAX_CHARS) + 'TAIL_END'
+    vi.spyOn(api, 'getTerminalOutput').mockResolvedValue({ output: long, mode: 'full' })
+
+    render(<SyncedTerminalPane event={nullOffsetsWithTerminal} />)
+
+    const pre = await waitFor(() => screen.getByText(/TAIL_END$/))
+    expect(pre.textContent).toHaveLength(TAIL_MAX_CHARS)
+    expect(pre.textContent?.endsWith('TAIL_END')).toBe(true)
+  })
+
+  it('degrades VISIBLY when the tail fetch fails — an alert, not a crash or a spinner', async () => {
+    vi.spyOn(api, 'getTerminalOutput').mockRejectedValue(
+      Object.assign(new Error('boom'), { detail: 'terminal not found' })
+    )
+
+    render(<SyncedTerminalPane event={nullOffsetsWithTerminal} />)
+
+    const alert = await waitFor(() => screen.getByRole('alert'))
+    expect(alert).toHaveTextContent('terminal not found')
+    // The spinner is gone — a failed fetch must not leave it spinning forever.
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+
+  it('renders an explicit empty note (not a blank pane) when the tail is empty', async () => {
+    vi.spyOn(api, 'getTerminalOutput').mockResolvedValue({ output: '', mode: 'full' })
+    render(<SyncedTerminalPane event={nullOffsetsWithTerminal} />)
+    await waitFor(() => expect(screen.getByText(/no terminal output yet/i)).toBeInTheDocument())
+  })
+
+  it('does NOT fetch anything when the event names no terminal (branch 3)', () => {
+    const tailSpy = vi.spyOn(api, 'getTerminalOutput')
+    const rangeSpy = vi.spyOn(api, 'getTerminalOutputRange')
+    render(<SyncedTerminalPane event={noTerminal} />)
+    expect(screen.getByText(/sync pending/i)).toBeInTheDocument()
+    expect(tailSpy).not.toHaveBeenCalled()
+    expect(rangeSpy).not.toHaveBeenCalled()
   })
 })
 
@@ -197,6 +295,97 @@ describe('WorkflowTimeline — declared-gap list semantics (a11y)', () => {
     render(<WorkflowTimeline events={events} gaps={gaps} selectedIndex={0} onSelectIndex={() => {}} />)
     const gap = screen.getByRole('listitem', { name: /3 event\(s\) missing between seq 1 and 5/i })
     expect(gap).toHaveAttribute('data-testid', 'timeline-gap')
+  })
+})
+
+// PR #526 human review — BLOCKING 1b: the web playback surface dropped TRAILING
+// declared gaps exactly as the SSE arm did.
+//
+// ScrubBar keyed its hatched ticks off `gapSet.has(ev.seq)` INSIDE events.map(),
+// and WorkflowTimeline's list keyed off `gapByBeforeSeq.get(ev.seq)`. A trailing
+// gap ("the run ended and the last N events were lost") carries
+// before_seq = high_water + 1, a sentinel matching no stored event, so BOTH
+// surfaces rendered nothing at all for the most severe loss the API can declare.
+describe('ScrubBar / WorkflowTimeline — TRAILING declared gap', () => {
+  const events: WorkflowEvent[] = [
+    { run_id: 'r', seq: 1, event_type: 'step.started', event_schema_version: 1, ts: '', step_id: 'a', state: 'running' },
+    { run_id: 'r', seq: 2, event_type: 'step.completed', event_schema_version: 1, ts: '', step_id: 'a', state: 'completed' },
+  ]
+  // before_seq 4 = high_water(3) + 1 — past the last event's seq (2), so it can
+  // never match an event and is invisible to a per-event lookup.
+  const trailing: GapMarker[] = [
+    { after_seq: 2, before_seq: 4, missing_count: 1, reason: 'append_failed_trailing' },
+  ]
+
+  it('renders a trailing tick at the end of the scrub bar', () => {
+    render(<WorkflowTimeline events={events} gaps={trailing} selectedIndex={0} onSelectIndex={() => {}} />)
+    const tick = screen.getByTestId('scrub-trailing-gap')
+    expect(tick).toBeInTheDocument()
+    // Hatched like an interior gap — a striped fill, NOT a colour-only signal.
+    expect(tick.className).toMatch(/repeating-linear-gradient/)
+    expect(tick).toHaveAttribute('title', expect.stringMatching(/1 event\(s\) lost after event 2/i))
+  })
+
+  it('announces the trailing gap in the slider aria-valuetext (not visual-only)', () => {
+    render(<WorkflowTimeline events={events} gaps={trailing} selectedIndex={0} onSelectIndex={() => {}} />)
+    // Every tick is aria-hidden, so the slider's value text is the ONLY route by
+    // which a screen-reader user learns the run lost its final events.
+    const slider = screen.getByRole('slider', { name: /playback position/i })
+    expect(slider).toHaveAttribute(
+      'aria-valuetext',
+      expect.stringMatching(/Trailing gap: 1 event\(s\) lost after event 2/i)
+    )
+  })
+
+  it('renders the trailing gap as a labelled list item after the last event', () => {
+    render(<WorkflowTimeline events={events} gaps={trailing} selectedIndex={0} onSelectIndex={() => {}} />)
+    const gap = screen.getByTestId('timeline-trailing-gap')
+    expect(gap.tagName).toBe('LI')
+    expect(gap).toHaveTextContent(/1 event\(s\) lost after seq 2/i)
+    expect(gap).toHaveTextContent(/append_failed_trailing/)
+    // Reachable by accessible name, and LAST in the list (the hole is at the end).
+    expect(
+      screen.getByRole('listitem', { name: /1 event\(s\) lost after seq 2/i })
+    ).toBe(gap)
+    const items = screen.getAllByRole('listitem')
+    expect(items[items.length - 1]).toBe(gap)
+  })
+
+  it('renders NO trailing marker when every gap is interior (negative control)', () => {
+    const interior: GapMarker[] = [
+      { after_seq: 1, before_seq: 2, missing_count: 0, reason: 'append_failed' },
+    ]
+    render(<WorkflowTimeline events={events} gaps={interior} selectedIndex={0} onSelectIndex={() => {}} />)
+    expect(screen.queryByTestId('scrub-trailing-gap')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('timeline-trailing-gap')).not.toBeInTheDocument()
+    const slider = screen.getByRole('slider', { name: /playback position/i })
+    expect(slider.getAttribute('aria-valuetext')).not.toMatch(/trailing gap/i)
+  })
+
+  it('renders NO trailing marker when there are no gaps at all', () => {
+    render(<WorkflowTimeline events={events} gaps={[]} selectedIndex={0} onSelectIndex={() => {}} />)
+    expect(screen.queryByTestId('scrub-trailing-gap')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('timeline-trailing-gap')).not.toBeInTheDocument()
+  })
+
+  it('renders interior AND trailing markers together without relocating the interior one', () => {
+    const spread: WorkflowEvent[] = [
+      { run_id: 'r', seq: 1, event_type: 'step.started', event_schema_version: 1, ts: '', step_id: 'a', state: 'running' },
+      { run_id: 'r', seq: 3, event_type: 'step.completed', event_schema_version: 1, ts: '', step_id: 'a', state: 'completed' },
+    ]
+    const both: GapMarker[] = [
+      { after_seq: 1, before_seq: 3, missing_count: 1, reason: 'append_failed' },
+      { after_seq: 3, before_seq: 6, missing_count: 2, reason: 'append_failed_trailing' },
+    ]
+    render(<WorkflowTimeline events={spread} gaps={both} selectedIndex={0} onSelectIndex={() => {}} />)
+
+    expect(screen.getByTestId('timeline-gap')).toBeInTheDocument()
+    expect(screen.getByTestId('timeline-trailing-gap')).toBeInTheDocument()
+    // Order: event 1, interior gap, event 3, trailing gap.
+    const items = screen.getAllByRole('listitem')
+    expect(items).toHaveLength(4)
+    expect(items[1]).toBe(screen.getByTestId('timeline-gap'))
+    expect(items[3]).toBe(screen.getByTestId('timeline-trailing-gap'))
   })
 })
 
@@ -311,5 +500,45 @@ describe('RunDetail — terminal state is observed from the polled run list (#52
     } finally {
       vi.unstubAllGlobals()
     }
+  })
+})
+
+// PR 526 review fix cycle 1 — BLOCKING: a total-loss run (no events survived, but
+// the server DECLARED the hole) must not render as the benign empty state. The
+// `events.length === 0` early return fired before the trailing-gap render, so the
+// most severe loss the journal can report ("every append was swallowed") appeared
+// as "No events recorded for this run yet" — the exact confusion FR-3.3/BR-4 exist
+// to prevent.
+describe('WorkflowTimeline — total loss is not the empty state', () => {
+  const totalLoss: GapMarker[] = [
+    { after_seq: 0, before_seq: 4, missing_count: 3, reason: 'append_failed_trailing' },
+  ]
+
+  it('declares the loss instead of the empty state when no events survived', () => {
+    render(<WorkflowTimeline events={[]} gaps={totalLoss} selectedIndex={0} onSelectIndex={() => {}} />)
+    const loss = screen.getByTestId('timeline-total-loss')
+    expect(loss).toBeInTheDocument()
+    expect(loss).toHaveTextContent(/3 events declared lost/i)
+    // The benign "nothing happened" state must NOT be what the user sees.
+    expect(screen.queryByTestId('timeline-empty')).not.toBeInTheDocument()
+  })
+
+  it('announces the loss assertively (it is a data-loss report, not decoration)', () => {
+    render(<WorkflowTimeline events={[]} gaps={totalLoss} selectedIndex={0} onSelectIndex={() => {}} />)
+    expect(screen.getByRole('alert')).toHaveTextContent(/declared lost/i)
+  })
+
+  it('still shows the empty state for a genuinely idle run (no events, no gaps)', () => {
+    render(<WorkflowTimeline events={[]} gaps={[]} selectedIndex={0} onSelectIndex={() => {}} />)
+    expect(screen.getByTestId('timeline-empty')).toBeInTheDocument()
+    expect(screen.queryByTestId('timeline-total-loss')).not.toBeInTheDocument()
+  })
+
+  it('singularises a one-event loss', () => {
+    const one: GapMarker[] = [
+      { after_seq: 0, before_seq: 2, missing_count: 1, reason: 'append_failed_trailing' },
+    ]
+    render(<WorkflowTimeline events={[]} gaps={one} selectedIndex={0} onSelectIndex={() => {}} />)
+    expect(screen.getByTestId('timeline-total-loss')).toHaveTextContent(/1 event declared lost/i)
   })
 })

@@ -416,7 +416,7 @@ async def _journal_event(
     ) as e:  # noqa: BLE001 — event append is best-effort; a lost event leaves a declared gap, never raises (BR-2)
         # WARNING, not DEBUG: losing an actual event is the more consequential
         # loss of the two best-effort writes on this path (the high-water write
-        # below degrades durability metadata; this loses journal CONTENT and
+        # ABOVE degrades durability metadata; this loses journal CONTENT and
         # punches a hole the reader must declare as a gap).
         logger.warning(
             "journal: append_event '%s' seq %d (%s) failed: %s",
@@ -962,11 +962,13 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
         record.finished_at = _now()
         # Persist the terminal FAILED state (best-effort) before re-raising (§1).
         await _ajournal(_journal_current_step, record)
-        await _ajournal(_journal_run_state, record)
         # U2 emission (BR-1, after the in-memory FAILED settle): an engine-internal
         # invariant violation faulted the run (error_kind "error", not a step
         # timeout). Emitted before the raise so the forensic timeline records it.
+        # Event BEFORE state, for the same trailing-gap reason as the finalize path
+        # below — see the ORDER IS LOAD-BEARING comment there.
         await _journal_event(record, "run.failed", state=record.state.value, error_kind="error")
+        await _ajournal(_journal_run_state, record)
         logger.error("drive: run '%s' failed with an engine error", record.run_id)
         raise
 
@@ -982,19 +984,34 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
         record.state = RunState.COMPLETED
     record.current_step_id = None
     record.finished_at = _now()
-    # Journal the terminal run state + cleared current step (§1, B4-BR-5).
     await _ajournal(_journal_current_step, record)
-    await _ajournal(_journal_run_state, record)
     # U2 emission (BR-1, after the in-memory terminal settle): the run reached its
     # terminal state. Branch on the final state — run.completed for a clean finish,
     # run.cancelled for a cooperative cancel, run.failed for a halted (on_failure=
     # halt) run (its error_kind is already carried on the step.failed event).
+    #
+    # ORDER IS LOAD-BEARING: the terminal EVENT is appended BEFORE the terminal
+    # STATE is journaled (PR #526 review, BLOCKING). The reader's trailing-gap
+    # check declares a hole when a TERMINAL run's high-water exceeds its last
+    # stored seq, on the premise that a terminal run can have no append in flight
+    # (see workflow_journal.read_events_with_gaps). With the state written first
+    # that premise was false: every healthy completed run spent the duration of
+    # its final append looking exactly like a lost trailing write, so live
+    # followers were told "1 event(s) lost" on the common success path — and the
+    # web store latches that marker for the session. Appending the event first
+    # closes the window: by the time the run is observably terminal, its last
+    # event has already landed.
     if record.state == RunState.CANCELLED:
         await _journal_event(record, "run.cancelled", state=record.state.value)
     elif record.state == RunState.FAILED:
         await _journal_event(record, "run.failed", state=record.state.value, error_kind="error")
     else:
         await _journal_event(record, "run.completed", state=record.state.value)
+    # Journal the terminal run state last (§1, B4-BR-5). Still best-effort: a lost
+    # state write leaves the run non-terminal in the journal, which the F-1 guard
+    # in _follow_run_events handles — it re-reads state each poll and closes on the
+    # transition, so a follower is not pinned forever.
+    await _ajournal(_journal_run_state, record)
 
     # Aggregate the result.
     return _build_result(record, order)
@@ -1277,9 +1294,28 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
     # append was lost) — max() of both recovers the true floor. Both reads are
     # best-effort and already degrade to 0 on failure (matching the seeded reads
     # above), so this never raises into the rebuild path.
+    #
+    # THIRD TERM (PR #526 review): both durable reads degrade to 0 on failure, so
+    # a DOUBLE read fault re-seeded the counter to 0 and the next emission
+    # re-allocated seq 1 — colliding with an already-stored (run_id, seq) row on
+    # its PK and losing the event to an IntegrityError. That matters most on the
+    # resume path, which rebuilds over a record ALREADY LIVE in this process: the
+    # cached record's ``event_seq`` is a record of what this process has actually
+    # ALLOCATED, which is exactly the floor a resume must stay above (it is safer
+    # than any value that merely PERSISTED). Flooring against it makes the
+    # counter monotonic across a rebuild even when the journal is unreadable; on
+    # a genuine cold rebuild there is no cached record and the term is 0, so the
+    # normal two-term max is unchanged.
+    # ``run_registry`` is a UNION registry (U4 widened it to hold a script tier's
+    # ``ScriptRunRecord`` too), and a ScriptRunRecord has no ``event_seq`` — so
+    # the floor is read via getattr with a 0 default rather than attribute access
+    # that would AttributeError on a script row sharing this id.
+    live = run_registry.get(run_id)
+    live_floor = int(getattr(live, "event_seq", 0) or 0)
     record.event_seq = max(
         workflow_journal.persisted_high_water(run_id),
         workflow_journal.max_event_seq(run_id),
+        live_floor,
     )
     return record
 

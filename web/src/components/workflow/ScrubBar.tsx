@@ -4,12 +4,19 @@
 // on the thumb; the value text names the selected event, not just its number.
 
 import { useRef, useEffect } from 'react'
-import type { WorkflowEvent } from '../../api'
+import type { WorkflowEvent, GapMarker } from '../../api'
 
 interface ScrubBarProps {
   events: WorkflowEvent[]
   /** Seqs at which a DECLARED gap precedes the event (hatched tick markers). */
   gapBeforeSeqs: number[]
+  /**
+   * The declared gaps themselves. Needed because a TRAILING gap's before_seq is
+   * a sentinel (high_water + 1) that matches no event, so it cannot be rendered
+   * from `gapBeforeSeqs` alone — it needs its own missing_count/after_seq to
+   * describe the hole. Optional so existing callers keep working.
+   */
+  gaps?: GapMarker[]
   selectedIndex: number
   onChange: (index: number) => void
   /** When true, move focus to the thumb (e.g. after a jump). */
@@ -19,6 +26,7 @@ interface ScrubBarProps {
 export function ScrubBar({
   events,
   gapBeforeSeqs,
+  gaps,
   selectedIndex,
   onChange,
   focusOnUpdate,
@@ -27,6 +35,15 @@ export function ScrubBar({
   const max = Math.max(0, events.length - 1)
   const selected = events[selectedIndex]
   const gapSet = new Set(gapBeforeSeqs)
+
+  // PR #526 review (BLOCKING): a TRAILING declared gap — "the run ended and the
+  // last N events were lost" — carries before_seq = high_water + 1, a sentinel
+  // that by construction matches NO stored event. Rendering ticks only inside
+  // events.map() therefore dropped it entirely: the most severe loss the API can
+  // declare was invisible on the scrub bar. Any gap sitting past the last
+  // event's seq is rendered as its own tick at the END of the bar.
+  const lastSeq = events.length ? events[events.length - 1].seq : 0
+  const trailingGaps = (gaps ?? []).filter(g => g.before_seq > lastSeq)
 
   useEffect(() => {
     if (focusOnUpdate) thumbRef.current?.focus()
@@ -45,11 +62,24 @@ export function ScrubBar({
     onChange(Math.min(Math.max(0, next), max))
   }
 
-  const valueText = selected
+  // "N event(s) lost after event M" — the trailing hole in words. Every tick
+  // here is aria-hidden (the slider owns the accessible name), so this same
+  // sentence is appended to aria-valuetext below: the declaration must not be
+  // reachable only by sighted hover over a hatched tick.
+  const trailingText = trailingGaps
+    .map(
+      g =>
+        `Trailing gap: ${g.missing_count} event(s) lost after event ${g.after_seq}` +
+        ` (${g.reason})`
+    )
+    .join('. ')
+
+  const baseValueText = selected
     ? `Event ${selectedIndex + 1} of ${events.length}: ${selected.event_type}${
         selected.step_id ? ` (${selected.step_id})` : ''
       }`
     : 'No events'
+  const valueText = trailingText ? `${baseValueText}. ${trailingText}` : baseValueText
 
   return (
     <div className="w-full">
@@ -94,6 +124,19 @@ export function ScrubBar({
             />
           )
         })}
+        {/* Trailing gap tick — pinned to the END of the bar, hatched with the
+            SAME striped fill as an interior gap (non-color encoding, no
+            color-only signal). Not a jump target: there is no event to select,
+            so it is a static marker rather than a button. */}
+        {trailingGaps.map(g => (
+          <div
+            key={`trailing-${g.before_seq}`}
+            data-testid="scrub-trailing-gap"
+            aria-hidden="true"
+            title={`Trailing gap: ${g.missing_count} event(s) lost after event ${g.after_seq} (${g.reason})`}
+            className="absolute top-0 right-0 h-full w-1.5 bg-[repeating-linear-gradient(45deg,#facc15,#facc15_2px,transparent_2px,transparent_4px)]"
+          />
+        ))}
       </div>
       <p className="mt-1 text-[11px] text-gray-500">{valueText}</p>
     </div>

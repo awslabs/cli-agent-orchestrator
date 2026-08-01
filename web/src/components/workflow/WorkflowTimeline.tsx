@@ -28,11 +28,19 @@ export function WorkflowTimeline({
   const [playing, setPlaying] = useState(false)
   const [focusScrub, setFocusScrub] = useState(false)
 
-  // A declared gap is keyed by the seq of the event it precedes (its
+  // An INTERIOR declared gap is keyed by the seq of the event it precedes (its
   // before_seq), so we can render it immediately above that event.
   const gapByBeforeSeq = new Map<number, GapMarker>()
   for (const g of gaps) gapByBeforeSeq.set(g.before_seq, g)
   const gapBeforeSeqs = gaps.map(g => g.before_seq)
+
+  // A TRAILING declared gap ("the run ended and the last N events were lost")
+  // carries before_seq = high_water + 1 — a sentinel that matches no stored
+  // event — so keying only off event seqs dropped it from this list as well as
+  // from the scrub bar (PR #526 review, BLOCKING). It renders AFTER the last
+  // event, which is where the hole actually is.
+  const lastSeq = events.length ? events[events.length - 1].seq : 0
+  const trailingGaps = gaps.filter(g => g.before_seq > lastSeq)
 
   const handleJump = (index: number) => {
     setPlaying(false)
@@ -41,13 +49,43 @@ export function WorkflowTimeline({
   }
 
   // Empty state — explicitly NOT the same as a declared gap.
-  if (events.length === 0) {
+  //
+  // A run with NO stored events but a DECLARED trailing gap is the total-loss
+  // shape: every append was swallowed, so the journal knows events existed and
+  // were lost. Falling into the empty state here reported the most severe loss
+  // the journal can express as the benign "nothing happened" (PR #526 review fix
+  // cycle 1, BLOCKING) — exactly the distinction FR-3.3 / BR-4 exist to keep. So
+  // the empty state requires BOTH no events and no declared gap.
+  if (events.length === 0 && trailingGaps.length === 0) {
     return (
       <div
         className="rounded-lg border border-gray-700/50 bg-gray-900/40 p-6 text-center text-sm text-gray-500"
         data-testid="timeline-empty"
       >
         No events recorded for this run yet.
+      </div>
+    )
+  }
+
+  // Total loss: no events survived, but the server declared the hole. Render the
+  // declaration on its own — the transport/scrubber below index events, and there
+  // are none to index.
+  if (events.length === 0) {
+    const lost = trailingGaps.reduce((n, g) => n + g.missing_count, 0)
+    return (
+      <div
+        className="rounded-lg border border-amber-600/40 bg-amber-950/20 p-6 text-sm"
+        data-testid="timeline-total-loss"
+        role="alert"
+      >
+        <p className="font-medium text-amber-300">
+          {GAP_CUE.glyph} {lost} event{lost === 1 ? '' : 's'} declared lost
+        </p>
+        <p className="mt-1 text-gray-400">
+          No events were durably recorded for this run, but the journal shows{' '}
+          {lost} {lost === 1 ? 'was' : 'were'} allocated — every append was lost.
+          This is a data-loss report, not an idle run.
+        </p>
       </div>
     )
   }
@@ -71,6 +109,7 @@ export function WorkflowTimeline({
         <ScrubBar
           events={events}
           gapBeforeSeqs={gapBeforeSeqs}
+          gaps={gaps}
           selectedIndex={selectedIndex}
           onChange={handleJump}
           focusOnUpdate={focusScrub}
@@ -132,6 +171,25 @@ export function WorkflowTimeline({
             </Fragment>
           )
         })}
+        {/* Trailing declared gap(s) — the run ended with its last append(s)
+            swallowed. Same hatched, labelled <li> treatment as an interior gap
+            (so the encoding is not color-only), positioned after the final
+            event because that is where the hole is. */}
+        {trailingGaps.map(gap => (
+          <li
+            key={`trailing-${gap.before_seq}`}
+            data-testid="timeline-trailing-gap"
+            aria-label={`${GAP_CUE.sr}: ${gap.missing_count} event(s) lost after seq ${gap.after_seq}; the run ended before they were recorded, reason ${gap.reason}`}
+            className="flex items-center gap-2 my-1 px-3 py-1.5 rounded border border-yellow-600/40 text-xs text-yellow-300 bg-[repeating-linear-gradient(45deg,rgba(250,204,21,0.12),rgba(250,204,21,0.12)_6px,transparent_6px,transparent_12px)]"
+          >
+            <GAP_CUE.Icon size={14} aria-hidden="true" className={GAP_CUE.color} />
+            <span className="font-medium">Trailing gap</span>
+            <span aria-hidden="true">{GAP_CUE.glyph}</span>
+            <span className="text-yellow-400/80">
+              {gap.missing_count} event(s) lost after seq {gap.after_seq} · {gap.reason}
+            </span>
+          </li>
+        ))}
       </ol>
     </div>
   )

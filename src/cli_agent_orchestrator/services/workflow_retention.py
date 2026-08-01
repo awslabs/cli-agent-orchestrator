@@ -115,7 +115,11 @@ def output_cap_bytes() -> int:
 
 
 def retention_days() -> int:
-    """Return the retention age bound in days (default 30, BR-1), configurable."""
+    """Return the retention age bound in days (default 30, BR-1), configurable.
+
+    ``0`` means the age bound is DISABLED (unlimited), not "expire everything" —
+    see ``sweep_runs``. A negative persisted value falls back to the default.
+    """
     try:
         v = int(get_memory_settings().get(RETENTION_DAYS_KEY, RETENTION_DAYS_DEFAULT))
         return v if v >= 0 else RETENTION_DAYS_DEFAULT
@@ -124,7 +128,11 @@ def retention_days() -> int:
 
 
 def retention_count() -> int:
-    """Return the retention run-count bound (default 100, BR-1), configurable."""
+    """Return the retention run-count bound (default 100, BR-1), configurable.
+
+    ``0`` means the count bound is DISABLED (unlimited), not "keep zero runs" —
+    see ``sweep_runs``. A negative persisted value falls back to the default.
+    """
     try:
         v = int(get_memory_settings().get(RETENTION_COUNT_KEY, RETENTION_COUNT_DEFAULT))
         return v if v >= 0 else RETENTION_COUNT_DEFAULT
@@ -262,6 +270,19 @@ def sweep_runs(
     continues (a maintenance sweep must not abort on a single bad row); only
     successful deletes are counted. Read/enumeration failures degrade to a no-op sweep
     (0) rather than raising.
+
+    **``0`` DISABLES a bound — it does not mean "keep nothing"** (PR #526 review).
+    Read naively, ``retention_days=0`` puts the age cutoff at *now*, so every run
+    that ever started is older than it; and ``retention_count=0`` makes the count
+    slice ``rows[0:]``, i.e. every row. Either therefore DELETED THE ENTIRE
+    JOURNAL — and because this sweep runs automatically at startup, a persisted 0
+    would have wiped every run on boot with no confirmation. 0 is a reachable
+    value: the settings validator admits ``>= 0`` for both keys. Treating it as
+    "this bound is off" is chosen over rejecting it, because a startup sweep must
+    not crash the server on an already-persisted 0 and because "0 = unlimited" is
+    the conventional reading of a retention bound. Both 0 -> the sweep is a no-op.
+    To delete runs deliberately, use the explicit ``DELETE /workflows/runs/{id}``
+    route; retention is a bound, not a purge tool.
     """
     days = retention_days if retention_days is not None else _default_retention_days()
     count = retention_count if retention_count is not None else _default_retention_count()
@@ -273,15 +294,21 @@ def sweep_runs(
         return 0
 
     to_prune: set[str] = set()
-    # Age bound: started_at strictly before the cutoff.
-    cutoff = _age_cutoff(days)
-    for run_id, started_at in rows:
-        if started_at and started_at < cutoff:
-            to_prune.add(run_id)
+    # Age bound: started_at strictly before the cutoff. days == 0 disables the
+    # bound (a cutoff of *now* would match every run ever started), so the age
+    # pass is SKIPPED rather than run with a degenerate cutoff.
+    if days > 0:
+        cutoff = _age_cutoff(days)
+        for run_id, started_at in rows:
+            if started_at and started_at < cutoff:
+                to_prune.add(run_id)
     # Count bound: everything beyond the most-recent ``count`` runs (rows are
-    # most-recent-first, so index >= count is "beyond the window").
-    for run_id, _started in rows[count:]:
-        to_prune.add(run_id)
+    # most-recent-first, so index >= count is "beyond the window"). count == 0
+    # disables the bound — the slice must never be allowed to become rows[0:],
+    # which is every row.
+    if count > 0:
+        for run_id, _started in rows[count:]:
+            to_prune.add(run_id)
 
     pruned = 0
     # Iterate the enumerated order for determinism; delete those in the prune set.

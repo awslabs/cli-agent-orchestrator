@@ -650,9 +650,24 @@ def _is_terminal_run(run_id: str) -> bool:
     A missing/unreadable run row answers ``False`` (declare nothing) rather than
     raising into the read path: a gap is an assertion about lost data, so the
     quiet answer is the safe default when the run's state cannot be established.
+
+    Uses the MEMOIZED ``_connect_event`` rather than ``_connect`` (PR #526
+    review): this runs on every ``read_events_with_gaps`` call, which the SSE
+    follow arm invokes 4x/second per follower, and ``_connect`` re-runs
+    ``_migrate_workflow_run`` + ``_migrate_workflow_run_step`` on EVERY call.
+    ``_connect_event`` migrates the event/seq tables at most once per process per
+    DB path, so the poll no longer pays two migrations per tick.
+
+    The table-coverage difference is not a behaviour change here. ``_connect``
+    would CREATE an absent ``workflow_run`` table and then read no row -> False;
+    ``_connect_event`` does not create it, so an absent table raises
+    ``sqlite3.Error``, which the except-arm below also answers False. Both paths
+    reach the identical answer, and the only path that produces a True (a real
+    stored run row) requires ``insert_run`` to have run through ``_connect``
+    already.
     """
     try:
-        with _connect() as conn:
+        with _connect_event() as conn:
             row = conn.execute(
                 "SELECT state FROM workflow_run WHERE run_id = ?",
                 (run_id,),
@@ -691,19 +706,51 @@ def read_events_with_gaps(
     event's seq (nothing has been allocated at ``high_water + 1`` yet).
 
     A trailing gap is declared ONLY for a run in a terminal state. Because the
-    high-water is persisted BEFORE its append, a RUNNING run legitimately sits
-    one seq ahead for the duration of every in-flight append — declaring on that
-    window would emit a phantom gap on essentially every poll of every live run.
-    Once the run is terminal no further append can land, so the excess is a real,
-    permanent hole. This makes the check quiet by construction rather than
-    relying on a timing tolerance.
+    high-water is persisted BEFORE each fallible append, a RUNNING run
+    legitimately sits one seq ahead for the duration of every in-flight append —
+    declaring on that window would emit a phantom gap on essentially every poll
+    of every live run. Once the run is terminal no further append can land, so
+    the excess is a real, permanent hole. This makes the check quiet by
+    construction rather than relying on a timing tolerance.
+
+    That invariant depends on ``_drive`` appending a run's terminal EVENT before
+    it writes the terminal STATE. The reverse order (state first) opened a window
+    in which a perfectly healthy completed run read as a trailing loss, because
+    the run row said ``completed`` while its final append was still in flight —
+    see the ordering comment in ``workflow_service._drive``. Do not reorder those
+    two writes without re-reading this guard.
+
+    A from-start read (``after_seq is None``) seeds the comparison at ``0`` —
+    one below the first allocatable seq — unconditionally, so the from-start and
+    cursor-at-0 reads agree on every shape: leading, interior, trailing, and
+    total loss. Healthy runs are unaffected (first seq is 1, and an empty run has
+    ``high_water == 0``), so the quiet cases stay quiet.
     """
     rows = read_events(run_id, after_seq)
     gaps: List[GapMarker] = []
     if after_seq is not None:
         prev: Optional[int] = after_seq
     else:
-        prev = rows[0].seq - 1 if rows else None
+        # A from-start read seeds at 0 — one below the first allocatable seq
+        # (seqs start at 1) — UNCONDITIONALLY, whether or not rows came back.
+        #
+        # This replaced two earlier forms, each of which hid a real hole (PR #526
+        # review). `prev = None` on the empty-rows path skipped the trailing block
+        # entirely, so the MOST severe shape — every append swallowed, nothing
+        # landed — declared nothing on the default read while a cursor read of the
+        # same run DID declare it. And `prev = rows[0].seq - 1` on the non-empty
+        # path was SELF-REFERENTIAL: it defined "previous" as one below the first
+        # SURVIVING row, which makes any LEADING hole invisible by construction
+        # (seqs 1,2 lost with 3,4,5 landed read back as no gap at all, while the
+        # equivalent cursor-at-0 read declared it).
+        #
+        # Seeding 0 makes the from-start and cursor-at-0 reads agree on every
+        # shape — leading, interior, trailing, and total loss — which is the
+        # contract this function documents. A healthy run is unaffected: its
+        # first row is seq 1, and 1 > 0 + 1 is false, so no phantom leading gap.
+        # A healthy EMPTY run has high_water == 0, so 0 > 0 is false and the
+        # trailing block stays silent too — the quiet cases stay quiet.
+        prev = 0
     for row in rows:
         if prev is not None and row.seq > prev + 1:
             gaps.append(
@@ -719,8 +766,13 @@ def read_events_with_gaps(
     # Trailing hole: allocated past the last row that landed. `prev` is the last
     # delivered seq (or the cursor when this page is empty); a read failure in
     # persisted_high_water degrades to 0, which simply declares no trailing gap.
-    # Terminal-only (see the docstring): a live run is legitimately one ahead
-    # mid-append, so checking it there would emit a phantom gap every poll.
+    # TERMINAL-only, and that is sufficient ONLY because `_drive` appends a run's
+    # terminal EVENT before it writes the terminal STATE. With the writes in the
+    # other order a healthy completed run spent the whole duration of its final
+    # append looking exactly like a lost trailing write, and every live follower
+    # was told it had lost an event (PR #526 review, BLOCKING — fixed by the
+    # reorder, see the ORDER IS LOAD-BEARING comments in workflow_service._drive).
+    # Do not reorder those two writes without re-reading this guard.
     if prev is not None and _is_terminal_run(run_id):
         high_water = persisted_high_water(run_id)
         if high_water > prev:
@@ -801,10 +853,24 @@ def list_run_ids_by_age() -> List[Tuple[str, str]]:
 # ---------------------------------------------------------------------------
 # Per-run deletion cascade (FR-11 / NFR-SEC-5, Algorithm 5).
 # ---------------------------------------------------------------------------
-def delete_run_events(run_id: str) -> None:
-    """DELETE every ``workflow_run_event`` row for a run (append-only table cleared)."""
-    with _connect_event() as conn:
-        conn.execute("DELETE FROM workflow_run_event WHERE run_id = ?", (run_id,))
+_DELETE_EVENTS_SQL = "DELETE FROM workflow_run_event WHERE run_id = ?"
+
+
+def delete_run_events(run_id: str, conn: Optional[sqlite3.Connection] = None) -> None:
+    """DELETE every ``workflow_run_event`` row for a run (append-only table cleared).
+
+    ``conn`` lets a caller that already holds a connection run this statement
+    INSIDE its own transaction; omitted, the function opens and commits its own.
+    ``delete_run`` passes its connection so the helper has a real production
+    caller (PR #526 review — it was reachable only from a test) WITHOUT splitting
+    the four-statement cascade across two transactions, which is what a naive
+    ``delete_run_events(run_id)`` call from inside ``delete_run`` would have done.
+    """
+    if conn is not None:
+        conn.execute(_DELETE_EVENTS_SQL, (run_id,))
+        return
+    with _connect_event() as own:
+        own.execute(_DELETE_EVENTS_SQL, (run_id,))
 
 
 def delete_run(run_id: str) -> None:
@@ -831,7 +897,10 @@ def delete_run(run_id: str) -> None:
     _migrate_workflow_run()
     _migrate_workflow_run_step()
     with _connect_event() as conn:
-        conn.execute("DELETE FROM workflow_run_event WHERE run_id = ?", (run_id,))
+        # The event delete goes through the shared helper (DRY, one definition of
+        # "clear a run's events"); the connection is threaded in so all four
+        # statements stay in ONE transaction.
+        delete_run_events(run_id, conn)
         conn.execute("DELETE FROM workflow_run_seq WHERE run_id = ?", (run_id,))
         conn.execute("DELETE FROM workflow_run_step WHERE run_id = ?", (run_id,))
         conn.execute("DELETE FROM workflow_run WHERE run_id = ?", (run_id,))

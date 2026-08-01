@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Validated by a 20-package controlled A/B experiment: +11 mean points on work items with headroom (6/6 wins, sign test p = 0.016), neutral at the ceiling — `docs/self-learning-validation.md`
 - `cao profile find <query>` CLI verb and `find_profiles` MCP tool for keyword/BM25 profile discovery over metadata (name, description, tags, capabilities); metadata-only, never exposes prompt bodies (#340)
 - Optional `capabilities` and `tags` arrays in the agent profile frontmatter schema (#340)
+- **Durable workflow run journal** — a workflow run's execution history now survives a server restart and is inspectable after the fact (#504):
+  - append-only `workflow_run_event` table with a per-run `seq` as the sole ordering authority; a swallowed append leaves a hole the read path DECLARES as a `GapMarker` (interior and trailing) rather than renumbering it away, so "nothing happened" is distinguishable from "an event was lost"
+  - read routes over the durable journal, all answered with no in-memory `run_registry` dependency: `GET /workflows/runs/{id}` (enriched inspect), `GET .../events` (ordered timeline), `GET .../compare?against=` (per-step comparison), `GET .../diagnostics` (troubleshooting bundle). All four require a `cao:read`/`cao:write`/`cao:admin` scope when auth is enabled
+  - SSE live-follow content-negotiated onto the same `.../events` path (`Accept: text/event-stream` or `?stream=true`): durable replay from a cursor, exact `Last-Event-ID` reconnect, and a terminal-state guard that closes an already-ended run instead of hanging the follower
+  - `GET /terminals/{id}/output/range` for byte-exact reads of a terminal's append-only log
+  - `DELETE /workflows/runs/{id}` (write/admin scope) removing a run and all its retained data, plus an age + run-count retention sweep at startup — `0` on either bound DISABLES that bound
+  - web: a run list / detail surface with event-timeline playback (transport + ARIA scrubber), declared-gap markers, and a terminal pane synced to the selected event
+  - output capture is OFF by default (metadata only); when enabled, retained text is size-capped and funnelled through the existing `audit_log` sanitizer. Four new `memory` settings — see [Configuration](docs/configuration.md#memory-memory)
 
 ### Fixed
 

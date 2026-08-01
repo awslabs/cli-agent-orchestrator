@@ -124,7 +124,14 @@ from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
     TerminalInputBlockedError,
 )
-from cli_agent_orchestrator.services.workflow_journal import EventRow, GapMarker, StepRow
+from cli_agent_orchestrator.services.workflow_journal import (
+    _TERMINAL_RUN_STATES as _JOURNAL_TERMINAL_RUN_STATES,
+)
+from cli_agent_orchestrator.services.workflow_journal import (
+    EventRow,
+    GapMarker,
+    StepRow,
+)
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -2433,6 +2440,7 @@ async def get_terminal_output_range(
         le=TERMINAL_RANGE_MAX_LENGTH,
         description=f"Bytes to read (capped at {TERMINAL_RANGE_MAX_LENGTH})",
     ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> TerminalOutputRange:
     """Read an exact byte range from a terminal's on-disk log (U5 / #504, FR-4.3).
 
@@ -2441,6 +2449,14 @@ async def get_terminal_output_range(
     fetch the output produced around a selected event (FR-7.3). A valid terminal
     that has not logged anything yet returns 200 with empty ``data`` so playback
     degrades gracefully (BR-4), rather than 404.
+
+    Scope-gated (PR #526 review): this route is NEW in #504 and returns raw
+    terminal log bytes, the same payload class as the run read routes gated
+    alongside it. Its only caller is this repo's own web UI, so adding the gate
+    breaks nothing. The sibling ``GET /terminals/{id}/output`` is deliberately
+    left as-is — it predates #504 and the wider ``/terminals/*`` surface is
+    uniformly ungated, so gating one pre-existing member of it belongs to a
+    separate, deliberate decision about that whole surface rather than to this PR.
     """
     try:
         # Reads a byte slice off disk — run it off the loop so a large range
@@ -2894,7 +2910,10 @@ async def start_workflow_run_endpoint(
 
 
 @app.get("/workflows/runs/{run_id}", response_model=RunInspection)
-async def get_workflow_run_endpoint(run_id: str) -> RunInspection:
+async def get_workflow_run_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> RunInspection:
     """Inspect a run: metadata, current state, and per-step projections (FR-5.1).
 
     U3 (issue #504) ENRICHES this endpoint IN PLACE to the ``RunInspection``
@@ -2914,6 +2933,19 @@ async def get_workflow_run_endpoint(run_id: str) -> RunInspection:
     ``run_registry`` cleared, and NO read path requires the registry to hold an
     entry. A never-acked or corrupt-snapshot run degrades to 404 exactly as
     ``get_run_status`` does today (BR-7).
+
+    SCOPE-GATED (PR #526 review, BLOCKING): the enrichment puts every step's full
+    ``output_json`` and ``error`` text in the response body, which makes this the
+    single most payload-bearing read route on the run surface — strictly more so
+    than ``/diagnostics``, whose excerpts are capture-gated while ``output_json``
+    here is not. It therefore carries the same read-or-better gate as
+    ``/diagnostics``, ``/events`` and ``/compare``: a FULL-route gate, not a
+    per-field split, because a field split would still return ``output_json`` to
+    an unscoped caller. Default-off is unchanged — with ``CAO_AUTH_ENABLED``
+    unset the dependency returns the full scope set and enforces nothing.
+    Consequence for #505: its CLI/MCP status/result clients read this route (plus
+    ``/events`` and ``/compare``) and must present a token carrying
+    ``cao:read``/``cao:write``/``cao:admin`` once auth is enabled.
     """
     from cli_agent_orchestrator.services import workflow_journal, workflow_service
 
@@ -3015,7 +3047,13 @@ _EVENTS_FOLLOW_POLL_INTERVAL_S = 0.25
 # Run states at which the follow stream replays what remains and CLOSES (BR-5):
 # a run that has already ended must never leave a follower hanging on a
 # possibly-swallowed terminal event.
-_TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
+#
+# IMPORTED, not redefined (PR #526 review): this set also gates whether the DAL
+# declares a trailing gap, so two independently-maintained copies could disagree
+# about whether a run has ended — the SSE arm would close a run the journal still
+# considered live, or vice versa. ``workflow_journal`` is the single Python source
+# of truth; this alias keeps the local references readable.
+_TERMINAL_RUN_STATES = _JOURNAL_TERMINAL_RUN_STATES
 
 
 def _event_sse_frame(event: EventRow) -> str:
@@ -3055,22 +3093,73 @@ def _run_absent_sse_frame(run_id: str) -> str:
     return f"event: run_absent\ndata: {json.dumps({'run_id': run_id})}\n\n"
 
 
-def _merge_ordered_sse_frames(events: List[EventRow], gaps: List[GapMarker]) -> List[str]:
+def _gap_identity(gap: GapMarker) -> Tuple[Optional[int], int, str]:
+    """A declared gap's stable identity, for at-most-once emission per stream.
+
+    ``read_events_with_gaps`` re-synthesizes the SAME trailing marker on every
+    call while the run stays terminal, so the SSE follow loop — which reads twice
+    on the terminal-transition pass (the poll read, then the drain read) — would
+    otherwise declare one hole to the follower twice. Identity is the declared
+    span plus the reason, not object identity: the markers are distinct instances
+    built by separate reads.
+    """
+    return (gap.after_seq, gap.before_seq, gap.reason)
+
+
+def _merge_ordered_sse_frames(
+    events: List[EventRow],
+    gaps: List[GapMarker],
+    declared: Optional[set] = None,
+) -> List[str]:
     """Interleave event + gap frames in seq/position order (business-logic-model).
 
-    ``read_events_with_gaps`` synthesizes each ``GapMarker`` between two adjacent
-    stored rows, so a gap's ``before_seq`` is always the seq of a delivered event.
-    The gap frame is emitted immediately BEFORE that event, placing the declared
-    hole exactly where it occurred in the stream (BR-4) rather than leaving the
-    client to infer it from numbering.
+    An INTERIOR ``GapMarker`` is synthesized between two adjacent stored rows, so
+    its ``before_seq`` IS the seq of a delivered event; its frame is emitted
+    immediately BEFORE that event, placing the declared hole exactly where it
+    occurred in the stream (BR-4) rather than leaving the client to infer it from
+    numbering.
+
+    A gap's ``before_seq`` is NOT always a delivered event's seq, though: the
+    TRAILING marker ``read_events_with_gaps`` synthesizes for a terminal run whose
+    last append(s) were swallowed carries ``before_seq = high_water + 1``, a
+    sentinel one past the last ALLOCATED seq that by construction matches no
+    stored row (PR #526 review, BLOCKING). Matching gaps only against delivered
+    events therefore DROPPED the "run ended, the last N events are lost" fault on
+    the SSE arm entirely — the batch arm and the diagnostics bundle declared it,
+    the live surface silently did not. Any gap left unmatched after the event
+    drain is emitted as a standalone ``event: gap`` frame, in ``before_seq`` order,
+    at the position it belongs: past every event in this batch.
+
+    ``declared`` is an optional MUTABLE set of ``_gap_identity`` keys owned by the
+    caller's stream; a gap already in it is not re-emitted, and every emitted gap
+    is added to it. The follow loop passes one per connection so the trailing
+    marker is declared exactly once even though two reads synthesize it. Omitted
+    (the pure two-arg form) there is no cross-call state and every gap is emitted.
     """
+    if declared is None:
+        declared = set()
     gaps_by_before = {g.before_seq: g for g in gaps}
     frames: List[str] = []
     for event in events:
         gap = gaps_by_before.get(event.seq)
-        if gap is not None:
+        if gap is not None and _gap_identity(gap) not in declared:
             frames.append(_gap_sse_frame(gap))
+            declared.add(_gap_identity(gap))
         frames.append(_event_sse_frame(event))
+    # Leftover drain: every gap whose before_seq bounded no delivered event —
+    # emitted in before_seq order after the event frames. Most often that is the
+    # trailing marker (before_seq = high_water + 1), but NOT always: a gap whose
+    # bounding event fell outside this page (e.g. a leading hole, or a batch the
+    # caller trimmed) is also unmatched, so its frame arrives here rather than at
+    # its true position (PR #526 review fix cycle 1 — an earlier version of this
+    # comment claimed a leftover gap is always past every event in the batch). The
+    # drain is deliberately generic: an unmatched declaration reaching the follower
+    # slightly out of position beats being swallowed, since the marker carries its
+    # own after_seq/before_seq range and the client renders what the server says.
+    for gap in sorted(gaps, key=lambda g: g.before_seq):
+        if _gap_identity(gap) not in declared:
+            frames.append(_gap_sse_frame(gap))
+            declared.add(_gap_identity(gap))
     return frames
 
 
@@ -3104,9 +3193,16 @@ async def _follow_run_events(run_id: str, after_seq: Optional[int]) -> AsyncIter
 
     cursor = after_seq
 
+    # Every gap identity already declared on THIS connection. The trailing marker
+    # is re-synthesized by every read of a terminal run, and the terminal
+    # transition below reads twice (poll + drain), so without this the follower
+    # would be told about one hole twice. Scoped per connection: a reconnect
+    # legitimately re-declares, since the new stream has not seen it.
+    declared_gaps: set = set()
+
     # Phase 1 — durable replay from the cursor.
     events, gaps = await asyncio.to_thread(workflow_journal.read_events_with_gaps, run_id, cursor)
-    for frame in _merge_ordered_sse_frames(events, gaps):
+    for frame in _merge_ordered_sse_frames(events, gaps, declared_gaps):
         yield frame
     if events:
         cursor = events[-1].seq
@@ -3127,6 +3223,20 @@ async def _follow_run_events(run_id: str, after_seq: Optional[int]) -> AsyncIter
         yield _run_absent_sse_frame(run_id)
         return
     if run.state in _TERMINAL_RUN_STATES:
+        # The run is terminal — but it may have BECOME terminal in the window
+        # between the Phase 1 read above and this state read. In that window
+        # Phase 1 saw a live run, so the terminal-only guard in
+        # read_events_with_gaps deliberately declared nothing, and any event
+        # appended in the window is not yet delivered. Returning bare here would
+        # close the stream on a run whose trailing hole was never declared (and
+        # drop those last events). One final drain read closes that window; on
+        # the common path (already terminal at connect) it is a no-op re-read
+        # whose gap is deduped by `declared_gaps`.
+        events, gaps = await asyncio.to_thread(
+            workflow_journal.read_events_with_gaps, run_id, cursor
+        )
+        for frame in _merge_ordered_sse_frames(events, gaps, declared_gaps):
+            yield frame
         return
 
     # Phase 3 — live-follow: tail the durable table until the run goes terminal
@@ -3137,7 +3247,7 @@ async def _follow_run_events(run_id: str, after_seq: Optional[int]) -> AsyncIter
             events, gaps = await asyncio.to_thread(
                 workflow_journal.read_events_with_gaps, run_id, cursor
             )
-            for frame in _merge_ordered_sse_frames(events, gaps):
+            for frame in _merge_ordered_sse_frames(events, gaps, declared_gaps):
                 yield frame
             if events:
                 cursor = events[-1].seq
@@ -3150,11 +3260,16 @@ async def _follow_run_events(run_id: str, after_seq: Optional[int]) -> AsyncIter
                 return
             if run.state in _TERMINAL_RUN_STATES:
                 # Drain any events appended between this poll's read and the
-                # terminal projection landing, then close (BR-5).
+                # terminal projection landing, then close (BR-5). This read is
+                # ALSO the one that can first see a trailing gap: the poll read
+                # above may have run while the run was still live, when the
+                # terminal-only guard in read_events_with_gaps deliberately
+                # declares nothing. So a run that goes terminal mid-follow
+                # declares its trailing hole here, before the stream closes.
                 events, gaps = await asyncio.to_thread(
                     workflow_journal.read_events_with_gaps, run_id, cursor
                 )
-                for frame in _merge_ordered_sse_frames(events, gaps):
+                for frame in _merge_ordered_sse_frames(events, gaps, declared_gaps):
                     yield frame
                 return
     except GeneratorExit:
@@ -3202,6 +3317,7 @@ async def get_workflow_run_events_endpoint(
             "?after_seq= takes precedence when both are supplied (BR-3)."
         ),
     ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Any:
     """Read a run's ordered event timeline — BATCH page OR live SSE follow (FR-5.2/FR-6).
 
@@ -3229,6 +3345,14 @@ async def get_workflow_run_events_endpoint(
     cursor is ``?after_seq=`` (preferred) or the ``Last-Event-ID`` header
     (``?after_seq=`` wins when both are present, BR-3). Each event frame carries
     ``id: <seq>`` so a native ``EventSource`` reconnect is exact and dedupe-free.
+
+    SCOPE-GATED (PR #526 review, BLOCKING): the timeline carries per-event
+    ``error_kind`` / ``reason`` / ``validation_result`` / ``output_ref`` and the
+    terminal-offset coordinates that address captured terminal output, so it is a
+    payload-bearing read like ``/diagnostics`` and takes the same read-or-better
+    gate. The gate applies to BOTH arms — batch and SSE — because the dependency
+    resolves before the arm is chosen. Default-off is unchanged. Consequence for
+    #505: its follower client must present a scoped token once auth is enabled.
     """
     from cli_agent_orchestrator.services import workflow_journal
 
@@ -3364,6 +3488,7 @@ async def compare_workflow_runs_endpoint(
             "404, never a partial silent compare (BR-8)."
         ),
     ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> RunComparison:
     """Compare two runs by aligned step (FR-8.1, business-logic-model Algorithm 1).
 
@@ -3383,6 +3508,12 @@ async def compare_workflow_runs_endpoint(
     Registered before the ``/workflows/{name}`` catch-all (FR-6.5) — a 2-segment
     ``/workflows/runs/...`` path structurally unmatched by the single-segment
     catch-all, pinned by ``test_workflow_route_ordering``.
+
+    SCOPE-GATED (PR #526 review, BLOCKING): the comparison exposes both runs'
+    per-step ``error_kind`` / validation outcomes and their ``output_ref``
+    references, so it is a payload-bearing read like ``/diagnostics`` and takes
+    the same read-or-better gate. Default-off is unchanged. Consequence for #505:
+    a scoped token is required once auth is enabled.
     """
     from cli_agent_orchestrator.services import workflow_journal
 

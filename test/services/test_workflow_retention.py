@@ -699,3 +699,96 @@ def test_sanitize_output_does_not_remove_secrets(settings):
     token = "AKIAIOSFODNN7EXAMPLE"
     out = workflow_retention.sanitize_output(f'{{"aws_key": "{token}"}}')
     assert token in out  # NOT redacted — hygiene only
+
+
+# ===========================================================================
+# PR 526 human review — IMPORTANT: retention 0 must DISABLE a bound, never
+# "delete everything".
+#
+# The naive reads were catastrophic: retention_days=0 puts the age cutoff at
+# *now*, so every run that ever started sorts before it; retention_count=0 makes
+# the count slice rows[0:], i.e. every row. And sweep_runs is invoked
+# automatically at startup (_sweep_workflow_runs_at_startup), so a persisted 0 —
+# a value the settings validator explicitly admits, since both keys accept >= 0 —
+# would have silently wiped the entire journal on boot.
+# ===========================================================================
+def test_retention_days_zero_disables_the_age_bound(settings):
+    """days=0 must prune NOTHING on age, not everything. The seeded run is 400
+    days old, so a cutoff of *now* would certainly have taken it."""
+    _seed_run("ancient", started_at=_iso(400))
+    _seed_run("fresh", started_at=_iso(0))
+
+    pruned = workflow_retention.sweep_runs(retention_days=0, retention_count=1000)
+
+    assert pruned == 0
+    assert workflow_journal.get_run("ancient") is not None
+    assert workflow_journal.get_run("fresh") is not None
+
+
+def test_retention_count_zero_disables_the_count_bound(settings):
+    """count=0 must prune NOTHING on count, not every row (the rows[0:] slice)."""
+    for i in range(4):
+        _seed_run(f"r{i}", started_at=_iso(i))
+
+    pruned = workflow_retention.sweep_runs(retention_days=3650, retention_count=0)
+
+    assert pruned == 0
+    for i in range(4):
+        assert workflow_journal.get_run(f"r{i}") is not None
+
+
+def test_both_retention_bounds_zero_is_a_total_noop(settings):
+    """Both bounds off -> the sweep touches nothing. This is the exact shape the
+    startup sweep would hit with both settings persisted as 0."""
+    _seed_run("ancient", started_at=_iso(500))
+    for i in range(3):
+        _seed_run(f"r{i}", started_at=_iso(i))
+
+    assert workflow_retention.sweep_runs(retention_days=0, retention_count=0) == 0
+    assert workflow_journal.get_run("ancient") is not None
+    for i in range(3):
+        assert workflow_journal.get_run(f"r{i}") is not None
+    # The cascade is intact too — not just the run rows.
+    assert workflow_journal.read_events("ancient") != []
+
+
+def test_startup_sweep_with_persisted_zeroes_does_not_wipe_the_journal(settings):
+    """The real blast radius: the automatic startup sweep with both settings
+    persisted as 0 must be a no-op, not a full journal wipe."""
+    settings["workflow_journal_retention_days"] = 0
+    settings["workflow_journal_retention_count"] = 0
+    _seed_run("ancient", started_at=_iso(365))
+    _seed_run("fresh", started_at=_iso(1))
+
+    from cli_agent_orchestrator.api import main as api_main
+
+    api_main._sweep_workflow_runs_at_startup()
+
+    assert workflow_journal.get_run("ancient") is not None
+    assert workflow_journal.get_run("fresh") is not None
+
+
+def test_disabling_one_bound_leaves_the_other_enforced(settings):
+    """0 disables ONE bound, it does not disable retention. With days=0 the count
+    bound must still prune — otherwise the fix would have turned a single 0 into
+    a global opt-out of retention."""
+    for i in range(5):
+        _seed_run(f"r{i}", started_at=_iso(i * 100))  # all old, r0 newest
+
+    pruned = workflow_retention.sweep_runs(retention_days=0, retention_count=2)
+
+    assert pruned == 3  # count bound still prunes beyond the most-recent 2
+    assert workflow_journal.get_run("r0") is not None
+    assert workflow_journal.get_run("r1") is not None
+    for gone in ("r2", "r3", "r4"):
+        assert workflow_journal.get_run(gone) is None
+
+
+def test_nonzero_bounds_still_prune_after_the_zero_guard(settings):
+    """Regression control: the guard must not have disabled pruning generally."""
+    _seed_run("old", started_at=_iso(60))
+    _seed_run("fresh", started_at=_iso(1))
+
+    assert workflow_retention.sweep_runs(retention_days=30, retention_count=1000) == 1
+    assert workflow_journal.get_run("old") is None
+    assert workflow_journal.get_run("fresh") is not None

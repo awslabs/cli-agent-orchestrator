@@ -449,3 +449,121 @@ def test_interior_and_trailing_gaps_are_both_declared():
     assert [g.reason for g in gaps] == ["append_failed", "append_failed_trailing"]
     assert (gaps[0].after_seq, gaps[0].missing_count) == (1, 1)
     assert (gaps[1].after_seq, gaps[1].missing_count) == (3, 2)
+
+
+# ---------------------------------------------------------------------------
+# PR 526 human review — NIT N2: a FROM-START read hid the trailing gap when the
+# run had NO stored events.
+#
+# `prev` was seeded `rows[0].seq - 1 if rows else None`, and the trailing block
+# is guarded on `prev is not None`, so a run with zero stored rows skipped it
+# entirely. That is the MOST severe loss shape there is — every append swallowed,
+# nothing landed at all — and the default read declared nothing for it, while a
+# cursor read of the very same run DID declare it. The two reads must agree.
+# ---------------------------------------------------------------------------
+def test_from_start_read_declares_the_trailing_gap_when_nothing_landed():
+    """Total loss: high-water 3 allocated, zero events stored, run terminal. A
+    from-start read must declare all 3 missing — it declared nothing before."""
+    workflow_journal.persist_high_water("r1", 3)  # 1,2,3 allocated, none landed
+    _seed_run_state("r1", "failed")
+
+    rows, gaps = workflow_journal.read_events_with_gaps("r1")
+
+    assert rows == []
+    assert len(gaps) == 1, f"total loss must be declared, got {gaps}"
+    assert gaps[0].reason == "append_failed_trailing"
+    assert gaps[0].after_seq == 0
+    assert gaps[0].before_seq == 4  # high_water + 1 sentinel
+    assert gaps[0].missing_count == 3  # == high_water: the whole sequence
+    # The interior-gap arithmetic invariant still holds.
+    assert gaps[0].missing_count == gaps[0].before_seq - gaps[0].after_seq - 1
+
+
+def test_from_start_and_cursor_reads_agree_on_a_total_loss():
+    """The defect was an INCONSISTENCY between two reads of one run, so pin the
+    agreement directly: a from-start read and a cursor-at-0 read must declare the
+    same hole. Before the fix the from-start side returned no gaps at all."""
+    workflow_journal.persist_high_water("r1", 2)
+    _seed_run_state("r1", "completed")
+
+    _, from_start = workflow_journal.read_events_with_gaps("r1")
+    _, from_cursor = workflow_journal.read_events_with_gaps("r1", after_seq=0)
+
+    assert from_start == from_cursor
+    assert [g.reason for g in from_start] == ["append_failed_trailing"]
+
+
+def test_from_start_read_of_a_healthy_empty_run_declares_nothing():
+    """The quiet case must stay quiet: a terminal run that genuinely recorded no
+    events (high_water 0) declares no gap. Without this, seeding prev=0 could
+    have turned every empty run into a false loss report."""
+    _seed_run_state("r1", "completed")  # no events, no high-water persisted
+
+    rows, gaps = workflow_journal.read_events_with_gaps("r1")
+    assert rows == []
+    assert gaps == []
+
+
+def test_from_start_read_of_an_empty_running_run_declares_nothing():
+    """And the terminal-only guard still applies to the empty case: a LIVE run
+    whose first append is in flight must not be reported as a total loss."""
+    workflow_journal.persist_high_water("r1", 1)  # first append in flight
+    _seed_run_state("r1", "running")
+
+    rows, gaps = workflow_journal.read_events_with_gaps("r1")
+    assert rows == []
+    assert gaps == []
+
+
+# ---------------------------------------------------------------------------
+# PR 526 review fix cycle 1 — a LEADING hole must be declared on the default read.
+#
+# The from-start seed was `rows[0].seq - 1`, which is self-referential: it defines
+# "previous" as one below the first SURVIVING row, so a hole before that row is
+# invisible by construction. The same run read with an explicit cursor at 0 DID
+# declare it. Seeding 0 unconditionally makes every shape agree.
+# ---------------------------------------------------------------------------
+def test_leading_hole_is_declared_on_a_from_start_read():
+    """Seqs 1,2 were allocated and lost; 3,4,5 landed. The default read (what the
+    web uses) must declare the leading hole, not silently start at 3."""
+    for seq in (3, 4, 5):
+        workflow_journal.append_event(
+            "r1", seq, "step.started", event_schema_version=1, ts="2026-07-27T00:00:00Z"
+        )
+    workflow_journal.persist_high_water("r1", 5)
+    _seed_run_state("r1", "completed")
+
+    rows, gaps = workflow_journal.read_events_with_gaps("r1")
+    assert [r.seq for r in rows] == [3, 4, 5]
+    assert [g.reason for g in gaps] == ["append_failed"]
+    assert (gaps[0].after_seq, gaps[0].before_seq, gaps[0].missing_count) == (0, 3, 2)
+
+
+def test_from_start_and_cursor_reads_agree_on_a_leading_hole():
+    """The agreement contract, on the shape that used to break it."""
+    for seq in (3, 4, 5):
+        workflow_journal.append_event(
+            "r1", seq, "step.started", event_schema_version=1, ts="2026-07-27T00:00:00Z"
+        )
+    workflow_journal.persist_high_water("r1", 5)
+    _seed_run_state("r1", "completed")
+
+    _, from_start = workflow_journal.read_events_with_gaps("r1")
+    _, from_cursor = workflow_journal.read_events_with_gaps("r1", after_seq=0)
+    assert from_start == from_cursor
+    assert [g.reason for g in from_start] == ["append_failed"]
+
+
+def test_healthy_run_declares_no_phantom_leading_gap():
+    """The counterpart: the unconditional 0 seed must not invent a hole before
+    seq 1 on a run that lost nothing."""
+    for seq in (1, 2, 3):
+        workflow_journal.append_event(
+            "r1", seq, "step.started", event_schema_version=1, ts="2026-07-27T00:00:00Z"
+        )
+    workflow_journal.persist_high_water("r1", 3)
+    _seed_run_state("r1", "completed")
+
+    rows, gaps = workflow_journal.read_events_with_gaps("r1")
+    assert [r.seq for r in rows] == [1, 2, 3]
+    assert gaps == [], f"phantom gap on a healthy run: {gaps}"

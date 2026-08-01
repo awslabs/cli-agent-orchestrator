@@ -1,5 +1,5 @@
 // WorkflowsPanel — the top-level Workflows surface (#504 / U8, FR-10), a
-// sibling to Agents/Inbox/Memory. A master/detail layout: RunList (left) drives
+// sibling to Agents/Inbox/Memory. A list/detail layout: RunList (left) drives
 // RunDetail (right) via the additive workflowRuns store slice. Purely
 // client-side over the already-built durable-journal read APIs.
 

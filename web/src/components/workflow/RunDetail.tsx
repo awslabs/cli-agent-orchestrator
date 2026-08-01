@@ -24,6 +24,13 @@ interface RunDetailProps {
   allRuns: RunSummaryRow[]
 }
 
+// A deliberate cross-language COPY of the Python source of truth,
+// `workflow_journal._TERMINAL_RUN_STATES` (which api/main.py imports rather than
+// redefining — see PR #526 review, N6). There is no import path from TS to
+// Python, so this duplicate cannot be eliminated; keep it in step with the
+// journal's set if a run state is ever added. The values are also part of the
+// wire contract (`RunInspection.state`), so a drift here shows up as a live
+// follower that never stops polling a finished run.
 const TERMINAL_RUN_STATES = new Set(['completed', 'failed', 'cancelled'])
 
 export function RunDetail({ run, allRuns }: RunDetailProps) {

@@ -476,3 +476,184 @@ async def test_losing_an_event_is_never_quieter_than_losing_the_high_water(monke
     hw_levels = [r.levelno for r in caplog.records if "high-water" in r.getMessage()]
     assert append_levels and hw_levels, "expected both failure paths to log"
     assert min(append_levels) >= min(hw_levels)
+
+
+# ---------------------------------------------------------------------------
+# PR 526 human review — NIT N3: a DOUBLE read fault must not re-seed event_seq
+# to 0 and collide on the (run_id, seq) primary key.
+#
+# Both re-seed terms — persisted_high_water and max_event_seq — degrade to 0 on a
+# read failure, so if BOTH fail the rebuild re-seeded the counter to 0 and the
+# next emission re-allocated seq 1, which already exists: the append dies on an
+# IntegrityError and the event is LOST. The rebuild now also floors against the
+# ``event_seq`` of a record already live in this process, which records what has
+# actually been ALLOCATED here (a stronger floor than anything that merely
+# PERSISTED) and keeps the counter monotonic across a rebuild.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_double_read_fault_does_not_reseed_below_a_live_records_counter(monkeypatch):
+    """Both journal reads fail while a live record exists: the rebuilt counter
+    must stay at the live record's allocated high-water, not fall back to 0."""
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    await ws.start_run(_spec(step_ids=("s1",)), {}, "runN3")
+
+    live = ws.run_registry["runN3"]
+    allocated = live.event_seq
+    assert allocated > 0
+
+    # Both durable re-seed reads fail (the double fault).
+    monkeypatch.setattr(ws.workflow_journal, "persisted_high_water", lambda rid: 0)
+    monkeypatch.setattr(ws.workflow_journal, "max_event_seq", lambda rid: 0)
+
+    rebuilt = ws._rebuild_record_from_journal("runN3")
+
+    assert rebuilt is not None
+    assert rebuilt.event_seq == allocated, (
+        "a double read fault re-seeded below what this process already allocated; "
+        "the next emission would collide on the (run_id, seq) primary key"
+    )
+
+
+@pytest.mark.asyncio
+async def test_next_emission_after_a_double_fault_rebuild_does_not_collide(monkeypatch):
+    """The consequence, end-to-end: emitting after a double-fault rebuild must
+    land a NEW seq, not raise IntegrityError against an existing row. Before the
+    fix the counter reset to 0 and the append re-used seq 1."""
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    await ws.start_run(_spec(step_ids=("s1",)), {}, "runN3b")
+
+    seqs_before = sorted(e.seq for e in workflow_journal.read_events("runN3b"))
+    assert seqs_before, "expected the run to have journaled events"
+
+    monkeypatch.setattr(ws.workflow_journal, "persisted_high_water", lambda rid: 0)
+    monkeypatch.setattr(ws.workflow_journal, "max_event_seq", lambda rid: 0)
+    rebuilt = ws._rebuild_record_from_journal("runN3b")
+    assert rebuilt is not None
+
+    await ws._journal_event(rebuilt, "run.completed", state=RunState.COMPLETED.value)
+
+    seqs_after = sorted(e.seq for e in workflow_journal.read_events("runN3b"))
+    # A new row landed (no swallowed IntegrityError), at a strictly higher seq.
+    assert (
+        len(seqs_after) == len(seqs_before) + 1
+    ), f"the emission was lost to a PK collision: {seqs_before} -> {seqs_after}"
+    assert max(seqs_after) > max(seqs_before)
+    assert len(set(seqs_after)) == len(seqs_after)  # still no duplicate seq
+
+
+@pytest.mark.asyncio
+async def test_cold_rebuild_with_no_live_record_is_unaffected_by_the_floor(monkeypatch):
+    """The added term must not change a genuine cold rebuild: with no cached
+    record the floor is 0, so the two-term max stands exactly as before."""
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    await ws.start_run(_spec(step_ids=("s1",)), {}, "runN3c")
+
+    expected = max(
+        workflow_journal.persisted_high_water("runN3c"),
+        workflow_journal.max_event_seq("runN3c"),
+    )
+    ws.run_registry.clear()  # a true cold rebuild — nothing live in this process
+
+    rebuilt = ws._rebuild_record_from_journal("runN3c")
+    assert rebuilt is not None
+    assert rebuilt.event_seq == expected
+
+
+# ---------------------------------------------------------------------------
+# PR 526 review fix cycle 1 — BLOCKING: a HEALTHY completed run must never be
+# reported as having lost trailing events.
+#
+# The trailing-gap check declares a hole when a TERMINAL run's durable high-water
+# exceeds its last stored seq. Its correctness rests entirely on ordering inside
+# `_drive`: the high-water is persisted BEFORE each fallible append, so if the
+# terminal run STATE were written before the terminal EVENT, every healthy run
+# would spend the duration of that final append looking exactly like a lost
+# trailing write — and live SSE followers would be told "1 event(s) lost" on the
+# common success path (the web store then latches the marker for the session).
+#
+# These tests pin the ordering through the REAL drive loop rather than a
+# hand-seeded snapshot, because a snapshot test cannot observe the window: the
+# defect exists only BETWEEN two awaits. They go RED if the two writes are
+# swapped back.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_terminal_event_is_durable_before_the_terminal_state_is_visible(monkeypatch):
+    """Observed from inside the terminal state write: the run's last event has
+    ALREADY landed, so no trailing gap can be synthesized in that window."""
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+
+    observed: List[dict] = []
+    real_update = workflow_journal.update_run_state
+
+    def _observing_update(run_id: str, state: str, finished_at):
+        # Fires while the terminal state transition is in progress. Capture what a
+        # concurrent reader would see at exactly this moment.
+        if state in ("completed", "failed", "cancelled"):
+            observed.append(
+                {
+                    "high_water": workflow_journal.persisted_high_water(run_id),
+                    "max_stored": workflow_journal.max_event_seq(run_id),
+                    "types": _types(run_id),
+                }
+            )
+        return real_update(run_id, state, finished_at)
+
+    monkeypatch.setattr(workflow_journal, "update_run_state", _observing_update)
+    await ws.start_run(_spec(step_ids=("s1",)), {}, "runOrder1")
+
+    assert observed, "the terminal state write was never observed"
+    snap = observed[-1]
+    # The terminal event is already durable when the state flips...
+    assert (
+        "run.completed" in snap["types"]
+    ), f"terminal state became visible before its event landed: {snap['types']}"
+    # ...so the high-water does NOT exceed the last stored seq: nothing for the
+    # trailing-gap check to declare. This is the assertion that fails if the two
+    # writes are reordered.
+    assert snap["high_water"] == snap["max_stored"], (
+        "high-water exceeded the last stored seq while the run was going terminal — "
+        f"a healthy run would be reported as a trailing loss: {snap}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_healthy_completed_run_declares_no_trailing_gap(monkeypatch):
+    """End-to-end: a run in which nothing was ever lost declares no gap on either
+    read arm. The user-visible statement of the same defect."""
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    await ws.start_run(_spec(step_ids=("s1", "s2")), {}, "runOrder2")
+
+    rows, gaps = workflow_journal.read_events_with_gaps("runOrder2")
+    assert gaps == [], f"healthy run reported lost events: {gaps}"
+    # The sequence really is complete and contiguous — the gap-free verdict is
+    # earned, not the result of an inert check.
+    seqs = sorted(r.seq for r in rows)
+    assert seqs == list(range(1, len(seqs) + 1))
+    assert workflow_journal.persisted_high_water("runOrder2") == max(seqs)
+    # And a cursor read mid-stream agrees.
+    _, tail_gaps = workflow_journal.read_events_with_gaps("runOrder2", after_seq=seqs[0])
+    assert tail_gaps == []
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_lost_terminal_append_is_still_declared(monkeypatch):
+    """The counterpart guard: the reorder must not buy quiet by going blind. When
+    the terminal event's append genuinely fails, the hole is still declared."""
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+
+    real_append = workflow_journal.append_event
+
+    def _drop_terminal_append(run_id, seq, event_type, **kwargs):
+        if event_type == "run.completed":
+            raise sqlite3.OperationalError("simulated terminal append failure")
+        return real_append(run_id, seq, event_type, **kwargs)
+
+    monkeypatch.setattr(workflow_journal, "append_event", _drop_terminal_append)
+    await ws.start_run(_spec(step_ids=("s1",)), {}, "runOrder3")
+
+    types = _types("runOrder3")
+    assert "run.completed" not in types  # the append really was dropped
+    _, gaps = workflow_journal.read_events_with_gaps("runOrder3")
+    assert [g.reason for g in gaps] == [
+        "append_failed_trailing"
+    ], f"a real trailing loss went undeclared: {gaps}"
