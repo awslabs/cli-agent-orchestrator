@@ -526,3 +526,73 @@ def test_cli_module_is_thin_http_client_no_engine_import():
     )
     violations = [t for t in targets if any(bad in t for bad in forbidden_substrings)]
     assert not violations, f"thin client must not import {violations}"
+
+
+# ---------------------------------------------------------------------------
+# FD-1 (PR #525 review): the streamed response is CLOSED on every exit path.
+#
+# ``stream=True`` holds the connection open until it is explicitly closed or fully
+# drained, and this generator is routinely abandoned WITHOUT draining: the follow
+# loop ``break``s the instant a terminal frame arrives, and each reconnect leaves the
+# previous generator suspended. Before the fix the socket/FD survived until GC, so a
+# long follow with repeated reconnects accumulated live sockets. The MCP twin
+# ``workflow_events`` was hardened for exactly this; the CLI twin was not.
+# ---------------------------------------------------------------------------
+def test_stream_closed_after_terminal_frame_break(runner):
+    """The terminal-frame ``break`` path closes the response.
+
+    This is the common case and the one a naive ``try``/``finally``-less
+    implementation leaks on every single successful follow.
+
+    MUTATION PROOF: remove the ``try``/``finally`` from ``_stream_event_frames`` and
+    ``close`` is never called, failing the assertion.
+    """
+    stream = _stream_resp(
+        _event_frame(1, "step.completed", "s1", "completed"),
+        _event_frame(2, "run.completed", None, "completed"),
+        # Trailing frames the follower will NEVER read: it breaks on the terminal
+        # frame above, so the generator is abandoned mid-stream and undrained.
+        _event_frame(3, "step.completed", "s3", "completed"),
+        _event_frame(4, "step.completed", "s4", "completed"),
+    )
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+        result = runner.invoke(workflow, ["events", "run1"])
+    assert result.exit_code == 0
+    stream.close.assert_called()
+
+
+def test_stream_closed_on_non_200_error_arm(runner):
+    """The non-200 arm closes too — an early ``raise`` must not leak the socket."""
+    stream = _stream_resp(status_code=500)
+    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+        result = runner.invoke(workflow, ["events", "run1"])
+    assert result.exit_code != 0
+    stream.close.assert_called()
+
+
+def test_every_reconnect_closes_its_own_stream(runner):
+    """Each reconnect closes the stream it abandoned, so a flapping follow cannot
+    accumulate live sockets across attempts."""
+    dropped = MagicMock(spec=requests.Response)
+    dropped.status_code = 200
+    dropped.close.return_value = None
+
+    def _drop_midway():
+        yield from _sse_lines(_event_frame(1, "step.completed", "s1", "completed"))
+        raise requests.exceptions.ConnectionError("socket died")
+
+    dropped.iter_lines.return_value = _drop_midway()
+    final = _stream_resp(_event_frame(2, "run.completed", None, "completed"))
+
+    with (
+        patch(
+            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            side_effect=[dropped, final],
+        ),
+        patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep", lambda *_: None),
+    ):
+        result = runner.invoke(workflow, ["events", "run1"])
+    assert result.exit_code == 0
+    # BOTH the dropped stream and the reconnected one were closed.
+    dropped.close.assert_called()
+    final.close.assert_called()

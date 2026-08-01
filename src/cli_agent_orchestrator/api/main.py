@@ -2412,6 +2412,7 @@ async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> L
 async def list_workflow_runs_endpoint(
     state: Optional[str] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """List journaled workflow runs newest-first as narrow summaries (U4, FR-3.3).
 
@@ -2663,16 +2664,37 @@ async def _run_in_background(
     swallowing a cancellation would break cooperative-cancellation semantics for the
     caller. The semaphore (AB-1) is acquired here rather than in the handler so a
     queued run still holds its durable row and its already-returned 202.
+
+    BR-2b (PR #525 review): the backstop is STATE-GUARDED. Written unconditionally it
+    fired on any exception, including one raised AFTER the engine had already settled
+    the row — turning a true COMPLETED/CANCELLED into a false FAILED. The journal row
+    is the durable record of what actually happened, so a wrong terminal state is
+    worse than the orphaned-RUNNING hole BR-2 closes: an orphan is visibly stuck,
+    whereas a wrong terminal state is indistinguishable from a real one. The guard is
+    a conditional UPDATE in the DAL (``settle_run_state_if_running``), atomic rather
+    than a read-then-write here, so no concurrent settle can land between the check
+    and the write. The never-settled case still lands FAILED — BR-2's guarantee is
+    narrowed, not removed.
     """
     from cli_agent_orchestrator.models.workflow_runtime import RunState
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
 
     def _failed_backstop(why: str) -> None:
-        """Best-effort mark the run FAILED; itself guarded so it can never re-raise."""
+        """Mark the run FAILED **only if still RUNNING**; itself guarded so it can never re-raise."""
         try:
-            workflow_journal.update_run_state(
+            settled = workflow_journal.settle_run_state_if_running(
                 run_id, RunState.FAILED.value, workflow_service._now()
             )
+            if not settled:
+                # BR-2b: the engine already settled this row. Logged explicitly —
+                # an unobservable no-op is indistinguishable from a broken guard
+                # when this is read back after an incident.
+                logger.info(
+                    "background workflow run '%s' already settled; FAILED backstop "
+                    "not written (%s)",
+                    run_id,
+                    why,
+                )
         except Exception:  # noqa: BLE001 — the backstop is itself best-effort
             logger.error(
                 "background workflow run '%s' FAILED-backstop journal write failed (%s)",
@@ -2823,9 +2845,13 @@ async def submit_workflow_run_endpoint(
        both BEFORE any insert, so a rejected run leaves NO durable row and NO 202.
     5. The awaited HARD atomic durable insert (INV-1, TR-1) — a ``sqlite3.Error``
        aborts with 500 and NO 202. This is the one deliberate deviation from the
-       engines' best-effort write.
+       engines' best-effort write. An ``IntegrityError`` is special-cased FIRST
+       (it is an ``Error`` subclass, so arm order is load-bearing) and maps to
+       409: it means a concurrent submit won the race for this run id, which is
+       the same collision step 0 reports as 409 when it can see it serially.
     6. Register the tier-appropriate in-process record (the SAME record C2 drives).
-    7. Schedule the background drive via ``asyncio.create_task``.
+    7. Schedule the background drive through ``_schedule_background_drive`` — the
+       registry helper, NOT a bare ``asyncio.create_task`` (see BG-1 at step 7).
     8. Return 202 ``{run_id, state:"running", links}``.
     """
     import sqlite3
@@ -2935,6 +2961,18 @@ async def submit_workflow_run_endpoint(
                 "script",
                 "1",
             )
+        except sqlite3.IntegrityError:
+            # TOCTOU (PR #525 review): step 0's uniqueness check and this insert are
+            # not one atomic operation, so two concurrent submits carrying the SAME
+            # caller-supplied run_id can both pass step 0. The loser's PRIMARY KEY
+            # violation is the same collision step 0 reports as 409 when it sees it
+            # serially, so it must answer 409 too — a 500 would tell the caller the
+            # server broke when in fact their run id was simply taken. Ordered BEFORE
+            # the generic arm: IntegrityError is a sqlite3.Error subclass.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run id '{run_id}' already exists",
+            )
         except sqlite3.Error as e:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2980,6 +3018,13 @@ async def submit_workflow_run_endpoint(
                 started_at,
                 "yaml",
                 "1",
+            )
+        except sqlite3.IntegrityError:
+            # Same TOCTOU → 409 mapping as the script arm above; ordered before the
+            # generic sqlite3.Error arm because IntegrityError subclasses it.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run id '{run_id}' already exists",
             )
         except sqlite3.Error as e:
             raise HTTPException(
@@ -3160,7 +3205,10 @@ def _build_failure_envelope(
 
 
 @app.get("/workflows/runs/{run_id}/result")
-async def get_workflow_run_result_endpoint(run_id: str) -> Dict:
+async def get_workflow_run_result_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Return the complete retained ``WorkflowRunResult`` for a run (U4, FR-7.2).
 
     A two-segment path (safe at any declaration position, RO-2). Journal-authoritative
@@ -3177,6 +3225,12 @@ async def get_workflow_run_result_endpoint(run_id: str) -> Dict:
     next-command hint), assembled from the same journal rows (JP-1). A
     COMPLETED/non-terminal run omits the key, so a successful run's ``--json`` shape
     stays byte-identical (NFR-3).
+
+    NOT returned (PR #525 review): a run-level ``output``. The journal has no column
+    for one, so the key was always null here; it is dropped rather than advertised.
+    Per-step outputs are unaffected and still populate ``steps[].output``. A caller
+    that needs a script run's run-level output must use the blocking
+    ``POST /workflows/runs``, whose live return path carries it.
     """
     from cli_agent_orchestrator.models.workflow_runtime import (
         RunState,
@@ -3212,6 +3266,19 @@ async def get_workflow_run_result_endpoint(run_id: str) -> Dict:
         kind=error_kind,
     )
     body = result.model_dump()
+
+    # PR #525 review: DROP the run-level ``output`` key from this route's body.
+    # It was advertised in three places but STRUCTURALLY always None here: there is
+    # no run-level output column on ``workflow_run`` and ``RunRow`` has no such
+    # field, so a journal-assembled result has nothing to populate it from. (Only
+    # the LIVE script-tier return path fills it — ``script_runner._finalize`` — which
+    # the blocking route still returns, so the model field stays.) The pop is
+    # explicit because Pydantic's ``model_dump`` emits defaulted fields: simply not
+    # passing ``output=`` above leaves the key present as null, which is exactly the
+    # false advertisement being removed. Advertising a field that can never carry a
+    # value is worse than omitting it — a client feature-detecting on key presence
+    # wires up a code path that can never fire.
+    body.pop("output", None)
 
     # U9 (FR-7.1): attach the failure envelope ONLY for a terminal-failed/cancelled
     # run (a completed/non-terminal run keeps its byte-identical shape, NFR-3). The

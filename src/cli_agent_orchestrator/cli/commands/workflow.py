@@ -819,19 +819,33 @@ def _stream_event_frames(run_id: str, cursor):
     tracks the resume cursor in ITS OWN scope as frames are yielded: on a dropped
     connection the cursor is already advanced to the last seen ``seq``, so the
     reconnect resumes exactly (``?after_seq=<cursor>``) with no re-delivery.
+
+    FD-1 (PR #525 review): the response is closed on EVERY exit path via
+    ``try``/``finally``, matching the hardening already applied to the MCP twin
+    ``workflow_events``. ``stream=True`` holds the connection open until it is
+    explicitly closed or fully drained, and this generator is routinely abandoned
+    WITHOUT draining: the caller ``break``s out of its loop the moment a terminal
+    frame arrives, and every reconnect leaves the prior generator suspended. Without
+    the ``finally`` the socket/FD survives until the generator is garbage collected —
+    so a long follow with repeated reconnects accumulates live sockets. The ``finally``
+    runs on the terminal-frame break too, because abandoning a suspended generator
+    raises ``GeneratorExit`` into it at collection.
     """
     response = _open_events_stream(run_id, cursor)
-    if response.status_code == 404:
-        # A 404 here is AMBIGUOUS and the two causes need opposite messages (CD-1):
-        # the RUN may be unknown, or the events ROUTE may not exist on this server
-        # (it ships with issue #504; until that merges, this path 404s for every
-        # perfectly healthy run). Reporting "unknown run" for a live run sends the
-        # operator hunting a nonexistent problem, so discriminate against the
-        # snapshot route — which this build always has — before naming the cause.
-        raise _events_route_or_run_missing(run_id)
-    if response.status_code != 200:
-        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
-    yield from parse_sse_frames(response.iter_lines(decode_unicode=True))
+    try:
+        if response.status_code == 404:
+            # A 404 here is AMBIGUOUS and the two causes need opposite messages (CD-1):
+            # the RUN may be unknown, or the events ROUTE may not exist on this server
+            # (it ships with issue #504; until that merges, this path 404s for every
+            # perfectly healthy run). Reporting "unknown run" for a live run sends the
+            # operator hunting a nonexistent problem, so discriminate against the
+            # snapshot route — which this build always has — before naming the cause.
+            raise _events_route_or_run_missing(run_id)
+        if response.status_code != 200:
+            raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+        yield from parse_sse_frames(response.iter_lines(decode_unicode=True))
+    finally:
+        response.close()
 
 
 def _final_events_status(run_id: str):

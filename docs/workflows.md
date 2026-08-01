@@ -156,9 +156,28 @@ Three shapes:
 > A non-TTY plain `run` (no `--json`) also emits this JSON, so a piped invocation has one
 > stable machine format. **Scripts that read `steps[]` or `workflow_name` off `run --json`
 > must change**: fetch the full result explicitly with `cao workflow result <id> --json`
-> (or `cao workflow status <id> --json` for a mid-run snapshot). `--wait` follows the same
-> new shape; `result`/`status` are the full-detail surfaces. Exit codes are unchanged and
-> identical across TTY, non-TTY, and `--json`.
+> (or `cao workflow status <id> --json` for a mid-run snapshot). Exit codes are unchanged
+> and identical across TTY, non-TTY, and `--json`.
+>
+> **`--wait --json` is the exception**: it still emits the complete `WorkflowRunResult`.
+> `--wait` is the retained fully-blocking path, so returning everything in one call is the
+> reason to reach for it. Only the default follow path and `--detach` emit the narrow
+> `{run_id, state}` object.
+
+So there are two machine shapes, chosen by invocation:
+
+| Invocation | `--json` shape |
+| --- | --- |
+| `cao workflow run <name>` (default follow) | `{run_id, state}` |
+| `cao workflow run <name> --detach` | the 202 body — `{run_id, state, links}` |
+| `cao workflow run <name> --wait` | the full `WorkflowRunResult` |
+| `cao workflow result <id>` | the full `WorkflowRunResult` |
+| `cao workflow status <id>` | a mid-run snapshot |
+
+Note that no run-level `output` field is returned by `result`, `status`, or the
+`workflow_result` / `workflow_wait` MCP tools: run-level output is not journaled, so it is
+only available from the blocking `run --wait` path. Per-step outputs are always present on
+`steps[].output`.
 
 Choose the shape by how the run is triggered, because the client-side ceilings differ:
 
@@ -249,10 +268,48 @@ All twelve verbs live under `cao workflow`.
 | `status <run_id>` | `--json` | Point-in-time status snapshot for a run (full detail, including steps). |
 | `runs` | `--state <state>`, `--limit <n>`, `--json` | List recorded runs from the durable journal, newest first. |
 | `wait <run_id>` | `--json` | Follow an already-submitted run by polling until terminal. Same exit codes as `run`. |
-| `result <run_id>` | `--json` | The complete `WorkflowRunResult` for a finished run — the full-detail surface `run --json` no longer prints. |
+| `result <run_id>` | `--json` | The complete `WorkflowRunResult` for a run — the full-detail surface `run --json` no longer prints. Answers for an **in-flight** run too (the steps settled so far), not only a finished one, and works for a detached or post-restart run because it is assembled from the journal. |
 | `events <run_id>` | `--follow/--no-follow`, `--after-seq <n>`, `--json` | Stream live per-run ordered progress (SSE). `--no-follow` does a one-shot batch read. Requires the events route from issue #504 — on a build without it, both modes report that the stream is unavailable and point at `wait`/`status`, rather than claiming the run is unknown. |
 | `resume <run_id>` | `--json` | Resume a crashed/failed run from its journal (blocks). |
 | `cancel <run_id>` | — | Cooperatively cancel a running workflow. |
+
+## MCP tool reference (from inside an agent session)
+
+Ten workflow tools are exposed over MCP. Each returns a structured `{ok, ...}` envelope on
+every path and never raises into the agent loop.
+
+| Tool | Description |
+| --- | --- |
+| `workflow_run` | Run a workflow to completion **inline** (blocking). Bounded by the MCP host's per-tool-call timeout — see the ceiling note above. |
+| `workflow_start` | Submit a run **asynchronously**; returns the run id immediately without waiting. |
+| `workflow_status` | Point-in-time status snapshot for one run. |
+| `workflow_wait` | Poll a submitted run to a terminal state, then return `{ok, run_id, state, kind, steps}`. |
+| `workflow_result` | The complete retained result for a run; answerable for a detached or post-restart run. |
+| `workflow_list` | List recorded **runs** from the durable journal (not specs). |
+| `workflow_events` | Read live per-run ordered progress. Needs the events route from issue #504. |
+| `workflow_resume` | Resume a crashed/failed run from its journal. |
+| `workflow_cancel` | Cooperatively cancel a running workflow. |
+| `workflow_return` | Called by a worker to hand its structured step output back to the run. |
+
+### CLI ↔ MCP name mapping
+
+The two surfaces grew separately and their names do **not** line up. Read this table
+before assuming a verb and a tool with similar names do the same thing:
+
+| Concept | CLI verb | MCP tool |
+| --- | --- | --- |
+| List workflow **specs** | `list` | *(none — MCP has no spec-listing tool)* |
+| List workflow **runs** | `runs` | `workflow_list` |
+| Submit asynchronously | `run` (the default) | `workflow_start` |
+| Run inline / blocking | `run --wait` | `workflow_run` |
+
+> **`list` and `workflow_list` are false friends.** The CLI's `list` lists **specs**; the
+> MCP `workflow_list` lists **runs**. An agent reaching for "the list tool" expecting specs
+> gets runs. The CLI equivalent of `workflow_list` is `cao workflow runs`.
+>
+> `run` and `workflow_run` are also not equivalent: the CLI's bare `run` submits
+> asynchronously and follows, whereas the MCP `workflow_run` blocks inline. The MCP
+> counterpart of the CLI default is `workflow_start`.
 
 ## See also
 

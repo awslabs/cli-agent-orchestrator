@@ -269,12 +269,50 @@ def update_run_state(run_id: str, state: str, finished_at: Optional[str]) -> Non
 
     ``finished_at`` is set on a terminal transition and cleared (``None``) when a
     resume re-opens a previously-settled run (business-logic-model §3).
+
+    UNCONDITIONAL BY CONTRACT. Do NOT add a ``WHERE state = ...`` predicate here:
+    the resume path calls this to write state BACK to ``running`` on an already
+    terminal row (``script_runner.resume_script_run`` and
+    ``workflow_service.resume_from_last_completed``), so any "only if still
+    running" guard would silently turn every resume into a no-op. A caller that
+    needs the guarded write wants ``settle_run_state_if_running`` below.
     """
     with _connect() as conn:
         conn.execute(
             "UPDATE workflow_run SET state = ?, finished_at = ? WHERE run_id = ?",
             (state, finished_at, run_id),
         )
+
+
+def settle_run_state_if_running(run_id: str, state: str, finished_at: Optional[str]) -> bool:
+    """Settle a run's state ONLY while the row is still ``running``; report whether it did.
+
+    The conditional sibling of ``update_run_state``, added for the background
+    drive's FAILED backstop (issue #505 review). The backstop exists so a
+    scheduling bug cannot orphan a run in ``running`` forever — but written
+    unconditionally it also overwrites a run the engine ALREADY settled, so a
+    drive that raised during post-settlement bookkeeping turned a true
+    ``completed``/``cancelled`` into a false ``failed``. That is worse than the
+    hole it was closing: the journal row is the durable record of what actually
+    happened, and a wrong terminal state is indistinguishable from a real one.
+
+    The state test lives in the SQL (``AND state = 'running'``) rather than in a
+    read-then-write on the caller's side, so the check and the write are one
+    atomic statement and no concurrent settle can land between them.
+
+    Returns ``True`` when a row was updated and ``False`` when the row was
+    already terminal (or absent) — the caller logs the distinction, because a
+    silent no-op is indistinguishable from a broken guard when reading logs
+    after an incident.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE workflow_run SET state = ?, finished_at = ? " "WHERE run_id = ? AND state = ?",
+            (state, finished_at, run_id, RunState.RUNNING.value),
+        )
+        return cursor.rowcount > 0
 
 
 # ---------------------------------------------------------------------------

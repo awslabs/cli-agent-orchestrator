@@ -21,11 +21,13 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Iterator, Optional
 
-# Run-level terminal event types on the wire (F-1 terminal guard) and the
-# terminal projection states a frame's ``state`` field may carry. The follower
+# The terminal projection states a frame's ``state`` field may carry. The follower
 # closes on EITHER — a terminal ``event:`` line OR a terminal ``state`` in the
-# frame data — so a swallowed terminal EVENT can never hang the follow.
-TERMINAL_EVENT_TYPES = frozenset({"run.completed", "run.failed", "run.cancelled"})
+# frame data — so a swallowed terminal EVENT can never hang the follow. The
+# ``event:``-side membership test is ``_EVENT_TO_STATE`` below, which is the single
+# authority for it: a sibling ``TERMINAL_EVENT_TYPES`` frozenset was exported here
+# with no referent anywhere in src/ or test/ (PR #525 review) and is removed, since
+# two overlapping definitions of "which events are terminal" can silently disagree.
 TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
 
 # The declared-gap frame's ``event:`` value. A gap frame carries no ``id:`` line
@@ -183,7 +185,6 @@ def parse_sse_frames(lines: Iterable[Optional[str]]) -> Iterator[SseFrame]:
 __all__ = [
     "GAP_EVENT_TYPE",
     "SseFrame",
-    "TERMINAL_EVENT_TYPES",
     "TERMINAL_RUN_STATES",
     "parse_sse_frames",
 ]

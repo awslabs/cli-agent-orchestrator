@@ -439,7 +439,13 @@ class TestWorkflowList:
 class TestWorkflowWait:
     def test_converges_to_terminal_then_result(self):
         """T7 (MR-2): poll running -> terminal, then fetch result -> {ok, run_id,
-        state, kind, steps, output} with the terminal state."""
+        state, kind, steps} with the terminal state.
+
+        NO run-level ``output`` key (PR #525 review): the ``/result`` route it wraps has
+        no run-level output to give — there is no such column on ``workflow_run`` — so
+        the key this envelope used to carry was always null. The stub below therefore
+        mirrors the real route and omits it. Per-step outputs are unaffected.
+        """
         running = _resp(200, {"run_id": "run1", "state": "running", "steps": []})
         terminal = _resp(200, {"run_id": "run1", "state": "completed", "steps": []})
         result_body = _resp(
@@ -448,9 +454,15 @@ class TestWorkflowWait:
                 "run_id": "run1",
                 "workflow_name": "wf",
                 "state": "completed",
-                "steps": [{"id": "s1", "state": "completed", "attempts": 1}],
+                "steps": [
+                    {
+                        "id": "s1",
+                        "state": "completed",
+                        "attempts": 1,
+                        "output": {"answer": 42},
+                    }
+                ],
                 "kind": None,
-                "output": {"answer": 42},
             },
         )
         with (
@@ -465,7 +477,9 @@ class TestWorkflowWait:
         assert out["run_id"] == "run1"
         assert out["state"] == "completed"
         assert out["steps"][0]["id"] == "s1"
-        assert out["output"] == {"answer": 42}
+        # Per-step output still reaches the agent; only the run-level key is gone.
+        assert out["steps"][0]["output"] == {"answer": 42}
+        assert "output" not in out
         assert "kind" in out
 
     def test_poll_uses_async_timeout_not_long(self):

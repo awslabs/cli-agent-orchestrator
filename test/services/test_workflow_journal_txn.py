@@ -109,3 +109,90 @@ def test_tr1_error_propagates_not_swallowed():
         raised = True
     assert raised is True
     assert workflow_journal.get_run("run-atomic-raise") is None
+
+
+class TestSettleRunStateIfRunning:
+    """PR #525 review — the conditional terminal-state write behind the background
+    drive's FAILED backstop.
+
+    The backstop exists so a scheduling bug cannot orphan a run in ``running``
+    forever. Written unconditionally it ALSO overwrote a run the engine had already
+    settled, so a drive that raised during post-settlement bookkeeping turned a true
+    ``completed``/``cancelled`` into a false ``failed`` — a wrong terminal state is
+    worse than a visibly-stuck one, because it is indistinguishable from a real one.
+    """
+
+    def _seed(self, run_id: str, state: str) -> None:
+        workflow_journal.insert_run(
+            run_id,
+            "wf",
+            "{}",
+            "{}",
+            state,
+            "2026-08-01T00:00:00Z",
+        )
+
+    def test_settles_a_running_row_and_reports_true(self):
+        """Happy path: while the row is still ``running`` the write lands."""
+        self._seed("run-guard-running", "running")
+        settled = workflow_journal.settle_run_state_if_running(
+            "run-guard-running", "failed", "2026-08-01T00:05:00Z"
+        )
+        assert settled is True
+        row = workflow_journal.get_run("run-guard-running")
+        assert row is not None
+        assert row.state == "failed"
+        assert row.finished_at == "2026-08-01T00:05:00Z"
+
+    def test_refuses_to_overwrite_a_completed_row(self):
+        """THE finding-1 guard: a settled COMPLETED row is never downgraded to FAILED.
+
+        MUTATION PROOF: drop the ``AND state = ?`` clause from
+        ``settle_run_state_if_running`` and this fails on ``row.state``.
+        """
+        self._seed("run-guard-completed", "completed")
+        settled = workflow_journal.settle_run_state_if_running(
+            "run-guard-completed", "failed", "2026-08-01T00:05:00Z"
+        )
+        assert settled is False
+        row = workflow_journal.get_run("run-guard-completed")
+        assert row is not None
+        assert row.state == "completed"
+
+    def test_refuses_to_overwrite_a_cancelled_row(self):
+        """The ``CancelledError``-arm case: a journalled CANCELLED survives shutdown."""
+        self._seed("run-guard-cancelled", "cancelled")
+        settled = workflow_journal.settle_run_state_if_running(
+            "run-guard-cancelled", "failed", "2026-08-01T00:05:00Z"
+        )
+        assert settled is False
+        row = workflow_journal.get_run("run-guard-cancelled")
+        assert row is not None
+        assert row.state == "cancelled"
+
+    def test_absent_row_reports_false_and_does_not_insert(self):
+        """A missing run is a no-op, not an upsert — the backstop must not mint rows."""
+        settled = workflow_journal.settle_run_state_if_running(
+            "run-guard-absent", "failed", "2026-08-01T00:05:00Z"
+        )
+        assert settled is False
+        assert workflow_journal.get_run("run-guard-absent") is None
+
+    def test_update_run_state_still_reopens_a_settled_run(self):
+        """REGRESSION GUARD for the guard itself: ``update_run_state`` must stay
+        UNCONDITIONAL.
+
+        The resume path (``script_runner.resume_script_run``,
+        ``workflow_service.resume_from_last_completed``) calls ``update_run_state`` to
+        write state BACK to ``running`` on an already-terminal row. Pushing the
+        backstop's ``WHERE state = 'running'`` predicate into that shared function —
+        the obvious "tidy-up" — would silently make EVERY resume a no-op, turning this
+        data-integrity fix into a worse data-integrity bug on a path the review never
+        raised. This test fails the moment someone does that.
+        """
+        self._seed("run-reopen", "completed")
+        workflow_journal.update_run_state("run-reopen", "running", None)
+        row = workflow_journal.get_run("run-reopen")
+        assert row is not None
+        assert row.state == "running"
+        assert row.finished_at is None

@@ -2247,10 +2247,14 @@ async def workflow_result(
     A thin HTTP client over ``GET /workflows/runs/{run_id}/result``. Journal-
     authoritative: answerable even for a detached or post-restart run. On success
     returns ``{ok: True, **the retained result}`` (``run_id``, ``workflow_name``,
-    ``state``, ``steps``, ``kind``, ``output`` — plus a ``failure_envelope`` for a
+    ``state``, ``steps``, ``kind`` — plus a ``failure_envelope`` for a
     terminal-failed/cancelled run, U9/FR-7.1, spread through verbatim from the body).
     Returns a structured envelope on EVERY path — never raises into the agent loop
     (EV-1).
+
+    No run-level ``output`` (PR #525 review): the journal has no column for one, so
+    the key this docstring used to advertise was always null. Per-step outputs are
+    unaffected — read them from ``steps[].output``.
     """
     try:
         response = requests.get(
@@ -2307,8 +2311,10 @@ async def workflow_wait(
 
     Polls ``GET /workflows/runs/{run_id}`` (ADR-4 Option A — the snapshot route, not
     the events stream) until the run is ``completed`` / ``failed`` / ``cancelled``,
-    then fetches the retained result and returns ``{ok, run_id, state, kind, steps,
-    output}`` (MR-2). Each poll uses the normal per-call ``_mcp_timeout()`` (TR-1),
+    then fetches the retained result and returns ``{ok, run_id, state, kind, steps}``
+    (MR-2). No run-level ``output`` key (PR #525 review): the journal has no column
+    for one, so the key this tool used to return was always null — per-step outputs
+    live on ``steps[].output``. Each poll uses the normal ``_mcp_timeout()`` (TR-1),
     sleeping ``WORKFLOW_POLL_INTERVAL_SECONDS`` between polls; the OVERALL wait is
     bounded by ``WORKFLOW_RUN_REQUEST_TIMEOUT`` so a never-terminating run cannot pin
     the tool open forever. Returns a structured envelope on EVERY path — a poll
@@ -2362,7 +2368,6 @@ async def workflow_wait(
         "state": result.get("state", state),
         "kind": result.get("kind"),
         "steps": result.get("steps", []),
-        "output": result.get("output"),
     }
     # U9 (FR-7.1): a failed/cancelled run's result body carries a failure envelope;
     # surface it in the dict so an agent gets the failing step / attempt / error kind

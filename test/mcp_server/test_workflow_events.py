@@ -246,22 +246,42 @@ class TestWorkflowEventsBounds:
         traffic that resets the socket read timeout. So NEITHER pre-existing bound
         could ever be reached and the loop blocked forever.
 
-        The stream here is INFINITE by construction: if the wall-clock bound is not
-        enforced, this test hangs rather than fails. The deadline is monkeypatched to
-        0 so the bound trips immediately without a real sleep.
+        The deadline is monkeypatched to 0 so the bound trips immediately without a
+        real sleep.
 
-        MUTATION PROOF: remove the ``_deadline_bounded`` wrapper and this test HANGS
-        (the infinite heartbeat generator is never exhausted).
+        MUTATION PROOF: remove the ``_deadline_bounded`` wrapper and this test fails
+        on ``consumed`` (the drive runs to the end of the heartbeat supply) and on
+        ``timed_out``.
+
+        FAILS RATHER THAN HANGS (PR #525 review): the heartbeat supply is
+        large-but-FINITE, not infinite. It was previously a ``while True`` generator,
+        which meant a regression of the wall-clock bound HUNG this test — surfacing as
+        a whole-job CI timeout with no attribution, so it read as flaky infrastructure
+        instead of as this assertion catching the bug it exists to catch. A finite
+        supply makes the regression terminate and fail a named assertion instead.
+
+        Note an ``asyncio.wait_for`` wrapper does NOT work here and was rejected:
+        ``workflow_events``' frame loop contains no ``await``, so it never yields to
+        the event loop and a ``wait_for`` timeout can never fire (verified directly —
+        a synchronous spin under ``wait_for(timeout=1.0)`` hangs indefinitely).
+        Bounding the DATA is the only thing that bounds a synchronous consumer.
         """
         resp = MagicMock(spec=requests.Response)
         resp.status_code = 200
         resp.close.return_value = None
 
-        def _infinite_heartbeats():
-            while True:
+        # Enough lines that the bound is plainly what stops the drive, few enough that
+        # exhausting them (the regression path) takes well under a second.
+        supply = 50_000
+        consumed = 0
+
+        def _bounded_heartbeats():
+            nonlocal consumed
+            for _ in range(supply):
+                consumed += 1
                 yield ":keep-alive"
 
-        resp.iter_lines.return_value = _infinite_heartbeats()
+        resp.iter_lines.return_value = _bounded_heartbeats()
         with patch("cli_agent_orchestrator.mcp_server.server.WORKFLOW_EVENTS_MCP_MAX_SECONDS", 0.0):
             with patch("cli_agent_orchestrator.mcp_server.server.requests.get", return_value=resp):
                 out = asyncio.run(workflow_events("run1"))
@@ -271,6 +291,12 @@ class TestWorkflowEventsBounds:
         assert out["events"] == []
         assert out["state"] is None
         resp.close.assert_called_once()
+        # The DEADLINE stopped the drive, not the end of the supply. Without this the
+        # test would pass identically on a build with no wall-clock bound at all.
+        assert consumed < supply, (
+            f"the drive consumed all {supply} heartbeats, so it was ended by the supply "
+            "running out rather than by the wall-clock bound"
+        )
 
     def test_normal_terminal_stream_is_not_marked_timed_out(self):
         """TB-1 must not over-fire: a stream that reaches a terminal frame within the

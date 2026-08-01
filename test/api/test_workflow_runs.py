@@ -464,6 +464,48 @@ def test_submit_insert_failure_returns_5xx_and_no_row(client, async_yaml_env, mo
     assert "async-fail" not in workflow_service.run_registry
 
 
+def test_submit_integrity_error_is_409_not_500(client, async_yaml_env, monkeypatch):
+    """TOCTOU (PR #525 review): the loser of a same-run-id submit race gets 409, not 500.
+
+    Step 0's uniqueness check and step 5's insert are not one atomic operation, so two
+    concurrent submits carrying the SAME caller-supplied run_id can both pass step 0.
+    The loser's PRIMARY KEY violation is the same collision step 0 reports as 409 when
+    it sees it serially, so the status must agree — a 500 tells the caller the server
+    broke when in fact their run id was simply taken, which sends them to the logs
+    instead of to a new id.
+
+    MUTATION PROOF: delete the ``except sqlite3.IntegrityError`` arm (or move it BELOW
+    the generic ``sqlite3.Error`` arm, which shadows it since IntegrityError is a
+    subclass) and this fails with 500.
+    """
+
+    def _collide(*a, **k):
+        raise sqlite3.IntegrityError("UNIQUE constraint failed: workflow_run.run_id")
+
+    monkeypatch.setattr(workflow_journal, "insert_run_with_steps", _collide)
+    resp = client.post(
+        "/workflows/runs:submit",
+        json={"name_or_path": "wf", "inputs": {}, "run_id": "async-race"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert async_yaml_env["journal"].get_run("async-race") is None
+
+
+def test_submit_script_tier_integrity_error_is_409_not_500(client, async_script_env, monkeypatch):
+    """The same TOCTOU -> 409 mapping on the SCRIPT arm (it has its own insert call,
+    so a fix applied to only one arm would leave the other returning 500)."""
+
+    def _collide(*a, **k):
+        raise sqlite3.IntegrityError("UNIQUE constraint failed: workflow_run.run_id")
+
+    monkeypatch.setattr(workflow_journal, "insert_run", _collide)
+    resp = client.post(
+        "/workflows/runs:submit",
+        json={"name_or_path": "script-wf", "inputs": {}, "run_id": "async-race-script"},
+    )
+    assert resp.status_code == 409, resp.text
+
+
 def test_submit_reaches_terminal_in_journal(client, async_yaml_env):
     """CR-2/BR-3: a submitted run's background drive settles the journal to a
     terminal state without the client waiting for it at ack time."""
@@ -828,7 +870,14 @@ async def test_run_in_background_never_reraises_and_marks_failed(monkeypatch, tm
 @pytest.mark.asyncio
 async def test_run_in_background_backstop_write_failure_swallowed(monkeypatch, tmp_path):
     """BR-2: even the FAILED backstop write is best-effort — a failure there is
-    logged and swallowed, never re-raised."""
+    logged and swallowed, never re-raised.
+
+    Patches ``settle_run_state_if_running`` — the function the backstop actually calls
+    since the BR-2b state guard landed. It previously patched ``update_run_state``,
+    which the backstop no longer reaches, so nothing raised and this test asserted
+    "did not re-raise" about a path where no exception was ever thrown: green, and
+    proving nothing. Patching the real callee restores the failure it is here to catch.
+    """
     from cli_agent_orchestrator.api.main import _run_in_background
 
     db_path = tmp_path / "wf.db"
@@ -841,7 +890,7 @@ async def test_run_in_background_backstop_write_failure_swallowed(monkeypatch, t
         raise sqlite3.OperationalError("journal down")
 
     monkeypatch.setattr(workflow_service, "start_run_prepared", _boom)
-    monkeypatch.setattr(workflow_journal, "update_run_state", _boom_update)
+    monkeypatch.setattr(workflow_journal, "settle_run_state_if_running", _boom_update)
 
     record = workflow_service.RunRecord(
         run_id="bg-fail-2",
@@ -966,6 +1015,130 @@ async def test_background_drive_cancellation_marks_failed_and_reraises(monkeypat
     # The whole point: the durable row is NOT left in RUNNING.
     row = workflow_journal.get_run("bg-cancel")
     assert row is not None and row.state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_backstop_does_not_overwrite_a_settled_completed_row(monkeypatch, tmp_path):
+    """BR-2b (PR #525 review): a drive that raises AFTER the engine settled the row
+    must NOT downgrade a true COMPLETED to a false FAILED.
+
+    This is the complement of ``test_run_in_background_never_reraises_and_marks_failed``
+    (which covers raise-BEFORE-settle). The failure it guards is the worse of the two:
+    an orphaned RUNNING row is visibly stuck, whereas a wrong terminal state is
+    indistinguishable from a real one, so the durable record silently lies about what
+    the system did.
+
+    MUTATION PROOF: point ``_failed_backstop`` back at the unconditional
+    ``workflow_journal.update_run_state`` and this fails with ``state == 'failed'``.
+    """
+    from cli_agent_orchestrator.api.main import _run_in_background
+    from cli_agent_orchestrator.clients.database import (
+        _migrate_workflow_run,
+        _migrate_workflow_run_step,
+    )
+
+    db_path = tmp_path / "wf.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+    _migrate_workflow_run()
+    _migrate_workflow_run_step()
+    workflow_journal.insert_run(
+        run_id="bg-settled",
+        workflow_name="wf",
+        spec_snapshot="{}",
+        inputs_json="{}",
+        state=RunState.RUNNING.value,
+        started_at="2026-08-01T00:00:00Z",
+    )
+
+    async def _settle_then_raise(record):
+        # Exactly what the prepared entries do: settle the terminal state through the
+        # engine's write-through FIRST...
+        workflow_journal.update_run_state(
+            "bg-settled", RunState.COMPLETED.value, "2026-08-01T00:01:00Z"
+        )
+        # ...then fail during post-settlement bookkeeping (registry eviction, a
+        # metrics emit, an event append — anything after the row is already true).
+        raise RuntimeError("raised AFTER the row was settled")
+
+    monkeypatch.setattr(workflow_service, "start_run_prepared", _settle_then_raise)
+
+    record = workflow_service.RunRecord(
+        run_id="bg-settled",
+        workflow_name="wf",
+        spec=_SPEC,
+        inputs={},
+        state=RunState.RUNNING,
+        step_states={},
+        started_at="2026-08-01T00:00:00Z",
+    )
+    await _run_in_background(record, _SPEC, "bg-settled", "yaml", {})
+
+    row = workflow_journal.get_run("bg-settled")
+    assert row is not None
+    assert row.state == "completed", "the FAILED backstop overwrote a settled terminal state"
+    assert row.finished_at == "2026-08-01T00:01:00Z"
+
+
+@pytest.mark.asyncio
+async def test_backstop_does_not_overwrite_a_journalled_cancelled_row(monkeypatch, tmp_path):
+    """BR-2a + BR-2b together: the CANCELLED-arm case.
+
+    A cooperative cancel journals CANCELLED, and then interpreter shutdown cancels the
+    drive task. The ``CancelledError`` arm fires its backstop — which must NOT turn the
+    user's CANCELLED into FAILED — and must still RE-RAISE so cooperative-cancellation
+    semantics are preserved for the caller (FR-1.5).
+    """
+    import asyncio as _asyncio
+
+    from cli_agent_orchestrator.api.main import _run_in_background
+    from cli_agent_orchestrator.clients.database import (
+        _migrate_workflow_run,
+        _migrate_workflow_run_step,
+    )
+
+    db_path = tmp_path / "wf.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+    _migrate_workflow_run()
+    _migrate_workflow_run_step()
+    workflow_journal.insert_run(
+        run_id="bg-cancel-settled",
+        workflow_name="wf",
+        spec_snapshot="{}",
+        inputs_json="{}",
+        state=RunState.RUNNING.value,
+        started_at="2026-08-01T00:00:00Z",
+    )
+
+    entered = _asyncio.Event()
+
+    async def _settle_cancelled_then_hang(record):
+        workflow_journal.update_run_state(
+            "bg-cancel-settled", RunState.CANCELLED.value, "2026-08-01T00:01:00Z"
+        )
+        entered.set()
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(workflow_service, "start_run_prepared", _settle_cancelled_then_hang)
+
+    record = workflow_service.RunRecord(
+        run_id="bg-cancel-settled",
+        workflow_name="wf",
+        spec=_SPEC,
+        inputs={},
+        state=RunState.RUNNING,
+        step_states={},
+        started_at="2026-08-01T00:00:00Z",
+    )
+    task = _asyncio.create_task(_run_in_background(record, _SPEC, "bg-cancel-settled", "yaml", {}))
+    await entered.wait()
+    task.cancel()
+    # FR-1.5: the cancellation still propagates — the guard must not swallow it.
+    with pytest.raises(_asyncio.CancelledError):
+        await task
+
+    row = workflow_journal.get_run("bg-cancel-settled")
+    assert row is not None
+    assert row.state == "cancelled", "the cancel-arm backstop overwrote a journalled CANCELLED"
 
 
 @pytest.mark.asyncio
@@ -1212,6 +1385,64 @@ def test_result_answerable_from_journal_with_empty_registry(client, read_surface
     assert step["attempts"] == 2
     assert step["output"] == {"answer": 42}
     assert body["kind"] is None
+
+
+def test_result_body_has_no_run_level_output_key(client, read_surface_db):
+    """PR #525 review: the ``/result`` body must NOT carry a run-level ``output`` key.
+
+    It was advertised in three docstrings but STRUCTURALLY always None here — there is
+    no run-level output column on ``workflow_run`` and ``RunRow`` has no such field, so
+    a journal-assembled result has nothing to populate it from. Advertising a field
+    that can never carry a value is worse than omitting it: a client feature-detecting
+    on key presence wires up a code path that can never fire.
+
+    The assertion is ``"output" not in body`` and NOT ``body["output"] is None``. The
+    latter would be VACUOUS — Pydantic's ``model_dump`` emits defaulted fields, so the
+    key was present as ``null`` before this fix and ``body["output"] is None`` passes
+    identically on both sides of it.
+
+    MUTATION PROOF: remove the ``body.pop("output", None)`` line and this fails.
+    """
+    _seed_run(
+        "no-output",
+        RunState.COMPLETED.value,
+        "2026-08-01T00:00:00Z",
+        finished_at="2026-08-01T00:00:10Z",
+        steps=[
+            {
+                "id": "s1",
+                "state": StepState.COMPLETED.value,
+                "output_json": '{"per_step": "kept"}',
+            }
+        ],
+    )
+    resp = client.get("/workflows/runs/no-output/result")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "output" not in body, "the async read surface still advertises a run-level output"
+    # PER-STEP output is untouched — only the run-level key was dropped.
+    assert body["steps"][0]["output"] == {"per_step": "kept"}
+
+
+def test_workflow_run_result_model_still_carries_output(client):
+    """FR-4.4: the field stays ON THE MODEL — only the async READ surface drops it.
+
+    The live script-tier path (``script_runner._finalize``) populates ``output`` from
+    the run's sentinel scan and the BLOCKING route returns it, so removing the model
+    field would break a working contract. This guards against "fixing" the finding by
+    deleting the field outright.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import WorkflowRunResult
+
+    result = WorkflowRunResult(
+        run_id="live",
+        workflow_name="wf",
+        state=RunState.COMPLETED,
+        started_at="2026-08-01T00:00:00Z",
+        output={"sentinel": "value"},
+    )
+    assert result.output == {"sentinel": "value"}
+    assert result.model_dump()["output"] == {"sentinel": "value"}
 
 
 def test_result_per_row_corruption_degrades_not_fails(client, read_surface_db):
