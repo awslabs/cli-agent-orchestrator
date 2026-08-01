@@ -5,6 +5,16 @@ the two-observation warning state, and asks a reviewer for an advisory importanc
 synthesis. Apply mode revalidates every candidate against live data before making
 an idempotent comment or state change. Closure also requires an explicit allowlist.
 
+Two invariants keep enforcement from spamming or stalling, and both are covered
+by ``test/examples/test_pr_health_workflow_example.py``:
+
+- Each lifecycle stage notifies the owner at most once. Idempotency keys on a
+  marker's *stage*, never on its full text, because the marker also embeds the
+  emitting run's score and ``as_of``.
+- Lifecycle progression is independent of the run cadence. The
+  furthest-advanced marker owns the PR's grace period, so a later earlier-stage
+  comment cannot restart the clock or shadow the closure branch.
+
 Example (authoring does not authorize this run):
     cao workflow run pr_health --run-id pr-health-2026-07-31 \
       --input as_of=2026-07-31 \
@@ -72,10 +82,18 @@ INPUTS = {
 SCHEMA_VERSION = 1
 MARKER_RE = re.compile(
     r"<!--\s*cao-pr-health:v1\s+"
-    r"stage=(warning|draft)\s+score=(\d{1,3})\s+"
+    r"stage=(warning|draft|closed)\s+score=(\d{1,3})\s+"
     r"as_of=(\d{4}-\d{2}-\d{2})\s*-->"
 )
+ESCALATION_MARKER_RE = re.compile(
+    r"<!--\s*cao-pr-health:v1\s+action=escalation\s+score=(\d{1,3})\s+"
+    r"as_of=(\d{4}-\d{2}-\d{2})\s*-->"
+)
+# Lifecycle stages never regress: the furthest-advanced stage owns the PR's
+# grace period, so a later-posted earlier-stage marker cannot shadow it.
+STAGE_RANK = {"warning": 0, "draft": 1, "closed": 2}
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+RESERVED_IDS = {".", ".."}
 ISSUE_REF_RE = re.compile(r"(?i)(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)?\s*#\d+")
 RATIONALE_RE = re.compile(r"(?i)\b(?:motivation|rationale|problem|why|because)\b")
 TEST_RE = re.compile(r"(?i)\b(?:test|tests|tested|testing|verification)\b")
@@ -133,6 +151,17 @@ ACTIONABLE_RECOMMENDATIONS = {
     "propose_draft",
     "second_owner_notification",
     "warn_owner",
+}
+# Marker stage each enforcement action writes. Idempotency is keyed on the
+# stage alone: the marker text also carries the run's score and as_of, so an
+# exact-string comparison would never match a prior run's marker and the same
+# notification would be posted again on every run.
+ACTION_STAGES = {
+    "warn_owner": "warning",
+    "propose_draft": "draft",
+    "second_owner_notification": "draft",
+    "propose_close": "closed",
+    "escalate_protected_pr": "escalation",
 }
 
 
@@ -243,6 +272,13 @@ def _labels(pr: dict[str, Any]) -> list[str]:
 
 
 def _latest_commit_at(pr: dict[str, Any]) -> str:
+    """Newest commit date on the PR, falling back to its creation date.
+
+    ``gh pr view --json commits`` may return a truncated page on PRs with very
+    long histories. A missed newer commit only makes the PR look more idle than
+    it is, which lowers its score; the live re-score before any mutation reads
+    the same field, so enforcement never acts on a stale page alone.
+    """
     dates = []
     for commit in pr.get("commits") or []:
         if not isinstance(commit, dict):
@@ -403,7 +439,20 @@ def _category(score: int) -> str:
     return "abandoned"
 
 
-def _latest_marker(pr: dict[str, Any]) -> dict[str, Any] | None:
+def _lifecycle_marker(pr: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the marker that owns the PR's current grace period.
+
+    The furthest-advanced stage wins, and within that stage the earliest
+    marker wins. Selecting by recency instead would let a later warning-stage
+    comment shadow an existing draft marker, so the draft grace period would
+    restart on every run and the closure branch would never be re-evaluated.
+    Lifecycle progression therefore does not depend on the run cadence.
+
+    Only comments authored by the authenticated identity count, and ``gh pr
+    view`` may return a truncated comment page on very busy PRs; a marker that
+    falls outside that page reads as absent, which is the conservative
+    direction (the ladder restarts rather than escalating).
+    """
     markers = []
     for comment in pr.get("comments") or []:
         if not isinstance(comment, dict):
@@ -423,7 +472,12 @@ def _latest_marker(pr: dict[str, Any]) -> dict[str, Any] | None:
                     "created_at": created_at,
                 }
             )
-    return max(markers, key=lambda item: item["created_at"]) if markers else None
+    if not markers:
+        return None
+    return min(
+        markers,
+        key=lambda item: (-STAGE_RANK[item["stage"]], item["created_at"]),
+    )
 
 
 def _owner_responded_after(pr: dict[str, Any], marker_at: str) -> bool:
@@ -455,8 +509,18 @@ def _observation_streak(
     previous_as_of = previous.get("last_as_of")
     if not isinstance(previous_as_of, str):
         return 1
-    if _date_ordinal(as_of) < _date_ordinal(previous_as_of):
-        raise ValueError("as_of predates the persisted PR health state")
+    try:
+        stale = _date_ordinal(as_of) < _date_ordinal(previous_as_of)
+    except ValueError:
+        # Unparsable persisted date (hand-edited or written by a future
+        # schema): restart this PR's streak rather than aborting the run.
+        return 1
+    if stale:
+        # Backfill, clock skew, or a reopened PR carrying old state. Restarting
+        # this PR's streak is the conservative direction — it delays the first
+        # warning by one observation instead of aborting scoring for every
+        # other PR in the run.
+        return 1
     if as_of == previous_as_of:
         return int(previous.get("below60_owner_streak") or 1)
     prior_qualified = (
@@ -500,6 +564,15 @@ def _recommend_action(
             if protected:
                 return score, "escalate_protected_pr", reasons
             return score, "propose_draft", reasons
+        if marker["stage"] in {"warning", "draft"} and score < 60:
+            # The stage's notification is already on the PR and its grace period
+            # has not expired. Falling through to the score<60 ladder would
+            # re-recommend warn_owner — a stage this PR has already passed — so
+            # hold here instead of walking the lifecycle backwards.
+            reasons.append(f"awaiting_{marker['stage']}_grace_period")
+            return score, "await_owner_deadline", reasons
+        # stage=closed means a previous close was reverted (PR reopened); the
+        # ladder restarts from observation below.
 
     if score < 60:
         if next_actor == "CI":
@@ -532,7 +605,7 @@ def _score_pr(
     raw_score = ci_points + merge_points + review_points + engagement_points + completeness_points
     priority, priority_evidence = _priority(pr)
     next_actor = _next_actor(pr, ci_status, merge_status, review_status)
-    marker = _latest_marker(pr)
+    marker = _lifecycle_marker(pr)
     streak = _observation_streak(previous, as_of, raw_score, next_actor)
     score, action, action_reasons = _recommend_action(
         pr,
@@ -765,30 +838,36 @@ This PR is protected from automated draft or closure because of its {protection_
     return f"{message}\n\n{marker}"
 
 
-def _has_exact_marker(pr: dict[str, Any], marker: str) -> bool:
-    return any(
-        isinstance(comment, dict)
-        and comment.get("viewerDidAuthor") is True
-        and marker in str(comment.get("body") or "")
+def _authored_bodies(pr: dict[str, Any]) -> list[str]:
+    return [
+        str(comment.get("body") or "")
         for comment in pr.get("comments") or []
-    )
+        if isinstance(comment, dict) and comment.get("viewerDidAuthor") is True
+    ]
 
 
-def _has_marker_for_action(
-    pr: dict[str, Any],
-    action: str,
-    marker: str,
-) -> bool:
-    if _has_exact_marker(pr, marker):
-        return True
-    if action != "escalate_protected_pr":
-        return False
-    return any(
-        isinstance(comment, dict)
-        and comment.get("viewerDidAuthor") is True
-        and "<!-- cao-pr-health:v1 action=escalation " in str(comment.get("body") or "")
-        for comment in pr.get("comments") or []
-    )
+def _has_marker_for_stage(pr: dict[str, Any], stage: str) -> bool:
+    """Has this workflow identity already posted a marker for ``stage``?
+
+    Dedupe is by stage presence, never by exact marker text: markers embed the
+    run's ``score`` and ``as_of``, so exact matching would re-post the same
+    notification every run.
+    """
+    for body in _authored_bodies(pr):
+        if stage == "escalation":
+            if ESCALATION_MARKER_RE.search(body):
+                return True
+            continue
+        if any(match.group(1) == stage for match in MARKER_RE.finditer(body)):
+            return True
+    return False
+
+
+def _has_marker_for_action(pr: dict[str, Any], action: str) -> bool:
+    stage = ACTION_STAGES.get(action)
+    if stage is None:
+        raise ValueError(f"unsupported enforcement action: {action}")
+    return _has_marker_for_stage(pr, stage)
 
 
 def _fetch_pr(repo: str, number: int) -> dict[str, Any]:
@@ -856,8 +935,7 @@ def _apply_recommendations(
                     },
                 )
                 continue
-            marker = _action_marker(action, int(planned["score"]), as_of)
-            if _has_marker_for_action(live_pr, action, marker):
+            if _has_marker_for_action(live_pr, action):
                 result["status"] = "already_applied"
                 results.append(result)
                 _write_json(
@@ -891,14 +969,12 @@ def _apply_recommendations(
             else:
                 body = _comment_body(planned, as_of)
                 if action == "propose_draft":
-                    if not bool(live_pr.get("isDraft")):
-                        _run_gh_command(["pr", "ready", str(number), "--repo", repo, "--undo"])
+                    # propose_draft is only recommended for a non-draft PR, and
+                    # the live re-score above rejects any drift, so the PR is
+                    # known not to be a draft here.
+                    _run_gh_command(["pr", "ready", str(number), "--repo", repo, "--undo"])
                     _run_gh_command(["pr", "comment", str(number), "--repo", repo, "--body", body])
-                    result["status"] = (
-                        "commented_existing_draft"
-                        if bool(live_pr.get("isDraft"))
-                        else "drafted_and_commented"
-                    )
+                    result["status"] = "drafted_and_commented"
                 elif action == "propose_close":
                     _run_gh_command(
                         [
@@ -930,187 +1006,7 @@ def _apply_recommendations(
     return results
 
 
-def _run_self_tests() -> None:
-    assert _days_between("2024-02-28", "2024-03-01") == 2
-    assert _days_between("2025-02-28", "2025-03-01") == 1
-    assert [_engagement_component(day) for day in (3, 4, 7, 8, 14, 15, 21, 22, 30, 31)] == [
-        40,
-        32,
-        32,
-        24,
-        24,
-        16,
-        16,
-        8,
-        8,
-        0,
-    ]
-    assert [_category(score) for score in (100, 85, 84, 70, 69, 60, 59, 51, 50, 30, 29)] == [
-        "healthy",
-        "healthy",
-        "active",
-        "active",
-        "watch",
-        "watch",
-        "at_risk",
-        "at_risk",
-        "stalled",
-        "stalled",
-        "abandoned",
-    ]
-    assert sum((20, 15, 15, 40, 10)) == 100
-    assert sum((20, 10, 0, 40, 10)) == 80
-    assert sum((20, 10, 0, 24, 10)) == 64
-    assert sum((20, 10, 0, 16, 10)) == 56
-    assert sum((0, 10, 0, 40, 10)) == 60
-    assert sum((0, 10, 0, 32, 10)) == 52
-    assert sum((0, 10, 0, 24, 10)) == 44
-    assert sum((20, 0, 15, 0, 10)) == 45
-    assert sum((5, 0, 0, 0, 5)) == 10
-
-    base_pr = {
-        "number": 1,
-        "title": "feat: deterministic workflow",
-        "url": "https://example.invalid/pull/1",
-        "author": {"login": "owner"},
-        "isDraft": False,
-        "body": (
-            "This change fixes #1 because the workflow needs deterministic scoring. "
-            "Testing and verification cover every score boundary. " * 3
-        ),
-        "createdAt": "2026-07-01T00:00:00Z",
-        "additions": 100,
-        "deletions": 20,
-        "changedFiles": 4,
-        "files": [{"path": "test/test_pr_health.py"}],
-        "labels": [{"name": "feature"}],
-        "comments": [],
-        "commits": [{"committedDate": "2026-07-31T00:00:00Z"}],
-        "reviewDecision": "APPROVED",
-        "mergeable": "MERGEABLE",
-        "mergeStateStatus": "CLEAN",
-        "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
-        "closingIssuesReferences": [{"number": 1}],
-    }
-    healthy, _ = _score_pr(base_pr, "2026-07-31", None)
-    assert healthy["score"] == 100
-    assert healthy["category"] == "healthy"
-    assert healthy["next_actor"] == "MAINTAINER"
-    assert healthy["recommended_action"] == "none"
-
-    at_risk_pr = {
-        **base_pr,
-        "reviewDecision": "CHANGES_REQUESTED",
-        "mergeStateStatus": "BLOCKED",
-        "commits": [{"committedDate": "2026-07-14T00:00:00Z"}],
-    }
-    at_risk, at_risk_state = _score_pr(at_risk_pr, "2026-07-31", None)
-    assert at_risk["score"] == 56
-    assert at_risk["recommended_action"] == "observe_again"
-    assert at_risk["below60_owner_streak"] == 1
-
-    warning, _ = _score_pr(
-        at_risk_pr,
-        "2026-08-01",
-        {
-            **at_risk_state,
-            "last_as_of": "2026-07-31",
-        },
-    )
-    assert warning["below60_owner_streak"] == 2
-    assert warning["recommended_action"] == "warn_owner"
-
-    warning_marker = "<!-- cao-pr-health:v1 stage=warning score=44 as_of=2026-07-24 -->"
-    stalled_pr = {
-        **at_risk_pr,
-        "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}],
-        "commits": [{"committedDate": "2026-07-23T00:00:00Z"}],
-        "comments": [
-            {
-                "author": {"login": "maintainer"},
-                "createdAt": "2026-07-24T00:00:00Z",
-                "body": warning_marker,
-                "viewerDidAuthor": True,
-            }
-        ],
-    }
-    stalled, _ = _score_pr(stalled_pr, "2026-07-31", None)
-    assert stalled["score"] == 44
-    assert stalled["recommended_action"] == "propose_draft"
-
-    recently_posted_marker_pr = {
-        **stalled_pr,
-        "comments": [
-            {
-                "author": {"login": "maintainer"},
-                "createdAt": "2026-07-30T00:00:00Z",
-                "body": warning_marker,
-                "viewerDidAuthor": True,
-            }
-        ],
-    }
-    recently_marked, _ = _score_pr(recently_posted_marker_pr, "2026-07-31", None)
-    assert "warning_marker_age=1" in recently_marked["action_reasons"]
-    assert recently_marked["recommended_action"] == "observe_again"
-
-    draft_marker = "<!-- cao-pr-health:v1 stage=draft score=50 as_of=2026-07-17 -->"
-    abandoned_pr = {
-        **base_pr,
-        "isDraft": True,
-        "reviewDecision": "REVIEW_REQUIRED",
-        "commits": [{"committedDate": "2026-06-01T00:00:00Z"}],
-        "comments": [
-            {
-                "author": {"login": "maintainer"},
-                "createdAt": "2026-07-17T00:00:00Z",
-                "body": draft_marker,
-                "viewerDidAuthor": True,
-            }
-        ],
-    }
-    abandoned, _ = _score_pr(abandoned_pr, "2026-07-31", None)
-    assert abandoned["raw_score"] == 50
-    assert abandoned["score"] == 25
-    assert abandoned["category"] == "abandoned"
-    assert abandoned["recommended_action"] == "propose_close"
-
-    protected_pr = {
-        **abandoned_pr,
-        "title": "fix(security): prevent command injection",
-        "labels": [{"name": "security"}],
-    }
-    protected, _ = _score_pr(protected_pr, "2026-07-31", None)
-    assert protected["priority"] == "P0"
-    assert protected["score"] == 25
-    assert protected["recommended_action"] == "escalate_protected_pr"
-    protected_comment = _comment_body(protected, "2026-07-31")
-    assert protected_comment.startswith("@owner ")
-    assert "priority P0" in protected_comment
-    assert (
-        "<!-- cao-pr-health:v1 action=escalation score=25 as_of=2026-07-31 -->" in protected_comment
-    )
-
-    forged_marker_pr = {
-        **stalled_pr,
-        "comments": [
-            {
-                "author": {"login": "owner"},
-                "createdAt": "2026-07-01T00:00:00Z",
-                "body": warning_marker,
-                "viewerDidAuthor": False,
-            }
-        ],
-    }
-    forged_marker, _ = _score_pr(forged_marker_pr, "2026-07-31", None)
-    assert forged_marker["lifecycle_marker"] is None
-    assert forged_marker["recommended_action"] == "observe_again"
-
-    assert _parse_close_allowlist("") == set()
-    assert _parse_close_allowlist("222, 231,222") == {222, 231}
-
-
 def _run_locked(inputs: dict[str, Any]) -> None:
-    _run_self_tests()
     repo = str(inputs.get("repo") or "").strip()
     as_of = str(inputs.get("as_of") or "").strip()
     snapshot_id = str(inputs.get("snapshot_id") or "").strip()
@@ -1124,8 +1020,11 @@ def _run_locked(inputs: dict[str, Any]) -> None:
     if repo.count("/") != 1 or any(not part for part in repo.split("/")):
         raise ValueError("repo must be in owner/name form")
     _validate_as_of(as_of)
-    if not SAFE_ID_RE.fullmatch(snapshot_id):
-        raise ValueError("snapshot_id may contain only letters, numbers, dot, underscore, and dash")
+    if not SAFE_ID_RE.fullmatch(snapshot_id) or snapshot_id in RESERVED_IDS:
+        raise ValueError(
+            "snapshot_id may contain only letters, numbers, dot, underscore, and dash, "
+            "and may not be '.' or '..'"
+        )
     if isinstance(max_prs, bool) or not isinstance(max_prs, int) or not 1 <= max_prs <= 2000:
         raise ValueError("max_prs must be an integer from 1 through 2000")
     if not isinstance(importance_analysis, bool):
@@ -1272,7 +1171,6 @@ def _run_locked(inputs: dict[str, Any]) -> None:
             in {
                 "closed_and_commented",
                 "commented",
-                "commented_existing_draft",
                 "drafted_and_commented",
             }
             for result in enforcement_results

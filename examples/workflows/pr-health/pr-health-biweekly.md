@@ -11,10 +11,10 @@ This is a pre-authorized scheduled PR-health dry run.
 Run exactly this command and do not change, omit, or add arguments:
 
 ```bash
-cao workflow run pr_health --run-id [[run_id]] \
+cao workflow run pr_health --run-id [[run_id_dry_run]] \
   --input repo=[[repo]] \
   --input as_of=[[as_of]] \
-  --input snapshot_id=[[snapshot_id]] \
+  --input snapshot_id=[[snapshot_id_dry_run]] \
   --input importance_analysis=true \
   --input importance_provider=claude_code \
   --input importance_agent=reviewer \

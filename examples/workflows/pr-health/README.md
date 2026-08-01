@@ -5,7 +5,9 @@ tracks degradation across runs, and produces an auditable Markdown and JSON
 report. It also includes a CAO scheduled flow with an exact 14-day cadence.
 
 The score is rule-based. The optional reviewer agent may summarize importance,
-but it cannot change scores, categories, next-actor attribution, or actions.
+but it cannot change scores, categories, next-actor attribution, or actions. Its
+prompt reads untrusted PR text (titles, bodies, comments), so treat its output as
+advisory prose only — nothing it says can alter a score or trigger an action.
 
 ## Safety model
 
@@ -23,12 +25,29 @@ additional safeguards:
 - Every candidate is fetched and scored again immediately before mutation.
 - Only hidden markers in comments authored by the authenticated workflow
   identity can advance lifecycle stages or make actions idempotent.
+- Each lifecycle stage notifies the owner at most once, ever. Idempotency keys
+  on the marker's stage, not its text, so a repeat run cannot re-post a
+  notification even though the marker embeds that run's score and date.
+- Lifecycle progression does not depend on the run cadence. The
+  furthest-advanced marker owns the PR's grace period, so a weekly, biweekly, or
+  ad-hoc run reaches the same stage after the same elapsed time.
+- A per-PR state problem (backfill, clock skew, a reopened PR carrying old
+  state) restarts that PR's observation streak; it never aborts the run for the
+  other PRs.
 - Runs for the same repository are serialized with a local file lock.
 
 The dry-run and apply schedules are separate templates. Registering the apply
 template is a deliberate standing authorization for future comments and draft
 changes. Both templates keep `close_allowlist` empty, so unattended runs cannot
-close PRs.
+close PRs. Both may be registered together: the guard emits mode-qualified run
+and snapshot identifiers so they never collide on a shared due date.
+
+> **Apply mode is a standing unattended write-grant.** Once registered, the
+> apply schedule comments on and drafts other contributors' pull requests under
+> the operator's `gh` identity, with no per-run review. Drafting someone's PR
+> has real social impact. Trial the apply template against a fork you own before
+> registering it against a shared repository, and read the dry-run report for at
+> least one full cycle first.
 
 ## Scoring
 
@@ -141,12 +160,18 @@ cao schedule list
 ```
 
 For an apply schedule, install and register
-`pr-health-biweekly-apply.md` instead. Its empty closure allowlist must remain
-empty for unattended operation.
+`pr-health-biweekly-apply.md` instead — or in addition, since the guard
+differentiates each mode's `run_id` and `snapshot_id`. Its empty closure
+allowlist must remain empty for unattended operation.
 
 CAO uses APScheduler weekday numbering, where `0` is Monday. The flow therefore
 uses `0 9 * * 0` for Monday at 09:00 in the server's local timezone. The
 `cao-server` process must remain running for scheduled flows to execute.
+
+The guard derives `as_of` from the **UTC** date, not the server's local date,
+because the scoring rules compare it against GitHub's UTC timestamps. A
+local-date `as_of` would shift the 7/14/21-day threshold crossings by a day for
+runs scheduled near midnight.
 
 Manage the schedule with:
 
