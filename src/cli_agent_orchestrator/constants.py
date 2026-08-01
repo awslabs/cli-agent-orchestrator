@@ -502,6 +502,15 @@ def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> boo
       ``CORS_ORIGINS`` list the HTTP API enforces plus any
       ``CAO_WS_ALLOWED_ORIGINS`` entries. Exact-string match mirrors how the
       browser reports ``Origin`` and how ``CORSMiddleware`` compares it.
+
+    A ``*`` entry in ``CORS_ORIGINS`` (i.e. ``CAO_CORS_ORIGINS="*"``) is
+    **deliberately NOT** treated as a wildcard here: it would open unauthenticated
+    PTY access — keystroke injection is RCE — to every website the victim
+    visits, a far higher blast radius than the read-oriented HTTP surface
+    ``CORSMiddleware`` guards. Disabling this check therefore requires the
+    dedicated, more conspicuous ``CAO_WS_ALLOWED_ORIGINS="*"`` opt-in, matching
+    the ``CAO_WS_ALLOWED_CLIENTS="*"`` escape hatch for the IP check. This
+    divergence from ``CORSMiddleware`` is intentional.
     """
     if not origin:
         return True
@@ -511,6 +520,9 @@ def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> boo
         authority = _origin_authority(origin)
         if authority is not None and authority == host:
             return True
+    # Membership only — an operator's ``CAO_CORS_ORIGINS="*"`` lands as the
+    # literal string "*" in this list and matches ONLY a literal "*" Origin
+    # (which no browser sends), so it never widens PTY trust. See docstring.
     return origin in CORS_ORIGINS or origin in WS_ALLOWED_ORIGINS
 
 

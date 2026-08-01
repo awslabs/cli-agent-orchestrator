@@ -3244,7 +3244,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     origin = websocket.headers.get("origin")
     if not is_ws_origin_allowed(origin, websocket.headers.get("host")):
         logger.warning(
-            "Rejected WebSocket attach for terminal %s: disallowed Origin %r",
+            "Rejected WebSocket attach for terminal %r: disallowed Origin %r",
             terminal_id,
             origin,
         )

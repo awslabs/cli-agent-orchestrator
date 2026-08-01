@@ -296,6 +296,23 @@ class TestIsWsOriginAllowed:
             with patch.object(constants, "WS_ALLOWED_ORIGINS", ["https://tunnel.example.dev"]):
                 assert constants.is_ws_origin_allowed("https://tunnel.example.dev") is True
 
+    def test_cors_wildcard_does_not_disable_ws_guard(self):
+        """Deliberate divergence from CORSMiddleware: a ``*`` in CORS_ORIGINS
+        (CAO_CORS_ORIGINS="*") must NOT wave through arbitrary WS origins — PTY
+        access is RCE-grade, so only the dedicated CAO_WS_ALLOWED_ORIGINS="*"
+        disables the check. The literal "*" only ever matches a "*" Origin,
+        which no browser sends."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["*"]):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("http://evil.example.com") is False
+                # A real same-origin request still works via the Host match.
+                assert (
+                    constants.is_ws_origin_allowed("http://localhost:9889", "localhost:9889")
+                    is True
+                )
+
     def test_wildcard_disables_check(self):
         from cli_agent_orchestrator import constants
 
