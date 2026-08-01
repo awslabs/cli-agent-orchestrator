@@ -16,7 +16,6 @@ from cli_agent_orchestrator.constants import (
     COPILOT_AGENTS_DIR,
     DEFAULT_PROVIDER,
     KIRO_AGENTS_DIR,
-    LOCAL_AGENT_STORE_DIR,
     OPENCODE_AGENTS_DIR,
     SKILLS_DIR,
 )
@@ -25,6 +24,7 @@ from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.services.profile_store import write_profile
 from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
@@ -153,11 +153,11 @@ def _download_agent(source: str) -> str:
     has legitimate filesystem trust, and keeping Path(user_input) out of the
     HTTP-reachable layer closes an entire class of py/path-injection alerts
     (CodeQL #49/#61 kept reopening while this lived here). The CLI entry point
-    copies local files into LOCAL_AGENT_STORE_DIR itself and then calls
+    resolves the local file itself and stores it via profile_store, then calls
     install_agent() with the bare stem, which flows through the "name" branch.
+    This function only ever hands profile_store a stem it has already validated,
+    never a caller-supplied path.
     """
-    LOCAL_AGENT_STORE_DIR.mkdir(parents=True, exist_ok=True)
-
     # SSRF hardening: narrow what a caller-provided URL can reach before any
     # network I/O happens. https-only rules out http://169.254.169.254/...;
     # the host allowlist rules out arbitrary internal services; the path
@@ -198,9 +198,12 @@ def _download_agent(source: str) -> str:
         raise ValueError("Redirects are not allowed for profile downloads.")
     response.raise_for_status()
 
-    dest_file = LOCAL_AGENT_STORE_DIR / filename
-    dest_file.write_text(response.text, encoding="utf-8")
-    return dest_file.stem
+    # The stem was validated against _PROFILE_NAME_RE above; profile_store owns
+    # the store join and the atomic write. overwrite=True preserves the
+    # pre-existing re-download behaviour of replacing the stored copy.
+    stem = filename[: -len(".md")]
+    write_profile(stem, response.text, overwrite=True)
+    return stem
 
 
 def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:

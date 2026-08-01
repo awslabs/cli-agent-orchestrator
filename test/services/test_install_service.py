@@ -59,7 +59,7 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         path.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR",
+        "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
         local_store_dir,
     )
     monkeypatch.setattr(
@@ -637,7 +637,7 @@ class TestInstallSkillCatalogBaking:
             d.mkdir()
 
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR",
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
             local_store_dir,
         )
         monkeypatch.setattr(

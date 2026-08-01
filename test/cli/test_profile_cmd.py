@@ -348,7 +348,10 @@ class TestProfileRemoveVerb:
         profile_file = store / "test-agent.md"
         profile_file.write_text("---\nname: test-agent\n---\ntest")
 
-        with patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store):
+        with (
+            patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store),
+            patch("cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", store),
+        ):
             result = runner.invoke(profile, ["remove", "test-agent", "-y"])
         assert result.exit_code == 0
         assert "Removed" in result.output
@@ -361,7 +364,10 @@ class TestProfileRemoveVerb:
         store = tmp_path / "store"
         store.mkdir()
 
-        with patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store):
+        with (
+            patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store),
+            patch("cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", store),
+        ):
             result = runner.invoke(profile, ["remove", "../../etc/passwd", "-y"])
         assert result.exit_code != 0
         assert "Invalid" in result.output or "not found" in result.output.lower()
@@ -375,7 +381,10 @@ class TestProfileRemoveVerb:
         profile_file = store / "keep-me.md"
         profile_file.write_text("---\nname: keep-me\n---\ntest")
 
-        with patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store):
+        with (
+            patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store),
+            patch("cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", store),
+        ):
             result = runner.invoke(profile, ["remove", "keep-me"], input="n\n")
         assert profile_file.exists()  # File should still be there
 

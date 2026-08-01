@@ -1,4 +1,12 @@
-"""Shared helper for inter-process-safe atomic read-modify-write on a file.
+"""Shared helpers for inter-process-safe atomic writes to a file.
+
+Two entry points share one set of guarantees:
+
+* :func:`locked_atomic_rewrite` — read the existing content, compute the new
+  content from it, publish atomically. For genuine read-modify-write callers.
+* :func:`locked_atomic_write` — publish new content without reading the old.
+  For full replaces, where the read is pointless and is the only step that can
+  fail on a target holding undecodable bytes.
 
 Several call sites (the Codex/Claude Code memory-injection plugins,
 ``utils/skill_injection.py``) implement the same "read existing content,
@@ -230,35 +238,95 @@ def locked_atomic_rewrite(
 
     with _file_lock(lock_path, lock_timeout):
         existing = target.read_text(encoding=encoding) if target.exists() else ""
-        new_content = compute_new_content(existing)
+        _atomic_publish(target, compute_new_content(existing), encoding)
 
-        # Capture the mode to apply to the published file BEFORE we write —
-        # tempfile.mkstemp creates the temp at 0600, so without this fixup the
-        # os.replace below would downgrade a user-authored 0644 file to 0600.
-        mode = _target_mode(target)
 
-        # Unique temp file in the SAME directory as target (same filesystem,
-        # so the final os.replace stays atomic) rather than a fixed
-        # ``target + ".tmp"`` name, so an unrelated unlocked writer (or a
-        # retry of this same call) can never collide with this call's temp
-        # file or unlink it out from under another in-flight write.
-        fd, temp_name = tempfile.mkstemp(
-            dir=str(target.parent),
-            prefix=f".{target.name}.",
-            suffix=".tmp",
-        )
-        temp_path = Path(temp_name)
-        try:
-            with os.fdopen(fd, "w", encoding=encoding) as handle:
-                handle.write(new_content)
-                handle.flush()
-                # Restore the target's (or umask-default) mode on the temp file
-                # before the replace, so the published file keeps its intended
-                # permissions rather than inheriting mkstemp's 0600.
-                os.fchmod(handle.fileno(), mode)
-                os.fsync(handle.fileno())
-            os.replace(temp_path, target)
-        finally:
-            # Only ever removes OUR OWN uniquely-named temp file.
-            with contextlib.suppress(FileNotFoundError):
-                temp_path.unlink()
+def locked_atomic_write(
+    target: Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+    overwrite: bool = True,
+) -> None:
+    """Replace ``target``'s entire contents atomically and safely across processes.
+
+    The blind-write sibling of :func:`locked_atomic_rewrite`. Identical locking,
+    temp-file, fsync, mode-preservation and ``os.replace`` semantics, but it
+    never reads the existing file.
+
+    Use this when the new content does not depend on the old. Reaching for
+    ``locked_atomic_rewrite`` with a callback that ignores its argument looks
+    equivalent but is not: that path decodes the existing bytes first, so a
+    target holding invalid ``encoding`` bytes raises ``UnicodeDecodeError``
+    instead of being replaced. For a full replace that read is both pointless
+    and the only thing that can fail, which makes a corrupt file unrepairable
+    by the very call that would have fixed it.
+
+    Args:
+        target: The file to replace. Parent directory is created if missing.
+        content: The full new content to write.
+        encoding: Text encoding for the write.
+        lock_timeout: Seconds to wait for the lock before raising
+            ``LockTimeoutError``.
+        overwrite: When False, refuse to replace an existing target. The check
+            runs *inside* the lock, so two concurrent creators cannot both
+            observe an absent file. Callers must not pre-check with
+            ``target.exists()`` themselves: that test would sit outside this
+            critical section and reintroduce the race.
+
+    Raises:
+        FileExistsError: If ``target`` exists and ``overwrite`` is False.
+        LockTimeoutError: If the lock is not acquired within ``lock_timeout``
+            seconds.
+        OSError: Propagated from filesystem operations (write, fsync, replace).
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _lock_path_for(target)
+
+    with _file_lock(lock_path, lock_timeout):
+        # Checked HERE, not by the caller: an exists() test outside this
+        # critical section lets two concurrent creators both see "absent" and
+        # both write, so the second silently clobbers the first.
+        if not overwrite and target.exists():
+            raise FileExistsError(f"{target} already exists")
+        _atomic_publish(target, content, encoding)
+
+
+def _atomic_publish(target: Path, content: str, encoding: str) -> None:
+    """Write ``content`` to ``target`` via a unique temp file + ``os.replace``.
+
+    Shared by :func:`locked_atomic_rewrite` and :func:`locked_atomic_write`.
+    The caller MUST already hold the target's lock; this helper does no locking
+    of its own.
+    """
+    # Capture the mode to apply to the published file BEFORE we write —
+    # tempfile.mkstemp creates the temp at 0600, so without this fixup the
+    # os.replace below would downgrade a user-authored 0644 file to 0600.
+    mode = _target_mode(target)
+
+    # Unique temp file in the SAME directory as target (same filesystem,
+    # so the final os.replace stays atomic) rather than a fixed
+    # ``target + ".tmp"`` name, so an unrelated unlocked writer (or a
+    # retry of this same call) can never collide with this call's temp
+    # file or unlink it out from under another in-flight write.
+    fd, temp_name = tempfile.mkstemp(
+        dir=str(target.parent),
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            # Restore the target's (or umask-default) mode on the temp file
+            # before the replace, so the published file keeps its intended
+            # permissions rather than inheriting mkstemp's 0600.
+            os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+    finally:
+        # Only ever removes OUR OWN uniquely-named temp file.
+        with contextlib.suppress(FileNotFoundError):
+            temp_path.unlink()
