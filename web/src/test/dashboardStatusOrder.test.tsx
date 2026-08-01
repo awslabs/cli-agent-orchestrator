@@ -128,4 +128,23 @@ describe('DashboardHome status summary totals (unrenderable statuses)', () => {
     // The same count the card's own header reports, from the same terminals.
     expect(metadata().textContent).toContain(`${TERMINALS_WITH_UNRENDERABLE.length} agents`)
   })
+  it('lets the operator click through the folded Unknown count to the rows behind it', async () => {
+    await renderDashboard(TERMINALS_WITH_UNRENDERABLE)
+
+    // The fold has to apply to counting AND filtering from one accessor. When
+    // it applied only to the count, the Unknown chip read 2 while the Unknown
+    // pill compared the raw 'DEAD'/'SUPERSEDED' and matched nothing -- so
+    // selecting it emptied the whole card. A count the operator cannot click
+    // through to is worse than no count: it reads as a broken dashboard.
+    expect(summaryCounts()['Unknown']).toBe(2)
+
+    const unknownPill = Array.from(statusFilterRow().querySelectorAll('button'))
+      .find(b => (b.textContent || '').includes('Unknown'))
+    expect(unknownPill).toBeTruthy()
+    fireEvent.click(unknownPill!)
+
+    // The session card survives the filter, and shows exactly the two rows the
+    // Unknown chip was counting.
+    expect(visibleTerminalIds(TERMINALS_WITH_UNRENDERABLE).sort()).toEqual(['dead-001', 'supr-001'])
+  })
 })

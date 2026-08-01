@@ -32,6 +32,19 @@ const STATUS_ORDER = ['PROCESSING', 'NOT_FIFO_MONITORED', 'IDLE', 'WAITING_USER_
 // that governs rendering, rather than against a second hand-kept copy.
 const RENDERABLE_STATUSES = new Set(STATUS_ORDER)
 
+// The single status accessor for counting AND filtering. A row whose reported
+// status has no chip (the lifecycle vocabulary 'dead' / 'superseded' /
+// 'unknown-liveness' that terminal_projection assigns to non-live rows) folds
+// to UNKNOWN so it stays visible in the totals.
+//
+// Counting and filtering MUST use this same fold. Folding only at the counting
+// site produces an Unknown chip reading "2" whose pill then matches nothing and
+// empties the card — a count the operator cannot click through to.
+function displayStatus(raw: string | undefined): string {
+  const reported = raw || 'UNKNOWN'
+  return RENDERABLE_STATUSES.has(reported) ? reported : 'UNKNOWN'
+}
+
 function fmtRel(dateStr: string | null | undefined): string | null {
   if (!dateStr) return null
   const d = new Date(dateStr)
@@ -136,7 +149,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
     const filtered = sessionData.filter(s =>
       s.terminals.length === 0 || s.terminals.some(t => {
         const matchAgent = !agentTypeFilter || (t.agent_profile || 'default') === agentTypeFilter
-        const matchStatus = !statusFilter || (terminalStatuses[t.id] || 'UNKNOWN') === statusFilter
+        const matchStatus = !statusFilter || displayStatus(terminalStatuses[t.id]) === statusFilter
         return matchAgent && matchStatus
       })
     )
@@ -158,13 +171,12 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   // unrecognised status must be visibly unknown, never invisible. It is
   // deliberately not fixed by extending STATUS_ORDER — see the note there.
   //
-  // The fold is display-only. Filtering still compares the raw status, so a
-  // folded row is counted as Unknown without the Unknown pill claiming it.
+  // Uses the same displayStatus() fold as both filter sites, so every count in
+  // the summary is reachable by clicking its pill.
   const getStatusCounts = (terminals: TerminalMeta[]) => {
     const counts: Record<string, number> = {}
     terminals.forEach(t => {
-      const reported = terminalStatuses[t.id] || 'UNKNOWN'
-      const s = RENDERABLE_STATUSES.has(reported) ? reported : 'UNKNOWN'
+      const s = displayStatus(terminalStatuses[t.id])
       counts[s] = (counts[s] || 0) + 1
     })
     return counts
@@ -392,7 +404,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
           {filteredSessions.map(session => {
             const visibleTerminals = session.terminals.filter(t => {
               const matchAgent = !agentTypeFilter || t.agent_profile === agentTypeFilter
-              const matchStatus = !statusFilter || (terminalStatuses[t.id] || 'UNKNOWN') === statusFilter
+              const matchStatus = !statusFilter || displayStatus(terminalStatuses[t.id]) === statusFilter
               return matchAgent && matchStatus
             })
             const statusCounts = getStatusCounts(session.terminals)
