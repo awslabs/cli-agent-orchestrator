@@ -9,6 +9,9 @@
 **CLI Agent Orchestrator (CAO)** coordinates multiple AI coding CLIs so a
 supervisor can delegate work to specialist agents in parallel or sequence.
 
+📚 **[Documentation](https://awslabs.github.io/cli-agent-orchestrator/)** —
+guides, reference, and two interactive courses.
+
 ## What CAO does
 
 CAO runs a local `cao-server`, starts provider CLIs in isolated terminal
