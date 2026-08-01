@@ -491,13 +491,21 @@ def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> boo
       This is the request the browser makes when the viewer is served by
       cao-server itself, and it is exactly what a cross-site attacker CANNOT
       forge — script-set ``Host`` is forbidden and the real ``Host`` is the
-      CAO server the socket is opened to, not the attacker's page. It is
-      DNS-rebinding-safe because ``TrustedHostMiddleware`` independently
-      validates ``Host`` against ``ALLOWED_HOSTS`` on the same WebSocket scope.
-      Matching on the live ``Host`` is what lets the imported-app deployment
+      CAO server the socket is opened to, not the attacker's page. Matching on
+      the live ``Host`` is what lets the imported-app deployment
       (``uvicorn ...:app``, which never runs ``add_local_cors_origins``) and
       dynamic reverse-proxy / Codespaces hostnames work without pre-registering
       every origin.
+
+      This branch trusts ``Host`` and so is only as safe as ``Host`` itself:
+      ``TrustedHostMiddleware`` validates ``Host`` against ``ALLOWED_HOSTS`` on
+      the same WebSocket scope BEFORE this handler runs, which is what makes
+      the match DNS-rebinding-safe in the default (loopback) config. Setting
+      ``CAO_ALLOWED_HOSTS="*"`` turns that validation off (``allow_any``), so an
+      operator who does that has opted out of the DNS-rebinding protection for
+      this branch too — the same explicit-opt-out tradeoff as
+      ``CAO_WS_ALLOWED_CLIENTS="*"``. Keep ``ALLOWED_HOSTS`` scoped to the real
+      serving hostname(s) rather than ``*`` whenever possible.
     * Otherwise the ``Origin`` must appear in the explicit allowlists: the same
       ``CORS_ORIGINS`` list the HTTP API enforces plus any
       ``CAO_WS_ALLOWED_ORIGINS`` entries. Exact-string match mirrors how the

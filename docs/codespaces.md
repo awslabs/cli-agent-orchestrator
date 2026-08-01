@@ -48,6 +48,12 @@ served by cao-server through the same forwarded hostname, so the handshake's
 ever serve the viewer from a *different* origin than the cao-server host, allow
 that origin explicitly with `CAO_WS_ALLOWED_ORIGINS="https://<that-origin>"`.
 
+> **Prefer a scoped host over `"*"`.** `CAO_ALLOWED_HOSTS="*"` disables
+> `TrustedHostMiddleware`'s Host validation, which is what makes the WebSocket
+> same-origin check DNS-rebinding-safe. If you know your Codespace hostname, set
+> `CAO_ALLOWED_HOSTS="<name>-9889.app.github.dev"` instead of `"*"` to keep that
+> protection. Use `"*"` only when the exact hostname is not known ahead of time.
+
 You should see:
 
 ```

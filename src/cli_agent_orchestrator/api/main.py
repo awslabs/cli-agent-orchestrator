@@ -3238,9 +3238,11 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # Origin header (and a Host it cannot forge) on every cross-site handshake,
     # so accept the connection only when it is same-origin with the request
     # Host — the request the bundled viewer makes, and the one an attacker page
-    # cannot spoof — or when the Origin is in the explicit allowlists. Host is
-    # independently validated against ALLOWED_HOSTS by TrustedHostMiddleware on
-    # this same WebSocket scope, so the same-origin match is DNS-rebinding-safe.
+    # cannot spoof — or when the Origin is in the explicit allowlists. In the
+    # default config the same-origin match is DNS-rebinding-safe because
+    # TrustedHostMiddleware validates Host against ALLOWED_HOSTS on this same
+    # WebSocket scope first (CAO_ALLOWED_HOSTS="*" opts out of that; see
+    # is_ws_origin_allowed).
     origin = websocket.headers.get("origin")
     if not is_ws_origin_allowed(origin, websocket.headers.get("host")):
         logger.warning(
