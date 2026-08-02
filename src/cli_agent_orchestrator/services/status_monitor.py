@@ -7,6 +7,7 @@ Publisher: terminal.{id}.status
 import asyncio
 import logging
 import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
@@ -45,6 +46,29 @@ _STICKY_READY_STATUSES = frozenset(
     }
 )
 
+# Live production incident (2026-08-02, app.workain.ai, harness-control#617/#618 investigation):
+# get_status()'s own stale-PROCESSING re-check (below) re-derives from the SAME rolling
+# self._buffers[terminal_id] the FIFO push pipeline feeds -- which stops changing the moment the
+# underlying process goes genuinely idle and stops emitting output. If the buffer's last content
+# never happened to parse as a ready state (a truncated escape sequence, or the true idle marker
+# rotated out of the bounded window before it was ever sampled as ready), re-running detection on
+# that SAME unchanging buffer produces the SAME PROCESSING/UNKNOWN result forever -- a session can
+# be genuinely idle, with the model's real response already fully rendered in the pane, while
+# get_status() reports PROCESSING indefinitely. Confirmed live TWICE in one operator session
+# (`cao-support`, workspace 227): a real chat message queued behind PROCESSING sat undelivered for
+# ~10 minutes until a manual tmux resize (forcing a fresh redraw) unstuck it -- no automatic
+# self-healing existed for this case at all. `_handle_trust_prompt` (codex.py) already solved the
+# identical staleness problem for init-time dialog detection by reading `get_backend().
+# get_history()` directly (a real `tmux capture-pane`, NOT the FIFO-fed buffer) -- tmux itself
+# always holds the correct, current rendered pane state regardless of output volume, so a fresh
+# capture-pane read can see what the stale FIFO buffer cannot. `STALE_PROCESSING_CAPTURE_INTERVAL_S`
+# rate-limits this to at most once per terminal per interval -- get_status() is a hot path (every
+# wait_until_status poll, every UI status refresh, across the whole fleet), and unlike the existing
+# cheap buffer re-check, a capture-pane read is a real subprocess call; unbounded, it would repeat
+# the exact "fork storm freezes the server" class of problem `run()`'s own docstring already
+# documents for status detection in general.
+STALE_PROCESSING_CAPTURE_INTERVAL_S = 3.0
+
 
 class StatusMonitor:
     """Accumulates terminal output into rolling buffers and detects status changes."""
@@ -68,6 +92,15 @@ class StatusMonitor:
         # IDLE/COMPLETED would freeze the terminal forever even when the
         # agent is genuinely processing new work.
         self._allow_processing_revert: Dict[str, bool] = {}
+        # Per-terminal timestamp of the last stale-PROCESSING fresh capture-pane read (see
+        # STALE_PROCESSING_CAPTURE_INTERVAL_S / get_status()) -- rate-limits that fallback so a
+        # terminal genuinely stuck reprocessing doesn't get a real tmux subprocess call on every
+        # single get_status() poll. Absence (never checked) is `None`, deliberately NOT `0.0` --
+        # `time.monotonic()`'s reference point is arbitrary and a `0.0` sentinel would collide
+        # with a genuinely-elapsed `0.0` reading (as it did in this fix's own tests, mocked with
+        # `time.monotonic() == 0.0` on the first call), incorrectly rate-limiting the very first
+        # check before it ever runs.
+        self._last_stale_capture_check: Dict[str, Optional[float]] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -510,6 +543,7 @@ class StatusMonitor:
             self._allow_processing_revert.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
+            self._last_stale_capture_check.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -530,6 +564,7 @@ class StatusMonitor:
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
+            self._last_stale_capture_check.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -587,7 +622,74 @@ class StatusMonitor:
             if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
                 self._apply_detection(terminal_id, fresh)
                 return fresh
+
+        if cached == TerminalStatus.PROCESSING:
+            # The cheap re-check above re-derives from the SAME rolling buffer the FIFO pipeline
+            # feeds -- if the terminal has genuinely gone idle and stopped emitting output, that
+            # buffer stops changing too, so the re-check above can return PROCESSING/UNKNOWN
+            # forever even though the real pane already shows a ready state. See
+            # STALE_PROCESSING_CAPTURE_INTERVAL_S's own comment for the live incident this closes.
+            fresh_capture = self._fresh_capture_pane_status(terminal_id)
+            if fresh_capture is not None:
+                logger.debug(
+                    f"get_status [{terminal_id}]: cached=PROCESSING stale-buffer re-check "
+                    f"still PROCESSING/UNKNOWN, fresh capture-pane={fresh_capture.value}"
+                )
+                if (
+                    fresh_capture != TerminalStatus.PROCESSING
+                    and fresh_capture != TerminalStatus.UNKNOWN
+                ):
+                    self._apply_detection(terminal_id, fresh_capture)
+                    return fresh_capture
         return cached
+
+    def _fresh_capture_pane_status(self, terminal_id: str) -> Optional[TerminalStatus]:
+        """Rate-limited fallback for a terminal stuck showing PROCESSING against a buffer that's
+        stopped changing: reads the pane directly via ``get_backend().get_history()`` (a real
+        ``tmux capture-pane``, not the FIFO-fed rolling buffer) and re-runs provider detection
+        against that. tmux always holds the correct, current rendered pane state regardless of
+        output volume, so this can see a genuine idle/ready state the stale buffer cannot.
+
+        Returns ``None`` when skipped (rate-limited, no provider, or the read/detection itself
+        failed) -- the caller treats that identically to "still PROCESSING", never as a signal to
+        change status. Only ever called when cached status is already PROCESSING, so a transient
+        failure here just means "try again next poll", not a regression from today's behavior.
+        """
+        now = time.monotonic()
+        with self._lock:
+            last_check = self._last_stale_capture_check.get(terminal_id)
+            if last_check is not None and now - last_check < STALE_PROCESSING_CAPTURE_INTERVAL_S:
+                return None
+            self._last_stale_capture_check[terminal_id] = now
+
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception as e:
+            # get_provider() raises (not returns None) for a terminal it doesn't recognize
+            # (e.g. not yet/no longer in the DB) -- matches the defensive pattern get_status()'s
+            # own event-inbox branch above already uses for the identical call.
+            logger.debug(f"_fresh_capture_pane_status [{terminal_id}]: get_provider failed: {e}")
+            return None
+        if provider is None:
+            return None
+
+        try:
+            from cli_agent_orchestrator.backends.registry import get_backend
+
+            fresh_output = get_backend().get_history(provider.session_name, provider.window_name)
+        except Exception as e:
+            logger.debug(
+                f"_fresh_capture_pane_status [{terminal_id}]: capture-pane read failed: {e}"
+            )
+            return None
+        if not fresh_output:
+            return None
+
+        try:
+            return provider.get_status(fresh_output)
+        except Exception as e:
+            logger.debug(f"_fresh_capture_pane_status [{terminal_id}]: detection failed: {e}")
+            return None
 
     def get_buffer(self, terminal_id: str) -> str:
         """Get accumulated output buffer for a terminal."""
