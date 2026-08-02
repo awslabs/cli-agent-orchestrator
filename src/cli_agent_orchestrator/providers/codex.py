@@ -8,6 +8,7 @@ import time
 from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -360,6 +361,11 @@ class CodexProvider(BaseProvider):
         if resolved_model:
             command_parts.extend(["--model", resolved_model])
 
+        # Set below, only when there is a non-empty system_prompt to inject -- appended, raw and
+        # deliberately unquoted by shlex, after the shlex.join() of everything else at the very
+        # end of this method. See the long comment at its assignment site for why.
+        developer_instructions_fragment: Optional[str] = None
+
         if profile is not None:
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
             system_prompt = self._apply_skill_prompt(system_prompt)
@@ -380,8 +386,64 @@ class CodexProvider(BaseProvider):
                 # Escape backslashes, double quotes, and newlines for TOML basic string.
                 # Newlines must become literal \n to prevent tmux send_keys from
                 # splitting the command across multiple lines.
-                command_parts.extend(
-                    ["-c", f"developer_instructions={_toml_scalar(system_prompt)}"]
+                #
+                # The escaped value is written to a CAO-owned temp file and referenced via a
+                # shell command substitution ($(cat <file>)) instead of being inlined directly,
+                # so the LAUNCH LINE ITSELF (what actually gets typed/pasted into the tmux pane)
+                # stays short regardless of how long the instructions text is. A real profile
+                # combining a security preamble, the caller's own system prompt, and the full
+                # skill-list prompt (see _apply_skill_prompt) commonly produces several KB of
+                # escaped text -- observed live at 8+KB. At launch time the pane is still a bare
+                # shell (codex has not started yet), which correctly does not get bracketed-paste
+                # framing (see clients/tmux.py's BRACKETED_PASTE_INCOMPATIBLE_SHELLS) since a bare
+                # shell does not understand those escape sequences. But WITHOUT that framing, a
+                # single pasted/typed line longer than the tty's canonical-mode line-length limit
+                # (MAX_CANON, 4096 bytes on Linux) is silently truncated/dropped by the kernel's
+                # tty line discipline before the shell ever sees a complete, valid command --
+                # this manifests as the shell hanging at an unclosed-quote continuation prompt
+                # forever (confirmed live: zero codex process ever spawned under the pane's shell,
+                # even after an explicit trailing Enter), until CAO's own init-timeout eventually
+                # fires with a generic "Codex initialization timed out" that gives no hint of the
+                # real cause. $(cat <file>) is expanded internally by the shell BEFORE exec'ing
+                # codex -- that internal expansion is not subject to the tty's per-line INPUT
+                # limit at all, only the typed/pasted command line is. Wrapped in double quotes
+                # (not left bare, not single-quoted) so the substitution still happens (command
+                # substitution is disabled inside single quotes) while word-splitting/globbing of
+                # the substituted content is suppressed (it is not inside single quotes either).
+                # The file's own content is `_toml_scalar`'s output verbatim, already including
+                # its own surrounding TOML double-quotes -- appended as a raw, deliberately
+                # UNquoted-by-shlex fragment after the main shlex.join() below (shlex.join would
+                # otherwise single-quote the whole "developer_instructions=$(cat ...)" fragment as
+                # one opaque token, disabling the substitution it depends on).
+                #
+                # Same underlying instructions/skills length problem does not affect Claude Code
+                # or Kimi CLI providers -- both already write the system prompt to a temp file and
+                # pass a short file-path flag instead of inlining it (see claude_code.py's
+                # --append-system-prompt-file, kimi_cli.py's system_prompt_path: YAML field).
+                # Codex has no direct equivalent of that "arbitrary absolute path" flag (its only
+                # file-loading mechanism, --profile, resolves names relative to $CODEX_HOME, which
+                # this provider has no reliable way to resolve per-account from here) -- this
+                # command-substitution approach reaches the same practical outcome (a short launch
+                # line) without needing that.
+                #
+                # Not covering here (disclosed, not silently assumed away): the other -c overrides
+                # below (per-MCP-server config, codexConfig) are NOT routed through this same
+                # mechanism and remain inlined directly -- they are typically far smaller than
+                # developer_instructions, but a profile configuring many MCP servers could in
+                # theory still accumulate enough inline -c overrides to hit the same limit. Left
+                # as a known, scoped-out follow-up rather than expanding this fix's surface.
+                developer_instructions_dir = CAO_HOME_DIR / "tmp"
+                developer_instructions_dir.mkdir(parents=True, exist_ok=True)
+                developer_instructions_file = (
+                    developer_instructions_dir / f"{self.terminal_id}.codex_developer_instructions"
+                )
+                developer_instructions_file.write_text(_toml_scalar(system_prompt), encoding="utf-8")
+                try:
+                    developer_instructions_file.chmod(0o600)
+                except OSError:
+                    pass
+                developer_instructions_fragment = (
+                    f'-c "developer_instructions=$(cat {shlex.quote(str(developer_instructions_file))})"'
                 )
 
             # Add MCP servers via -c config overrides (per-session, no global config changes).
@@ -450,7 +512,10 @@ class CodexProvider(BaseProvider):
         # wins even if a profile sets check_for_update_on_startup=true.
         command_parts.extend(["-c", "check_for_update_on_startup=false"])
 
-        return shlex.join(command_parts)
+        command = shlex.join(command_parts)
+        if developer_instructions_fragment is not None:
+            command = f"{command} {developer_instructions_fragment}"
+        return command
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
         """Dismiss startup prompts that block readiness.
@@ -872,3 +937,10 @@ class CodexProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Codex CLI provider."""
         self._initialized = False
+        # Remove the developer_instructions temp file written by _build_codex_command, if any --
+        # same convention claude_code.py's own cleanup() uses for its analogous .prompt file.
+        tmp_file = CAO_HOME_DIR / "tmp" / f"{self.terminal_id}.codex_developer_instructions"
+        try:
+            tmp_file.unlink(missing_ok=True)
+        except OSError:
+            pass
