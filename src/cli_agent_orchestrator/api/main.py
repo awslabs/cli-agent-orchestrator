@@ -77,6 +77,7 @@ from cli_agent_orchestrator.graph.providers import get_provider
 # Import the sinks package for its import-time @register_sink side effects
 # ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
 from cli_agent_orchestrator.graph.sinks import get_sink
+from cli_agent_orchestrator.models.annotations import AnnotationsResponse
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import (
     CallbackRecoveryCallbackRequest,
@@ -126,6 +127,7 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.services import (
+    annotations,
     callback_recovery,
     companion_receipts,
     control_input_service,
@@ -1646,6 +1648,45 @@ async def get_skill_content(name: str) -> SkillContentResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to load skill: {str(e)}",
         )
+
+
+@app.get("/annotations", response_model=AnnotationsResponse)
+async def list_annotations(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> AnnotationsResponse:
+    """Conductor-published annotations for the dashboard's chips (design §9.5).
+
+    THE ONE ADDITIVE FORK SEAM, and it is meant to be the last one. It reads a
+    fixed, non-configurable, conductor-owned location and passes what it finds
+    through verbatim, bounded and confined. It has no vocabulary of kinds,
+    roles, subjects or facets, so the conductor can evolve the status model
+    indefinitely without another fork release — see
+    ``services/annotations.py`` for why each of those omissions is deliberate.
+
+    **The signature takes no parameters, and that is the security property.**
+    Not a project, not a path, not a filter. There is therefore no caller input
+    that can reach a filesystem operation — path confinement here is a
+    consequence of the route's shape rather than of sanitising a string, and
+    symlink escape is refused explicitly on top of that.
+
+    **It cannot fail.** A missing conductor state root, an unreadable one, a
+    malformed or oversized document, an item the fork cannot represent, and a
+    non-regular file where a document should be all degrade to a shorter list
+    with a typed reason. No single source can unwind the fan-out: each is read
+    inside its own handler, so one producer's bad document costs that producer
+    and nothing else. ``coverage: "unavailable"`` with an empty list is the
+    ordinary answer on a machine with no conductor, and it renders exactly as
+    the dashboard did before this route existed: no chips, no error, no empty
+    state.
+
+    Off the event loop: the fan-out is a bounded number of small blocking reads
+    and this route is polled by the dashboard. Every open is ``O_NONBLOCK``, so
+    a FIFO left in the state root cannot park a worker from the shared default
+    executor — the failure that would take the whole API's blocking work down
+    with it.
+    """
+    payload = await asyncio.to_thread(annotations.read_annotations)
+    return AnnotationsResponse(**payload)
 
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)

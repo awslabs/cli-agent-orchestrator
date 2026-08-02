@@ -1,5 +1,7 @@
 import type { Page, Route } from "@playwright/test";
 import { tryParseNotation, renderPreview } from "../src/lib/macroNotation";
+import { projectedTerminal } from "../src/test/projectedTerminal";
+import type { AnnotationsResponse } from "../src/api";
 
 /**
  * The §10.5 stubbed server: Playwright route mocks for every HTTP endpoint
@@ -23,6 +25,47 @@ const KIMI_COMPACT_EVENTS = [
   { type: "key", key: "Enter" },
 ];
 const KIMI_STOP_EVENTS = [{ type: "key", key: "Escape" }];
+
+/**
+ * The stubbed fleet, as `terminal_projection.project_row` actually shapes it.
+ *
+ * This array used to be seven hand-written keys against the projection's
+ * twenty-five, including a `created_at` the server has never sent, so the e2e
+ * suite was rendering a shape production cannot produce. It now comes from the
+ * one shared fixture, so widening the projection cannot leave this stub behind.
+ *
+ * `t-native` keeps its id and generation: every other spec resolves the
+ * terminal by that id, and the annotation generation fence keys on the
+ * generation.
+ */
+export const T_NATIVE_GENERATION = "generation-1";
+
+export const stubTerminals = [
+  projectedTerminal({
+    id: "t-native",
+    tmux_window: "0",
+    provider: "kimi_cli",
+    agent_profile: "spec-writer-k3",
+    generation: T_NATIVE_GENERATION,
+    callback_target_generation: T_NATIVE_GENERATION,
+    last_active: "2026-07-28T10:00:00Z",
+    status: "not_fifo_monitored",
+  }),
+];
+
+/** The §9.5 "no conductor installed" answer: empty, typed, never an error. */
+export function emptyAnnotations(): AnnotationsResponse {
+  return {
+    annotation_schema: "cao-annotations-v1",
+    coverage: "unavailable",
+    sources_read: 0,
+    sources_failed: 0,
+    items_dropped: 0,
+    items_omitted: 0,
+    reasons: [],
+    annotations: [],
+  };
+}
 
 export interface StubMacro {
   id: string;
@@ -159,6 +202,8 @@ export async function stubBackend(page: Page, options?: {
   /** Canned control-input POST responses by ordinal (1-based); later POSTs
    * fall back to the default accepted answer. */
   controlInputResponses?: Array<Record<string, unknown>>;
+  /** The §9.5 annotation payload. Omit for the no-annotations control. */
+  annotations?: AnnotationsResponse;
 }): Promise<StubHarness> {
   const laneC = options?.laneC ?? true;
   const interactiveStreaming = options?.interactiveStreaming ?? false;
@@ -209,29 +254,23 @@ export async function stubBackend(page: Page, options?: {
     if (path === "/sessions/cao-fleet" && method === "GET") {
       return json(route, {
         session: { id: "s-1", name: "cao-fleet", status: "active" },
-        terminals: [
-          {
-            id: "t-native",
-            tmux_session: "cao-fleet",
-            tmux_window: "0",
-            provider: "kimi_cli",
-            agent_profile: "spec-writer-k3",
-            created_at: "2026-07-28T09:00:00Z",
-            last_active: "2026-07-28T10:00:00Z",
-          },
-        ],
+        terminals: stubTerminals,
       });
     }
+    if (path === "/annotations" && method === "GET") {
+      // §9.5: absent conductor state = an empty, typed answer, never a 404 and
+      // never an error. The default is exactly that, so every pre-existing spec
+      // runs against the no-annotations control.
+      return json(route, options?.annotations ?? emptyAnnotations());
+    }
     if (path === "/terminals/t-native" && method === "GET") {
-      return json(route, {
-        id: "t-native",
-        name: "cao-fleet",
-        provider: "kimi_cli",
-        session_name: "cao-fleet",
-        agent_profile: "spec-writer-k3",
-        status: "running",
-        last_active: "2026-07-28T10:00:00Z",
-      });
+      // The same projected row the listing serves. It used to answer
+      // `status: "running"`, which is not a value `project_row` can produce —
+      // the dashboard uppercased it into a bucket STATUS_ORDER has never held
+      // and drew every stubbed worker as "Unknown". A managed native-TUI
+      // worker reports `not_fifo_monitored` ("Managed Live"), which is what
+      // nearly all of the real fleet reports.
+      return json(route, stubTerminals[0]);
     }
     if (path === "/terminals/t-native/managed-control") {
       return json(route, {

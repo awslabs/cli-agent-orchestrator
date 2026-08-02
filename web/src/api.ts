@@ -64,14 +64,121 @@ export interface SessionDetail {
   terminals: TerminalMeta[]
 }
 
+/**
+ * One row of the shared terminal projection.
+ *
+ * This is `terminal_projection.project_row`'s ACTUAL output, key for key —
+ * `/sessions/{name}` returns `project_session(...)` verbatim
+ * (services/session_service.py), so anything this interface omits is a field
+ * the dashboard cannot see and anything it invents is a field the server never
+ * sends. It previously declared seven keys against the real twenty-five, and
+ * one of those seven — `created_at` — is not among them: no `TerminalModel`
+ * column and no projection key by that name exists, so `t.created_at` was
+ * permanently `undefined` in production while three test fixtures fed it a
+ * value and made the dead branch look covered. That is the specific failure
+ * mode this shape exists to prevent, so keep it driven from `project_row`.
+ *
+ * `terminal_id`/`name`/`session_name` are the canonical spellings both human
+ * views are required to agree on; `id`/`tmux_session`/`tmux_window` are the
+ * pre-existing display keys the projection deliberately keeps alongside them.
+ */
 export interface TerminalMeta {
+  // Identity — canonical spellings.
+  terminal_id: string
+  name: string | null
+  session_name: string | null
+  // Identity — the pre-existing display keys, kept by the projection.
   id: string
-  tmux_session: string
-  tmux_window: string
-  provider: string
+  tmux_session: string | null
+  tmux_window: string | null
+  // Provenance.
+  provider: string | null
   agent_profile: string | null
-  created_at: string | null
+  caller_id: string | null
+  generation: string | null
+  callback_target_generation: string | null
+  protocol_vintage: string
+  // Recorded pane identity.
+  server_socket_path: string | null
+  session_id: string | null
+  window_id: string | null
+  pane_id: string | null
+  pane_pid: number | string | null
+  native_session_id: string | null
+  // Observed liveness — never the stored lifecycle.
+  lifecycle_state: string
+  lifecycle_reason: string | null
+  superseded_by_terminal_id: string | null
+  superseded_by_generation: string | null
+  /** Stated rather than inferred from `status`: no classification is coming. */
+  fifo_monitored: boolean
+  /** Provider status for a live pane; the lifecycle word otherwise. */
+  status: string | null
   last_active: string | null
+}
+
+// ── Conductor annotations (work-state design §9.5) ─────────────────────
+// The wire shape of GET /annotations. The fork is a bounded, confined
+// pass-through: `kind`, `semantic_role` and `subject.type` are the conductor's
+// vocabulary and are deliberately typed as open strings here, so the conductor
+// can add to any of them without a change on this side. The renderer resolves
+// `semantic_role` against the six roles in design-tokens/tokens.json and falls
+// back to `neutral` for anything else.
+
+export interface AnnotationSubject {
+  /** "terminal" | "task" | "campaign" today; open by design. */
+  type: string
+  terminal_id?: string | null
+  /**
+   * The generation this annotation was derived against. The renderer fences on
+   * it: an annotation whose generation differs from the projection row's is
+   * dropped, so a stale claim cannot outlive the obligation that produced it.
+   */
+  generation?: string | null
+  task_id?: string | null
+  campaign?: string | null
+  /**
+   * A subject type invented later brings its own identifier, and the route
+   * carries a bounded number of them through. Typed open here so the renderer
+   * can draw whatever arrived instead of an anonymous chip — placement is
+   * durable without this, identity is not.
+   */
+  [key: string]: string | null | undefined
+}
+
+export interface Annotation {
+  namespace: string
+  kind: string
+  version: number
+  label: string
+  semantic_role: string
+  priority: number
+  subject: AnnotationSubject
+  /** Past this the renderer greys the chip (§9.6). */
+  valid_until?: string | null
+  /** Derived facets only — never worker-authored free text (§7). */
+  details?: Record<string, string>
+  /** The conductor project directory that published it; never a path. */
+  source?: string | null
+}
+
+export interface AnnotationSourceReason {
+  source: string
+  reason: string
+}
+
+export interface AnnotationsResponse {
+  annotation_schema: string
+  /** "complete" | "partial" | "truncated" | "unavailable" */
+  coverage: string
+  sources_read: number
+  sources_failed: number
+  items_dropped: number
+  items_omitted: number
+  /** Facets that did not fit the bounded detail bag, or had no display form. */
+  facets_dropped?: number
+  reasons: AnnotationSourceReason[]
+  annotations: Annotation[]
 }
 
 /**
@@ -339,6 +446,12 @@ export const api = {
   createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
   deleteSession: (name: string) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${name}`, { method: 'DELETE' }),
+
+  // Conductor annotations (§9.5). The route takes no parameters — that is the
+  // security property, not an omission — and never errors: an absent or
+  // unreadable conductor state root answers `coverage: "unavailable"` with an
+  // empty list, which renders exactly as the dashboard did before it existed.
+  getAnnotations: () => fetchJSON<AnnotationsResponse>('/annotations'),
 
   // Terminals
   getTerminalStatus: (id: string) =>

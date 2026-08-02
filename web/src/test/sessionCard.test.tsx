@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, cleanup, fireEvent, screen } from '@testing-library/react'
 import { DashboardHome } from '../components/DashboardHome'
 import { useStore } from '../store'
+import { projectedTerminal } from './projectedTerminal'
 
 // §7.6 session-card header: metadata must be selectable text that never
 // toggles the card; expand/collapse belongs exclusively to the chevron button.
@@ -13,15 +14,11 @@ import { useStore } from '../store'
 vi.mock('../components/TerminalView', () => ({ TerminalView: () => null }))
 
 const SESSION = { id: 'sess-1', name: 'cao-fleet', status: 'active' }
-const TERMINAL = {
-  id: 'term-001',
-  tmux_session: 'cao-fleet',
-  tmux_window: 'reviewer-a1b2',
-  provider: 'kimi_cli',
-  agent_profile: 'reviewer',
-  created_at: '2026-07-28T10:00:00Z',
-  last_active: '2026-07-28T12:00:00Z',
-}
+// The real projected row, from the one shared fixture. It carries no
+// `created_at` because `terminal_projection.project_row` does not emit one —
+// this file used to supply the field, and asserted on a "Started …" line that
+// could never render against a real server.
+const TERMINAL = projectedTerminal({ id: 'term-001', status: 'idle' })
 const REGION_ID = 'session-cao-fleet-terminals'
 
 function jsonResponse(body: unknown): Response {
@@ -35,7 +32,7 @@ function stubDashboardFetch() {
       return jsonResponse({ session: SESSION, terminals: [TERMINAL] })
     }
     if (url === '/terminals/term-001') {
-      return jsonResponse({ ...TERMINAL, name: 'term-001', session_name: 'cao-fleet', status: 'idle' })
+      return jsonResponse({ ...TERMINAL, name: 'term-001', session_name: 'cao-fleet' })
     }
     if (url === '/agents/profiles') return jsonResponse([])
     return jsonResponse({})
@@ -86,10 +83,12 @@ describe('DashboardHome session-card header (§7.6)', () => {
     // 'reviewer' also appears in the agent-type filter row; the card's type
     // badge is the one inside the selectable metadata container.
     const badge = screen.getAllByText('reviewer').find(el => el.closest('div.select-text'))!
-    const started = screen.getByText(/^Started \d/)
+    // `Active` is the only timestamp line a projected row can produce: there
+    // is no `created_at` on the projection, so the old `Started …` assertion
+    // was covering a branch the server can never reach.
     const active = screen.getByText(/^Active \d/)
 
-    for (const el of [name, count, badge, started, active]) {
+    for (const el of [name, count, badge, active]) {
       fireEvent.click(el)
       expectCollapsed()
     }
@@ -108,10 +107,10 @@ describe('DashboardHome session-card header (§7.6)', () => {
     collapseCard()
 
     const name = screen.getByText('cao-fleet')
-    const started = screen.getByText(/^Started \d/)
+    const active = screen.getByText(/^Active \d/)
 
     fireEvent.doubleClick(name)
-    fireEvent.doubleClick(started)
+    fireEvent.doubleClick(active)
     expectCollapsed()
 
     // Simulated drag-select from the session name across the timestamp,
@@ -119,12 +118,12 @@ describe('DashboardHome session-card header (§7.6)', () => {
     fireEvent.mouseDown(name)
     const range = document.createRange()
     range.setStartBefore(name)
-    range.setEndAfter(started)
+    range.setEndAfter(active)
     const selection = window.getSelection()
     selection?.removeAllRanges()
     selection?.addRange(range)
-    fireEvent.mouseMove(started)
-    fireEvent.mouseUp(started)
+    fireEvent.mouseMove(active)
+    fireEvent.mouseUp(active)
 
     expect(selection?.toString()).toContain('cao-fleet')
     expectCollapsed()

@@ -1,12 +1,15 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { useStore } from '../store'
-import { api, TerminalMeta } from '../api'
+import { api, Annotation, AnnotationsResponse, TerminalMeta } from '../api'
 import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileText, LogOut, Send, ChevronRight, ChevronDown, Users, Filter, ArrowDownUp } from 'lucide-react'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
 import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
+import { CampaignAnnotations, TerminalAnnotations } from './AnnotationChips'
+import { placeAnnotations, readAnnotations } from '../lib/annotations'
+import { fmtAbs, fmtRel } from '../lib/time'
 
 // Render/filter order for the per-session status summary and the status filter
 // pills. NOT_FIFO_MONITORED sits second, immediately after PROCESSING, because
@@ -43,29 +46,6 @@ const RENDERABLE_STATUSES = new Set(STATUS_ORDER)
 function displayStatus(raw: string | undefined): string {
   const reported = raw || 'UNKNOWN'
   return RENDERABLE_STATUSES.has(reported) ? reported : 'UNKNOWN'
-}
-
-function fmtRel(dateStr: string | null | undefined): string | null {
-  if (!dateStr) return null
-  const d = new Date(dateStr)
-  if (isNaN(d.getTime())) return null
-  const diff = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000))
-  if (diff < 60) return 'just now'
-  const m = Math.floor(diff / 60)
-  if (m < 60) return `${m}m ago`
-  const h = Math.floor(m / 60)
-  const rm = m % 60
-  if (h < 24) return rm ? `${h}h ${rm}m ago` : `${h}h ago`
-  const days = Math.floor(h / 24)
-  const rh = h % 24
-  return rh ? `${days}d ${rh}h ago` : `${days}d ago`
-}
-
-function fmtAbs(dateStr: string | null | undefined): string | null {
-  if (!dateStr) return null
-  const d = new Date(dateStr)
-  if (isNaN(d.getTime())) return null
-  return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
 const STATUS_META: Record<string, { label: string; dot: string; text: string; pulse?: boolean }> = Object.fromEntries(
@@ -135,6 +115,11 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc')
   const [pendingDeleteSession, setPendingDeleteSession] = useState<string | null>(null)
   const [deletingSession, setDeletingSession] = useState(false)
+  const [annotations, setAnnotations] = useState<AnnotationsResponse | null>(null)
+  /** The last /annotations poll failed; the payload on screen is unverified. */
+  const [staleFetch, setStaleFetch] = useState(false)
+  /** True once one full session-detail pass has landed — the fence's precondition. */
+  const [rowsLoaded, setRowsLoaded] = useState(false)
   const seenSessionsRef = useRef<Set<string>>(new Set())
 
   const totalTerminals = sessionData.reduce((sum, s) => sum + s.terminals.length, 0)
@@ -197,6 +182,9 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
           })
         )
         setSessionData(sessionDetails)
+        // The annotation placement fence cannot run until the row set is
+        // known — see the `placement` memo below.
+        setRowsLoaded(true)
         // Auto-expand only newly seen sessions
         const newNames = sessionDetails.map(s => s.name).filter(n => !seenSessionsRef.current.has(n))
         newNames.forEach(n => seenSessionsRef.current.add(n))
@@ -234,6 +222,66 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   useEffect(() => {
     api.listProfiles().then(p => setProfileCount(p.length)).catch(() => {})
   }, [])
+
+  // Conductor annotations (§9.5). Failure-isolated in both directions: a 404
+  // from a server without the route, a network error, and a body that is not
+  // the documented shape all resolve to "no annotations", which renders
+  // exactly as the dashboard did before this existed.
+  //
+  // The 5s interval is NOT chasing the producer's 30s tick — nothing new can
+  // arrive in between. It re-evaluates FRESHNESS: `valid_until` passes while
+  // the page sits open, and a chip must grey when it expires rather than when
+  // the next document happens to land.
+  //
+  // A SINGLE FAILED POLL DOES NOT WIPE THE SURFACE. Discarding the payload on
+  // one blip blanked every chip for 5s and then brought them back, which reads
+  // as the fleet changing when nothing did. The last body is held and marked
+  // unverified — the existing "partial data" marker — and only a run of
+  // failures clears it, because at that point "I have not been able to check"
+  // is the honest answer.
+  useEffect(() => {
+    let failures = 0
+    const fetchAnnotations = () => {
+      api.getAnnotations()
+        .then(body => {
+          failures = 0
+          setStaleFetch(false)
+          setAnnotations(readAnnotations(body))
+        })
+        .catch(() => {
+          failures += 1
+          if (failures >= 3) {
+            setAnnotations(null)
+            setStaleFetch(false)
+          } else {
+            setStaleFetch(true)
+          }
+        })
+    }
+    fetchAnnotations()
+    const interval = setInterval(fetchAnnotations, 5000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // Placement is computed against EVERY terminal in the fleet, not per session,
+  // so an annotation naming a terminal in another session is attached there
+  // rather than landing on the campaign surface as "orphaned".
+  //
+  // `rowsLoaded` is the whole reason this is not just `sessionData`. The two
+  // fetches are independent effects and the session pass is a sequential loop,
+  // so `/annotations` routinely lands first, against `sessionData === []`.
+  // Classifying then announced every live worker as an `orphaned run` on every
+  // load and every refresh — a confidently wrong claim, made by the surface
+  // whose job is to report the fence.
+  const placement = useMemo(() => {
+    const rows = sessionData.flatMap(s =>
+      s.terminals.map(t => ({ id: t.id, generation: t.generation ?? null })),
+    )
+    return placeAnnotations(annotations?.annotations ?? [], rows, rowsLoaded)
+  }, [annotations, sessionData, rowsLoaded])
+
+  const annotationsFor = (terminalId: string): Annotation[] | undefined =>
+    placement.byTerminal[terminalId]
 
   const handleDeleteTerminal = async () => {
     if (!pendingClose) return
@@ -344,6 +392,23 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
         </button>
       </div>
 
+      {/* Terminal-independent annotations: unbound gates, orphaned runs and
+          campaign-scoped work have somewhere visible to land instead of being
+          dropped for want of a terminal row. Renders nothing at all when there
+          is nothing to say, so a fleet with no annotations is unchanged. */}
+      <CampaignAnnotations
+        unplaced={placement.unplaced}
+        fenced={placement.fenced}
+        pending={placement.pending}
+        omitted={annotations?.items_omitted ?? 0}
+        degraded={
+          annotations !== null &&
+          (staleFetch ||
+            annotations.coverage === 'partial' ||
+            annotations.coverage === 'truncated')
+        }
+      />
+
       {/* Header with sort toggle */}
       <div className="mb-1">
         <div className="flex items-center justify-between">
@@ -425,11 +490,6 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                 return acc
               }, {})
             ).sort((a, b) => b[1] - a[1])
-            const sessionStart = session.terminals.reduce<string | null>((earliest, t) => {
-              if (!t.created_at) return earliest
-              if (!earliest) return t.created_at
-              return new Date(t.created_at) < new Date(earliest) ? t.created_at : earliest
-            }, null)
             const sessionLastActive = session.terminals.reduce<string | null>((latest, t) => {
               if (!t.last_active) return latest
               if (!latest) return t.last_active
@@ -480,7 +540,6 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                         </div>
                         <StatusSummary counts={statusCounts} />
                         <div className="flex items-center gap-3 text-[10px] text-gray-600">
-                          {sessionStart && <span title={fmtAbs(sessionStart) || ''}>Started {fmtRel(sessionStart)}</span>}
                           {sessionLastActive && <span title={fmtAbs(sessionLastActive) || ''}>Active {fmtRel(sessionLastActive)}</span>}
                         </div>
                       </div>
@@ -500,9 +559,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                         </div>
                         <div className="space-y-1.5">
                           {terminals.map(t => {
-                            const relCreated = fmtRel(t.created_at)
                             const relActive = fmtRel(t.last_active)
-                            const showActive = relActive && relActive !== relCreated
                             return (
                               <div key={t.id} className="bg-gray-900/50 border border-gray-700/30 rounded-lg px-3 py-2 space-y-1.5">
                                 {/* flex-wrap keeps narrow (mobile) widths from
@@ -510,25 +567,44 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                     wrap under the identity line instead of
                                     forcing a wider-than-viewport layout. */}
                                 <div className="flex flex-wrap items-center justify-between gap-y-1.5">
-                                  <div className="flex items-center gap-2 min-w-0">
+                                  {/* `flex-wrap` so the conductor chip group can
+                                      take its own line at narrow widths. At 390
+                                      the identity row measured 282px of space
+                                      for 459px of content: flexbox shrank the
+                                      `truncate` profile name to nothing and
+                                      then clipped the chips off the card
+                                      anyway, so one annotation deleted the only
+                                      thing saying which worker the row is. */}
+                                  <div className="flex items-center gap-2 min-w-0 flex-wrap">
                                     <TermIcon size={12} className="text-gray-500 shrink-0" />
                                     <span className="text-xs font-medium text-gray-300 truncate">{t.agent_profile || 'default'}</span>
                                     <span className="text-[10px] font-mono text-gray-600">{t.id.slice(0, 8)}</span>
+                                    {/* Fork-owned status first, conductor chips
+                                        after it. Never a replacement: `status`
+                                        is the only reachability statement the
+                                        fork can make, and `not_fifo_monitored`
+                                        already IS one. */}
                                     <StatusBadge status={terminalStatuses[t.id] || null} />
-                                    <span className="text-[10px] text-gray-600">{t.provider}</span>
+                                    <TerminalAnnotations annotations={annotationsFor(t.id)} />
+                                    {/* Same fallback the modals use: a blank
+                                        gap and the word "unknown" are the same
+                                        fact, and only one of them says so. */}
+                                    <span className="text-[10px] text-gray-600">{t.provider || 'unknown'}</span>
                                   </div>
                                   <div className="flex items-center gap-1 shrink-0">
                                     <button onClick={() => setInboxTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Inbox"><Mail size={12} /></button>
                                     <button onClick={() => setOutputTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Output"><FileText size={12} /></button>
-                                    <button onClick={() => setLiveTerminal({ id: t.id, provider: t.provider, agentProfile: t.agent_profile })} className="flex items-center gap-1 px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-medium rounded transition-colors"><Monitor size={12} />Terminal</button>
+                                    <button onClick={() => setLiveTerminal({ id: t.id, provider: t.provider ?? undefined, agentProfile: t.agent_profile })} className="flex items-center gap-1 px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-medium rounded transition-colors"><Monitor size={12} />Terminal</button>
                                     <button onClick={() => setPendingExit(t)} disabled={exitingTerminal === t.id} className="p-1 text-gray-500 hover:text-amber-400 bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Graceful Exit"><LogOut size={12} /></button>
                                     <button onClick={() => setPendingClose(t)} disabled={closingTerminal === t.id} className="p-1 text-gray-500 hover:text-red-400 bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Close"><Trash2 size={12} /></button>
                                   </div>
                                 </div>
-                                {/* Timestamps */}
+                                {/* Timestamps. `last_active` is the only one
+                                    the projection publishes — there is no
+                                    `created_at` on a projected row, and the
+                                    branch that read one could never fire. */}
                                 <div className="flex items-center gap-3 text-[10px] text-gray-600">
-                                  {relCreated && <span title={fmtAbs(t.created_at) || ''}>{relCreated}</span>}
-                                  {showActive && <span title={fmtAbs(t.last_active) || ''}>↻ {relActive}</span>}
+                                  {relActive && <span title={fmtAbs(t.last_active) || ''}>↻ {relActive}</span>}
                                 </div>
                                 {/* Quick Send */}
                                 {!sendInputOpen[t.id] ? (
@@ -565,7 +641,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
         message="This will kill the tmux window and terminate the agent process."
         details={pendingClose ? [
           { label: 'Terminal', value: `${pendingClose.agent_profile || 'default'} (${pendingClose.id})` },
-          { label: 'Session', value: pendingClose.tmux_session },
+          { label: 'Session', value: pendingClose.tmux_session || 'unknown' },
         ] : []}
         confirmLabel="Close Terminal"
         variant="danger"
@@ -579,7 +655,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
         message="This will send the provider-specific exit command (e.g., /exit)."
         details={pendingExit ? [
           { label: 'Terminal', value: `${pendingExit.agent_profile || 'default'} (${pendingExit.id})` },
-          { label: 'Provider', value: pendingExit.provider },
+          { label: 'Provider', value: pendingExit.provider || 'unknown' },
         ] : []}
         confirmLabel="Send Exit"
         variant="warning"
