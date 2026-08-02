@@ -15,11 +15,21 @@
 // by this file, which is the point: the CI drift gate must never fire because
 // somebody added a chip.
 //
-// NOTHING HERE IS INTERACTIVE. The chips are spans with a `title` and a
-// matching `aria-label`, so the hover facets are available to a pointer and to
-// assistive technology without adding a control to an unauthenticated
-// dashboard's tab order — and the AAA 44×44 target question (§13.8) never
-// arises for an element that is not a target.
+// THE CHIPS STAY OUT OF THE TAB ORDER. They are spans, never controls, so the
+// AAA 44×44 target question (§13.8) never arises for an element that is not a
+// target and an unauthenticated dashboard does not grow 41 tab stops.
+//
+// They now carry a POINTER-ONLY hover card (AnnotationDetails.tsx) where the
+// native `title` used to be. `title` was the one affordance the browser gives
+// for free and the one an operator cannot use: it appears on the browser's
+// schedule, cannot be moused into, and cannot be selected or copied. It is
+// gone rather than kept alongside, because two tooltips on one element is a
+// bug, not a fallback.
+//
+// NOTHING DEPENDS ON THE HOVER. The complete detail lives behind the row's
+// info button, which IS a real control and therefore the keyboard and touch
+// path; the facets stay in `aria-label` for assistive technology and stay
+// visible as text below `sm`, where there is no hover at all.
 //
 // `role="note"` IS NOT DECORATION. `aria-label` is PROHIBITED by ARIA in HTML
 // on a `<span>` with no role, and axe says so at serious impact on every chip;
@@ -34,13 +44,17 @@
 // did not, which left `waiting` on a phone saying a worker is parked and
 // nothing about which obligation it is parked on.
 //
-// NO IDENTITY BUNDLE AND NO COPY-TO-CLIPBOARD (§9.5): `conduct dashboard`
-// instructs `tailscale serve` and the server is unauthenticated by default, so
-// this surface publishes derived facts and nothing that identifies or actuates
-// a worker. No worker-authored free text either (§7) — every string drawn here
-// is either the conductor's derived label or a timestamp this file formatted.
+// NO IDENTITY BUNDLE AND NO COPY-TO-CLIPBOARD *ON THE CHIP* (§9.5): `conduct
+// dashboard` instructs `tailscale serve` and the server is unauthenticated by
+// default, so this surface publishes derived facts and nothing that identifies
+// or actuates a worker. No worker-authored free text either (§7) — every string
+// drawn here is either the conductor's derived label or a timestamp this file
+// formatted. The info popover does offer copy, of text this page already
+// renders and this origin already serves; AnnotationDetails.tsx argues that
+// case at its head.
 
 import { Annotation } from '../api'
+import { useAnnotationHover } from './AnnotationDetails'
 import {
   ageSource,
   freshness,
@@ -170,16 +184,21 @@ export function AnnotationChip({ annotation, stale }: { annotation: Annotation; 
         ? 'freshness not declared'
         : null
   const hover = [subjectText(annotation), facets, freshnessText].filter(Boolean).join(' · ')
+  // The card is portalled, so `hoverCard` adds no box here and `anchorProps`
+  // go straight onto the chip — nothing is interposed between it and the flex
+  // container whose rules the 390px layout depends on.
+  const { anchorProps, hoverCard } = useAnnotationHover(annotation)
 
   return (
+    <>
     <span
+      {...anchorProps}
       data-testid="annotation-chip"
       data-kind={annotation.kind}
       data-role={role}
       data-stale={state === 'stale' ? 'true' : 'false'}
       data-freshness={state}
       role="note"
-      title={hover}
       aria-label={`${annotation.label}${age ? `, ${age}` : ''} — ${hover}`}
       // Staleness is signalled by the neutral role, a dashed outline and a
       // hollow dot — NOT by opacity. Dimming the whole chip was the first
@@ -220,6 +239,8 @@ export function AnnotationChip({ annotation, stale }: { annotation: Annotation; 
         </span>
       )}
     </span>
+    {hoverCard}
+    </>
   )
 }
 

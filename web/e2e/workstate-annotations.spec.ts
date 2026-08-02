@@ -131,12 +131,132 @@ async function assertNoSeriousAxeViolations(page: Page, ...include: string[]) {
   let builder = new AxeBuilder({ page });
   for (const selector of include) builder = builder.include(selector);
   const scan = await builder.analyze();
+  // The messageKey is included because "color-contrast: <selector>" does not
+  // say WHY, and the why decides the fix: `bgGradient`/`bgOverlap` mean axe
+  // could not composite the backdrop, `shortTextContent` means it declined to
+  // judge, and a bare contrast failure means the colours are actually wrong.
   const serious = (results: typeof scan.violations) =>
     results
       .filter((v) => v.impact === "serious" || v.impact === "critical")
-      .flatMap((v) => v.nodes.map((n) => `${v.id}: ${n.target.join(" ")}`));
+      .flatMap((v) =>
+        v.nodes.map((n) => {
+          const why = [...n.any, ...n.all, ...n.none]
+            .map((c) => (c.data as { messageKey?: string } | undefined)?.messageKey)
+            .filter(Boolean)[0];
+          return `${v.id}${why ? `[${why}]` : ""}: ${n.target.join(" ")}`;
+        }),
+      );
   expect(serious(scan.violations), "axe violations").toEqual([]);
   expect(serious(scan.incomplete), "axe incomplete").toEqual([]);
+}
+
+/**
+ * The same gate, minus specific axe *measurement-limitation* reason codes.
+ *
+ * Only ever legitimate when the thing the code prevents axe from judging is
+ * being judged some other way — see the `assertCompositedContrast` call that
+ * accompanies every use.
+ */
+async function assertAxeExcept(page: Page, tolerate: string[], ...include: string[]) {
+  let builder = new AxeBuilder({ page });
+  for (const selector of include) builder = builder.include(selector);
+  const scan = await builder.analyze();
+  const serious = (results: typeof scan.violations) =>
+    results
+      .filter((v) => v.impact === "serious" || v.impact === "critical")
+      .flatMap((v) =>
+        v.nodes.map((n) => {
+          const why = [...n.any, ...n.all, ...n.none]
+            .map((c) => (c.data as { messageKey?: string } | undefined)?.messageKey)
+            .filter(Boolean)[0];
+          return { key: `${v.id}${why ? `[${why}]` : ""}: ${n.target.join(" ")}`, why };
+        }),
+      )
+      .filter((r) => !r.why || !tolerate.includes(r.why))
+      .map((r) => r.key);
+  expect(serious(scan.violations), "axe violations").toEqual([]);
+  expect(serious(scan.incomplete), "axe incomplete").toEqual([]);
+}
+
+/**
+ * Composited contrast for every text node under `selector`, checked ourselves.
+ *
+ * WHY THIS EXISTS RATHER THAN A WIDER axe SCOPE. axe will not certify contrast
+ * on an element that partially overlaps others — it returns
+ * `color-contrast[elmPartiallyObscuring]`, meaning "I cannot determine the
+ * backdrop", not "the contrast is wrong". A `position: fixed` popover overlaps
+ * page content by construction, so on the 390×844 project the card's footer is
+ * permanently uncertifiable no matter how opaque it is made.
+ *
+ * Tolerating that reason code alone would be a hole: it is indistinguishable
+ * from a genuine failure axe merely could not measure. So instead of relaxing
+ * the gate we do the measurement axe declined to do — walk the ancestor chain
+ * compositing every semi-transparent layer to an opaque backdrop, then apply
+ * the WCAG AA ratio. That is strictly stronger than the check it replaces.
+ */
+async function assertCompositedContrast(page: Page, selector: string) {
+  const failures = await page.evaluate((sel) => {
+    const parse = (c: string) => {
+      const m = c.match(/rgba?\(([^)]+)\)/);
+      if (!m) return null;
+      const p = m[1].split(",").map((s) => parseFloat(s.trim()));
+      return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+    };
+    type C = { r: number; g: number; b: number; a: number };
+    const over = (fg: C, bg: C): C => ({
+      r: fg.r * fg.a + bg.r * (1 - fg.a),
+      g: fg.g * fg.a + bg.g * (1 - fg.a),
+      b: fg.b * fg.a + bg.b * (1 - fg.a),
+      a: 1,
+    });
+    const lum = (c: C) => {
+      const f = (v: number) => {
+        v /= 255;
+        return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+      };
+      return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b);
+    };
+    const ratio = (a: C, b: C) => {
+      const l1 = lum(a);
+      const l2 = lum(b);
+      return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+    };
+    const backdrop = (el: Element): C => {
+      const stack: C[] = [];
+      let node: Element | null = el;
+      while (node && node !== document.documentElement) {
+        const bg = parse(getComputedStyle(node).backgroundColor);
+        if (bg && bg.a > 0) {
+          stack.push(bg);
+          if (bg.a === 1) break;
+        }
+        node = node.parentElement;
+      }
+      let base: C = { r: 255, g: 255, b: 255, a: 1 };
+      for (let i = stack.length - 1; i >= 0; i--) base = over(stack[i], base);
+      return base;
+    };
+    const root = document.querySelector(sel);
+    if (!root) return [`selector matched nothing: ${sel}`];
+    const bad: string[] = [];
+    for (const el of Array.from(root.querySelectorAll("*"))) {
+      if (el.children.length > 0) continue;
+      const text = (el.textContent || "").trim();
+      if (!text) continue;
+      const cs = getComputedStyle(el);
+      const fg = parse(cs.color);
+      if (!fg) continue;
+      const bg = backdrop(el);
+      const size = parseFloat(cs.fontSize);
+      const weight = parseInt(cs.fontWeight) || 400;
+      const large = size >= 24 || (size >= 18.66 && weight >= 700);
+      const need = large ? 3 : 4.5;
+      const got = ratio(fg.a < 1 ? over(fg, bg) : fg, bg);
+      if (got < need) bad.push(`${got.toFixed(2)}:1 < ${need}:1 — ${size}px "${text.slice(0, 24)}"`);
+    }
+    return bad;
+  }, selector);
+  expect(failures, `composited contrast under ${selector}`).toEqual([]);
 }
 
 /**
@@ -275,7 +395,11 @@ test.describe("conductor annotation chips (§9.5)", () => {
     await expect(chip).toBeVisible();
     await expect(chip).toHaveAttribute("data-stale", "true");
     await expect(chip).toHaveAttribute("data-role", "neutral");
-    await expect(chip).toHaveAttribute("title", /stale since/);
+    // The native `title` is gone: it could not be moused into or selected. The
+    // same sentence now lives in the hover card, which can be.
+    await expect(chip).not.toHaveAttribute("title", /./);
+    await chip.hover();
+    await expect(page.getByTestId("annotation-hovercard")).toContainText("stale since");
 
     await page.screenshot({
       path: `${SHOTS}/${testInfo.project.name}-c-stale-greyed.png`,
@@ -430,7 +554,8 @@ test.describe("conductor annotation chips (§9.5)", () => {
   test("the staleness dot keeps its geometry at every viewport", async ({ page }) => {
     // The dot is one of the two deliberate NON-COLOUR channels for staleness
     // (hollow vs filled). Without `shrink-0` flexbox squashed it to a 1.2px
-    // sliver at 390, where the `title` fallback does not exist either.
+    // sliver at 390 — the viewport with no hover at all, so neither the old
+    // `title` nor the hover card that replaced it is reachable there.
     await stubBackend(page, {
       annotations: payload([
         annotation({ label: "waiting", priority: 90 }),
@@ -601,6 +726,75 @@ test.describe("conductor annotation chips (§9.5)", () => {
     await expect(page.getByTestId("campaign-annotations")).toBeVisible();
 
     expect(await seriousViolationIds(page)).toEqual(control);
+  });
+
+  test("the work-state popover is reachable, complete and accessible", async ({
+    page,
+  }, testInfo) => {
+    // The chips are spans and stay out of the tab order, so this button is the
+    // ONLY keyboard and touch path to the detail. It therefore has to carry
+    // everything the pointer-only hover card shows, and has to survive the same
+    // axe gate the chips do.
+    await stubBackend(page, {
+      annotations: payload([
+        annotation({
+          details: {
+            task: "p0-09b-b0-b1-implementation-r1",
+            round: "12",
+            lifecycle: "assigned",
+          },
+        }),
+      ]),
+    });
+    await page.goto("/");
+
+    const info = page.getByTestId("workstate-info-button");
+    await expect(info).toBeVisible();
+    await expect(info).toHaveAttribute("aria-expanded", "false");
+
+    await info.click();
+    const details = page.getByTestId("workstate-details");
+    await expect(details).toBeVisible();
+    await expect(info).toHaveAttribute("aria-expanded", "true");
+
+    // Verbose by contract: the facets, the identity, and the envelope the chip
+    // has no room for.
+    await expect(details).toContainText("p0-09b-b0-b1-implementation-r1");
+    await expect(details).toContainText("t-native");
+    await expect(page.getByTestId("workstate-copy")).toBeVisible();
+
+    // The card must sit ENTIRELY within the viewport. A card that hangs off the
+    // bottom puts its footer — and with it the copy button — out of reach, and
+    // at 390×844 that is exactly what an unclamped placement did.
+    const box = (await details.boundingBox())!;
+    const vp = page.viewportSize()!;
+    expect(
+      { top: Math.round(box.y), bottom: Math.round(box.y + box.height), vh: vp.height },
+      "popover must fit the viewport",
+    ).toEqual({
+      top: expect.any(Number),
+      bottom: expect.any(Number),
+      vh: vp.height,
+    });
+    expect(box.y, "popover top edge on screen").toBeGreaterThanOrEqual(0);
+    expect(box.y + box.height, "popover bottom edge on screen").toBeLessThanOrEqual(vp.height);
+
+    // Contrast is measured by compositing rather than delegated to axe, because
+    // a fixed popover overlaps page content and axe will not certify what it
+    // cannot composite. See `assertCompositedContrast`.
+    await assertCompositedContrast(page, '[data-testid="workstate-details"]');
+    // Everything axe CAN judge about the card — roles, names, structure,
+    // focus order — still has to pass, so the rule set is filtered to the one
+    // reason code that is a measurement limitation rather than a finding.
+    await assertAxeExcept(page, ["elmPartiallyObscuring"], '[data-testid="workstate-details"]');
+    await page.screenshot({
+      path: `${SHOTS}/${testInfo.project.name}-g-workstate-popover.png`,
+      fullPage: true,
+    });
+
+    await page.keyboard.press("Escape");
+    await expect(details).toHaveCount(0);
+    await expect(info).toHaveAttribute("aria-expanded", "false");
   });
 
   test("a body the route should never send degrades to the control rendering", async ({

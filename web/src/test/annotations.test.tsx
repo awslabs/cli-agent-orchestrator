@@ -11,7 +11,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import annotationsLibSource from '../lib/annotations.ts?raw'
 import annotationChipsSource from '../components/AnnotationChips.tsx?raw'
-import { render, cleanup, screen, waitFor, within } from '@testing-library/react'
+import { render, cleanup, screen, waitFor, within, fireEvent } from '@testing-library/react'
 import { DashboardHome } from '../components/DashboardHome'
 import { CampaignAnnotations } from '../components/AnnotationChips'
 import { useStore } from '../store'
@@ -35,6 +35,23 @@ const TERMINAL = projectedTerminal({ id: 'term-001', generation: GENERATION, sta
 
 const FUTURE = '2999-01-01T00:00:00Z'
 const PAST = '2020-01-01T00:00:00Z'
+
+/**
+ * The facet key/value pairs a card is showing.
+ *
+ * Structural rather than a substring match on `textContent`: the card renders
+ * key and value as sibling `<dt>`/`<dd>` with no literal separator, so
+ * `toContain('task: x')` would assert a format only the old `title` ever had
+ * and would pass or fail for reasons unrelated to the facts being present.
+ */
+function facetPairs(root: HTMLElement): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const dt of Array.from(root.querySelectorAll('dt'))) {
+    const dd = dt.nextElementSibling
+    if (dd) out[(dt.textContent || '').trim()] = (dd.textContent || '').trim()
+  }
+  return out
+}
 
 function annotation(overrides: Partial<Annotation> = {}): Annotation {
   return {
@@ -154,21 +171,52 @@ describe('annotations render alongside StatusBadge, never instead of it', () => 
     expect(chips()[0].textContent).toMatch(/3h/)
   })
 
-  it('exposes the derived facets in the hover and in the accessible name', async () => {
+  it('exposes the derived facets in the hover card and in the accessible name', async () => {
     stubFetch(payload([annotation()]))
     await renderDashboard()
 
     await waitFor(() => expect(chips().length).toBe(1))
     const chip = chips()[0]
-    const hover = chip.getAttribute('title')!
-    expect(hover).toContain('task: p0-09b-r1')
-    expect(hover).toContain('role: reviewer')
-    expect(hover).toContain('round: 12')
+
+    // The accessible name is the path that does NOT depend on a pointer, and it
+    // is unchanged by the move off `title`.
     expect(chip.getAttribute('aria-label')).toContain('waiting')
     expect(chip.getAttribute('aria-label')).toContain('task: p0-09b-r1')
+
+    // `title` is gone on purpose: a native tooltip cannot be moused into or
+    // selected, and rendering both would show two tooltips on one element.
+    expect(chip.getAttribute('title')).toBeNull()
+
+    fireEvent.mouseEnter(chip)
+    const card = await waitFor(() => screen.getByTestId('annotation-hovercard'))
+    const facets = facetPairs(card)
+    expect(facets['task']).toBe('p0-09b-r1')
+    expect(facets['role']).toBe('reviewer')
+    expect(facets['round']).toBe('12')
   })
 
-  it('adds no interactive element and no copy affordance to the dashboard', async () => {
+  it('keeps the hover card open while the pointer travels into it', async () => {
+    // The whole reason for replacing `title`: an operator must be able to move
+    // onto the card to read or select it. Leaving the chip must not close a
+    // card the pointer has entered.
+    stubFetch(payload([annotation()]))
+    await renderDashboard()
+    await waitFor(() => expect(chips().length).toBe(1))
+
+    fireEvent.mouseEnter(chips()[0])
+    const card = await waitFor(() => screen.getByTestId('annotation-hovercard'))
+    fireEvent.mouseLeave(chips()[0])
+    fireEvent.mouseEnter(card)
+
+    await new Promise(r => setTimeout(r, 300))
+    expect(screen.queryByTestId('annotation-hovercard')).not.toBeNull()
+  })
+
+  it('keeps the chips themselves out of the tab order', async () => {
+    // Unchanged founding decision: the chips are spans, never controls, so an
+    // unauthenticated dashboard does not grow one tab stop per annotation and
+    // the AAA 44×44 target question never arises. The hover card is a
+    // pointer-only enhancement and the row's info button is the real control.
     stubFetch(payload([annotation()]))
     await renderDashboard()
     await waitFor(() => expect(chips().length).toBe(1))
@@ -178,9 +226,25 @@ describe('annotations render alongside StatusBadge, never instead of it', () => 
       expect(chip.querySelector('button, a, input, [role="button"], [tabindex]')).toBeNull()
       expect(chip.getAttribute('tabindex')).toBeNull()
     }
-    // §9.5: no identity bundle and no copy-to-clipboard on an unauthenticated
-    // dashboard. The chip publishes derived facts only.
-    expect(screen.queryByText(/copy/i)).toBeNull()
+    // The copy affordance is inside the popover, so it does not exist until an
+    // operator deliberately opens it.
+    expect(screen.queryByTestId('workstate-copy')).toBeNull()
+  })
+
+  it('never publishes pane identity, even with the detail popover open', async () => {
+    // §9.5 still binds where it bites. The popover may copy DERIVED facts the
+    // page already shows; it must never surface something that identifies or
+    // actuates a worker. Asserted with the popover OPEN, because asserting it
+    // closed proves nothing about the surface that was actually added.
+    stubFetch(payload([annotation()]))
+    await renderDashboard()
+    await waitFor(() => expect(chips().length).toBe(1))
+
+    fireEvent.click(screen.getByTestId('workstate-info-button'))
+    const details = await waitFor(() => screen.getByTestId('workstate-details'))
+
+    expect(facetPairs(details)['task']).toBe('p0-09b-r1')
+    expect(screen.queryByTestId('workstate-copy')).not.toBeNull()
     expect(document.body.textContent).not.toContain(TERMINAL.pane_id)
     expect(document.body.textContent).not.toContain(TERMINAL.server_socket_path)
   })
@@ -248,7 +312,10 @@ describe('freshness (§9.6)', () => {
     expect(chip.className).not.toContain('opacity-')
     // A stale danger chip must not keep its alarming colour.
     expect(chip.className).not.toContain('bg-cao-danger')
-    expect(chip.getAttribute('title')).toContain('stale since')
+
+    fireEvent.mouseEnter(chip)
+    const card = await waitFor(() => screen.getByTestId('annotation-hovercard'))
+    expect(card.textContent).toContain('stale since')
   })
 
   it('leaves a chip inside its validity window authoritative', async () => {
@@ -291,8 +358,11 @@ describe('freshness (§9.6)', () => {
     expect(chip.getAttribute('data-stale')).toBe('false')
     expect(chip.getAttribute('data-role')).toBe('neutral')
     expect(chip.className).toContain('border-dashed')
-    expect(chip.getAttribute('title')).toContain('freshness not declared')
-    expect(chip.getAttribute('title')).not.toContain('stale since')
+
+    fireEvent.mouseEnter(chip)
+    const card = await waitFor(() => screen.getByTestId('annotation-hovercard'))
+    expect(card.textContent).toContain('freshness not declared')
+    expect(card.textContent).not.toContain('stale since')
   })
 
   it('puts a visible staleness token on the chip face, not only in the hover', async () => {

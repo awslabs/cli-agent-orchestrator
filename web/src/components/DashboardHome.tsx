@@ -8,6 +8,7 @@ import { InboxPanel } from './InboxPanel'
 import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 import { CampaignAnnotations, TerminalAnnotations } from './AnnotationChips'
+import { WorkStateInfoButton } from './AnnotationDetails'
 import { placeAnnotations, readAnnotations } from '../lib/annotations'
 import { fmtAbs, fmtRel } from '../lib/time'
 
@@ -592,6 +593,15 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                     <span className="text-[10px] text-gray-600">{t.provider || 'unknown'}</span>
                                   </div>
                                   <div className="flex items-center gap-1 shrink-0">
+                                    {/* The complete work state, and the only
+                                        path to it that a keyboard or a touch
+                                        screen has — the chips' hover card is a
+                                        pointer-only enhancement. Renders
+                                        nothing when the row has no
+                                        annotations, so a fleet without the
+                                        conductor keeps this cluster exactly as
+                                        it was. */}
+                                    <WorkStateInfoButton annotations={annotationsFor(t.id)} terminalId={t.id} agentProfile={t.agent_profile} />
                                     <button onClick={() => setInboxTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Inbox"><Mail size={12} /></button>
                                     <button onClick={() => setOutputTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Output"><FileText size={12} /></button>
                                     <button onClick={() => setLiveTerminal({ id: t.id, provider: t.provider ?? undefined, agentProfile: t.agent_profile })} className="flex items-center gap-1 px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-medium rounded transition-colors"><Monitor size={12} />Terminal</button>
