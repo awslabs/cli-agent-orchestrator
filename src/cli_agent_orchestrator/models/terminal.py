@@ -22,6 +22,32 @@ class TerminalStatus(str, Enum):
     ERROR = "error"
 
 
+class TerminalInputBlockedError(Exception):
+    """Raised when a terminal is alive but blocked on an interactive prompt that needs a human
+    (or an explicit answer_user_prompt call) to proceed -- never auto-answered.
+
+    Defined here (not in services/terminal_service.py, its original home) because
+    providers/claude_code.py (and any other provider) needs to raise it from initialize() and
+    services/terminal_service.py already imports providers/manager.py, which imports the concrete
+    provider modules -- a provider importing back from terminal_service would be a circular
+    import. models/terminal.py has no such dependency. terminal_service.py re-exports this name
+    unchanged so every existing `from cli_agent_orchestrator.services.terminal_service import
+    TerminalInputBlockedError` caller keeps working without edits.
+
+    Two distinct raise sites share this one exception:
+    1. services/terminal_service.py's send_input(): an orchestrated (assign/handoff) message
+       would answer a prompt still showing WAITING_USER_ANSWER -- refuse, since only a real
+       answer_user_prompt call (or the operator themselves) should resolve it.
+    2. providers/*.py's own initialize(): the CLI reached a real, alive, interactive state that
+       isn't {IDLE, COMPLETED} but IS a recognized "something is asking a question" signal
+       (WAITING_USER_ANSWER) -- or, for the outermost fallback, genuinely never resolved within
+       the init timeout despite the terminal staying alive and producing output the whole time.
+       Both are "this terminal needs a human, not a teardown" -- see terminal_service.py's own
+       _schedule_deferred_init, which catches this exception specifically to leave the terminal
+       running instead of tearing it down the way any other exception from initialize() would.
+    """
+
+
 class Terminal(BaseModel):
     """Terminal model - represents a tmux window."""
 
