@@ -86,6 +86,28 @@ TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
 TRUST_PROMPT_PATTERN_V2 = r"Do you trust the contents of this directory\?"
 TRUST_PROMPT_FOOTER = r"Press enter to continue"
 
+# First-run auth menu, shown when no OpenAI/Codex credentials are configured yet:
+#   Welcome to Codex, OpenAI's command-line coding agent
+#   Sign in with ChatGPT to use Codex as part of your paid plan
+#   or connect an API key for usage-based billing
+#   > 1. Sign in with ChatGPT
+#     2. Sign in with Device Code
+#     3. Provide your own API key
+#   Press enter to continue
+# Unlike the trust/update-available dialogs above, this one cannot be auto-dismissed --
+# it requires a real human to actually complete OAuth or supply a real API key, which is
+# squarely an operator task, not something this provider can or should fabricate. Before
+# this was recognized, `initialize()`'s own wait_until_status(..., {IDLE, COMPLETED}, ...)
+# had no way to ever succeed for an account with no credentials configured yet: the pane
+# would sit at this exact, correctly-rendered screen -- process alive, output real, nothing
+# actually broken -- but never reach IDLE/COMPLETED, so the 60s init timeout would always
+# fire and CAO would tear the terminal down before an operator had any real chance to open
+# the session and complete login themselves. Bottom-anchored (last 15 lines) requiring BOTH
+# the menu text and the footer together, same shape as TRUST_PROMPT_PATTERN_V2 immediately
+# above, to avoid a false match on this text surviving in scrollback from earlier output.
+LOGIN_MENU_PATTERN = r"Sign in with ChatGPT"
+LOGIN_MENU_FOOTER = TRUST_PROMPT_FOOTER
+
 # Startup "Update available!" dialog. Codex shows this at startup when a newer
 # release exists, with a numbered menu whose cursor default is option 1:
 #   ✨ Update available! 0.142.5 -> 0.144.5
@@ -652,9 +674,19 @@ class CodexProvider(BaseProvider):
         # Handle workspace trust prompt if it appears (new/untrusted directories)
         await self._handle_trust_prompt(timeout=20.0)
 
+        # WAITING_USER_ANSWER is included here specifically for the first-run login/auth
+        # menu (see LOGIN_MENU_PATTERN's own comment) — an account with no credentials
+        # configured yet is a real, expected state at this exact point (trust/update
+        # dialogs above are already auto-dismissed by _handle_trust_prompt, so nothing
+        # else should legitimately produce WAITING_USER_ANSWER this early), not a failure.
+        # Without this, initialize() had no way to ever succeed for such an account: the
+        # pane would sit at a correctly-rendered, fully-alive login screen forever without
+        # reaching IDLE/COMPLETED, and CAO would tear the terminal down on every single
+        # attempt before an operator had any real chance to open the session and complete
+        # login themselves.
         if not await wait_until_status(
             self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
             timeout=float(get_server_settings()["provider_init_timeout"]),
             polling_interval=1.0,
         ):
@@ -742,6 +774,15 @@ class CodexProvider(BaseProvider):
         # where a queued message or blind Enter could select "Update now".
         # Eager inbox delivery is not a vector: accepts_input_while_processing=False.
         if _has_update_dialog_in_bottom(clean_output):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # First-run login/auth menu (no credentials configured yet). Bottom-anchored like
+        # trust-v2, same reasoning. See LOGIN_MENU_PATTERN's own comment for why this can't
+        # be auto-dismissed the way trust/update dialogs are, and why classifying it here
+        # (rather than leaving it unrecognized) matters for initialize()'s own timeout.
+        if re.search(LOGIN_MENU_PATTERN, bottom_region) and re.search(
+            LOGIN_MENU_FOOTER, bottom_region
+        ):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Check bottom of captured output for idle prompt.

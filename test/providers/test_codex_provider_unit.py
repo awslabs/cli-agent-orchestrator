@@ -2065,6 +2065,98 @@ class TestCodexProviderTrustPrompt:
         # Should be COMPLETED (model replied to user question), NOT WAITING
         assert status == TerminalStatus.COMPLETED
 
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_login_menu_is_waiting(self, mock_backend):
+        """First-run auth menu (no credentials configured) in the bottom region
+        classifies WAITING_USER_ANSWER -- live-reproduced real Codex output."""
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
+        output = (
+            "  Welcome to Codex, OpenAI's command-line coding agent\n"
+            "\n"
+            "  Sign in with ChatGPT to use Codex as part of your paid plan\n"
+            "  or connect an API key for usage-based billing\n"
+            "\n"
+            "> 1. Sign in with ChatGPT\n"
+            "     Usage included with Plus, Pro, Business, and Enterprise plans\n"
+            "\n"
+            "  2. Sign in with Device Code\n"
+            "     Sign in from another device with a one-time code\n"
+            "\n"
+            "  3. Provide your own API key\n"
+            "     Pay for what you use\n"
+            "\n"
+            "  Press enter to continue\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_login_menu_in_scrollback_does_not_false_positive(self, mock_backend):
+        """Login-menu text in scrollback (not the bottom region) must NOT trigger WAITING --
+        same bottom-anchoring discipline as the V2 trust dialog check immediately above."""
+        mock_backend.return_value.get_pane_current_command.return_value = "codex"
+        output = (
+            "› explain the codex login menu\n"
+            '• Earlier it showed "Sign in with ChatGPT to use Codex as part of your paid plan".\n'
+            "• That happens on first run with no credentials configured.\n"
+            "• There were three options: ChatGPT, Device Code, or an API key.\n"
+            "• Once authenticated, this menu never shows again.\n"
+            "• You can re-trigger it with codex logout.\n"
+            "• The credentials get stored in ~/.codex/auth.json.\n"
+            "• API keys are validated on first use, not at login time.\n"
+            "• Device code login works well for headless environments.\n"
+            "• ChatGPT login opens a browser tab for OAuth.\n"
+            "• Both paths end up writing the same auth.json format.\n"
+            "• You can check current auth status with codex login status.\n"
+            "• Logging out clears the stored credentials entirely.\n"
+            "• None of this appears again once you're signed in.\n"
+            "• This whole explanation is well past fifteen lines by now.\n"
+            "• Padding further to push the earlier mention out of the tail window.\n"
+            "\n"
+            "› \n"
+            "  ? for shortcuts                     95% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        status = provider.get_status(output)
+
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_initialize_includes_waiting_user_answer_in_target_status(
+        self, mock_tmux, mock_wait_shell, mock_wait_status
+    ):
+        """Regression test for the real, live-reproduced failure: an account with no
+        credentials configured yet reaches a correctly-rendered, fully-alive login screen
+        that never becomes IDLE/COMPLETED on its own -- initialize()'s own
+        wait_until_status(..., {IDLE, COMPLETED}, ...) target set had no way to ever
+        succeed for it, so CAO tore the terminal down on every single attempt (a live,
+        reproduced "Codex initialization timed out after 60 seconds", the operator's own
+        "the session doesn't even start" symptom) before anyone had a real chance to open
+        the session and complete login. WAITING_USER_ANSWER must be in the target set."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
+
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        result = await provider.initialize()
+
+        assert result is True
+        target_status_arg = mock_wait_status.call_args.args[1]
+        assert TerminalStatus.WAITING_USER_ANSWER in target_status_arg
+        assert TerminalStatus.IDLE in target_status_arg
+        assert TerminalStatus.COMPLETED in target_status_arg
+
     def test_backend_registry_is_clean_at_test_start(self):
         """Regression for #522: autouse fixture resets the backend singleton."""
         from cli_agent_orchestrator.backends import registry
