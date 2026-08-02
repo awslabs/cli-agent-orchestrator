@@ -373,7 +373,7 @@ export function AgentPanel() {
                       Inbox
                     </button>
                     <button
-                      onClick={() => openTerminal(t.id, t.provider, t.agent_profile)}
+                      onClick={() => openTerminal(t.id, t.provider ?? undefined, t.agent_profile)}
                       className="flex items-center gap-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium rounded-lg transition-colors"
                       title="Open live terminal"
                     >
@@ -480,9 +480,9 @@ export function AgentPanel() {
         message="This will kill the tmux window and terminate the agent process. This action cannot be undone."
         details={pendingClose ? [
           { label: 'Terminal ID', value: pendingClose.id },
-          { label: 'Provider', value: pendingClose.provider },
+          { label: 'Provider', value: pendingClose.provider || 'unknown' },
           { label: 'Profile', value: pendingClose.agent_profile || 'none' },
-          { label: 'Session', value: pendingClose.tmux_session },
+          { label: 'Session', value: pendingClose.tmux_session || 'unknown' },
         ] : []}
         confirmLabel="Close Terminal"
         variant="danger"
@@ -498,9 +498,9 @@ export function AgentPanel() {
         message="This will send the provider-specific exit command (e.g., /exit). The agent will shut down gracefully."
         details={pendingExit ? [
           { label: 'Terminal ID', value: pendingExit.id },
-          { label: 'Provider', value: pendingExit.provider },
+          { label: 'Provider', value: pendingExit.provider || 'unknown' },
           { label: 'Profile', value: pendingExit.agent_profile || 'none' },
-          { label: 'Session', value: pendingExit.tmux_session },
+          { label: 'Session', value: pendingExit.tmux_session || 'unknown' },
         ] : []}
         confirmLabel="Send Exit"
         variant="warning"

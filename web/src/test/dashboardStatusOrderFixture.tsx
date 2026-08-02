@@ -9,37 +9,31 @@ import { vi, expect } from 'vitest'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import { DashboardHome } from '../components/DashboardHome'
 import { useStore } from '../store'
+import { projectedTerminal } from './projectedTerminal'
+import type { TerminalMeta } from '../api'
 
 export const SESSION = { id: 'sess-1', name: 'cao-fleet', status: 'active' }
 
 /** The session card's terminals region — the component's own stable handle. */
 export const REGION_ID = 'session-cao-fleet-terminals'
 
-export interface TerminalFixture {
-  id: string
-  tmux_session: string
-  tmux_window: string
-  provider: string
-  agent_profile: string
-  created_at: string
-  last_active: string
-  /** Server-side status, lowercase; the store uppercases it. */
-  status: string
-}
+// The full projected row, not a hand-written subset: this fixture drives two
+// suites, and a shape the server never sends would make both of them agree
+// about something untrue. `status` is the server's lowercase value; the store
+// uppercases it.
+export type TerminalFixture = TerminalMeta
 
 // Ids are exactly 8 characters: the terminal row renders `t.id.slice(0, 8)`,
 // so a longer id would not be findable by its own name.
 function terminal(id: string, status: string, profile: string, lastActive: string): TerminalFixture {
-  return {
+  return projectedTerminal({
     id,
-    tmux_session: 'cao-fleet',
     tmux_window: `${profile}-${id}`,
     provider: profile === 'reviewer' ? 'claude_code' : 'kimi_cli',
     agent_profile: profile,
-    created_at: '2026-07-28T10:00:00Z',
     last_active: lastActive,
     status,
-  }
+  })
 }
 
 // Two managed native workers and one FIFO-monitored worker, so the summary has
