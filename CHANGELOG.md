@@ -20,8 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cao profile find <query>` CLI verb and `find_profiles` MCP tool for keyword/BM25 profile discovery over metadata (name, description, tags, capabilities); metadata-only, never exposes prompt bodies (#340)
 - Optional `capabilities` and `tags` arrays in the agent profile frontmatter schema (#340)
 
+### Changed
+
+- consolidate local agent-store persistence into `services/profile_store.py` so the store write path, profile-name validation, and store-path containment live in one service instead of being spread across `install_service`, `cli/commands/install`, and `cli/commands/profile`. `cao profile remove` now reports "Invalid profile name" instead of "not found in local store" for names that fail `[A-Za-z0-9_-]{1,64}` but are still contained (for example `has space`, `has.dot`, or over 64 characters); the exit code is unchanged (#543)
+
 ### Fixed
 
+- profile store writes are now atomic and inter-process safe. Both store writes were previously bare `write_text` calls, so a concurrent `cao profile` write and a server-side write could interleave or leave a partial file. Adds `locked_atomic_write` to `utils/atomic_file.py` as the blind-write sibling of `locked_atomic_rewrite` (#492): it shares the same lock, temp file, fsync, mode preservation and `os.replace`, but skips the read, so a corrupt or non-UTF-8 file in the agent store can still be replaced by the install that would have repaired it instead of failing with `UnicodeDecodeError` (#543)
 - self-healing pipe-pane liveness watchdog for silently-stalled FIFO forwarding (fixes #388) (#397), including detection of a stall that settles into a new static frame before the next poll and of a pipe that never delivers a single byte from terminal creation (cold start, harness-control#93) — see `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` / `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` in `docs/configuration.md`
 - web: attach web terminals through the configured backend so herdr-backed terminals no longer fail to attach (#417)
 - honor profile frontmatter `provider:` during install (flag > frontmatter > default) (#414)
