@@ -76,13 +76,24 @@ function useAnchoredPosition(anchor: HTMLElement | null, card: HTMLElement | nul
     const below = a.bottom + OFFSET
     const above = a.top - c.height - OFFSET
     // Prefer below; flip only when below genuinely overflows AND above fits.
-    const top = below + c.height + MARGIN > vh && above >= MARGIN ? above : below
+    let top = below + c.height + MARGIN > vh && above >= MARGIN ? above : below
+
+    // CLAMP BOTH EDGES, not just the top. Clamping only the top let a card
+    // taller than the space beneath its anchor hang off the bottom of the
+    // viewport — which at 390×844 put the footer, and with it the copy button,
+    // out of reach entirely. The mobile axe run caught it as an unresolvable
+    // contrast on the footer, because a node outside the viewport cannot be
+    // composited. Bottom clamp first, then top, so a card taller than the
+    // viewport pins to the top and scrolls internally rather than pinning to
+    // the bottom and losing its header.
+    if (top + c.height + MARGIN > vh) top = vh - c.height - MARGIN
+    if (top < MARGIN) top = MARGIN
 
     let left = a.left
     if (left + c.width + MARGIN > vw) left = vw - c.width - MARGIN
     if (left < MARGIN) left = MARGIN
 
-    setCoords({ top: Math.max(MARGIN, top), left })
+    setCoords({ top, left })
   }, [anchor, card])
 
   useLayoutEffect(() => {
@@ -151,7 +162,20 @@ function FloatingCard({
         left: coords?.left ?? 0,
         visibility: coords ? 'visible' : 'hidden',
       }}
-      className={`z-[70] rounded-lg border border-gray-700 bg-gray-900/98 shadow-2xl backdrop-blur-sm ${className}`}
+      // FULLY OPAQUE, deliberately. A translucent surface cannot be composited
+      // by axe, so every text node on it reports `color-contrast` as
+      // *incomplete* at serious impact — and this repo's gate asserts on
+      // `scan.incomplete` as well as `scan.violations`, precisely because an
+      // unverifiable contrast claim is not a passing one. `bg-gray-900/98`
+      // bought nothing visually and cost the whole card its verifiability.
+      // `overflow-hidden` is not cosmetic. Without it the square-cornered
+      // header and footer paint OUTSIDE the card's rounded boundary, so they
+      // overlap the page behind the card directly — visible as corners poking
+      // out of the radius, and reported by axe as
+      // `color-contrast[elmPartiallyObscuring]` on the footer, because a node
+      // that partially covers other elements has no determinable backdrop.
+      // Clipping to the radius fixes the artefact and the finding together.
+      className={`z-[70] overflow-hidden rounded-lg border border-gray-700 bg-gray-900 shadow-2xl ${className}`}
     >
       {children}
     </div>,
@@ -191,7 +215,10 @@ function FacetRows({ entries, dense }: { entries: Array<[string, string]>; dense
         const v = facetValue(value)
         return (
           <div key={key} className="contents">
-            <dt className="text-[10px] uppercase tracking-wide text-gray-500 whitespace-nowrap">
+            {/* gray-400, not gray-500. On this card's opaque gray-900 the
+                latter measures 3.65:1 — under the 4.5 floor — and the e2e axe
+                gate caught every `dt` on the surface. gray-400 is 6.95:1. */}
+            <dt className="text-[10px] uppercase tracking-wide text-gray-400 whitespace-nowrap">
               {humanKey(key)}
             </dt>
             <dd className="text-[11px] text-gray-200 break-words">{v.text}</dd>
@@ -240,7 +267,7 @@ export function AnnotationHoverCardBody({ annotation }: { annotation: Annotation
           {annotation.label}
         </span>
         {age && <span className="text-[11px] text-gray-400">{age}</span>}
-        <span className="text-[10px] uppercase tracking-wide text-gray-500">{role}</span>
+        <span className="text-[10px] uppercase tracking-wide text-gray-400">{role}</span>
       </div>
       <p className="text-[10px] text-gray-400 font-mono break-all">{shortSubject(annotation)}</p>
       <FacetRows entries={orderedFacets(annotation.details)} dense />
@@ -477,10 +504,17 @@ export function WorkStateInfoButton({
         testId="workstate-details"
         className="w-[24rem] max-w-[calc(100vw-1rem)]"
       >
-        <div className="flex items-start justify-between gap-2 px-3 py-2 border-b border-gray-700/60">
+        {/* Header and footer declare their own opaque background rather than
+            inheriting the card's. A fixed card sits over page content, and a
+            child with no background of its own makes axe report
+            `elmPartiallyObscuring` — it cannot prove what the text is read
+            against, so it will not certify the contrast even when the contrast
+            is fine. Declaring it removes the ambiguity instead of suppressing
+            the check. The borders are opaque for the same reason. */}
+        <div className="flex items-start justify-between gap-2 px-3 py-2 bg-gray-900 border-b border-gray-700">
           <div className="min-w-0">
             <p className="text-xs font-semibold text-white truncate">Work state</p>
-            <p className="text-[10px] text-gray-500 font-mono truncate">{heading}</p>
+            <p className="text-[10px] text-gray-400 font-mono truncate">{heading}</p>
           </div>
           <button
             type="button"
@@ -493,7 +527,7 @@ export function WorkStateInfoButton({
           </button>
         </div>
 
-        <div className="max-h-[60vh] overflow-y-auto px-3 py-2 space-y-3 select-text">
+        <div className="max-h-[60vh] overflow-y-auto px-3 py-2 space-y-3 select-text bg-gray-900">
           {annotations.map((a, i) => {
             const age = fmtAge(ageSource(a))
             const note = freshnessNote(a)
@@ -509,7 +543,7 @@ export function WorkStateInfoButton({
                 </div>
                 <FacetRows entries={orderedFacets(a.details)} dense />
                 <details className="group">
-                  <summary className="text-[10px] text-gray-500 cursor-pointer hover:text-gray-300 select-none">
+                  <summary className="text-[10px] text-gray-400 cursor-pointer hover:text-white select-none">
                     subject &amp; envelope
                   </summary>
                   <div className="mt-1 pl-2 border-l border-gray-700/60 space-y-1">
@@ -523,8 +557,8 @@ export function WorkStateInfoButton({
           })}
         </div>
 
-        <div className="flex items-center justify-between gap-2 px-3 py-2 border-t border-gray-700/60">
-          <span className="text-[10px] text-gray-500">
+        <div className="flex items-center justify-between gap-2 px-3 py-2 bg-gray-900 border-t border-gray-700">
+          <span className="text-[10px] text-gray-400">
             {annotations.length} annotation{annotations.length === 1 ? '' : 's'}
           </span>
           <CopyButton text={text} />
