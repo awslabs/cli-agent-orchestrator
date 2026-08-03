@@ -1576,6 +1576,58 @@ class TestCodexBulletFormatExtraction:
 
         assert "Called attention to the import bug" in message
 
+    def test_extract_skips_native_activity_prelude(self):
+        """Native activity rows before a blank-separated reply are not returned."""
+        output = (
+            "› fix the failing test\n"
+            "\n"
+            "• Explored src/providers\n"
+            "• Ran pytest -q\n"
+            "\n"
+            "• The bug is in the poll loop.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "• The bug is in the poll loop."
+
+    def test_extract_skips_native_activity_with_continuation(self):
+        """A tree-continuation row identifies a single native activity block."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored src/providers\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "• The extraction starts at the wrong marker.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "• The extraction starts at the wrong marker."
+
+    def test_extract_preserves_blank_separated_reply_bullets(self):
+        """A single reply bullet before a blank line is not an activity prelude."""
+        output = (
+            "› summarize the fix\n"
+            "• The parser now uses structural layout.\n"
+            "\n"
+            "• English verbs remain valid answer text.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "parser now uses structural layout" in message
+        assert "English verbs remain valid" in message
+
 
 class TestCodexV0111Extraction:
     """Extraction tests for Codex v0.111.0+ footer format."""
