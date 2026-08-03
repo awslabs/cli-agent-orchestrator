@@ -333,21 +333,21 @@ def _find_response_marker(text: str) -> Optional[re.Match[str]]:
     structural signal rather than matching English verbs such as ``Read`` or
     ``Called``, which can also begin legitimate replies.
     """
+
+    def line_end(start: int) -> int:
+        newline = text.find("\n", start)
+        return len(text) if newline == -1 else newline
+
     matches = []
     for match in re.finditer(ASSISTANT_PREFIX_PATTERN, text, re.IGNORECASE | re.MULTILINE):
-        line_end = text.find("\n", match.start())
-        if line_end == -1:
-            line_end = len(text)
-        if not re.match(MCP_TOOL_CALL_PATTERN, text[match.start() : line_end]):
+        if not re.match(MCP_TOOL_CALL_PATTERN, text[match.start() : line_end(match.start())]):
             matches.append(match)
 
     if not matches:
         return None
 
     for index, match in enumerate(matches[1:], start=1):
-        previous_line_end = text.find("\n", matches[index - 1].start())
-        if previous_line_end == -1:
-            previous_line_end = len(text)
+        previous_line_end = line_end(matches[index - 1].start())
         gap = text[previous_line_end : match.start()]
         if re.search(r"\n[^\S\n]*\n", gap) is None:
             continue

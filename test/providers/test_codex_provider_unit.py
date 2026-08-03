@@ -13,6 +13,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
     CodexProvider,
     ProviderError,
+    _find_response_marker,
     _has_startup_idle_composer,
     _toml_override,
     _toml_scalar,
@@ -1792,6 +1793,17 @@ class TestCodexBulletFormatExtraction:
         message = provider.extract_last_message_from_script(output)
 
         assert message == "• The bug is in the poll loop."
+
+    def test_response_marker_returns_none_without_assistant_output(self):
+        """A user prompt without a response has no response marker."""
+        assert _find_response_marker("› still waiting") is None
+
+    def test_response_marker_handles_final_line_without_newline(self):
+        """A marker on the final line is detected without a trailing newline."""
+        marker = _find_response_marker("• Complete")
+
+        assert marker is not None
+        assert marker.group() == "•"
 
     def test_extract_skips_native_activity_with_continuation(self):
         """A tree-continuation row identifies a single native activity block."""
