@@ -450,9 +450,11 @@ class AntigravityCliProvider(BaseProvider):
                 if isinstance(servers, dict):
                     for name in self._mcp_server_names:
                         entry = servers.get(name)
+                        env = entry.get("env", {}) if isinstance(entry, dict) else {}
                         if (
                             isinstance(entry, dict)
-                            and entry.get("env", {}).get("CAO_TERMINAL_ID") != self.terminal_id
+                            and isinstance(env, dict)
+                            and env.get("CAO_TERMINAL_ID") != self.terminal_id
                         ):
                             continue  # belongs to a different terminal — leave it
                         servers.pop(name, None)
@@ -478,7 +480,8 @@ class AntigravityCliProvider(BaseProvider):
 
         stale_keys: list[str] = []
         for key, entry in servers.items():
-            tid = entry.get("env", {}).get("CAO_TERMINAL_ID") if isinstance(entry, dict) else None
+            env = entry.get("env", {}) if isinstance(entry, dict) else {}
+            tid = env.get("CAO_TERMINAL_ID") if isinstance(env, dict) else None
             if tid is None:
                 continue  # not a CAO-managed entry — leave it
             if _db.get_terminal_metadata(tid) is None:
