@@ -40,7 +40,15 @@ import { createPortal } from 'react-dom'
 import { Info, Copy, Check, X } from 'lucide-react'
 
 import { Annotation } from '../api'
-import { ageSource, freshness, orderedFacets, resolveRole } from '../lib/annotations'
+import {
+  ageSource,
+  freshness,
+  groupedFacets,
+  isIdentity,
+  orderedFacets,
+  plainFacets,
+  resolveRole,
+} from '../lib/annotations'
 import { fmtAbs, fmtAge, fmtRel, parseTimestamp } from '../lib/time'
 
 /** Gap between the anchor and the card, and the minimum margin to the viewport edge. */
@@ -202,8 +210,16 @@ function facetValue(value: string): { text: string } {
   return { text: abs ? `${rel} (${abs})` : rel }
 }
 
+/**
+ * A facet key as prose.
+ *
+ * The dot goes the same way the underscore does. A key carrying a provenance
+ * class reads as "observed branch" wherever it is drawn ungrouped, which keeps
+ * the class visible on the per-chip surface without this file knowing what any
+ * class is called.
+ */
 function humanKey(key: string): string {
-  return key.replace(/_/g, ' ')
+  return key.replace(/[_.]/g, ' ')
 }
 
 /** Key/value rows shared by both surfaces. */
@@ -211,10 +227,14 @@ function FacetRows({ entries, dense }: { entries: Array<[string, string]>; dense
   if (entries.length === 0) return null
   return (
     <dl className={`grid grid-cols-[auto,1fr] gap-x-3 ${dense ? 'gap-y-0.5' : 'gap-y-1'}`}>
-      {entries.map(([key, value]) => {
+      {entries.map(([key, value], i) => {
         const v = facetValue(value)
         return (
-          <div key={key} className="contents">
+          // Index in the key because a grouped block can legitimately hold the
+          // same short name twice — two chips asserting different values for
+          // one name is precisely the disagreement worth showing, not a
+          // collision to collapse.
+          <div key={`${key}:${i}`} className="contents">
             {/* gray-400, not gray-500. On this card's opaque gray-900 the
                 latter measures 3.65:1 — under the 4.5 floor — and the e2e axe
                 gate caught every `dt` on the surface. gray-400 is 6.95:1. */}
@@ -259,7 +279,13 @@ function freshnessNote(annotation: Annotation): string | null {
 export function AnnotationHoverCardBody({ annotation }: { annotation: Annotation }) {
   const age = fmtAge(ageSource(annotation))
   const note = freshnessNote(annotation)
-  const role = resolveRole(annotation.semantic_role)
+  // THE ROLE IS DRAWN ONLY FOR A CHIP THAT IS MAKING A SEVERITY CLAIM. An
+  // identity chip deliberately withholds `data-role` so that nothing — a test
+  // or an operator — reads severity off it; printing the same word here in
+  // plain sight was the louder half of the leak the attribute was withheld to
+  // prevent. The role still appears in the info popover's envelope block,
+  // which promises the whole envelope and labels it as such.
+  const role = isIdentity(annotation) ? null : resolveRole(annotation.semantic_role)
   return (
     <div className="max-w-[22rem] p-3 space-y-2">
       <div className="flex items-baseline gap-2 flex-wrap">
@@ -267,7 +293,14 @@ export function AnnotationHoverCardBody({ annotation }: { annotation: Annotation
           {annotation.label}
         </span>
         {age && <span className="text-[11px] text-gray-400">{age}</span>}
-        <span className="text-[10px] uppercase tracking-wide text-gray-400">{role}</span>
+        {role && (
+          <span
+            data-testid="hovercard-role"
+            className="text-[10px] uppercase tracking-wide text-gray-400"
+          >
+            {role}
+          </span>
+        )}
       </div>
       <p className="text-[10px] text-gray-400 font-mono break-all">{shortSubject(annotation)}</p>
       <FacetRows entries={orderedFacets(annotation.details)} dense />
@@ -383,19 +416,66 @@ function envelopeEntries(annotation: Annotation): Array<[string, string]> {
  * Built from the SAME entry lists the card draws, so what is copied is what
  * was read. A second formatter would be a second thing to keep true.
  */
+/**
+ * The row's classed facets, grouped and labelled by the producer's own classes.
+ *
+ * WHY A SEPARATE BLOCK AT ALL. The classes answer a question no single chip
+ * can: what was ASSIGNED to this worker, what it was LAUNCHED with, and what is
+ * OBSERVED of it now. Conflating those is the specific failure the grouping
+ * exists to prevent — an assigned value the worker has since left is not a lie
+ * about now, it is a true statement of a different class — and the labels are
+ * the only thing that makes the distinction readable.
+ *
+ * The headings are the producer's own class tokens, humanised. Nothing here
+ * knows what they are, how many there will be, or what order they belong in;
+ * rename them and the headings rename themselves.
+ */
+function WorkerSection({ annotations }: { annotations: Annotation[] }) {
+  const groups = groupedFacets(annotations)
+  if (groups.length === 0) return null
+  return (
+    <section data-testid="workstate-worker" className="space-y-1.5">
+      <p className="text-[11px] font-semibold text-white">Worker</p>
+      {groups.map(({ group, entries }) => (
+        <div key={group} data-testid="workstate-worker-group" data-group={group} className="space-y-1">
+          <p className="text-[10px] uppercase tracking-wide text-gray-300">{humanKey(group)}</p>
+          <div className="pl-2 border-l border-gray-700/60">
+            <FacetRows entries={entries} dense />
+          </div>
+        </div>
+      ))}
+    </section>
+  )
+}
+
 export function detailsToText(annotations: Annotation[], heading: string): string {
   const lines: string[] = [heading, '='.repeat(heading.length)]
+  const push = (entries: Array<[string, string]>, indent: string) => {
+    for (const [k, v] of entries) lines.push(`${indent}${humanKey(k)}: ${facetValue(v).text}`)
+  }
+  // FIRST, for the same reason it is drawn first: it is the dossier, and the
+  // per-annotation sections below are the individual claims made against it.
+  const groups = groupedFacets(annotations)
+  if (groups.length > 0) {
+    lines.push('', 'Worker')
+    for (const { group, entries } of groups) {
+      lines.push(`  ${humanKey(group)}`)
+      push(entries, '    ')
+    }
+    lines.push('', 'Annotations')
+  }
   annotations.forEach((a, i) => {
-    if (i > 0) lines.push('')
+    // Byte-identical to the pre-existing rendering when there is no Worker
+    // block, which is every document published before this field existed.
+    if (i > 0 || groups.length > 0) lines.push('')
     const age = fmtAge(ageSource(a))
     lines.push(`${a.label}${age ? `  (${age})` : ''}`)
-    const push = (entries: Array<[string, string]>) => {
-      for (const [k, v] of entries) lines.push(`  ${humanKey(k)}: ${facetValue(v).text}`)
-    }
-    push(orderedFacets(a.details))
+    // The classed facets are in the Worker block above; repeating them here
+    // would make the copied text say everything twice.
+    push(plainFacets(a), '  ')
     lines.push('  --')
-    push(subjectEntries(a))
-    push(envelopeEntries(a))
+    push(subjectEntries(a), '  ')
+    push(envelopeEntries(a), '  ')
   })
   return lines.join('\n')
 }
@@ -528,6 +608,9 @@ export function WorkStateInfoButton({
         </div>
 
         <div className="max-h-[60vh] overflow-y-auto px-3 py-2 space-y-3 select-text bg-gray-900">
+          {/* Above the annotations, and complete regardless of which chip the
+              operator arrived from: the dossier is a property of the ROW. */}
+          <WorkerSection annotations={annotations} />
           {annotations.map((a, i) => {
             const age = fmtAge(ageSource(a))
             const note = freshnessNote(a)
@@ -541,7 +624,11 @@ export function WorkStateInfoButton({
                   <span className="text-[11px] font-semibold text-white">{a.label}</span>
                   {age && <span className="text-[10px] text-gray-400">{age}</span>}
                 </div>
-                <FacetRows entries={orderedFacets(a.details)} dense />
+                {/* Only the UNCLASSED facets. A classed facet is drawn once,
+                    in the Worker block, where it is labelled with the class
+                    that gives it its meaning; drawing it here as well would
+                    make the card say everything twice and say it worse. */}
+                <FacetRows entries={plainFacets(a)} dense />
                 <details className="group">
                   <summary className="text-[10px] text-gray-400 cursor-pointer hover:text-white select-none">
                     subject &amp; envelope

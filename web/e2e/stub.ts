@@ -204,7 +204,20 @@ export async function stubBackend(page: Page, options?: {
   controlInputResponses?: Array<Record<string, unknown>>;
   /** The §9.5 annotation payload. Omit for the no-annotations control. */
   annotations?: AnnotationsResponse;
+  /**
+   * The fleet, when a spec needs more than one row.
+   *
+   * ADDITIVE, AND DEFAULTED TO THE SHARED ARRAY ON PURPOSE. Five other specs
+   * resolve the fleet by `t-native` and would change meaning if the shared
+   * array simply grew a second entry, so a spec that wants a fleet asks for
+   * one and every other spec keeps the single row it was written against.
+   */
+  terminals?: typeof stubTerminals;
 }): Promise<StubHarness> {
+  // Everything below serves THIS list. `/terminals/{id}` is resolved by
+  // LOOKUP rather than by index: `stubTerminals[0]` happens to be `t-native`
+  // today, and an index is a silent lie the moment the list has two entries.
+  const terminals = options?.terminals ?? stubTerminals;
   const laneC = options?.laneC ?? true;
   const interactiveStreaming = options?.interactiveStreaming ?? false;
   let controlInputPostNumber = 0;
@@ -254,7 +267,7 @@ export async function stubBackend(page: Page, options?: {
     if (path === "/sessions/cao-fleet" && method === "GET") {
       return json(route, {
         session: { id: "s-1", name: "cao-fleet", status: "active" },
-        terminals: stubTerminals,
+        terminals,
       });
     }
     if (path === "/annotations" && method === "GET") {
@@ -263,14 +276,19 @@ export async function stubBackend(page: Page, options?: {
       // runs against the no-annotations control.
       return json(route, options?.annotations ?? emptyAnnotations());
     }
-    if (path === "/terminals/t-native" && method === "GET") {
-      // The same projected row the listing serves. It used to answer
-      // `status: "running"`, which is not a value `project_row` can produce —
-      // the dashboard uppercased it into a bucket STATUS_ORDER has never held
-      // and drew every stubbed worker as "Unknown". A managed native-TUI
-      // worker reports `not_fifo_monitored` ("Managed Live"), which is what
-      // nearly all of the real fleet reports.
-      return json(route, stubTerminals[0]);
+    // The same projected row the listing serves, found BY ID. It used to
+    // answer `status: "running"`, which is not a value `project_row` can
+    // produce — the dashboard uppercased it into a bucket STATUS_ORDER has
+    // never held and drew every stubbed worker as "Unknown". A managed
+    // native-TUI worker reports `not_fifo_monitored` ("Managed Live"), which is
+    // what nearly all of the real fleet reports.
+    //
+    // The pattern matches exactly ONE path segment, so every
+    // `/terminals/t-native/<action>` route below is untouched by it.
+    const terminalMatch = /^\/terminals\/([^/]+)$/.exec(path);
+    if (terminalMatch && method === "GET") {
+      const found = terminals.find((t) => t.id === terminalMatch[1]);
+      if (found) return json(route, found);
     }
     if (path === "/terminals/t-native/managed-control") {
       return json(route, {

@@ -277,3 +277,112 @@ export function ageSource(annotation: Annotation, now: number = Date.now()): str
   }
   return null
 }
+
+/**
+ * Is this chip an IDENTITY chip rather than a SEVERITY one?
+ *
+ * PRESENCE, NOT TRUTHINESS. `!!a.colour_key` would be the obvious spelling and
+ * it is wrong: the empty string is a real third state meaning "an identity chip
+ * that has no colour", and truthiness folds it back into the severity group,
+ * where it would be drawn in a role colour that means danger or warning.
+ *
+ * THIS IS ALSO THE WHOLE PARTITION RULE, and it deliberately reads one opaque
+ * field rather than a list of names. Nothing here knows what kinds exist, which
+ * is why a new identity chip needs no change on this side.
+ *
+ * The fragility worth writing down: the arrangement below holds only while the
+ * identity chips are exactly the set carrying the field. A future COLOURED
+ * SEVERITY chip would silently migrate into the identity group and into its
+ * cap. This side cannot enforce that — it has nothing to enforce it with — so
+ * it is the producer's invariant to keep.
+ */
+export function isIdentity(annotation: Annotation): boolean {
+  return typeof annotation.colour_key === 'string'
+}
+
+export interface ChipPartition {
+  severity: Annotation[]
+  identity: Annotation[]
+}
+
+/**
+ * The row's chips, split into the two groups that get INDEPENDENT caps.
+ *
+ * Two caps are not cosmetic. One sorted list capped at three means a row with
+ * three severity chips drops its identity chips entirely, and a row carrying
+ * two identity chips pushes a live `danger` behind a "+1" — which is precisely
+ * the regression the freshness-before-priority sort was introduced to fix.
+ * Order WITHIN each group is whatever the caller already sorted; nothing here
+ * re-ranks.
+ */
+export function partitionChips(annotations: Annotation[]): ChipPartition {
+  const severity: Annotation[] = []
+  const identity: Annotation[] = []
+  for (const annotation of annotations) {
+    if (isIdentity(annotation)) identity.push(annotation)
+    else severity.push(annotation)
+  }
+  return { severity, identity }
+}
+
+/**
+ * A facet key's provenance class and its short name.
+ *
+ * Split on the FIRST dot, and only when both halves are non-empty. The
+ * producer groups its facets by prefixing them; this side does not know or
+ * check what the prefixes are, it only reads the shape. A key with no dot —
+ * every facet published before this existed — comes back unchanged with no
+ * class, so nothing about the existing rendering moves.
+ */
+export function splitFacetKey(key: string): { group: string | null; name: string } {
+  const dot = key.indexOf('.')
+  if (dot <= 0 || dot >= key.length - 1) return { group: null, name: key }
+  return { group: key.slice(0, dot), name: key.slice(dot + 1) }
+}
+
+/** The facets carrying no provenance class — rendered exactly as they always were. */
+export function plainFacets(annotation: Annotation): Array<[string, string]> {
+  return orderedFacets(annotation.details).filter(([key]) => splitFacetKey(key).group === null)
+}
+
+export interface FacetGroup {
+  group: string
+  entries: Array<[string, string]>
+}
+
+/**
+ * Every classed facet on the ROW, collected across all of its annotations.
+ *
+ * Row-scoped rather than chip-scoped on purpose: the classes describe the
+ * WORKER, and which chip happened to carry a given fact is an artifact of how
+ * the producer split them. Two chips both naming the same fact should say it
+ * once, so entries are deduped on (class, name, value) — a genuine disagreement
+ * between two chips survives as two rows, because collapsing that would hide
+ * the one case worth seeing.
+ *
+ * Classes come out in FIRST-APPEARANCE order. The producer already decided what
+ * to say first by the order it wrote its facets, and honouring that costs
+ * nothing and buys no vocabulary to keep in step.
+ */
+export function groupedFacets(annotations: Annotation[]): FacetGroup[] {
+  const order: string[] = []
+  const byGroup = new Map<string, Array<[string, string]>>()
+  const seen = new Set<string>()
+  for (const annotation of annotations) {
+    for (const [key, value] of orderedFacets(annotation.details)) {
+      const { group, name } = splitFacetKey(key)
+      if (group === null) continue
+      const fingerprint = `${group} ${name} ${value}`
+      if (seen.has(fingerprint)) continue
+      seen.add(fingerprint)
+      let entries = byGroup.get(group)
+      if (!entries) {
+        entries = []
+        byGroup.set(group, entries)
+        order.push(group)
+      }
+      entries.push([name, value])
+    }
+  }
+  return order.map(group => ({ group, entries: byGroup.get(group) as Array<[string, string]> }))
+}
