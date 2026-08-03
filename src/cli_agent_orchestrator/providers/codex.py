@@ -326,11 +326,13 @@ def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
 
 
 def _find_response_marker(text: str) -> Optional[re.Match[str]]:
-    """Find the first model-reply marker after any compact activity prelude.
+    """Find the first model-reply marker after a structural activity prelude.
 
-    Native Codex activity is rendered as a compact run of ``•`` status rows,
-    followed by a blank line and the model reply. Treat that layout as the
-    structural signal rather than matching English verbs such as ``Read`` or
+    Native Codex activity cells have a ``•`` summary followed by a ``└`` tree
+    continuation.  Require at least two complete cells before advancing the
+    response boundary.  A compact bullet group or a single tree-formatted
+    bullet is indistinguishable from a legitimate answer, so preserve it.
+    This deliberately avoids matching English verbs such as ``Read`` or
     ``Called``, which can also begin legitimate replies.
     """
 
@@ -346,19 +348,14 @@ def _find_response_marker(text: str) -> Optional[re.Match[str]]:
     if not matches:
         return None
 
-    for index, match in enumerate(matches[1:], start=1):
-        previous_line_end = line_end(matches[index - 1].start())
-        gap = text[previous_line_end : match.start()]
-        if re.search(r"\n[^\S\n]*\n", gap) is None:
-            continue
+    complete_cells = []
+    for index, match in enumerate(matches[:-1]):
+        cell_tail = text[line_end(match.start()) : matches[index + 1].start()]
+        if re.search(r"^[^\S\n]*└", cell_tail, re.MULTILINE):
+            complete_cells.append(index)
 
-        prelude_lines = text[matches[0].start() : match.start()].splitlines()
-        nonblank_lines = [line for line in prelude_lines if line.strip()]
-        bullet_lines = [line for line in nonblank_lines if re.match(r"^[^\S\n]*•", line)]
-        continuation_lines = [line for line in nonblank_lines if re.match(r"^[^\S\n]*└", line)]
-        compact_rows = len(bullet_lines) >= 2 and len(bullet_lines) == len(nonblank_lines)
-        if compact_rows or continuation_lines:
-            return match
+    if len(complete_cells) >= 2:
+        return matches[complete_cells[-1] + 1]
 
     return matches[0]
 
