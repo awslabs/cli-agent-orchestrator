@@ -135,6 +135,26 @@ def test_launch_passes_explicit_working_directory():
         assert params["working_directory"] == "/remote/path"
 
 
+def test_launch_passes_explicit_kiro_engine():
+    """The direct CLI surface forwards engine selection without changing provider selection."""
+    runner = CliRunner()
+
+    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        result = runner.invoke(
+            launch, ["--agents", "test-agent", "--engine", "kas", "--headless", "--yolo"]
+        )
+
+    assert result.exit_code == 0
+    assert mock_post.call_args.kwargs["params"]["engine"] == "kas"
+
+
 def test_launch_headless_message_sends_to_terminal():
     """Test headless mode with message waits for IDLE then sends and polls for output."""
     runner = CliRunner()

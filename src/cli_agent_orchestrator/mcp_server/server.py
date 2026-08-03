@@ -178,6 +178,7 @@ def _resolve_child_allowed_tools(
 def _create_terminal(
     agent_profile: str,
     working_directory: Optional[str] = None,
+    engine: Optional[str] = None,
     defer_init: bool = False,
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
@@ -201,6 +202,7 @@ def _create_terminal(
             existing session, ``defer_init=True`` is required.
         initial_message_orchestration_type: Passed through to send_input for
             plugin event emission (assign/handoff).
+        engine: Explicit Kiro engine for the child terminal.
         model: Explicit per-call model override for the new terminal, applied
             ahead of the agent profile's own static model field (where the
             resolved provider supports it). Honored by both the existing-
@@ -262,6 +264,8 @@ def _create_terminal(
             params["working_directory"] = working_directory
         if child_allowed_tools:
             params["allowed_tools"] = child_allowed_tools
+        if engine is not None:
+            params["engine"] = engine
         if model is not None:
             params["model"] = model
         # The message payload goes in the JSON body, not the query string, so
@@ -308,6 +312,8 @@ def _create_terminal(
         }
         if working_directory:
             params["working_directory"] = working_directory
+        if engine is not None:
+            params["engine"] = engine
         if model is not None:
             params["model"] = model
 
@@ -705,6 +711,7 @@ async def _handoff_impl(
     message: str,
     timeout: int = 600,
     working_directory: Optional[str] = None,
+    engine: Optional[str] = None,
     model: Optional[str] = None,
 ) -> HandoffResult:
     """Implementation of handoff logic.
@@ -777,6 +784,8 @@ async def _handoff_impl(
             payload["allowed_tools"] = ctx.allowed_tools
         if working_directory:
             payload["working_directory"] = working_directory
+        if engine is not None:
+            payload["engine"] = engine
         if model:
             payload["model"] = model
 
@@ -877,6 +886,9 @@ if ENABLE_WORKING_DIRECTORY:
             default=None,
             description='Optional working directory where the agent should execute (e.g., "/path/to/workspace/src/Package")',
         ),
+        engine: Optional[str] = Field(
+            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+        ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
@@ -923,7 +935,9 @@ if ENABLE_WORKING_DIRECTORY:
         Returns:
             HandoffResult with success status, message, and agent output
         """
-        return await _handoff_impl(agent_profile, message, timeout, working_directory, model)
+        return await _handoff_impl(
+            agent_profile, message, timeout, working_directory, engine=engine, model=model
+        )
 
 else:
 
@@ -938,6 +952,9 @@ else:
             description="Maximum time to wait for the agent to complete the task (in seconds)",
             ge=1,
             le=3600,
+        ),
+        engine: Optional[str] = Field(
+            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
     ) -> HandoffResult:
@@ -976,7 +993,9 @@ else:
         Returns:
             HandoffResult with success status, message, and agent output
         """
-        return await _handoff_impl(agent_profile, message, timeout, None, model)
+        return await _handoff_impl(
+            agent_profile, message, timeout, None, engine=engine, model=model
+        )
 
 
 # Implementation function for assign
@@ -984,6 +1003,7 @@ def _assign_impl(
     agent_profile: str,
     message: str,
     working_directory: Optional[str] = None,
+    engine: Optional[str] = None,
     model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
@@ -1040,6 +1060,7 @@ def _assign_impl(
         terminal_id, _ = _create_terminal(
             agent_profile,
             working_directory,
+            engine=engine,
             defer_init=True,
             initial_message=worker_message,
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
@@ -1147,9 +1168,12 @@ if ENABLE_WORKING_DIRECTORY:
         working_directory: Optional[str] = Field(
             default=None, description="Optional working directory where the agent should execute"
         ),
+        engine: Optional[str] = Field(
+            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+        ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, working_directory, model)
+        return _assign_impl(agent_profile, message, working_directory, engine=engine, model=model)
 
 else:
 
@@ -1159,9 +1183,12 @@ else:
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),
         message: str = Field(description=_assign_message_field_desc),
+        engine: Optional[str] = Field(
+            default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
+        ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, None, model)
+        return _assign_impl(agent_profile, message, None, engine=engine, model=model)
 
 
 # Implementation function for send_message

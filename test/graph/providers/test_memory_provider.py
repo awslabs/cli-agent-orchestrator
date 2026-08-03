@@ -78,26 +78,71 @@ def _insert_row(db_engine, key: str, file_path: str, *, tags: str = "t", related
         session.close()
 
 
+def _insert_relationship(
+    db_engine,
+    source_key,
+    target_key,
+    type_="relates_to",
+    origin="compiler",
+    status="active",
+    scope="global",
+    scope_id="",
+):
+    """Seed a row in the memory_relationships STORE (issue #511). scope_id "" is
+    the global-scope sentinel used by the relationship table."""
+    import uuid as _uuid
+
+    from cli_agent_orchestrator.clients.database import MemoryRelationshipModel
+
+    Session = sessionmaker(bind=db_engine)
+    session = Session()
+    try:
+        session.add(
+            MemoryRelationshipModel(
+                id=str(_uuid.uuid4()),
+                scope=scope,
+                scope_id=scope_id,
+                source_key=source_key,
+                target_key=target_key,
+                type=type_,
+                origin=origin,
+                status=status,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+
 @pytest.fixture
 def populated_scope(svc, db_engine, monkeypatch):
-    """Three global topics: a→b via related_keys, a/b share a tag (pairable)."""
+    """Three global topics; a→b as an ACTIVE relates_to edge in the relationship
+    STORE (issue #511 — the provider reads the store, not related_keys). The
+    related_keys column is still set as the compiler's computation-state marker
+    but is NO LONGER the graph edge source."""
     paths = {key: _write_topic(svc, key) for key in ("a", "b", "c")}
     _write_index(svc, ["a", "b", "c"])
     _insert_row(db_engine, "a", paths["a"], tags="t", related_keys="b")
     _insert_row(db_engine, "b", paths["b"], tags="t")
     _insert_row(db_engine, "c", paths["c"], tags="other")
+    # Store edge a→b (compiler origin). This is what the provider projects now.
+    _insert_relationship(db_engine, "a", "b", type_="relates_to", origin="compiler")
 
-    # run_lint constructs MemoryService() and SessionLocal() internally —
-    # point both at the test fixtures.
+    # run_lint AND the relationship service both construct SessionLocal()
+    # internally — point them at the test engine.
     _patch_lint_env(monkeypatch, db_engine, svc)
     return svc
 
 
 def _patch_lint_env(monkeypatch, db_engine, svc) -> None:
     from cli_agent_orchestrator.clients import database as db_mod
+    from cli_agent_orchestrator.services import memory_relationship_service as mrs_mod
     from cli_agent_orchestrator.services import memory_service as ms_mod
 
-    monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=db_engine))
+    session_factory = sessionmaker(bind=db_engine)
+    monkeypatch.setattr(db_mod, "SessionLocal", session_factory)
+    # The relationship service imported SessionLocal into its own namespace.
+    monkeypatch.setattr(mrs_mod, "SessionLocal", session_factory)
     monkeypatch.setattr(ms_mod, "MEMORY_BASE_DIR", svc.base_dir)
     # Hermeticity: run_lint short-circuits on is_memory_enabled() — pin it so
     # a CAO_MEMORY_ENABLED=0 environment can't fail these tests (N3).
@@ -121,11 +166,18 @@ def _disable_llm(monkeypatch) -> None:
 class TestMemoryProviderHappyPath:
     @pytest.mark.asyncio
     async def test_nodes_edges_from_populated_scope(self, populated_scope, monkeypatch):
-        """AC 1-4: topic nodes for every index key; related_keys edge with
-        source attr; contradiction edge from the lint finding; no edge
-        outside the scope's node set.
-        """
-        _stub_llm_contradicts(monkeypatch)
+        """AC 1-4, updated for issue #511: topic nodes for every index key; the
+        relates_to edge now comes from the relationship STORE (attrs.source is
+        the row ORIGIN, not "related_keys"); a store contradiction edge is
+        projected when present; no edge outside the scope's node set.
+
+        DELIBERATE EXPECTATION CHANGE (issue #511): edges are sourced from the
+        durable store, not related_keys / projection-time lint. attrs.source is
+        the provenance origin. A contradiction now requires a stored row, not a
+        live-lint stub."""
+        # The fixture already seeded the ACTIVE relates_to a→b store edge
+        # (origin=compiler). No contradiction is stored here, so none projects —
+        # a separate test covers store-sourced contradictions.
         provider = MemoryGraphProvider(memory_service=populated_scope)
 
         view = await provider.project(scope="global")
@@ -135,13 +187,10 @@ class TestMemoryProviderHappyPath:
         assert all(n.status.value == "active" for n in view.nodes)
         related = [e for e in view.edges if e.type == EdgeType.RELATES_TO]
         assert [(e.source, e.target) for e in related] == [("a", "b")]
-        assert related[0].attrs["source"] == "related_keys"
-        # related_keys carries no relevance score — none must be invented.
+        # attrs.source is now the row ORIGIN (provenance), not "related_keys".
+        assert related[0].attrs["source"] == "compiler"
+        # No relevance score is invented (FR-4.3).
         assert "score" not in related[0].attrs and "relevance" not in related[0].attrs
-
-        contradictions = [e for e in view.edges if e.type == EdgeType.CONTRADICTION]
-        assert len(contradictions) == 1
-        assert {contradictions[0].source, contradictions[0].target} == {"a", "b"}
 
         node_ids = {n.id for n in view.nodes}
         for edge in view.edges:
@@ -194,6 +243,112 @@ class TestMemoryProviderEdgeCases:
 
         assert {n.id for n in view.nodes} >= {"a"}
         assert view.edges == []
+
+    @pytest.mark.asyncio
+    async def test_stored_edge_to_out_of_node_set_target_is_dropped(
+        self, svc, db_engine, monkeypatch
+    ):
+        """FR-2.3a: the node-set query bound must NOT replace the target check.
+
+        The provider now passes ``source_keys=<node set>`` to bound the rows
+        FETCHED, but that bounds only the SOURCE side. Here source "a" IS in the
+        node set while its target "ghost" is NOT (no index entry), so the row is
+        fetched and must still be dropped in Python. Without the surviving
+        both-endpoints check this would emit an edge to a non-existent node,
+        breaking GraphView's endpoint validation and FR-9's no-cross-scope-edge
+        guarantee — i.e. a performance fix turning into a correctness bug.
+        """
+        path_a = _write_topic(svc, "a")
+        _write_index(svc, ["a"])
+        _insert_row(db_engine, "a", path_a, tags="t")
+        # A real, ACTIVE store row whose target is outside this scope's node set.
+        _insert_relationship(db_engine, "a", "ghost", type_="relates_to", origin="compiler")
+        _disable_llm(monkeypatch)
+        _patch_lint_env(monkeypatch, db_engine, svc)
+        provider = MemoryGraphProvider(memory_service=svc)
+
+        view = await provider.project(scope="global")
+
+        assert {n.id for n in view.nodes} == {"a"}
+        assert view.edges == [], "an edge whose target is outside the node set must be dropped"
+
+    @pytest.mark.asyncio
+    async def test_edge_written_by_run_lint_is_visible_in_the_same_projection(
+        self, populated_scope, db_engine, monkeypatch
+    ):
+        """Human review (PR #524): the relationship read must happen AFTER
+        run_lint, because run_lint persists its contradiction findings into the
+        same store.
+
+        Reading first made a contradiction detected during THIS projection absent
+        from the graph it produced — invisible for a full cache window, then
+        appearing later with no apparent cause. Here a stubbed run_lint writes a
+        real store row for a pair already in the node set; the returned view must
+        contain that edge.
+        """
+        written = {"n": 0}
+
+        async def _lint_that_writes(project_hash, scope=None, **kw):
+            # Stands in for _persist_contradictions: a real row, written while
+            # run_lint is executing.
+            _insert_relationship(db_engine, "b", "c", type_="contradiction", origin="wiki_lint")
+            written["n"] += 1
+            return []
+
+        monkeypatch.setattr(wiki_lint, "run_lint", _lint_that_writes)
+        _disable_llm(monkeypatch)
+        provider = MemoryGraphProvider(memory_service=populated_scope)
+
+        view = await provider.project(scope="global")
+
+        assert written["n"] == 1, "run_lint must have run"
+        contra = [(e.source, e.target) for e in view.edges if e.type == EdgeType.CONTRADICTION]
+        assert contra == [("b", "c")], (
+            "an edge run_lint wrote during this projection must appear in it; "
+            f"got contradiction edges {contra}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_relationship_read_is_bounded_to_the_node_set(
+        self, populated_scope, db_engine, monkeypatch
+    ):
+        """FR-2.3a (efficiency): the provider must push the node-set filter INTO
+        the query, not fetch every active row and discard the surplus in Python.
+
+        This is an over-read, so a correctness test cannot catch it: filtering
+        in Python yields exactly the same graph, just after reading the whole
+        (scope, scope_id). The guard therefore asserts on the CALL at the
+        service boundary — that ``source_keys`` is passed and carries this
+        projection's node set. ``list_relationships`` accepting the parameter is
+        a different (already covered) claim; nothing else proved the provider
+        actually uses it.
+        """
+        from cli_agent_orchestrator.services import memory_relationship_service as _mrs
+
+        seen = {}
+        real = _mrs.MemoryRelationshipService.list_relationships
+
+        def _recording(self, scope, scope_id, **kw):
+            seen["source_keys"] = kw.get("source_keys", "MISSING")
+            return real(self, scope, scope_id, **kw)
+
+        monkeypatch.setattr(_mrs.MemoryRelationshipService, "list_relationships", _recording)
+        _disable_llm(monkeypatch)
+        provider = MemoryGraphProvider(memory_service=populated_scope)
+
+        view = await provider.project(scope="global")
+
+        assert seen.get("source_keys") not in (
+            "MISSING",
+            None,
+        ), "the relationship read must be bounded by source_keys, not load the whole scope"
+        assert set(seen["source_keys"]) == {
+            "a",
+            "b",
+            "c",
+        }, f"source_keys must carry this projection's node set, got {seen['source_keys']}"
+        # And the bound must not have cost us the real edge.
+        assert [(e.source, e.target) for e in view.edges] == [("a", "b")]
 
     @pytest.mark.asyncio
     async def test_session_scope_id_filters_shared_index(self, svc, db_engine, monkeypatch):
@@ -261,7 +416,8 @@ class TestMemoryProviderEdgeCases:
         assert by_id["lonely"].attrs["is_orphan"] is True
         assert by_id["lonely"].kind == "topic"
         assert by_id["a"].attrs["is_hub"] is True
-        # Cross-container contradiction filtered; only the related_keys edge remains.
+        # Contradictions no longer come from live lint (issue #511) — the store
+        # holds none here — so only the store relates_to edge (a→b) remains.
         assert [e.type for e in view.edges] == [EdgeType.RELATES_TO]
         # EdgeType has no orphan/hub/stale/poison members.
         assert {t.value for t in EdgeType} == {"relates_to", "contradiction", "supersedes"}

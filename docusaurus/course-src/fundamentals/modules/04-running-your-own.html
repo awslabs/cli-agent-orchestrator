@@ -1,0 +1,240 @@
+<section class="module" id="module-4">
+  <div class="module-content">
+
+    <div class="module-header animate-in">
+      <span class="module-number">04</span>
+      <h1 class="module-title">Running Your Own Agents</h1>
+      <p class="module-subtitle">From install to your first multi-agent session in 5 minutes.</p>
+    </div>
+
+  <!-- Screen 1: From Zero to Multi-Agent in 5 Minutes -->
+  <div class="screen" id="screen-4-1">
+    <h2>From Zero to Multi-Agent in 5 Minutes</h2>
+
+    <div class="callout callout-accent animate-in">
+      <div class="callout-icon">&#9888;&#65039;</div>
+      <div class="callout-content">
+        <span class="callout-title">Prerequisites</span>
+        <p><strong>Python 3.10+</strong>, <strong>tmux</strong>, and at least one AI CLI agent (Claude Code, Kiro CLI, or Codex). CAO requires macOS or Linux — tmux is not available on Windows.</p>
+      </div>
+    </div>
+
+    <p>Six commands take you from nothing installed to a fully running multi-agent session:</p>
+
+    <div class="step-cards">
+      <div class="step-card">
+        <div class="step-num">1</div>
+        <div class="step-body">
+          <strong>Install</strong>
+          <p><code>uv tool install cli-agent-orchestrator</code> &mdash; Downloads the CAO binary and all dependencies in one shot.</p>
+        </div>
+      </div>
+
+      <div class="step-card">
+        <div class="step-num">2</div>
+        <div class="step-body">
+          <strong>Start the server</strong>
+          <p><code>cao-server</code> &mdash; Launches the FastAPI orchestration service. Keep this terminal open; everything else talks to it.</p>
+        </div>
+      </div>
+
+      <div class="step-card">
+        <div class="step-num">3</div>
+        <div class="step-body">
+          <strong>Launch a session</strong>
+          <p><code>cao launch --agents code_supervisor --session-name demo --provider claude_code</code> &mdash; Creates a tmux session and starts the supervisor agent inside it. The session is named <code>cao-demo</code> &mdash; CAO prefixes every session with <code>cao-</code>.</p>
+        </div>
+      </div>
+
+      <div class="step-card">
+        <div class="step-num">4</div>
+        <div class="step-body">
+          <strong>Observe</strong>
+          <p><code>cao session status cao-demo --workers</code> &mdash; Shows the session state: which agents are running, idle, or finished.</p>
+        </div>
+      </div>
+
+      <div class="step-card">
+        <div class="step-num">5</div>
+        <div class="step-body">
+          <strong>Send more work</strong>
+          <p><code>cao session send cao-demo "Add unit tests"</code> &mdash; Types a new task straight into the supervisor's terminal. The agent must be idle; if it is still working, the command tells you to wait.</p>
+        </div>
+      </div>
+
+      <div class="step-card">
+        <div class="step-num">6</div>
+        <div class="step-body">
+          <strong>Shut down</strong>
+          <p><code>cao shutdown --all</code> &mdash; Terminates all agent tmux sessions and cleans up terminal records. The server keeps running.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="callout callout-info">
+      <span class="callout-icon">i</span>
+      <div class="callout-content">
+        <span class="callout-title">Keeping up to date</span>
+        <p>Run <code>cao update</code> to pull the latest version. Use <code>cao profile list</code> to see all available agent profiles on your machine.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 2: Anatomy of a Profile -->
+  <div class="screen" id="screen-4-2">
+    <h2>Anatomy of a Profile</h2>
+    <p>Profiles are markdown files with YAML frontmatter. They live in a standard directory:</p>
+
+    <div class="file-tree">
+      <div class="ft-folder">
+        <span class="ft-name">~/.aws/cli-agent-orchestrator/</span>
+        <div class="ft-children">
+          <div class="ft-folder">
+            <span class="ft-name">agent-context/</span>
+            <span class="ft-desc">&mdash; profiles installed by <code>cao install</code></span>
+            <div class="ft-children">
+              <div class="ft-file"><span class="ft-name">code_supervisor.md</span></div>
+              <div class="ft-file"><span class="ft-name">developer.md</span></div>
+              <div class="ft-file"><span class="ft-name">reviewer.md</span></div>
+            </div>
+          </div>
+          <div class="ft-folder">
+            <span class="ft-name">agent-store/</span>
+            <span class="ft-desc">&mdash; profiles you author locally</span>
+          </div>
+          <div class="ft-folder">
+            <span class="ft-name">db/</span>
+            <span class="ft-desc">&mdash; session state and message history</span>
+          </div>
+          <div class="ft-folder">
+            <span class="ft-name">logs/</span>
+            <span class="ft-desc">&mdash; server logs; per-terminal output in logs/terminal/</span>
+          </div>
+          <div class="ft-folder">
+            <span class="ft-name">memory/</span>
+            <span class="ft-desc">&mdash; persistent context between sessions</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="translation-block">
+      <div class="translation-code">
+        <span class="translation-label">profile</span>
+<pre><code><span class="code-line"><span class="code-operator">---</span></span>
+<span class="code-line"><span class="code-property">name:</span> <span class="code-string">code_supervisor</span></span>
+<span class="code-line"><span class="code-property">description:</span> <span class="code-string">Coding Supervisor Agent</span></span>
+<span class="code-line"><span class="code-property">provider:</span> <span class="code-string">claude_code</span></span>
+<span class="code-line"><span class="code-property">role:</span> <span class="code-string">supervisor</span></span>
+<span class="code-line"><span class="code-operator">---</span></span>
+<span class="code-line"><span class="code-comment">You are a supervisor. Delegate to</span></span>
+<span class="code-line"><span class="code-comment">`developer` and `reviewer` profiles.</span></span></code></pre>
+      </div>
+      <div class="translation-english">
+        <span class="translation-label">Plain English</span>
+        <div class="translation-lines">
+          <div class="tl"><code>name</code> &mdash; Unique identifier passed to <code>--agents</code></div>
+          <div class="tl"><code>description</code> &mdash; Human label shown in <code>cao profile list</code></div>
+          <div class="tl"><code>provider</code> &mdash; Which AI CLI runs this agent (claude_code, kiro_cli, codex, etc.)</div>
+          <div class="tl"><code>role</code> &mdash; Determines default tool access (supervisor, developer, reviewer)</div>
+          <div class="tl"><strong>Body (below the frontmatter)</strong> &mdash; The system prompt injected into the agent at launch</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 3: The Role System -->
+  <div class="screen" id="screen-4-3">
+    <h2>The Role System</h2>
+    <p>Each role grants a specific set of tools. Choose the narrowest role that fits the agent's job.</p>
+
+    <div class="pattern-cards">
+      <div class="pattern-card">
+        <div class="pattern-icon" style="background: var(--color-actor-1); color: white;">S</div>
+        <div class="pattern-title">supervisor</div>
+        <p class="pattern-desc">Orchestrates other agents. Cannot edit files or run commands directly.</p>
+        <div style="margin-top: var(--space-3);">
+          <code style="font-size: var(--text-xs); color: var(--color-text-muted);">@cao-mcp-server, fs_read, fs_list</code>
+        </div>
+      </div>
+
+      <div class="pattern-card">
+        <div class="pattern-icon" style="background: var(--color-actor-2); color: white;">D</div>
+        <div class="pattern-title">developer</div>
+        <p class="pattern-desc">Full execution environment. Reads, writes, runs commands, fetches URLs, and coordinates via MCP.</p>
+        <div style="margin-top: var(--space-3);">
+          <code style="font-size: var(--text-xs); color: var(--color-text-muted);">@builtin, fs_*, execute_bash, web_fetch, @cao-mcp-server</code>
+        </div>
+      </div>
+
+      <div class="pattern-card">
+        <div class="pattern-icon" style="background: var(--color-actor-5); color: white;">R</div>
+        <div class="pattern-title">reviewer</div>
+        <p class="pattern-desc">Read-only access. Can inspect code and communicate findings but cannot modify anything.</p>
+        <div style="margin-top: var(--space-3);">
+          <code style="font-size: var(--text-xs); color: var(--color-text-muted);">@builtin, fs_read, fs_list, @cao-mcp-server</code>
+        </div>
+      </div>
+    </div>
+
+    <div class="callout callout-warning">
+      <span class="callout-icon">!</span>
+      <div class="callout-content">
+        <span class="callout-title">The --yolo flag</span>
+        <p>The <code>--yolo</code> flag removes ALL restrictions &mdash; useful for experimentation but dangerous for production. The agent can run any command including <code>rm -rf</code> and <code>aws</code> calls.</p>
+      </div>
+    </div>
+
+    <div class="callout callout-info">
+      <span class="callout-icon">i</span>
+      <div class="callout-content">
+        <span class="callout-title">Provider-agnostic orchestration</span>
+        <p>Providers are interchangeable &mdash; the orchestration layer is provider-agnostic. A supervisor on Claude Code can assign workers to Kiro CLI, Codex, or any mix.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 4: Quiz -->
+  <div class="screen" id="screen-4-4">
+    <h2>Final Check</h2>
+
+    <div class="quiz-container" id="quiz-running">
+
+      <div class="quiz-question-block" data-correct="server-first" data-explanation-right="cao-server must be running before any other command can reach the orchestration layer." data-explanation-wrong="The CLI communicates with cao-server over HTTP. If the server is not running, there is nothing to connect to.">
+        <p class="quiz-question">1. You installed CAO but <code>cao launch</code> says "Failed to connect to cao-server". What's wrong?</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-value="reinstall" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>You need to reinstall with <code>uv tool install --force</code></span>
+          </button>
+          <button class="quiz-option" data-value="server-first" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>cao-server is not running &mdash; start it first in another terminal</span>
+          </button>
+          <button class="quiz-option" data-value="port" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>tmux is not installed on your system</span>
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+      <div style="margin-top: var(--space-6);">
+        <button class="btn btn-primary quiz-check-btn" onclick="checkQuiz('quiz-running')">Check Answers</button>
+        <button class="btn quiz-reset-btn" onclick="resetQuiz('quiz-running')">Try Again</button>
+      </div>
+    </div>
+
+    <p style="margin-top: var(--space-8); font-size: var(--text-lg); font-weight: 600; font-family: var(--font-display);">
+      You now understand how CAO works &mdash; from the supervisor-worker pattern to the orchestration tools to hands-on usage. Go build something with multiple agents.
+    </p>
+
+    <div style="margin-top: var(--space-6); padding: var(--space-5); background: var(--color-accent-light); border-radius: var(--radius-md); text-align: center;">
+      <p style="margin: 0 0 var(--space-3); font-weight: 600;">Ready for more?</p>
+      <p style="margin: 0 0 var(--space-4); color: var(--color-text-muted);">Learn about Workflows, Skills, Scheduled Flows, and the Ops MCP Server.</p>
+      <a href="../course-advanced/index.html" class="btn btn-primary" style="text-decoration: none;">Advanced Features &rarr;</a>
+    </div>
+  </div>
+
+  </div>
+</section>

@@ -90,6 +90,12 @@ NOWAIT_AUDIT_EVENTS: frozenset = frozenset(
         # the CLI/apply path after the profile write completes; content-free
         # (profile name + lesson keys only).
         "instruction_promotion",
+        # Typed memory relationship store (issue #511). NOWAIT: emitted by the
+        # synchronous MemoryRelationshipService on the same write path memory
+        # events use. Content-free (endpoints/type/origin/status only, never a
+        # memory body/prompt — NFR-1.7). MUST be whitelisted or the event is
+        # silently dropped and the content-free-audit test passes vacuously.
+        "relationship_mutation",
     }
 )
 AUDIT_EVENT_WHITELIST: frozenset = SYNC_AUDIT_EVENTS | NOWAIT_AUDIT_EVENTS

@@ -10,6 +10,7 @@ for agent management.
 
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cli_agent_orchestrator.models.provider import ProviderType
 
@@ -128,6 +129,16 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 # FIFO directory for event-driven terminal output streaming
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
 FIFO_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+# Sidecar lock directory for utils/atomic_file.locked_atomic_rewrite. The
+# targets it serializes (AGENTS.md / .claude/CLAUDE.md / dev.agent.md) live in
+# the USER's working tree, so a lock file placed beside each target would leave
+# permanent untracked ``*.lock`` files polluting the user's repo. Keeping the
+# lock files here — under CAO's own home dir, keyed by a hash of the target's
+# resolved absolute path — means every process (CLI and cao-server) that locks
+# the same target agrees on the same lock file while the user's tree gains ZERO
+# new files. Created lazily (0o700) on first use by the lock helper.
+LOCK_DIR = CAO_HOME_DIR / "locks"
 
 # =============================================================================
 # Event-Driven State Detection Configuration
@@ -434,6 +445,94 @@ WS_ALLOWED_CLIENTS = [
     "::1",
     "localhost",
 ] + _split_env_list("CAO_WS_ALLOWED_CLIENTS")
+
+# Extra Origin values accepted on the WebSocket PTY attach handshake, on top of
+# the same-origin match and the ``CORS_ORIGINS`` list the HTTP surface already
+# trusts. The browser sends ``Origin`` on every cross-site WebSocket handshake,
+# but — unlike ``fetch`` — the Same-Origin Policy does NOT block the connection
+# and Starlette's ``CORSMiddleware`` never runs for the WebSocket ASGI scope,
+# so the handler must validate ``Origin`` itself or any web page the victim
+# visits can drive the local PTY (CWE-1385, cross-site WebSocket hijacking).
+# Operators serving the terminal viewer from a genuinely cross-origin page can
+# allow it here; a literal ``*`` disables the Origin check entirely, mirroring
+# ``CAO_WS_ALLOWED_CLIENTS="*"`` for trusted setups.
+WS_ALLOWED_ORIGINS = _split_env_list("CAO_WS_ALLOWED_ORIGINS")
+
+
+def _origin_authority(origin: str) -> "str | None":
+    """Return the ``host[:port]`` authority of an http/https ``Origin``.
+
+    ``None`` for anything that is not a plain http/https origin — an opaque
+    ``"null"`` origin, a ``file://``/``data:`` scheme, or a malformed value —
+    so those never satisfy the same-origin match below.
+    """
+    parts = urlsplit(origin)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    # ``netloc`` may carry userinfo (user:pass@host); the authority a browser
+    # actually reports in ``Origin`` never does, but strip it defensively so a
+    # crafted value can't smuggle the trusted host into the userinfo segment.
+    return parts.netloc.rsplit("@", 1)[-1]
+
+
+def is_ws_origin_allowed(origin: "str | None", host: "str | None" = None) -> bool:
+    """Whether a WebSocket handshake ``Origin`` header may open a PTY socket.
+
+    Rules, tightest-safe first:
+
+    * A missing / empty ``Origin`` is allowed. Browsers *always* send it on a
+      cross-site WebSocket handshake, so its absence means the caller is a
+      non-browser client (native ``websockets`` lib, CLI, tests). Those are
+      still gated by the loopback IP allowlist (``WS_ALLOWED_CLIENTS``); the
+      cross-site-request-forgery threat this guards against is browser-only.
+    * A literal ``*`` in ``WS_ALLOWED_ORIGINS`` disables the check (opt-in
+      escape hatch for trusted tunnels, matching ``WS_ALLOWED_CLIENTS``).
+    * **Same-origin**: the ``Origin`` authority equals the request ``Host``.
+      This is the request the browser makes when the viewer is served by
+      cao-server itself, and it is exactly what a cross-site attacker CANNOT
+      forge — script-set ``Host`` is forbidden and the real ``Host`` is the
+      CAO server the socket is opened to, not the attacker's page. Matching on
+      the live ``Host`` is what lets the imported-app deployment
+      (``uvicorn ...:app``, which never runs ``add_local_cors_origins``) and
+      dynamic reverse-proxy / Codespaces hostnames work without pre-registering
+      every origin.
+
+      This branch trusts ``Host`` and so is only as safe as ``Host`` itself:
+      ``TrustedHostMiddleware`` validates ``Host`` against ``ALLOWED_HOSTS`` on
+      the same WebSocket scope BEFORE this handler runs, which is what makes
+      the match DNS-rebinding-safe in the default (loopback) config. Setting
+      ``CAO_ALLOWED_HOSTS="*"`` turns that validation off (``allow_any``), so an
+      operator who does that has opted out of the DNS-rebinding protection for
+      this branch too — the same explicit-opt-out tradeoff as
+      ``CAO_WS_ALLOWED_CLIENTS="*"``. Keep ``ALLOWED_HOSTS`` scoped to the real
+      serving hostname(s) rather than ``*`` whenever possible.
+    * Otherwise the ``Origin`` must appear in the explicit allowlists: the same
+      ``CORS_ORIGINS`` list the HTTP API enforces plus any
+      ``CAO_WS_ALLOWED_ORIGINS`` entries. Exact-string match mirrors how the
+      browser reports ``Origin`` and how ``CORSMiddleware`` compares it.
+
+    A ``*`` entry in ``CORS_ORIGINS`` (i.e. ``CAO_CORS_ORIGINS="*"``) is
+    **deliberately NOT** treated as a wildcard here: it would open unauthenticated
+    PTY access — keystroke injection is RCE — to every website the victim
+    visits, a far higher blast radius than the read-oriented HTTP surface
+    ``CORSMiddleware`` guards. Disabling this check therefore requires the
+    dedicated, more conspicuous ``CAO_WS_ALLOWED_ORIGINS="*"`` opt-in, matching
+    the ``CAO_WS_ALLOWED_CLIENTS="*"`` escape hatch for the IP check. This
+    divergence from ``CORSMiddleware`` is intentional.
+    """
+    if not origin:
+        return True
+    if "*" in WS_ALLOWED_ORIGINS:
+        return True
+    if host:
+        authority = _origin_authority(origin)
+        if authority is not None and authority == host:
+            return True
+    # Membership only — an operator's ``CAO_CORS_ORIGINS="*"`` lands as the
+    # literal string "*" in this list and matches ONLY a literal "*" Origin
+    # (which no browser sends), so it never widens PTY trust. See docstring.
+    return origin in CORS_ORIGINS or origin in WS_ALLOWED_ORIGINS
+
 
 # Trusted upstream IP allowlist for uvicorn's ``proxy_headers`` and
 # ``forwarded_allow_ips`` settings. When cao-server is bound to a

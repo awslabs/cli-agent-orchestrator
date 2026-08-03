@@ -528,6 +528,7 @@ async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> S
             prompt=_reprompt_prompt(step),
             teardown=True,
             timeout=WORKFLOW_STEP_TIMEOUT,
+            engine=step.engine,
             env_vars={
                 "CAO_WORKFLOW_RUN_ID": record.run_id,
                 "CAO_WORKFLOW_STEP_ID": step.id,
@@ -581,6 +582,7 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                 prompt=prompt,
                 teardown=True,
                 timeout=WORKFLOW_STEP_TIMEOUT,
+                engine=step.engine,
                 env_vars={
                     "CAO_WORKFLOW_RUN_ID": record.run_id,
                     "CAO_WORKFLOW_STEP_ID": step.id,

@@ -188,7 +188,7 @@ Default-off. See [../src/cli_agent_orchestrator/ext_apps/apps.py](../src/cli_age
 
 ### Network (`network`) — env-var only
 
-> **`network.*` keys in `settings.json` are schema-only and have no runtime effect yet.** `constants.py` builds `CORS_ORIGINS` / `ALLOWED_HOSTS` / `WS_ALLOWED_CLIENTS` as module-level lists at import time, and Starlette's CORS/TrustedHost middleware are instantiated once at server startup holding a reference to those exact list objects (`add_local_cors_origins` depends on this reference semantics). Only the `CAO_ALLOWED_HOSTS` / `CAO_CORS_ORIGINS` / `CAO_WS_ALLOWED_CLIENTS` / `CAO_FORWARDED_ALLOW_IPS` env vars are read — directly in `constants.py`, not through `ConfigService`. Routing these through the unified config would require either a live-invalidation path for the middleware's list references or restructuring how the middleware is wired; both are out of scope for this PR.
+> **`network.*` keys in `settings.json` are schema-only and have no runtime effect yet.** `constants.py` builds `CORS_ORIGINS` / `ALLOWED_HOSTS` / `WS_ALLOWED_CLIENTS` as module-level lists at import time, and Starlette's CORS/TrustedHost middleware are instantiated once at server startup holding a reference to those exact list objects (`add_local_cors_origins` depends on this reference semantics). Only the `CAO_ALLOWED_HOSTS` / `CAO_CORS_ORIGINS` / `CAO_WS_ALLOWED_CLIENTS` / `CAO_WS_ALLOWED_ORIGINS` / `CAO_FORWARDED_ALLOW_IPS` env vars are read — directly in `constants.py`, not through `ConfigService`. Routing these through the unified config would require either a live-invalidation path for the middleware's list references or restructuring how the middleware is wired; both are out of scope for this PR.
 
 `cao-server` is a local-only service by default. These env vars **extend** (not replace) the loopback-only built-in defaults, so loopback access is preserved even when set.
 
@@ -197,8 +197,11 @@ Default-off. See [../src/cli_agent_orchestrator/ext_apps/apps.py](../src/cli_age
 | `CAO_ALLOWED_HOSTS` | `ALLOWED_HOSTS` (Host header allowlist for `TrustedHostMiddleware`) | Fronting cao-server with a reverse proxy at a non-localhost hostname. |
 | `CAO_CORS_ORIGINS` | `CORS_ORIGINS` (browser origins permitted by CORS) | Serving the web UI from a non-default port or origin. |
 | `CAO_WS_ALLOWED_CLIENTS` | `WS_ALLOWED_CLIENTS` (client IPs permitted to attach to the PTY WebSocket) | Running `cao-server` inside Docker (host browser arrives via a bridge IP). |
+| `CAO_WS_ALLOWED_ORIGINS` | `WS_ALLOWED_ORIGINS` (extra browser `Origin`s permitted to attach to the PTY WebSocket) | Serving the terminal viewer from a page whose origin **differs** from the cao-server host (a separate reverse-proxy hostname or dashboard). |
 
 > **Security note:** the WebSocket PTY endpoint is unauthenticated. Only add client IPs you actually trust to `CAO_WS_ALLOWED_CLIENTS` — anyone reaching the listener at one of those IPs gets full PTY access to running agent terminals.
+>
+> The endpoint also enforces an **Origin** check to block cross-site WebSocket hijacking (CWE-1385): a browser page that is not same-origin with the cao-server host (and not in `CAO_WS_ALLOWED_ORIGINS`) is refused. Same-origin viewers — including the bundled UI, imported-app deployments (`uvicorn cli_agent_orchestrator.api.main:app`), and dynamic reverse-proxy / Codespaces hostnames — work with no configuration, because the check accepts any `Origin` whose authority equals the request `Host` (itself validated by `TrustedHostMiddleware`). `CAO_WS_ALLOWED_ORIGINS` is only for *genuinely cross-origin* viewers; a literal `*` disables the Origin check. Note that `CAO_CORS_ORIGINS="*"` does **not** disable it — PTY access is more sensitive than ordinary CORS reads, so the escape hatch is the dedicated `CAO_WS_ALLOWED_ORIGINS="*"`.
 
 ### Auth (`auth`) — env-var only
 
@@ -253,6 +256,7 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 | `CAO_ALLOWED_HOSTS` | `network.allowed_hosts` | comma-separated list |
 | `CAO_CORS_ORIGINS` | `network.cors_origins` | comma-separated list |
 | `CAO_WS_ALLOWED_CLIENTS` | `network.ws_allowed_clients` | comma-separated list |
+| `CAO_WS_ALLOWED_ORIGINS` | `network.ws_allowed_origins` | comma-separated list |
 
 ### Not yet routed through ConfigService
 

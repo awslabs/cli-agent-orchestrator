@@ -1,0 +1,200 @@
+<section class="module" id="module-3">
+  <div class="module-content">
+
+    <div class="module-header animate-in">
+      <span class="module-number">03</span>
+      <h1 class="module-title">How Agents Talk</h1>
+      <p class="module-subtitle">Three orchestration tools. Each creates a different collaboration style between supervisor and workers.</p>
+    </div>
+
+  <!-- Screen 1: Three Tools, Three Styles -->
+  <div class="screen" id="screen-3-1">
+    <h2>Three Tools, Three Styles</h2>
+    <p>
+      CAO gives agents exactly three MCP tools for inter-agent communication. Each one creates a
+      distinct interaction pattern between supervisor and worker, matching a real-world collaboration style.
+    </p>
+    <p>
+      Master these three and you understand everything about how CAO agents coordinate.
+    </p>
+
+    <div class="pattern-cards">
+
+      <div class="pattern-card">
+        <h3><code>handoff()</code></h3>
+        <p><strong>Sync.</strong> Blocks until the worker finishes. Auto-deletes on success.</p>
+        <p class="pattern-metaphor">Waiting by the door for your assistant to return.</p>
+      </div>
+
+      <div class="pattern-card">
+        <h3><code>assign()</code></h3>
+        <p><strong>Async.</strong> Returns immediately. Worker reports back later via inbox.</p>
+        <p class="pattern-metaphor">Dispatching a delivery and going back to work.</p>
+      </div>
+
+      <div class="pattern-card">
+        <h3><code>send_message()</code></h3>
+        <p><strong>Direct.</strong> Delivers to an existing agent's inbox. No new terminal.</p>
+        <p class="pattern-metaphor">Texting a colleague who's already working.</p>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Screen 2: The Key Difference: Sync vs Async -->
+  <div class="screen" id="screen-3-2">
+    <h2>The Key Difference</h2>
+
+    <div class="pattern-cards">
+      <div class="pattern-card" style="border-top: 3px solid var(--color-actor-2);">
+        <h3>handoff = Blocked</h3>
+        <p>Supervisor waits. Nothing else happens until the worker finishes or the 10-minute timeout hits.</p>
+        <p><strong>Use when:</strong> the next decision depends on the result.</p>
+      </div>
+      <div class="pattern-card" style="border-top: 3px solid var(--color-actor-5);">
+        <h3>assign = Free</h3>
+        <p>Supervisor continues immediately. Can fire multiple assigns back-to-back for parallel work.</p>
+        <p><strong>Use when:</strong> tasks are independent and can run simultaneously.</p>
+      </div>
+    </div>
+
+    <div class="translation-block animate-in">
+      <div class="translation-code">
+        <span class="translation-label">assign() internals</span>
+        <pre><code><span class="code-line"><span class="code-comment"># mcp_server/server.py (simplified)</span></span>
+<span class="code-line">worker_message = message + <span class="code-string">"[...reply to me with send_message]"</span></span>
+<span class="code-line">terminal_id, _ = _create_terminal(</span>
+<span class="code-line">    agent_profile=agent_profile,</span>
+<span class="code-line">    initial_message=worker_message,</span>
+<span class="code-line">    defer_init=<span class="code-keyword">True</span>,</span>
+<span class="code-line">)</span>
+<span class="code-line"><span class="code-keyword">return</span> {<span class="code-string">"success"</span>: <span class="code-keyword">True</span>, <span class="code-string">"terminal_id"</span>: terminal_id, ...}</span></code></pre>
+      </div>
+      <div class="translation-english">
+        <span class="translation-label">Plain English</span>
+        <div class="translation-lines">
+          <p class="tl">&nbsp;</p>
+          <p class="tl">Append a note telling the worker where to reply...</p>
+          <p class="tl">Create a new terminal for this agent...</p>
+          <p class="tl">&nbsp;</p>
+          <p class="tl">with the task plus that reply instruction...</p>
+          <p class="tl">but DON'T wait for it to start.</p>
+          <p class="tl">&nbsp;</p>
+          <p class="tl">Return the worker ID immediately.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 3: Match the Patterns (Drag-and-Drop) -->
+  <div class="screen" id="screen-3-3">
+    <h2>Match the Patterns</h2>
+    <p>Drag each chip into the correct zone:</p>
+
+    <div class="dnd-container" id="dnd-talk-patterns">
+      <div class="dnd-chips">
+        <div class="dnd-chip" draggable="true" data-answer="handoff">Blocks until worker finishes, then auto-deletes it</div>
+        <div class="dnd-chip" draggable="true" data-answer="assign">Returns immediately, worker reports back later</div>
+        <div class="dnd-chip" draggable="true" data-answer="send_message">Delivers to an existing terminal's inbox</div>
+      </div>
+      <div class="dnd-zones">
+        <div class="dnd-zone" data-correct="handoff">
+          <p class="dnd-zone-label">handoff()</p>
+          <div class="dnd-zone-target">Drop here</div>
+        </div>
+        <div class="dnd-zone" data-correct="assign">
+          <p class="dnd-zone-label">assign()</p>
+          <div class="dnd-zone-target">Drop here</div>
+        </div>
+        <div class="dnd-zone" data-correct="send_message">
+          <p class="dnd-zone-label">send_message()</p>
+          <div class="dnd-zone-target">Drop here</div>
+        </div>
+      </div>
+      <div style="margin-top: var(--space-4); display: flex; gap: var(--space-3);">
+        <button class="btn btn-primary quiz-check-btn" onclick="checkDnD('dnd-talk-patterns')">Check</button>
+        <button class="btn quiz-reset-btn" onclick="resetDnD('dnd-talk-patterns')">Reset</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 4: When to Use What (Scenario Quiz) -->
+  <div class="screen" id="screen-3-4">
+    <h2>When to Use What</h2>
+    <p>
+      Real orchestration decisions come down to one question: does the supervisor need
+      the result <em>right now</em>, or can it keep working? Pick the right tool for each scenario.
+    </p>
+
+    <div class="quiz-container" id="quiz-how-agents-talk">
+
+      <div class="quiz-question-block" data-correct="handoff" data-explanation-right="The merge depends on the review result, so you must block and wait for it." data-explanation-wrong="Since your next step depends on the review outcome, you need the synchronous (blocking) pattern: handoff.">
+        <p class="quiz-question"><strong>1.</strong> You need a code review before merging — the result determines your next step.</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-value="handoff" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>handoff — block until the review completes</span>
+          </button>
+          <button class="quiz-option" data-value="assign" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>assign — dispatch a reviewer asynchronously</span>
+          </button>
+          <button class="quiz-option" data-value="send_message" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>send_message — ask an existing agent to review</span>
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+      <div class="quiz-question-block" data-correct="assign" data-explanation-right="Independent parallel work is the ideal use case for assign. All 5 workers run simultaneously while the supervisor plans ahead." data-explanation-wrong="These tasks are independent and should run in parallel. Assign dispatches workers without blocking the supervisor.">
+        <p class="quiz-question"><strong>2.</strong> You want 5 workers building different microservices simultaneously while the supervisor plans the integration.</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-value="handoff" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>handoff — wait for each one sequentially</span>
+          </button>
+          <button class="quiz-option" data-value="assign" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>assign — dispatch all 5 in parallel</span>
+          </button>
+          <button class="quiz-option" data-value="send_message" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>send_message — message 5 existing workers</span>
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+      <div class="quiz-question-block" data-correct="send_message" data-explanation-right="The supervisor already exists — no new terminal needed. send_message delivers directly to its inbox." data-explanation-wrong="The target agent already exists. No new terminal is needed — just deliver a message to its inbox with send_message.">
+        <p class="quiz-question"><strong>3.</strong> A worker finished its task and needs to tell the supervisor it's done.</p>
+        <div class="quiz-options">
+          <button class="quiz-option" data-value="handoff" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>handoff — create a new agent to deliver the message</span>
+          </button>
+          <button class="quiz-option" data-value="assign" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>assign — spawn a messenger worker</span>
+          </button>
+          <button class="quiz-option" data-value="send_message" onclick="selectOption(this)">
+            <span class="quiz-option-radio"></span>
+            <span>send_message — deliver directly to the supervisor's inbox</span>
+          </button>
+        </div>
+        <div class="quiz-feedback"></div>
+      </div>
+
+      <div style="margin-top: var(--space-6);">
+        <button class="btn btn-primary quiz-check-btn" onclick="checkQuiz('quiz-how-agents-talk')">Check Answers</button>
+        <button class="btn quiz-reset-btn" onclick="resetQuiz('quiz-how-agents-talk')">Try Again</button>
+      </div>
+
+      <div class="callout callout-info" style="margin-top: var(--space-8);">
+        <strong>Rule of thumb:</strong> Need the result now? Use handoff. Work is independent? Use assign. Target already running? Use send_message.
+      </div>
+    </div>
+  </div>
+
+  </div>
+</section>

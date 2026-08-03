@@ -27,7 +27,7 @@ kiro-cli --version
 cao-server
 
 # Launch a Kiro CLI-backed session (agent profile is required)
-cao launch --agents developer --provider kiro_cli
+cao launch --agents developer --provider kiro_cli --engine v2
 ```
 
 Via HTTP API:
@@ -37,6 +37,10 @@ curl -X POST "http://localhost:9889/sessions?provider=kiro_cli&agent_profile=dev
 ```
 
 **Note**: Kiro CLI requires an agent profile — it cannot be launched without one.
+
+`--engine v2` is explicit but optional because v2 is the default. `--engine kas`
+is an opt-in Phase 0 selection; CAO capability-probes it and currently rejects it
+before terminal allocation rather than claiming runtime KAS support.
 
 ## Features
 
@@ -120,7 +124,7 @@ The profile name determines the prompt pattern used for status detection. Built-
 The provider launches using kiro-cli's default UI, with automatic `--legacy-ui` fallback:
 
 ```
-kiro-cli chat --agent developer
+kiro-cli chat --agent-engine v2 --agent developer
 ```
 
 The provider auto-detects whether the terminal is in legacy or TUI mode and uses the appropriate detection patterns. If initialization times out, the provider automatically exits and retries with `--legacy-ui`. Both TUI and legacy detection patterns are fully supported.

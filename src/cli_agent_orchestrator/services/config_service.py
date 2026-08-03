@@ -88,13 +88,15 @@ class NetworkConfig(BaseModel):
     Rewiring them through ConfigService would require either mutating those
     lists after settings.json changes (no invalidation mechanism exists yet)
     or restructuring the middleware wiring — out of scope for this PR. Only
-    the ``CAO_ALLOWED_HOSTS``/``CAO_CORS_ORIGINS``/``CAO_WS_ALLOWED_CLIENTS``
-    env vars are read (in ``constants.py``, not through this schema).
+    the ``CAO_ALLOWED_HOSTS``/``CAO_CORS_ORIGINS``/``CAO_WS_ALLOWED_CLIENTS``/
+    ``CAO_WS_ALLOWED_ORIGINS`` env vars are read (in ``constants.py``, not
+    through this schema).
     """
 
     allowed_hosts: List[str] = Field(default_factory=list)
     cors_origins: List[str] = Field(default_factory=list)
     ws_allowed_clients: List[str] = Field(default_factory=list)
+    ws_allowed_origins: List[str] = Field(default_factory=list)
 
 
 class AuthConfig(BaseModel):
@@ -159,6 +161,7 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     "network.allowed_hosts": [],
     "network.cors_origins": [],
     "network.ws_allowed_clients": [],
+    "network.ws_allowed_origins": [],
 }
 
 # Env-var registry: every CAO_* var this schema recognizes, mapped to its
@@ -177,6 +180,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_ALLOWED_HOSTS": ("network.allowed_hosts", "list", []),
     "CAO_CORS_ORIGINS": ("network.cors_origins", "list", []),
     "CAO_WS_ALLOWED_CLIENTS": ("network.ws_allowed_clients", "list", []),
+    "CAO_WS_ALLOWED_ORIGINS": ("network.ws_allowed_origins", "list", []),
     "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
     "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),

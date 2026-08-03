@@ -13,6 +13,12 @@ import frontmatter
 from jsonschema import Draft202012Validator
 
 from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR, ROLE_TOOL_DEFAULTS
+from cli_agent_orchestrator.services.profile_store import (
+    InvalidProfileNameError,
+    ProfileNotFoundError,
+    delete_profile,
+    store_path,
+)
 from cli_agent_orchestrator.utils.agent_profiles import (
     list_agent_profiles,
 )
@@ -57,9 +63,11 @@ def _resolve_profile_path(name_or_path: str) -> Optional[Path]:
 
     # The shared lookup found it. Now find the actual path for display.
     # Check local store first (most common case for user-installed profiles)
-    store_root = LOCAL_AGENT_STORE_DIR.resolve()
-    candidate = (LOCAL_AGENT_STORE_DIR / f"{name_or_path}.md").resolve()
-    if candidate.is_relative_to(store_root) and candidate.exists():
+    try:
+        candidate = store_path(name_or_path)
+    except InvalidProfileNameError:
+        return None
+    if candidate.exists():
         return candidate
 
     # For built-in/provider profiles, return None — caller uses _read_profile_text.
@@ -253,11 +261,9 @@ def remove_cmd(name: str, yes: bool):
     Only removes profiles from ~/.aws/cli-agent-orchestrator/agent-store/.
     Does not affect built-in or provider-managed profiles.
     """
-    store_root = LOCAL_AGENT_STORE_DIR.resolve()
-    target = (LOCAL_AGENT_STORE_DIR / f"{name}.md").resolve()
-
-    # Containment check
-    if not target.is_relative_to(store_root):
+    try:
+        target = store_path(name)
+    except InvalidProfileNameError:
         raise click.ClickException(f"Invalid profile name '{name}'.")
 
     if not target.exists():
@@ -269,7 +275,10 @@ def remove_cmd(name: str, yes: bool):
     if not yes:
         click.confirm(f"Remove profile '{name}' from local store?", abort=True)
 
-    target.unlink()
+    try:
+        delete_profile(name)
+    except ProfileNotFoundError as e:  # lost a race with another remover
+        raise click.ClickException(str(e))
     click.echo(f"✓ Removed '{name}' from {LOCAL_AGENT_STORE_DIR}")
 
 

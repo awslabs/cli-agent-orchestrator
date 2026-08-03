@@ -66,6 +66,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_ENV_VALUE_MAX_LEN,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
+    is_ws_origin_allowed,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
 from cli_agent_orchestrator.graph.models import GraphView
@@ -76,6 +77,7 @@ from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.memory import (
     MemoryKey,
     MemoryScope,
@@ -84,6 +86,10 @@ from cli_agent_orchestrator.models.memory import (
 )
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.kiro_capabilities import (
+    KiroCapabilityError,
+    KiroPhase0KASError,
+)
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -116,6 +122,9 @@ from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxServic
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
+from cli_agent_orchestrator.services.profile_search import (
+    DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
@@ -373,6 +382,10 @@ class RunStepRequest(BaseModel):
             )
         return self
 
+    engine: Optional[KiroEngine] = Field(
+        default=None, description="Explicit Kiro engine for this child step"
+    )
+
 
 class RunStepResponse(BaseModel):
     """Response wrapping an ``AgentStepResult`` from ``run_agent_step``."""
@@ -471,6 +484,50 @@ class InstallAgentProfileRequest(BaseModel):
     source: str
     provider: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
+
+
+# Scaffold templates are identified as ``category/name`` (e.g.
+# ``aws/stepfunction``). Constraining that identifier with an allowlist pattern
+# at the API boundary rejects traversal attempts before they reach the scaffold
+# service — which independently re-checks containment via ``_check_containment``.
+# Allowlist rather than denylist is deliberate: a denylist of dot sequences is
+# always incomplete.
+TEMPLATE_NAME_PATTERN = r"^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$"
+
+
+class TemplateConfigRequest(BaseModel):
+    """Request body for the non-mutating template validate and preview routes."""
+
+    template: str = Field(
+        pattern=TEMPLATE_NAME_PATTERN,
+        max_length=128,
+        description="Template identifier in 'category/name' form, e.g. 'aws/stepfunction'",
+    )
+    config: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Flat config values matching the template's JSON-Schema",
+    )
+
+
+class TemplateSummary(BaseModel):
+    """Public template metadata. Excludes the internal filesystem path."""
+
+    name: str
+    description: str
+
+
+class ValidateTemplateConfigResponse(BaseModel):
+    """Outcome of validating a config against a template's JSON-Schema."""
+
+    valid: bool
+    errors: List[str] = Field(default_factory=list)
+
+
+class PreviewTemplateResponse(BaseModel):
+    """A rendered profile. Returned to the caller and never written to disk."""
+
+    template: str
+    content: str
 
 
 class MemorySummary(BaseModel):
@@ -1490,6 +1547,153 @@ async def list_agent_profiles_endpoint() -> List[Dict]:
         )
 
 
+def _resolve_template_name(template: str) -> str:
+    """Map a caller-supplied template id onto an enumerated template name.
+
+    Returns the matching value from ``list_templates()`` (built from filesystem
+    enumeration), never the caller's own string, so the identifier handed to the
+    scaffold service — and thence to ``Path`` — is not derived from request
+    data. This is the sanitizer that removes the taint CodeQL flags on the
+    scaffold path expressions; the allowlist regex and ``_check_containment``
+    remain as additional layers. Raises 404 for an unknown template.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import list_templates
+
+    for known in list_templates():
+        if known["name"] == template:
+            return str(known["name"])
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Template not found: {template}",
+    )
+
+
+# The static sub-paths below (`/search`, `/templates`, and the template schema
+# route) MUST stay declared ABOVE `/agents/profiles/{name}`. FastAPI resolves in
+# declaration order, so moving them below would let the `{name}` route capture
+# "search" and "templates" as profile names. test_api_profile_surface.py pins
+# this ordering.
+@app.get("/agents/profiles/search")
+async def search_agent_profiles_endpoint(
+    q: str = Query(description="Free-text capability keywords, e.g. 'monitor sqs'"),
+    limit: int = Query(default=PROFILE_SEARCH_DEFAULT_LIMIT, ge=1, le=100),
+) -> List[Dict]:
+    """Rank installed agent profiles against ``q``.
+
+    Delegates to ``services.profile_search.search_profiles`` so HTTP, the CLI
+    (``cao profile find``) and the ``find_profiles`` MCP tool return identical
+    ordering and scores — no ranking logic lives here. The service excludes
+    profiles that ``load_agent_profile()`` would reject, and results are
+    metadata-only: the profile prompt body is never returned.
+    """
+    from cli_agent_orchestrator.services.profile_search import search_profiles
+
+    try:
+        return search_profiles(q, limit=limit)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to search agent profiles: {str(e)}",
+        )
+
+
+@app.get("/agents/profiles/templates")
+async def list_profile_templates_endpoint() -> List[TemplateSummary]:
+    """List public scaffold-template metadata for profile creation."""
+    from cli_agent_orchestrator.services.agent_scaffold import list_templates
+
+    try:
+        return [
+            TemplateSummary(
+                name=template["name"],
+                description=template.get("description", ""),
+            )
+            for template in list_templates()
+        ]
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list profile templates: {str(e)}",
+        )
+
+
+@app.get("/agents/profiles/templates/{category}/{name}/schema")
+async def get_profile_template_schema_endpoint(category: str, name: str) -> Dict:
+    """Return the JSON-Schema for one scaffold template.
+
+    ``category`` and ``name`` are two path segments rather than one so the
+    ``category/name`` template identifier survives routing without a
+    percent-encoded slash. The pair is allowlist-validated here and the scaffold
+    service re-checks containment independently.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import get_template_schema
+
+    template = f"{category}/{name}"
+    if not re.fullmatch(TEMPLATE_NAME_PATTERN, template):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid template name: {template}",
+        )
+
+    resolved = _resolve_template_name(template)
+    try:
+        schema = get_template_schema(resolved)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    if schema is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No schema found for template '{template}'",
+        )
+    return schema
+
+
+@app.post("/agents/profiles/templates/validate")
+async def validate_profile_template_config_endpoint(
+    request: TemplateConfigRequest,
+) -> ValidateTemplateConfigResponse:
+    """Validate a config against a template's JSON-Schema. Writes nothing.
+
+    Deliberately NOT guarded by ``SCOPE_WRITE``. This is a POST only because the
+    config travels in a JSON body rather than a query string; it mutates no
+    state. The write-scope guard belongs on the create/edit routes that persist
+    a profile, not on validation.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import validate_config
+
+    resolved = _resolve_template_name(request.template)
+    try:
+        errors = validate_config(resolved, request.config)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return ValidateTemplateConfigResponse(valid=not errors, errors=errors)
+
+
+@app.post("/agents/profiles/templates/preview")
+async def preview_profile_template_endpoint(
+    request: TemplateConfigRequest,
+) -> PreviewTemplateResponse:
+    """Render a template to markdown and return it. Writes nothing.
+
+    Same non-mutating rationale as template validation: rendering is a pure function of
+    the template and the supplied config. ``render_template`` validates the
+    config first, so an invalid config returns 400 rather than partial output.
+    """
+    from cli_agent_orchestrator.services.agent_scaffold import render_template
+
+    resolved = _resolve_template_name(request.template)
+    try:
+        content = render_template(resolved, request.config)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return PreviewTemplateResponse(template=request.template, content=content)
+
+
 @app.get("/agents/profiles/{name}")
 async def get_agent_profile_endpoint(name: str) -> Dict:
     """Return the full parsed content of a named agent profile."""
@@ -1693,6 +1897,7 @@ async def create_session(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
     memory_manager: Optional[str] = None,
+    engine: Optional[KiroEngine] = None,
     model: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -1766,6 +1971,7 @@ async def create_session(
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
             env_vars=body.env_vars if body else None,
+            engine=engine,
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
@@ -1874,6 +2080,7 @@ async def create_terminal_in_session(
     provider: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
+    engine: Optional[KiroEngine] = None,
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
     model: Optional[str] = None,
@@ -1966,6 +2173,7 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            engine=engine,
             model=model,
         )
         return result
@@ -1973,6 +2181,11 @@ async def create_terminal_in_session(
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except (KiroPhase0KASError, KiroCapabilityError) as e:
+        # Both subclass ValueError, so they must precede the generic arm below —
+        # a rejected engine is a bad request, not a missing resource. Matches
+        # POST /sessions, which already returns 400 for the identical failure.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -2273,6 +2486,7 @@ async def run_step(
             working_directory=body.working_directory,
             caller_id=body.caller_id,
             allowed_tools=body.allowed_tools,
+            engine=body.engine,
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,
@@ -2307,6 +2521,11 @@ async def run_step(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
         )
+    except (KiroPhase0KASError, KiroCapabilityError) as e:
+        # Ordered before the ValueError arm they subclass: an engine rejection is
+        # a bad request, not an unknown terminal.
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -3696,9 +3915,12 @@ async def get_inbox_messages_endpoint(
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
     """WebSocket endpoint for live terminal streaming via tmux attach.
 
-    Security: This endpoint provides full PTY access with no authentication.
-    It is intended for localhost-only use. Do NOT expose the server to
-    untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
+    Security: This endpoint provides full PTY access with no bearer/token
+    authentication. It is intended for localhost-only use and is gated by two
+    checks before accept: the peer IP must be in ``WS_ALLOWED_CLIENTS`` and,
+    for browser callers, the ``Origin`` header must be in the trusted set
+    (CWE-1385 cross-site WebSocket hijacking guard). Do NOT expose the server
+    to untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
     """
     # Reject connections from clients outside the configured allowlist.
     # Defaults to loopback; operators running cao-server inside a container can
@@ -3714,6 +3936,32 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         and client_host not in WS_ALLOWED_CLIENTS
     ):
         await websocket.close(code=4003, reason="WebSocket access is restricted to allowed clients")
+        return
+
+    # Cross-site WebSocket hijacking (CWE-1385) guard. The loopback IP check
+    # above is NOT sufficient: a WebSocket opened by JavaScript on any site the
+    # victim visits originates from the victim's own browser, so its peer is
+    # 127.0.0.1 and it passes the IP allowlist. Unlike fetch(), the browser's
+    # Same-Origin Policy does not block the connection, and Starlette's
+    # CORSMiddleware never sees the WebSocket ASGI scope — so without this the
+    # attacker page gets full PTY control (keystroke injection = RCE, plus
+    # read-back of everything the terminal renders). The browser attaches an
+    # Origin header (and a Host it cannot forge) on every cross-site handshake,
+    # so accept the connection only when it is same-origin with the request
+    # Host — the request the bundled viewer makes, and the one an attacker page
+    # cannot spoof — or when the Origin is in the explicit allowlists. In the
+    # default config the same-origin match is DNS-rebinding-safe because
+    # TrustedHostMiddleware validates Host against ALLOWED_HOSTS on this same
+    # WebSocket scope first (CAO_ALLOWED_HOSTS="*" opts out of that; see
+    # is_ws_origin_allowed).
+    origin = websocket.headers.get("origin")
+    if not is_ws_origin_allowed(origin, websocket.headers.get("host")):
+        logger.warning(
+            "Rejected WebSocket attach for terminal %r: disallowed Origin %r",
+            terminal_id,
+            origin,
+        )
+        await websocket.close(code=4403, reason="WebSocket Origin not allowed")
         return
 
     await websocket.accept()
@@ -4188,6 +4436,185 @@ async def export_memories_endpoint(
         filename=tar_path.name,
         background=BackgroundTask(_cleanup),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Memory relationship routes (issue #511).
+#
+# Registered BEFORE the single-segment ``/memory/{key}`` catch-all below so the
+# literal ``/memory/relationships`` collection is not captured as a key (FR-5.2;
+# same precedent as ``/memory/export`` above). A route-resolution test guards
+# this ordering. All go through the single MemoryRelationshipService; the route
+# layer is a thin adapter that maps ValueError -> 400 and not-found -> 404 and
+# never issues SQL. Responses are content-free RelationshipDTOs (NFR-1.7).
+# --------------------------------------------------------------------------- #
+
+
+class RelationshipCreateRequest(BaseModel):
+    scope: str
+    scope_id: Optional[str] = None
+    source_key: str
+    target_key: str
+    type: str
+    origin: str
+    status: str = "active"
+    confidence: Optional[float] = None
+    rank: Optional[int] = None
+    attributes: Optional[Dict[str, Any]] = None
+
+
+class RelationshipPatchRequest(BaseModel):
+    status: Optional[str] = None
+    confidence: Optional[float] = None
+    rank: Optional[int] = None
+    attributes: Optional[Dict[str, Any]] = None
+
+
+def _relationship_service():
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        MemoryRelationshipService,
+    )
+
+    return MemoryRelationshipService()
+
+
+@app.get("/memory/relationships")
+async def list_relationships_endpoint(
+    scope: str,
+    scope_id: Optional[str] = None,
+    source_key: Optional[str] = None,
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    stale: bool = False,
+    limit: int = Query(default=50, ge=1, le=100),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """List relationships (read scope). Default returns ACTIVE only; ``status``
+    widens; ``stale=true`` filters to stale edges. Each row is a content-free
+    RelationshipDTO exposing provenance/status/timestamps (FR-5.4, AC-7).
+
+    ``limit`` bounds the response, matching ``GET /memory``'s precedent
+    (default 50, max 100). This route previously returned every row in the
+    scope, so a large scope could emit an unbounded payload where every sibling
+    memory list route was already capped (human review, PR #524)."""
+    _require_memory_enabled()
+    svc = _relationship_service()
+    dtos = svc.list_relationships(
+        scope,
+        scope_id,
+        source_key,
+        status=status_filter,
+        stale_only=stale,
+        include_non_active=status_filter is not None,
+    )
+    return [d.to_dict() for d in dtos[:limit]]
+
+
+@app.post("/memory/relationships")
+async def create_relationship_endpoint(
+    body: RelationshipCreateRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Create/upsert a relationship (write scope). Fail-closed: the service
+    rejects invalid type/status/confidence/attributes, self-links, and
+    cross-scope/dangling endpoints with ValueError -> 400, before persistence."""
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.create(
+            body.scope,
+            body.scope_id,
+            body.source_key,
+            body.target_key,
+            body.type,
+            body.origin,
+            status=body.status,
+            confidence=body.confidence,
+            rank=body.rank,
+            attributes=body.attributes,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return dto.to_dict()
+
+
+@app.patch("/memory/relationships/{relationship_id}")
+async def patch_relationship_endpoint(
+    relationship_id: str,
+    body: RelationshipPatchRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.patch(
+            relationship_id,
+            status=body.status,
+            confidence=body.confidence,
+            rank=body.rank,
+            attributes=body.attributes,
+        )
+    except ValueError as e:
+        # not-found is raised as ValueError by the service; map to 404, other
+        # validation errors to 400.
+        detail = str(e)
+        code = status.HTTP_404_NOT_FOUND if "not found" in detail else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=code, detail=detail)
+    return dto.to_dict()
+
+
+@app.post("/memory/relationships/{relationship_id}/promote")
+async def promote_relationship_endpoint(
+    relationship_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.promote(relationship_id)
+    except ValueError as e:
+        detail = str(e)
+        code = status.HTTP_404_NOT_FOUND if "not found" in detail else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=code, detail=detail)
+    return dto.to_dict()
+
+
+@app.post("/memory/relationships/{relationship_id}/reject")
+async def reject_relationship_endpoint(
+    relationship_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.reject(relationship_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return dto.to_dict()
+
+
+@app.delete("/memory/relationships/{relationship_id}")
+async def delete_relationship_endpoint(
+    relationship_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Soft-delete (write scope): status -> deleted, row retained (auditable).
+
+    WRITE, not ADMIN, is DELIBERATE (human review, PR #524). The ADMIN-gated
+    memory routes destroy user content irreversibly (a memory's file and its
+    metadata row); this one only transitions a derived annotation's status and
+    retains the row, so it is recoverable and forensically intact — the same
+    authority already needed to CREATE the edge via POST, and no more. Gating it
+    ADMIN would also make ordinary curation (rejecting a bad compiler edge)
+    require an admin token while writing one did not, which is the wrong
+    asymmetry. Note this is the SOFT delete; the hard purge is not exposed over
+    HTTP at all — it is driven internally by ``forget()``."""
+    _require_memory_enabled()
+    svc = _relationship_service()
+    try:
+        dto = svc.soft_delete(relationship_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return dto.to_dict()
 
 
 @app.get("/memory/{key}", response_model=MemoryDetail)

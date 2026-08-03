@@ -30,6 +30,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS
 from cli_agent_orchestrator.models.flow import Flow
+from cli_agent_orchestrator.models.kiro_engine import parse_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
@@ -94,6 +95,22 @@ def add_flow(file_path: str) -> Flow:
         except Exception as e:
             raise ValueError(f"Invalid cron expression '{schedule}': {e}")
 
+        # Construct the model before persisting the registration so front-matter
+        # engine values receive Pydantic's canonical v2/kas validation.
+        validated_flow = Flow(
+            name=name,
+            file_path=str(path),
+            schedule=schedule,
+            agent_profile=agent_profile,
+            provider=provider,
+            engine=metadata.get("engine"),
+            script=script,
+            last_run=None,
+            next_run=next_run,
+            enabled=True,
+            prompt_template=None,
+        )
+
         # Create flow in database
         flow = db_create_flow(
             name=name,
@@ -104,6 +121,7 @@ def add_flow(file_path: str) -> Flow:
             script=script,
             next_run=next_run,
         )
+        flow = Flow.model_validate({**flow.model_dump(), "engine": validated_flow.engine})
 
         logger.info(f"Added flow: {name}")
         return flow
@@ -116,11 +134,26 @@ def add_flow(file_path: str) -> Flow:
 def _enrich_flow_with_prompt(flow: Flow) -> Flow:
     """Read the prompt template from the flow file and attach it."""
     try:
-        _, prompt = _parse_flow_file(Path(flow.file_path))
-        flow.prompt_template = prompt.strip()
+        metadata, prompt = _parse_flow_file(Path(flow.file_path))
     except Exception:
-        flow.prompt_template = None
-    return flow
+        return Flow.model_validate({**flow.model_dump(), "prompt_template": None})
+
+    enriched_flow = {
+        **flow.model_dump(),
+        "engine": metadata.get("engine"),
+        "prompt_template": prompt.strip(),
+    }
+    try:
+        return Flow.model_validate(enriched_flow)
+    except ValueError:
+        # Flow files can be edited after registration. Do not let an invalid
+        # engine value in one file prevent callers from reading other flows.
+        logger.warning(
+            "Ignoring invalid engine metadata for flow %s in %s",
+            flow.name,
+            flow.file_path,
+        )
+        return Flow.model_validate({**enriched_flow, "engine": None})
 
 
 def list_flows() -> List[Flow]:
@@ -183,7 +216,13 @@ async def execute_flow(name: str) -> bool:
 
         # Read flow file
         file_path = Path(flow.file_path)
-        _, prompt_template = _parse_flow_file(file_path)
+        metadata, prompt_template = _parse_flow_file(file_path)
+
+        # get_flow degrades an invalid engine to None so one bad file cannot
+        # break listing. Executing on that None would silently launch v2, so
+        # re-validate the raw value here: at the execution boundary a rejected
+        # engine must fail rather than fall back to the default.
+        parse_kiro_engine(metadata.get("engine"))
 
         # If no script, always execute with empty output
         if not flow.script:
@@ -265,6 +304,7 @@ async def execute_flow(name: str) -> bool:
             provider=flow.provider,
             agent_profile=flow.agent_profile,
             new_session=True,
+            engine=flow.engine,
         )
 
         # Send rendered prompt to terminal. send_input is blocking tmux I/O

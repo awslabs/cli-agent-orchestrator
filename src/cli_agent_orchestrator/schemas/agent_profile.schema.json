@@ -35,6 +35,11 @@
       "type": "string",
       "description": "Provider override (e.g. claude_code, kiro_cli, codex)."
     },
+    "engine": {
+      "type": "string",
+      "enum": ["v2", "kas"],
+      "description": "Kiro engine selection."
+    },
     "allowedTools": {
       "type": "array",
       "items": {"type": "string"},

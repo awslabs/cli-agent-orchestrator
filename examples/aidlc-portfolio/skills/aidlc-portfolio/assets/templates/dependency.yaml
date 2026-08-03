@@ -1,0 +1,20 @@
+schemaVersion: 1
+id: source-to-target
+source:
+  project: source-project
+  component: source-component
+target:
+  project: target-project
+  component: target-component
+type: contract
+blockingAt:
+  - integration
+contract:
+  kind: openapi
+  location: contracts/example.yaml
+  compatibility: backward-compatible
+status: proposed
+confidence: low
+evidence: []
+lastVerified: "2026-01-01"
+

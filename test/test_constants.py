@@ -98,7 +98,12 @@ class TestNetworkAllowlistEnvOverrides:
         env_copy = os.environ.copy()
         # Strip any pre-set network override vars so the test starts from the
         # documented defaults, then layer the overrides under test on top.
-        for key in ("CAO_CORS_ORIGINS", "CAO_ALLOWED_HOSTS", "CAO_WS_ALLOWED_CLIENTS"):
+        for key in (
+            "CAO_CORS_ORIGINS",
+            "CAO_ALLOWED_HOSTS",
+            "CAO_WS_ALLOWED_CLIENTS",
+            "CAO_WS_ALLOWED_ORIGINS",
+        ):
             env_copy.pop(key, None)
         env_copy.update(env_overrides)
         with patch.dict("os.environ", env_copy, clear=True):
@@ -166,7 +171,12 @@ class TestAddLocalCorsOrigins:
         import os
 
         env_copy = os.environ.copy()
-        for key in ("CAO_CORS_ORIGINS", "CAO_ALLOWED_HOSTS", "CAO_WS_ALLOWED_CLIENTS"):
+        for key in (
+            "CAO_CORS_ORIGINS",
+            "CAO_ALLOWED_HOSTS",
+            "CAO_WS_ALLOWED_CLIENTS",
+            "CAO_WS_ALLOWED_ORIGINS",
+        ):
             env_copy.pop(key, None)
         with patch.dict("os.environ", env_copy, clear=True):
             import cli_agent_orchestrator.constants as constants_module
@@ -246,6 +256,148 @@ class TestAddLocalCorsOrigins:
         # The unbracketed form would never match a real Origin header and so
         # would only bloat the allowlist — guard against accidental reintro.
         assert "http://2001:db8::1:9889" not in mod.CORS_ORIGINS
+
+
+class TestIsWsOriginAllowed:
+    """Tests for the CWE-1385 cross-site WebSocket hijacking Origin guard.
+
+    ``is_ws_origin_allowed`` decides whether a WebSocket PTY handshake with a
+    given ``Origin`` header may open a socket. It reads the module-level
+    ``CORS_ORIGINS`` / ``WS_ALLOWED_ORIGINS`` lists, so patch those on the
+    module object rather than importing the values by value.
+    """
+
+    def test_missing_origin_is_allowed(self):
+        """Non-browser clients (CLI, websockets lib) send no Origin; the CSRF
+        threat is browser-only, so a missing Origin passes the guard."""
+        from cli_agent_orchestrator import constants
+
+        assert constants.is_ws_origin_allowed(None) is True
+        assert constants.is_ws_origin_allowed("") is True
+
+    def test_origin_in_cors_list_is_allowed(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["http://localhost:9889"]):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("http://localhost:9889") is True
+
+    def test_foreign_origin_is_rejected(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["http://localhost:9889"]):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("http://evil.example.com") is False
+
+    def test_extra_ws_origin_is_allowed(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", ["https://tunnel.example.dev"]):
+                assert constants.is_ws_origin_allowed("https://tunnel.example.dev") is True
+
+    def test_cors_wildcard_does_not_disable_ws_guard(self):
+        """Deliberate divergence from CORSMiddleware: a ``*`` in CORS_ORIGINS
+        (CAO_CORS_ORIGINS="*") must NOT wave through arbitrary WS origins — PTY
+        access is RCE-grade, so only the dedicated CAO_WS_ALLOWED_ORIGINS="*"
+        disables the check. The literal "*" only ever matches a "*" Origin,
+        which no browser sends."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["*"]):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("http://evil.example.com") is False
+                # A real same-origin request still works via the Host match.
+                assert (
+                    constants.is_ws_origin_allowed("http://localhost:9889", "localhost:9889")
+                    is True
+                )
+
+    def test_wildcard_disables_check(self):
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", ["*"]):
+                assert constants.is_ws_origin_allowed("http://anything.example") is True
+
+    def test_null_origin_string_is_rejected(self):
+        """Sandboxed iframes and some cross-site contexts send the literal
+        string ``"null"``. It is a real (truthy) Origin, not an absent one, so
+        it must not pass unless explicitly allowlisted."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", ["http://localhost:9889"]):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("null") is False
+
+    def test_same_origin_via_host_match_is_allowed_without_allowlist(self):
+        """Origin authority == request Host is same-origin (the bundled viewer)
+        and passes even when both allowlists are empty — this is what keeps the
+        imported-app / dynamic-proxy deployments working."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed("http://localhost:9889", "localhost:9889")
+                    is True
+                )
+                # Proxied HTTPS at a dynamic hostname, same authority as Host.
+                assert (
+                    constants.is_ws_origin_allowed(
+                        "https://myspace-9889.app.github.dev",
+                        "myspace-9889.app.github.dev",
+                    )
+                    is True
+                )
+
+    def test_origin_authority_mismatch_with_host_is_rejected(self):
+        """A foreign Origin is rejected even when a Host is supplied — the
+        attacker's Origin authority never equals the CAO server's Host."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed("http://evil.example.com", "localhost:9889")
+                    is False
+                )
+
+    def test_null_origin_not_treated_as_same_origin(self):
+        """The opaque ``"null"`` origin has no http/https authority, so it can
+        never satisfy the Host match regardless of the request Host."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert constants.is_ws_origin_allowed("null", "localhost:9889") is False
+
+    def test_non_http_scheme_origin_not_same_origin(self):
+        """A ``file://`` origin whose netloc coincidentally matches the Host
+        must not pass the same-origin branch — the scheme must be http/https."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed("file://localhost:9889", "localhost:9889")
+                    is False
+                )
+
+    def test_userinfo_cannot_smuggle_trusted_host(self):
+        """A crafted Origin that puts the trusted Host in the userinfo segment
+        (``http://localhost:9889@evil.example``) has real authority
+        ``evil.example`` and must be rejected."""
+        from cli_agent_orchestrator import constants
+
+        with patch.object(constants, "CORS_ORIGINS", []):
+            with patch.object(constants, "WS_ALLOWED_ORIGINS", []):
+                assert (
+                    constants.is_ws_origin_allowed(
+                        "http://localhost:9889@evil.example", "localhost:9889"
+                    )
+                    is False
+                )
 
 
 class TestPipeLivenessCheckIntervalClamp:

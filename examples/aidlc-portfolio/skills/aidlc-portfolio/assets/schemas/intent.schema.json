@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "intent.schema.json",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "id",
+    "name",
+    "objective",
+    "status",
+    "businessOutcomes",
+    "projects",
+    "createdAt",
+    "updatedAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "name": { "type": "string", "minLength": 1 },
+    "objective": { "type": "string", "minLength": 1 },
+    "status": {
+      "enum": ["proposed", "active", "blocked", "completed", "archived"]
+    },
+    "businessOutcomes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "projects": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "project",
+          "aidlcIntent",
+          "branch",
+          "worktree",
+          "dependsOn"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "project": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "aidlcIntent": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "aidlcSpace": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "branch": { "type": "string", "minLength": 1 },
+          "worktree": { "type": "string", "minLength": 1 },
+          "dependsOn": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+            "uniqueItems": true
+          }
+        }
+      }
+    },
+    "createdAt": { "type": "string", "minLength": 1 },
+    "updatedAt": { "type": "string", "minLength": 1 }
+  }
+}

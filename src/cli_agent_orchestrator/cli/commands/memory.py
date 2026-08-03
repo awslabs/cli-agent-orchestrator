@@ -865,3 +865,114 @@ def promote_cmd(agent_name, do_apply, min_recalls, profile_path):
     )
     if report.skipped:
         click.echo(f"  skipped (at {MAX_LESSONS}-lesson cap): {', '.join(report.skipped)}")
+
+
+# --------------------------------------------------------------------------- #
+# Relationship review surface (issue #511, U7). Thin adapter over the single
+# MemoryRelationshipService — list proposals, inspect endpoints + provenance,
+# promote/reject. No SQL here (FR-2.1). Content-free output (NFR-1.7).
+# --------------------------------------------------------------------------- #
+
+
+def _relationship_service():
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        MemoryRelationshipService,
+    )
+
+    return MemoryRelationshipService()
+
+
+def _resolve_cli_scope_id(svc, scope: str):
+    """Resolve scope_id from the current terminal context (matches other memory
+    commands). Returns None for global/federated."""
+    terminal_context = {"cwd": os.path.realpath(os.getcwd())}
+    try:
+        return svc.resolve_scope_id(scope, terminal_context=terminal_context)
+    except Exception:
+        return None
+
+
+@memory.group(name="relationships")
+def relationships():
+    """Inspect and curate typed memory relationships (issue #511)."""
+
+
+@relationships.command(name="list")
+@click.option("--scope", default="global", help="Scope (default: global).")
+@click.option("--scope-id", default=None, help="Explicit scope_id (else resolved from cwd).")
+@click.option("--source-key", default=None, help="Filter to one source memory key.")
+@click.option(
+    "--status", "status_filter", default=None, help="Filter by status (default: active only)."
+)
+@click.option("--stale", is_flag=True, default=False, help="Only stale edges.")
+@click.option("--format", "out_format", type=click.Choice(["table", "json"]), default="table")
+def relationships_list(scope, scope_id, source_key, status_filter, stale, out_format):
+    """List relationships (default: active). Use --status proposal to review the
+    proposal queue."""
+    import json as _json
+
+    msvc = _get_memory_service()
+    sid = scope_id if scope_id is not None else _resolve_cli_scope_id(msvc, scope)
+    rsvc = _relationship_service()
+    dtos = rsvc.list_relationships(
+        scope,
+        sid,
+        source_key,
+        status=status_filter,
+        stale_only=stale,
+        include_non_active=status_filter is not None,
+    )
+    if out_format == "json":
+        click.echo(_json.dumps([d.to_dict() for d in dtos], indent=2))
+        return
+    if not dtos:
+        click.echo("No relationships found.")
+        return
+    click.echo(f"{'ID':36}  {'TYPE':13}  {'ORIGIN':18}  {'STATUS':9}  STALE  SOURCE -> TARGET")
+    for d in dtos:
+        click.echo(
+            f"{d.id:36}  {d.type:13}  {d.origin:18}  {d.status:9}  "
+            f"{'yes' if d.stale else 'no':5}  {d.source_key} -> {d.target_key}"
+        )
+
+
+@relationships.command(name="inspect")
+@click.argument("relationship_id")
+@click.option("--format", "out_format", type=click.Choice(["table", "json"]), default="table")
+def relationships_inspect(relationship_id, out_format):
+    """Show one relationship's endpoints, provenance, status, and timestamps."""
+    import json as _json
+
+    rsvc = _relationship_service()
+    dto = rsvc.get(relationship_id)
+    if dto is None:
+        raise click.ClickException(f"relationship not found: {relationship_id}")
+    if out_format == "json":
+        click.echo(_json.dumps(dto.to_dict(), indent=2))
+        return
+    for k, v in dto.to_dict().items():
+        click.echo(f"{k:18}: {v}")
+
+
+@relationships.command(name="promote")
+@click.argument("relationship_id")
+def relationships_promote(relationship_id):
+    """Promote a proposal to active."""
+    rsvc = _relationship_service()
+    try:
+        dto = rsvc.promote(relationship_id)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    click.echo(f"{dto.id}: status -> {dto.status}")
+
+
+@relationships.command(name="reject")
+@click.argument("relationship_id")
+def relationships_reject(relationship_id):
+    """Reject a proposal."""
+    rsvc = _relationship_service()
+    try:
+        dto = rsvc.reject(relationship_id)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    click.echo(f"{dto.id}: status -> {dto.status}")

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- add Phase 0 Kiro engine selection (`v2` default; `kas` capability-probed and rejected before terminal allocation)
+- Read-only profile HTTP routes for capability search, template discovery and schema retrieval, template-config validation, and rendered previews (#523)
 - `CAO_HOME_DIR` environment variable to relocate CAO's entire data directory outside `~/.aws` (#467)
 - **Self-learning loop** (opt-in, off by default; see `docs/self-learning.md`):
   - Phase 1 — outcome capture: `memory.learning_enabled` setting (`CAO_MEMORY_LEARNING_ENABLED`), `workflow_outcomes` table, `report_outcome`/`list_outcomes`/`store_lesson` MCP tools (the latter targets a named worker profile's agent scope so retrospective lessons reach the worker), scope-gated `POST/GET /outcomes` endpoints, and a built-in `retrospector` agent profile that distills session outcomes into worker-scoped memory lessons
@@ -28,12 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING** — `cao workflow run --json` output shape (#505). It previously echoed the complete `WorkflowRunResult` (`run_id`, `workflow_name`, `state`, `steps[]`, timestamps, `kind`); because the default path now submits-and-follows rather than blocking, it emits only the stable terminal object `{"run_id": ..., "state": ...}`. A non-TTY plain `run` emits the same JSON. **Scripts reading `steps[]` or `workflow_name` off `run --json` must change** — use `cao workflow result <id> --json` for full detail, or `cao workflow status <id> --json` for a mid-run snapshot. `run --wait --json` is unaffected and still returns the complete `WorkflowRunResult`. Exit codes are unchanged across TTY, non-TTY, and `--json`
 - **BREAKING** — the run-level `output` field is no longer returned by `GET /workflows/runs/{run_id}/result` or by the `workflow_result` / `workflow_wait` MCP tools (#505). Run-level output is not journaled, so the field was structurally always `null` on those journal-assembled surfaces; it is dropped rather than advertised. Per-step outputs are unaffected (`steps[].output`), and the blocking `run --wait` path still returns run-level output for script-tier runs
 
+### Changed
+
+- consolidate local agent-store persistence into `services/profile_store.py` so the store write path, profile-name validation, and store-path containment live in one service instead of being spread across `install_service`, `cli/commands/install`, and `cli/commands/profile`. `cao profile remove` now reports "Invalid profile name" instead of "not found in local store" for names that fail `[A-Za-z0-9_-]{1,64}` but are still contained (for example `has space`, `has.dot`, or over 64 characters); the exit code is unchanged (#543)
+
 ### Fixed
 
 - workflow: the background drive's FAILED backstop no longer overwrites an already-settled run (#505). It fired unconditionally on any exception, so a drive that raised *after* the engine journaled COMPLETED/CANCELLED — during post-settlement bookkeeping — rewrote that terminal state to FAILED, making the durable record misreport the run's outcome. The write is now a conditional `UPDATE ... WHERE state = 'running'` in the journal DAL (atomic, so no concurrent settle can interleave), covering both the `Exception` and `CancelledError` arms; a run that raises *before* settling still lands FAILED as before, so no run is left orphaned in `running`
 - workflow: `cao workflow events` closes its streamed SSE response on every exit path (#505). The follower breaks out of its loop on a terminal frame and abandons the generator on each reconnect, so without an explicit close the socket survived until garbage collection and a long follow with repeated reconnects accumulated live file descriptors. The equivalent MCP tool was already hardened
 - workflow: a caller-supplied `run_id` that loses a concurrent-submit race now returns `409` instead of `500` (#505). The uniqueness pre-check and the durable insert are not one atomic operation, so both submits can pass the pre-check; the loser's `IntegrityError` is now mapped to the same `409` the serialized case reports
 
+- profile store writes are now atomic and inter-process safe. Both store writes were previously bare `write_text` calls, so a concurrent `cao profile` write and a server-side write could interleave or leave a partial file. Adds `locked_atomic_write` to `utils/atomic_file.py` as the blind-write sibling of `locked_atomic_rewrite` (#492): it shares the same lock, temp file, fsync, mode preservation and `os.replace`, but skips the read, so a corrupt or non-UTF-8 file in the agent store can still be replaced by the install that would have repaired it instead of failing with `UnicodeDecodeError` (#543)
 - self-healing pipe-pane liveness watchdog for silently-stalled FIFO forwarding (fixes #388) (#397), including detection of a stall that settles into a new static frame before the next poll and of a pipe that never delivers a single byte from terminal creation (cold start, harness-control#93) — see `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` / `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` in `docs/configuration.md`
 - web: attach web terminals through the configured backend so herdr-backed terminals no longer fail to attach (#417)
 - honor profile frontmatter `provider:` during install (flag > frontmatter > default) (#414)
@@ -662,5 +669,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-
-

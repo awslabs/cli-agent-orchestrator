@@ -1,0 +1,15 @@
+schemaVersion: 1
+id: example-intent
+name: Example Intent
+objective: Replace with the portfolio outcome.
+status: proposed
+businessOutcomes: []
+projects:
+  - project: example-project
+    aidlcIntent: example-child-intent
+    aidlcSpace: default
+    branch: feat/example-intent
+    worktree: worktrees/example-project/example-intent
+    dependsOn: []
+createdAt: "2026-01-01T00:00:00.000Z"
+updatedAt: "2026-01-01T00:00:00.000Z"

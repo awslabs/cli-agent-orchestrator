@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "project.schema.json",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "id",
+    "name",
+    "repository",
+    "description",
+    "status",
+    "businessCapabilities",
+    "components",
+    "owners",
+    "environments",
+    "evidence",
+    "confidence",
+    "lastVerified"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "name": { "type": "string", "minLength": 1 },
+    "repository": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["discovered", "proposed", "verified", "archived"] },
+    "businessCapabilities": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+      "uniqueItems": true
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "type", "criticality"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "name": { "type": "string", "minLength": 1 },
+          "type": {
+            "enum": [
+              "service",
+              "web",
+              "library",
+              "data-store",
+              "data-pipeline",
+              "event-producer",
+              "event-consumer",
+              "infrastructure",
+              "job",
+              "other"
+            ]
+          },
+          "criticality": { "enum": ["tier-1", "tier-2", "tier-3", "unknown"] }
+        }
+      }
+    },
+    "owners": {
+      "type": "object",
+      "required": ["team"],
+      "additionalProperties": false,
+      "properties": {
+        "team": { "type": "string", "minLength": 1 },
+        "business": { "type": "string", "minLength": 1 }
+      }
+    },
+    "environments": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source"],
+        "additionalProperties": false,
+        "properties": {
+          "source": { "type": "string", "minLength": 1 },
+          "revision": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "confidence": { "enum": ["low", "medium", "high"] },
+    "lastVerified": { "type": "string", "minLength": 1 }
+  }
+}
+
