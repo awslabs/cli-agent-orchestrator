@@ -325,6 +325,44 @@ def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
     return None
 
 
+def _find_response_marker(text: str) -> Optional[re.Match[str]]:
+    """Find the first model-reply marker after any compact activity prelude.
+
+    Native Codex activity is rendered as a compact run of ``•`` status rows,
+    followed by a blank line and the model reply. Treat that layout as the
+    structural signal rather than matching English verbs such as ``Read`` or
+    ``Called``, which can also begin legitimate replies.
+    """
+    matches = []
+    for match in re.finditer(ASSISTANT_PREFIX_PATTERN, text, re.IGNORECASE | re.MULTILINE):
+        line_end = text.find("\n", match.start())
+        if line_end == -1:
+            line_end = len(text)
+        if not re.match(MCP_TOOL_CALL_PATTERN, text[match.start() : line_end]):
+            matches.append(match)
+
+    if not matches:
+        return None
+
+    for index, match in enumerate(matches[1:], start=1):
+        previous_line_end = text.find("\n", matches[index - 1].start())
+        if previous_line_end == -1:
+            previous_line_end = len(text)
+        gap = text[previous_line_end : match.start()]
+        if re.search(r"\n[^\S\n]*\n", gap) is None:
+            continue
+
+        prelude_lines = text[matches[0].start() : match.start()].splitlines()
+        nonblank_lines = [line for line in prelude_lines if line.strip()]
+        bullet_lines = [line for line in nonblank_lines if re.match(r"^[^\S\n]*•", line)]
+        continuation_lines = [line for line in nonblank_lines if re.match(r"^[^\S\n]*└", line)]
+        compact_rows = len(bullet_lines) >= 2 and len(bullet_lines) == len(nonblank_lines)
+        if compact_rows or continuation_lines:
+            return match
+
+    return matches[0]
+
+
 class ProviderError(Exception):
     """Exception raised for provider-specific errors."""
 
@@ -957,11 +995,9 @@ class CodexProvider(BaseProvider):
             last_user = user_matches[-1]
 
             # Find the first assistant response marker (• or assistant:) after
-            # the user message, skipping "• Called <server>.<tool>(...)" MCP
-            # tool call markers — those are followed by tool output, not the
-            # model's reply. Anchoring on a tool call marker would pull tool
-            # output (e.g. skill body text) into the extracted response.
-            asst_after_user = _find_assistant_marker(clean_output[last_user.start() :])
+            # the user message. Skip MCP calls and any compact, blank-separated
+            # native activity prelude before the model's actual reply.
+            asst_after_user = _find_response_marker(clean_output[last_user.start() :])
 
             if asst_after_user:
                 response_start = last_user.start() + asst_after_user.start()
