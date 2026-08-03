@@ -226,7 +226,20 @@ function humanKey(key: string): string {
 function FacetRows({ entries, dense }: { entries: Array<[string, string]>; dense?: boolean }) {
   if (entries.length === 0) return null
   return (
-    <dl className={`grid grid-cols-[auto,1fr] gap-x-3 ${dense ? 'gap-y-0.5' : 'gap-y-1'}`}>
+    // `minmax(0,1fr)`, NOT `1fr`. A grid item's automatic minimum size is its
+    // MIN-CONTENT width, so a plain `1fr` track cannot shrink below the longest
+    // unbreakable run in it — `break-words` never gets the chance to break. The
+    // track then pushes the card wider than its own `max-w`, and the
+    // `overflow-hidden` that clips the rounded corners silently clips the text
+    // instead. Measured live before the fix: a 352px hover card holding 425px
+    // of content, so every value lost its last 72px and `observed.branch`
+    // rendered as `review/cond0225-0230-native-atte` + `sol-r5` -- a branch
+    // name that does not exist, drawn as if it were complete.
+    //
+    // This surfaced only now because until the VCS chip every facet value was
+    // short (`task: p0-09b-r1`, `role: implementer`). Branch names, 40-char
+    // shas and worktree names are the first values wide enough to hit it.
+    <dl className={`grid grid-cols-[auto,minmax(0,1fr)] gap-x-3 ${dense ? 'gap-y-0.5' : 'gap-y-1'}`}>
       {entries.map(([key, value], i) => {
         const v = facetValue(value)
         return (

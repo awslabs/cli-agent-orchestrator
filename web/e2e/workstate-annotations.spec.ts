@@ -1202,6 +1202,76 @@ test.describe("conductor annotation chips (§9.5)", () => {
     });
   });
 
+  test("the hover card contains its facet values instead of clipping them", async ({
+    page,
+  }) => {
+    // The real shapes that broke it, copied off the live fleet: a 51-character
+    // branch, a full 40-character sha, and a worktree basename just as long.
+    // Until the VCS chip every facet value was short (`task: p0-09b-r1`,
+    // `role: implementer`) and fit whatever width the grid track happened to
+    // take, so nothing here was ever under pressure.
+    const BRANCH = "review/cond0225-0230-native-attestation-spec-sol-r5";
+    await stubBackend(page, {
+      annotations: payload([
+        identity({
+          kind: "vcs",
+          label: BRANCH,
+          colour_key: "wt-alpha",
+          details: {
+            "observed.branch": BRANCH,
+            "observed.commit_short": "bbc6a75",
+            "observed.commit": "bbc6a75cd37586ff99026746d3dd14acf3f39880",
+            "launch.worktree": "cond0225-0230-native-attestation-spec-review-sol-r5",
+            "launch.repo": "cao-conductor",
+          },
+        }),
+      ]),
+    });
+    await page.goto("/");
+
+    const chip = page.getByTestId("annotation-chip").first();
+    await expect(chip).toBeVisible();
+    await chip.hover();
+    const card = page.getByTestId("annotation-hovercard");
+    await expect(card).toBeVisible();
+
+    // THE ASSERTION THAT WAS MISSING, and every neighbouring one passed while
+    // the bug was live. The card carries `overflow-hidden` so its
+    // square-cornered header and footer stay inside its radius; the same rule
+    // silently clips any content wider than the box. A `1fr` grid track cannot
+    // shrink below its min-content width, so the value column pushed 425px of
+    // content into a 352px card and every value lost its last 72px --
+    // `observed.branch` drew as `review/cond0225-0230-native-atte` + `sol-r5`,
+    // a branch that does not exist, with no visual sign of truncation.
+    // Visibility, the card's own bounding box, and axe were all satisfied.
+    const fit = await card.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      let worst = 0;
+      for (const kid of el.querySelectorAll("dd,dt,span,p")) {
+        const kr = kid.getBoundingClientRect();
+        if (kr.width) worst = Math.max(worst, kr.right - r.right);
+      }
+      return { scrollW: el.scrollWidth, clientW: el.clientWidth, worstSpill: worst };
+    });
+    expect(
+      fit.scrollW,
+      "hover card content is wider than the card that clips it",
+    ).toBeLessThanOrEqual(fit.clientW + 1);
+    expect(
+      fit.worstSpill,
+      "a facet row extends past the card's right edge",
+    ).toBeLessThanOrEqual(1);
+
+    // Inside the box is necessary and not sufficient: the value must also be
+    // all there. Asserted on the `dd` with the WHOLE string, because a clipped
+    // or re-joined value still contains the prefix a `hasText` check accepts.
+    const values = card.locator("dd");
+    await expect(values.filter({ hasText: "review/cond0225" })).toHaveText([BRANCH]);
+    await expect(values.filter({ hasText: "bbc6a75cd" })).toHaveText([
+      "bbc6a75cd37586ff99026746d3dd14acf3f39880",
+    ]);
+  });
+
   test("a body the route should never send degrades to the control rendering", async ({
     page,
   }) => {
