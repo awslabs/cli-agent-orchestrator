@@ -11,20 +11,32 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import annotationsLibSource from '../lib/annotations.ts?raw'
 import annotationChipsSource from '../components/AnnotationChips.tsx?raw'
+import annotationDetailsSource from '../components/AnnotationDetails.tsx?raw'
+import identityColourSource from '../lib/identityColour.ts?raw'
 import { render, cleanup, screen, waitFor, within, fireEvent } from '@testing-library/react'
 import { DashboardHome } from '../components/DashboardHome'
-import { CampaignAnnotations } from '../components/AnnotationChips'
+import {
+  CampaignAnnotations,
+  MAX_IDENTITY_CHIPS,
+  MAX_ROW_CHIPS,
+} from '../components/AnnotationChips'
+import { detailsToText } from '../components/AnnotationDetails'
 import { useStore } from '../store'
 import { projectedTerminal } from './projectedTerminal'
 import {
   ageSource,
   freshness,
+  groupedFacets,
+  isIdentity,
   isStale,
   orderedFacets,
+  partitionChips,
   placeAnnotations,
   readAnnotations,
   resolveRole,
+  splitFacetKey,
 } from '../lib/annotations'
+import { IDENTITY_PALETTE, paletteIndex, rgba } from '../lib/identityColour'
 import type { Annotation, AnnotationsResponse } from '../api'
 
 vi.mock('../components/TerminalView', () => ({ TerminalView: () => null }))
@@ -598,12 +610,34 @@ describe('the renderer holds no conductor vocabulary either', () => {
   // every one of those would have failed the Python guard verbatim. This is
   // that guard, mirrored, over the modules most likely to acquire
   // `if (annotation.kind === 'human-gate')`.
+  //
+  // WIDENED, AND THE WIDENING IS THE POINT. The popover was the one module with
+  // a real appetite for vocabulary and no guard over it: `if (key ===
+  // 'track_id')` is the natural way to write a grouped detail card, and nothing
+  // would have stopped it. The colour module is listed for the same reason —
+  // it is where a palette keyed by a lane name would go. Both pass every check
+  // as written, so covering them costs nothing today and is the whole cost of
+  // the guard's value the day somebody reaches for the shortcut.
+  //
+  // AN EXPLICIT LIST, NOT `import.meta.glob('src/lib/*.ts')`. A glob sweeps in
+  // unrelated modules that may legitimately contain one of these substrings and
+  // turns a guard into a CI hazard; the list is four entries and the non-vacuity
+  // control below is what keeps it honest.
   const MODULES: Array<[string, string]> = [
     ['src/lib/annotations.ts', annotationsLibSource],
+    ['src/lib/identityColour.ts', identityColourSource],
     ['src/components/AnnotationChips.tsx', annotationChipsSource],
+    ['src/components/AnnotationDetails.tsx', annotationDetailsSource],
   ]
 
-  // The same eight terms the Python guard forbids.
+  // The eight terms the Python guard forbids, plus the vocabulary this
+  // feature's producer uses.
+  //
+  // ONLY UNAMBIGUOUS TOKENS. Matching is `String.includes`, so the obvious
+  // additions are traps: `lane` is inside `plane`, and `base` is inside
+  // `basis`, `database` and `basename` — all three of which are words this
+  // renderer has legitimate reason to use. A term that false-positives must be
+  // NARROWED rather than dropped.
   const CONDUCTOR_TERMS = [
     'work-state',
     'work_item',
@@ -613,6 +647,15 @@ describe('the renderer holds no conductor vocabulary either', () => {
     'in-round',
     'finalized',
     'supervisor',
+    'track_id',
+    'lane_source',
+    'lane_scope',
+    'cross-lane',
+    'task-prefix',
+    'worktree',
+    'base_branch',
+    'commit_short',
+    'vcs',
   ]
 
   /** Comments stripped — they explain the design, exactly as Python docstrings
@@ -632,7 +675,18 @@ describe('the renderer holds no conductor vocabulary either', () => {
     const source = stripComments(text)
     expect(source).not.toMatch(/kind\s*[=!]==/)
     expect(source).not.toMatch(/switch\s*\([^)]*kind[^)]*\)/)
-    for (const forbidden of ['KNOWN_KINDS', 'SUPPORTED_KINDS', 'FACET_ORDER', 'SUBJECT_TYPES']) {
+    for (const forbidden of [
+      'KNOWN_KINDS',
+      'SUPPORTED_KINDS',
+      'FACET_ORDER',
+      'SUBJECT_TYPES',
+      // A table of scope names, a table of provenance classes, or a table of
+      // identity tokens are the three shapes this feature could plausibly
+      // acquire. Each would move a decision the producer owns onto this side.
+      'LANE_SCOPES',
+      'PROVENANCE_CLASSES',
+      'COLOUR_KEYS',
+    ]) {
       expect(source).not.toContain(forbidden)
     }
   })
@@ -644,6 +698,34 @@ describe('the renderer holds no conductor vocabulary either', () => {
     const planted = stripComments("const x = 'human-gate'\nif (a.kind === 'x') {}")
     expect(CONDUCTOR_TERMS.filter(term => planted.includes(term))).toEqual(['human-gate'])
     expect(planted).toMatch(/kind\s*[=!]==/)
+  })
+
+  it('the widened guard catches this feature\'s vocabulary, in every covered module', () => {
+    // The NON-VACUITY CONTROL FOR THE WIDENING. The four terms below are the
+    // ones a grouped detail card and a colour module would actually reach for,
+    // and every one of them is a NEW entry — a suite that only ever proved the
+    // original eight could fail could be reverted to two modules and eight
+    // terms without a single test going red.
+    for (const planted of [
+      "if (key === 'track_id') return 'Lane'",
+      "const PROVENANCE_CLASSES = ['assigned', 'launch']",
+      "if (facet.startsWith('lane_scope')) {}",
+      "const label = a.details['commit_short']",
+    ]) {
+      const source = stripComments(planted)
+      const offenders = CONDUCTOR_TERMS.filter(term => source.includes(term))
+      const constants = ['PROVENANCE_CLASSES', 'LANE_SCOPES', 'COLOUR_KEYS'].filter(c =>
+        source.includes(c),
+      )
+      expect(
+        offenders.length + constants.length,
+        `the guard would not have caught: ${planted}`,
+      ).toBeGreaterThan(0)
+    }
+    // And the modules the widening ADDED are genuinely in the list, so planting
+    // a term in either of them reaches an assertion.
+    expect(MODULES.map(([name]) => name)).toContain('src/components/AnnotationDetails.tsx')
+    expect(MODULES.map(([name]) => name)).toContain('src/lib/identityColour.ts')
   })
 })
 
@@ -830,5 +912,416 @@ describe('the no-annotations control is byte-identical to today', () => {
     // no empty container, no stray separator.
     const region = document.getElementById('session-cao-fleet-terminals')!
     expect(within(region).queryAllByTestId('annotation-chip')).toHaveLength(0)
+    // THE WRAPPER ITSELF, which is what this test is named for and did not
+    // previously assert. An empty group span is invisible but not free: it is
+    // a flex item, so it consumes a `gap` on every row of a fleet with no
+    // conductor — the one case that must stay byte-identical.
+    expect(within(region).queryAllByTestId('annotation-group')).toHaveLength(0)
+  })
+})
+
+// ── Identity chips (lane / VCS design §5) ─────────────────────────────────
+//
+// The seam is one opaque field. Everything below asserts that the renderer
+// branches on that field's PRESENCE AND EMPTINESS and on nothing else — not on
+// `kind`, not on a facet name, not on a subject type — because the moment it
+// does, the "this needs no fork change" promise is gone and only a test can
+// tell you.
+
+/** An identity chip: the only difference from `annotation()` is the opaque key. */
+function identity(overrides: Partial<Annotation> = {}): Annotation {
+  return annotation({
+    kind: 'lane',
+    label: 'pr04',
+    semantic_role: 'neutral',
+    priority: 8,
+    colour_key: '9f2c41a7be03d5e8',
+    details: {},
+    ...overrides,
+  })
+}
+
+function identityChips(): HTMLElement[] {
+  return chips().filter(c => c.getAttribute('data-identity') === 'true')
+}
+
+function severityChips(): HTMLElement[] {
+  return chips().filter(c => !c.hasAttribute('data-identity'))
+}
+
+describe('an identity chip never competes with a severity chip for the row cap', () => {
+  it('draws three severity chips and both identity chips from a row of six', async () => {
+    // ONE SHARED CAP WOULD DROP BOTH IDENTITY CHIPS HERE. The row would say
+    // nothing about where the worker is, and the operator would have no signal
+    // that anything had been withheld beyond a "+3" that means something else.
+    stubFetch(payload([
+      annotation({ label: 'sev-A', priority: 99 }),
+      annotation({ label: 'sev-B', priority: 98 }),
+      annotation({ label: 'sev-C', priority: 97 }),
+      annotation({ label: 'sev-D', priority: 96 }),
+      identity({ label: 'pr04', colour_key: 'lane-alpha' }),
+      identity({ label: 'agent/payment', kind: 'vcs', colour_key: 'wt-alpha' }),
+    ]))
+    await renderDashboard()
+
+    await waitFor(() => expect(chips().length).toBe(5))
+    expect(severityChips().map(c => c.textContent)).toHaveLength(3)
+    expect(identityChips().map(c => c.textContent?.slice(0, 20))).toHaveLength(2)
+    expect(screen.getByTestId('annotation-overflow').textContent).toBe('+1 more')
+    expect(screen.queryByTestId('annotation-identity-overflow')).toBeNull()
+
+    // DOM ORDER: severity, then the severity overflow marker, then identity.
+    // The marker belongs to the group it counts; putting the identity chips
+    // before it would make "+1 more" read as covering them too.
+    const group = screen.getByTestId('annotation-group')
+    const order = Array.from(group.children)
+    const markerAt = order.indexOf(screen.getByTestId('annotation-overflow'))
+    for (const chip of identityChips()) {
+      expect(order.indexOf(chip), 'identity chip must follow the severity marker')
+        .toBeGreaterThan(markerAt)
+    }
+  })
+
+  it('caps the identity group on its own and counts what it withheld', async () => {
+    stubFetch(payload([
+      annotation({ label: 'live-danger', semantic_role: 'danger', priority: 10 }),
+      identity({ label: 'pr04', colour_key: 'lane-alpha', priority: 8 }),
+      identity({ label: 'agent/x', kind: 'vcs', colour_key: 'wt-alpha', priority: 7 }),
+      identity({ label: 'extra', kind: 'vcs', colour_key: 'wt-beta', priority: 6 }),
+    ]))
+    await renderDashboard()
+
+    await waitFor(() => expect(chips().length).toBe(3))
+    expect(severityChips()).toHaveLength(1)
+    expect(identityChips()).toHaveLength(2)
+    // The live danger is DRAWN, not behind a marker — the regression a single
+    // shared cap reintroduces.
+    expect(severityChips()[0].textContent).toContain('live-danger')
+    expect(screen.queryByTestId('annotation-overflow')).toBeNull()
+    expect(screen.getByTestId('annotation-identity-overflow').textContent).toBe('+1')
+  })
+})
+
+describe('the identity token has three states and the renderer draws all three', () => {
+  it('draws a non-empty token coloured, by the token and nothing else', async () => {
+    stubFetch(payload([identity({ colour_key: 'a7f3' })]))
+    await renderDashboard()
+
+    await waitFor(() => expect(chips().length).toBe(1))
+    const chip = chips()[0]
+    expect(chip.getAttribute('data-identity')).toBe('true')
+    expect(chip.getAttribute('data-colour')).toBe(String(paletteIndex('a7f3')))
+    expect(chip.style.backgroundColor).toBe(rgba(IDENTITY_PALETTE[paletteIndex('a7f3')], 0.1))
+    // THE TOKEN ITSELF IS NEVER ECHOED INTO THE DOM. It is a hash of whatever
+    // identity the producer chose, on an unauthenticated page (§9.5); the
+    // bucket index is all a reader needs and leaks under four bits.
+    expect(document.body.innerHTML).not.toContain('a7f3')
+  })
+
+  it('draws an empty token outlined and grey, not as a severity chip', async () => {
+    // THE STATE `!!colour_key` DELETES. An empty token means "an identity chip
+    // with no colour"; truthiness folds it into the severity group, where it
+    // would be drawn in a role colour that means severity.
+    stubFetch(payload([identity({ label: 'campaign', colour_key: '' })]))
+    await renderDashboard()
+
+    await waitFor(() => expect(chips().length).toBe(1))
+    const chip = chips()[0]
+    expect(chip.getAttribute('data-identity')).toBe('true')
+    expect(chip.getAttribute('data-colour')).toBe('none')
+    expect(chip.style.backgroundColor).toBe('')
+    expect(chip.className).toContain('border-gray-500')
+    // Dashed already means stale. An uncoloured chip is not a stale one.
+    expect(chip.className).not.toContain('border-dashed')
+    expect(chip.textContent).toContain('campaign')
+  })
+
+  it('draws an absent token as the severity chip it has always been', async () => {
+    stubFetch(payload([annotation({ label: 'waiting', semantic_role: 'warning' })]))
+    await renderDashboard()
+
+    await waitFor(() => expect(chips().length).toBe(1))
+    const chip = chips()[0]
+    expect(chip.hasAttribute('data-identity')).toBe(false)
+    expect(chip.getAttribute('data-role')).toBe('warning')
+    expect(chip.style.backgroundColor).toBe('')
+  })
+
+  it('is decided by the token alone, not by kind, role or subject type', async () => {
+    // The seam's headline promise, applied to this feature. A kind invented in
+    // 2031, a role the palette has never heard of and a subject type with no
+    // renderer — the chip is still an identity chip, because the ONE field that
+    // decides is present.
+    const exotic = {
+      kind: 'quantum-lease-reconciliation-2031',
+      semantic_role: 'chartreuse',
+      subject: { type: 'fleet', campaign: 'aegix' },
+      label: 'somewhere',
+    }
+    stubFetch(payload([identity({ ...exotic, colour_key: 'lane-beta' })]))
+    await renderDashboard()
+
+    const panel = await screen.findByTestId('campaign-annotations')
+    const chip = within(panel).getByTestId('annotation-chip')
+    expect(chip.getAttribute('data-identity')).toBe('true')
+    expect(chip.getAttribute('data-colour')).toBe(String(paletteIndex('lane-beta')))
+    expect(chip.style.backgroundColor).not.toBe('')
+
+    // Remove ONLY the token and the very same annotation is an ordinary chip,
+    // resolved to `neutral` because `chartreuse` is not a role.
+    cleanup()
+    vi.unstubAllGlobals()
+    useStore.setState({ sessions: [SESSION], terminalStatuses: {} })
+    stubFetch(payload([annotation({ ...exotic })]))
+    await renderDashboard()
+    const plain = within(await screen.findByTestId('campaign-annotations')).getByTestId('annotation-chip')
+    expect(plain.hasAttribute('data-identity')).toBe(false)
+    expect(plain.getAttribute('data-role')).toBe('neutral')
+  })
+})
+
+describe('colour is redundant: the text always carries the fact', () => {
+  it('draws the label and the facets as text for coloured, uncoloured and stale chips', async () => {
+    const branch = 'agent/payment-pr04-foundation-r3'
+    stubFetch(payload([
+      identity({ label: 'pr04', colour_key: 'lane-alpha', details: { 'assigned.lane': 'pr04' } }),
+      identity({
+        label: 'campaign',
+        colour_key: '',
+        details: { 'assigned.scope': 'cross-lane' },
+      }),
+      identity({
+        label: branch,
+        kind: 'vcs',
+        colour_key: 'wt-alpha',
+        valid_until: PAST,
+        details: { 'observed.branch': branch },
+      }),
+    ]))
+    await renderDashboard()
+
+    await waitFor(() => expect(identityChips().length).toBe(2))
+    // Two are drawn, the third is behind the identity marker — so assert over
+    // whatever IS drawn rather than assuming which two.
+    for (const chip of identityChips()) {
+      const label = chip.querySelector('span:nth-child(2)')!
+      expect(label.textContent, 'the chip must draw its own label as text').toBeTruthy()
+      expect(chip.getAttribute('aria-label')).toContain(label.textContent)
+    }
+  })
+
+  it('carries the full untruncated value on the line the phone reads, with the label clamped', async () => {
+    const branch = 'agent/payment-pr04-foundation-and-a-very-long-tail'
+    stubFetch(payload([
+      identity({
+        label: branch,
+        kind: 'vcs',
+        colour_key: 'wt-alpha',
+        details: { 'observed.branch': branch, 'launch.repo': 'dnd-scheduler' },
+      }),
+    ]))
+    await renderDashboard()
+
+    await waitFor(() => expect(chips().length).toBe(1))
+    const chip = chips()[0]
+    const label = chip.querySelector('span:nth-child(2)')!
+    // Clamped on the chip...
+    expect(label.className).toContain('truncate')
+    expect(label.className).toContain('max-w-[16ch]')
+    expect(label.className).toContain('sm:max-w-[30ch]')
+    // ...and complete on the line that exists only where the clamp bites, and
+    // in the accessible name, which is never clamped at all.
+    const group = screen.getByTestId('annotation-group')
+    const line = Array.from(group.children).find(
+      el => el.className.includes('sm:hidden') && el.textContent?.includes(branch),
+    )
+    expect(line, 'the phone facet line must carry the full value').toBeTruthy()
+    expect(chip.getAttribute('aria-label')).toContain(branch)
+  })
+
+  it('draws no severity word in an identity chip\'s own hover card', async () => {
+    // THE `data-role` OMISSION AND THIS ARE ONE RULE. The identity chip
+    // withholds `data-role` so that nothing reads severity off a chip that is
+    // not making a severity claim; the hover card is that chip's own
+    // statement, and printing `resolveRole(...)` in it said the quiet part out
+    // loud. A severity chip still shows it, and the info popover — which
+    // promises the whole envelope and labels it — still carries it for both.
+    stubFetch(payload([
+      identity({ label: 'pr04', colour_key: 'lane-alpha', semantic_role: 'danger' }),
+      annotation({ label: 'blocked', semantic_role: 'danger', valid_until: FUTURE }),
+    ]))
+    await renderDashboard()
+    await waitFor(() => expect(chips().length).toBe(2))
+
+    const identityChip = chips().find(c => c.getAttribute('data-identity') === 'true')!
+    fireEvent.mouseEnter(identityChip)
+    let card = await waitFor(() => screen.getByTestId('annotation-hovercard'))
+    expect(card.querySelector('[data-testid="hovercard-role"]')).toBeNull()
+    expect(card.textContent).not.toContain('danger')
+    fireEvent.mouseLeave(identityChip)
+
+    const severityChip = chips().find(c => c.getAttribute('data-identity') !== 'true')!
+    fireEvent.mouseEnter(severityChip)
+    // Waited for by the ROLE element rather than by the card: the identity
+    // card is still inside its close grace here, so a bare card query would
+    // resolve against the one that correctly has no role in it.
+    await waitFor(() => expect(screen.getByTestId('hovercard-role').textContent).toBe('danger'))
+  })
+
+  it('emits exactly one phone facet line per chip it drew, and no more', async () => {
+    // ROW DENSITY AT 390px, PINNED. Every shown chip emits its own
+    // `basis-full` facet line, so the row's height is linear in the number of
+    // chips drawn — with three severity chips and two identity chips that is
+    // five extra wrapped lines under one row, and nothing measured the
+    // fan-out. This does not judge the shape; it makes a change to it visible
+    // instead of silent, and it is the reason `MAX_FACET_LINE` and the two
+    // chip caps exist.
+    stubFetch(payload([
+      annotation({ label: 'one', details: { a: '1' }, priority: 90, valid_until: FUTURE }),
+      annotation({ label: 'two', details: { b: '2' }, priority: 80, valid_until: FUTURE }),
+      annotation({ label: 'three', details: { c: '3' }, priority: 70, valid_until: FUTURE }),
+      annotation({ label: 'four', details: { d: '4' }, priority: 60, valid_until: FUTURE }),
+      identity({ label: 'pr04', colour_key: 'lane-alpha', details: { e: '5' } }),
+      identity({ label: 'feat/x', kind: 'vcs', colour_key: 'wt-alpha', details: { f: '6' } }),
+      identity({ label: 'extra', kind: 'vcs', colour_key: 'wt-beta', details: { g: '7' } }),
+    ]))
+    await renderDashboard()
+
+    const group = await waitFor(() => screen.getByTestId('annotation-group'))
+    const drawn = chips().length
+    const lines = Array.from(group.children).filter(el =>
+      el.className.includes('sm:hidden'),
+    )
+    expect(drawn).toBe(MAX_ROW_CHIPS + MAX_IDENTITY_CHIPS)
+    expect(lines).toHaveLength(drawn)
+    // Every one of them is hidden from `sm` up, where the hover exists — so
+    // the density cost is the phone's alone.
+    for (const line of lines) expect(line.className).toContain('basis-full')
+  })
+
+  it('caps a long facet line and says how many it withheld', async () => {
+    stubFetch(payload([
+      identity({
+        kind: 'vcs',
+        colour_key: 'wt-alpha',
+        details: { a: '1', b: '2', c: '3', d: '4', e: '5', f: '6' },
+      }),
+    ]))
+    await renderDashboard()
+
+    await waitFor(() => expect(chips().length).toBe(1))
+    const group = screen.getByTestId('annotation-group')
+    const line = Array.from(group.children).find(el => el.className.includes('sm:hidden'))!
+    expect(line.textContent).toContain('a: 1')
+    expect(line.textContent).toContain('d: 4')
+    expect(line.textContent).not.toContain('e: 5')
+    expect(line.textContent).toContain('+2')
+    // The accessible name still promises completeness.
+    expect(chips()[0].getAttribute('aria-label')).toContain('f: 6')
+  })
+})
+
+describe('the popover groups the row by the producer\'s own provenance classes', () => {
+  // Priorities as the producer actually publishes them. THE ORDER OF THE
+  // BLOCKS IS NOT A RULE THIS SIDE HOLDS: the chips are sorted by the existing
+  // `(stale, priority desc, label)` comparator, and first-appearance ordering
+  // then falls out of it. That is exactly why the producer can put the lane
+  // block first by setting a priority, with no new field and no change here.
+  const dossier = [
+    identity({
+      label: 'pr04',
+      priority: 8,
+      colour_key: 'lane-alpha',
+      details: {
+        'assigned.assigned_at': '2026-07-31T18:04:11Z',
+        'assigned.role': 'implementer',
+      },
+    }),
+    identity({
+      label: 'agent/payment',
+      kind: 'vcs',
+      priority: 7,
+      colour_key: 'wt-alpha',
+      details: {
+        'observed.commit': '0e63aac5f65421ff481a7186b3f2e8de5030fd52',
+        'launch.repo': 'dnd-scheduler',
+      },
+    }),
+    annotation({ label: 'waiting', details: { task: 'p0-09b-r1', role: 'implementer' } }),
+  ]
+
+  async function openPopover(items: Annotation[]) {
+    stubFetch(payload(items))
+    await renderDashboard()
+    fireEvent.click(await screen.findByTestId('workstate-info-button'))
+    return screen.getByTestId('workstate-details')
+  }
+
+  it('labels one block per class, in first-appearance order, with full-length values', async () => {
+    const card = await openPopover(dossier)
+    const worker = within(card).getByTestId('workstate-worker')
+    const groups = within(card).getAllByTestId('workstate-worker-group')
+
+    expect(groups.map(g => g.getAttribute('data-group'))).toEqual(['assigned', 'observed', 'launch'])
+    expect(worker.textContent).toContain('assigned')
+    expect(worker.textContent).toContain('observed')
+    expect(worker.textContent).toContain('launch')
+    // The full 40-character sha, untruncated and selectable.
+    expect(worker.textContent).toContain('0e63aac5f65421ff481a7186b3f2e8de5030fd52')
+    expect(card.querySelector('.select-text')).toBeTruthy()
+  })
+
+  it('draws a classed facet ONCE, in its class block and not in its annotation', async () => {
+    const card = await openPopover(dossier)
+    const sections = within(card).getAllByTestId('workstate-annotation')
+    for (const section of sections) {
+      expect(Object.keys(facetPairs(section))).not.toContain('launch repo')
+      expect(Object.keys(facetPairs(section))).not.toContain('assigned role')
+    }
+    // The UNCLASSED facets are untouched: they render exactly where they always
+    // did, on the annotation that published them.
+    const plain = sections.find(s => s.textContent?.includes('waiting'))!
+    expect(facetPairs(plain)).toMatchObject({ task: 'p0-09b-r1', role: 'implementer' })
+  })
+
+  it('renames its headings when the producer renames its classes', async () => {
+    // THE PROOF THAT NO CLASS NAME IS HARDCODED. Same shapes, different words.
+    const card = await openPopover([
+      identity({ priority: 8, colour_key: 'lane-alpha', details: { 'A.one': '1' } }),
+      identity({
+        kind: 'vcs',
+        priority: 7,
+        colour_key: 'wt-alpha',
+        details: { 'B.two': '2', 'C.three': '3' },
+      }),
+    ])
+    const groups = within(card).getAllByTestId('workstate-worker-group')
+    expect(groups.map(g => g.getAttribute('data-group'))).toEqual(['A', 'B', 'C'])
+    expect(groups.map(g => g.querySelector('p')!.textContent)).toEqual(['A', 'B', 'C'])
+  })
+
+  it('renders no Worker block at all when nothing on the row is classed', async () => {
+    const card = await openPopover([annotation({ details: { task: 't', role: 'r' } })])
+    expect(within(card).queryByTestId('workstate-worker')).toBeNull()
+    expect(facetPairs(card)).toMatchObject({ task: 't', role: 'r' })
+  })
+
+  it('puts the Worker block first in the copied text, and says each fact once', async () => {
+    const text = detailsToText(dossier, 'Work state — x')
+    expect(text.indexOf('Worker')).toBeLessThan(text.indexOf('Annotations'))
+    expect(text).toContain('    role: implementer')
+    expect(text).toContain('0e63aac5f65421ff481a7186b3f2e8de5030fd52')
+    // `assigned.role` appears in the Worker block; the work-item chip's own
+    // unclassed `role` facet is a different fact and still appears under it.
+    expect(text.match(/^\s+role: implementer$/gm)).toHaveLength(2)
+  })
+
+  it('leaves the copied text byte-identical when the row carries no classes', async () => {
+    // The compatibility floor: every document published before this field
+    // existed must copy exactly as it did.
+    const plain = [annotation({ label: 'waiting', details: { task: 't' } })]
+    const text = detailsToText(plain, 'Work state — x')
+    expect(text.startsWith('Work state — x\n==============\nwaiting')).toBe(true)
+    expect(text).not.toContain('Worker')
   })
 })

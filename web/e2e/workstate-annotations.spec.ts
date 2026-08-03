@@ -1,7 +1,8 @@
 import { test, expect, Page } from "@playwright/test";
 import { AxeBuilder } from "@axe-core/playwright";
 import type { Annotation, AnnotationsResponse } from "../src/api";
-import { stubBackend, T_NATIVE_GENERATION } from "./stub";
+import { projectedTerminal } from "../src/test/projectedTerminal";
+import { stubBackend, stubTerminals, T_NATIVE_GENERATION } from "./stub";
 
 // A3 visual evidence: conductor annotation chips (work-state design §9.5),
 // captured at 1280×800 and 390×844 (both configured projects) against the
@@ -65,6 +66,49 @@ function annotation(overrides: Partial<Annotation> = {}): Annotation {
     details: {},
     source: "aegix-mobile-phase0-renewal",
     ...overrides,
+  };
+}
+
+/**
+ * An identity chip: `annotation()` plus the one opaque field that makes it one.
+ *
+ * `colour_key` is the ONLY difference. Nothing in the renderer reads `kind`,
+ * so the kinds below are labels for the reader of this file and nothing more.
+ */
+function identity(overrides: Partial<Annotation> = {}): Annotation {
+  return annotation({
+    kind: "lane",
+    label: "pr04",
+    semantic_role: "neutral",
+    priority: 8,
+    colour_key: "lane-alpha",
+    details: {},
+    ...overrides,
+  });
+}
+
+/** `t-native` plus `count - 1` extra rows sharing its agent type. */
+function fleet(count: number) {
+  return [
+    stubTerminals[0],
+    ...Array.from({ length: count - 1 }, (_, i) =>
+      projectedTerminal({
+        id: `t-${i + 1}`,
+        tmux_window: `${i + 1}`,
+        provider: "kimi_cli",
+        agent_profile: "spec-writer-k3",
+        status: "not_fifo_monitored",
+      }),
+    ),
+  ];
+}
+
+/** The subject naming row `id`, fenced on the generation `projectedTerminal` gives it. */
+function onRow(id: string): Annotation["subject"] {
+  return {
+    type: "terminal",
+    terminal_id: id,
+    generation: id === "t-native" ? T_NATIVE_GENERATION : `${id}-gen-1`,
   };
 }
 
@@ -542,8 +586,19 @@ test.describe("conductor annotation chips (§9.5)", () => {
     const chip = page.getByTestId("annotation-chip").first();
     await expect(chip).toBeVisible();
 
-    const box = (await chip.boundingBox())!;
-    expect(box.height, "chip wrapped into a multi-line blob").toBeLessThan(40);
+    // POLLED, not sampled once. `toBeVisible()` and `boundingBox()` are two
+    // round trips, and the dashboard's own poll can replace the node between
+    // them — `boundingBox()` then answers `null` and the non-null assertion
+    // throws a TypeError that reads like a layout failure. Observed once in
+    // five full-suite runs, only while the machine was saturated, and the same
+    // shape exists on `main`, so this is the measurement being fragile rather
+    // than the layout. Polling the measurement itself asserts the same bound
+    // without the race.
+    await expect
+      .poll(async () => (await chip.boundingBox())?.height ?? null, {
+        message: "chip wrapped into a multi-line blob",
+      })
+      .toBeLessThan(40);
     await assertNoHorizontalClipping(page);
     // Scoped to the identity row: the agent-type group heading carries the same
     // text, and it is the ROW's copy that used to vanish.
@@ -632,9 +687,25 @@ test.describe("conductor annotation chips (§9.5)", () => {
     // Recorded rather than remembered: the dashed-outline decision exists
     // BECAUSE `opacity-60` put the label under the floor, and a number nobody
     // re-measures is a number somebody reverts.
+    //
+    // ITERATES WHATEVER IS ON THE PAGE, not a fixed list of six roles. The
+    // payload below adds a second, independently-coloured chip family drawn
+    // with INLINE styles rather than token classes, and a gate that walked a
+    // hard-coded role list would have gone on measuring six chips and reporting
+    // success while twelve new colours went unchecked.
+    //
+    // Every one of the twelve palette slots is forced onto the page: the keys
+    // are chosen to land in distinct buckets, two per row across six rows,
+    // because a row caps its identity group at two.
+    const BUCKET_KEYS = [
+      "key-40", "key-4", "key-7", "key-1", "key-9", "key-2",
+      "key-5", "key-15", "key-19", "key-0", "key-6", "key-27",
+    ];
+    const rows = fleet(7);
     await stubBackend(page, {
-      annotations: payload(
-        ["success", "info", "accent", "warning", "danger", "neutral"].map((role, i) =>
+      terminals: rows,
+      annotations: payload([
+        ...["success", "info", "accent", "warning", "danger", "neutral"].map((role, i) =>
           annotation({
             label: role,
             semantic_role: role,
@@ -642,10 +713,43 @@ test.describe("conductor annotation chips (§9.5)", () => {
             subject: { type: "campaign", campaign: `c-${role}` },
           }),
         ),
-      ),
+        // TWO COLOURED IDENTITY CHIPS ON THE CAMPAIGN PANEL, deliberately.
+        // The panel is the LIGHTER backdrop and therefore the binding one: a
+        // tint deepened from 10% to 20% measures 4.50 on a row card — which
+        // rounds to exactly the floor and passes — and 4.34 on the panel,
+        // which does not. A gate that only ever drew identity chips on rows
+        // would have certified that change.
+        ...["key-40", "key-4"].map((key, i) =>
+          identity({
+            label: `panel-${i}`,
+            colour_key: key,
+            priority: 84 - i,
+            subject: { type: "campaign", campaign: `c-panel-${i}` },
+          }),
+        ),
+        // The uncoloured variant is a THIRD rendering with its own foreground
+        // and its own outline, so it is measured alongside the twelve.
+        identity({
+          label: "campaign",
+          colour_key: "",
+          priority: 7,
+          subject: onRow(rows[6].id),
+        }),
+        ...BUCKET_KEYS.map((key, i) =>
+          identity({
+            label: `id-${i}`,
+            colour_key: key,
+            priority: 9,
+            subject: onRow(rows[Math.floor(i / 2)].id),
+          }),
+        ),
+      ]),
     });
     await page.goto("/");
-    await expect(page.getByTestId("annotation-chip")).toHaveCount(6);
+    // 6 role chips + 2 coloured identity fill the campaign panel exactly to
+    // its 8-row cap; the 12 bucket chips take two slots on each of six rows;
+    // the uncoloured one gets a seventh row to itself.
+    await expect(page.getByTestId("annotation-chip")).toHaveCount(21);
 
     const measured = await page.evaluate(() => {
       const parse = (value: string): [number, number, number, number] => {
@@ -683,13 +787,24 @@ test.describe("conductor annotation chips (§9.5)", () => {
         const text = over(fg, backdrop);
         const [a, b] = [lum(text), lum(backdrop)].sort((x, y) => y - x);
         return {
-          role: chip.getAttribute("data-role"),
+          // Whichever channel this chip family names itself by. An identity
+          // chip deliberately publishes no `data-role`: it is not making a
+          // severity claim, and echoing one would invite this very test to
+          // read severity off it.
+          role: chip.getAttribute("data-role") ?? `identity-${chip.getAttribute("data-colour")}`,
           ratio: Math.round(((a + 0.05) / (b + 0.05)) * 10) / 10,
         };
       });
     });
 
     console.log("CHIP CONTRAST", JSON.stringify(measured));
+    expect(measured.length, "the gate must measure every chip on the page").toBe(21);
+    // NON-VACUITY: all twelve palette slots really were drawn, so a hash change
+    // that collapsed the palette could not quietly shrink what is checked.
+    const buckets = new Set(
+      measured.map((m) => m.role).filter((r) => r.startsWith("identity-") && r !== "identity-none"),
+    );
+    expect(buckets.size, "every palette slot must be on the page").toBe(12);
     for (const { role, ratio } of measured) {
       expect(ratio, `${role} chip label contrast (WCAG AA 4.5:1)`).toBeGreaterThanOrEqual(4.5);
     }
@@ -795,6 +910,296 @@ test.describe("conductor annotation chips (§9.5)", () => {
     await page.keyboard.press("Escape");
     await expect(details).toHaveCount(0);
     await expect(info).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("two agents in one lane share a colour and a third lane does not", async ({
+    page,
+  }, testInfo) => {
+    // THE HEADLINE CLAIM OF THE WHOLE FEATURE: an operator can see, at a
+    // glance, which agents are working on the same thing. It is asserted on
+    // COMPUTED style, because that is what the operator's eye receives — a
+    // matching `data-colour` would pass even if the two chips painted
+    // differently.
+    //
+    // TWO PINNED KEYS CHOSEN TO LAND IN DIFFERENT BUCKETS, never a universal
+    // claim that different keys differ: twelve colours across a real fleet
+    // collide BY DESIGN, and a test asserting otherwise would be asserting
+    // something the design explicitly does not promise.
+    const rows = fleet(3);
+    await stubBackend(page, {
+      terminals: rows,
+      annotations: payload([
+        identity({ label: "pr04", colour_key: "lane-alpha", subject: onRow("t-native") }),
+        identity({ label: "pr04", colour_key: "lane-alpha", subject: onRow("t-1") }),
+        identity({ label: "cond-0241", colour_key: "lane-beta", subject: onRow("t-2") }),
+      ]),
+    });
+    await page.goto("/");
+    await expect(page.getByTestId("annotation-chip")).toHaveCount(3);
+
+    const painted = await page.evaluate(() =>
+      Array.from(
+        document.querySelectorAll<HTMLElement>('[data-testid="annotation-chip"]'),
+      ).map((chip) => ({
+        label: (chip.querySelector("span:nth-child(2)") as HTMLElement).textContent,
+        bg: getComputedStyle(chip).backgroundColor,
+        fg: getComputedStyle(chip.querySelector("span:nth-child(2)") as HTMLElement).color,
+      })),
+    );
+
+    // Matched BY LABEL, not by DOM order: the dashboard sorts and groups its
+    // rows, so which row paints first is its business and asserting on it here
+    // would make this test fail for a reason that has nothing to do with colour.
+    const shared = painted.filter((p) => p.label === "pr04");
+    const other = painted.filter((p) => p.label === "cond-0241");
+    expect(shared, "two agents in the one lane").toHaveLength(2);
+    expect(other, "one agent in a different lane").toHaveLength(1);
+    const [a, b] = shared;
+    const [c] = other;
+    expect({ bg: a.bg, fg: a.fg }, "one lane, one colour").toEqual({ bg: b.bg, fg: b.fg });
+    expect(c.bg, "a different lane, a different colour").not.toBe(a.bg);
+    expect(c.fg, "a different lane, a different colour").not.toBe(a.fg);
+    // The colour is a property of the TOKEN, not of the row it landed on: the
+    // two matching chips are on different terminals with different ids and
+    // different generations.
+    expect(rows[0].id).not.toBe(rows[1].id);
+
+    await page.screenshot({
+      path: `${SHOTS}/${testInfo.project.name}-h-lane-colour-sharing.png`,
+      fullPage: true,
+    });
+    await assertNoHorizontalClipping(page);
+  });
+
+  test("a lane chip, a VCS chip and three annotations still leave the agent-profile name a box", async ({
+    page,
+  }, testInfo) => {
+    // THE REGRESSION THAT HAS HAPPENED TWICE. At 390 the identity row had 282px
+    // for 459px of content: flexbox shrank the `truncate` profile name to
+    // nothing and clipped the chips off the card anyway, so the row lost the
+    // one thing saying which worker it is. This feature adds two more chips to
+    // that row, which is the largest increase it has ever taken.
+    const branch = "agent/payment-pr04-foundation-r3";
+    await stubBackend(page, {
+      annotations: payload([
+        annotation({ label: "waiting", priority: 90, details: { task: "t", parked_at: hoursAgo(58) } }),
+        annotation({ label: "review", priority: 89, semantic_role: "info", details: { task: "t" } }),
+        annotation({ label: "blocked", priority: 88, semantic_role: "danger", details: { task: "t" } }),
+        identity({
+          label: "pr04",
+          priority: 8,
+          colour_key: "lane-alpha",
+          details: { "assigned.lane_source": "registry", "assigned.lane_scope": "lane" },
+        }),
+        identity({
+          kind: "vcs",
+          label: branch,
+          priority: 7,
+          colour_key: "wt-alpha",
+          details: { "observed.branch": branch, "launch.repo": "dnd-scheduler" },
+        }),
+      ]),
+    });
+    await page.goto("/");
+    await expect(page.getByTestId("annotation-chip")).toHaveCount(5);
+
+    const row = page.locator("#session-cao-fleet-terminals");
+    const profile = row.getByText("spec-writer-k3").first();
+    await expect(profile).toBeVisible();
+    const nameBox = (await profile.boundingBox())!;
+    expect(nameBox.width, "agent profile name has a visible box").toBeGreaterThan(20);
+
+    // NOT MERELY VISIBLE — NOT SQUEEZED. The name carries `truncate`, so a
+    // flexbox that shrank it renders an ellipsis and keeps a non-zero box; a
+    // width check alone would pass on a name reduced to "spec-w…". Comparing
+    // the scroll width to the client width is the direct question.
+    const squeezed = await profile.evaluate((el) => ({
+      client: el.clientWidth,
+      scroll: el.scrollWidth,
+    }));
+    expect(
+      squeezed.scroll,
+      "the chips squeezed the agent-profile name into an ellipsis",
+    ).toBeLessThanOrEqual(squeezed.client + 1);
+
+    // Nothing hangs off the right edge of the card at either viewport.
+    await assertNoHorizontalClipping(page);
+
+    // EVERY CHIP IS A DIRECT CHILD OF THE GROUP. `shrink-0`,
+    // `whitespace-nowrap` and `basis-full` are all statements about that one
+    // flex container, so an interposed wrapper silently redirects all three at
+    // whatever it wraps. Structural because it is a structural invariant: it
+    // must hold at every viewport and for every payload, not only for the ones
+    // dense enough to make the difference visible.
+    const structure = await page.evaluate(() => {
+      const group = document.querySelector('[data-testid="annotation-group"]')!;
+      const chips = Array.from(
+        document.querySelectorAll<HTMLElement>('[data-testid="annotation-chip"]'),
+      ).filter((c) => group.contains(c));
+      return {
+        chips: chips.length,
+        orphaned: chips.filter((c) => c.parentElement !== group).length,
+        tallest: Math.max(...chips.map((c) => Math.round(c.getBoundingClientRect().height))),
+      };
+    });
+    expect(structure.chips, "the row must draw a full group").toBe(5);
+    expect(structure.orphaned, "a chip separated from the flex container it is laid out by").toBe(0);
+    // A chip that wrapped internally becomes a multi-line blob; the 64-char
+    // label test pins the same number for the severity chip.
+    expect(structure.tallest, "a chip wrapped into a multi-line blob").toBeLessThan(40);
+
+    const vp = page.viewportSize()!;
+    if (vp.width < 640) {
+      // Below `sm` the whole chip group takes its own line. Measured rather
+      // than asserted from the class list: `basis-full` only does this while
+      // every chip is a DIRECT child of the group, and wrapping the identity
+      // chips in an inner span is exactly how the regression comes back.
+      const groupBox = (await page.getByTestId("annotation-group").boundingBox())!;
+      expect(
+        groupBox.y,
+        "the chip group must drop below the identity line, not squeeze it",
+      ).toBeGreaterThan(nameBox.y);
+      // ...and the full branch is readable there, even though the chip clamps it.
+      await expect(page.getByTestId("annotation-group")).toContainText(branch);
+    }
+
+    // If anything was withheld, the marker saying so is on screen.
+    const marker = page.getByTestId("annotation-identity-overflow");
+    if (await marker.count()) {
+      await marker.scrollIntoViewIfNeeded();
+      await expect(marker).toBeInViewport();
+    }
+
+    await page.screenshot({
+      path: `${SHOTS}/${testInfo.project.name}-i-identity-row-density.png`,
+      fullPage: true,
+    });
+  });
+
+  test("the identity chips add no serious or critical axe result", async ({ page }) => {
+    // READS `scan.incomplete` AS WELL AS `scan.violations`, unmodified. That is
+    // not belt-and-braces: `aria-label` on a role-less `<span>` is
+    // `aria-prohibited-attr`, which axe files as INCOMPLETE at serious impact
+    // because it cannot verify the AT behaviour. Dropping `role="note"` from an
+    // identity chip would therefore pass a violations-only gate on 100% of the
+    // chips, which is the exact hole this repo has already fallen into once.
+    await stubBackend(page, {
+      annotations: payload([
+        identity({ label: "pr04", colour_key: "lane-alpha" }),
+        identity({ kind: "vcs", label: "agent/payment", priority: 7, colour_key: "wt-alpha" }),
+        identity({
+          label: "campaign",
+          colour_key: "",
+          subject: { type: "campaign", campaign: "aegix-mobile-phase0-renewal" },
+        }),
+        identity({
+          label: "stale-lane",
+          colour_key: "lane-beta",
+          valid_until: LONG_PAST,
+          subject: { type: "campaign", campaign: "aegix-mobile-phase0-renewal" },
+        }),
+      ]),
+    });
+    await page.goto("/");
+    await expect(page.getByTestId("annotation-chip")).toHaveCount(4);
+
+    // The chips are still spans, so this must still measure nothing. A control
+    // added here would change the AAA target-size claim silently.
+    expect(
+      await assertTargetSize(page, '[data-testid="annotation-chip"]'),
+      "identity chips must stay non-interactive",
+    ).toBe(0);
+    await assertNoSeriousAxeViolations(
+      page,
+      '[data-testid="annotation-chip"]',
+      '[data-testid="campaign-annotations"]',
+    );
+
+    // Every chip keeps the role that makes its accessible name legal, and
+    // every chip still says its identity in TEXT — the redundancy the whole
+    // colour-blindness argument rests on.
+    const chips = page.getByTestId("annotation-chip");
+    for (let i = 0; i < (await chips.count()); i += 1) {
+      const chip = chips.nth(i);
+      await expect(chip).toHaveAttribute("role", "note");
+      const label = await chip.locator("span:nth-child(2)").textContent();
+      expect(label?.trim().length, "a chip drawn only as a swatch").toBeGreaterThan(0);
+      expect(await chip.getAttribute("aria-label")).toContain(label!.trim());
+    }
+  });
+
+  test("the popover Worker section carries the provenance classes, labelled, with full ids", async ({
+    page,
+  }, testInfo) => {
+    const sha = "0e63aac5f65421ff481a7186b3f2e8de5030fd52";
+    const branch = "agent/payment-pr04-foundation";
+    await stubBackend(page, {
+      annotations: payload([
+        annotation({ label: "waiting", priority: 70, details: { task: "pr04-foundation-impl" } }),
+        identity({
+          label: "pr04",
+          priority: 8,
+          colour_key: "lane-alpha",
+          details: {
+            "assigned.assigned_at": hoursAgo(30),
+            "assigned.lane_source": "registry",
+            "assigned.role": "implementer",
+          },
+        }),
+        identity({
+          kind: "vcs",
+          label: branch,
+          priority: 7,
+          colour_key: "wt-alpha",
+          details: {
+            "observed.branch": branch,
+            "observed.commit": sha,
+            "launch.repo": "dnd-scheduler",
+            "launch.base_branch": "master",
+          },
+        }),
+      ]),
+    });
+    await page.goto("/");
+
+    await page.getByTestId("workstate-info-button").click();
+    const details = page.getByTestId("workstate-details");
+    await expect(details).toBeVisible();
+
+    // Three labelled groups, above the annotations, in the producer's order.
+    const groups = details.getByTestId("workstate-worker-group");
+    await expect(groups).toHaveCount(3);
+    expect(
+      await groups.evaluateAll((els) => els.map((e) => e.getAttribute("data-group"))),
+    ).toEqual(["assigned", "observed", "launch"]);
+    const worker = details.getByTestId("workstate-worker");
+    const workerTop = (await worker.boundingBox())!.y;
+    const firstAnnotationTop = (await details.getByTestId("workstate-annotation").first().boundingBox())!.y;
+    expect(workerTop, "the dossier sits above the annotations").toBeLessThan(firstAnnotationTop);
+
+    // FULL LENGTH, and selectable. The chip clamps; this surface promises the
+    // complete value, which is the entire reason it exists.
+    await expect(worker).toContainText(sha);
+    await expect(worker).toContainText(branch);
+    await expect(details).toContainText("t-native");
+
+    // The card fits the viewport at BOTH sizes — at 390×844 an unclamped
+    // placement put the footer, and with it the copy button, out of reach.
+    const box = (await details.boundingBox())!;
+    const vp = page.viewportSize()!;
+    expect(box.y, "popover top edge on screen").toBeGreaterThanOrEqual(0);
+    expect(box.y + box.height, "popover bottom edge on screen").toBeLessThanOrEqual(vp.height);
+
+    // UNMODIFIED, both of them. A floating card overlaps page content by
+    // construction, so axe cannot composite it; the contrast it declines to
+    // judge is measured directly instead of the gate being relaxed.
+    await assertCompositedContrast(page, '[data-testid="workstate-details"]');
+    await assertAxeExcept(page, ["elmPartiallyObscuring"], '[data-testid="workstate-details"]');
+
+    await page.screenshot({
+      path: `${SHOTS}/${testInfo.project.name}-j-worker-provenance.png`,
+      fullPage: true,
+    });
   });
 
   test("a body the route should never send degrades to the control rendering", async ({

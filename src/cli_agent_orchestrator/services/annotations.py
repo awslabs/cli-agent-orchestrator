@@ -375,6 +375,13 @@ def _coerce_item(raw: Any) -> Tuple[Optional[Dict[str, Any]], int]:
         "priority": priority,
         "subject": subject,
         "valid_until": _bounded(raw.get("valid_until"), 40),
+        # ``_bounded``, NOT ``_bounded_required``. An empty value here is a
+        # third state, not an absent one: the producer distinguishes "not an
+        # identity chip" (field absent) from "an identity chip with no colour"
+        # (empty), and the renderer draws those two differently. The required
+        # variant collapses the empty case to None and deletes one of the
+        # three renderings.
+        "colour_key": _bounded(raw.get("colour_key"), 64),
         "details": details,
     }, facets_lost
 

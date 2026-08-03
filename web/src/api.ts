@@ -156,6 +156,17 @@ export interface Annotation {
   subject: AnnotationSubject
   /** Past this the renderer greys the chip (§9.6). */
   valid_until?: string | null
+  /**
+   * An OPAQUE identity token. The conductor decides what identity it
+   * expresses; this side only hashes it into a palette slot, which is why a
+   * change of grouping policy needs no change here.
+   *
+   * Three states, and the renderer branches on PRESENCE AND EMPTINESS ONLY:
+   * absent (or null) is a severity chip coloured by `semantic_role`; `''` is
+   * an identity chip with no colour; a non-empty value is an identity chip
+   * coloured by the hash.
+   */
+  colour_key?: string | null
   /** Derived facets only — never worker-authored free text (§7). */
   details?: Record<string, string>
   /** The conductor project directory that published it; never a path. */

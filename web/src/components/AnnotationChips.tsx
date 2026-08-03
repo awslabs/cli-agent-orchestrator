@@ -58,15 +58,41 @@ import { useAnnotationHover } from './AnnotationDetails'
 import {
   ageSource,
   freshness,
+  isIdentity,
   orderedFacets,
+  partitionChips,
   resolveRole,
+  splitFacetKey,
   UnplacedAnnotation,
   UnplacedReason,
 } from '../lib/annotations'
+import { identityStyle } from '../lib/identityColour'
 import { fmtAbs, fmtAge, fmtRel, parseTimestamp } from '../lib/time'
 
-/** Most chips drawn inline on one terminal row before the overflow marker. */
+/** Most SEVERITY chips drawn inline on one terminal row before the overflow marker. */
 export const MAX_ROW_CHIPS = 3
+
+/**
+ * Most IDENTITY chips drawn on one terminal row, capped SEPARATELY.
+ *
+ * A single shared cap is the obvious shape and it is wrong in both directions:
+ * a row with three severity chips would drop every identity chip, and a row
+ * with two identity chips would push a live `danger` behind a "+1" — the exact
+ * regression the freshness-before-priority sort exists to prevent. The two
+ * groups answer different questions ("is anything wrong?" and "where is this
+ * worker?") and neither may starve the other.
+ */
+export const MAX_IDENTITY_CHIPS = 2
+
+/**
+ * Most facets drawn on one visible facet line before a `+k` count.
+ *
+ * The line is the phone's only path to the facets, and an identity chip can
+ * carry ten of them. Uncapped, that measured roughly five wrapped lines per row
+ * across a 44-row fleet at 390px — the surface stops being scannable long
+ * before it stops being complete. The popover is the complete rendering.
+ */
+export const MAX_FACET_LINE = 4
 
 /** Most rows drawn on the campaign surface before its own overflow line. */
 export const MAX_CAMPAIGN_ROWS = 8
@@ -114,18 +140,27 @@ const REASON_TEXT: Record<UnplacedReason, string> = {
   'unknown-subject': 'unrecognised subject',
 }
 
-function facetText(annotation: Annotation): string {
-  const facets = orderedFacets(annotation.details)
-  const parts = facets.map(([key, value]) => {
+function facetParts(annotation: Annotation): string[] {
+  return orderedFacets(annotation.details).map(([key, value]) => {
+    // The provenance class is dropped HERE and only here. On a 390px line the
+    // class is repeated noise — every facet on a chip shares one or two of them
+    // — and the popover's grouped block is where the classes are actually
+    // labelled and read. Nothing knows what the classes ARE; the shape is read,
+    // the value is not inspected.
+    const { name } = splitFacetKey(key)
     // A timestamp facet reads as an age, which is what an operator is actually
     // asking. Decided by the VALUE's shape, not by the key's name: a
     // `_at|_utc|since` suffix allowlist is a rule about the conductor's
     // spelling, and it fails the day a facet is renamed.
     const rel = parseTimestamp(value) !== null ? fmtRel(value) : null
-    if (rel) return `${key.replace(/_/g, ' ')}: ${rel}`
-    return `${key.replace(/_/g, ' ')}: ${value}`
+    if (rel) return `${name.replace(/_/g, ' ')}: ${rel}`
+    return `${name.replace(/_/g, ' ')}: ${value}`
   })
-  return parts.join(' · ')
+}
+
+/** Every facet, uncapped — the accessible name promises completeness. */
+function facetText(annotation: Annotation): string {
+  return facetParts(annotation).join(' · ')
 }
 
 /**
@@ -161,14 +196,35 @@ function subjectText(annotation: Annotation): string {
 }
 
 /**
- * One chip.
+ * One chip, of whichever of the two shapes this annotation asked for.
+ *
+ * THE DISPATCH IS HERE, NOT IN `TerminalAnnotations`. The campaign surface
+ * renders `AnnotationChip` too, so a partition applied only on the terminal row
+ * would leave the campaign panel drawing identity chips in role colours — and
+ * the campaign panel is exactly where an identity chip that could not be fenced
+ * onto a row ends up.
+ *
+ * Neither branch calls a hook, so the two sub-components own their own hook
+ * order and an annotation changing shape between renders cannot desynchronise
+ * it.
+ */
+export function AnnotationChip({ annotation, stale }: { annotation: Annotation; stale?: boolean }) {
+  return isIdentity(annotation) ? (
+    <IdentityChip annotation={annotation} stale={stale} />
+  ) : (
+    <SeverityChip annotation={annotation} stale={stale} />
+  )
+}
+
+/**
+ * A chip whose colour means SEVERITY.
  *
  * A stale chip is drawn `neutral` and dimmed no matter what role it claims,
  * and says so in its own hover. Keeping the original colour and adding a
  * subtitle was rejected: a red "blocked" chip that stopped being true an hour
  * ago is read as current at a glance, and the glance is the whole product.
  */
-export function AnnotationChip({ annotation, stale }: { annotation: Annotation; stale?: boolean }) {
+function SeverityChip({ annotation, stale }: { annotation: Annotation; stale?: boolean }) {
   const state = stale === undefined ? freshness(annotation.valid_until) : stale ? 'stale' : 'fresh'
   const isOld = state !== 'fresh'
   const role = isOld ? 'neutral' : resolveRole(annotation.semantic_role)
@@ -244,11 +300,139 @@ export function AnnotationChip({ annotation, stale }: { annotation: Annotation; 
   )
 }
 
-/** The facets as a visible line — the phone's only path to them. */
-function FacetLine({ annotation, className }: { annotation: Annotation; className: string }) {
+/**
+ * A chip whose colour means IDENTITY.
+ *
+ * THREE PRE-ATTENTIVE CHANNELS SEPARATE IT FROM A SEVERITY CHIP, and hue is
+ * none of them: `rounded-sm` against the severity chip's `rounded-md` and
+ * StatusBadge's `rounded-full`, and a monospaced face against both. Hue must
+ * never have to carry "is this an alarm or a location", because the whole
+ * reason for a separate palette is that the operator reads colour as severity.
+ *
+ * COLOUR SURVIVES STALENESS HERE, unlike on a severity chip. Greying is right
+ * there because an expired `danger` misread as current is the failure; an
+ * identity does not stop being that identity, and blanking its colour would
+ * make a stale chip indistinguishable from an uncoloured one — a different
+ * claim entirely. Staleness keeps its two NON-colour channels: the dashed
+ * outline and the hollow dot, plus the visible note.
+ *
+ * NO `data-role`. The annotation has a `semantic_role` like every other, but
+ * this chip does not draw it, and echoing it into an attribute would invite a
+ * test — or an operator — to read severity off a chip that is not making a
+ * severity claim.
+ */
+function IdentityChip({ annotation, stale }: { annotation: Annotation; stale?: boolean }) {
+  const state = stale === undefined ? freshness(annotation.valid_until) : stale ? 'stale' : 'fresh'
+  const isOld = state !== 'fresh'
+  const { index, colour, tint } = identityStyle(annotation.colour_key ?? '')
+  const age = fmtAge(ageSource(annotation))
   const facets = facetText(annotation)
-  if (!facets) return null
-  return <span className={className}>{facets}</span>
+  const freshnessText =
+    state === 'stale'
+      ? `stale since ${fmtAbs(annotation.valid_until) ?? 'an unknown time'}`
+      : state === 'unknown'
+        ? 'freshness not declared'
+        : null
+  const hover = [subjectText(annotation), facets, freshnessText].filter(Boolean).join(' · ')
+  const { anchorProps, hoverCard } = useAnnotationHover(annotation)
+
+  // Dashed-and-hollow already means stale, so the UNCOLOURED variant is given
+  // the opposite of both — a solid outline and a filled dot — rather than a
+  // second dashed treatment nobody could tell apart from an expired chip.
+  const edge = isOld
+    ? 'border border-dashed border-cao-neutral'
+    : colour
+      ? ''
+      : 'border border-gray-500'
+
+  return (
+    <>
+      <span
+        {...anchorProps}
+        data-testid="annotation-chip"
+        data-kind={annotation.kind}
+        data-identity="true"
+        // THE BUCKET, NEVER THE TOKEN. Echoing `colour_key` itself would put a
+        // hash of whatever identity the producer chose into the DOM of an
+        // unauthenticated page (§9.5); the slot index leaks under four bits and
+        // is all a test needs to prove two chips resolved together.
+        data-colour={index === null ? 'none' : String(index)}
+        data-stale={state === 'stale' ? 'true' : 'false'}
+        data-freshness={state}
+        role="note"
+        aria-label={`${annotation.label}${age ? `, ${age}` : ''} — ${hover}`}
+        // `shrink-0 whitespace-nowrap` for the same reason the severity chip
+        // carries them: without them flexbox shrinks the sibling profile-name
+        // span to zero at 390px. These chips are DIRECT SIBLINGS in the group's
+        // flex container — no inner wrapper — because every one of those class
+        // names is a statement about that specific parent.
+        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm font-mono shrink-0 whitespace-nowrap max-w-full ${edge}`}
+        style={colour ? { backgroundColor: tint ?? undefined } : undefined}
+      >
+        <span
+          className={`w-1.5 h-1.5 shrink-0 rounded-full ${
+            isOld ? 'border border-cao-neutral' : colour ? '' : 'bg-gray-400'
+          }`}
+          style={!isOld && colour ? { backgroundColor: colour } : undefined}
+        />
+        {/* Clamped. WHERE THE FULL VALUE STILL IS, measured rather than
+            assumed — an earlier comment here claimed the facet line below
+            covers the clamp at every viewport, and it does not:
+
+              * a VCS chip's branch is `observed.branch`, the FIRST facet
+                `_vcs_details` writes, so it is always inside `MAX_FACET_LINE`
+                and the line does carry it in full below `sm`;
+              * a LANE chip's id is the label and is NOT a facet, so below `sm`
+                the line carries nothing that repairs a clamp at 16ch;
+              * at and above `sm` the line is hidden entirely, so on desktop
+                NEITHER chip is repaired by it.
+
+            The full value is reached instead by the two surfaces built for it:
+            the pointer hover card (desktop) and the row's info popover (both,
+            and the only path on a phone). Colour is a WEAK second channel: it
+            keys on the worktree (and on the full lane id), never on the drawn
+            text, so two chips clamped to the same characters usually differ in
+            colour — usually, not always, because the ramp is twelve slots.
+            Widening the clamp is a live layout question — of 172 branches on
+            the fleet, 116 exceed 30ch — and it is left to visual review on real
+            data rather than settled here. */}
+        <span
+          className={`text-[10px] font-medium truncate max-w-[16ch] sm:max-w-[30ch] ${
+            colour ? '' : 'text-gray-400'
+          }`}
+          style={colour ? { color: colour } : undefined}
+        >
+          {annotation.label}
+        </span>
+        {age && <span className="text-[10px] text-gray-400 shrink-0">{age}</span>}
+        {isOld && (
+          <span data-testid="annotation-stale-note" className="text-[10px] text-gray-400 shrink-0">
+            · {state === 'stale' ? 'stale' : 'age unknown'}
+          </span>
+        )}
+      </span>
+      {hoverCard}
+    </>
+  )
+}
+
+/**
+ * The facets as a visible line — the phone's only path to them.
+ *
+ * Capped, with the count stated. An uncapped line is complete and unreadable;
+ * a silently cut one is neither.
+ */
+function FacetLine({ annotation, className }: { annotation: Annotation; className: string }) {
+  const parts = facetParts(annotation)
+  if (parts.length === 0) return null
+  const shown = parts.slice(0, MAX_FACET_LINE)
+  const hidden = parts.length - shown.length
+  return (
+    <span className={className}>
+      {shown.join(' · ')}
+      {hidden > 0 && ` · +${hidden}`}
+    </span>
+  )
 }
 
 /**
@@ -260,27 +444,52 @@ function FacetLine({ annotation, className }: { annotation: Annotation; classNam
  */
 export function TerminalAnnotations({ annotations }: { annotations: Annotation[] | undefined }) {
   if (!annotations || annotations.length === 0) return null
-  const shown = annotations.slice(0, MAX_ROW_CHIPS)
-  const hidden = annotations.length - shown.length
+  // TWO GROUPS, TWO CAPS, TWO MARKERS. See `MAX_IDENTITY_CHIPS`: one shared cap
+  // lets either group delete the other, and both deletions are the failure the
+  // cap exists to prevent.
+  const { severity, identity } = partitionChips(annotations)
+  const shownSeverity = severity.slice(0, MAX_ROW_CHIPS)
+  const hiddenSeverity = severity.length - shownSeverity.length
+  const shownIdentity = identity.slice(0, MAX_IDENTITY_CHIPS)
+  const hiddenIdentity = identity.length - shownIdentity.length
+  const shown = [...shownSeverity, ...shownIdentity]
   return (
     // `basis-full` below `sm` drops the whole chip group onto its own line, so
     // the identity row keeps the agent-profile name it was previously losing
     // to a single chip at 390px. The wrapper lives INSIDE the null guard: a row
     // with no annotations still emits no element at all.
+    //
+    // EVERY CHIP BELOW IS A DIRECT CHILD OF THIS SPAN. Grouping the identity
+    // chips in an inner wrapper is the obvious tidier shape and it reproduces
+    // the 390px regression exactly: `shrink-0`, `whitespace-nowrap` and
+    // `basis-full` are statements about THIS flex container, and an interposed
+    // box makes all three apply to the wrapper instead of the chips.
     <span
       data-testid="annotation-group"
       className="flex items-center gap-1.5 flex-wrap min-w-0 basis-full sm:basis-auto"
     >
-      {shown.map((a, i) => (
+      {shownSeverity.map((a, i) => (
         <AnnotationChip key={`${a.namespace}:${a.kind}:${a.label}:${i}`} annotation={a} />
       ))}
-      {hidden > 0 && (
+      {hiddenSeverity > 0 && (
         <span
           data-testid="annotation-overflow"
           className="text-[10px] text-gray-400 shrink-0"
-          title={`${hidden} more annotation${hidden === 1 ? '' : 's'} not shown`}
+          title={`${hiddenSeverity} more annotation${hiddenSeverity === 1 ? '' : 's'} not shown`}
         >
-          +{hidden} more
+          +{hiddenSeverity} more
+        </span>
+      )}
+      {shownIdentity.map((a, i) => (
+        <AnnotationChip key={`identity:${a.namespace}:${a.kind}:${a.label}:${i}`} annotation={a} />
+      ))}
+      {hiddenIdentity > 0 && (
+        <span
+          data-testid="annotation-identity-overflow"
+          className="text-[10px] text-gray-400 shrink-0"
+          title={`${hiddenIdentity} more not shown`}
+        >
+          +{hiddenIdentity}
         </span>
       )}
       {/* The phone's only path to the facets. Hidden from `sm` up, where the

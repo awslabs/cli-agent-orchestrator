@@ -22,6 +22,37 @@ import pytest
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.services import annotations
 
+#: Conductor vocabulary the service may never name. KEPT IDENTICAL, TERM FOR
+#: TERM, TO THE RENDERER'S MIRROR in `web/src/test/annotations.test.tsx` — the
+#: two guards cover the two halves of one seam and a term in only one of them is
+#: a hole in the other. The last nine arrived with the lane/VCS chips; the
+#: renderer's list gained them and this one had not, which left the module that
+#: actually reads the field off the wire unguarded against exactly the shortcut
+#: the guard exists for.
+#:
+#: ONLY UNAMBIGUOUS TOKENS, for the same reason the mirror says so: matching is
+#: a substring test, and `lane` is inside `plane` while `base` is inside
+#: `basename`. A term that false-positives must be narrowed, never dropped.
+_CONDUCTOR_TERMS = (
+    "work-state",
+    "work_item",
+    "human-gate",
+    "route-breaker",
+    "parked",
+    "in-round",
+    "finalized",
+    "supervisor",
+    "track_id",
+    "lane_source",
+    "lane_scope",
+    "cross-lane",
+    "task-prefix",
+    "worktree",
+    "base_branch",
+    "commit_short",
+    "vcs",
+)
+
 
 def _item(**overrides):
     """A minimal valid annotation, so each test can perturb exactly one thing."""
@@ -453,20 +484,32 @@ class TestUnknownKindsAreIgnored:
             and isinstance(node.value, str)
             and id(node) not in docstring_ids
         ]
-        conductor_terms = (
-            "work-state",
-            "work_item",
-            "human-gate",
-            "route-breaker",
-            "parked",
-            "in-round",
-            "finalized",
-            "supervisor",
-        )
+        conductor_terms = _CONDUCTOR_TERMS
         offenders = [text for text in literals if any(term in text for term in conductor_terms)]
         assert offenders == []
         for forbidden in ("KNOWN_KINDS", "SUPPORTED_KINDS", "SEMANTIC_ROLES", "SUBJECT_TYPES"):
             assert forbidden not in source
+
+    def test_the_guard_is_not_vacuous_and_covers_this_features_vocabulary(self):
+        """The non-vacuity control, and the widening's own control.
+
+        THE TYPESCRIPT GUARD NEXT DOOR WAS WIDENED AND THIS ONE WAS NOT. The
+        renderer's mirror gained the nine terms the lane/VCS producer speaks;
+        the Python guard — over the module that actually READS the field off the
+        wire — kept the original eight, so `if item["kind"] == "vcs"` or a
+        `LANE_SCOPES` table in the service would have passed here. Both sides of
+        the seam are now guarded by the same list.
+        """
+        for term in ("track_id", "lane_source", "lane_scope", "cross-lane",
+                     "task-prefix", "worktree", "base_branch", "commit_short",
+                     "vcs"):
+            assert term in _CONDUCTOR_TERMS
+        # It must be able to FAIL: a term planted in a literal is caught.
+        planted = ['annotations', 'lane_scope', 'coverage']
+        assert [t for t in planted
+                if any(term in t for term in _CONDUCTOR_TERMS)] == ['lane_scope']
+        # And the field this feature added is not itself a vocabulary term.
+        assert not any(term in "colour_key" for term in _CONDUCTOR_TERMS)
 
     def test_an_unrecognised_document_schema_is_not_a_gate(self, client, root):
         """A future document version still yields its v1-valid items."""
@@ -809,3 +852,94 @@ class TestReadScope:
     def test_it_is_readable_with_no_auth_configured(self, client, root):
         _publish(root, "campaign", {"annotations": [_item()]})
         assert client.get("/annotations").status_code == 200
+
+
+class TestOpaqueIdentityToken:
+    """``colour_key`` — an opaque carrier with THREE states, not two.
+
+    The producer distinguishes "this is not an identity chip" (field absent)
+    from "this is an identity chip with no colour" (empty string), and the
+    renderer draws those two differently. The route is the only thing between
+    them, so the empty string surviving it is the whole contract.
+    """
+
+    def test_an_empty_token_survives_as_an_empty_token(self, client, root):
+        """The state a ``_bounded_required``-style read would delete.
+
+        Reading this field the way every other bounded string is read collapses
+        ``""`` to ``None``, which is indistinguishable on the wire from a chip
+        that never carried the field — and the renderer would then draw an
+        uncoloured identity chip as a severity chip in a role colour.
+        """
+        _publish(root, "campaign", {"annotations": [_item(colour_key="")]})
+        body = client.get("/annotations").json()
+        assert body["annotations"][0]["colour_key"] == ""
+        assert body["items_dropped"] == 0
+
+    def test_a_token_is_carried_verbatim(self, client, root):
+        _publish(root, "campaign", {"annotations": [_item(colour_key="9f2c41a7be03d5e8")]})
+        body = client.get("/annotations").json()
+        assert body["annotations"][0]["colour_key"] == "9f2c41a7be03d5e8"
+
+    def test_an_absent_token_is_null_and_not_an_empty_string(self, client, root):
+        """The third state, and the one every pre-existing document is in."""
+        _publish(root, "campaign", {"annotations": [_item()]})
+        body = client.get("/annotations").json()
+        assert body["annotations"][0]["colour_key"] is None
+
+    def test_a_token_that_is_not_a_string_is_refused_rather_than_stringified(
+        self, client, root
+    ):
+        """A number is not an opaque token, and coercing one would invent a colour."""
+        for value in (12, True, None, {"a": 1}, ["x"]):
+            _publish(root, "campaign", {"annotations": [_item(colour_key=value)]})
+            body = client.get("/annotations").json()
+            assert body["annotations"][0]["colour_key"] is None, value
+            assert body["items_dropped"] == 0, value
+
+    def test_an_oversized_token_is_bounded_rather_than_dropped(self, client, root):
+        """Bounded like every other string the fork carries.
+
+        Truncation changes which colour the token resolves to, which is
+        acceptable and cheap: a chip in the wrong bucket still draws its label,
+        and colour is a scan filter rather than an identifier. Dropping the
+        field instead would silently demote an identity chip to a severity one.
+        """
+        _publish(root, "campaign", {"annotations": [_item(colour_key="k" * 100)]})
+        body = client.get("/annotations").json()
+        assert body["annotations"][0]["colour_key"] == "k" * 64
+
+    def test_the_token_is_not_smuggled_through_the_facet_bag(self, client, root):
+        """It is a TOP-LEVEL field, and that placement is load-bearing.
+
+        The facet bag drops empty values by design, so the uncoloured state
+        could not cross it at all; and every facet is rendered as visible text,
+        so a token carried there would draw a hash string on the chip, in its
+        accessible name, and on the phone's facet line.
+        """
+        _publish(
+            root,
+            "campaign",
+            {"annotations": [_item(colour_key="9f2c41a7be03d5e8", details={"task": "t"})]},
+        )
+        body = client.get("/annotations").json()
+        item = body["annotations"][0]
+        assert item["details"] == {"task": "t"}
+        assert "colour_key" not in item["details"]
+
+    def test_carrying_it_added_no_vocabulary_to_the_service(self):
+        """The field is read BY NAME, and the name is not itself a vocabulary.
+
+        ``test_the_service_holds_no_kind_or_role_vocabulary`` already scans the
+        whole module for conductor terms and runs in this same suite; what this
+        adds is the two things that test cannot know — that the field is read at
+        all, and that reading it did not require a TABLE of values. A palette,
+        a scope list or a class list on this side would move a decision the
+        producer owns across the seam, and each has a plausible name.
+        """
+        source = open(annotations.__file__, encoding="utf-8").read()
+        assert '"colour_key"' in source
+        # The name introduced here must not itself trip the guard next door.
+        assert not any(term in "colour_key" for term in _CONDUCTOR_TERMS)
+        for forbidden in ("LANE_SCOPES", "PROVENANCE_CLASSES", "COLOUR_KEYS", "IDENTITY_PALETTE"):
+            assert forbidden not in source

@@ -69,6 +69,18 @@ class AnnotationItem(BaseModel):
     #: When this claim stops being current (§9.6). Past it the renderer greys
     #: the chip: a stale annotation must look stale, never authoritative.
     valid_until: Optional[str] = None
+    #: An OPAQUE identity token. The conductor decides what identity it
+    #: expresses; the fork only hashes it into a palette slot, so a change of
+    #: grouping policy is a conductor change alone.
+    #:
+    #: THREE STATES, AND THE EMPTY STRING IS ONE OF THEM. Absent means "this
+    #: chip is a severity chip, colour it by ``semantic_role``"; ``""`` means
+    #: "this is an identity chip that has no colour"; a non-empty value means
+    #: "identity chip, colour by the hash". Folding ``""`` into absent would
+    #: delete the uncoloured identity rendering, which is why the reader uses
+    #: the bounding helper that keeps an empty string rather than the one that
+    #: treats it as no value.
+    colour_key: Optional[str] = None
     #: Derived facets — task, role, round, parked-for, lifecycle, phase,
     #: dependencies. Bounded in count and length by the reader.
     details: Dict[str, str] = {}
