@@ -1,0 +1,419 @@
+//! Test 3 of `skeleton-handoff-proof`: **neither backend's `attach_session` is called from this
+//! crate, ever** (BR-1, INV-2, SR-3, and the structural half of FR-5.1). Issue #321.
+//!
+//! # This is a safety property, not a style rule
+//!
+//! CAO's two backends each expose an `attach_session`, and both are unusable for a hand-off —
+//! for *asymmetric* reasons, each re-read at source rather than taken from its docstring:
+//!
+//! | Backend | Body | Effect on a TUI that called it |
+//! |---|---|---|
+//! | tmux (`backends/tmux_backend.py:131-135`) | `subprocess.run([...])` | **Blocks until the operator detaches**, freezing the event loop |
+//! | herdr (`backends/herdr_backend.py:631`) | `os.execvp` | **Replaces the process image** — the TUI is gone |
+//!
+//! The tmux docstring claims the method "replaces current process". **It does not** — the body
+//! is `subprocess.run`. Quoting that docstring as fact was a real error earlier in this intent,
+//! corrected across six artifacts. The lesson is in this file's own method: it asserts against
+//! **source text**, never against a comment about it.
+//!
+//! # Why a source-text assertion rather than a type
+//!
+//! FR-5.1 — "the TUI process is still alive after hand-off" — **is not expressible in the type
+//! system**. `os.execvp` type-checks perfectly, and so does any Rust equivalent. Nothing about a
+//! signature distinguishes a call that returns from one that never does, so the only available
+//! guard is a check on what the source contains. That is precisely why the predecessor's defect
+//! was possible.
+//!
+//! # What this test does NOT prove
+//!
+//! It proves this crate contains no call to either attach helper, and no direct spawn of the
+//! attach verb. It does **not** prove end-to-end that a live TUI process survives a real
+//! hand-off — that needs `server-client` (Bolt 3) and `renderer` (Bolt 5) to exist so there is
+//! a real process to observe. Stated here so nobody reads a green run as the full FR-5.1
+//! discharge (VR-1 remains outstanding).
+
+use std::collections::BTreeMap;
+
+/// Every Rust source file in this crate, embedded at compile time.
+///
+/// `include_str!` rather than a `walkdir` over `src/`: a filesystem walk depends on the working
+/// directory a runner happens to use, and — worse — **a walk that silently finds no files would
+/// pass**. Embedding makes a missing file a *compile* error, so the guard cannot degrade into a
+/// vacuous pass. The cost is that a newly added module must be listed here; the count assertion
+/// below is what turns that from a silent gap into a failing test. (#321)
+const SOURCES: &[(&str, &str)] = &[
+    ("src/main.rs", include_str!("../src/main.rs")),
+    ("src/error.rs", include_str!("../src/error.rs")),
+    ("src/handoff.rs", include_str!("../src/handoff.rs")),
+    ("src/types.rs", include_str!("../src/types.rs")),
+    // Added by `safety-guards` (Bolt 2) along with the module itself. Listing it here is not
+    // optional bookkeeping: the count assertion below reddens when a module is ADDED to this
+    // list, but nothing reddens when a new module is left OUT of it — so an unlisted file is a
+    // silent hole, which is precisely what this happened to be until it was caught. (#321)
+    ("src/env_guard.rs", include_str!("../src/env_guard.rs")),
+    // Added by `command-catalog` (Bolt 3) along with the module itself, because the
+    // `mod`-declaration cross-check below made omitting it a FAILING test rather than a silent
+    // hole — which is the asymmetry the comment above was written about, now closed in the
+    // direction it named. (#321)
+    ("src/catalog.rs", include_str!("../src/catalog.rs")),
+    // Added by `results-pane` (Bolt 4). Listing it is load-bearing for this guard specifically,
+    // not just for the cross-check: the pane is what renders a hand-off's *refusal*, so it is the
+    // module where somebody trying to be helpful would most plausibly "just run the
+    // attach-session command for them" instead of printing the argv for the operator to copy.
+    // That is exactly the process-replacing call `project.md`'s TUI run-policy forbids, and this
+    // file is the guard that would catch it. (#321)
+    (
+        "src/results_pane.rs",
+        include_str!("../src/results_pane.rs"),
+    ),
+    // Added by `server-client` (Bolt 3). This is the module that most needed listing: it is the
+    // crate's only I/O component, so it is the one place a `CommandExt::exec` or an
+    // `attach-session` spawn could plausibly be written by somebody wiring a hand-off through
+    // HTTP. The `mod`-declaration cross-check below is what made omitting it fail rather than
+    // pass silently. (#321)
+    ("src/server.rs", include_str!("../src/server.rs")),
+    // Added by `guided-flow` (Bolt 4). Load-bearing for this guard in its own right: this is the
+    // module that decides whether a launch may proceed, so it is where somebody would most
+    // plausibly follow `to_params()` straight through to "and then attach the operator to the
+    // session" — the process-replacing call `project.md`'s TUI run-policy forbids. The
+    // `mod`-declaration cross-check below is what made omitting it fail rather than pass. (#321)
+    ("src/guided_flow.rs", include_str!("../src/guided_flow.rs")),
+    // Added by `renderer` (Bolt 5). **This is the module this whole tripwire was written for.**
+    // Every other listing above is defence in depth; this one is the primary target: `renderer`
+    // is the unit that performs the hand-off, so it is where the forbidden call would actually be
+    // written. `project.md`'s TUI run-policy mandates a NEW window and both Python backends
+    // violate it by construction (`tmux_backend.attach_session` blocks, `herdr_backend`'s
+    // `os.execvp`s), so the correct path here is `HandoffDriver::handoff` — and the incorrect one
+    // is one `Command::new` away. Budgeted at ZERO occurrences of every needle, including the
+    // verb: `renderer` receives the refusal argv as an opaque `Option<String>` from `Refused` and
+    // hands it straight to `ResultsPane::refuse`, so it never names, builds, or spawns it. (#321)
+    ("src/renderer.rs", include_str!("../src/renderer.rs")),
+];
+
+/// Strips `//`-comments so the needles named in prose are not counted as code.
+///
+/// `//` covers `///` and `//!` too. Deliberately not a full lexer: no string literal in this
+/// crate contains `//`, and an over-eager stripper could only ever *weaken* this guard by
+/// hiding real code — it cannot manufacture a pass for code that is present, because stripping
+/// removes text rather than adding it.
+fn code_only(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(comment_start) => &line[..comment_start],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The forbidden needles, each with the reason it is forbidden.
+///
+/// Assembled from **three** spellings rather than one, because a single needle is easy to slip
+/// past by accident:
+///
+/// - `attach_session` — the Python method name, as it would appear in a comment, a subprocess
+///   argument, or a Rust helper named after it.
+/// - `attach-session` — the tmux **verb**. Spawning it directly is the same defect wearing a
+///   different costume: from inside tmux it fails outright (tmux refuses a nested attach), and
+///   from outside it blocks the TUI until the operator detaches. BR-4 forbids it as navigation.
+/// - `execvp` / `exec_replace` — the mechanism itself. `std::os::unix::process::CommandExt::exec`
+///   replaces the process image exactly as herdr's `os.execvp` does, and would be the natural
+///   Rust translation of that line by someone porting it faithfully.
+///
+/// Each is split at construction so **this array does not contain its own needles** as
+/// contiguous text. Without that, the comment-stripped body of this file would contain them and
+/// the guard would fire on itself — a guard that always fails is as useless as one that never
+/// can. (#321)
+fn forbidden_needles() -> BTreeMap<String, &'static str> {
+    let mut needles = BTreeMap::new();
+    needles.insert(
+        format!("attach{}session", "_"),
+        "tmux's blocks the TUI's event loop until detach (subprocess.run, tmux_backend.py:131); \
+         herdr's replaces the TUI process image (os.execvp, herdr_backend.py:631)",
+    );
+    needles.insert(
+        format!("attach{}session", "-"),
+        "the tmux attach verb must never be spawned as navigation (BR-4): nested attach fails \
+         outright, and from outside tmux it blocks until the operator detaches. It may only \
+         appear as a STRING the operator is handed to run themselves",
+    );
+    needles.insert(
+        format!("exec{}", "vp"),
+        "replacing the process image is the exact defect herdr's attach_session has; the TUI \
+         must outlive every hand-off (FR-5.1)",
+    );
+    needles.insert(
+        format!("CommandExt{}", "::exec"),
+        "std::os::unix::process::CommandExt::exec is Rust's os.execvp — it replaces the process \
+         image and never returns (FR-5.1)",
+    );
+    needles
+}
+
+/// The one file permitted to name the tmux attach **verb** at all: the module that builds the
+/// FR-5.3 refusal string.
+///
+/// The exemption is narrow by construction — it covers one file and one needle, and
+/// [`the_attach_verb_is_only_ever_a_printed_string`] then accounts for every occurrence inside
+/// it. An exemption that arises because the tripwire happens not to cover a path is
+/// indistinguishable from a hole in the tripwire, which is why it is enumerated rather than
+/// implied. (#321)
+const REFUSAL_ARGV_FILE: &str = "src/handoff.rs";
+
+/// Every file permitted to name the attach verb, with the **exact** occurrences allowed in each
+/// region: `(path, production, tests, why)`.
+///
+/// A budget rather than a bare allow-list, because "this file may mention the verb" is not the
+/// property worth enforcing — *how many times, and on which side of `#[cfg(test)]`* is. A file
+/// budgeted at zero production occurrences is still fully guarded: adding one fires
+/// [`the_attach_verb_is_only_ever_a_printed_string`] even though the file is exempt from the
+/// blanket scan.
+///
+/// `results_pane.rs` was added by `results-pane` (Bolt 4) and is budgeted at **0 production**.
+/// It renders FR-5.3's refusal argv but never builds one — the string is passed in by `renderer`
+/// as an opaque `Option<String>` — so its only occurrences are the two hard-coded test
+/// expectations that assert the argv is reproduced byte-for-byte. Those must stay literals:
+/// deriving them from the value handed to `refuse()` would make the test agree with whatever the
+/// pane stored and stay green through the exact mangling it exists to catch. (#321)
+const VERB_BUDGET: &[(&str, usize, usize, &str)] = &[
+    (
+        REFUSAL_ARGV_FILE,
+        1,
+        2,
+        "the display-only `attach_argv` builder, plus VR-5's two hard-coded expectations",
+    ),
+    (
+        "src/results_pane.rs",
+        0,
+        2,
+        "renders the refusal argv it is GIVEN and never builds one, so production must never \
+         name the verb; the two test occurrences are FR-5.3's byte-for-byte expectations",
+    ),
+];
+
+/// The tmux attach verb, assembled so this file's own code does not contain it contiguously.
+fn attach_verb() -> String {
+    format!("attach{}session", "-")
+}
+
+/// The `attach_session` methods, and process replacement, appear in **no** Rust source here.
+///
+/// Three of the four needles have **zero** legitimate uses anywhere in this crate, so they are
+/// checked with no exemption at all. The fourth — the tmux verb — is exempted only in
+/// [`REFUSAL_ARGV_FILE`], and is then fully accounted for by the next test rather than waved
+/// through. (#321)
+#[test]
+fn no_rust_source_calls_either_backend_attach_session() {
+    // Cross-checked against the module declarations in `src/main.rs` rather than only against a
+    // literal. A bare count cannot notice a module that was never listed — it only reddens once
+    // somebody adds one — and that asymmetry let `env_guard` sit unscanned after Bolt 2 added it.
+    // Deriving the expected set from `mod` declarations closes the direction the count misses.
+    // (#321)
+    assert_eq!(
+        SOURCES.len(),
+        10,
+        "expected exactly 10 Rust sources under src/ (main, error, handoff, types, env_guard, \
+         catalog, results_pane, server, guided_flow, renderer); a new module must be added to \
+         SOURCES or this tripwire silently stops covering it"
+    );
+
+    let crate_root = SOURCES
+        .iter()
+        .find(|(path, _)| *path == "src/main.rs")
+        .map(|(_, source)| code_only(source))
+        .expect("src/main.rs must be listed in SOURCES");
+
+    for line in crate_root.lines() {
+        let declaration = line.trim();
+        let Some(module) = declaration
+            .strip_prefix("mod ")
+            .and_then(|rest| rest.strip_suffix(';'))
+        else {
+            continue;
+        };
+        let expected = format!("src/{module}.rs");
+        assert!(
+            SOURCES.iter().any(|(path, _)| *path == expected),
+            "`src/main.rs` declares `mod {module};` but {expected} is not in SOURCES, so this \
+             guard does not scan it. An unlisted module is a silent hole: the count assertion \
+             above only fires when a file is ADDED to the list, never when one is omitted"
+        );
+    }
+
+    let verb = attach_verb();
+
+    for (path, source) in SOURCES {
+        let code = code_only(source);
+
+        for (needle, reason) in forbidden_needles() {
+            if needle == verb {
+                // Accounted for per-occurrence and per-region by the next test, for the budgeted
+                // files only. Every other needle, and every other file, is checked with no
+                // exemption at all.
+                if VERB_BUDGET.iter().any(|(budgeted, ..)| budgeted == path) {
+                    continue;
+                }
+            }
+
+            assert!(
+                !code.contains(&needle),
+                "{path} must not contain {needle:?}: {reason}"
+            );
+        }
+    }
+}
+
+/// Every occurrence of the attach verb is a **printed string**, never something this crate runs.
+///
+/// This is what keeps the exemption above honest: without it, the exemption would license
+/// `handoff.rs` to spawn `tmux attach-session` — the very call BR-1 forbids — while the previous
+/// test stayed green.
+///
+/// # The accounting is per-region, and that is the point
+///
+/// The file is split at its `#[cfg(test)]` marker and each side gets its own exact count, rather
+/// than one loose total. A single total is what a stray production use would hide behind: adding
+/// one in production while deleting one from the tests would keep any total-only assertion
+/// green.
+///
+/// - **Production: exactly 1.** The display-only builder `attach_argv`. Zero would mean FR-5.3's
+///   command was dropped and this exemption is stale.
+/// - **Tests: exactly 2.** The two hard-coded expectations VR-5 *requires* — `work:planner-1`
+///   for the `$TMUX`-unset refusal and the bare `work` session-level fallback. They must stay
+///   literals: deriving them from `attach_argv` would make those tests agree with the builder
+///   and stay green through the exact typo they exist to catch.
+///
+/// Every budgeted file is checked this way, not just `handoff.rs` — see [`VERB_BUDGET`].
+/// `results_pane.rs` is budgeted at **0 production**, which is what makes its exemption from the
+/// blanket scan safe: the pane renders an argv it is handed and must never name one itself, so a
+/// production occurrence appearing there fires here.
+///
+/// # The assertion that actually holds BR-1, and why the obvious one did not
+///
+/// The obvious check is "no line naming the verb also spawns". **It is not sufficient, and that
+/// was found by mutation rather than by reasoning.** Injecting the real defect —
+/// `self.host.run(&attach_argv(&target))` on the refusal path — left this test **green**, because
+/// the spawn site names `attach_argv`, not the verb. The verb sits one function away.
+///
+/// So the check is inverted to follow the *builder* instead of the string: every call to
+/// `attach_argv` must be wrapped in `render_argv(&attach_argv(..))`, the display-only path. A call
+/// reaching `Host::run` or a `Command` cannot satisfy that shape. The line-level check is kept as
+/// a cheap second net, but the builder-wrapping assertion is the one with teeth. (#321)
+#[test]
+fn the_attach_verb_is_only_ever_a_printed_string() {
+    let verb = attach_verb();
+    let test_marker = format!("#[cfg({})]", "test");
+
+    // Every budgeted file, region by region. This is the loop that makes a zero-production budget
+    // meaningful: an exemption from the blanket scan is only safe because the exact count is
+    // asserted here instead.
+    for (path, allowed_production, allowed_tests, why) in VERB_BUDGET {
+        let source = SOURCES
+            .iter()
+            .find(|(scanned, _)| scanned == path)
+            .map(|(_, source)| code_only(source))
+            .unwrap_or_else(|| panic!("{path} must be listed in SOURCES to be budgeted"));
+
+        let (production, test_code) = source.split_once(&test_marker).unwrap_or_else(|| {
+            panic!("{path} must carry a #[cfg(test)] module for the region split to mean anything")
+        });
+
+        assert_eq!(
+            production.matches(&verb).count(),
+            *allowed_production,
+            "{path} may name the attach verb exactly {allowed_production} time(s) in PRODUCTION \
+             code ({why}). A production occurrence beyond the budget is how the verb reaches a \
+             process instead of the operator's clipboard (BR-1, BR-4)"
+        );
+        assert_eq!(
+            test_code.matches(&verb).count(),
+            *allowed_tests,
+            "{path} may name the attach verb exactly {allowed_tests} time(s) in TEST code ({why})"
+        );
+    }
+
+    let handoff = SOURCES
+        .iter()
+        .find(|(path, _)| *path == REFUSAL_ARGV_FILE)
+        .map(|(_, source)| code_only(source))
+        .expect("src/handoff.rs must be listed in SOURCES");
+
+    let (production, test_code) = handoff.split_once(&test_marker).expect(
+        "src/handoff.rs must carry a #[cfg(test)] module for the split below to mean anything",
+    );
+
+    assert_eq!(
+        production.matches(&verb).count(),
+        1,
+        "the attach verb may appear exactly ONCE in {REFUSAL_ARGV_FILE}'s production code — \
+         inside the display-only argv builder for the FR-5.3 refusal. Zero means the refusal no \
+         longer offers a command; more than one means a second use is hiding behind the exemption"
+    );
+    assert_eq!(
+        test_code.matches(&verb).count(),
+        2,
+        "exactly TWO hard-coded expectations may name the attach verb (VR-5): the \
+         `work:planner-1` refusal and the session-level `work` fallback. They must stay literals \
+         — deriving them from `attach_argv` would make the tests agree with the builder"
+    );
+
+    let builder = "fn attach_argv";
+    assert!(
+        production.contains(builder),
+        "the refusal argv must be built by `{builder}`, a named display-only helper, so its one \
+         permitted use is reviewable in a single place"
+    );
+
+    // The load-bearing assertion: follow the BUILDER, not the string. Every `attach_argv(` call
+    // outside its own definition must be wrapped by `render_argv(&attach_argv(`, which is the
+    // display-only path — a call that reached `Host::run` or a `Command` could not match this
+    // shape. Found necessary by mutation: a `self.host.run(&attach_argv(&target))` injected on
+    // the refusal path left the line-level check below green, because the spawn site names the
+    // builder rather than the verb.
+    let builder_call = "attach_argv(";
+    let display_wrapped = format!("render_argv(&{builder_call}");
+
+    let total_calls = production.matches(builder_call).count();
+    let definition_occurrences = production.matches(builder).count();
+    let wrapped_calls = production.matches(&display_wrapped).count();
+
+    assert!(
+        total_calls > definition_occurrences,
+        "`attach_argv` must be CALLED somewhere in production, otherwise FR-5.3's refusal no \
+         longer offers a command at all"
+    );
+    assert_eq!(
+        wrapped_calls,
+        total_calls - definition_occurrences,
+        "every call to `attach_argv` must be wrapped as `{display_wrapped}..)` — the \
+         display-only path. Found {total_calls} occurrences, {definition_occurrences} of which \
+         is the definition, but only {wrapped_calls} wrapped for display. An unwrapped call is \
+         how the attach argv reaches a process instead of the operator's clipboard, which is \
+         exactly BR-1: tmux's attach blocks the TUI until detach, herdr's replaces its process \
+         image, and a nested attach fails outright (BR-4)"
+    );
+
+    // A cheap second net: naming the verb on the same line as a spawner. Weaker than the check
+    // above (a spawn one function away slips past it), kept because it costs nothing.
+    for (index, line) in handoff.lines().enumerate() {
+        if !line.contains(&verb) {
+            continue;
+        }
+        for spawner in [".run(", "Command::new", "spawn(", "status()", "output()"] {
+            assert!(
+                !line.contains(spawner),
+                "line {number} names the attach verb AND {spawner:?}: the verb may only ever be \
+                 built into a string for the operator to run themselves (BR-1/BR-4). Line: \
+                 {line:?}",
+                number = index + 1
+            );
+        }
+    }
+
+    assert!(
+        !handoff.contains("sh -c") && !handoff.contains("bash -c"),
+        "no shell may be invoked anywhere in the hand-off path: session and window names come \
+         from server responses, so a shell string would make them injection vectors (T-10, SR-1)"
+    );
+}

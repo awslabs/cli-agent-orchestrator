@@ -1,0 +1,1384 @@
+//! The static run-policy table: what the TUI offers, and how (issue #321).
+//!
+//! One row per leaf command of the CAO Click tree — **61 of them** — each classified `InApp`,
+//! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
+//!
+//! # No I/O, and that is the security property (SR-1)
+//!
+//! No HTTP, no subprocess, no file reads, at build time or run time. There is no injection
+//! surface because there is no input channel: the table is a compile-time constant. Stated as a
+//! requirement rather than an observation, so a later change that reads the classification from
+//! disk or the network is visibly a *security* change and not a refactor.
+//!
+//! # Why the table exists at all (FR-1.3)
+//!
+//! The superseded TUI built its catalog by **scraping `cao ... --help`**. That is design defect
+//! #1 of the three motivating this rewrite: Click renders `--agents` and `--provider` as bare
+//! `TEXT`, not `Choice`, so scraped help yields `choices=None` and a picker becomes structurally
+//! impossible to build. The rows below were produced by walking `cli_agent_orchestrator.cli.main:cli`
+//! programmatically — the enumeration is of the command *tree*, never of its help output.
+//!
+//! # Why [`CommandId`] is an enum and not a map key (FR-4.2)
+//!
+//! This is the load-bearing decision in the module, and it is about a failure mode rather than
+//! about ergonomics.
+//!
+//! `project.md` affirms that an unclassified CAO command **defaults to HIDE**, so an unvetted
+//! command cannot appear half-working in the front door. There are two ways to implement that
+//! default:
+//!
+//! - A `HashMap<String, Policy>` plus `unwrap_or(Policy::Hidden)`. A new command then hides
+//!   itself **silently**, at run time, and nobody is told. The affirmed rule survives as a
+//!   convention that happens to hold.
+//! - An enum with one variant per command, and an exhaustive `match`. A new command **fails to
+//!   compile** until a human classifies it.
+//!
+//! The second is what is implemented. [`entry`] carries no `_` arm, deliberately: a fallback arm
+//! would restore exactly the silence the enum exists to remove. `HIDE-by-default` is therefore a
+//! property the compiler enforces, not a branch that chooses it.
+//!
+//! # What that mechanism does NOT catch
+//!
+//! An exhaustive match catches a **missing** classification and never a **wrong** one, and that
+//! is not hypothetical here: `memory compact` and `memory heal` were classified HANDOFF during
+//! design, compiled perfectly, and were wrong — only human review caught them. Both are HIDE
+//! below.
+//!
+//! Two things follow, and both are in the code rather than in this comment:
+//!
+//! - Every `Handoff` row carries a **required reason** ([`Command::handoff_reason`], BR-4/VR-1),
+//!   so the justification sits where a reviewer reads it.
+//! - Every `Hidden` row carries its reason as a trailing comment, for the same purpose. There is
+//!   no field for it because the design gives `Command` a *handoff* reason specifically; a
+//!   general-purpose reason field would blur what BR-4 makes mandatory.
+//!
+//! # Infallible, and defining no error type (INV-3)
+//!
+//! All three public functions are infallible. `team.md` affirms `thiserror` for crate-internal
+//! error types and `anyhow` at integration boundaries; **neither applies here** — this module is
+//! not a boundary and has no fallible operation. Adding a variant to [`crate::error::TuiError`]
+//! for it would be dead code, and a fallible signature would force six consumers to handle a
+//! case that cannot occur. `unwrap`/`expect` do not appear either: there is nothing to unwrap.
+
+use std::vec::Vec;
+
+/// The number of leaf commands in the CAO Click tree.
+///
+/// **61, not the 60 the design records** — and the discrepancy is a prediction coming true
+/// rather than a defect. `business-logic-model.md` wrote that `cao tui` was "absent from the
+/// table … `skeleton-wheel-bundle` adds the subcommand"; Bolt 1 then added it. The affirmed
+/// distribution of 33/5/22 no longer summed, so `cao tui` was classified — HIDE, because the TUI
+/// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
+/// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
+/// (#321)
+const COMMAND_COUNT: usize = 61;
+
+/// What the TUI does with a command.
+///
+/// A **closed** three-variant enum. A fourth state — "offer with a warning", say — would have to
+/// be handled at every match site in `renderer`, `guided-flow`, and `results-pane`, and the
+/// run-policy decision was made per command by the operator rather than deferred to run time.
+/// (#321)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    /// Run captured; render the output in the results pane.
+    InApp,
+    /// Drive the terminal backend so the command runs on real stdio in a **new** window.
+    ///
+    /// The new window is not a detail: `project.md` mandates that a hand-off must leave the TUI
+    /// running, and both Python backends violate that by construction today
+    /// (`tmux_backend.attach_session` blocks, `herdr_backend.attach_session` calls `os.execvp`).
+    /// (#321)
+    Handoff,
+    /// Not offered in the TUI at all.
+    ///
+    /// FR-4.3 requires hidden commands be **absent from navigation**, not greyed out — which is
+    /// why [`commands`] filters them rather than marking them.
+    Hidden,
+}
+
+/// The shape of a parameter's value.
+///
+/// Two variants because the Click tree yields exactly these two shapes. **A `Choice` variant is
+/// deliberately absent.** Enumerated choices for `--agents` and `--provider` come from
+/// `GET /agents/profiles` and `GET /agents/providers` at run time (ADR-02), never from this
+/// static table. A `Choice` here would invite precisely the baked-in-choices pattern that
+/// produced `choices=None` in the predecessor. (#321)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamKind {
+    /// Takes a value.
+    Text,
+    /// Boolean presence.
+    Flag,
+}
+
+/// One parameter, mirroring the CLI's own declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Param {
+    /// **The CLI's exact spelling** — `--agents`, not "Agents" and not "agents" (BR-8).
+    ///
+    /// A display label may be prettified; the value that reaches `SessionParams` may not. A
+    /// renamed parameter is a request the CLI rejects.
+    ///
+    /// A name with **no `--` prefix is a positional argument**, which is how `cao launch`'s
+    /// trailing `message` appears (BR-9). Callers building an argv must place those by position
+    /// and must not invent a flag for them.
+    pub name: &'static str,
+    /// Whether the CLI requires it. For `cao launch` this is true for `--agents` and nothing
+    /// else — marking a second parameter required would block runs the CLI accepts (FR-2.2).
+    pub required: bool,
+    /// Value shape.
+    pub kind: ParamKind,
+}
+
+/// A catalog row as callers see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Command {
+    /// The generated variant naming this row.
+    pub id: CommandId,
+    /// The Click group, e.g. `session`. `None` for a top-level leaf such as `cao launch`.
+    pub parent: Option<&'static str>,
+    /// The leaf token, e.g. `list`.
+    pub leaf_name: &'static str,
+    /// The command's own one-line help, for display.
+    pub summary: &'static str,
+    /// The classification.
+    pub policy: Policy,
+    /// The parameter set, in the order the CLI declares it. Empty for many commands.
+    pub params: &'static [Param],
+    /// **Mandatory when `policy == Policy::Handoff`** (BR-4, VR-1); `None` otherwise.
+    ///
+    /// `Option` in the type rather than `Handoff { reason: &'static str }`, which *would* have
+    /// been compiler-enforced. The trade-off is deliberate and recorded rather than accidental:
+    /// a payload-carrying variant stops [`Policy`] being a plain comparable enum, and the many
+    /// call sites that only test *which* variant it is would all have to destructure. The cost
+    /// is that BR-4 is a review rule (VR-1, guarded by a test) instead of a compile rule. (#321)
+    pub handoff_reason: Option<&'static str>,
+}
+
+/// Every leaf command, in display order.
+///
+/// **Order is by parent group, then leaf name** — the eight top-level leaves first, then each
+/// Click group contiguously. Not alphabetical across the flattened set, which would scatter
+/// `session list` away from `session status`; an operator scanning for session commands expects
+/// them adjacent.
+///
+/// The length lives in the **type**, so a list that has drifted from [`COMMAND_COUNT`] is a
+/// compile error at this item rather than a short navigation list at run time. (#321)
+///
+/// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
+/// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
+/// other way would mean re-listing 61 commands in a second place, which is a worse trade than
+/// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
+/// this crate exists, and the table is not a public API. (#321)
+pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
+    CommandId::Info,
+    CommandId::Init,
+    CommandId::Install,
+    CommandId::Launch,
+    CommandId::McpServer,
+    CommandId::Shutdown,
+    CommandId::Tui,
+    CommandId::Update,
+    CommandId::ConfigGet,
+    CommandId::ConfigList,
+    CommandId::ConfigPath,
+    CommandId::ConfigSet,
+    CommandId::EnvGet,
+    CommandId::EnvList,
+    CommandId::EnvSet,
+    CommandId::EnvUnset,
+    CommandId::FlowAdd,
+    CommandId::FlowDisable,
+    CommandId::FlowEnable,
+    CommandId::FlowList,
+    CommandId::FlowRemove,
+    CommandId::FlowRun,
+    CommandId::MemoryClear,
+    CommandId::MemoryCompact,
+    CommandId::MemoryDelete,
+    CommandId::MemoryExport,
+    CommandId::MemoryHeal,
+    CommandId::MemoryImport,
+    CommandId::MemoryLint,
+    CommandId::MemoryList,
+    CommandId::MemoryPromote,
+    CommandId::MemoryRepair,
+    CommandId::MemoryShow,
+    CommandId::ProfileCreate,
+    CommandId::ProfileFind,
+    CommandId::ProfileList,
+    CommandId::ProfileRemove,
+    CommandId::ProfileShow,
+    CommandId::ProfileTemplates,
+    CommandId::ProfileValidate,
+    CommandId::ScheduleAdd,
+    CommandId::ScheduleDisable,
+    CommandId::ScheduleEnable,
+    CommandId::ScheduleList,
+    CommandId::ScheduleRemove,
+    CommandId::ScheduleRun,
+    CommandId::SessionList,
+    CommandId::SessionSend,
+    CommandId::SessionStatus,
+    CommandId::SkillsAdd,
+    CommandId::SkillsList,
+    CommandId::SkillsRemove,
+    CommandId::TerminalRestore,
+    CommandId::WorkflowCancel,
+    CommandId::WorkflowDelete,
+    CommandId::WorkflowGet,
+    CommandId::WorkflowList,
+    CommandId::WorkflowResume,
+    CommandId::WorkflowRun,
+    CommandId::WorkflowStatus,
+    CommandId::WorkflowValidate,
+];
+
+/// One variant per leaf command — **all 61**.
+///
+/// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
+/// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
+///
+/// Variants are named by concatenating the command path, so `cao mcp-server` is `McpServer` and
+/// `cao workflow run` is `WorkflowRun`. Lifecycle: **compile time only** — the set is fixed when
+/// the crate is built. (#321)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CommandId {
+    // Top-level leaves.
+    /// `cao info`
+    Info,
+    /// `cao init`
+    Init,
+    /// `cao install`
+    Install,
+    /// `cao launch`
+    Launch,
+    /// `cao mcp-server`
+    McpServer,
+    /// `cao shutdown`
+    Shutdown,
+    /// `cao tui`
+    Tui,
+    /// `cao update`
+    Update,
+
+    // `cao config *`
+    /// `cao config get`
+    ConfigGet,
+    /// `cao config list`
+    ConfigList,
+    /// `cao config path`
+    ConfigPath,
+    /// `cao config set`
+    ConfigSet,
+
+    // `cao env *`
+    /// `cao env get`
+    EnvGet,
+    /// `cao env list`
+    EnvList,
+    /// `cao env set`
+    EnvSet,
+    /// `cao env unset`
+    EnvUnset,
+
+    // `cao flow *`
+    /// `cao flow add`
+    FlowAdd,
+    /// `cao flow disable`
+    FlowDisable,
+    /// `cao flow enable`
+    FlowEnable,
+    /// `cao flow list`
+    FlowList,
+    /// `cao flow remove`
+    FlowRemove,
+    /// `cao flow run`
+    FlowRun,
+
+    // `cao memory *`
+    /// `cao memory clear`
+    MemoryClear,
+    /// `cao memory compact`
+    MemoryCompact,
+    /// `cao memory delete`
+    MemoryDelete,
+    /// `cao memory export`
+    MemoryExport,
+    /// `cao memory heal`
+    MemoryHeal,
+    /// `cao memory import`
+    MemoryImport,
+    /// `cao memory lint`
+    MemoryLint,
+    /// `cao memory list`
+    MemoryList,
+    /// `cao memory promote`
+    MemoryPromote,
+    /// `cao memory repair`
+    MemoryRepair,
+    /// `cao memory show`
+    MemoryShow,
+
+    // `cao profile *`
+    /// `cao profile create`
+    ProfileCreate,
+    /// `cao profile find`
+    ProfileFind,
+    /// `cao profile list`
+    ProfileList,
+    /// `cao profile remove`
+    ProfileRemove,
+    /// `cao profile show`
+    ProfileShow,
+    /// `cao profile templates`
+    ProfileTemplates,
+    /// `cao profile validate`
+    ProfileValidate,
+
+    // `cao schedule *`
+    /// `cao schedule add`
+    ScheduleAdd,
+    /// `cao schedule disable`
+    ScheduleDisable,
+    /// `cao schedule enable`
+    ScheduleEnable,
+    /// `cao schedule list`
+    ScheduleList,
+    /// `cao schedule remove`
+    ScheduleRemove,
+    /// `cao schedule run`
+    ScheduleRun,
+
+    // `cao session *`
+    /// `cao session list`
+    SessionList,
+    /// `cao session send`
+    SessionSend,
+    /// `cao session status`
+    SessionStatus,
+
+    // `cao skills *`
+    /// `cao skills add`
+    SkillsAdd,
+    /// `cao skills list`
+    SkillsList,
+    /// `cao skills remove`
+    SkillsRemove,
+
+    // `cao terminal *`
+    /// `cao terminal restore`
+    TerminalRestore,
+
+    // `cao workflow *`
+    /// `cao workflow cancel`
+    WorkflowCancel,
+    /// `cao workflow delete`
+    WorkflowDelete,
+    /// `cao workflow get`
+    WorkflowGet,
+    /// `cao workflow list`
+    WorkflowList,
+    /// `cao workflow resume`
+    WorkflowResume,
+    /// `cao workflow run`
+    WorkflowRun,
+    /// `cao workflow status`
+    WorkflowStatus,
+    /// `cao workflow validate`
+    WorkflowValidate,
+}
+
+/// The one place a command's row is written.
+///
+/// **Exhaustive, with no `_` arm — that is the whole mechanism** (FR-4.2, BR-5, SR-2). Adding a
+/// variant to [`CommandId`] without adding an arm here does not compile, so a new CAO command
+/// cannot reach the front door until a human has classified it. A `_ => Policy::Hidden` fallback
+/// would compile, hide the command silently, and tell nobody; deleting the fallback is what
+/// turns `project.md`'s affirmed HIDE-by-default rule from a convention into a mechanism.
+///
+/// Returns by value: [`Command`] is `Copy` and every field is `&'static` or a scalar, so nothing
+/// is owned, cloned, or allocated here. The `Hidden` rows carry their reason as a trailing
+/// comment — see the module docs for why that is a comment and not a field. (#321)
+fn entry(id: CommandId) -> Command {
+    match id {
+
+        CommandId::Info => Command {
+            id: CommandId::Info,
+            parent: None,
+            leaf_name: "info",
+            summary: "Display information about the current session.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: no HTTP route exists; ADR-02 forbids subprocess execution
+        },
+        CommandId::Init => Command {
+            id: CommandId::Init,
+            parent: None,
+            leaf_name: "init",
+            summary: "Initialize CLI Agent Orchestrator database.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: one-time bootstrap; already done by the time the TUI runs
+        },
+        CommandId::Install => Command {
+            id: CommandId::Install,
+            parent: None,
+            leaf_name: "install",
+            summary: "Install an agent from local store, built-in store, URL, or file path.",
+            policy: Policy::Handoff,
+            params: &[Param { name: "agent_source", required: true, kind: ParamKind::Text }, Param { name: "--provider", required: false, kind: ParamKind::Text }, Param { name: "--env", required: false, kind: ParamKind::Text }],
+            handoff_reason: Some("may prompt and fetch from network/URL"),
+        },
+        CommandId::Launch => Command {
+            id: CommandId::Launch,
+            parent: None,
+            leaf_name: "launch",
+            summary: "Launch cao session with specified agent profile.",
+            policy: Policy::Handoff,
+            params: &[Param { name: "message", required: false, kind: ParamKind::Text }, Param { name: "--agents", required: true, kind: ParamKind::Text }, Param { name: "--session-name", required: false, kind: ParamKind::Text }, Param { name: "--headless", required: false, kind: ParamKind::Flag }, Param { name: "--provider", required: false, kind: ParamKind::Text }, Param { name: "--allowed-tools", required: false, kind: ParamKind::Text }, Param { name: "--async", required: false, kind: ParamKind::Flag }, Param { name: "--auto-approve", required: false, kind: ParamKind::Flag }, Param { name: "--yolo", required: false, kind: ParamKind::Flag }, Param { name: "--working-directory", required: false, kind: ParamKind::Text }, Param { name: "--memory", required: false, kind: ParamKind::Flag }, Param { name: "--env", required: false, kind: ParamKind::Text }],
+            handoff_reason: Some("interactive agent session — the stated hand-off case; MUST open a NEW tab/window and leave the TUI alive"),
+        },
+        CommandId::McpServer => Command {
+            id: CommandId::McpServer,
+            parent: None,
+            leaf_name: "mcp-server",
+            summary: "Start the CAO MCP server.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: long-running foreground server; nothing to render, never exits
+        },
+        CommandId::Shutdown => Command {
+            id: CommandId::Shutdown,
+            parent: None,
+            leaf_name: "shutdown",
+            summary: "Shutdown tmux sessions and cleanup terminal records.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "--all", required: false, kind: ParamKind::Flag }, Param { name: "--session", required: false, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: kills tmux sessions — can kill the session hosting the TUI
+        },
+        CommandId::Tui => Command {
+            id: CommandId::Tui,
+            parent: None,
+            leaf_name: "tui",
+            summary: "Launch the terminal UI (bundled Rust binary).",
+            policy: Policy::Hidden,
+            params: &[Param { name: "tui_args", required: false, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: the TUI must not offer itself; nesting is a no-op or a mess
+        },
+        CommandId::Update => Command {
+            id: CommandId::Update,
+            parent: None,
+            leaf_name: "update",
+            summary: "Update CAO to the latest version.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: self-update may replace the binary under a running TUI
+        },
+
+        CommandId::ConfigGet => Command {
+            id: CommandId::ConfigGet,
+            parent: Some("config"),
+            leaf_name: "get",
+            summary: "Get the resolved value for a dotted config KEY, e.g.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "key", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: human ruled: wrong CLI surface to drive from a TUI
+        },
+        CommandId::ConfigList => Command {
+            id: CommandId::ConfigList,
+            parent: Some("config"),
+            leaf_name: "list",
+            summary: "List every known config key with its resolved value.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: human ruled: wrong CLI surface to drive from a TUI
+        },
+        CommandId::ConfigPath => Command {
+            id: CommandId::ConfigPath,
+            parent: Some("config"),
+            leaf_name: "path",
+            summary: "Print the absolute path to the unified settings.json file.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: human ruled: wrong CLI surface to drive from a TUI
+        },
+        CommandId::ConfigSet => Command {
+            id: CommandId::ConfigSet,
+            parent: Some("config"),
+            leaf_name: "set",
+            summary: "Set config KEY to VALUE, persisting it to settings.json.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "key", required: true, kind: ParamKind::Text }, Param { name: "value", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: human ruled: wrong CLI surface to drive from a TUI
+        },
+
+        CommandId::EnvGet => Command {
+            id: CommandId::EnvGet,
+            parent: Some("env"),
+            leaf_name: "get",
+            summary: "Get a managed environment variable.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "key", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: no HTTP route exists; ADR-02 forbids subprocess execution
+        },
+        CommandId::EnvList => Command {
+            id: CommandId::EnvList,
+            parent: Some("env"),
+            leaf_name: "list",
+            summary: "List managed environment variables.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: no HTTP route exists; ADR-02 forbids subprocess execution
+        },
+        CommandId::EnvSet => Command {
+            id: CommandId::EnvSet,
+            parent: Some("env"),
+            leaf_name: "set",
+            summary: "Set a managed environment variable.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "key", required: true, kind: ParamKind::Text }, Param { name: "value", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: no HTTP route exists; ADR-02 forbids subprocess execution
+        },
+        CommandId::EnvUnset => Command {
+            id: CommandId::EnvUnset,
+            parent: Some("env"),
+            leaf_name: "unset",
+            summary: "Unset a managed environment variable.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "key", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: no HTTP route exists; ADR-02 forbids subprocess execution
+        },
+
+        CommandId::FlowAdd => Command {
+            id: CommandId::FlowAdd,
+            parent: Some("flow"),
+            leaf_name: "add",
+            summary: "Add a flow from file.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "file_path", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: Click marks the group `hidden=True` at cli/commands/schedule.py:133; deprecated alias
+            // for `schedule`, registered at cli/main.py:44 (issue #378). FR-4.4 — the TUI must not
+            // resurrect a command the CLI itself conceals
+        },
+        CommandId::FlowDisable => Command {
+            id: CommandId::FlowDisable,
+            parent: Some("flow"),
+            leaf_name: "disable",
+            summary: "Disable a flow.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: Click marks the group `hidden=True` at cli/commands/schedule.py:133; deprecated alias
+            // for `schedule`, registered at cli/main.py:44 (issue #378). FR-4.4 — the TUI must not
+            // resurrect a command the CLI itself conceals
+        },
+        CommandId::FlowEnable => Command {
+            id: CommandId::FlowEnable,
+            parent: Some("flow"),
+            leaf_name: "enable",
+            summary: "Enable a flow.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: Click marks the group `hidden=True` at cli/commands/schedule.py:133; deprecated alias
+            // for `schedule`, registered at cli/main.py:44 (issue #378). FR-4.4 — the TUI must not
+            // resurrect a command the CLI itself conceals
+        },
+        CommandId::FlowList => Command {
+            id: CommandId::FlowList,
+            parent: Some("flow"),
+            leaf_name: "list",
+            summary: "List all flows.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: Click marks the group `hidden=True` at cli/commands/schedule.py:133; deprecated alias
+            // for `schedule`, registered at cli/main.py:44 (issue #378). FR-4.4 — the TUI must not
+            // resurrect a command the CLI itself conceals
+        },
+        CommandId::FlowRemove => Command {
+            id: CommandId::FlowRemove,
+            parent: Some("flow"),
+            leaf_name: "remove",
+            summary: "Remove a flow.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: Click marks the group `hidden=True` at cli/commands/schedule.py:133; deprecated alias
+            // for `schedule`, registered at cli/main.py:44 (issue #378). FR-4.4 — the TUI must not
+            // resurrect a command the CLI itself conceals
+        },
+        CommandId::FlowRun => Command {
+            id: CommandId::FlowRun,
+            parent: Some("flow"),
+            leaf_name: "run",
+            summary: "Manually run a flow.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: Click marks the group `hidden=True` at cli/commands/schedule.py:133; deprecated alias
+            // for `schedule`, registered at cli/main.py:44 (issue #378). FR-4.4 — the TUI must not
+            // resurrect a command the CLI itself conceals
+        },
+
+        CommandId::MemoryClear => Command {
+            id: CommandId::MemoryClear,
+            parent: Some("memory"),
+            leaf_name: "clear",
+            summary: "Clear all memories for a given scope.",
+            policy: Policy::InApp,
+            params: &[Param { name: "--scope", required: true, kind: ParamKind::Text }, Param { name: "--yes", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::MemoryCompact => Command {
+            id: CommandId::MemoryCompact,
+            parent: Some("memory"),
+            leaf_name: "compact",
+            summary: "Compact wiki topics with the LLM compiler (repair sweep).",
+            policy: Policy::Hidden,
+            params: &[Param { name: "--scope", required: false, kind: ParamKind::Text }, Param { name: "--key", required: false, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: maintenance operation; no HTTP route; not an interactive session
+        },
+        CommandId::MemoryDelete => Command {
+            id: CommandId::MemoryDelete,
+            parent: Some("memory"),
+            leaf_name: "delete",
+            summary: "Delete a memory by key.",
+            policy: Policy::InApp,
+            params: &[Param { name: "key", required: true, kind: ParamKind::Text }, Param { name: "--scope", required: false, kind: ParamKind::Text }, Param { name: "--yes", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::MemoryExport => Command {
+            id: CommandId::MemoryExport,
+            parent: Some("memory"),
+            leaf_name: "export",
+            summary: "Export a memory scope as an archive bundle (OKF directory by default).",
+            policy: Policy::InApp,
+            params: &[Param { name: "--format", required: false, kind: ParamKind::Text }, Param { name: "--scope", required: true, kind: ParamKind::Text }, Param { name: "--output", required: true, kind: ParamKind::Text }, Param { name: "--include-private", required: false, kind: ParamKind::Flag }, Param { name: "--include-history", required: false, kind: ParamKind::Flag }, Param { name: "--redact", required: false, kind: ParamKind::Flag }, Param { name: "--prune", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::MemoryHeal => Command {
+            id: CommandId::MemoryHeal,
+            parent: Some("memory"),
+            leaf_name: "heal",
+            summary: "Repair wiki lint findings (orphan pages, contradictions, stale claims).",
+            policy: Policy::Hidden,
+            params: &[Param { name: "--scope", required: false, kind: ParamKind::Text }, Param { name: "--apply", required: false, kind: ParamKind::Flag }, Param { name: "--aggressive", required: false, kind: ParamKind::Flag }, Param { name: "--issue-type", required: false, kind: ParamKind::Text }, Param { name: "--format", required: false, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: maintenance operation; no HTTP route; not an interactive session
+        },
+        CommandId::MemoryImport => Command {
+            id: CommandId::MemoryImport,
+            parent: Some("memory"),
+            leaf_name: "import",
+            summary: "Import an archive bundle directory into a memory scope.",
+            policy: Policy::Handoff,
+            params: &[Param { name: "path", required: true, kind: ParamKind::Text }, Param { name: "--format", required: false, kind: ParamKind::Text }, Param { name: "--scope", required: true, kind: ParamKind::Text }, Param { name: "--conflict", required: false, kind: ParamKind::Text }, Param { name: "--dry-run", required: false, kind: ParamKind::Flag }],
+            handoff_reason: Some(
+                "no HTTP route: svc.import_memories is in-process (memory.py:703); OQ-6",
+            ),
+        },
+        CommandId::MemoryLint => Command {
+            id: CommandId::MemoryLint,
+            parent: Some("memory"),
+            leaf_name: "lint",
+            summary: "Run wiki lint detectors and print findings.",
+            policy: Policy::Handoff,
+            params: &[Param { name: "--scope", required: false, kind: ParamKind::Text }, Param { name: "--format", required: false, kind: ParamKind::Text }],
+            handoff_reason: Some(
+                "no HTTP route: wiki_lint.run_lint is in-process (memory.py:286); OQ-6",
+            ),
+        },
+        CommandId::MemoryList => Command {
+            id: CommandId::MemoryList,
+            parent: Some("memory"),
+            leaf_name: "list",
+            summary: "List stored memories.",
+            policy: Policy::InApp,
+            params: &[Param { name: "--scope", required: false, kind: ParamKind::Text }, Param { name: "--type", required: false, kind: ParamKind::Text }, Param { name: "--all", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::MemoryPromote => Command {
+            id: CommandId::MemoryPromote,
+            parent: Some("memory"),
+            leaf_name: "promote",
+            summary: "Promote reinforced agent-scope lessons into AGENT_NAME's profile file.",
+            policy: Policy::Handoff,
+            params: &[Param { name: "agent_name", required: true, kind: ParamKind::Text }, Param { name: "--apply", required: false, kind: ParamKind::Flag }, Param { name: "--min-recalls", required: false, kind: ParamKind::Text }, Param { name: "--profile-path", required: false, kind: ParamKind::Text }],
+            handoff_reason: Some(
+                "no HTTP route: PromotionService is in-process (memory.py:815); OQ-6",
+            ),
+        },
+        CommandId::MemoryRepair => Command {
+            id: CommandId::MemoryRepair,
+            parent: Some("memory"),
+            leaf_name: "repair",
+            summary: "Reconcile surviving canonical topics into SQLite and index.md.",
+            policy: Policy::Handoff,
+            params: &[Param { name: "--apply", required: false, kind: ParamKind::Flag }],
+            handoff_reason: Some(
+                "no HTTP route: reconcile runs only at server startup (main.py:514); OQ-6",
+            ),
+        },
+        CommandId::MemoryShow => Command {
+            id: CommandId::MemoryShow,
+            parent: Some("memory"),
+            leaf_name: "show",
+            summary: "Display full content of a memory.",
+            policy: Policy::InApp,
+            params: &[Param { name: "key", required: true, kind: ParamKind::Text }, Param { name: "--scope", required: false, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
+
+        CommandId::ProfileCreate => Command {
+            id: CommandId::ProfileCreate,
+            parent: Some("profile"),
+            leaf_name: "create",
+            summary: "Generate an agent profile from a template.",
+            policy: Policy::Handoff,
+            params: &[Param { name: "--template", required: true, kind: ParamKind::Text }, Param { name: "--config", required: true, kind: ParamKind::Text }, Param { name: "--output-dir", required: false, kind: ParamKind::Text }],
+            handoff_reason: Some(
+                "no HTTP route: agent_scaffold.render_template is in-process (profile.py:318); OQ-6",
+            ),
+        },
+        CommandId::ProfileFind => Command {
+            id: CommandId::ProfileFind,
+            parent: Some("profile"),
+            leaf_name: "find",
+            summary: "Find agent profiles by keyword (searches name, description, tags, capabilities).",
+            policy: Policy::InApp,
+            params: &[Param { name: "query", required: true, kind: ParamKind::Text }, Param { name: "--limit", required: false, kind: ParamKind::Text }, Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::ProfileList => Command {
+            id: CommandId::ProfileList,
+            parent: Some("profile"),
+            leaf_name: "list",
+            summary: "List all available agent profiles.",
+            policy: Policy::InApp,
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::ProfileRemove => Command {
+            id: CommandId::ProfileRemove,
+            parent: Some("profile"),
+            leaf_name: "remove",
+            summary: "Remove an agent profile from the local store.",
+            policy: Policy::Handoff,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }, Param { name: "--yes", required: false, kind: ParamKind::Flag }],
+            handoff_reason: Some(
+                "no HTTP route: unlink() locally; no DELETE on /agents/* (profile.py:250); OQ-6",
+            ),
+        },
+        CommandId::ProfileShow => Command {
+            id: CommandId::ProfileShow,
+            parent: Some("profile"),
+            leaf_name: "show",
+            summary: "Show details of an agent profile.",
+            policy: Policy::InApp,
+            params: &[Param { name: "name_or_path", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
+        CommandId::ProfileTemplates => Command {
+            id: CommandId::ProfileTemplates,
+            parent: Some("profile"),
+            leaf_name: "templates",
+            summary: "List available agent templates for scaffolding.",
+            policy: Policy::Handoff,
+            params: &[],
+            handoff_reason: Some(
+                "no HTTP route: agent_scaffold.list_templates (profile.py:277); OQ-6",
+            ),
+        },
+        CommandId::ProfileValidate => Command {
+            id: CommandId::ProfileValidate,
+            parent: Some("profile"),
+            leaf_name: "validate",
+            summary: "Validate an agent profile against the CAO schema.",
+            policy: Policy::Handoff,
+            params: &[Param { name: "name_or_path", required: true, kind: ParamKind::Text }],
+            handoff_reason: Some(
+                "no HTTP route: schema validation is local (profile.py:207); OQ-6",
+            ),
+        },
+
+        CommandId::ScheduleAdd => Command {
+            id: CommandId::ScheduleAdd,
+            parent: Some("schedule"),
+            leaf_name: "add",
+            summary: "Add a flow from file.",
+            policy: Policy::InApp,
+            params: &[Param { name: "file_path", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
+        CommandId::ScheduleDisable => Command {
+            id: CommandId::ScheduleDisable,
+            parent: Some("schedule"),
+            leaf_name: "disable",
+            summary: "Disable a flow.",
+            policy: Policy::InApp,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
+        CommandId::ScheduleEnable => Command {
+            id: CommandId::ScheduleEnable,
+            parent: Some("schedule"),
+            leaf_name: "enable",
+            summary: "Enable a flow.",
+            policy: Policy::InApp,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
+        CommandId::ScheduleList => Command {
+            id: CommandId::ScheduleList,
+            parent: Some("schedule"),
+            leaf_name: "list",
+            summary: "List all flows.",
+            policy: Policy::InApp,
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::ScheduleRemove => Command {
+            id: CommandId::ScheduleRemove,
+            parent: Some("schedule"),
+            leaf_name: "remove",
+            summary: "Remove a flow.",
+            policy: Policy::InApp,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
+        CommandId::ScheduleRun => Command {
+            id: CommandId::ScheduleRun,
+            parent: Some("schedule"),
+            leaf_name: "run",
+            summary: "Manually run a flow.",
+            policy: Policy::Handoff,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }],
+            handoff_reason: Some("runs a flow; duration unbounded"),
+        },
+
+        CommandId::SessionList => Command {
+            id: CommandId::SessionList,
+            parent: Some("session"),
+            leaf_name: "list",
+            summary: "List all active CAO sessions.",
+            policy: Policy::InApp,
+            params: &[Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::SessionSend => Command {
+            id: CommandId::SessionSend,
+            parent: Some("session"),
+            leaf_name: "send",
+            summary: "Send a message to a session's conductor (or specific terminal).",
+            policy: Policy::InApp,
+            params: &[Param { name: "session_name", required: true, kind: ParamKind::Text }, Param { name: "message", required: true, kind: ParamKind::Text }, Param { name: "--terminal", required: false, kind: ParamKind::Text }, Param { name: "--async", required: false, kind: ParamKind::Flag }, Param { name: "--timeout", required: false, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
+        CommandId::SessionStatus => Command {
+            id: CommandId::SessionStatus,
+            parent: Some("session"),
+            leaf_name: "status",
+            summary: "Show status of a session's conductor (or specific terminal).",
+            policy: Policy::InApp,
+            params: &[Param { name: "session_name", required: true, kind: ParamKind::Text }, Param { name: "--terminal", required: false, kind: ParamKind::Text }, Param { name: "--workers", required: false, kind: ParamKind::Flag }, Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+
+        CommandId::SkillsAdd => Command {
+            id: CommandId::SkillsAdd,
+            parent: Some("skills"),
+            leaf_name: "add",
+            summary: "Install a skill from a local folder path.",
+            policy: Policy::Handoff,
+            params: &[Param { name: "folder_path", required: true, kind: ParamKind::Text }, Param { name: "--force", required: false, kind: ParamKind::Flag }],
+            handoff_reason: Some(
+                "no HTTP route: shutil.copytree into the global store (skills.py:32); OQ-6",
+            ),
+        },
+        CommandId::SkillsList => Command {
+            id: CommandId::SkillsList,
+            parent: Some("skills"),
+            leaf_name: "list",
+            summary: "List installed skills.",
+            policy: Policy::Handoff,
+            params: &[],
+            handoff_reason: Some(
+                "no HTTP route: list_skills never imported server-side (skills.py:86); OQ-6",
+            ),
+        },
+        CommandId::SkillsRemove => Command {
+            id: CommandId::SkillsRemove,
+            parent: Some("skills"),
+            leaf_name: "remove",
+            summary: "Remove an installed skill.",
+            policy: Policy::Handoff,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }],
+            handoff_reason: Some(
+                "no HTTP route: shutil.rmtree (skills.py:78); OQ-6",
+            ),
+        },
+
+        CommandId::TerminalRestore => Command {
+            id: CommandId::TerminalRestore,
+            parent: Some("terminal"),
+            leaf_name: "restore",
+            summary: "Restore a deleted terminal from its snapshot.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "terminal_id", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+            // HIDE: human ruled out; recovery-by-terminal-ID tooling, not a launcher action
+        },
+
+        CommandId::WorkflowCancel => Command {
+            id: CommandId::WorkflowCancel,
+            parent: Some("workflow"),
+            leaf_name: "cancel",
+            summary: "Cooperatively cancel a running workflow.",
+            policy: Policy::InApp,
+            params: &[Param { name: "run_id", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
+        CommandId::WorkflowDelete => Command {
+            id: CommandId::WorkflowDelete,
+            parent: Some("workflow"),
+            leaf_name: "delete",
+            summary: "Delete a workflow's spec file and its index row.",
+            policy: Policy::InApp,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }, Param { name: "--yes", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::WorkflowGet => Command {
+            id: CommandId::WorkflowGet,
+            parent: Some("workflow"),
+            leaf_name: "get",
+            summary: "Show the parsed/validated spec for a workflow name or file path.",
+            policy: Policy::InApp,
+            params: &[Param { name: "name", required: true, kind: ParamKind::Text }, Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::WorkflowList => Command {
+            id: CommandId::WorkflowList,
+            parent: Some("workflow"),
+            leaf_name: "list",
+            summary: "List indexed workflows (rebuilt from the spec files on disk).",
+            policy: Policy::InApp,
+            params: &[Param { name: "--dir", required: false, kind: ParamKind::Text }, Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::WorkflowResume => Command {
+            id: CommandId::WorkflowResume,
+            parent: Some("workflow"),
+            leaf_name: "resume",
+            summary: "Resume a crashed/failed run from its durable journal (blocks until done).",
+            policy: Policy::Handoff,
+            params: &[Param { name: "run_id", required: true, kind: ParamKind::Text }, Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: Some("blocks until done, same as run"),
+        },
+        CommandId::WorkflowRun => Command {
+            id: CommandId::WorkflowRun,
+            parent: Some("workflow"),
+            leaf_name: "run",
+            summary: "Run a workflow to completion (blocks until the run finishes).",
+            policy: Policy::Handoff,
+            params: &[Param { name: "name_or_path", required: true, kind: ParamKind::Text }, Param { name: "--input", required: false, kind: ParamKind::Text }, Param { name: "--run-id", required: false, kind: ParamKind::Text }, Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: Some("blocks until the run finishes; unbounded duration"),
+        },
+        CommandId::WorkflowStatus => Command {
+            id: CommandId::WorkflowStatus,
+            parent: Some("workflow"),
+            leaf_name: "status",
+            summary: "Show a point-in-time status snapshot for a run.",
+            policy: Policy::InApp,
+            params: &[Param { name: "run_id", required: true, kind: ParamKind::Text }, Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+        CommandId::WorkflowValidate => Command {
+            id: CommandId::WorkflowValidate,
+            parent: Some("workflow"),
+            leaf_name: "validate",
+            summary: "Validate a workflow spec file WITHOUT running it.",
+            policy: Policy::InApp,
+            params: &[Param { name: "file", required: true, kind: ParamKind::Text }, Param { name: "--json", required: false, kind: ParamKind::Flag }],
+            handoff_reason: None,
+        },
+    }
+}
+
+/// Every command the TUI offers, in display order — **`Hidden` rows excluded** (INV-1).
+///
+/// The exclusion is a correctness property, not a display choice: FR-4.3 requires hidden
+/// commands be *absent from navigation*, so a `Hidden` row reaching a caller is a defect. It
+/// also means `Hidden` cannot occur downstream of a selection — the operator was never able to
+/// pick one.
+///
+/// Infallible: it filters a compile-time constant. (#321)
+#[allow(dead_code)] // consumed by `renderer` (Bolt 5), which does not exist yet. (#321)
+pub fn commands() -> Vec<Command> {
+    DISPLAY_ORDER
+        .iter()
+        .copied()
+        .map(entry)
+        .filter(|command| command.policy != Policy::Hidden)
+        .collect()
+}
+
+/// How to run `id`. Infallible (INV-3) — see [`entry`] for why there is no `None` case.
+///
+/// Returns `Hidden` honestly when asked. Reachability through [`commands`] does not imply
+/// non-hidden for a *programmatic* caller, so a caller holding a [`CommandId`] from somewhere
+/// other than `commands()` must still check. (#321)
+#[allow(dead_code)] // consumed by `renderer` and `results-pane` (Bolt 5). (#321)
+pub fn policy(id: CommandId) -> Policy {
+    entry(id).policy
+}
+
+/// `id`'s parameters, in the CLI's own spelling (BR-8). Infallible (INV-3).
+///
+/// An empty `Vec` for a command that takes none is the honest answer, not an error — many do.
+/// (#321)
+#[allow(dead_code)] // consumed by `guided-flow` (Bolt 4). (#321)
+pub fn params(id: CommandId) -> Vec<Param> {
+    entry(id).params.to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{commands, entry, params, policy, CommandId, ParamKind, Policy, DISPLAY_ORDER};
+    use std::collections::BTreeSet;
+
+    /// A command's full path, e.g. `workflow run` — the *identifying* name.
+    ///
+    /// Not [`super::Command::leaf_name`] on its own, which is ambiguous in exactly the place it
+    /// matters: `flow run`, `schedule run`, and `workflow run` all have `leaf_name == "run"`, and
+    /// two of the three are HANDOFF. A failure message reading "`cao run` is HANDOFF with no
+    /// reason" would send the reader to the wrong row. Found by reading a mutation's own output
+    /// rather than by review. (#321)
+    fn full_name(command: &super::Command) -> String {
+        match command.parent {
+            Some(parent) => format!("{parent} {}", command.leaf_name),
+            None => command.leaf_name.to_string(),
+        }
+    }
+
+    /// Counts each policy across the whole table, by asking production code.
+    ///
+    /// Returns `(in_app, handoff, hidden)`. The counts are *derived*; every number they are
+    /// compared against is a hard-coded literal in the test body. That direction matters — see
+    /// [`the_policy_distribution_is_twentytwo_sixteen_twentythree`].
+    fn distribution() -> (usize, usize, usize) {
+        let mut counts = (0, 0, 0);
+        for id in DISPLAY_ORDER {
+            match policy(id) {
+                Policy::InApp => counts.0 += 1,
+                Policy::Handoff => counts.1 += 1,
+                Policy::Hidden => counts.2 += 1,
+            }
+        }
+        counts
+    }
+
+    /// Test 1 — **the policy distribution is 33 IN-APP / 5 HANDOFF / 23 HIDE, totalling 61.**
+    ///
+    /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
+    /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
+    /// — compares production against itself and can never fail. That vacuous-guard shape is the
+    /// dominant failure mode in this project's history, so it is worth naming what this test
+    /// would look like if it had it.
+    ///
+    /// **Four assertions rather than one summed check**, also deliberately: a single
+    /// `in_app + handoff + hidden == 61` stays green when a command moves from IN-APP to HIDE,
+    /// because the total is conserved. Reclassification is exactly the change most likely to
+    /// happen by accident, so each policy is pinned separately and the failure names *which* one
+    /// moved.
+    ///
+    /// The distribution's own history is why the literals are worth this much care: the design
+    /// recorded 33/5/22 = 60, Bolt 1 added `cao tui`, and an earlier revision of the
+    /// implementation plan "corrected" the total to 61 while leaving the decomposition at
+    /// 33/5/24 — which sums to 62. Fixing an instance without re-deriving the count is the same
+    /// failure mode twice over. (#321)
+    ///
+    /// Then **OQ-6 moved 11 more**, from IN-APP to HANDOFF: `api/main.py` has no route that does
+    /// their work, and ADR-02 forbids the subprocess execution that would be the only alternative,
+    /// so they cannot run captured in-pane at all. `decisions.md:121` had claimed "33 of 38 IN-APP
+    /// commands have a route" — the real figure is 21 served plus `profile find` client-side.
+    /// The count reached 22/16/23 only after being wrong at 38/7/15, 33/5/22, and 33/5/24. (#321)
+    #[test]
+    fn the_policy_distribution_is_twentytwo_sixteen_twentythree() {
+        let (in_app, handoff, hidden) = distribution();
+
+        assert_eq!(in_app, 22, "expected 22 IN-APP commands, found {in_app}");
+        assert_eq!(handoff, 16, "expected 16 HANDOFF commands, found {handoff}");
+        assert_eq!(hidden, 23, "expected 23 HIDE commands, found {hidden}");
+        assert_eq!(
+            in_app + handoff + hidden,
+            61,
+            "the three policy counts must account for all 61 leaf commands of the Click tree"
+        );
+
+        // The three counts summing to 61 does not prove 61 *distinct* commands were counted: a
+        // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
+        // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
+        // this is a live hazard rather than a theoretical one.
+        let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            61,
+            "DISPLAY_ORDER must list 61 DISTINCT commands; a duplicate would let one command go \
+             uncounted while the totals still summed correctly"
+        );
+    }
+
+    /// Test 2 — **`commands()` never returns a `Hidden` entry** (INV-1).
+    ///
+    /// FR-4.3 requires hidden commands be *absent from navigation*, not greyed out, so a
+    /// `Hidden` row reaching a caller is a correctness defect rather than a display nit.
+    ///
+    /// The length assertion is what stops this being vacuous in the other direction: a
+    /// `commands()` that returned an empty `Vec` would satisfy "contains no `Hidden` entry"
+    /// perfectly. 38 is `33 + 5` written as a literal for the same reason as test 1. (#321)
+    #[test]
+    fn commands_excludes_every_hidden_entry() {
+        let offered = commands();
+
+        assert_eq!(
+            offered.len(),
+            38,
+            "commands() must offer the 33 IN-APP plus 5 HANDOFF commands and nothing else; an \
+             empty or short list would satisfy the Hidden check below while offering nothing"
+        );
+
+        for command in &offered {
+            assert_ne!(
+                command.policy,
+                Policy::Hidden,
+                "commands() returned `cao {}` with policy Hidden; FR-4.3 requires hidden \
+                 commands be ABSENT from navigation, not present-and-marked",
+                full_name(command)
+            );
+        }
+    }
+
+    /// Test 3 — **every HANDOFF entry carries a non-empty reason** (BR-4, VR-1).
+    ///
+    /// This is the control against a **wrong** classification, which the exhaustive match cannot
+    /// catch at all: `memory compact` and `memory heal` were classified HANDOFF during design,
+    /// compiled cleanly, and were wrong — only human review found them. The reason field exists
+    /// so the justification sits where a reviewer reads it.
+    ///
+    /// The count assertion is load-bearing, not decoration. A loop over "every HANDOFF entry"
+    /// passes trivially when there are none, so reclassifying all five away would turn this test
+    /// green while destroying what it checks. The literal 5 is what makes the loop's body
+    /// guaranteed to execute. (#321)
+    #[test]
+    fn every_handoff_entry_states_a_reason() {
+        let mut handoffs = Vec::new();
+
+        for id in DISPLAY_ORDER {
+            let command = entry(id);
+            let name = full_name(&command);
+            match command.policy {
+                Policy::Handoff => {
+                    let reason = command.handoff_reason.unwrap_or_else(|| {
+                        panic!(
+                            "`cao {name}` is HANDOFF with handoff_reason: None; BR-4 makes the \
+                             reason mandatory because an exhaustive match catches a MISSING \
+                             classification but never a WRONG one"
+                        )
+                    });
+                    assert!(
+                        !reason.trim().is_empty(),
+                        "`cao {name}` is HANDOFF with an empty reason; an empty reason compiles \
+                         and is still a defect (VR-1)"
+                    );
+                    handoffs.push(name);
+                }
+                // The converse: a reason on a non-HANDOFF row means a classification was
+                // changed and its justification left behind, which misleads the next reviewer.
+                _ => assert!(
+                    command.handoff_reason.is_none(),
+                    "`cao {name}` is not HANDOFF but carries a handoff_reason; a stale reason \
+                     left behind by a reclassification misinforms review"
+                ),
+            }
+        }
+
+        // The exact sixteen, not merely sixteen of them. A count alone cannot distinguish "the
+        // right sixteen" from "one reclassified in and another out" — and VR-3 exists because a
+        // count-only check passed while two commands were misclassified.
+        //
+        // Eleven of these were IN-APP until OQ-6 (#321): they have NO server route, so under
+        // ADR-02's no-subprocess rule the TUI cannot run them captured in-pane at all. Their
+        // reasons name the in-process call site, because "no route exists" is a different reason
+        // for HANDOFF than the original five's "interactive or unbounded".
+        assert_eq!(
+            handoffs,
+            vec![
+                "install",
+                "launch",
+                "memory import",
+                "memory lint",
+                "memory promote",
+                "memory repair",
+                "profile create",
+                "profile remove",
+                "profile templates",
+                "profile validate",
+                "schedule run",
+                "skills add",
+                "skills list",
+                "skills remove",
+                "workflow resume",
+                "workflow run"
+            ],
+            "expected exactly these 16 HANDOFF commands; without this assertion the loop above \
+             passes vacuously when zero entries are HANDOFF"
+        );
+    }
+
+    /// Test 4 — **all six `cao flow *` commands are HIDE** (FR-4.4).
+    ///
+    /// `flow` is a deprecated alias for `schedule` whose group Click itself marks
+    /// `hidden=True`, at `cli/commands/schedule.py:133` (issue **#378**). FR-4.4 forbids the TUI
+    /// resurrecting a command the CLI conceals — and the alias is not inert: invoking it emits a
+    /// deprecation warning to stderr, so surfacing all six would give the operator six phantom
+    /// commands that complain when run.
+    ///
+    /// The expected set is written out rather than filtered from the table, so the test reddens
+    /// in **both** directions: a seventh `flow` command appearing, and one of the six vanishing.
+    /// A `filter(parent == "flow")` loop would silently shrink with the table. (#321)
+    #[test]
+    fn every_flow_alias_command_is_hidden() {
+        const FLOW_COMMANDS: [CommandId; 6] = [
+            CommandId::FlowAdd,
+            CommandId::FlowDisable,
+            CommandId::FlowEnable,
+            CommandId::FlowList,
+            CommandId::FlowRemove,
+            CommandId::FlowRun,
+        ];
+
+        for id in FLOW_COMMANDS {
+            assert_eq!(
+                policy(id),
+                Policy::Hidden,
+                "{id:?} must be Hidden: Click marks the `flow` group hidden=True at \
+                 cli/commands/schedule.py:133, and FR-4.4 forbids the TUI resurrecting a \
+                 command the CLI itself conceals (issue #378)"
+            );
+        }
+
+        let in_table = DISPLAY_ORDER
+            .iter()
+            .filter(|id| entry(**id).parent == Some("flow"))
+            .count();
+        assert_eq!(
+            in_table, 6,
+            "expected exactly 6 `cao flow *` commands in the table; the hard-coded list above \
+             cannot notice a seventh being added"
+        );
+
+        assert!(
+            !commands()
+                .iter()
+                .any(|command| command.parent == Some("flow")),
+            "no `cao flow *` command may appear in the navigable list"
+        );
+    }
+
+    /// Test 5 — **`cao tui` is HIDE.**
+    ///
+    /// The 61st entry, and the one the design predicted would arrive: `business-logic-model.md`
+    /// recorded `cao tui` as "absent from the table … `skeleton-wheel-bundle` adds the
+    /// subcommand", and Bolt 1 duly added it. It is HIDE because the TUI must not offer itself —
+    /// launching a second TUI from inside the first is either a no-op or a nested-terminal mess.
+    ///
+    /// This test is what guards the arithmetic correction described in test 1: if `cao tui` were
+    /// ever reclassified, or dropped from the table, the 33/5/23 distribution would stop
+    /// describing reality and the reason would be this specific command. (#321)
+    #[test]
+    fn the_tui_command_does_not_offer_itself() {
+        assert_eq!(
+            policy(CommandId::Tui),
+            Policy::Hidden,
+            "`cao tui` must be Hidden: the TUI offering itself as a runnable command nests a \
+             second TUI inside the first"
+        );
+
+        assert!(
+            !commands()
+                .iter()
+                .any(|command| command.id == CommandId::Tui),
+            "`cao tui` must be absent from the navigable list, not merely marked (FR-4.3)"
+        );
+    }
+
+    /// Test 6 — **`cao launch` has 12 parameters: 1 required, 7 text, 5 flags** (BR-9).
+    ///
+    /// Every number is hard-coded. The surface was enumerated from the Click tree, and getting
+    /// it wrong is not cosmetic in either direction: marking a second parameter required blocks
+    /// runs the CLI would accept (FR-2.2), while missing one hides a parameter the operator
+    /// needs. An earlier artifact in this record claimed "all 12 parameters are reachable" while
+    /// showing only 10 — `--auto-approve` and the positional `message` were the two omitted.
+    ///
+    /// `message` being **positional** is asserted separately because it changes how a caller
+    /// builds argv. `params()` returns the CLI's own spelling (BR-8), so a positional argument
+    /// is recognisable by having no `--` prefix — there is no separate flag on [`super::Param`]
+    /// for it, and inventing `--message` would make the CLI reject the request. Note also that
+    /// `--memory` is a **flag** despite reading like a value-taking option. (#321)
+    #[test]
+    fn launch_exposes_twelve_parameters_with_agents_the_only_required_one() {
+        let launch = params(CommandId::Launch);
+
+        assert_eq!(launch.len(), 12, "`cao launch` declares 12 parameters");
+
+        let required: Vec<&str> = launch
+            .iter()
+            .filter(|p| p.required)
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(
+            required,
+            vec!["--agents"],
+            "`--agents` is the ONLY required parameter of `cao launch`; marking a second one \
+             required blocks runs the CLI would accept (FR-2.2)"
+        );
+
+        let text = launch.iter().filter(|p| p.kind == ParamKind::Text).count();
+        let flags = launch.iter().filter(|p| p.kind == ParamKind::Flag).count();
+        assert_eq!(text, 7, "7 of the 12 take a value");
+        assert_eq!(flags, 5, "5 of the 12 are boolean flags");
+
+        let message = launch
+            .iter()
+            .find(|p| p.name == "message")
+            .expect("`cao launch` takes a trailing positional `message` argument");
+        assert!(
+            !message.name.starts_with("--"),
+            "`message` is a POSITIONAL argument, so it must carry no `--` prefix; a caller \
+             building argv places it by position and `--message` is a flag the CLI rejects"
+        );
+        assert!(
+            !message.required,
+            "the positional `message` is optional; only `--agents` is required"
+        );
+    }
+}
