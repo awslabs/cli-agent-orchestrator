@@ -33,6 +33,14 @@ src/cli_agent_orchestrator/web_ui/
 # cao_mcp_apps/, bundled into the wheel via the hatch artifacts rule)
 src/cli_agent_orchestrator/ext_apps/apps_static/
 
+# Compiled Rust TUI binary staged here by `python scripts/build_tui.py build`
+# and bundled into the wheel via the fourth hatch artifacts glob. Build output,
+# never a source file: it is ~400 KB per platform and platform-specific, so
+# committing it would put a binary blob in the history that the weekly gitleaks
+# sweep scans. Same posture as web_ui/ and ext_apps/apps_static/ above. (#321)
+src/cli_agent_orchestrator/cao-tui
+src/cli_agent_orchestrator/cao-tui.exe
+
 # Project specific
 *.log
 *.db
@@ -60,3 +68,14 @@ aidlc-docs
 
 # Separate git repos (not part of this project)
 cao-flows/
+
+# Rust build output (tui/). Must be ignored BEFORE the first `cargo build`:
+# cargo output is multi-GB and must never enter the history the weekly gitleaks
+# sweep scans. No leading slash, so this also covers any future nested crate. (#321)
+target/
+
+# cibuildwheel's default output directory. `dist/` is already ignored above, but
+# cibuildwheel writes elsewhere, and these wheels each embed a compiled binary —
+# committing one would put a multi-MB executable into the history the weekly
+# gitleaks sweep scans, for the same reason target/ is ignored. (#321)
+wheelhouse/

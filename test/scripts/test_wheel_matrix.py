@@ -1,0 +1,607 @@
+"""Tests for the per-platform wheel matrix — unit `wheel-matrix`, issue #321.
+
+These lock in the fix for a defect verified in a REAL artifact: a wheel tagged
+``py3-none-any`` that carried a ``Mach-O 64-bit arm64`` executable. ``py3-none-any`` means
+"pure Python, runs anywhere", so pip installed it on Linux and Windows where the binary
+cannot execute, and the operator only found out at ``cao tui`` time.
+
+Every test here either (a) exercises the tag-selection logic that produces the platform tag,
+or (b) asserts a guard actually FAILS on the bad input it exists to catch. The second kind
+matters more: a guard that cannot fail is worse than no guard, because it reports success.
+
+What these tests deliberately do NOT claim: that Linux or Windows wheels work. Those cannot
+be built or executed on the development machine (macOS arm64), and no test here pretends
+otherwise — see `test_wheel_matrix_documents_unverified_platforms`.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+
+
+def _load_script(name: str) -> Any:
+    """Import a module from scripts/ by path.
+
+    scripts/ is not a package (no __init__.py) and is not on sys.path, so a plain import
+    would fail. Loading by path keeps the scripts runnable as scripts — which is how CI
+    invokes them — rather than forcing them into a package layout just to be testable.
+    """
+    path = SCRIPTS_DIR / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"_cao_script_{name}", path)
+    assert spec is not None and spec.loader is not None, f"cannot load {path}"
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+build_tui = _load_script("build_tui")
+assert_wheel_matrix = _load_script("assert_wheel_matrix")
+smoke_test_wheel = _load_script("smoke_test_wheel")
+
+
+# The build-hook module imports `hatchling` at module scope, and `hatchling` is a BUILD
+# dependency (`[build-system] requires`) — absent from a `uv sync --dev` environment.
+#
+# So the tag DECISION lives in a module-level `resolve_build_data()` that needs no hatchling,
+# and is loaded here by exec'ing the file's source up to that import. The alternative — skip
+# these tests when hatchling is missing — would mean the tests for THE ACTUAL FIX never ran
+# in CI's test job, and a guard that does not run is not a guard.
+#
+# The hatchling adapter class itself is 4 lines of delegation and is exercised end-to-end by
+# `uv build` in CI, which is where a broken adapter would surface immediately. (#321)
+def _load_hook_logic() -> Any:
+    """Load hatch_build_tui_tag's pure logic without importing hatchling.
+
+    Executes the module source truncated at the deliberately-late hatchling import. The
+    truncation point is ASSERTED, not assumed: if that import ever moves above the pure
+    functions, this raises instead of silently testing a partial module.
+    """
+    source = (SCRIPTS_DIR / "hatch_build_tui_tag.py").read_text(encoding="utf-8")
+    marker = "from hatchling.builders.hooks.plugin.interface import BuildHookInterface"
+    assert marker in source, "the hatchling import moved; update this loader deliberately"
+    head = source.split(marker, 1)[0]
+    for required in ("def resolve_build_data", "def staged_binaries", "def _env_flag"):
+        assert required in head, (
+            f"{required} is no longer defined BEFORE the hatchling import — the tag decision "
+            "must stay importable without the build backend so its tests always run"
+        )
+    module: Dict[str, Any] = {"__name__": "_cao_hook_logic", "__file__": str(SCRIPTS_DIR)}
+    exec(compile(head, str(SCRIPTS_DIR / "hatch_build_tui_tag.py"), "exec"), module)
+    return SimpleNamespace(**module)
+
+
+hatch_hook = _load_hook_logic()
+
+
+def _make_wheel(path: Path, members: dict[str, bytes]) -> Path:
+    """Write a minimal .whl (a zip) containing the given members."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return path
+
+
+def _wheel_with_tag(tmp_path: Path, tag: str, binary_size: int = 1024) -> Path:
+    """A wheel whose WHEEL metadata declares ``tag`` and which bundles a fake TUI binary."""
+    filename = f"cli_agent_orchestrator-2.3.0-{tag}.whl"
+    return _make_wheel(
+        tmp_path / filename,
+        {
+            "cli_agent_orchestrator-2.3.0.dist-info/WHEEL": (
+                f"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: false\nTag: {tag}\n"
+            ).encode(),
+            "cli_agent_orchestrator/cao-tui": b"\x00" * binary_size,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# THE FIX: the tag the build hook selects
+# ---------------------------------------------------------------------------------------
+
+
+def _stage_binary(tmp_path: Path, name: str = "cao-tui") -> Path:
+    """Create the package dir with a staged fake TUI binary, as build_tui.py would."""
+    pkg = tmp_path / "src" / "cli_agent_orchestrator"
+    pkg.mkdir(parents=True, exist_ok=True)
+    binary = pkg / name
+    binary.write_bytes(b"\x7fELF fake binary")
+    return binary
+
+
+def _resolve(tmp_path: Path, best_tag: str, target_name: str = "wheel") -> Dict[str, Any]:
+    """Run the real decision function and return the resulting build_data.
+
+    ``best_tag`` is the one input a test substitutes — it stands in for hatchling's
+    ``get_best_matching_tag()``, the platform-tag SOURCE. Everything else is production code,
+    so these tests cannot pass by re-expressing the logic they are checking.
+    """
+    build_data: Dict[str, Any] = {"infer_tag": False, "pure_python": True}
+    hatch_hook.resolve_build_data(str(tmp_path), target_name, best_tag, build_data)
+    return build_data
+
+
+class TestPlatformTagSelection:
+    """The hook must produce ``py3-none-<platform>`` — not ``any``, and not ``cpXX-cpXX``."""
+
+    def test_tags_wheel_for_the_platform_when_binary_is_staged(self, tmp_path, monkeypatch):
+        """The defect's direct inverse: a staged binary yields a platform-specific tag."""
+        _stage_binary(tmp_path)
+        monkeypatch.setenv(hatch_hook.FORCE_ENV, "1")
+
+        build_data = _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64")
+
+        assert build_data["tag"] == "py3-none-macosx_26_0_arm64"
+        assert build_data["pure_python"] is False, "Root-Is-Purelib must become false"
+
+    def test_windows_exe_is_detected_by_the_same_path(self, tmp_path, monkeypatch):
+        """The artifacts glob ends in `*` to cover `.exe`; the hook must agree."""
+        _stage_binary(tmp_path, name="cao-tui.exe")
+        monkeypatch.setenv(hatch_hook.FORCE_ENV, "1")
+
+        build_data = _resolve(tmp_path, "cp310-cp310-win_amd64")
+        assert build_data["tag"] == "py3-none-win_amd64"
+
+    @pytest.mark.parametrize(
+        "best_tag,expected_platform",
+        [
+            ("cp312-cp312-macosx_26_0_arm64", "macosx_26_0_arm64"),
+            ("cp310-cp310-macosx_26_0_x86_64", "macosx_26_0_x86_64"),
+            ("cp310-cp310-manylinux_2_28_x86_64", "manylinux_2_28_x86_64"),
+            ("cp310-cp310-linux_x86_64", "linux_x86_64"),
+            ("cp310-cp310-win_amd64", "win_amd64"),
+        ],
+    )
+    def test_platform_component_is_preserved_for_every_matrix_target(
+        self, tmp_path, monkeypatch, best_tag, expected_platform
+    ):
+        """The platform half comes from hatchling and must pass through untouched."""
+        _stage_binary(tmp_path)
+        monkeypatch.setenv(hatch_hook.FORCE_ENV, "1")
+
+        build_data = _resolve(tmp_path, best_tag)
+        assert build_data["tag"] == f"py3-none-{expected_platform}"
+
+    def test_tag_is_abi_independent_so_the_wheel_installs_on_every_supported_python(
+        self, tmp_path, monkeypatch
+    ):
+        """``cpXX-cpXX`` would pin the wheel to ONE CPython ABI.
+
+        This is the trap that ``infer_tag = True`` alone walks into: hatchling's
+        ``get_best_matching_tag()`` returns the RUNNING interpreter's full tag. Under
+        cibuildwheel the build runs on cp310, so the wheel would be tagged
+        ``cp310-cp310-<plat>`` and pip would REFUSE it on 3.11-3.14 — while this project
+        declares ``requires-python = ">=3.10"`` and ships no CPython extension module. That
+        would be a wider outage than the defect it replaced.
+        """
+        _stage_binary(tmp_path)
+        monkeypatch.setenv(hatch_hook.FORCE_ENV, "1")
+
+        build_data = _resolve(tmp_path, "cp310-cp310-manylinux_2_28_x86_64")
+
+        interpreter, abi, _ = build_data["tag"].split("-", 2)
+        assert (interpreter, abi) == ("py3", "none"), (
+            f"tag {build_data['tag']!r} pins an ABI; a wheel with no C extension must stay "
+            "py3-none so it installs on every supported Python"
+        )
+
+    def test_is_inert_when_no_binary_is_staged(self, tmp_path, monkeypatch):
+        """A contributor with no Rust toolchain must still get an installable pure wheel."""
+        (tmp_path / "src" / "cli_agent_orchestrator").mkdir(parents=True)
+        monkeypatch.delenv(hatch_hook.FORCE_ENV, raising=False)
+        monkeypatch.delenv(hatch_hook.CIBUILDWHEEL_ENV, raising=False)
+
+        build_data = _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64")
+
+        assert "tag" not in build_data, "no binary staged: hatchling's default tag must stand"
+        assert build_data["pure_python"] is True
+
+    def test_refuses_a_pure_tag_when_a_native_binary_is_staged(self, tmp_path, monkeypatch):
+        """The contradiction must be an error, not a silent choice — it IS the defect."""
+        _stage_binary(tmp_path)
+        monkeypatch.setenv(hatch_hook.FORCE_ENV, "0")
+
+        with pytest.raises(ValueError, match="native TUI binary is staged"):
+            _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64")
+
+    def test_refuses_a_platform_wheel_with_no_binary_in_it(self, tmp_path, monkeypatch):
+        """Under cibuildwheel a missing binary means before-build did not stage."""
+        (tmp_path / "src" / "cli_agent_orchestrator").mkdir(parents=True)
+        monkeypatch.setenv(hatch_hook.CIBUILDWHEEL_ENV, "1")
+        monkeypatch.delenv(hatch_hook.FORCE_ENV, raising=False)
+
+        with pytest.raises(ValueError, match=r"no cao-tui\* binary is staged"):
+            _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64")
+
+    def test_refuses_when_hatchling_resolves_an_any_platform(self, tmp_path, monkeypatch):
+        """Never fall through to 'any' — that is the exact defect being fixed."""
+        _stage_binary(tmp_path)
+        monkeypatch.setenv(hatch_hook.FORCE_ENV, "1")
+
+        with pytest.raises(ValueError, match="platform-independent wheel"):
+            _resolve(tmp_path, "py3-none-any")
+
+    def test_sdist_target_is_untouched(self, tmp_path, monkeypatch):
+        """An sdist ships source; tagging it for a platform would be meaningless."""
+        _stage_binary(tmp_path)
+        monkeypatch.setenv(hatch_hook.FORCE_ENV, "1")
+
+        build_data: Dict[str, Any] = {}
+        hatch_hook.resolve_build_data(str(tmp_path), "sdist", "", build_data)
+        assert build_data == {}
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+    def test_truthy_force_values_request_a_platform_wheel(self, tmp_path, monkeypatch, value):
+        _stage_binary(tmp_path)
+        monkeypatch.setenv(hatch_hook.FORCE_ENV, value)
+        assert _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64")["pure_python"] is False
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_blank_force_value_is_treated_as_unset_not_as_false(self, tmp_path, monkeypatch, value):
+        """Blank must mean "decide from the tree", not "the caller demanded a pure wheel".
+
+        Reading blank as an explicit False would make a staged binary raise the contradiction
+        error on any CI runner that defines the variable as empty — a self-inflicted outage.
+        """
+        _stage_binary(tmp_path)
+        monkeypatch.setenv(hatch_hook.FORCE_ENV, value)
+        monkeypatch.delenv(hatch_hook.CIBUILDWHEEL_ENV, raising=False)
+
+        build_data = _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64")
+        assert build_data["tag"] == "py3-none-macosx_26_0_arm64"
+
+
+# ---------------------------------------------------------------------------------------
+# The publish gate: the full platform set, and no 'any' wheel
+# ---------------------------------------------------------------------------------------
+
+
+class TestAssertWheelMatrix:
+    def test_full_four_platform_set_passes(self, tmp_path):
+        for tag in (
+            "py3-none-macosx_26_0_arm64",
+            "py3-none-macosx_26_0_x86_64",
+            "py3-none-linux_x86_64",
+            "py3-none-win_amd64",
+        ):
+            _wheel_with_tag(tmp_path, tag)
+        assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 0
+
+    def test_missing_one_platform_fails(self, tmp_path):
+        """A partial matrix must not publish. `fail-fast: false` makes this easy to miss."""
+        for tag in (
+            "py3-none-macosx_26_0_arm64",
+            "py3-none-linux_x86_64",
+            "py3-none-win_amd64",
+        ):
+            _wheel_with_tag(tmp_path, tag)
+        assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 1
+
+    def test_an_any_wheel_in_the_set_fails(self, tmp_path):
+        """An 'any' wheel OUTRANKS the platform wheels for any unmatched host."""
+        for tag in (
+            "py3-none-macosx_26_0_arm64",
+            "py3-none-macosx_26_0_x86_64",
+            "py3-none-linux_x86_64",
+            "py3-none-win_amd64",
+            "py3-none-any",
+        ):
+            _wheel_with_tag(tmp_path, tag)
+        assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 1
+
+    def test_empty_dist_fails_rather_than_passing_quietly(self, tmp_path):
+        """A missing artifact is a FAILED check — the vacuous-guard failure mode."""
+        assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 1
+
+    def test_missing_directory_fails(self, tmp_path):
+        assert assert_wheel_matrix.main(["--dist", str(tmp_path / "nope")]) == 1
+
+    def test_manylinux_retagged_wheel_satisfies_the_linux_requirement(self, tmp_path):
+        """``manylinux_2_28_x86_64`` is the tag that ACTUALLY ships, and must be accepted.
+
+        Measured, not assumed: running `auditwheel repair` inside
+        ``quay.io/pypa/manylinux_2_28_x86_64`` against a wheel carrying a real ELF binary
+        rewrote ``py3-none-linux_x86_64`` to ``py3-none-manylinux_2_28_x86_64`` and exited 0.
+        PyPI rejects the un-retagged ``linux_x86_64`` form, so requiring that literal would
+        have failed this gate on every correctly-built Linux wheel.
+
+        This test exists because an earlier draft asserted the OPPOSITE — that a manylinux
+        wheel should be rejected — encoding a wrong belief about auditwheel as a passing test.
+        Running the real tool is what corrected it.
+        """
+        for tag in (
+            "py3-none-macosx_26_0_arm64",
+            "py3-none-macosx_26_0_x86_64",
+            "py3-none-manylinux_2_28_x86_64",
+            "py3-none-win_amd64",
+        ):
+            _wheel_with_tag(tmp_path, tag)
+        assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 0
+
+    def test_musllinux_does_not_satisfy_the_linux_requirement(self, tmp_path):
+        """The Linux pattern must not be so loose that a skipped platform satisfies it.
+
+        `musllinux` is explicitly skipped (no musl Rust target, no Alpine CI job), so a
+        musllinux wheel appearing in place of the glibc one is a real misconfiguration. Pinned
+        because the pattern's leading wildcard — needed for `manylinux` — could otherwise
+        match this too and make the Linux check unfalsifiable.
+        """
+        for tag in (
+            "py3-none-macosx_26_0_arm64",
+            "py3-none-macosx_26_0_x86_64",
+            "py3-none-musllinux_1_2_x86_64",
+            "py3-none-win_amd64",
+        ):
+            _wheel_with_tag(tmp_path, tag)
+        assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 1
+
+    def test_wrong_arch_linux_wheel_does_not_satisfy_x86_64(self, tmp_path):
+        """The suffix pins the ARCH; an aarch64 wheel must not stand in for x86_64."""
+        for tag in (
+            "py3-none-macosx_26_0_arm64",
+            "py3-none-macosx_26_0_x86_64",
+            "py3-none-manylinux_2_28_aarch64",
+            "py3-none-win_amd64",
+        ):
+            _wheel_with_tag(tmp_path, tag)
+        assert assert_wheel_matrix.main(["--dist", str(tmp_path)]) == 1
+
+
+# ---------------------------------------------------------------------------------------
+# NFR-2's 10 MB ceiling
+# ---------------------------------------------------------------------------------------
+
+
+class TestBinarySizeCeiling:
+    def test_ceiling_is_ten_binary_megabytes(self):
+        """Pinned at 3.2 Q5; read strictly as 10 * 1024 * 1024, the stricter reading.
+
+        Hard-coded literal rather than derived from the constant under test: sourcing the
+        expected value from the value being checked is a guard that cannot fail.
+        """
+        assert build_tui.DEFAULT_MAX_BINARY_BYTES == 10485760
+        assert smoke_test_wheel.DEFAULT_MAX_BINARY_BYTES == 10485760
+
+    def test_oversized_binary_in_wheel_is_rejected(self, tmp_path):
+        wheel = _wheel_with_tag(tmp_path, "py3-none-macosx_26_0_arm64", binary_size=2048)
+        with pytest.raises(build_tui.BuildError, match="over NFR-2's ceiling"):
+            build_tui._assert_binary_size(wheel, max_bytes=1024)
+
+    def test_binary_at_exactly_the_ceiling_is_allowed(self, tmp_path):
+        """Boundary: the ceiling is inclusive, so ``==`` must pass while ``+1`` fails."""
+        wheel = _wheel_with_tag(tmp_path, "py3-none-macosx_26_0_arm64", binary_size=1024)
+        build_tui._assert_binary_size(wheel, max_bytes=1024)
+        with pytest.raises(build_tui.BuildError):
+            build_tui._assert_binary_size(wheel, max_bytes=1023)
+
+    def test_wheel_with_no_binary_fails_rather_than_passing_quietly(self, tmp_path):
+        wheel = _make_wheel(
+            tmp_path / "cli_agent_orchestrator-2.3.0-py3-none-macosx_26_0_arm64.whl",
+            {"cli_agent_orchestrator/__init__.py": b""},
+        )
+        with pytest.raises(build_tui.BuildError, match="no cao-tui\\* binary found"):
+            build_tui._assert_binary_size(wheel, max_bytes=10485760)
+
+
+# ---------------------------------------------------------------------------------------
+# The per-platform smoke test (SR-1)
+# ---------------------------------------------------------------------------------------
+
+
+class TestSmokeTestAssertions:
+    def test_any_tag_is_rejected(self, tmp_path):
+        wheel = _wheel_with_tag(tmp_path, "py3-none-any")
+        with pytest.raises(smoke_test_wheel.SmokeTestError, match="platform 'any'"):
+            smoke_test_wheel.assert_platform_tag(wheel)
+
+    def test_platform_tag_is_accepted(self, tmp_path):
+        wheel = _wheel_with_tag(tmp_path, "py3-none-macosx_26_0_arm64")
+        smoke_test_wheel.assert_platform_tag(wheel)
+
+    def test_wheel_without_wheel_metadata_fails(self, tmp_path):
+        wheel = _make_wheel(tmp_path / "broken-1.0-py3-none-any.whl", {"a.py": b""})
+        with pytest.raises(smoke_test_wheel.SmokeTestError, match="no .dist-info/WHEEL"):
+            smoke_test_wheel.assert_platform_tag(wheel)
+
+    def test_missing_wheel_is_a_failure_not_a_pass(self, tmp_path):
+        assert smoke_test_wheel.main(["--wheel", str(tmp_path / "absent.whl")]) == 1
+
+
+# ---------------------------------------------------------------------------------------
+# Cross-compilation: the arch cargo builds must match the arch the wheel is tagged for
+# ---------------------------------------------------------------------------------------
+
+
+class TestMacosCrossCompileTarget:
+    """ARCHFLAGS drives BOTH the wheel tag and the cargo target; they must not diverge.
+
+    A mismatch here is invisible until exec time: an arm64 binary inside an x86_64-tagged
+    wheel installs cleanly on an Intel Mac and then fails to run.
+    """
+
+    @pytest.mark.parametrize(
+        "archflags,expected",
+        [
+            ("-arch arm64", "aarch64-apple-darwin"),
+            ("-arch x86_64", "x86_64-apple-darwin"),
+        ],
+    )
+    def test_archflags_maps_to_the_matching_rust_target(self, archflags, expected, monkeypatch):
+        monkeypatch.setenv("ARCHFLAGS", archflags)
+        arch = build_tui._requested_macos_arch()
+        assert build_tui._ARCHFLAGS_TO_RUST_TARGET[arch] == expected
+
+    def test_no_archflags_means_a_native_build(self, monkeypatch):
+        monkeypatch.delenv("ARCHFLAGS", raising=False)
+        assert build_tui._requested_macos_arch() is None
+
+    def test_blank_archflags_means_a_native_build(self, monkeypatch):
+        monkeypatch.setenv("ARCHFLAGS", "   ")
+        assert build_tui._requested_macos_arch() is None
+
+    def test_universal2_request_is_refused_rather_than_silently_single_arch(self, monkeypatch):
+        """Two archs need a `lipo` of two cargo targets, which this script does not do.
+
+        Returning one arch here would put a single-arch binary inside a universal2-tagged
+        wheel — broken on half the Macs that accept it.
+        """
+        monkeypatch.setenv("ARCHFLAGS", "-arch arm64 -arch x86_64")
+        with pytest.raises(build_tui.BuildError, match="cannot produce a universal2 binary"):
+            build_tui._requested_macos_arch()
+
+
+# ---------------------------------------------------------------------------------------
+# Configuration invariants
+# ---------------------------------------------------------------------------------------
+
+
+class TestConfigurationInvariants:
+    @staticmethod
+    def _pyproject() -> dict:
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10
+            import tomli as tomllib  # type: ignore[no-redef]
+        return tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    def test_binary_stem_agrees_across_every_place_it_is_declared(self):
+        """Five copies of one name. A drift makes the artifacts glob match nothing —
+        and hatchling treats that as a SILENT no-op (defect D1's failure mode)."""
+        cargo = (REPO_ROOT / "tui" / "Cargo.toml").read_text(encoding="utf-8")
+        assert 'name = "cao-tui"' in cargo
+
+        assert build_tui.BINARY_STEM == "cao-tui"
+        assert smoke_test_wheel.BINARY_STEM == "cao-tui"
+
+        # The hook's copy is read as TEXT rather than imported, so this invariant holds in
+        # environments without hatchling — the drift it guards against is the whole point.
+        hook_source = (SCRIPTS_DIR / "hatch_build_tui_tag.py").read_text(encoding="utf-8")
+        assert 'BINARY_STEM = "cao-tui"' in hook_source
+
+        # cli/commands/tui.py locates the binary at runtime; a drift here means `cao tui`
+        # cannot find a binary the wheel does in fact contain.
+        cli_source = (
+            REPO_ROOT / "src" / "cli_agent_orchestrator" / "cli" / "commands" / "tui.py"
+        ).read_text(encoding="utf-8")
+        assert '_BINARY_STEM = "cao-tui"' in cli_source
+
+        globs = self._pyproject()["tool"]["hatch"]["build"]["artifacts"]
+        assert "src/cli_agent_orchestrator/cao-tui*" in globs
+
+    def test_build_hook_is_registered_for_the_wheel_target(self):
+        """Without the registration the tag stays py3-none-any and the defect returns."""
+        hooks = self._pyproject()["tool"]["hatch"]["build"]["targets"]["wheel"]["hooks"]
+        assert hooks["custom"]["path"] == "scripts/hatch_build_tui_tag.py"
+
+    def test_cibuildwheel_before_build_stages_the_binary(self):
+        """Ordering is load-bearing: the binary must exist BEFORE hatchling globs for it."""
+        cibw = self._pyproject()["tool"]["cibuildwheel"]
+        assert "scripts/build_tui.py build" in cibw["before-build"]
+
+    def test_cibuildwheel_test_command_executes_the_binary(self):
+        """SR-1: `cao --help` passes with NO binary in the wheel. Only an exec proves it."""
+        cibw = self._pyproject()["tool"]["cibuildwheel"]
+        assert "smoke_test_wheel.py" in cibw["test-command"]
+        assert "--max-binary-bytes" in cibw["test-command"]
+
+    def test_cibuildwheel_builds_one_abi_independent_wheel_per_platform(self):
+        cibw = self._pyproject()["tool"]["cibuildwheel"]
+        assert cibw["build"] == "cp310-*", (
+            "one build per platform; cibuildwheel reuses the py3-none wheel for the other "
+            "interpreters via find_compatible_wheel()"
+        )
+        assert cibw["archs"] == ["auto64"]
+
+    def test_cargo_build_passes_locked(self):
+        """SR-5: a release must not silently resolve different dependency versions."""
+        source = (SCRIPTS_DIR / "build_tui.py").read_text(encoding="utf-8")
+        assert '["cargo", "build", "--release", "--locked"]' in source
+
+    def test_trivy_can_fail_the_build(self):
+        """SR-4: without exit-code, "Security Scan passed" attests completion, not cleanliness."""
+        ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        assert "exit-code: '1'" in ci
+
+    def test_every_action_added_by_this_unit_is_sha_pinned(self):
+        """SR-2: a `uses:` on a mutable tag or branch is unreviewable supply chain.
+
+        Asserted over the whole publish workflow because that is the file this unit owns and
+        the one holding the PyPI credential path. A 40-hex ref is required for every
+        third-party action; the local `./`-style and reusable-workflow forms are absent here.
+        """
+        import re
+
+        text = (REPO_ROOT / ".github" / "workflows" / "publish-to-pypi.yml").read_text(
+            encoding="utf-8"
+        )
+        unpinned = [
+            ref
+            for ref in re.findall(r"^\s*-?\s*uses:\s*(\S+)", text, re.MULTILINE)
+            if not re.search(r"@[0-9a-f]{40}$", ref)
+        ]
+        assert not unpinned, f"these `uses:` are not SHA-pinned: {unpinned}"
+
+    def test_pypi_publish_action_is_sha_pinned_specifically(self):
+        """Called out separately: this action holds the OIDC credential path to PyPI.
+
+        `release/v1` is a mutable BRANCH — the highest-consequence moving reference in the
+        repo. Named in its own test so a regression here cannot hide inside the aggregate.
+        """
+        text = (REPO_ROOT / ".github" / "workflows" / "publish-to-pypi.yml").read_text(
+            encoding="utf-8"
+        )
+        assert "pypa/gh-action-pypi-publish@release/v1" not in text
+        assert "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33" in text
+
+    def test_wheel_jobs_carry_an_explicit_timeout(self):
+        """No job in this repo had one; a hung pty/container build must not burn 6 hours."""
+        text = (REPO_ROOT / ".github" / "workflows" / "publish-to-pypi.yml").read_text(
+            encoding="utf-8"
+        )
+        assert text.count("timeout-minutes:") >= 5
+
+    def test_matrix_covers_the_four_named_platforms(self):
+        """Interview Q2. This repo had ZERO non-Linux runners before this unit."""
+        text = (REPO_ROOT / ".github" / "workflows" / "publish-to-pypi.yml").read_text(
+            encoding="utf-8"
+        )
+        for runner in ("macos-latest", "ubuntu-latest", "windows-latest"):
+            assert f"os: {runner}" in text, f"{runner} missing from the wheel matrix"
+        for arch in ("arm64", "x86_64", "AMD64"):
+            assert f"archs: {arch}" in text
+
+    def test_wheelhouse_is_gitignored(self):
+        """cibuildwheel's output dir holds multi-MB binaries; it must not enter history."""
+        assert "wheelhouse/" in (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+
+
+def test_wheel_matrix_documents_unverified_platforms():
+    """The honesty requirement, asserted rather than left to a report.
+
+    Three of the four platform wheels CANNOT be built or executed on the development machine
+    (macOS arm64), and the operator declined Docker/QEMU emulation. The configuration must
+    therefore state which platforms remain CI's to prove — a config that reads as though all
+    four were verified is exactly the "passed CI but partially worked" failure this intent
+    exists to eliminate, made worse because wheels reach operators.
+
+    This test fails if those admissions are removed from the config, so the caveat cannot be
+    quietly dropped by a later edit.
+    """
+    text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert "CONSEQUENCE, stated rather than glossed" in text, (
+        "the pyproject cibuildwheel section must keep naming the known gaps (the "
+        "linux_x86_64/PyPI rejection, and the untested cross-compiled macOS x86_64 binary)"
+    )
+    assert "UNVERIFIED" in text
