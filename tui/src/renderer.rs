@@ -1468,6 +1468,75 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
     /// forwarding, and PR-1's test could not distinguish incremental from buffered. `PaneSink`
     /// wraps the pane and counts writes, which is what makes the incrementality assertion possible
     /// without changing the production path. (#321)
+    /// `profile find`, served client-side (OQ-6 Q2) — the one routeless IN-APP command.
+    ///
+    /// Reads the query from the form's own field rather than inventing a second input, and renders
+    /// through the SAME pane path every other IN-APP command uses, so FR-3.2's production-caller
+    /// obligation holds here too: `attach` -> `push_bytes` -> `complete`.
+    ///
+    /// A no-match is `exit 0` with a stated "no profiles matched", NOT an error: the search worked
+    /// and the answer is empty. Reporting a successful empty search as a failure is the same
+    /// misrepresentation as an empty HANDOFF pane reading as a failed run.
+    fn run_profile_find(&mut self) {
+        // `cao profile find` takes a positional KEYWORD, so accept either spelling rather than
+        // guessing one.
+        let query = self
+            .flow
+            .fields()
+            .iter()
+            .find(|field| {
+                field.name == "keyword" || field.name == "--keyword" || field.name == "KEYWORD"
+            })
+            .map(field_value_text)
+            .unwrap_or_default()
+            .to_lowercase();
+
+        self.running = true;
+        self.pane.attach(Policy::InApp);
+
+        // Filters `profiles()` rather than calling `ServerClient::find_profiles`: the renderer holds
+        // an injected `S: ServerApi`, and that trait exposes `profiles()`. Widening the trait for one
+        // command would force every test double to implement a method only this path uses. The
+        // substring rule is identical either way, and this keeps the injection seam intact.
+        let outcome = self.server.profiles();
+        self.running = false;
+
+        match outcome {
+            Ok(all) => {
+                let profiles: Vec<&Profile> = all
+                    .iter()
+                    .filter(|profile| profile_searchable_text(profile).contains(&query))
+                    .collect();
+                let mut rendered = String::new();
+                if profiles.is_empty() {
+                    rendered.push_str(&format!("no profiles matched {query:?}\n"));
+                } else {
+                    for profile in &profiles {
+                        // The unselectable marker travels with the row (FR-1.5): an unloadable
+                        // profile is SHOWN and explained, never filtered out silently.
+                        let marker = if profile.loadable {
+                            ""
+                        } else {
+                            "  [not loadable]"
+                        };
+                        rendered.push_str(&format!("{}{marker}\n", profile.name));
+                    }
+                }
+                self.pane.push_bytes(rendered.as_bytes());
+                self.pane.complete(0, None);
+            }
+            Err(error) => {
+                self.pane.push_bytes(error.to_string().as_bytes());
+                self.pane.complete(1, None);
+                self.banner = Some(Banner::error(
+                    "could not read the profile list".to_string(),
+                    error.to_string(),
+                    "check that cao-server is reachable, then retry with [ctrl+r]",
+                ));
+            }
+        }
+    }
+
     pub fn run_in_app(&mut self, id: CommandId) {
         self.retryable = Some(Retryable::InApp(id));
         self.banner = None;
@@ -1501,6 +1570,16 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                     ),
                     "run it from the CLI for now; this is a stated limit, not a failure",
                 ));
+                return;
+            }
+            // `profile find` is the ONE routeless IN-APP command, and the operator's OQ-6 Q2
+            // decision was to serve it CLIENT-SIDE: a case-insensitive substring filter over
+            // `GET /agents/profiles`, deliberately not a BM25Plus port. `ServerClient::find_profiles`
+            // implements it — but nothing called it from production, so this arm reported "no HTTP
+            // route" and the approved behaviour was unreachable. That is design defect #3's shape
+            // again: working code with no production caller. (#321)
+            InAppReadiness::NoRoute if id == CommandId::ProfileFind => {
+                self.run_profile_find();
                 return;
             }
             InAppReadiness::NoRoute => {
@@ -1754,6 +1833,30 @@ fn render_field(field: &Field, focused: bool) -> String {
     };
 
     format!("{marker} {label}{requirement} [{kind}]: {value}")
+}
+
+/// The four fields Python's `_searchable_text` tokenizes, lowercased for a case-insensitive match.
+///
+/// `name`, `description`, `tags`, `capabilities` — matching `profile_search.py:43-51`. Deliberately
+/// NOT a BM25Plus port (OQ-6 Q2): reimplementing the ranking invites silent divergence from the
+/// Python scorer, and a search that ranks differently while claiming parity is worse than one that
+/// plainly filters. (#321)
+fn profile_searchable_text(profile: &Profile) -> String {
+    let mut text = String::new();
+    text.push_str(&profile.name);
+    text.push(' ');
+    if let Some(description) = profile.description.as_deref() {
+        text.push_str(description);
+    }
+    for tag in &profile.tags {
+        text.push(' ');
+        text.push_str(tag);
+    }
+    for capability in &profile.capabilities {
+        text.push(' ');
+        text.push_str(capability);
+    }
+    text.to_lowercase()
 }
 
 /// Converts the focused value back to the text accepted by [`GuidedFlow::set`].
@@ -3650,6 +3753,53 @@ mod tests {
     }
 
     // ── The stated in-app gap: the real numbers ───────────────────────────────────────────────
+
+    /// **`profile find` actually SEARCHES — it does not report "no HTTP route".**
+    ///
+    /// Regression test for a defect the operator hit while testing by hand. `profile find` is the one
+    /// routeless IN-APP command, and OQ-6 Q2 settled that it is served **client-side** by a substring
+    /// filter. `ServerClient::find_profiles` implemented that — but **nothing called it from
+    /// production**, so `run_in_app` fell through to the `NoRoute` arm and rendered
+    /// `ProfileFind has no HTTP route` while a working implementation sat unreachable.
+    ///
+    /// **That is design defect #3's shape again** — the exact failure this rewrite exists to
+    /// eliminate: correct code with no production caller, invisible to a green suite because the
+    /// only caller was a test.
+    ///
+    /// Asserts on the PANE's rendered output, not on a helper's return value: a test calling the
+    /// filter directly would have passed throughout the defect. (#321)
+    #[test]
+    fn profile_find_searches_client_side_instead_of_reporting_no_route() {
+        let server = FakeServer::healthy();
+        let host = FakeHost::outside_tmux();
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+
+        assert!(shell.focus_command(CommandId::ProfileFind));
+        assert!(shell.on_key(KeyCode::Enter));
+        shell.run_in_app(CommandId::ProfileFind);
+
+        //  is the pane's own render path — the same accessor a prior test was
+        // corrected to use, because `lines()` omits the completion line and reported an empty pane
+        // after a successful run.
+        let cells = shell.render().results.join("\n");
+        assert!(
+            !cells.contains("has no HTTP route"),
+            "`profile find` must NOT report a missing route — it is served client-side per OQ-6 Q2. \
+             Cells: {cells:?}"
+        );
+        assert_eq!(
+            shell.pane().state(),
+            PaneState::Complete,
+            "an empty-query search over the profile list is a SUCCESSFUL run: the search worked and \
+             returned everything. Reporting it as an error is the same misrepresentation as an empty \
+             HANDOFF pane reading as a failed run"
+        );
+        assert!(
+            cells.contains("planner") || cells.contains("no profiles matched"),
+            "the pane must show the search RESULT — matching profile names, or a stated no-match. \
+             Cells: {cells:?}"
+        );
+    }
 
     /// **The in-app gap, with the numbers MEASURED from `route()` rather than taken from the plan.**
     ///
