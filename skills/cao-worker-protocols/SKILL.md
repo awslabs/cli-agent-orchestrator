@@ -56,3 +56,15 @@ If the task asks you to create files, write them before reporting completion. Wh
 - If `send_message` is available and the task requires a callback, call it directly rather than ending with prose alone.
 - Keep callback messages structured so the supervisor can merge them into a larger workflow.
 - For handoff tasks, return the completed output directly and let the orchestrator handle delivery.
+
+## Conductor-managed sessions
+
+The callback patterns above describe direct orchestrator use. When a session is
+managed by an external conducting layer, report through that layer's worker
+contract instead: it defines the report format, the round and lease discipline,
+and the evidence a supervisor needs to accept your work.
+
+Replying with a bare `send_message` in a managed session can leave the round
+unaccounted for even when the work itself is complete. Follow the managed worker
+contract that the session provides, and fall back to the direct patterns above
+only when no such contract is present.
