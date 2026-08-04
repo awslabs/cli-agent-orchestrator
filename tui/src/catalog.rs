@@ -1062,7 +1062,9 @@ pub fn params(id: CommandId) -> Vec<Param> {
 
 #[cfg(test)]
 mod tests {
-    use super::{commands, entry, params, policy, CommandId, ParamKind, Policy, DISPLAY_ORDER};
+    use super::{
+        commands, entry, params, policy, CommandId, ParamKind, Policy, COMMAND_COUNT, DISPLAY_ORDER,
+    };
     use std::collections::BTreeSet;
 
     /// A command's full path, e.g. `workflow run` — the *identifying* name.
@@ -1144,6 +1146,238 @@ mod tests {
             61,
             "DISPLAY_ORDER must list 61 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
+        );
+    }
+
+    /// Test 1b — **every [`CommandId`] variant is listed in [`DISPLAY_ORDER`]** (FR-4.3).
+    ///
+    /// # The hole this closes, found by mutation rather than by review
+    ///
+    /// The exhaustive `match` in [`entry`] proves a variant is **classified**. Nothing proved it
+    /// was **reachable**. Measured: adding a `SessionKill` variant, satisfying both `E0004`
+    /// errors (a row here and a route arm in `server.rs`), and simply *forgetting*
+    /// [`DISPLAY_ORDER`] **compiled cleanly and passed all 151 tests** — leaving a command that
+    /// is classified, routed, and absent from navigation forever.
+    ///
+    /// That is defect #3 of the three motivating this rewrite wearing a new costume: the
+    /// superseded TUI's results pane was likewise built, tested, and never reached from
+    /// production. "The compiler has my back" is exactly where a contributor stops checking, so
+    /// the uncovered case needs a test rather than a caveat in a doc comment.
+    ///
+    /// Neither existing guard catches it. [`the_policy_distribution_is_twentytwo_sixteen_twentythree`]
+    /// counts what `DISPLAY_ORDER` *contains*, so a variant missing from it is simply never
+    /// counted; and its `distinct.len() == 61` assertion detects a **duplicate**, which is the
+    /// opposite direction. [`COMMAND_COUNT`] pins the array's *length*, never its membership.
+    ///
+    /// # Why an exhaustive match and NOT a discriminant trick
+    ///
+    /// The first version of this test used `CommandId::WorkflowValidate as usize + 1` to count
+    /// variants. **It did not work, and the mutation above is what proved it**: `LAST` names a
+    /// specific variant, so appending a new one *after* it leaves the constant stale and the
+    /// computed total too low — the very edit the test exists to catch is the edit that
+    /// invalidates its own yardstick. It passed the replayed mutation cleanly. A guard whose
+    /// reference value is maintained by hand fails exactly when the hand forgets, which is
+    /// always the same moment the defect arrives.
+    ///
+    /// So the count comes from the **compiler** instead. Stable Rust cannot iterate an enum's
+    /// variants — that needs `strum` or a macro generating the enum and the array from one list
+    /// (the real fix, and a larger change than this guard warrants today). What stable Rust
+    /// *does* offer is exhaustiveness: the `match` below has no `_` arm, so **adding a variant
+    /// makes this test file stop compiling**, and the contributor is sent here to add it to
+    /// `EVERY_ID` — at which point the length assertions do the rest.
+    ///
+    /// That inverts the maintenance burden. `LAST` had to be *remembered*; `EVERY_ID` cannot be
+    /// forgotten, because forgetting it is a build failure in this file.
+    ///
+    /// The two sources stay independent, which is what keeps this from being the vacuous
+    /// `assert_eq!(x.len(), x.len())` shape this project keeps rediscovering: `EVERY_ID` is
+    /// written against the **enum**, `DISPLAY_ORDER` against the **display sequence**. (#321)
+    #[test]
+    fn display_order_lists_every_command_id() {
+        /// Maps each variant to itself, purely so the `match` is exhaustive over `CommandId`.
+        ///
+        /// The body is deliberately trivial; the *type check* is the mechanism. No `_` arm — that
+        /// is what turns a new variant into a compile error right here.
+        fn every_id() -> Vec<CommandId> {
+            // A new `CommandId` variant makes this match non-exhaustive and this file stops
+            // compiling. Add the variant to this list AND to DISPLAY_ORDER, then bump
+            // COMMAND_COUNT.
+            //
+            // `needless_match` is allowed because the match is NEEDED for its exhaustiveness
+            // check, not for its return value — clippy is judging the body while the type check
+            // is the whole point. Replacing it with the identity function clippy suggests would
+            // delete the mechanism and leave a test that cannot notice a new variant, which is
+            // precisely the defect this test was rewritten to fix. (#321)
+            #[allow(clippy::needless_match)]
+            fn identity(id: CommandId) -> CommandId {
+                match id {
+                    CommandId::Info => CommandId::Info,
+                    CommandId::Init => CommandId::Init,
+                    CommandId::Install => CommandId::Install,
+                    CommandId::Launch => CommandId::Launch,
+                    CommandId::McpServer => CommandId::McpServer,
+                    CommandId::Shutdown => CommandId::Shutdown,
+                    CommandId::Tui => CommandId::Tui,
+                    CommandId::Update => CommandId::Update,
+                    CommandId::ConfigGet => CommandId::ConfigGet,
+                    CommandId::ConfigList => CommandId::ConfigList,
+                    CommandId::ConfigPath => CommandId::ConfigPath,
+                    CommandId::ConfigSet => CommandId::ConfigSet,
+                    CommandId::EnvGet => CommandId::EnvGet,
+                    CommandId::EnvList => CommandId::EnvList,
+                    CommandId::EnvSet => CommandId::EnvSet,
+                    CommandId::EnvUnset => CommandId::EnvUnset,
+                    CommandId::FlowAdd => CommandId::FlowAdd,
+                    CommandId::FlowDisable => CommandId::FlowDisable,
+                    CommandId::FlowEnable => CommandId::FlowEnable,
+                    CommandId::FlowList => CommandId::FlowList,
+                    CommandId::FlowRemove => CommandId::FlowRemove,
+                    CommandId::FlowRun => CommandId::FlowRun,
+                    CommandId::MemoryClear => CommandId::MemoryClear,
+                    CommandId::MemoryCompact => CommandId::MemoryCompact,
+                    CommandId::MemoryDelete => CommandId::MemoryDelete,
+                    CommandId::MemoryExport => CommandId::MemoryExport,
+                    CommandId::MemoryHeal => CommandId::MemoryHeal,
+                    CommandId::MemoryImport => CommandId::MemoryImport,
+                    CommandId::MemoryLint => CommandId::MemoryLint,
+                    CommandId::MemoryList => CommandId::MemoryList,
+                    CommandId::MemoryPromote => CommandId::MemoryPromote,
+                    CommandId::MemoryRepair => CommandId::MemoryRepair,
+                    CommandId::MemoryShow => CommandId::MemoryShow,
+                    CommandId::ProfileCreate => CommandId::ProfileCreate,
+                    CommandId::ProfileFind => CommandId::ProfileFind,
+                    CommandId::ProfileList => CommandId::ProfileList,
+                    CommandId::ProfileRemove => CommandId::ProfileRemove,
+                    CommandId::ProfileShow => CommandId::ProfileShow,
+                    CommandId::ProfileTemplates => CommandId::ProfileTemplates,
+                    CommandId::ProfileValidate => CommandId::ProfileValidate,
+                    CommandId::ScheduleAdd => CommandId::ScheduleAdd,
+                    CommandId::ScheduleDisable => CommandId::ScheduleDisable,
+                    CommandId::ScheduleEnable => CommandId::ScheduleEnable,
+                    CommandId::ScheduleList => CommandId::ScheduleList,
+                    CommandId::ScheduleRemove => CommandId::ScheduleRemove,
+                    CommandId::ScheduleRun => CommandId::ScheduleRun,
+                    CommandId::SessionList => CommandId::SessionList,
+                    CommandId::SessionSend => CommandId::SessionSend,
+                    CommandId::SessionStatus => CommandId::SessionStatus,
+                    CommandId::SkillsAdd => CommandId::SkillsAdd,
+                    CommandId::SkillsList => CommandId::SkillsList,
+                    CommandId::SkillsRemove => CommandId::SkillsRemove,
+                    CommandId::TerminalRestore => CommandId::TerminalRestore,
+                    CommandId::WorkflowCancel => CommandId::WorkflowCancel,
+                    CommandId::WorkflowDelete => CommandId::WorkflowDelete,
+                    CommandId::WorkflowGet => CommandId::WorkflowGet,
+                    CommandId::WorkflowList => CommandId::WorkflowList,
+                    CommandId::WorkflowResume => CommandId::WorkflowResume,
+                    CommandId::WorkflowRun => CommandId::WorkflowRun,
+                    CommandId::WorkflowStatus => CommandId::WorkflowStatus,
+                    CommandId::WorkflowValidate => CommandId::WorkflowValidate,
+                }
+            }
+
+            // Every variant, each passed through the exhaustive map above.
+            [
+                CommandId::Info,
+                CommandId::Init,
+                CommandId::Install,
+                CommandId::Launch,
+                CommandId::McpServer,
+                CommandId::Shutdown,
+                CommandId::Tui,
+                CommandId::Update,
+                CommandId::ConfigGet,
+                CommandId::ConfigList,
+                CommandId::ConfigPath,
+                CommandId::ConfigSet,
+                CommandId::EnvGet,
+                CommandId::EnvList,
+                CommandId::EnvSet,
+                CommandId::EnvUnset,
+                CommandId::FlowAdd,
+                CommandId::FlowDisable,
+                CommandId::FlowEnable,
+                CommandId::FlowList,
+                CommandId::FlowRemove,
+                CommandId::FlowRun,
+                CommandId::MemoryClear,
+                CommandId::MemoryCompact,
+                CommandId::MemoryDelete,
+                CommandId::MemoryExport,
+                CommandId::MemoryHeal,
+                CommandId::MemoryImport,
+                CommandId::MemoryLint,
+                CommandId::MemoryList,
+                CommandId::MemoryPromote,
+                CommandId::MemoryRepair,
+                CommandId::MemoryShow,
+                CommandId::ProfileCreate,
+                CommandId::ProfileFind,
+                CommandId::ProfileList,
+                CommandId::ProfileRemove,
+                CommandId::ProfileShow,
+                CommandId::ProfileTemplates,
+                CommandId::ProfileValidate,
+                CommandId::ScheduleAdd,
+                CommandId::ScheduleDisable,
+                CommandId::ScheduleEnable,
+                CommandId::ScheduleList,
+                CommandId::ScheduleRemove,
+                CommandId::ScheduleRun,
+                CommandId::SessionList,
+                CommandId::SessionSend,
+                CommandId::SessionStatus,
+                CommandId::SkillsAdd,
+                CommandId::SkillsList,
+                CommandId::SkillsRemove,
+                CommandId::TerminalRestore,
+                CommandId::WorkflowCancel,
+                CommandId::WorkflowDelete,
+                CommandId::WorkflowGet,
+                CommandId::WorkflowList,
+                CommandId::WorkflowResume,
+                CommandId::WorkflowRun,
+                CommandId::WorkflowStatus,
+                CommandId::WorkflowValidate,
+            ]
+            .into_iter()
+            .map(identity)
+            .collect()
+        }
+
+        let in_enum: BTreeSet<CommandId> = every_id().into_iter().collect();
+        let in_display: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
+
+        // The load-bearing assertion. Set difference rather than a length compare, so the failure
+        // NAMES the unreachable command instead of reporting an off-by-one.
+        let missing: Vec<CommandId> = in_enum.difference(&in_display).copied().collect();
+        assert!(
+            missing.is_empty(),
+            "these CommandId variants are absent from DISPLAY_ORDER and can therefore NEVER \
+             appear in navigation: {missing:?}. Such a command still COMPILES and still passes \
+             every other test — `entry()`'s exhaustive match forces it to be classified, and the \
+             distribution test only counts what DISPLAY_ORDER already contains. It is the same \
+             'built but never reached from production' defect this rewrite exists to fix \
+             (FR-4.3). Add each to DISPLAY_ORDER in its group's position and bump COMMAND_COUNT."
+        );
+
+        // The converse: a variant listed for display that the enum no longer has cannot occur
+        // (the array is typed `[CommandId; _]`), but a DUPLICATE can — and would make the set
+        // smaller than the array while every length check above still passed.
+        assert_eq!(
+            in_display.len(),
+            DISPLAY_ORDER.len(),
+            "DISPLAY_ORDER contains a duplicate: {} distinct ids across {} slots",
+            in_display.len(),
+            DISPLAY_ORDER.len()
+        );
+
+        // And pin both against the module's own literal, so a wrong-but-internally-consistent
+        // pair cannot drift past all three checks.
+        assert_eq!(
+            in_enum.len(),
+            COMMAND_COUNT,
+            "`CommandId` declares {} variants but COMMAND_COUNT is {COMMAND_COUNT}",
+            in_enum.len()
         );
     }
 
