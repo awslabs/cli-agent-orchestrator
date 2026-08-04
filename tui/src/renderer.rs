@@ -789,54 +789,60 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
     fn picker_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
 
-        lines.push(match self.flow.agent_choices() {
-            PickerState::Loading => "agents: loading…".to_string(),
+        // ONE LINE PER CHOICE, not a comma-joined paragraph.
+        //
+        // 25 profiles joined by ", " wrapped into an unreadable block, and the operator could not
+        // pick a name out of it. The count stays on its own header line so it is still visible at a
+        // glance, and each choice is indented beneath it. (#321)
+        match self.flow.agent_choices() {
+            PickerState::Loading => lines.push("agents: loading…".to_string()),
             PickerState::Loaded(profiles) if profiles.is_empty() => {
-                "agents: none found on this machine".to_string()
+                lines.push("agents: none found on this machine".to_string());
             }
-            PickerState::Loaded(profiles) => format!(
-                "agents ({}): {}",
-                profiles.len(),
-                profiles
-                    .iter()
-                    .map(|profile| if profile.loadable {
-                        profile.name.clone()
+            PickerState::Loaded(profiles) => {
+                lines.push(format!("agents ({}):", profiles.len()));
+                for profile in profiles {
+                    // The unselectable marker travels WITH its row (FR-1.5): an unloadable profile
+                    // is shown and explained, never filtered out.
+                    if profile.loadable {
+                        lines.push(format!("  {}", profile.name));
                     } else {
-                        format!("{} [{UNLOADABLE_MARKER}]", profile.name)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            PickerState::Failed(error) => {
-                format!("agents: unavailable — {error}. Press [r] to retry")
+                        lines.push(format!("  {} [{UNLOADABLE_MARKER}]", profile.name));
+                    }
+                }
             }
-        });
+            PickerState::Failed(error) => {
+                // `[ctrl+r]`, not `[r]`: a plain `r` is TEXT in a field, so naming it here would
+                // promise an affordance that types instead of retrying — the `[c] clear` failure
+                // again, where a documented key did nothing. (#321)
+                lines.push(format!(
+                    "agents: unavailable — {error}. Press [ctrl+r] to retry"
+                ));
+            }
+        }
 
-        lines.push(match self.flow.provider_choices() {
-            PickerState::Loading => "providers: loading…".to_string(),
+        match self.flow.provider_choices() {
+            PickerState::Loading => lines.push("providers: loading…".to_string()),
             PickerState::Loaded(providers) if providers.is_empty() => {
-                "providers: none reported".to_string()
+                lines.push("providers: none reported".to_string());
             }
-            // `installed` is display information, never a filter (FR-1.7): the endpoint serves a
-            // hard-coded nine-entry map against a ten-value enum, so hiding an uninstalled
-            // provider hides real drift.
-            PickerState::Loaded(providers) => format!(
-                "providers ({}): {}",
-                providers.len(),
-                providers
-                    .iter()
-                    .map(|provider| if provider.installed {
-                        provider.name.clone()
+            PickerState::Loaded(providers) => {
+                lines.push(format!("providers ({}):", providers.len()));
+                for provider in providers {
+                    // `installed` is DISPLAY information, never a filter (FR-1.7): the endpoint
+                    // serves a hard-coded nine-entry map against a ten-value enum, so hiding an
+                    // uninstalled provider would hide real drift.
+                    if provider.installed {
+                        lines.push(format!("  {}", provider.name));
                     } else {
-                        format!("{} (not installed)", provider.name)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            PickerState::Failed(error) => {
-                format!("providers: unavailable — {error}. Press [r] to retry")
+                        lines.push(format!("  {} (not installed)", provider.name));
+                    }
+                }
             }
-        });
+            PickerState::Failed(error) => lines.push(format!(
+                "providers: unavailable — {error}. Press [ctrl+r] to retry"
+            )),
+        }
 
         lines
     }
@@ -1638,10 +1644,17 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         // The block scopes `sink`'s mutable borrow of the pane, so `complete()` below can borrow it
         // again. Not a stylistic block: without it the borrow lives to the end of the function and
         // the `complete` call does not compile.
-        let status = {
-            let mut sink = PaneSink::new(&mut self.pane);
-            self.server.run(id, &[], &[], None, &mut sink)
-        };
+        // Buffers through `JsonSink` so a JSON body can be pretty-printed, then pushes the
+        // rendered text into the pane in ONE write.
+        //
+        // This is the one place PR-1's incrementality is deliberately traded for readability, and
+        // it costs nothing measurable: zero of the 21 routed IN-APP commands uses
+        // `StreamingResponse` (measured at 3.6), so there is no incremental arrival to lose. A
+        // non-JSON body passes through unchanged. `PaneSink` remains the streaming path and is
+        // still what `push_bytes` is exercised through elsewhere. (#321)
+        let mut sink = JsonSink::new();
+        let status = self.server.run(id, &[], &[], None, &mut sink);
+        self.pane.push_bytes(sink.rendered().as_bytes());
 
         self.running = false;
         match status {
@@ -1998,6 +2011,54 @@ pub fn in_app_readiness(id: CommandId) -> InAppReadiness {
 /// `LineWriter`** — `strip-ansi-escapes` 0.2.1 wraps its sink in `std::io::LineWriter`, which
 /// withholds a newline-less `Loading 50%` rather than exposing it immediately. (#321)
 #[allow(dead_code)] // constructed by `run_in_app`, FR-3.2's second site. (#321)
+/// Buffers a response body so a JSON one can be PRETTY-PRINTED before it reaches the pane.
+///
+/// # Why buffering is acceptable here, and only here
+///
+/// PR-1 requires INCREMENTAL rendering: bytes appear as they arrive, so a slow command is never
+/// mistaken for a hang. Pretty-printing needs the WHOLE body, so it trades that away — and the
+/// trade is only defensible because it costs nothing for these routes. Measured at 3.6 by resolving
+/// all 57 route decorators and scanning each body: **zero of the 21 routed IN-APP commands uses
+/// `StreamingResponse`.** They all return buffered JSON, so there is no incremental arrival to
+/// preserve.
+///
+/// Non-JSON output is passed through UNCHANGED rather than mangled: if the body does not parse, the
+/// raw bytes go to the pane exactly as [`PaneSink`] would have sent them. A formatter that garbles
+/// what it cannot parse is worse than none.
+///
+/// The 10 MB response cap in `server.rs` bounds this buffer — it is not unbounded growth. (#321)
+struct JsonSink {
+    body: Vec<u8>,
+}
+
+impl JsonSink {
+    fn new() -> Self {
+        Self { body: Vec::new() }
+    }
+
+    /// The text to render: indented JSON when it parses, the raw body otherwise.
+    fn rendered(&self) -> String {
+        let raw = String::from_utf8_lossy(&self.body);
+        match serde_json::from_slice::<serde_json::Value>(&self.body) {
+            Ok(value) => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| raw.clone().into_owned())
+            }
+            Err(_) => raw.into_owned(),
+        }
+    }
+}
+
+impl Write for JsonSink {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        self.body.extend_from_slice(chunk);
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 struct PaneSink<'p> {
     pane: &'p mut ResultsPane,
     writes: usize,
@@ -2089,8 +2150,8 @@ type Step3FailurePayload = TerminalStatus;
 #[cfg(test)]
 mod tests {
     use super::{
-        in_app_readiness, Fatal, Focus, Frame, InAppReadiness, LayoutMode, PaneSink, Renderer,
-        Retryable, ServerApi, MIN_COLS, MIN_ROWS,
+        in_app_readiness, Fatal, Focus, Frame, InAppReadiness, JsonSink, LayoutMode, PaneSink,
+        Renderer, Retryable, ServerApi, MIN_COLS, MIN_ROWS,
     };
     use crate::catalog::{self, CommandId, Policy};
     use crate::error::TuiError;
@@ -2898,8 +2959,11 @@ mod tests {
             "FR-6.1 requires the REMEDY, not just the cause (NFR-3 item 5). Got: {all:?}"
         );
         assert!(
-            all.contains("[r]"),
-            "FR-6.3 requires the retry affordance to be stated in place. Got: {all:?}"
+            all.contains("[ctrl+r]"),
+            "FR-6.3 requires the retry affordance to be stated in place — and it must name \
+             `[ctrl+r]`, the key that WORKS. A plain `[r]` is text in a field, so advertising it \
+             would promise an affordance that types instead of retrying, which is the `[c] clear` \
+             failure again. Got: {all:?}"
         );
 
         // And the pickers are `Failed`, not `Loaded(vec![])` — an empty list would claim the
@@ -3790,6 +3854,48 @@ mod tests {
     }
 
     // ── The stated in-app gap: the real numbers ───────────────────────────────────────────────
+
+    /// **A JSON response is PRETTY-PRINTED; a non-JSON one passes through unchanged.**
+    ///
+    /// The operator reported `memory list` rendering as one unreadable JSON blob: `run()` streams
+    /// the HTTP body straight to the pane, which is right for a streaming route but leaves every
+    /// IN-APP command showing raw API output. The CLI already prints a table for the same data, so
+    /// the TUI was strictly worse than the surface it replaces.
+    ///
+    /// Asserts BOTH directions, because either alone is satisfiable by a wrong implementation:
+    /// formatting without a passthrough garbles anything that is not JSON, and a passthrough
+    /// without formatting is the defect. Operator decision at the fix gate. (#321)
+    #[test]
+    fn a_json_body_is_indented_and_a_non_json_body_is_left_alone() {
+        let compact = br#"[{"key":"a","scope":"session"},{"key":"b","scope":"project"}]"#;
+        let mut json = JsonSink::new();
+        json.write_all(compact).expect("the sink accepts bytes");
+        let rendered = json.rendered();
+
+        assert!(
+            rendered.contains('\n'),
+            "a JSON array must be rendered across MULTIPLE LINES — one blob is what the operator \
+             reported as unreadable. Got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\"key\": \"a\"") && rendered.contains("\"key\": \"b\""),
+            "pretty-printing must preserve every entry and space its keys, not summarise. Got: \
+             {rendered:?}"
+        );
+
+        // The other direction: plain text must survive byte-for-byte.
+        let plain = b"exit 0\nnot json at all\n";
+        let mut passthrough = JsonSink::new();
+        passthrough
+            .write_all(plain)
+            .expect("the sink accepts bytes");
+        assert_eq!(
+            passthrough.rendered(),
+            "exit 0\nnot json at all\n",
+            "a body that is not JSON must pass through UNCHANGED — a formatter that mangles what \
+             it cannot parse is worse than no formatter"
+        );
+    }
 
     /// **A SPACE is typeable in a text field — `"code review"`, not `"codereview"`.**
     ///
