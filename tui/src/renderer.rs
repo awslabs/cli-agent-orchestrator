@@ -913,9 +913,9 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         // where a documented key did nothing. Ctrl+R and Ctrl+C work in EVERY focus, so they are
         // what a text-entry focus advertises. (#321)
         lines.push(if self.focus_is_text_entry() {
-            "[tab] focus · [enter] select/run · [ctrl+r] retry · [ctrl+c] quit".to_string()
+            "[tab] focus · [←] commands · [enter] select/run · [ctrl+r] retry · [ctrl+c] quit".to_string()
         } else {
-            "[tab] focus · [enter] select/run · [k] stop following · [ctrl+r] retry · [q] quit"
+            "[tab] focus · [←] commands · [enter] run · [k] stop following · [ctrl+r] retry · [q] quit"
                 .to_string()
         });
         lines
@@ -954,6 +954,19 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                 self.focus = self.focus.previous();
                 return true;
             }
+            // LEFT ARROW: back to the command list from anywhere, in one keystroke.
+            //
+            // An operator reported being STUCK after `memory list`: Tab, `k` and `q` all appeared
+            // to do nothing. Tab was in fact working — but nothing moves focus to `Results` after a
+            // run, so focus sat on the form while the filled pane dominated the screen, and with no
+            // visible focus indicator the TUI looked frozen. `k` and `q` are TEXT in a form field,
+            // so they were silently absorbed into a field the operator could not see.
+            //
+            // Tab's cycle is four regions and requires knowing which one you are in; Left is
+            // unconditional and needs no such model. It is also not otherwise bound, so it costs no
+            // existing affordance. Clears the edit buffer for the same reason `select_at_cursor`
+            // does — leaving partial text keyed to a cursor the operator has left would resurrect it
+            // on return. (#321)
             // The guard is `!self.focus_is_text_entry()` and NOT an inline
             // `matches!(a | b if cond)`: in Rust an `if` guard on a multi-alternative pattern
             // applies to EVERY alternative, so `RequiredFields | OptionalSection if expanded`
@@ -961,6 +974,11 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
             // after selecting a command. `[q]` then quit the TUI instead of reaching the field,
             // so an agent name containing `q` could not be typed at all. Found by the §12a
             // reviewer; the sole keyboard test typed "planner", which has no `q`. (#321)
+            KeyCode::Left => {
+                self.focus = Focus::CommandList;
+                self.edit_buffer = None;
+                return true;
+            }
             KeyCode::Char('q') if !self.focus_is_text_entry() => {
                 self.request_quit();
                 return true;
@@ -3854,6 +3872,59 @@ mod tests {
     }
 
     // ── The stated in-app gap: the real numbers ───────────────────────────────────────────────
+
+    /// **`[←]` returns to the command list from ANY focus, including after a run.**
+    ///
+    /// Regression test for an operator report of being stuck: after `memory list` filled the pane,
+    /// Tab, `k` and `q` all appeared to do nothing.
+    ///
+    /// The diagnosis, which is why this binding exists rather than a Tab fix: **nothing moves focus
+    /// to `Results` after a run**, so focus sat on the form while the filled pane dominated the
+    /// screen. Tab WAS working — it just moved between form regions invisibly. And `k`/`q` are TEXT
+    /// in a form field, so they were absorbed into a field the operator could not see. Three keys
+    /// that each "did nothing" for three different reasons.
+    ///
+    /// Asserts from every region, not just the one reported: a fix that only escapes `Results`
+    /// would leave the actual reported state — stuck on `RequiredFields` — unfixed. (#321)
+    #[test]
+    fn the_left_arrow_returns_to_the_command_list_from_every_focus() {
+        let server = FakeServer::healthy();
+        let host = FakeHost::outside_tmux();
+
+        for region in [
+            Focus::CommandList,
+            Focus::RequiredFields,
+            Focus::OptionalSection,
+            Focus::Results,
+        ] {
+            let mut shell = Renderer::new(&server, &host, 100, 40);
+            assert!(shell.focus_command(CommandId::MemoryList));
+            assert!(shell.on_key(KeyCode::Enter));
+            shell.focus = region;
+
+            assert!(
+                shell.on_key(KeyCode::Left),
+                "[←] must be HANDLED from {region:?} — an unhandled key reports false and the \
+                 operator gets no response at all"
+            );
+            assert_eq!(
+                shell.focus,
+                Focus::CommandList,
+                "[←] must return to the command list from {region:?}. The operator reported being \
+                 stuck after a run with Tab, `k` and `q` all apparently inert"
+            );
+        }
+
+        // And the footer must ADVERTISE it: an escape hatch nobody can discover is not an escape.
+        let shell = Renderer::new(&server, &host, 100, 40);
+        let footer = shell.render().footer.join(" ");
+        assert!(
+            footer.contains("[←]"),
+            "the footer must name `[←]`, or the operator has no way to learn the key exists — the \
+             `[c] clear` failure was a documented key that did nothing; this is its inverse, a \
+             working key nobody is told about. Got: {footer:?}"
+        );
+    }
 
     /// **A JSON response is PRETTY-PRINTED; a non-JSON one passes through unchanged.**
     ///
