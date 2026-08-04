@@ -390,6 +390,18 @@ def do_build() -> None:
 
     PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
     staged = PACKAGE_DIR / _binary_filename()
+    # UNLINK BEFORE COPYING, so the copy lands on a NEW inode.
+    #
+    # `shutil.copy2` onto an existing path writes THROUGH it, keeping the inode. On macOS the
+    # kernel caches code-signature pages per inode, so a Mach-O overwritten at a path it has
+    # already been executed from is SIGKILLed on the next exec — exit 137, zero output, no
+    # diagnostic. Measured: the overwritten file and its source were byte-identical, both
+    # `codesign --verify` valid, and only the overwritten one died. `rm` + `cp` fixed it.
+    #
+    # An operator hit this as a silent `cao tui` failure after a rebuild, which looks exactly
+    # like the TUI hanging on cao-server. `missing_ok=True` keeps a first-ever build working.
+    # (#321)
+    staged.unlink(missing_ok=True)
     shutil.copy2(built, staged)
     # copy2 preserves mode, but assert it rather than trusting it: a wheel carrying a
     # non-executable binary fails at `cao tui` time on the operator's machine.
