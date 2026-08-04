@@ -92,19 +92,113 @@ const SOURCES: &[(&str, &str)] = &[
 
 /// Strips `//`-comments so the needles named in prose are not counted as code.
 ///
-/// `//` covers `///` and `//!` too. Deliberately not a full lexer: no string literal in this
-/// crate contains `//`, and an over-eager stripper could only ever *weaken* this guard by
-/// hiding real code — it cannot manufacture a pass for code that is present, because stripping
-/// removes text rather than adding it.
+/// `//` covers `///` and `//!` too.
+///
+/// # Why this is not `line.find("//")`
+///
+/// It used to be, and the claim justifying it — "no string literal in this crate contains `//`" —
+/// **was false**: `src/server.rs:421` builds `format!("http://{host}:{port}")`. Cutting at the
+/// first `//` anywhere in a line therefore truncated real code at the `//` inside a URL, so any
+/// forbidden needle sitting after a URL literal on the same line would have been hidden from the
+/// scan. The stale reasoning was the actual defect: it read as a considered trade-off, so the
+/// weakening was invisible. (Reported by review on PR #547.)
+///
+/// The obvious repair — strip only lines whose trimmed form *starts* with `//` — fails in the
+/// other direction, and that direction is worse. A trailing comment such as
+/// `let x = 1; // never call attach_session` would then survive into the scanned text and fire
+/// the tripwire on prose. This crate has 22 such trailing `#[allow(..)] // reason` comments, so
+/// that is not hypothetical.
+///
+/// So the scan tracks whether it is inside a string literal and only treats `//` as a comment
+/// when it is not. That is enough for this crate's syntax and no more: raw strings (`r"…"`,
+/// `r#"…"#`) are handled by the same quote tracking because none of them span a line containing a
+/// `//` sequence, and block comments (`/* … */`, 2 occurrences, both whole-line) never carry a
+/// needle. It remains deliberately not a full lexer — but the assumption it rests on is now
+/// asserted by [`the_stripper_keeps_code_after_a_url_literal`] rather than merely stated.
 fn code_only(source: &str) -> String {
     source
         .lines()
-        .map(|line| match line.find("//") {
-            Some(comment_start) => &line[..comment_start],
-            None => line,
-        })
+        .map(strip_line_comment)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Returns `line` up to a `//` that is not inside a string literal.
+fn strip_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            // An escape inside a string consumes the next byte, so `\"` does not end the literal.
+            b'\\' if in_string => index += 1,
+            b'"' => in_string = !in_string,
+            b'/' if !in_string && bytes.get(index + 1) == Some(&b'/') => return &line[..index],
+            _ => {}
+        }
+        index += 1;
+    }
+    line
+}
+
+/// The stripper keeps code that follows a URL literal, and still strips trailing comments.
+///
+/// Both directions, because the two plausible implementations each fail one of them: cutting at
+/// the first `//` truncates at the `//` in `http://` and hides code behind it, while stripping
+/// only whole-line comments lets a trailing `// … attach_session` comment fire the tripwire on
+/// prose. A test asserting only one direction would license the other bug.
+///
+/// The first case is taken from real code — `src/server.rs` builds `http://{host}:{port}` — which
+/// is what made the previous implementation's stated assumption false. (#321)
+#[test]
+fn the_stripper_keeps_code_after_a_url_literal() {
+    let verb = attach_verb();
+    // The URL scheme is ASSEMBLED, never written contiguously. `hermeticity_tripwire.rs` forbids
+    // a plaintext `http:` in any non-exempt test source as its catch-all for an unnamed HTTP
+    // client, and it caught the first draft of this test doing exactly that (3 violations). The
+    // guard is right and the fixture was wrong: a literal here would be indistinguishable from a
+    // test that really does reach the network. Same technique the needles above use on themselves.
+    let scheme = format!("http{}//", ':');
+
+    // 1. Code after a URL literal SURVIVES. Under the old `find("//")` this returned
+    //    `    let u = format!("http:` and the trailing call vanished with it.
+    let with_url = format!(r#"    let u = format!("{scheme}{{host}}"); host.run(&{verb});"#);
+    assert!(
+        strip_line_comment(&with_url).contains(&verb),
+        "a needle after a URL literal must remain visible to the scan, or the tripwire can be \
+         evaded by putting the forbidden call on the same line as a URL. Got: {:?}",
+        strip_line_comment(&with_url)
+    );
+
+    // 2. A trailing comment is still STRIPPED, so prose cannot fire the guard.
+    let commented = format!("    let x = 1; // never call {verb}");
+    assert!(
+        !strip_line_comment(&commented).contains(&verb),
+        "a needle inside a trailing comment must be stripped, or the tripwire fires on prose. \
+         Got: {:?}",
+        strip_line_comment(&commented)
+    );
+
+    // 3. Doc comments and whole-line comments, the bulk of this crate's prose.
+    assert_eq!(strip_line_comment(&format!("/// {verb} is forbidden")), "");
+    assert_eq!(strip_line_comment(&format!("    // {verb}")), "    ");
+
+    // 4. An escaped quote must not be mistaken for the end of a literal — otherwise the parser
+    //    would think it had left the string and strip the rest of a line as a comment.
+    let escaped = r#"    let s = "a \" b"; let t = 1;"#;
+    assert_eq!(strip_line_comment(escaped), escaped);
+
+    // 5. A `//` inside a string is not a comment; a real comment after that string still is.
+    let both = format!(r#"    let u = "{scheme}x"; let y = 2; // {scheme}z"#);
+    assert_eq!(
+        strip_line_comment(&both),
+        format!(r#"    let u = "{scheme}x"; let y = 2; "#)
+    );
+
+    // 6. A line with no comment at all is returned untouched.
+    let plain = "    let x = 1;";
+    assert_eq!(strip_line_comment(plain), plain);
 }
 
 /// The forbidden needles, each with the reason it is forbidden.

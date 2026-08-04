@@ -557,6 +557,72 @@ fn resize_is_visible_to_the_child_and_to_the_kernel() {
 fn count_geometry(bytes: &[u8], reading: &str) -> usize {
     String::from_utf8_lossy(bytes)
         .split("\r\n")
-        .filter(|line| line.trim() == reading)
+        .filter(|line| is_geometry_reading(line, reading))
         .count()
+}
+
+/// True when `line` carries exactly `reading`, ignoring any shell prompt printed ahead of it.
+///
+/// **The prompt tolerance is the Linux fix, and this is the one place the two platforms differ.**
+/// An exact `line.trim() == reading` comparison passed on macOS and failed on Ubuntu: `/bin/sh`
+/// there is `dash`, which writes its `$ ` prompt and the command's output onto the SAME pty line,
+/// so the transcript reads `$ 24 80` rather than `24 80`. The reading was present and correct and
+/// the assertion still rejected it — a test failing on the shell's prompt style rather than on
+/// terminal geometry, which is exactly the "green here, red there" class this suite exists to
+/// catch. (#321)
+///
+/// Deliberately NOT `line.contains(reading)`. A substring match would make the count meaningless
+/// in the direction test 6 depends on: with a bare `contains`, a reading of `40 120` is also
+/// satisfied by `140 120`, and the "appears exactly once" assertion — the half that proves the
+/// geometry genuinely CHANGED rather than being echoed twice — would be checking a weaker
+/// property than it claims. So the reading must be the line's suffix, and whatever precedes it
+/// may only be a prompt.
+fn is_geometry_reading(line: &str, reading: &str) -> bool {
+    let Some(prefix) = line.trim().strip_suffix(reading) else {
+        return false;
+    };
+    // Every prompt sigil a POSIX shell may print here: `$` for a user shell (dash, bash's
+    // `sh-3.2$`), `%` for zsh, `#` for root — which is the norm in a container. An empty prefix
+    // is the macOS case, where the reading already lands on its own line.
+    let prefix = prefix.trim_end();
+    prefix.is_empty() || prefix.ends_with('$') || prefix.ends_with('%') || prefix.ends_with('#')
+}
+
+/// Test 9 — **the reading parser tolerates a prompt, and still counts.**
+///
+/// A regression test for the Linux-only failure above, asserted against the transcript CI
+/// actually captured. It runs on every platform, so the Darwin development machine now reddens
+/// for a defect that previously could only be discovered on Ubuntu — the whole reason the pty
+/// suite is a two-platform matrix.
+///
+/// Both directions are asserted, because only fixing the first would have traded one silent
+/// failure for another: the prompt must be tolerated, AND the tolerance must not decay into a
+/// substring match. (#321)
+#[test]
+fn a_geometry_reading_is_found_behind_a_shell_prompt_but_is_not_a_substring_match() {
+    // Verbatim from the failing Ubuntu run: dash's prompt shares the line with the output.
+    let dash = b"stty size\r\n$ 24 80\r\n$ ";
+    assert_eq!(
+        count_geometry(dash, "24 80"),
+        1,
+        "dash prints `$ 24 80`; the reading is present and must be found"
+    );
+
+    // The macOS shape, where the reading already occupies its own line.
+    assert_eq!(count_geometry(b"stty size\r\n24 80\r\n", "24 80"), 1);
+
+    // The echoed command must never be mistaken for a reading.
+    assert_eq!(count_geometry(b"stty size\r\n", "24 80"), 0);
+
+    // NOT a substring match: `140 120` is not a reading of `40 120`. Without this the "appears
+    // exactly once" assertion in test 6 would be weaker than it claims to be.
+    assert_eq!(
+        count_geometry(b"140 120\r\n", "40 120"),
+        0,
+        "a longer number ending in the reading must not count as the reading"
+    );
+
+    // Counting still discriminates a change from a repeat, which is test 6's load-bearing use.
+    assert_eq!(count_geometry(b"$ 24 80\r\n$ 40 120\r\n", "40 120"), 1);
+    assert_eq!(count_geometry(b"$ 24 80\r\n$ 24 80\r\n", "24 80"), 2);
 }

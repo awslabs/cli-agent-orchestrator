@@ -522,10 +522,25 @@ jobs:
         # the same endpoint the TUI itself probes. 30 x 1s matches the readiness cap the TUI uses.
         # `timeout(1)` is NOT used — it does not exist on macOS runners by default. (#321)
         run: |
-          # No PID file and no explicit shutdown: the runner is ephemeral and torn down with the
-          # job, so a cleanup step would be ceremony. An earlier revision wrote /tmp/cao-server.pid
-          # that nothing read — a file implying lifecycle management that did not exist. (#321)
+          # The PID IS recorded and IS read — by the teardown step below. An earlier revision
+          # wrote /tmp/cao-server.pid that nothing read, and the revision after that dropped the
+          # file entirely on the reasoning that "the runner is ephemeral and torn down with the
+          # job, so a cleanup step would be ceremony."
+          #
+          # THAT REASONING WAS WRONG, and the first CI run is what proved it: `setup-uv`'s
+          # POST-JOB step runs before the runner is torn down, and on macOS it hung for exactly
+          # 300s in `uv cache prune --ci` and then failed the job with exit 2 — after all 8 pty
+          # tests had PASSED. The job's own teardown line names the culprit: "Terminate orphan
+          # process: pid (12288) (Python)". The server was still running while the post step tried
+          # to prune the cache underneath it.
+          #
+          # Linux passed this step only by luck: its uv cache RESTORED, and `setup-uv` skips the
+          # prune-and-save path entirely on a cache hit. macOS missed ("Failed to restore: Cache
+          # service responded with 400"), took the prune path, and hit the contention. So this is
+          # a cache-miss-only failure on BOTH platforms, not a Darwin quirk — which is why the fix
+          # is an explicit shutdown rather than a platform condition. (#321)
           uv run cao-server &
+          echo "$!" > "${RUNNER_TEMP}/cao-server.pid"
           for i in $(seq 1 30); do
             if curl -sf "http://127.0.0.1:9889/health" >/dev/null 2>&1; then
               echo "cao-server ready after ${i}s"
@@ -539,6 +554,39 @@ jobs:
       - name: cargo test --locked
         working-directory: tui
         run: cargo test --locked
+
+      # `if: always()` so the server is stopped even when the tests FAIL. Without it a red test
+      # run would leave the server up and turn one honest failure into two — the test failure plus
+      # a post-job cache error that has nothing to do with the change under review.
+      #
+      # Kills the process GROUP (`-PID`), not just the recorded pid: `uv run cao-server` is a
+      # parent `uv` process that execs the server as a child, and the Linux teardown listed BOTH
+      # ("pid (3510) (uv)", "pid (3517) (cao-server)"). Killing only the recorded pid would leave
+      # the other alive and holding the cache — the exact condition this step exists to remove.
+      #
+      # Never fails the job: `|| true` on every kill and `exit 0` at the end. A cleanup step that
+      # can fail is a second way for a green build to go red, and "the server had already exited"
+      # is not a defect. (#321)
+      - name: Stop cao-server before the post-job cache steps run
+        if: always()
+        run: |
+          pidfile="${RUNNER_TEMP}/cao-server.pid"
+          if [ ! -f "$pidfile" ]; then
+            echo "no pidfile at $pidfile; cao-server was never started"
+            exit 0
+          fi
+          pid="$(cat "$pidfile")"
+          # SIGTERM the group, give it a moment, then SIGKILL whatever ignored it. Mirrors the
+          # pty harness's own escalation rather than inventing a second shutdown policy.
+          kill -TERM "-${pid}" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+          for _ in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          kill -KILL "-${pid}" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+          rm -f "$pidfile"
+          echo "cao-server stopped"
+          exit 0
 
       # ---------------------------------------------------------------------------------
       # THE NO-FFI GATE (FR-5.2, SR-4, T-10) — hard gate, on BOTH platforms.

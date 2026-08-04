@@ -44,6 +44,19 @@ dependencies = [
     # JWKS). The [crypto] extra pulls in `cryptography` for RSA signature
     # verification and provides `jwt.PyJWKClient`. See spec task 9.1 research note.
     "pyjwt[crypto]>=2.8.0",
+    # Floor on the TRANSITIVE `cryptography` that `pyjwt[crypto]` pulls in. Two HIGH
+    # advisories affect the 48.0.1 the lockfile had resolved: GHSA-g6cj-pr64-35w5
+    # (CVE-2026-69247, PKCS#7 Bleichenbacher oracle, fixed in 50.0.0) and
+    # GHSA-jwv3-5hgf-82ww (CVE-2026-69249, exponential cert path-building, fixed in
+    # 49.0.0). Neither reaches this codebase's own call path — only `jwt.PyJWKClient`
+    # RSA verification is used — but Trivy's CRITICAL/HIGH gate is repo-wide, and
+    # PR #547 makes that gate blocking (`exit-code: 1`), so an unpatched transitive
+    # dep now fails CI rather than merely appearing in the Security tab.
+    #
+    # Declared as a DIRECT floor because a transitive pin cannot be expressed any
+    # other way: `pyjwt[crypto]` itself only requires `cryptography>=3.4`, so a bare
+    # `uv lock --upgrade-package` would drift back down on the next unrelated relock.
+    "cryptography>=50.0.0",
     "jsonschema>=4.25",
     "jinja2>=3.1.0",
     # Obsidian graph sink (Issue #348) imports yaml at module top; declare it

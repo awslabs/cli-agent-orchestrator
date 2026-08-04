@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -276,8 +277,14 @@ def test_banned_set_is_exactly_the_four_named_crates():
 # --------------------------------------------------------------------------------------
 
 
+# `shutil.which`, not `subprocess.run(["which", ...])`. A skipif condition is evaluated at
+# COLLECTION time, so an absent `which` binary raises FileNotFoundError before the skip can ever
+# apply — the decorator meant to make this test optional would instead break collection for the
+# whole module. `which` is not a Windows builtin, which is precisely where this test is most
+# likely to be skipped. `shutil.which` is the stdlib equivalent, needs no subprocess, and honours
+# PATHEXT on Windows. (#321; reported by review on PR #547)
 @pytest.mark.skipif(
-    subprocess.run(["which", "cargo"], capture_output=True).returncode != 0,
+    shutil.which("cargo") is None,
     reason="cargo not installed; the Rust CI job covers this path",
 )
 def test_real_graph_is_clean():

@@ -75,10 +75,18 @@ jobs:
       #   `arguments` REPLACES the action's default of `--all-features`, so `--locked` must be
       #     passed explicitly (TS-2, interview Q7) — the gate has to inspect the COMMITTED
       #     lockfile, not a fresh resolution that might resolve a problem away.
-      #   `--manifest-path tui/Cargo.toml` is repo-root-relative. cargo-deny resolves its
-      #     config next to the MANIFEST rather than the cwd, so `tui/deny.toml` is what gets
-      #     read. Verified by planting a deliberately-failing config at that path and
-      #     confirming a root-invoked run picked it up and failed.
+      #   `manifest-path` is the action's OWN input and must be used for the path — it is NOT
+      #     free-form, and this is the bug the first CI run caught. The action's `action.yml`
+      #     unconditionally appends `--manifest-path ${{ inputs.manifest-path }}` (defaulting to
+      #     `./Cargo.toml`) to the container args, so also naming `--manifest-path` inside
+      #     `arguments` passed the flag TWICE and cargo-deny rejected the invocation outright:
+      #     "error: the argument '--manifest-path <MANIFEST_PATH>' cannot be used multiple
+      #     times". A hard gate that cannot start is worse than one that fails, because the
+      #     usage error looks like a broken pin rather than a policy violation. The path stays
+      #     repo-root-relative: cargo-deny resolves its config next to the MANIFEST rather than
+      #     the cwd, so `tui/deny.toml` is what gets read. Verified by planting a
+      #     deliberately-failing config at that path and confirming a root-invoked run picked
+      #     it up and failed.
       #   `command-arguments: --show-stats` prints per-check tallies. That is what makes a pass
       #     LEGIBLE rather than merely green: "licenses ok: 0 errors, 0 warnings, 39 notes"
       #     attests that 39 crates were examined. Without it, a pass over a truncated graph
@@ -92,6 +100,7 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
-          arguments: --locked --manifest-path tui/Cargo.toml
+          arguments: --locked
+          manifest-path: tui/Cargo.toml
           command-arguments: --show-stats
           log-level: warn
