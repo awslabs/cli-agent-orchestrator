@@ -1,0 +1,11 @@
+schemaVersion: 1
+id: example-portfolio
+name: Example Portfolio
+status: draft
+organization:
+  name: Unknown
+  domains: []
+businessCapabilities: []
+createdAt: "2026-01-01T00:00:00.000Z"
+updatedAt: "2026-01-01T00:00:00.000Z"
+

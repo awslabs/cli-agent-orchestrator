@@ -39,7 +39,20 @@ What each variable does:
 | `CAO_API_HOST=0.0.0.0`    | Bind on all interfaces so the GitHub port-forward proxy can reach the server. `127.0.0.1` will not work through a forwarded URL. |
 | `CAO_API_PORT=9889`       | The port the forwarded URL maps to.                                                                                    |
 | `CAO_ALLOWED_HOSTS="*"`   | FastAPI's `TrustedHostMiddleware` accepts the `*.app.github.dev` forwarded hostname.                                   |
-| `CAO_WS_ALLOWED_CLIENTS="*"` | WebSocket connections from the forwarded origin are accepted.                                                       |
+| `CAO_WS_ALLOWED_CLIENTS="*"` | WebSocket connections whose peer IP is the forwarding proxy (not loopback) are accepted.                            |
+
+The terminal WebSocket also enforces an `Origin` check to block cross-site
+WebSocket hijacking (CWE-1385). No extra variable is needed here: the viewer is
+served by cao-server through the same forwarded hostname, so the handshake's
+`Origin` authority matches its `Host` and is accepted as same-origin. If you
+ever serve the viewer from a *different* origin than the cao-server host, allow
+that origin explicitly with `CAO_WS_ALLOWED_ORIGINS="https://<that-origin>"`.
+
+> **Prefer a scoped host over `"*"`.** `CAO_ALLOWED_HOSTS="*"` disables
+> `TrustedHostMiddleware`'s Host validation, which is what makes the WebSocket
+> same-origin check DNS-rebinding-safe. If you know your Codespace hostname, set
+> `CAO_ALLOWED_HOSTS="<name>-9889.app.github.dev"` instead of `"*"` to keep that
+> protection. Use `"*"` only when the exact hostname is not known ahead of time.
 
 You should see:
 

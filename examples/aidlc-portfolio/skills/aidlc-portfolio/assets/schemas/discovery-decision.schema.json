@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "discovery-decision.schema.json",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "organization",
+    "businessOutcomes",
+    "businessCapabilities",
+    "dependencies",
+    "acceptance"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "organization": {
+      "type": "object",
+      "required": ["disposition", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "disposition": { "$ref": "#/$defs/disposition" },
+        "value": { "type": "string" }
+      }
+    },
+    "businessOutcomes": { "$ref": "#/$defs/listFact" },
+    "businessCapabilities": { "$ref": "#/$defs/listFact" },
+    "dependencies": {
+      "type": "object",
+      "required": ["disposition", "ids"],
+      "additionalProperties": false,
+      "properties": {
+        "disposition": { "$ref": "#/$defs/disposition" },
+        "ids": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "required": ["acceptedBy", "acceptedAt", "unknowns", "deferrals"],
+      "additionalProperties": false,
+      "properties": {
+        "acceptedBy": { "type": "string", "minLength": 1 },
+        "acceptedAt": { "type": "string", "minLength": 1 },
+        "unknowns": { "$ref": "#/$defs/factNames" },
+        "deferrals": { "$ref": "#/$defs/factNames" }
+      }
+    },
+    "catalogRevision": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  },
+  "$defs": {
+    "disposition": {
+      "enum": ["confirmed", "unknown", "deferred"]
+    },
+    "listFact": {
+      "type": "object",
+      "required": ["disposition", "values"],
+      "additionalProperties": false,
+      "properties": {
+        "disposition": { "$ref": "#/$defs/disposition" },
+        "values": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "factNames": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "organization",
+          "businessOutcomes",
+          "businessCapabilities",
+          "dependencies"
+        ]
+      },
+      "uniqueItems": true
+    }
+  }
+}

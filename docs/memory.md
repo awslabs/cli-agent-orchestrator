@@ -281,7 +281,38 @@ cao memory export --scope global -o ./bundle --include-history --redact --prune
 cao memory import ./memory-bundle --scope global
 cao memory import ./memory-bundle --scope project --conflict merge
 cao memory import ./memory-bundle --scope global --dry-run   # full pipeline, no writes
+
+# Inspect and curate typed relationships between memories
+cao memory relationships list
+cao memory relationships list --scope project --source-key testing-framework
+cao memory relationships list --status proposal        # the review queue
+cao memory relationships list --stale                 # edges older than their source
+cao memory relationships list --format json
+cao memory relationships inspect <relationship-id>
+cao memory relationships promote <relationship-id>    # proposal -> active
+cao memory relationships reject <relationship-id>     # -> rejected (survives recompute)
 ```
+
+### Typed relationships
+
+Memories are linked by typed, provenance-tagged edges (`relates_to`,
+`contradiction`, `supersedes`) held in a durable store rather than inferred at
+read time. Each edge records its `origin` — `compiler`, `wiki_lint`, `human`,
+`legacy_related_keys`, or `external_import` — and a `status`.
+
+Writes are **producer-scoped**: when the compiler or linter recomputes its edges
+for a source memory, it replaces only rows carrying its own origin and type, so a
+human-authored edge on the same memory is never touched.
+
+`reject` is durable curation. A rejected edge is **not** resurrected by a later
+producer recompute, and is not deleted if the producer stops reporting it — the
+operator's verdict outranks the producer, and each refusal is reported back to
+the producer. `promote` refuses to act on a rejected or deleted edge; re-create
+it instead.
+
+`--stale` surfaces edges computed before their source memory was last edited
+(the edge stores the source's `updated_at` at write time), which is the signal
+that a recompute is due.
 
 `cao memory heal` consumes the findings from `cao memory lint` and applies one fix per
 issue type: it deletes orphan pages, resolves contradictions (keeping the newer article),

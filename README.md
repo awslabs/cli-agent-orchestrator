@@ -9,6 +9,9 @@
 **CLI Agent Orchestrator (CAO)** coordinates multiple AI coding CLIs so a
 supervisor can delegate work to specialist agents in parallel or sequence.
 
+📚 **[Documentation](https://awslabs.github.io/cli-agent-orchestrator/)** —
+guides, reference, and two interactive courses.
+
 ## What CAO does
 
 CAO runs a local `cao-server`, starts provider CLIs in isolated terminal
@@ -109,6 +112,8 @@ provider override while keeping the same sequence.
 - [Memory](docs/memory.md) and [self-learning](docs/self-learning.md):
   persistent cross-session memory, and the opt-in loop that turns workflow
   outcomes into lessons and promoted instructions.
+- [AI-DLC portfolio example](examples/aidlc-portfolio/README.md): coordinate
+  parallel AI-DLC intents across repositories and isolated worktrees.
 - [Tool restrictions](docs/tool-restrictions.md): roles, allowlists, and
   provider enforcement.
 - [Updating CAO](docs/updating.md): update an installed uv tool.

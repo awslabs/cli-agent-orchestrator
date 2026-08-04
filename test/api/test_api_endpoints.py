@@ -292,10 +292,33 @@ class TestCreateSession:
             allowed_tools=None,
             registry=ANY,
             env_vars=None,
+            engine=None,
             initial_message=None,
             initial_message_orchestration_type=None,
             model=None,
         )
+
+    def test_create_session_passes_explicit_kiro_engine(self, client):
+        """An explicit engine reaches the session service and the response."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+            engine="kas",
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={"provider": "kiro_cli", "agent_profile": "developer", "engine": "kas"},
+            )
+
+        assert response.status_code == 201
+        assert response.json()["engine"] == "kas"
+        assert mock_svc.create_session.call_args.kwargs["engine"] == "kas"
 
     def test_create_session_passes_model_and_initial_message(self, client):
         """The launch override and first task reach the session service, while

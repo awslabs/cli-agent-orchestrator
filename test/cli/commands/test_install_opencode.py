@@ -36,7 +36,7 @@ def install_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Dict[s
     # opencode_agents intentionally NOT pre-created — install must mkdir it.
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR", local_store
+        "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", local_store
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store
@@ -531,7 +531,7 @@ class TestOpencodeAgentListIntegration:
         context_dir.mkdir(parents=True)
 
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR", local_store
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", local_store
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store

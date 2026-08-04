@@ -1,0 +1,34 @@
+AI assistant in your terminal
+
+Usage: kiro-cli-chat chat [OPTIONS] [INPUT]
+
+Arguments:
+  [INPUT]
+          The first question to ask
+
+Options:
+      --agent <AGENT>
+          Context profile to use
+
+      --model <MODEL>
+          Current model to use
+
+  -a, --trust-all-tools
+          Allows the model to use any tool without asking for confirmation
+
+      --require-mcp-startup
+          Require all enabled MCP servers to start successfully
+
+      --legacy-ui
+          Use the legacy harness
+
+      --agent-engine <ENGINE>
+          Agent engine to use: "v1", "v2" (default), or "v3"
+
+          [possible values: v2, v1, v3]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+      --v3
+          Launch the next generation Kiro agent

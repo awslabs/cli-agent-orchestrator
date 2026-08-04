@@ -142,6 +142,17 @@ def _no_llm_compile_in_tests(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_backend_registry():
+    """Prevent leaked backend singletons from crossing test boundaries (fixes #522)."""
+    from cli_agent_orchestrator.backends import registry
+
+    original = registry._backend
+    registry._backend = None
+    yield
+    registry._backend = original
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_cao_env(monkeypatch):
     """Strip CAO runtime env vars that leak when the suite runs inside a CAO terminal.
 

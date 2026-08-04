@@ -1134,10 +1134,45 @@ class MemoryService:
                 provider_hint=provider_hint,
             )
             if related_result.used_llm:
+                # Marker write FIRST (ADR-4 / reviewer Finding 4): related_keys
+                # stays the compiler's computation-state marker.
                 related_keys_value = ",".join(related_result.related_keys)
-                if related_result.related_keys:
+                # Route the compiler's relationship set through the single service
+                # (FR-3.1), best-effort and AFTER the marker so a service failure
+                # never loses the marker. Producer-scoped: replaces only this
+                # source's (origin=compiler, type=relates_to) edges — human/lint/
+                # legacy edges are preserved (principle 6). Passes the FULL set.
+                see_also_targets = list(related_result.related_keys)
+                try:
+                    from cli_agent_orchestrator.services.memory_relationship_service import (
+                        EdgeInput,
+                        MemoryRelationshipService,
+                    )
+
+                    rel_svc = MemoryRelationshipService()
+                    rel_svc.replace_set(
+                        scope,
+                        scope_id,
+                        key,
+                        "compiler",
+                        "relates_to",
+                        [EdgeInput(target_key=t) for t in related_result.related_keys],
+                    )
+                    # ## See Also is a pure projection of ACTIVE relates_to edges
+                    # (FR-4.1) — so it reflects human-authored edges too, not just
+                    # the compiler's set. Fall back to the compiler set if the
+                    # store read fails.
+                    try:
+                        see_also_targets = rel_svc.active_targets(
+                            scope, scope_id, key, type="relates_to"
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                except Exception as e:  # noqa: BLE001 — non-blocking; marker already written
+                    logger.warning(f"relationship replace_set (compiler) failed, ignoring: {e}")
+                if see_also_targets:
                     see_also = self._render_see_also(
-                        related_result.related_keys,
+                        see_also_targets,
                         topic_scope=scope,
                         topic_scope_id=scope_id,
                     )
@@ -1525,6 +1560,61 @@ class MemoryService:
                 return None
         return None
 
+    def _superseded_keys(self, memories: list) -> set:
+        """Return ``{(scope, scope_id, key)}`` for memories that are the target of
+        an active supersedes edge (FR-4.6 ranking input). BATCHED per
+        (scope, scope_id) — one query per scope group, not one per memory (avoids
+        N queries on a large recall). Best-effort; empty on failure.
+
+        The identity is the FULL 3-tuple matching ``MemoryMetadataModel``'s
+        ``(key, scope, scope_id)`` uniqueness. Keying on ``(scope, key)`` alone
+        would let the same key in one project's scope_id mark a DIFFERENT,
+        non-superseded memory as superseded whenever a recall spans projects.
+
+        ``scope_id`` here is the LOGICAL value from ``_effective_scope_id`` —
+        ``None`` for global — never the ``""`` sentinel. That sentinel belongs to
+        the ``memory_relationships`` table's own NOT NULL column (it exists so
+        the dedup UNIQUE index is total); ``MemoryMetadataModel.scope_id`` is
+        genuinely nullable, and the Memory objects compared against this set
+        carry the logical value.
+        """
+        if not memories:
+            return set()
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            rel_svc = MemoryRelationshipService()
+        except Exception:  # pragma: no cover - import guard
+            return set()
+        groups: dict = {}
+        for m in memories:
+            groups.setdefault((m.scope, self._effective_scope_id(m)), []).append(m.key)
+        out: set = set()
+        for (g_scope, g_scope_id), keys in groups.items():
+            try:
+                hits = rel_svc.superseded_targets(g_scope, g_scope_id, keys)
+            except Exception:  # noqa: BLE001 — non-blocking
+                continue
+            for k in hits:
+                out.add((g_scope, g_scope_id, k))
+        return out
+
+    def _is_superseded(self, m, superseded: set) -> bool:
+        """The demotion predicate recall's sort key applies to ONE memory.
+
+        Extracted so the cross-project regression test can drive the REAL
+        predicate. A test that re-expresses this comparison locally cannot fail
+        when the production sort key is keyed too loosely — it proves only that
+        ``_superseded_keys`` is well-formed, which is a different claim.
+
+        Identity is the FULL ``(scope, scope_id, key)`` 3-tuple: a ``(scope,
+        key)`` comparison lets one project's supersedes edge demote a
+        same-named memory in a DIFFERENT project's scope_id.
+        """
+        return (m.scope, self._effective_scope_id(m), m.key) in superseded
+
     def _expand_related(self, primaries: list) -> list:
         """One-level cross-reference traversal for ``recall(include_related=True)``.
 
@@ -1537,20 +1627,71 @@ class MemoryService:
             return primaries
         visited: set = {m.key for m in primaries}
         extras: list = []
-        # Group primaries by (scope, scope_id) so each SQLite lookup is
-        # batched per scope rather than per row.
+        # One-level expansion follows ACTIVE relates_to edges from the
+        # relationship STORE (issue #511, FR-4.2 — the store is authoritative for
+        # typed edges: only active relates_to is traversed; proposal/rejected/
+        # superseded/deleted and contradiction/supersedes are NOT expansion edges).
+        # UNION with the legacy ``related_keys`` marker for any primary the store
+        # returns nothing for, so a related_keys value written by a route OTHER
+        # than an LLM compile (a direct write, an import, a restore, or a row that
+        # predates the one-time backfill and was modified after) is still
+        # traversable during the compatibility window S6 protects — retirement of
+        # related_keys stays gated on the loss-free proof (ADR-4/FR-7.2). Both
+        # sources dedupe against ``visited``. Best-effort throughout.
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            rel_svc: Any = MemoryRelationshipService()
+        except Exception as e:  # pragma: no cover - import guard
+            logger.debug(f"related expansion service import failed: {e}")
+            rel_svc = None
+        # Batch-load the legacy related_keys marker per (scope, scope_id) so the
+        # fallback is not N+1 (mirrors the pre-#511 grouping).
         groups: dict = {}
         for m in primaries:
             groups.setdefault((m.scope, self._effective_scope_id(m)), []).append(m)
-        lookups: dict = {}
+        legacy_lookups: dict = {}
+        # Batch-load the STORE's active relates_to targets per (scope, scope_id)
+        # too — one query per group, matching the legacy lookup's grouping. A
+        # per-primary active_targets call here was an N+1 on the authoritative
+        # read path while the legacy fallback beside it was already batched.
+        store_lookups: dict = {}
         for (g_scope, g_scope_id), members in groups.items():
-            lookups[(g_scope, g_scope_id)] = self._related_keys_lookup(
-                [m.key for m in members], g_scope, g_scope_id
-            )
+            member_keys = [m.key for m in members]
+            try:
+                legacy_lookups[(g_scope, g_scope_id)] = self._related_keys_lookup(
+                    member_keys, g_scope, g_scope_id
+                )
+            except Exception as e:  # noqa: BLE001 — non-blocking
+                logger.debug(f"related_keys lookup failed for {g_scope}: {e}")
+                legacy_lookups[(g_scope, g_scope_id)] = {}
+            if rel_svc is None:
+                store_lookups[(g_scope, g_scope_id)] = {}
+                continue
+            try:
+                store_lookups[(g_scope, g_scope_id)] = rel_svc.active_targets_for(
+                    g_scope, g_scope_id, member_keys, type="relates_to"
+                )
+            except Exception as e:  # noqa: BLE001 — non-blocking
+                logger.debug(f"active_targets_for failed for {g_scope}: {e}")
+                store_lookups[(g_scope, g_scope_id)] = {}
+
         for primary in primaries:
             primary_scope_id = self._effective_scope_id(primary)
-            raw = lookups.get((primary.scope, primary_scope_id), {}).get(primary.key)
-            for rk in self._parse_related_keys(raw, scope=primary.scope):
+            # Absent from the map == the store has no active edges for this
+            # primary, which is exactly the condition the legacy fallback below
+            # keys on (the store stays authoritative whenever it HAS edges).
+            targets: list = list(
+                store_lookups.get((primary.scope, primary_scope_id), {}).get(primary.key) or []
+            )
+            # Legacy fallback: only when the store yielded nothing for this
+            # primary (the store is authoritative when it has edges).
+            if not targets:
+                raw = legacy_lookups.get((primary.scope, primary_scope_id), {}).get(primary.key)
+                targets = self._parse_related_keys(raw, scope=primary.scope)
+            for rk in targets:
                 if rk in visited:
                     continue
                 visited.add(rk)
@@ -1872,6 +2013,22 @@ class MemoryService:
                         m.key,
                     )
                 )
+                # FR-4.6: a memory that is the TARGET of an active supersedes edge
+                # must not outrank active guidance merely by textual similarity.
+                # Apply a stable demotion — superseded memories sink below
+                # non-superseded ones while preserving the composite order within
+                # each group. Best-effort; a store read failure leaves the order
+                # unchanged. NULL confidence is NOT used here (never treated as
+                # zero — NFR-2.3); this demotion is purely lifecycle-based.
+                try:
+                    superseded = self._superseded_keys(results)
+                    if superseded:
+                        # Full (scope, scope_id, key) identity — see
+                        # _superseded_keys. A (scope, key) comparison would
+                        # cross-project-demote a same-named memory.
+                        results.sort(key=lambda m: 1 if self._is_superseded(m, superseded) else 0)
+                except Exception as e:  # noqa: BLE001 — non-blocking
+                    logger.debug(f"superseded demotion skipped: {e}")
             if not scope:
                 # Stable scope-precedence sort AFTER score/usage preserves
                 # within-scope ordering while enforcing scope dominance.
@@ -2528,6 +2685,10 @@ class MemoryService:
                 self._delete_metadata(key, scope, scope_id)
             except Exception as e:
                 logger.warning(f"Memory metadata SQLite delete failed (key={key}): {e}")
+            # The relationship rows are just as stale as the metadata row was —
+            # purge them on this path too, else a file that vanished out-of-band
+            # leaves edges that a same-slug memory would later inherit.
+            self._purge_relationships(key, scope, scope_id)
             return False
 
         # Delete the wiki file
@@ -2546,7 +2707,35 @@ class MemoryService:
         except Exception as e:
             logger.warning(f"Memory metadata SQLite delete failed (key={key}): {e}")
 
+        # Drop the typed relationship rows too (issue #511 / PR #524 review):
+        # the file, the index entry and the metadata row are all gone, so any
+        # edge touching this key is dangling.
+        self._purge_relationships(key, scope, scope_id)
+
         return True
+
+    def _purge_relationships(self, key: str, scope: str, scope_id: Optional[str]) -> None:
+        """Hard-delete relationship rows for a FORGOTTEN memory. Best-effort.
+
+        Without this, ``forget()`` left ``active`` rows pointing at a key that no
+        longer resolves, and a later memory created with the SAME slug silently
+        inherited the dead memory's edges. Non-blocking: a store failure must not
+        turn a successful forget into an exception, since the file and metadata
+        row are already gone by this point.
+        """
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            # ``scope_id`` here is already the resolved LOGICAL value (forget()
+            # resolves it before use); the store maps None to its own NOT-NULL
+            # sentinel internally, so it must NOT be pre-mapped here.
+            removed = MemoryRelationshipService().purge_for_key(scope, scope_id, key)
+            if removed:
+                logger.info(f"Purged {removed} relationship row(s) for forgotten memory: {key}")
+        except Exception as e:  # noqa: BLE001 — never fail a completed forget
+            logger.warning(f"Relationship purge failed (key={key}): {e}")
 
     # -------------------------------------------------------------------------
     # Context for terminal injection

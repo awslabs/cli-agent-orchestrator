@@ -8,6 +8,8 @@
 
 **CLI Agent Orchestrator (CAO)** 是一个开源的多 Agent 编排框架，面向 Claude Code、Kiro CLI、Codex CLI、Antigravity CLI、Hermes Agent、Kimi CLI、GitHub Copilot CLI、OpenCode 和 Cursor CLI 等 AI 编程 CLI。CAO 会把每个 Agent 运行在隔离的 tmux 会话中，并通过 Model Context Protocol (MCP) 以 supervisor-worker 模式协调它们。一个 supervisor Agent 可以并行、串行，或以 swarm 方式把任务分派给多个专长不同的 Agent。
 
+📚 **[文档站点](https://awslabs.github.io/cli-agent-orchestrator/)** —— 指南、参考文档，以及两门交互式课程（英文）。
+
 ## CAO 是什么？
 
 CAO（读作 "kay-oh"）是一个轻量的本地编排器，位于你和常用 CLI 编程 Agent 之间。你不再只能一次运行一个 Agent，而是可以让 supervisor Agent 启动、发送消息并协调多个 worker Agent。每个 worker 都是真实的 CLI 工具（如 Claude Code、Kiro、Codex 等），运行在自己的 tmux 终端里。

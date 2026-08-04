@@ -139,7 +139,7 @@ class TestInstallCommand:
         local_store = tmp_path / "agent-store"
         local_store.mkdir()
         monkeypatch.setattr(
-            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR",
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
             local_store,
         )
         source_profile = tmp_path / "local.md"
@@ -173,7 +173,7 @@ class TestInstallCommand:
     ) -> None:
         """A `.md`-suffixed path that doesn't exist should fail before the service call."""
         monkeypatch.setattr(
-            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR",
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
             tmp_path / "agent-store",
         )
 
@@ -191,7 +191,7 @@ class TestInstallCommand:
     ) -> None:
         """A local .md file whose stem contains unsafe characters must be refused."""
         monkeypatch.setattr(
-            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR",
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR",
             tmp_path / "agent-store",
         )
         bad = tmp_path / "evil space.md"
@@ -254,7 +254,7 @@ class TestCopyLocalProfileToStore:
     ) -> None:
         store = tmp_path / "store"
         monkeypatch.setattr(
-            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR", store
+            "cli_agent_orchestrator.services.profile_store.LOCAL_AGENT_STORE_DIR", store
         )
         src = tmp_path / "my-agent.md"
         src.write_text("body", encoding="utf-8")
