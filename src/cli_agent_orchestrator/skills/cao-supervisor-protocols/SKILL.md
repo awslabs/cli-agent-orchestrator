@@ -88,3 +88,20 @@ Other providers may still emit prompts in their terminal output without reportin
 - When workers create files, ask them to return absolute paths in their callback message.
 - Do not assume results will be delivered while your terminal is still busy.
 - Keep orchestration instructions separate from domain requirements so workers can parse both cleanly.
+
+## Conductor-managed sessions
+
+The patterns above describe direct orchestrator use. When a session is managed by
+an external conducting layer, that layer owns dispatch and lifecycle, and its
+guidance takes precedence over this skill.
+
+A managed session records worker identity, leases, callbacks, and recovery state
+through its own surfaces. Dispatching with raw `assign`, or blocking on `handoff`
+for long work, bypasses that bookkeeping: the resulting worker is unregistered,
+its lease and callback evidence are missing, and a result can be stranded when the
+blocking call ends. Use the managed launch and delivery surfaces instead, and let
+the conducting layer resolve profile, provider, model, and effort.
+
+If you cannot tell whether a session is conductor-managed, look for the managed
+control surfaces and campaign state before dispatching. When they are present,
+defer; when they are absent, the direct patterns above apply.
