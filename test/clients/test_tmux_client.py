@@ -517,14 +517,81 @@ class TestGetSessionWindows:
 # ── kill_session ─────────────────────────────────────────────────────
 
 
+def _cmd_result(returncode, stdout=(), stderr=()):
+    """Build a stand-in for libtmux's ``tmux_cmd`` result object.
+
+    ``session_exists_strict`` reads exactly three attributes off it, so this is
+    the whole surface. Used to drive the verify poll, which now runs its own
+    ``list-sessions`` instead of touching ``server.sessions`` (#498).
+    """
+    result = MagicMock()
+    result.returncode = returncode
+    result.stdout = list(stdout)
+    result.stderr = list(stderr)
+    return result
+
+
 class TestKillSession:
     def test_kill_session_success(self, tmux):
         mock_session = MagicMock()
         tmux.server.sessions.get.return_value = mock_session
+        # The strict verify runs list-sessions: exit 0 with "ses" absent from the
+        # name list is an authoritative "gone" (#498).
+        tmux.server.cmd.return_value = _cmd_result(0, stdout=["other"])
 
         result = tmux.kill_session("ses")
 
         assert result is True
+        mock_session.kill.assert_called_once()
+
+    def test_kill_session_polls_until_session_confirmed_gone(self, tmux, monkeypatch):
+        """The BOUNDED RETRY loop is what makes True mean "confirmed gone".
+
+        tmux does not always reap a session synchronously with ``session.kill()``,
+        so the primitive polls. Here the session is still listed on the first
+        verify and only absent on the second: kill_session must keep polling and
+        return True, having slept between attempts. Only immediate-success and
+        the timeout=0 path were covered before, leaving the retry loop — the
+        whole point of the confirmation contract — unexercised (#498).
+        """
+        mock_session = MagicMock()
+        tmux.server.sessions.get.return_value = mock_session
+        # 1st verify: still listed -> must sleep and retry. 2nd: gone -> True.
+        tmux.server.cmd.side_effect = [
+            _cmd_result(0, stdout=["ses"]),
+            _cmd_result(0, stdout=[]),
+        ]
+        sleeps: list[float] = []
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.tmux.time.sleep", lambda s: sleeps.append(s)
+        )
+
+        result = tmux.kill_session("ses")
+
+        assert result is True
+        mock_session.kill.assert_called_once()
+        # Exactly one retry: it slept once, between the alive verify and the
+        # one that confirmed absence.
+        assert sleeps == [tmux._KILL_SESSION_VERIFY_INTERVAL_SECONDS]
+        assert tmux.server.cmd.call_count == 2
+
+    def test_kill_session_lookup_error_during_verify_is_not_gone(self, tmux, monkeypatch):
+        """A transient lookup error during the verification poll must NOT be
+        read as "session gone": kill_session returns False, never a false True
+        (#498)."""
+        mock_session = MagicMock()
+        tmux.server.sessions.get.return_value = mock_session
+        # Found on the initial lookup; the verify's list-sessions then fails in a
+        # way that is NOT an absence (permission denied), so the strict check
+        # raises TmuxLookupError, which must be caught as a failed kill.
+        tmux.server.cmd.return_value = _cmd_result(
+            1, stderr=["error connecting to /tmp/x.sock (Permission denied)"]
+        )
+        monkeypatch.setattr(tmux, "_KILL_SESSION_VERIFY_TIMEOUT_SECONDS", 0)
+
+        result = tmux.kill_session("ses")
+
+        assert result is False
         mock_session.kill.assert_called_once()
 
     def test_kill_session_not_found(self, tmux):
@@ -540,6 +607,19 @@ class TestKillSession:
         result = tmux.kill_session("ses")
 
         assert result is False
+
+    def test_kill_session_returns_false_when_session_survives(self, tmux, monkeypatch):
+        mock_session = MagicMock()
+        tmux.server.sessions.get.return_value = mock_session
+        # Every verify authoritatively still lists the session, so the bounded
+        # poll expires without confirmation.
+        tmux.server.cmd.return_value = _cmd_result(0, stdout=["ses"])
+        monkeypatch.setattr(tmux, "_KILL_SESSION_VERIFY_TIMEOUT_SECONDS", 0)
+
+        result = tmux.kill_session("ses")
+
+        assert result is False
+        mock_session.kill.assert_called_once()
 
 
 # ── kill_window ──────────────────────────────────────────────────────
