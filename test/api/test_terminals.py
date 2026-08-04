@@ -278,6 +278,38 @@ class TestTerminalCreationWithWorkingDirectory:
             assert response.status_code == 400
             mock_svc.create_terminal.assert_not_called()
 
+    def test_create_terminal_kas_refusal_maps_to_400_not_404(self, client):
+        """A KAS refusal is a bad request, not a missing resource.
+
+        KiroPhase0KASError subclasses ValueError, and this endpoint's generic
+        ValueError arm means "session/window not found" -- so without a narrower
+        arm ordered first, an engine rejection reports 404. POST /sessions
+        already returns 400 for the identical failure.
+        """
+        from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=KiroPhase0KASError(profile_has_v2_policy=False)
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "engine": "kas",
+                },
+            )
+
+        assert response.status_code == 400
+
     def test_create_terminal_rejects_malformed_caller_id(self, client):
         """caller_id is validated against the TerminalId pattern — IDs arrive
         from agent input and must not be persisted unvalidated."""
@@ -535,6 +567,7 @@ class TestWebSocketLocalhostRestriction:
 
         ws = MagicMock()
         ws.client = MagicMock(host="172.17.0.1")  # Docker bridge IP, simulating issue #149
+        ws.headers = {}  # non-browser client: no Origin header, passes the Origin gate
         ws.accept = AsyncMock()
         ws.close = AsyncMock()
 
@@ -590,6 +623,7 @@ class TestWebSocketLocalhostRestriction:
 
         ws = MagicMock()
         ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {}
         ws.accept = AsyncMock()
         ws.close = AsyncMock()
 
@@ -611,6 +645,285 @@ class TestWebSocketLocalhostRestriction:
         kwargs = ws.close.call_args.kwargs
         assert kwargs.get("code") == 4003
         assert "Invalid tmux target name" in kwargs.get("reason", "")
+
+    @pytest.mark.asyncio
+    async def test_websocket_rejects_cross_site_origin(self):
+        """CWE-1385: a loopback peer carrying a foreign browser Origin (the
+        cross-site WebSocket hijacking scenario) is closed with 4403 before
+        any accept — even though its IP passes ``WS_ALLOWED_CLIENTS``.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")  # browser connects from loopback
+        # Attacker page: its Origin is its own site, but the socket's Host is
+        # the CAO server it targets (browser sets Host, script cannot forge it).
+        ws.headers = {"origin": "http://evil.example.com", "host": "localhost:9889"}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                ["127.0.0.1", "::1", "localhost"],
+            ),
+            patch(
+                "cli_agent_orchestrator.constants.CORS_ORIGINS",
+                ["http://localhost:9889", "http://127.0.0.1:9889"],
+            ),
+            patch("cli_agent_orchestrator.constants.WS_ALLOWED_ORIGINS", []),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        # Origin authority (evil.example.com) != Host (localhost:9889) and not
+        # in any allowlist → rejected before accept, no PTY spun up.
+        ws.accept.assert_not_called()
+        ws.close.assert_awaited_once()
+        kwargs = ws.close.call_args.kwargs
+        assert kwargs.get("code") == 4403
+
+    @pytest.mark.asyncio
+    async def test_websocket_admits_same_origin_via_host_match(self):
+        """The bundled viewer is served by cao-server, so its Origin authority
+        equals the request Host. That must pass EVEN WHEN the origin is absent
+        from ``CORS_ORIGINS`` — the imported-app deployment
+        (``uvicorn ...:app``) never runs ``add_local_cors_origins``, so the
+        same-origin match on Host is what keeps its viewer working.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {"origin": "http://localhost:9889", "host": "localhost:9889"}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                ["127.0.0.1", "::1", "localhost"],
+            ),
+            # Deliberately empty: proves the pass is via Host-match, not CORS.
+            patch("cli_agent_orchestrator.constants.CORS_ORIGINS", []),
+            patch("cli_agent_orchestrator.constants.WS_ALLOWED_ORIGINS", []),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value=None,
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        # Same-origin → accept happened; terminal lookup None → 4004 (not 4403).
+        ws.accept.assert_awaited_once()
+        ws.close.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4004
+
+    @pytest.mark.asyncio
+    async def test_websocket_admits_proxied_https_same_origin(self):
+        """Codespaces / reverse-proxy: the viewer loads over HTTPS at a dynamic
+        forwarded hostname and the WSS handshake carries a matching Host. The
+        same-origin match must accept it without the operator pre-registering
+        the (unpredictable) origin.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        proxied = "myspace-9889.app.github.dev"
+        ws = MagicMock()
+        ws.client = MagicMock(host="10.0.0.7")  # the forwarding proxy's peer IP
+        ws.headers = {"origin": f"https://{proxied}", "host": proxied}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            # Codespaces doc sets CAO_WS_ALLOWED_CLIENTS="*".
+            patch("cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS", ["*"]),
+            patch("cli_agent_orchestrator.constants.CORS_ORIGINS", []),
+            patch("cli_agent_orchestrator.constants.WS_ALLOWED_ORIGINS", []),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value=None,
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        ws.accept.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4004
+
+    @pytest.mark.asyncio
+    async def test_websocket_admits_cross_origin_via_allowlist(self):
+        """A genuinely cross-origin viewer (Origin authority != Host) still
+        works when the operator lists it in ``CAO_WS_ALLOWED_ORIGINS``.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {"origin": "https://viewer.example.dev", "host": "localhost:9889"}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                ["127.0.0.1", "::1", "localhost"],
+            ),
+            patch("cli_agent_orchestrator.constants.CORS_ORIGINS", []),
+            patch(
+                "cli_agent_orchestrator.constants.WS_ALLOWED_ORIGINS",
+                ["https://viewer.example.dev"],
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value=None,
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        ws.accept.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4004
+
+    @pytest.mark.asyncio
+    async def test_websocket_admits_non_browser_client_without_origin(self):
+        """Native (non-browser) clients — CLI, the ``websockets`` lib, tests —
+        send no Origin header. The CSRF threat is browser-only, so a missing
+        Origin passes the guard (still gated by the loopback IP allowlist).
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {}  # no Origin
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                ["127.0.0.1", "::1", "localhost"],
+            ),
+            patch("cli_agent_orchestrator.constants.CORS_ORIGINS", []),
+            patch("cli_agent_orchestrator.constants.WS_ALLOWED_ORIGINS", []),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value=None,
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        ws.accept.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4004
+
+
+class TestWebSocketOriginIntegration:
+    """End-to-end Origin-guard coverage through the real ASGI middleware stack
+    (TrustedHostMiddleware + CORSMiddleware + the route), not a mock WebSocket.
+
+    Starlette's ``TestClient.websocket_connect`` performs a genuine ASGI
+    handshake: a 4403 policy close surfaces as ``WebSocketDisconnect`` when the
+    client tries to receive, while an admitted connection proceeds past accept.
+    The TestClient's peer host is ``testclient``, so admit it in
+    ``WS_ALLOWED_CLIENTS`` to isolate the Origin behavior under test.
+    """
+
+    def _client(self):
+        from test.api.conftest import TestClientWithHost
+
+        app.state.plugin_registry = None
+        return TestClientWithHost(app)
+
+    def _trust_host(self, host):
+        """Add ``host`` to the live ``ALLOWED_HOSTS`` list so a fresh
+        ``TrustedHostMiddleware`` (built when the TestClient constructs its
+        stack) trusts it — the reverse-proxy case the documented Codespaces
+        ``CAO_ALLOWED_HOSTS`` / ``add_local_cors_origins`` flow handles at
+        runtime. ``add_middleware`` captured the list by reference, and the
+        middleware copies it at build time, so mutating it in place before the
+        client builds is what takes effect. Returns a restore callback.
+        """
+        import cli_agent_orchestrator.api.main as main_mod
+
+        added = host not in main_mod.ALLOWED_HOSTS
+        if added:
+            main_mod.ALLOWED_HOSTS.append(host)
+        # The app is a module singleton whose middleware_stack is built and
+        # cached on first request; drop it so the next connect rebuilds the
+        # TrustedHostMiddleware from the now-extended ALLOWED_HOSTS list.
+        app.middleware_stack = None
+
+        def restore():
+            if added and host in main_mod.ALLOWED_HOSTS:
+                main_mod.ALLOWED_HOSTS.remove(host)
+            app.middleware_stack = None
+
+        return restore
+
+    def _connect(self, origin, host="localhost", cors=None, extra_origins=None, trust_host=False):
+        """Open a WS handshake with the given Origin/Host and return the close
+        code (or None if the socket was admitted, then closed cleanly)."""
+        from starlette.websockets import WebSocketDisconnect
+
+        headers = {"Host": host}
+        if origin is not None:
+            headers["Origin"] = origin
+
+        restore = self._trust_host(host) if trust_host else (lambda: None)
+        try:
+            with (
+                patch(
+                    "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                    ["testclient", "127.0.0.1", "::1", "localhost"],
+                ),
+                patch("cli_agent_orchestrator.constants.CORS_ORIGINS", cors or []),
+                patch(
+                    "cli_agent_orchestrator.constants.WS_ALLOWED_ORIGINS",
+                    extra_origins or [],
+                ),
+                # Admitted path stops at terminal lookup so no PTY is spawned.
+                patch(
+                    "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                    return_value=None,
+                ),
+            ):
+                client = self._client()
+                try:
+                    with client.websocket_connect("/terminals/abcd1234/ws", headers=headers) as ws:
+                        # Admitted → accept happened; server then closes with
+                        # 4004 (terminal not found). Receiving surfaces that.
+                        try:
+                            ws.receive_text()
+                        except WebSocketDisconnect as exc:
+                            return exc.code
+                        return None
+                except WebSocketDisconnect as exc:
+                    # Pre-accept policy close (4403 Origin / 4003 IP).
+                    return exc.code
+        finally:
+            restore()
+
+    def test_bundled_same_origin_viewer_is_admitted(self):
+        """The imported-app deployment (``uvicorn ...:app``) never runs
+        ``add_local_cors_origins``; with empty CORS the bundled viewer at the
+        server's own origin must still be admitted via the Host match."""
+        code = self._connect("http://localhost:9889", host="localhost:9889", cors=[])
+        assert code == 4004  # admitted, then terminal-not-found
+
+    def test_proxied_https_same_origin_is_admitted(self):
+        """Codespaces / reverse proxy: HTTPS viewer at a dynamic forwarded
+        hostname, handshake Host matches, admitted with no allowlist entry."""
+        proxied = "myspace-9889.app.github.dev"
+        code = self._connect(f"https://{proxied}", host=proxied, cors=[], trust_host=True)
+        assert code == 4004
+
+    def test_cross_site_origin_is_rejected(self):
+        """CWE-1385: a foreign Origin whose authority differs from the Host is
+        closed with 4403 before accept, through the real stack."""
+        code = self._connect("http://evil.example.com", host="localhost:9889", cors=[])
+        assert code == 4403
+
+    def test_no_origin_is_admitted(self):
+        """Non-browser client: no Origin header, admitted (IP-gated only)."""
+        code = self._connect(None, host="localhost", cors=[])
+        assert code == 4004
 
 
 class TestBuildPtyEnv:
@@ -688,6 +1001,7 @@ class TestWebSocketSubprocessTerm:
 
         ws = MagicMock()
         ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {}
         ws.accept = AsyncMock()
         ws.close = AsyncMock()
 
@@ -738,6 +1052,7 @@ class TestWebSocketSubprocessTerm:
 
         ws = MagicMock()
         ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {}
         ws.accept = AsyncMock()
         ws.close = AsyncMock()
 
@@ -777,6 +1092,7 @@ class TestWebSocketSubprocessTerm:
 
         ws = MagicMock()
         ws.client = MagicMock(host="127.0.0.1")
+        ws.headers = {}
         ws.accept = AsyncMock()
         ws.close = AsyncMock()
 

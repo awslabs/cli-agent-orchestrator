@@ -43,6 +43,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH,
     WORKFLOW_SHIPPED_UNITS,
 )
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 
 # Re-exported from the light runtime module so existing
 # ``from ...models.workflow import StepState / WorkflowIndexRow / ...`` call
@@ -151,6 +152,7 @@ class WorkflowStep(BaseModel):
     provider: str
     agent: str
     prompt: str
+    engine: Optional[KiroEngine] = None
     output_schema: Optional[Dict[str, Any]] = None
     # RESERVED — conditional execution (no MVP unit). Validates, never runs.
     when: Optional[str] = None

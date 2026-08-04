@@ -8,6 +8,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.providers.manager import ProviderManager
 
 
@@ -248,6 +249,30 @@ def test_get_provider_marks_kiro_initialized_on_restore():
 
     assert provider.shell_baseline == "zsh"
     assert provider._initialized is True
+
+
+def test_get_provider_rejects_persisted_kas_before_provider_construction():
+    """A persisted KAS terminal is never restored as a runnable provider."""
+    manager = ProviderManager()
+
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": ProviderType.KIRO_CLI.value,
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "developer",
+                "engine": "kas",
+            },
+        ),
+        patch("cli_agent_orchestrator.providers.manager.KiroCliProvider") as provider_class,
+    ):
+        with pytest.raises(KiroPhase0KASError, match="Cedar"):
+            manager.get_provider("t1")
+
+    provider_class.assert_not_called()
+    assert "t1" not in manager._providers
 
 
 def test_get_provider_no_shell_baseline_when_metadata_missing_shell_command():

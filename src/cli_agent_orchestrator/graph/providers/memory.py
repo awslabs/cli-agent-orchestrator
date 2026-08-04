@@ -124,22 +124,18 @@ class MemoryGraphProvider(GraphProvider):
         nodes: dict[str, Node] = {key: Node(id=key, kind="topic", label=key) for key in keys}
         edges: list[Edge] = []
 
-        # related_keys edges (FR-7a). related_keys carries no relevance
-        # score, so edge attrs stay score-free. A target outside this
-        # scope's key set is dropped — never a cross-scope edge (FR-9).
-        related_raw = self._svc._related_keys_lookup(keys, scope, scope_id)
-        for key in keys:
-            for target in MemoryService._parse_related_keys(related_raw.get(key), scope):
-                if target not in nodes or target == key:
-                    continue
-                edges.append(
-                    Edge(
-                        source=key,
-                        target=target,
-                        type=EdgeType.RELATES_TO,
-                        attrs={"source": "related_keys"},
-                    )
-                )
+        # Typed relationship edges from the STORE (issue #511, FR-4.3). The
+        # provider projects ACTIVE relationships (relates_to + contradiction +
+        # supersedes) read through the single service — NOT from related_keys and
+        # NOT from projection-time lint. Edge attrs carry provenance (the row's
+        # origin) and NO invented score/relevance. A target outside this scope's
+        # node set is dropped (never a cross-scope edge, FR-9). Multiple edge
+        # types between one pair remain distinct Edges (FR-4.4).
+        _TYPE_MAP = {
+            "relates_to": EdgeType.RELATES_TO,
+            "contradiction": EdgeType.CONTRADICTION,
+            "supersedes": EdgeType.SUPERSEDES,
+        }
 
         issues = []
         if lint_enabled:
@@ -156,6 +152,53 @@ class MemoryGraphProvider(GraphProvider):
             except Exception as e:
                 logger.warning("memory graph provider: run_lint failed: %r", e, exc_info=True)
                 meta["lint_error"] = type(e).__name__
+
+        # ORDERING (human review, PR #524): the relationship read MUST come after
+        # run_lint. run_lint persists its contradiction findings into this same
+        # store (wiki_lint._persist_contradictions), so reading first meant a
+        # contradiction detected during THIS projection was absent from the graph
+        # it produced — invisible for a full cache window, and reappearing later
+        # with no apparent cause. Reading after makes the projection reflect the
+        # lint run it just performed.
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            # Bound the query to THIS projection's node set. Without
+            # source_keys the read loads every active relationship in the
+            # (scope, scope_id) and discards the out-of-set rows in Python,
+            # where the pre-#511 related_keys read was naturally bounded to
+            # the current keys.
+            #
+            # This bounds the SOURCE side only. The both-endpoints check below
+            # is still required and must NOT be removed: a source inside the
+            # node set may legitimately point at a target outside it, and
+            # dropping that edge is what enforces FR-9 (never a cross-scope
+            # edge) and keeps GraphView's endpoint validation satisfied.
+            active = MemoryRelationshipService().list_relationships(
+                scope, scope_id, status="active", source_keys=keys
+            )
+        except Exception as e:  # degrade to a relationship-free graph, never 500
+            logger.warning("memory graph provider: relationship read failed: %r", e)
+            meta["relationship_error"] = type(e).__name__
+            active = []
+        for rel in active:
+            edge_type = _TYPE_MAP.get(rel.type)
+            if edge_type is None:
+                continue
+            if rel.source_key not in nodes or rel.target_key not in nodes:
+                continue
+            if rel.source_key == rel.target_key:
+                continue
+            edges.append(
+                Edge(
+                    source=rel.source_key,
+                    target=rel.target_key,
+                    type=edge_type,
+                    attrs={"source": rel.origin},
+                )
+            )
 
         for issue in issues:
             if issue.issue_type == "orphan_page":
@@ -177,19 +220,11 @@ class MemoryGraphProvider(GraphProvider):
                 node = nodes.get(issue.key)
                 if node is not None:
                     node.attrs["is_hub"] = True
-            elif issue.issue_type == "contradiction":
-                if issue.scope_id != scope_id or issue.related_key is None:
-                    continue
-                if issue.key not in nodes or issue.related_key not in nodes:
-                    continue
-                edges.append(
-                    Edge(
-                        source=issue.key,
-                        target=issue.related_key,
-                        type=EdgeType.CONTRADICTION,
-                        attrs={"source": "wiki_lint", "summary": issue.description},
-                    )
-                )
+            # contradiction: NO LONGER projected from live lint here (issue #511).
+            # Contradiction edges now come from the durable store above (persisted
+            # by the wiki_lint producer with origin=wiki_lint), so projecting them
+            # again from the in-request lint run would double-source them. Lint
+            # still runs for the orphan_page/graph_density NODE attrs above.
             # stale_claim / poison_frequency / lint_error → dropped (ADR-2).
 
         return GraphView(nodes=list(nodes.values()), edges=edges, meta=meta)

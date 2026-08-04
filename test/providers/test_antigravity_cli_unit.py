@@ -345,6 +345,16 @@ def test_blocks_orchestrated_input_while_waiting_user_answer():
     assert make_provider().blocks_orchestrated_input_while_waiting_user_answer is True
 
 
+def test_paste_submit_delay_is_1_5():
+    """agy needs longer than BaseProvider's 0.3s delay for bracketed paste."""
+    assert make_provider().paste_submit_delay == 1.5
+
+
+def test_paste_enter_count_is_one():
+    """agy uses one Enter instead of BaseProvider's Claude-oriented default of two."""
+    assert make_provider().paste_enter_count == 1
+
+
 def test_get_idle_pattern_for_log():
     pat = make_provider().get_idle_pattern_for_log()
     import re

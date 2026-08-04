@@ -445,6 +445,66 @@ async def _check_pair(
     )
 
 
+#: ``lint_error`` descriptions that mean the contradiction pass did NOT examine
+#: every candidate source. Retraction is evidence-of-absence, so it is only safe
+#: after an EXHAUSTIVE pass — ``completion["contradiction"]`` alone is too weak a
+#: gate: the detector returns NORMALLY (setting it True) both when no LLM
+#: provider is configured and when the pair set was truncated by ``max_pairs``.
+#: Retracting on either would wipe live contradiction edges across the whole
+#: wiki the moment the LLM was unavailable.
+_CONTRADICTION_INCOMPLETE_MARKERS = (
+    "contradiction detector disabled",
+    "contradiction pass capped at",
+    "contradiction skipped:",
+    "contradiction timed out",
+    "contradiction did not complete",
+    "contradiction pair timed out",
+    "contradiction pair LLM error",
+    "contradiction pair output validation failed",
+    "contradiction task raised",
+)
+
+
+def _contradiction_pass_was_exhaustive(issues: list) -> bool:
+    """True only if every candidate pair was actually adjudicated.
+
+    Any degradation marker — no LLM provider, a ``max_pairs`` truncation, a
+    global or per-pair timeout, a task exception, a validation failure — means
+    some source's contradictions went unexamined this run. Treating that as
+    "clean" would retract real edges on absent evidence, so it fails CLOSED.
+    """
+    for i in issues:
+        if i.issue_type != "lint_error":
+            continue
+        desc = i.description or ""
+        if any(m in desc for m in _CONTRADICTION_INCOMPLETE_MARKERS):
+            return False
+    return True
+
+
+def _contradiction_candidates(rows: list) -> set:
+    """``{(scope_id, key)}`` for rows the contradiction detector could pair.
+
+    Retraction needs the EXAMINED set, not the finding set: a source whose last
+    contradiction was resolved emits no issue, so it never appears in the
+    findings and its final stale edge would persist forever.
+
+    The membership test mirrors ``_build_pairs``' own filters — a body of at
+    least 50 chars and at least one non-empty tag — so this can only ever name a
+    source the detector actually considered. A row excluded there is excluded
+    here, and is therefore left alone rather than having its edges retracted on
+    evidence that was never gathered.
+    """
+    candidates: set = set()
+    for r in rows:
+        if len(r.get("content") or "") < 50:
+            continue
+        if not any(t.strip() for t in (r.get("tags") or "").split(",")):
+            continue
+        candidates.add((r.get("scope_id"), r.get("key")))
+    return candidates
+
+
 def _build_pairs(rows: list, max_pairs: int) -> tuple[list, int]:
     """Build deduplicated tag-bucket pairs sorted by recency for stability.
 
@@ -1150,4 +1210,86 @@ async def run_lint(
     except Exception as e:
         logger.debug(f"audit_log lint write failed: {e}")
 
+    # Persist contradiction findings through the single relationship service
+    # (issue #511, FR-3.2) so they are inspectable durable rows (origin=wiki_lint,
+    # type=contradiction) rather than only projection-time findings. Grouped per
+    # source and written with producer-scoped replace_set so a re-run RETRACTS
+    # contradictions no longer detected while preserving human-authored ones
+    # (BR-LP6). Best-effort: a failure logs and never breaks lint.
+    #
+    # Retraction requires knowing which sources were EXAMINED, not just which
+    # produced a finding — a source whose last contradiction was resolved emits
+    # no issue at all, so grouping by findings alone can never retract its final
+    # stale edge. ``linted_sources`` supplies that set, and it is passed ONLY
+    # when the pass was EXHAUSTIVE. ``completion["contradiction"]`` is necessary
+    # but NOT sufficient: the detector also returns normally (setting it True)
+    # when no LLM provider is configured and when max_pairs truncated the pair
+    # set, so the marker scan fails closed on any degradation. Retracting off a
+    # partial pass would delete real edges on absent evidence.
+    try:
+        _exhaustive = completion["contradiction"] and _contradiction_pass_was_exhaustive(issues)
+        _persist_contradictions(
+            issues,
+            scope,
+            linted_sources=_contradiction_candidates(rows) if _exhaustive else None,
+        )
+    except Exception as e:  # noqa: BLE001 — non-blocking
+        logger.debug(f"contradiction persistence skipped: {e}")
+
     return issues
+
+
+def _persist_contradictions(
+    issues: list, scope: Optional[str], *, linted_sources: Optional[set] = None
+) -> None:
+    """Route wiki_lint contradiction findings into the relationship store.
+
+    One directed row per (source, target) contradiction (origin=wiki_lint); the
+    symmetric view is reconstructed at read time by the service, so no reciprocal
+    row is written. Uses producer-scoped replace_set per source key so stale
+    contradictions are retracted on re-lint while human/other-origin edges are
+    untouched (principle 6). Endpoints that no longer resolve in-scope are
+    rejected by the service (fail-closed) and simply dropped from the report.
+
+    ``linted_sources`` is the ``{(scope_id, key)}`` set the detector EXAMINED.
+    Sources in it with no finding this run are replaced with an EMPTY edge set,
+    which is what retracts a source's LAST contradiction — previously the
+    function grouped only sources that had a finding and returned early when
+    there were none, so a fully-resolved source kept its final stale edge
+    forever (the docstring already promised this retraction). Pass ``None`` when
+    the detector did not complete: no examined set means no evidence of absence,
+    so nothing is retracted.
+    """
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        EdgeInput,
+        MemoryRelationshipService,
+    )
+
+    # Group detected contradictions by (scope, scope_id, source_key).
+    grouped: dict = {}
+    for issue in issues:
+        if issue.issue_type != "contradiction" or issue.related_key is None:
+            continue
+        desc = (issue.description or "")[:512]
+        grouped.setdefault((issue.scope_id, issue.key), []).append((issue.related_key, desc))
+    # Every EXAMINED source with no finding this run gets an empty edge set, so
+    # replace_set retracts whatever it held. Without this a resolved source is
+    # simply absent from `grouped` and its last edge is never revisited.
+    for source in linted_sources or ():
+        grouped.setdefault(source, [])
+    if not grouped:
+        return
+
+    rel_svc = MemoryRelationshipService()
+    for (scope_id, source_key), targets in grouped.items():
+        eff_scope = scope or "global"
+        edges = [
+            EdgeInput(target_key=tgt, attributes={"summary": desc} if desc else None)
+            for tgt, desc in targets
+        ]
+        try:
+            rel_svc.replace_set(
+                eff_scope, scope_id, source_key, "wiki_lint", "contradiction", edges
+            )
+        except Exception as e:  # noqa: BLE001 — per-source best-effort
+            logger.debug(f"contradiction replace_set failed for {source_key}: {e}")

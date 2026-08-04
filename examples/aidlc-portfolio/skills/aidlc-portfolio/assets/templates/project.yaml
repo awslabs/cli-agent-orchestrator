@@ -1,0 +1,19 @@
+schemaVersion: 1
+id: example-project
+name: Example Project
+repository: repositories/example-project
+description: Replace with the evidence-backed purpose of this project.
+status: proposed
+businessCapabilities: []
+components:
+  - id: example-component
+    name: Example Component
+    type: service
+    criticality: unknown
+owners:
+  team: Unknown
+environments: []
+evidence: []
+confidence: low
+lastVerified: "2026-01-01"
+
