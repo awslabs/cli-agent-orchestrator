@@ -304,10 +304,11 @@ def _find_response_marker(text: str) -> Optional[re.Match[str]]:
 
     Native Codex activity cells have a ``•`` summary followed by a ``└`` tree
     continuation.  Require at least two complete cells before advancing the
-    response boundary.  A compact bullet group or a single tree-formatted
-    bullet is indistinguishable from a legitimate answer, so preserve it.
-    This deliberately avoids matching English verbs such as ``Read`` or
-    ``Called``, which can also begin legitimate replies.
+    response boundary: a single tree-formatted group may be a legitimate
+    answer, while two consecutive cells are strong evidence of TUI activity.
+    Compact bullet groups remain ambiguous and are preserved.  This trades a
+    rare false positive for avoiding silent truncation of ordinary replies and
+    deliberately avoids matching English verbs such as ``Read`` or ``Called``.
     """
 
     def line_end(start: int) -> int:
@@ -323,13 +324,27 @@ def _find_response_marker(text: str) -> Optional[re.Match[str]]:
         return None
 
     complete_cells = []
-    for index, match in enumerate(matches[:-1]):
-        cell_tail = text[line_end(match.start()) : matches[index + 1].start()]
-        if re.search(r"^[^\S\n]*└", cell_tail, re.MULTILINE):
+    prose_start = None
+    for index, match in enumerate(matches):
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        cell_tail = text[line_end(match.start()) : next_start]
+        continuation = re.search(r"^[^\S\n]*└[^\n]*(?:\n|$)", cell_tail, re.MULTILINE)
+        contains_mcp_call = re.search(MCP_TOOL_CALL_PATTERN, cell_tail, re.MULTILINE)
+        if continuation and not contains_mcp_call:
             complete_cells.append(index)
+            if index == len(matches) - 1:
+                following = re.search(r"\S", cell_tail[continuation.end() :])
+                if following:
+                    candidate = line_end(match.start()) + continuation.end() + following.start()
+                    if text[candidate] != "›":
+                        prose_start = candidate
 
     if len(complete_cells) >= 2:
-        return matches[complete_cells[-1] + 1]
+        last_cell = complete_cells[-1]
+        if last_cell + 1 < len(matches):
+            return matches[last_cell + 1]
+        if prose_start is not None:
+            return re.compile("").match(text, prose_start)
 
     return matches[0]
 
@@ -820,9 +835,9 @@ class CodexProvider(BaseProvider):
         if user_matches:
             last_user = user_matches[-1]
 
-            # Find the first assistant response marker (• or assistant:) after
-            # the user message. Skip MCP calls and any compact, blank-separated
-            # native activity prelude before the model's actual reply.
+            # Extraction uses a stricter anchor than status detection: skip MCP
+            # calls and at least two complete native activity cells before the
+            # model's actual reply, while preserving ambiguous compact groups.
             asst_after_user = _find_response_marker(clean_output[last_user.start() :])
 
             if asst_after_user:
