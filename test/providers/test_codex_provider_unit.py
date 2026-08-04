@@ -1846,6 +1846,49 @@ class TestCodexBulletFormatExtraction:
 
         assert message == "• The bug is fixed."
 
+    def test_extract_skips_activity_cells_before_prose_reply(self):
+        """A prose reply starts after the last complete native activity cell."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "• Ran pytest -q\n"
+            "  └ 170 passed\n"
+            "\n"
+            "The bug is fixed.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "The bug is fixed."
+
+    def test_extract_skips_three_activity_cells_before_prose_reply(self):
+        """All complete activity cells are removed before a prose reply."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "• Edited\n"
+            "  └ Updated codex.py\n"
+            "\n"
+            "• Ran pytest -q\n"
+            "  └ 170 passed\n"
+            "\n"
+            "The bug is fixed.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "The bug is fixed."
+
     def test_extract_skips_interleaved_commentary_and_activity(self):
         """Commentary between complete activity cells stays before the reply boundary."""
         output = (
@@ -1904,6 +1947,30 @@ class TestCodexBulletFormatExtraction:
         assert "Files changed" in message
         assert "src/provider.py" in message
         assert "Tests pass" in message
+
+    def test_extract_does_not_count_mcp_tree_output_as_activity_cells(self):
+        """MCP output must not complete neighboring model-reply bullets."""
+        output = (
+            "› summarize the work\n"
+            "• First finding\n"
+            '• Called tools.inspect({"path":"src"})\n'
+            "  └ inspection result\n"
+            "\n"
+            "• Second finding\n"
+            '• Called tools.verify({"path":"test"})\n'
+            "  └ verification result\n"
+            "\n"
+            "• Conclusion\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "First finding" in message
+        assert "Second finding" in message
+        assert "Conclusion" in message
 
     def test_extract_preserves_blank_separated_reply_bullets(self):
         """A single reply bullet before a blank line is not an activity prelude."""
