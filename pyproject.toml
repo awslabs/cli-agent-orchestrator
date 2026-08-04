@@ -33,7 +33,19 @@ dependencies = [
     "sqlalchemy>=2.0.0",
     "uvicorn[standard]>=0.24.0",
     "websockets>=12.0",
-    "libtmux>=0.51.0",
+    # Upper bound: libtmux 0.53.1 rewrote `neo.parse_output` to zip a fixed
+    # 125-name format list against each row's values with `strict=True`, so any
+    # row short of 125 values (a pane/session vanishing mid-listing, or a
+    # trailing field a given tmux build omits) raises
+    # ValueError('zip() argument 2 is shorter than argument 1') instead of
+    # degrading. 0.53.0 is the last release that zips non-strict; every release
+    # from 0.53.1 through 0.62.0 has it. Verified by inspecting `libtmux/neo.py`
+    # in every wheel in that range. clients/tmux.py wraps every listing call so
+    # a parse failure is a retryable TmuxLookupError rather than a fake
+    # "session not found" — this bound is the belt to that suspenders, keeping
+    # the broken releases from arriving silently on another machine. Raise it
+    # once upstream zips non-strict or pads short rows.
+    "libtmux>=0.51.0,<0.53.1",
     "click>=8.2.0",
     "python-dotenv>=1.2.2",
     "python-frontmatter>=1.1.0",
