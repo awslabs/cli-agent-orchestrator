@@ -55,8 +55,8 @@ async def test_writes_memory_block_on_post_create_terminal(
         },
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.codex_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: str(tmp_path),
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_backend",
+        lambda: type("FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(tmp_path)})(),
     )
 
     class FakeMemoryService:
@@ -103,8 +103,8 @@ async def test_replaces_existing_memory_block_on_rerun(
         },
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.codex_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: str(tmp_path),
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_backend",
+        lambda: type("FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(tmp_path)})(),
     )
 
     class FakeMemoryService:
@@ -142,8 +142,8 @@ async def test_skips_write_when_memory_context_empty(
         },
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.codex_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: str(tmp_path),
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_backend",
+        lambda: type("FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(tmp_path)})(),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.plugins.builtin.codex_memory.MemoryService",
@@ -176,8 +176,8 @@ async def test_disabled_memory_writes_nothing(
         },
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.codex_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: str(tmp_path),
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_backend",
+        lambda: type("FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(tmp_path)})(),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.settings_service.is_memory_enabled",
@@ -208,8 +208,8 @@ async def test_memory_fetch_failure_is_logged_not_raised(
         },
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.codex_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: str(tmp_path),
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_backend",
+        lambda: type("FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(tmp_path)})(),
     )
 
     class ExplodingMemoryService:
@@ -281,8 +281,8 @@ async def test_path_containment_guard_rejects_escape(
         },
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.codex_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: str(real_cwd),
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_backend",
+        lambda: type("FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: str(real_cwd)})(),
     )
 
     class FakeMemoryService:
@@ -342,8 +342,8 @@ async def test_missing_working_dir_does_not_escape_handler(
         },
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.codex_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: "/nonexistent-cao-dir-xyz123/sub",
+        "cli_agent_orchestrator.plugins.builtin.codex_memory.get_backend",
+        lambda: type("FakeBackend", (), {"get_pane_working_directory": lambda self, s, w: "/nonexistent-cao-dir-xyz123/sub"})(),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.plugins.builtin.codex_memory.MemoryService",

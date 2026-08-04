@@ -32,9 +32,15 @@ def _install_metadata_and_cwd(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
             "id": terminal_id,
         },
     )
+
+    # Mock get_backend() to return a fake backend with get_pane_working_directory
+    class FakeBackend:
+        def get_pane_working_directory(self, session: str, window: str) -> str:
+            return str(tmp_path)
+
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: str(tmp_path),
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.get_backend",
+        lambda: FakeBackend(),
     )
 
 
@@ -256,9 +262,15 @@ async def test_path_containment_guard_rejects_symlink_escape(
             "id": terminal_id,
         },
     )
+
+    # Mock get_backend() to return a fake backend with get_pane_working_directory
+    class FakeBackend:
+        def get_pane_working_directory(self, session: str, window: str) -> str:
+            return str(real_cwd)
+
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: str(real_cwd),
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.get_backend",
+        lambda: FakeBackend(),
     )
 
     class FakeMemoryService:
@@ -307,9 +319,15 @@ async def test_missing_working_dir_does_not_escape_handler(
             "id": terminal_id,
         },
     )
+
+    # Mock get_backend() to return a fake backend with get_pane_working_directory
+    class FakeBackend:
+        def get_pane_working_directory(self, session: str, window: str) -> str:
+            return "/nonexistent-cao-dir-xyz123/sub"
+
     monkeypatch.setattr(
-        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.tmux_client.get_pane_working_directory",
-        lambda session, window: "/nonexistent-cao-dir-xyz123/sub",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.get_backend",
+        lambda: FakeBackend(),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
