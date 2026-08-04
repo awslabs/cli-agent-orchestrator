@@ -492,6 +492,13 @@ pub struct Renderer<'a, S: ServerApi, H: Host> {
     running: bool,
     /// `true` once `[q]` was pressed while something was running — the confirm prompt.
     confirm_quit: bool,
+    /// In-progress text for the focused field, so a TRAILING space survives between keystrokes.
+    ///
+    /// `(field_cursor, text)`. `GuidedFlow::set` stores a trimmed value by an affirmed rule, which
+    /// made a trailing space unmakeable: the renderer appends one character and re-`set`s, so the
+    /// space was trimmed before the next character arrived. Keyed by cursor index so moving to
+    /// another field cannot inherit this one's partial text. (#321)
+    edit_buffer: Option<(usize, String)>,
     /// Set by `[q]` (or a confirmed quit) and read by the event loop.
     should_quit: bool,
 }
@@ -528,6 +535,7 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
             health: None,
             running: false,
             confirm_quit: false,
+            edit_buffer: None,
             should_quit: false,
         }
     }
@@ -1093,6 +1101,10 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         self.banner = None;
         self.focus = Focus::RequiredFields;
         self.field_cursor = 0;
+        // The buffer is keyed by cursor index, so moving BETWEEN fields invalidates it for free.
+        // A command change is the one case that needs an explicit clear: the cursor resets to 0,
+        // so field 0 of the NEW form would otherwise inherit the old form's partial text. (#321)
+        self.edit_buffer = None;
         self.optional_expanded = false;
         self.populate_pickers();
     }
@@ -1223,13 +1235,38 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         let Some(field) = self.flow.fields().get(self.field_cursor) else {
             return false;
         };
-        let mut value = field_value_text(field);
+
+        // Reads from the EDIT BUFFER, not from the stored field, when one is live for this field.
+        //
+        // `GuidedFlow::set` stores a trimmed value — an affirmed rule (BR-7/BR-8), and a test pins
+        // that `"  planner  "` is stored as `"planner"` rather than rejected. But the renderer
+        // appends ONE character per keystroke and calls `set()` each time, so a trailing space was
+        // trimmed away before the next character arrived: `"code"` + `' '` round-tripped to
+        // `"code"`, and the operator got `"codereview"` instead of `"code review"`. Typing a space
+        // was impossible in any text field.
+        //
+        // The buffer keeps the in-progress text verbatim so a trailing space survives long enough
+        // to be typed past, while `set()` keeps storing the trimmed value — so the wire never sees
+        // padding and BR-7/BR-8 are untouched. An operator hit this on `profile find`. (#321)
+        let mut value = match &self.edit_buffer {
+            Some((index, buffered)) if *index == self.field_cursor => buffered.clone(),
+            _ => field_value_text(field),
+        };
         match character {
             Some(character) => value.push(character),
             None => {
                 value.pop();
             }
         }
+
+        // A value that is entirely whitespace is not worth buffering: it collapses to None either
+        // way, and holding it would make the field render as non-empty when it is not.
+        self.edit_buffer = if value.trim().is_empty() {
+            None
+        } else {
+            Some((self.field_cursor, value.clone()))
+        };
+
         self.set_focused_field(&value)
     }
 
@@ -3753,6 +3790,59 @@ mod tests {
     }
 
     // ── The stated in-app gap: the real numbers ───────────────────────────────────────────────
+
+    /// **A SPACE is typeable in a text field — `"code review"`, not `"codereview"`.**
+    ///
+    /// Regression test for a defect the operator hit on `profile find`. `GuidedFlow::set` stores a
+    /// trimmed value by an affirmed rule (BR-7/BR-8, and a test pins that `"  planner  "` stores as
+    /// `"planner"`). But the renderer appends ONE character per keystroke and re-`set`s, so a
+    /// trailing space was trimmed away before the next character arrived: `"code"` + `' '`
+    /// round-tripped to `"code"`, and the next letter landed flush. **A space could not be typed in
+    /// any text field.**
+    ///
+    /// No existing test caught it because every fixture set a whitespace-free value in ONE `set()`
+    /// call — the multi-keystroke path was never exercised with a space.
+    ///
+    /// Drives real KEYSTROKES rather than calling `set()` directly: calling `set("code review")`
+    /// passes on the broken build, since the defect lives in the append-and-re-set loop. (#321)
+    #[test]
+    fn a_space_can_be_typed_into_a_text_field() {
+        let server =
+            FakeServer::healthy().with_session(SessionAnswer::Created(terminal("t-space")));
+        let host = FakeHost::outside_tmux();
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+        assert!(shell.focus_command(CommandId::Launch));
+        assert!(shell.on_key(KeyCode::Enter));
+
+        // A profile whose name has no space, then Tab to a free-text field and type one.
+        for character in "planner".chars() {
+            shell.on_key(KeyCode::Char(character));
+        }
+        shell.on_key(KeyCode::Down);
+
+        for character in "my session".chars() {
+            shell.on_key(KeyCode::Char(character));
+        }
+
+        let typed = shell
+            .flow()
+            .fields()
+            .iter()
+            .find_map(|field| match &field.value {
+                Some(crate::guided_flow::FieldValue::Text(text)) if text.contains("session") => {
+                    Some(text.clone())
+                }
+                _ => None,
+            });
+
+        assert_eq!(
+            typed.as_deref(),
+            Some("my session"),
+            "typing `my session` one keystroke at a time must land the SPACE. On the broken build \
+             the trailing space was trimmed between keystrokes, giving `mysession` — so an \
+             operator could not enter a multi-word value in any text field"
+        );
+    }
 
     /// **`profile find` actually SEARCHES — it does not report "no HTTP route".**
     ///
