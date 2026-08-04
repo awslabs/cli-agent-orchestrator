@@ -499,3 +499,62 @@ def test_write_block_two_concurrent_writers_neither_loses_the_other(tmp_path: Pa
     assert final.count(END_MARKER) == 1
     assert "Hand-written content." in final, "surrounding user content must survive"
     assert ("from-agent-a" in final) or ("from-agent-b" in final)
+
+
+@pytest.mark.asyncio
+async def test_writes_via_configured_backend_not_tmux_directly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: the cwd lookup must go through the CONFIGURED backend.
+
+    The plugin used to call ``tmux_client.get_pane_working_directory`` directly,
+    so on a non-tmux backend (herdr) the lookup returned None and CLAUDE.md was
+    silently never written. This drives the real backend registry via
+    ``set_backend`` instead of patching the plugin's ``get_backend`` name, so a
+    plugin that bypasses the abstraction never consults this backend and fails
+    the write assertion below.
+    """
+
+    from cli_agent_orchestrator.backends.registry import set_backend
+
+    resolved_for: list[tuple[str, str]] = []
+
+    class RecordingBackend:
+        """Stands in for a non-tmux backend (e.g. HerdrBackend)."""
+
+        def get_pane_working_directory(self, session: str, window: str) -> str:
+            resolved_for.append((session, window))
+            return str(tmp_path)
+
+    set_backend(RecordingBackend())
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
+        lambda terminal_id: {
+            "tmux_session": "cao-test-session",
+            "tmux_window": "developer-abcd",
+            "id": terminal_id,
+        },
+    )
+
+    class FakeMemoryService:
+        def get_memory_context_for_terminal(self, terminal_id: str) -> str:
+            return "<cao-memory>\n## Context\n- routed via backend\n</cao-memory>"
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.MemoryService",
+        lambda: FakeMemoryService(),
+    )
+
+    plugin = ClaudeCodeMemoryPlugin()
+    await plugin.setup()
+    await plugin.on_post_create_terminal(_event())
+    await plugin.teardown()
+
+    # The configured backend was actually consulted, with the metadata identifiers.
+    assert resolved_for == [("cao-test-session", "developer-abcd")]
+
+    # And CLAUDE.md landed under the cwd that backend reported.
+    target = tmp_path / ".claude" / "CLAUDE.md"
+    assert target.exists(), "CLAUDE.md must be written on a non-tmux backend"
+    assert "routed via backend" in target.read_text(encoding="utf-8")
