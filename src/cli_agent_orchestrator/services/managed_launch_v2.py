@@ -3403,6 +3403,16 @@ class _V2NativePane:
             terminal_id=self._record["terminal_id"],
         ).observe()
 
+    def capture_render(self) -> Any:
+        from cli_agent_orchestrator.services import native_tui_launch, terminal_service
+
+        return native_tui_launch.TmuxNativePane(
+            terminal_service.get_backend(),
+            session_name=self._record["session_name"],
+            window_name=self._window,
+            terminal_id=self._record["terminal_id"],
+        ).capture_render()
+
 
 async def _teardown_published_native_terminal(
     *,
@@ -3666,6 +3676,7 @@ async def _launch_native_tui(
             extra_args=launch_extra_args,
             launch_kind=launch_kind,
             expected_inner_executable=expected_inner_executable,
+            provider_version=bootstrap.get("provider_version"),
         )
     except Exception as exc:  # noqa: BLE001 - the attachment store holds the detail
         return _mark_preflight_blocked(

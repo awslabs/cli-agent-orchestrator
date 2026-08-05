@@ -66,13 +66,18 @@ class FakePane:
         create_error: Optional[Exception] = None,
         observe_error: Optional[Exception] = None,
         handle: Any = "native-window",
+        rendered: Optional[Sequence[str]] = None,
+        render_error: Optional[Exception] = None,
     ) -> None:
         self.observation = observation
         self.create_error = create_error
         self.observe_error = observe_error
         self.handle = handle
+        self.rendered = list(rendered) if rendered is not None else []
+        self.render_error = render_error
         self.created: list[list[str]] = []
         self.observe_calls = 0
+        self.render_calls = 0
 
     def create_pane(self, *, argv: Sequence[str]) -> str:
         self.created.append(list(argv))
@@ -85,6 +90,15 @@ class FakePane:
         if self.observe_error is not None:
             raise self.observe_error
         return self.observation
+
+    def capture_render(self) -> list[str]:
+        # The rendered-screen evidence channel (cond-0311): a separate
+        # read from the same pane, raised rather than empty when the pane
+        # cannot be looked at.
+        self.render_calls += 1
+        if self.render_error is not None:
+            raise self.render_error
+        return list(self.rendered)
 
 
 class SequencedPane(FakePane):
@@ -151,6 +165,33 @@ def _start(pinned: tuple[str, str], transport: Any, **overrides: Any) -> dict[st
     }
     kwargs.update(overrides)
     return native_tui_launch.start(**kwargs)
+
+
+# Kimi Code 0.31.0 rewrites its process title to ``kimi-code`` after parsing,
+# so the kernel argv the pane observer reads no longer carries the resumed
+# ``--session <id>`` (cond-0311).  These two constants model that live defect
+# for the regression suite below.
+_REWRITTEN_ARGV = ["kimi-code", "", "", "", ""]
+PINNED_0310 = "0.31.0"
+
+
+def _native_header_rows(
+    *, session: str = SESSION, directory: Optional[str] = None, version: str = PINNED_0310
+) -> list[str]:
+    """The Kimi 0.31.0 native header, framed the way ``capture-pane`` paints it.
+
+    The label rows sit inside the box's ``│`` verticals exactly as the live
+    pane renders them, so the parser must tolerate that chrome.  The directory
+    defaults to the worktree the session was minted in.
+    """
+    directory = _canonical_workdir() if directory is None else directory
+    return [
+        "│  Welcome to Kimi Code!                                                                              │",
+        f"│  Directory: {directory}                                                                              │",
+        f"│  Session:   {session}                                                                                │",
+        "│  Model:     K3                                                                                       │",
+        f"│  Version:   {version}                                                                                │",
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -838,6 +879,251 @@ def test_a_pane_not_resuming_the_bound_session_freezes_and_never_attaches(
         _start(pinned_binary, FakePane(observation=_observation(observed)))
     assert caught.value.reason == native_tui_launch.AMBIGUOUS_ARGV_MISMATCH
     _assert_frozen(native_tui_launch.AMBIGUOUS_ARGV_MISMATCH)
+
+
+# --------------------------------------------------------------------------
+# Kimi 0.31.0 process-title rewrite: the rendered native header is the proof
+# (cond-0311)
+# --------------------------------------------------------------------------
+
+
+def test_a_kimi_0310_pane_that_rewrote_its_title_attaches_via_the_rendered_header(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    """The exact live defect (cond-0311).
+
+    Kimi Code 0.31.0 rewrites ``process.title`` to ``kimi-code`` after parsing,
+    so the kernel argv the observer reads back is ``['kimi-code', '', ...]`` and
+    the resumed ``--session <id>`` is gone.  The argv proof necessarily freezes
+    on that argv -- which is what grounded p1-closure.  The TUI renders a strict
+    native header whose ``Session:`` line names the exact minted session, so the
+    attachment is published from that header instead, without weakening any of
+    the process-identity, cwd, or image checks.
+    """
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+    pane = FakePane(
+        observation=_observation(_REWRITTEN_ARGV),
+        rendered=_native_header_rows(),
+    )
+
+    result = _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert pane.render_calls >= 1
+    stored = native_attachment.get(PROVIDER, SESSION)
+    assert stored is not None and stored["state"] == native_attachment.ATTACHED
+
+
+def test_a_rewritten_title_pane_with_a_wrong_rendered_session_freezes(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+    pane = FakePane(
+        observation=_observation(_REWRITTEN_ARGV),
+        rendered=_native_header_rows(session="session_someone_else"),
+    )
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH)
+
+
+def test_a_rewritten_title_pane_with_no_session_label_freezes(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    # The picker hazard, rendered: a header with no Session line at all.
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+    rows = [row for row in _native_header_rows() if "Session:" not in row]
+    pane = FakePane(observation=_observation(_REWRITTEN_ARGV), rendered=rows)
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH)
+
+
+def test_a_rewritten_title_pane_with_a_duplicated_session_label_freezes(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+    rows = [
+        *_native_header_rows(),
+        "│  Session:   session_other                                           │",
+    ]
+    pane = FakePane(observation=_observation(_REWRITTEN_ARGV), rendered=rows)
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH)
+
+
+def test_a_rewritten_title_pane_whose_rendered_version_is_unproven_freezes(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    # A header that names a version whose behaviour was never read must not
+    # inherit the proof -- even when its Session line would otherwise match.
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+    pane = FakePane(
+        observation=_observation(_REWRITTEN_ARGV),
+        rendered=_native_header_rows(version="0.30.0"),
+    )
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH)
+
+
+def test_a_rewritten_title_pane_that_never_renders_the_header_freezes(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(native_tui_launch, "KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+    pane = FakePane(observation=_observation(_REWRITTEN_ARGV), rendered=[])
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH
+    assert "did not render" in caught.value.detail
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH)
+
+
+def test_an_unreadable_render_of_a_rewritten_title_pane_freezes(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+    pane = FakePane(
+        observation=_observation(_REWRITTEN_ARGV),
+        render_error=native_tui_launch.NativeLaunchUnavailable("capture-pane failed"),
+    )
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PANE_UNREADABLE
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_UNREADABLE)
+
+
+def test_a_replaced_process_identity_while_waiting_for_the_header_freezes(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    """The rendered proof is tied to the admitted pane by continuous identity.
+
+    A capture that has not yet rendered is followed by a re-observation; if
+    that re-observation names a *different* pid/start-marker the pane is no
+    longer the admitted process, and proving the session off it would bind
+    a stranger.  Frozen as an image mismatch, never published.
+    """
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+
+    class _DriftingPane(FakePane):
+        def __init__(self) -> None:
+            super().__init__(
+                observation=_observation(_REWRITTEN_ARGV, pid=4321),
+                rendered=[],  # not rendered yet on the first capture
+            )
+            self._observations = [
+                _observation(_REWRITTEN_ARGV, pid=4322),  # different process
+            ]
+
+        def observe(self) -> Optional[Mapping[str, Any]]:
+            self.observe_calls += 1
+            if self.observe_calls == 1:
+                return self.observation
+            return self._observations.pop(0)
+
+        def capture_render(self) -> list[str]:
+            self.render_calls += 1
+            return []  # still not rendered, so the loop re-observes
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, _DriftingPane(), provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH)
+
+
+def test_a_rewritten_title_pane_in_the_wrong_directory_freezes(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], tmp_path: Any, monkeypatch: Any
+) -> None:
+    """The rendered session proof does not relax the directory check.
+
+    The header proves which session the pane runs; the kernel cwd still has
+    to prove it runs in the directory that session was minted in.  A pane
+    rendering the right session from the wrong directory is still frozen.
+    """
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+    elsewhere = os.path.realpath(str(tmp_path))
+    workdir = _canonical_workdir()
+    assert elsewhere != workdir
+    pane = FakePane(
+        observation=_observation(_REWRITTEN_ARGV, cwd=elsewhere),
+        rendered=_native_header_rows(),
+    )
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, pane, working_directory=workdir, provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PANE_WORKDIR_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_WORKDIR_MISMATCH)
+
+
+def test_reentry_over_a_rewritten_title_pane_reconciles_via_the_rendered_header(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    """Re-entry over a ``starting`` row proves the same way a fresh launch does."""
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+    native_attachment.declare(
+        provider=PROVIDER,
+        native_session_id=SESSION,
+        terminal_id=TERMINAL,
+        generation=GENERATION,
+        execution_mode=em.NATIVE_TUI,
+        intent=_intent(),
+    )
+    native_attachment.mark_starting(
+        provider=PROVIDER,
+        native_session_id=SESSION,
+        terminal_id=TERMINAL,
+        generation=GENERATION,
+        execution_mode=em.NATIVE_TUI,
+    )
+
+    pane = FakePane(
+        observation=_observation(_REWRITTEN_ARGV),
+        rendered=_native_header_rows(),
+    )
+    result = _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_RECONCILED
+    assert pane.created == [], "re-entry must never start a second TUI"
+    assert native_attachment.get(PROVIDER, SESSION)["state"] == native_attachment.ATTACHED
+
+
+def test_a_non_rewriting_build_keeps_using_the_argv_proof_unchanged(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    """A build that preserves its argv (0.30.0 and earlier) is unaffected.
+
+    The rendered proof is opt-in per proven build; a non-rewriting build with
+    provider_version set must still attach straight off the argv and never
+    capture the render.
+    """
+    path, _ = pinned_binary
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+    pane = FakePane(observation=_observation(_expected_argv(path)))
+
+    result = _start(pinned_binary, pane, provider_version="0.30.0")
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert pane.render_calls == 0
 
 
 def test_a_frozen_session_refuses_every_later_launch(

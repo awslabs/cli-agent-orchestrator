@@ -85,6 +85,13 @@ LAUNCH_SCHEMA = "cao-native-tui-launch-v1"
 OBSERVATION_SCHEMA = "cao-native-tui-pane-observation-v1"
 INNER_EXEC_CONVERGENCE_TIMEOUT_SECONDS = 2.0
 INNER_EXEC_CONVERGENCE_POLL_SECONDS = 0.05
+#: How long to wait for a title-rewriting Kimi build to render the native
+#: header that proves the resumed session, and how often to re-read it.  The
+#: header paints during boot, well before the composer is ready, so this bound
+#: is a slow-boot backstop rather than a steady-state wait; a pane that never
+#: renders it freezes rather than publishing an unproven attachment.
+KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS = 15.0
+KIMI_RENDER_CONVERGENCE_POLL_SECONDS = 0.1
 ENV_EXECUTABLE = os.path.realpath("/usr/bin/env")
 MAX_SHEBANG_LINE_BYTES = 512
 MAX_PROCESS_ARGV_BYTES = 1024 * 1024
@@ -111,6 +118,12 @@ AMBIGUOUS_ARGV_MISMATCH = "pane_argv_does_not_resume_bound_session"
 AMBIGUOUS_PANE_WORKDIR_MISMATCH = "pane_cwd_is_not_the_bound_working_directory"
 AMBIGUOUS_PUBLISH_FAILED = "attachment_publication_failed"
 AMBIGUOUS_PROCESS_IMAGE_MISMATCH = "pane_process_image_does_not_match_inner_binary"
+#: The pane's rendered native header does not prove the bound session.  A
+#: distinct reason from :data:`AMBIGUOUS_ARGV_MISMATCH` because the evidence
+#: channel is different -- the argv was erased by a post-parse title rewrite,
+#: so the binding was being proven from the rendered header instead, and a
+#: reconciler needs to know it is looking at the screen, not the process table.
+AMBIGUOUS_PANE_RENDER_MISMATCH = "pane_render_does_not_show_bound_session"
 
 
 class NativeLaunchError(RuntimeError):
@@ -183,6 +196,19 @@ class NativePaneTransport(Protocol):
         ``start_marker``, the primary process's observed ``argv``, and
         its observed ``cwd``.  A transport that cannot report the cwd
         must raise: an observation missing it is unreadable, not exempt.
+        """
+
+    def capture_render(self) -> list[str]:
+        """The pane's rendered rows right now; raise on any failure to read.
+
+        A distinct, read-only evidence channel from :meth:`observe`.  The
+        process table proves *which process* the pane is; the rendered screen
+        proves *which session that process's TUI is running* for a provider
+        that rewrites its process title after parsing and so leaves the resumed
+        session id unreadable from the argv.  Deliberately still only a read:
+        nothing is sent to the pane, so the discipline against growing an input
+        side is preserved.  A capture that could not be made must raise -- an
+        unreadable render is an unresolved observation, not an empty one.
         """
         ...
 
@@ -361,14 +387,18 @@ def _observe(
         )
 
 
-def _verify_bound_session_and_cwd(
+def _verify_argv_resumes_session(
     *,
     provider: str,
     native_session_id: str,
-    working_directory: str,
     observation: Mapping[str, Any],
 ) -> None:
-    """Freeze unless an observation still describes the claimed session."""
+    """Freeze unless the observed argv still resumes exactly the bound session.
+
+    The argv half of the bound-session check, on its own so the rendered-header
+    half (:func:`_verify_rendered_session`) can replace it for a provider that
+    rewrites its title without also re-checking the cwd it did not change.
+    """
     if not _binder(provider)["binds_exactly"](observation["argv"], native_session_id):
         _freeze(
             provider=provider,
@@ -381,6 +411,16 @@ def _verify_bound_session_and_cwd(
                 "a different one"
             ),
         )
+
+
+def _verify_pane_cwd(
+    *,
+    provider: str,
+    native_session_id: str,
+    working_directory: str,
+    observation: Mapping[str, Any],
+) -> None:
+    """Freeze unless the observed process is still in the bound directory."""
     observed_cwd = os.path.realpath(observation["cwd"])
     if observed_cwd != working_directory:
         _freeze(
@@ -392,6 +432,60 @@ def _verify_bound_session_and_cwd(
                 f"{native_session_id!r} is bound to {working_directory!r}; the provider "
                 "resolves a resume against the directory the session was minted in, so this "
                 "pane cannot open the session it was started for"
+            ),
+        )
+
+
+def _verify_bound_session_and_cwd(
+    *,
+    provider: str,
+    native_session_id: str,
+    working_directory: str,
+    observation: Mapping[str, Any],
+) -> None:
+    """Freeze unless an observation still describes the claimed session."""
+    _verify_argv_resumes_session(
+        provider=provider,
+        native_session_id=native_session_id,
+        observation=observation,
+    )
+    _verify_pane_cwd(
+        provider=provider,
+        native_session_id=native_session_id,
+        working_directory=working_directory,
+        observation=observation,
+    )
+
+
+def _verify_rendered_session(
+    *,
+    provider: str,
+    native_session_id: str,
+    provider_version: Optional[str],
+    rendered_rows: Sequence[str],
+) -> None:
+    """Freeze unless the rendered native header proves exactly the bound session.
+
+    The rendered-header analogue of :func:`_verify_argv_resumes_session`: used
+    for a Kimi build proven to rewrite its process title after parsing, where
+    the resumed session id was erased from the kernel argv and the TUI's own
+    header is the proof that survives the rewrite.  Re-checked here, at
+    publication, from the rows the launch settled on, so the attachment rests
+    on evidence a later reader can re-walk.
+    """
+    if not kimi_native_launch.renders_session_exactly(
+        rendered_rows, native_session_id, provider_version=provider_version
+    ):
+        _freeze(
+            provider=provider,
+            native_session_id=native_session_id,
+            reason=AMBIGUOUS_PANE_RENDER_MISMATCH,
+            detail=(
+                f"the pane's rendered native header does not prove session "
+                f"{native_session_id!r}; the build rewrites its process title after parsing, "
+                "so the resumed session is proven from the rendered header rather than the "
+                "argv, and a header that is missing, ambiguous, or names a different session "
+                "is not the one claimed"
             ),
         )
 
@@ -545,6 +639,134 @@ def _await_inner_exec(
         observation = next_observation
 
 
+def _kimi_rendered_proof_active(provider: str, provider_version: Optional[str]) -> bool:
+    """Whether the bound session must be proven from the rendered header.
+
+    True only for a Kimi build whose post-parse process-title rewrite and
+    native header layout were both read (see
+    :func:`kimi_native_launch.rendered_session_proof_for`).  For every other
+    provider and build the resumed session id is still readable from the
+    kernel argv, so the argv remains the proof and the rendered header is
+    never consulted.
+    """
+    return provider == "kimi_cli" and (
+        kimi_native_launch.rendered_session_proof_for(provider_version) is not None
+    )
+
+
+def _await_kimi_rendered_session_proof(
+    transport: NativePaneTransport,
+    *,
+    provider: str,
+    native_session_id: str,
+    provider_version: Optional[str],
+    observation: dict[str, Any],
+    absent_reason: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """Converge on the rendered native header that proves the bound session.
+
+    Kimi 0.31.0 erases the resumed session id from the kernel argv, so the
+    binding is read from the pane's own header once the TUI has painted it.
+    The wait is observation-only -- the pane is never written to -- and every
+    unresolved outcome freezes: an unreadable capture, a header that never
+    renders within the bound, and a pane whose process identity changes while
+    the header is awaited (which would prove the session off a stranger) all
+    leave the attachment frozen rather than published.
+
+    Returns the settled observation and the rendered rows that proved the
+    session, so publication can re-check the same evidence independently.
+    """
+    identity = (
+        observation["pane_id"],
+        observation["pid"],
+        observation["start_marker"],
+    )
+    deadline = time.monotonic() + KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS
+    while True:
+        try:
+            rows = list(transport.capture_render())
+        except Exception as exc:  # noqa: BLE001 - an unreadable render is never "no header"
+            _freeze(
+                provider=provider,
+                native_session_id=native_session_id,
+                reason=AMBIGUOUS_PANE_UNREADABLE,
+                detail=f"the pane's rendered screen could not be read: {exc}",
+            )
+        if kimi_native_launch.renders_session_exactly(
+            rows, native_session_id, provider_version=provider_version
+        ):
+            return observation, rows
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _freeze(
+                provider=provider,
+                native_session_id=native_session_id,
+                reason=AMBIGUOUS_PANE_RENDER_MISMATCH,
+                detail=(
+                    f"the pane did not render a native header proving session "
+                    f"{native_session_id!r} within "
+                    f"{KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS:g} seconds"
+                ),
+            )
+        time.sleep(min(KIMI_RENDER_CONVERGENCE_POLL_SECONDS, remaining))
+        # Re-observe for continuity only: a changed pane_id/pid/start-marker
+        # means the pane is no longer the admitted process, and proving the
+        # session off it would bind a stranger's session.
+        next_observation = _observe(
+            transport,
+            provider=provider,
+            native_session_id=native_session_id,
+            absent_reason=absent_reason,
+        )
+        next_identity = (
+            next_observation["pane_id"],
+            next_observation["pid"],
+            next_observation["start_marker"],
+        )
+        if next_identity != identity:
+            _freeze(
+                provider=provider,
+                native_session_id=native_session_id,
+                reason=AMBIGUOUS_PROCESS_IMAGE_MISMATCH,
+                detail=(
+                    "the pane process identity changed while waiting for the rendered "
+                    f"native header: expected {identity!r}, observed {next_identity!r}"
+                ),
+            )
+        observation = next_observation
+
+
+def _settle_session_proof(
+    transport: NativePaneTransport,
+    *,
+    provider: str,
+    native_session_id: str,
+    provider_version: Optional[str],
+    observation: dict[str, Any],
+    absent_reason: str,
+) -> tuple[dict[str, Any], str, Optional[list[str]]]:
+    """Resolve the bound-session proof the launch will publish under.
+
+    Returns ``(observation, session_proof, rendered_rows)``.  For a Kimi build
+    proven to rewrite its title, the resumed session id is unreadable from the
+    argv, so the binding is converged from the rendered header and the rows are
+    handed back for an independent re-check at publication.  For every other
+    provider and build the argv is still the proof, nothing is captured, and
+    publication verifies from the observation's argv.
+    """
+    if _kimi_rendered_proof_active(provider, provider_version):
+        observation, rendered_rows = _await_kimi_rendered_session_proof(
+            transport,
+            provider=provider,
+            native_session_id=native_session_id,
+            provider_version=provider_version,
+            observation=observation,
+            absent_reason=absent_reason,
+        )
+        return observation, "kimi_rendered", rendered_rows
+    return observation, "argv", None
+
+
 def _publish(
     *,
     provider: str,
@@ -554,23 +776,47 @@ def _publish(
     working_directory: str,
     observation: Mapping[str, Any],
     expected_inner_executable: Optional[str] = None,
+    session_proof: str = "argv",
+    proven_rendered_rows: Optional[Sequence[str]] = None,
+    provider_version: Optional[str] = None,
 ) -> dict[str, Any]:
     """Verify the pane runs the bound session, then publish the attachment.
 
     Two independent proofs, both taken before the attachment is
     published, because publication is what makes the generation
-    bindable.  The argv proves *which session* the process resumed; the
-    cwd proves *which directory* it resumed it in.  Neither implies the
-    other: a correct argv started in the wrong directory names a session
-    the provider will refuse to open, and it fails after the launch has
-    already reported success.
+    bindable.  The session proof says *which session* the process resumed;
+    the cwd proof says *which directory* it resumed it in.  Neither implies
+    the other: a correct session started in the wrong directory names a
+    session the provider will refuse to open, and it fails after the launch
+    has already reported success.
+
+    The session proof is taken from the argv for every provider and build
+    whose resumed session id is still readable there, and from the rendered
+    native header for a Kimi build proven to rewrite its process title after
+    parsing (which erases the id from the argv).  Both are fail-closed and
+    both are re-checked here rather than trusted from the convergence that
+    preceded publication.
     """
-    _verify_bound_session_and_cwd(
-        provider=provider,
-        native_session_id=native_session_id,
-        working_directory=working_directory,
-        observation=observation,
-    )
+    if session_proof == "kimi_rendered":
+        _verify_rendered_session(
+            provider=provider,
+            native_session_id=native_session_id,
+            provider_version=provider_version,
+            rendered_rows=proven_rendered_rows or (),
+        )
+        _verify_pane_cwd(
+            provider=provider,
+            native_session_id=native_session_id,
+            working_directory=working_directory,
+            observation=observation,
+        )
+    else:
+        _verify_bound_session_and_cwd(
+            provider=provider,
+            native_session_id=native_session_id,
+            working_directory=working_directory,
+            observation=observation,
+        )
     if expected_inner_executable is not None:
         observed_executable = observation["argv"][0] if observation["argv"] else ""
         if os.path.realpath(observed_executable) != expected_inner_executable:
@@ -743,6 +989,7 @@ def start(
     extra_args: Optional[Sequence[str]] = None,
     launch_kind: str = LAUNCH_KIND_RESUME,
     expected_inner_executable: Optional[str] = None,
+    provider_version: Optional[str] = None,
 ) -> dict[str, Any]:
     """Claim, launch, prove, and publish one native TUI attachment.
 
@@ -757,6 +1004,13 @@ def start(
     was minted in, and it is checked twice here — once before anything is
     claimed, and once against the running process before the attachment
     is published.
+
+    ``provider_version`` selects the bound-session proof.  For a Kimi build
+    proven to rewrite its process title after parsing, the resumed session id
+    is erased from the kernel argv, so the proof is read from the rendered
+    native header instead; for every other provider and build the argv remains
+    the proof.  Absent (``None``), it leaves the argv proof in place, so a
+    caller that does not know the version is unchanged.
     """
     provider = _require_text(provider, field="provider")
     native_session_id = _require_text(native_session_id, field="native_session_id")
@@ -859,6 +1113,14 @@ def start(
             expected_inner_executable=expected_inner_executable,
             absent_reason=AMBIGUOUS_START_CROSSED_NO_PANE,
         )
+        observation, session_proof, proven_rendered_rows = _settle_session_proof(
+            transport,
+            provider=provider,
+            native_session_id=native_session_id,
+            provider_version=provider_version,
+            observation=observation,
+            absent_reason=AMBIGUOUS_START_CROSSED_NO_PANE,
+        )
         attachment = _publish(
             provider=provider,
             native_session_id=native_session_id,
@@ -867,6 +1129,9 @@ def start(
             working_directory=working_directory,
             observation=observation,
             expected_inner_executable=expected_inner_executable,
+            session_proof=session_proof,
+            proven_rendered_rows=proven_rendered_rows,
+            provider_version=provider_version,
         )
         return _result(
             outcome=OUTCOME_RECONCILED,
@@ -926,6 +1191,14 @@ def start(
         expected_inner_executable=expected_inner_executable,
         absent_reason=AMBIGUOUS_PANE_ABSENT_AFTER_CREATE,
     )
+    observation, session_proof, proven_rendered_rows = _settle_session_proof(
+        transport,
+        provider=provider,
+        native_session_id=native_session_id,
+        provider_version=provider_version,
+        observation=observation,
+        absent_reason=AMBIGUOUS_PANE_ABSENT_AFTER_CREATE,
+    )
     attachment = _publish(
         provider=provider,
         native_session_id=native_session_id,
@@ -934,6 +1207,9 @@ def start(
         working_directory=working_directory,
         observation=observation,
         expected_inner_executable=expected_inner_executable,
+        session_proof=session_proof,
+        proven_rendered_rows=proven_rendered_rows,
+        provider_version=provider_version,
     )
     return _result(
         outcome=OUTCOME_LAUNCHED,
@@ -986,6 +1262,51 @@ class TmuxNativePane:
             dict(self._extra_env),
         )
         return str(handle)
+
+    def capture_render(self, *, deadline_monotonic: Optional[float] = None) -> list[str]:
+        """The rendered rows of this window's pane; raised on any read failure.
+
+        Read without ``-e`` so the rows are the composited viewport the
+        provider's own detectors read, and not a raw stream of escape
+        sequences.  Targeted at the bound window rather than a pane handle so a
+        re-entry that never saw the handle reads the same screen a fresh launch
+        would.  A capture that fails is raised, never returned empty: the
+        rendered header is the session proof for a title-rewriting build, and an
+        unreadable render is an unresolved observation.
+        """
+        from cli_agent_orchestrator.clients.tmux import tmux_binary
+
+        argv = [
+            tmux_binary(),
+            "capture-pane",
+            "-p",
+            "-t",
+            f"{self._session_name}:{self._window_name}",
+        ]
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=_native_observation_timeout(deadline_monotonic, argv),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise NativeLaunchUnavailable(
+                f"the rendered screen of {self._session_name}:{self._window_name} could not "
+                f"be captured within the bound: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise NativeLaunchUnavailable(
+                f"the rendered screen of {self._session_name}:{self._window_name} could not "
+                f"be captured: {exc}"
+            ) from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or "").strip() or f"tmux exited {proc.returncode}"
+            raise NativeLaunchUnavailable(
+                f"could not capture {self._session_name}:{self._window_name}: {detail}"
+            )
+        return (proc.stdout or "").splitlines()
 
     def observe(self, *, deadline_monotonic: Optional[float] = None) -> Optional[Mapping[str, Any]]:
         if deadline_monotonic is None:

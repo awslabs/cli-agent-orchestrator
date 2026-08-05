@@ -285,6 +285,50 @@ async def test_the_pane_runs_the_provider_resuming_the_minted_session(
 
 
 @pytest.mark.asyncio
+async def test_a_kimi_0310_pane_that_rewrote_its_title_is_certified_via_the_rendered_header(
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
+):
+    """cond-0311 end to end: a title-rewriting 0.31.0 pane still certifies.
+
+    Kimi Code 0.31.0 rewrites ``process.title`` to ``kimi-code`` after parsing,
+    so the kernel argv the observer reads no longer carries the resumed
+    ``--session <id>`` -- the live defect that grounded p1-closure.  The launch
+    path threads the build's version through to the native launcher, which
+    proves the session from the rendered native header instead, and the native
+    readiness receipt is published with zero task bytes submitted.
+    """
+    monkeypatch.setattr(bridge, "provider_version_banner", lambda *a, **k: "kimi 0.31.0")
+
+    rewritten_argv = ["kimi-code", "", "", "", ""]
+    header_rows = [
+        "│  Welcome to Kimi Code!                                                                              │",
+        f"│  Directory: {worktree}                                                                               │",
+        f"│  Session:   {SESSION_ID}                                                                             │",
+        "│  Model:     K3                                                                                       │",
+        "│  Version:   0.31.0                                                                                   │",
+    ]
+
+    def _rewritten_observe(self):
+        return {
+            "pane_id": "%7",
+            "pid": harness.observed_pid,
+            "start_marker": "Thu Jul 24 10:00:00 2026",
+            "argv": list(rewritten_argv),
+            "cwd": harness.observed_cwd or self._record["working_directory"],
+        }
+
+    monkeypatch.setattr(v2._V2NativePane, "observe", _rewritten_observe)
+    monkeypatch.setattr(v2._V2NativePane, "capture_render", lambda self: list(header_rows))
+
+    record, result = await _launch(worktree, tmp_path)
+
+    receipt = _published_receipt(record["reservation_id"])
+    assert receipt["provider_receipt_kind"] == "kimi-native-tui-attached"
+    assert result["execution_mode"] == em.NATIVE_TUI
+    assert result["terminal_id"] == record["terminal_id"]
+
+
+@pytest.mark.asyncio
 async def test_the_native_launch_starts_no_acp_bridge(
     isolated_memory_db, worktree, tmp_path, harness
 ):
