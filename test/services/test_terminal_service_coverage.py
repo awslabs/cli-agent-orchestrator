@@ -363,6 +363,7 @@ class TestCreateTerminalSessionCleanupGuard:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
@@ -378,6 +379,7 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_tid,
         mock_wname,
         mock_db_create,
+        mock_db_delete,
         mock_pm,
         mock_tmux,
         mock_log_dir,
@@ -407,6 +409,7 @@ class TestCreateTerminalSessionCleanupGuard:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
@@ -422,6 +425,7 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_tid,
         mock_wname,
         mock_db_create,
+        mock_db_delete,
         mock_pm,
         mock_tmux,
         mock_log_dir,
