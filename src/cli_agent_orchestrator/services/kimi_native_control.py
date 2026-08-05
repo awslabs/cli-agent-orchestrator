@@ -314,6 +314,31 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
             "live acceptance per cond-0198)"
         ),
     },
+    # 0.31.0 is likewise a *separate* proven entry, not a range widening:
+    # read from the installed 0.31.0 bundle (main.mjs sha256
+    # 689fc2a123dfc3145dab26a8e6a86c71a5dc8552b13fe0449679e065ce96774e),
+    # which declares the same composer facts as the 0.29.x/0.30.0 line — the
+    # ['shift+enter', 'ctrl+j'] newLine defaultKeys, the 'enter' submit, the
+    # expandPasteMarkers(this.state.lines.join("\\n")).trim() submit
+    # computation, and PASTE_ENTER_SUPPRESS_WINDOW_MS = 120.  Same proven
+    # behaviour, so the same normalization identifier; no behavioral drift is
+    # claimed.  (cond-0310: bundle-read; live text/control EFFECT on the real
+    # 0.31.0 build is a separate post-review acceptance gate.)
+    "0.31.0": {
+        "keystroke": "C-j",
+        "burst_reset_keystroke": "End",
+        "submit_settle_seconds": 0.25,
+        "normalization": NORMALIZATION_JOIN_LF_THEN_TRIM,
+        "evidence": (
+            "installed 0.31.0 dist/main.mjs (sha256 689fc2a123dfc3145dab26a"
+            "8e6a86c71a5dc8552b13fe0449679e065ce96774e) declares the "
+            "['shift+enter', 'ctrl+j'] newLine defaultKeys and 'enter' "
+            "submit, and computes expandPasteMarkers(this.state.lines."
+            "join('\\n')).trim() on submit; PASTE_ENTER_SUPPRESS_WINDOW_MS "
+            "= 120 — the same composer facts as the 0.29.x/0.30.0 line "
+            "(bundle read per cond-0310)"
+        ),
+    },
 }
 
 #: The steer chords proven for each pinned Kimi build.  Distinct from
@@ -334,6 +359,10 @@ _PROVEN_STEER_CHORDS: dict[str, frozenset[str]] = {
     # 0.29.x line (bundle read; sha256 keyed in _PROVEN_COMPOSER_NEWLINE;
     # live acceptance per cond-0198).
     "0.30.0": frozenset({"C-s"}),
+    # Key.ctrl("s") exists in the installed 0.31.0 bundle exactly as in the
+    # 0.29.x/0.30.0 line (bundle read per cond-0310; sha256 keyed in
+    # _PROVEN_COMPOSER_NEWLINE).
+    "0.31.0": frozenset({"C-s"}),
 }
 
 
