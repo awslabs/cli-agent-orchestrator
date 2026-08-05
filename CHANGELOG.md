@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Fixed
+
+- Codex handoff extraction now skips native TUI activity cells without relying on an English verb allowlist, including when the model's reply starts with prose (#545)
+
 ## [2.4.1] - 2026-08-04
 
 ### Fixed
@@ -115,7 +122,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - workflow: the background drive's FAILED backstop no longer overwrites an already-settled run (#505). It fired unconditionally on any exception, so a drive that raised *after* the engine journaled COMPLETED/CANCELLED — during post-settlement bookkeeping — rewrote that terminal state to FAILED, making the durable record misreport the run's outcome. The write is now a conditional `UPDATE ... WHERE state = 'running'` in the journal DAL (atomic, so no concurrent settle can interleave), covering both the `Exception` and `CancelledError` arms; a run that raises *before* settling still lands FAILED as before, so no run is left orphaned in `running`
 - workflow: `cao workflow events` closes its streamed SSE response on every exit path (#505). The follower breaks out of its loop on a terminal frame and abandons the generator on each reconnect, so without an explicit close the socket survived until garbage collection and a long follow with repeated reconnects accumulated live file descriptors. The equivalent MCP tool was already hardened
 - workflow: a caller-supplied `run_id` that loses a concurrent-submit race now returns `409` instead of `500` (#505). The uniqueness pre-check and the durable insert are not one atomic operation, so both submits can pass the pre-check; the loser's `IntegrityError` is now mapped to the same `409` the serialized case reports
-- Codex handoff extraction now skips native TUI activity cells without relying on an English verb allowlist, including when the model's reply starts with prose (#545)
 - profile store writes are now atomic and inter-process safe. Both store writes were previously bare `write_text` calls, so a concurrent `cao profile` write and a server-side write could interleave or leave a partial file. Adds `locked_atomic_write` to `utils/atomic_file.py` as the blind-write sibling of `locked_atomic_rewrite` (#492): it shares the same lock, temp file, fsync, mode preservation and `os.replace`, but skips the read, so a corrupt or non-UTF-8 file in the agent store can still be replaced by the install that would have repaired it instead of failing with `UnicodeDecodeError` (#543)
 - self-healing pipe-pane liveness watchdog for silently-stalled FIFO forwarding (fixes #388) (#397), including detection of a stall that settles into a new static frame before the next poll and of a pipe that never delivers a single byte from terminal creation (cold start, harness-control#93) — see `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` / `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` in `docs/configuration.md`
 - web: attach web terminals through the configured backend so herdr-backed terminals no longer fail to attach (#417)
