@@ -136,6 +136,17 @@ TUI_PERMISSION_PATTERN = (
 # Must be anchored to bottom screen region (see get_status WAITING check) to avoid stale matches.
 TUI_TRUST_ALL_TOOLS_FOOTER = r"esc to cancel · ↑↓ to navigate · ↵ to select"
 
+# Distinctive consent-dialog body text. TUI_TRUST_ALL_TOOLS_FOOTER above is
+# kiro's GENERIC list-selector chrome — an update/login/onboarding selector
+# renders it identically — so before answering we require this trust-specific
+# line, and require the ❯ cursor to sit on "No, exit" so Down lands on
+# "Yes, I accept" (not "Yes, and don't ask again"). Anything else fails closed.
+TUI_TRUST_ALL_TOOLS_BODY = r"Kiro is running in trust all tools mode"
+TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
+
+# Bottom pane lines scanned for the consent dialog (mirrors codex's window).
+STARTUP_PROMPT_BOTTOM_LINES = 15
+
 # =============================================================================
 # Error Detection
 # =============================================================================
@@ -402,16 +413,18 @@ class KiroCliProvider(BaseProvider):
         init just times out on the dialog. This helper is applied to the
         ``--legacy-ui`` fallback path too, so if a kiro build shows the dialog
         there as well it is handled without a version check. get_status()
-        already classifies the dialog as WAITING_USER_ANSWER, so here we wait
-        for that alongside IDLE/COMPLETED and, when it appears, select
-        **"Yes, I accept"** (Down, Enter) — the one-line-down option.
-        We deliberately do NOT pick "Yes, and don't ask again", which would
-        persist a trust-all-tools bypass into the user's kiro config; CAO's
-        acceptance is scoped to this ephemeral session only.
+        classifies the dialog as WAITING_USER_ANSWER off generic selector
+        chrome, so before answering we VERIFY the dialog body and the ❯ cursor
+        line (fail closed on anything else), then select **"Yes, I accept"**
+        (Down, Enter) — the one-line-down option. We deliberately do NOT pick
+        "Yes, and don't ask again", which would persist a trust-all-tools
+        bypass into the user's kiro config; CAO's acceptance is scoped to this
+        ephemeral session only.
 
         Returns:
             True if the terminal reached IDLE or COMPLETED (dialog answered if
-            it was shown), False if it timed out before becoming ready.
+            it was verified and shown), False if it timed out or a
+            WAITING_USER_ANSWER could not be verified as the consent dialog.
         """
         init_timeout = float(get_server_settings()["provider_init_timeout"])
         from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -428,15 +441,41 @@ class KiroCliProvider(BaseProvider):
         )
         if not ready:
             return False
+        # Ready-flap window: wait_until_status returned on WAITING_USER_ANSWER,
+        # but get_status is re-read here rather than trusted from the wait. If it
+        # has since flapped to IDLE/COMPLETED, treat the terminal as ready and do
+        # NOT send dialog keys (a blind Down+Enter into a live prompt would be a
+        # stray message). Low probability given the sticky latch, but explicit.
         if status_monitor.get_status(self.terminal_id) != TerminalStatus.WAITING_USER_ANSWER:
             return True
 
-        # Trust-all-tools consent dialog is up: select "Yes, I accept".
+        # WAITING_USER_ANSWER is classified from TUI_TRUST_ALL_TOOLS_FOOTER,
+        # which is kiro's GENERIC list-selector chrome. Verify the dialog BODY
+        # and the ❯ cursor position before answering — a blind Down+Enter on
+        # some other startup selector would pick an arbitrary option. Same
+        # fail-closed shape as codex's directory-trust check. On any mismatch,
+        # fall through to the normal timeout/fallback path.
+        backend = get_backend()
+        pane = strip_terminal_escapes(
+            re.sub(ANSI_CODE_PATTERN, "", backend.get_history(self.session_name, self.window_name))
+        )
+        bottom = "\n".join(pane.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        if not (
+            re.search(TUI_TRUST_ALL_TOOLS_BODY, bottom)
+            and re.search(TUI_TRUST_ALL_TOOLS_CURSOR, bottom)
+        ):
+            logger.warning(
+                "kiro_cli: WAITING_USER_ANSWER but the trust-all-tools consent "
+                "dialog (body + '❯ No, exit') was not verified; not answering"
+            )
+            return False
+
+        # Verified consent dialog: cursor on "No, exit", so Down lands on
+        # "Yes, I accept" (session-scoped — NOT "Yes, and don't ask again").
         logger.info(
             "kiro_cli: answering --trust-all-tools startup consent dialog "
             "with 'Yes, I accept' (session-scoped)"
         )
-        backend = get_backend()
         # Arm the PROCESSING latch before the keystrokes, like every other
         # send_special_key path, so answering the dialog isn't blocked by the
         # WAITING_USER_ANSWER we just observed.

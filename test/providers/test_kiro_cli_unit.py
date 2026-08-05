@@ -19,6 +19,11 @@ def load_fixture(filename: str) -> str:
         return f.read()
 
 
+# Real active trust-all-tools consent dialog (body + '❯ No, exit' + footer),
+# used to satisfy the provider's verify-before-answer check.
+_TRUST_DIALOG_PANE = load_fixture("kiro_trust_all_tools_dialog_active.txt")
+
+
 class TestKiroCliProviderInitialization:
     """Test Kiro CLI provider initialization."""
 
@@ -296,6 +301,8 @@ class TestKiroCliProviderInitialization:
         # (after we answer) resolves to the prompt.
         mock_wait_status.side_effect = [True, True]
         mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        # The dialog must be VERIFIED from pane content before answering.
+        mock_tmux.return_value.get_history.return_value = _TRUST_DIALOG_PANE
         mock_load_profile.side_effect = FileNotFoundError("no profile")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
@@ -309,6 +316,73 @@ class TestKiroCliProviderInitialization:
         assert special_keys == ["Down", "Enter"]
         # The PROCESSING latch must be armed before answering the dialog.
         mock_status_monitor.notify_input_sent.assert_called_with("test1234")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_initialize_waiting_but_not_consent_dialog_fails_closed(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile, mock_status_monitor
+    ):
+        """A non-consent selector reported as WAITING_USER_ANSWER is NOT answered.
+
+        WAITING_USER_ANSWER is classified from kiro's generic list-selector
+        chrome, so any other startup selector (update/login/onboarding) would
+        share it. The pane content lacks the consent body + '❯ No, exit', so the
+        provider must send no keys and fall into the timeout/fallback path.
+        """
+        mock_wait_shell.return_value = True
+        # WAITING on first wait; the --legacy-ui fallback then times out too.
+        mock_wait_status.side_effect = [True, False]
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        mock_tmux.return_value.get_history.return_value = (
+            "Update available! 2.16 -> 2.17\n❯ 1. Update now\n  2. Later\n"
+            "esc to cancel · ↑↓ to navigate · ↵ to select\n"
+        )
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        with pytest.raises(TimeoutError):
+            await provider.initialize()
+
+        # The unverified selector must never receive dialog keystrokes.
+        mock_tmux.return_value.send_special_key.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_initialize_dialog_answered_but_prompt_times_out_falls_back(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile, mock_status_monitor
+    ):
+        """Answering the dialog but never reaching the prompt triggers --legacy-ui.
+
+        First wait → WAITING (verified, answered); second (post-accept) wait
+        times out; the --legacy-ui relaunch's wait then succeeds.
+        """
+        mock_wait_shell.return_value = True
+        # main: WAITING (answered) → post-accept times out; legacy relaunch: IDLE.
+        mock_wait_status.side_effect = [True, False, True]
+        mock_status_monitor.get_status.side_effect = [
+            TerminalStatus.WAITING_USER_ANSWER,
+            TerminalStatus.IDLE,
+        ]
+        mock_tmux.return_value.get_history.return_value = _TRUST_DIALOG_PANE
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        result = await provider.initialize()
+
+        assert result is True
+        # Dialog answered (Down+Enter), then /exit + --legacy-ui relaunch.
+        special_keys = [c.args[2] for c in mock_tmux.return_value.send_special_key.call_args_list]
+        assert special_keys[:2] == ["Down", "Enter"]
+        commands = [c.args[2] for c in mock_tmux.return_value.send_keys.call_args_list]
+        assert "--legacy-ui" in commands[-1]
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
