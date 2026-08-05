@@ -106,6 +106,38 @@ assert all(
     PINNED_VERSIONS[provider] in versions for provider, versions in SUPPORTED_VERSIONS.items()
 )
 
+#: Seconds one ``--version`` observation may take before the launch fails
+#: closed.  The bound must be finite — a probe that cannot answer inside it
+#: fails before any pane, session, or task byte — but it must also survive
+#: a cold start on a loaded host: a healthy pinned Kimi 0.31.0 answered in
+#: 0.37–0.41 s warm, yet one campaign launch observed its Node bundle miss
+#: a fixed 5 s deadline under startup load and the launch failed closed
+#: before any delivery (cond-0313).  Kimi therefore observes under the
+#: same 20 s bound the route attestor's ACP probe and the native-TUI
+#: acceptance harness already allow this exact probe; every other provider
+#: keeps the generic bound.  One adequate deadline, never a replayed
+#: launch.
+VERSION_PROBE_TIMEOUT_SECONDS = 5.0
+KIMI_VERSION_PROBE_TIMEOUT_SECONDS = 20.0
+
+#: Keyed by the canonical *wire* provider name — the launch surfaces that
+#: consult this table speak that namespace (``request["provider"]``), and
+#: the short recovery names deliberately find no entry here.
+VERSION_PROBE_TIMEOUTS: dict[str, float] = {
+    PROVIDER_KIMI_CLI: KIMI_VERSION_PROBE_TIMEOUT_SECONDS,
+}
+
+
+def version_probe_timeout(provider: str) -> float:
+    """The bounded ``--version`` observation deadline for one wire provider.
+
+    Exact-name lookup, never a prefix match or a widened default: a
+    provider with no entry keeps the generic bound, so one provider's
+    runway cannot silently widen another's.
+    """
+    return VERSION_PROBE_TIMEOUTS.get(provider, VERSION_PROBE_TIMEOUT_SECONDS)
+
+
 # The sole accepted pre-turn native-identity source per provider.
 NATIVE_ID_SOURCES = {
     PROVIDER_CODEX: "app_server_thread_start",  # app-server thread/start id

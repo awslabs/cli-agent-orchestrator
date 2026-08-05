@@ -296,7 +296,10 @@ def native_child_environment(
 
 
 def provider_version_banner(
-    request: dict[str, Any], *, timeout: float = 5.0, environment: Optional[dict[str, str]] = None
+    request: dict[str, Any],
+    *,
+    timeout: Optional[float] = None,
+    environment: Optional[dict[str, str]] = None,
 ) -> str:
     """Read the installed provider's ``--version`` in the child environment.
 
@@ -304,10 +307,18 @@ def provider_version_banner(
     version that matters is the one the worker will actually run — a
     version probe under different config or PATH can report a binary
     other than the one about to start.
+
+    ``timeout=None`` observes under the provider's contract deadline
+    (``provider_contracts.version_probe_timeout``): finite, and wide
+    enough for the provider's real cold start — the fixed 5 s bound that
+    used to be the default failed a healthy pinned Kimi binary under
+    startup load (cond-0313).
     """
     executable = request["provider_executable"]
     if not os.path.isabs(executable) or os.path.realpath(executable) != executable:
         raise BridgeError("provider executable must be a canonical absolute path")
+    if timeout is None:
+        timeout = provider_contracts.version_probe_timeout(request["provider"])
     proc = subprocess.run(
         [executable, "--version"],
         capture_output=True,
@@ -1851,7 +1862,7 @@ class _ProviderSession:
             [executable, "--version"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=provider_contracts.version_probe_timeout(self.provider),
             env=_provider_child_environment(self.request),
         )
         actual = proc.stdout.strip()

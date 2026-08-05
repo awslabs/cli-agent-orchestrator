@@ -22,6 +22,7 @@ import os
 import subprocess
 import tempfile
 import uuid
+from types import SimpleNamespace
 from typing import Any, Mapping, Optional
 
 import pytest
@@ -47,6 +48,11 @@ SESSION_ID = "session_9f2c41ab"
 DELIVERY_ID = "44444444-4444-4444-8444-444444444444"
 MODEL = "gpt-5.6-sol"
 EFFORT = "xhigh"
+
+# Captured at import time, before any fixture patches the module attribute,
+# so the COND-0313 preflight-deadline tests can run the *real* banner probe
+# against a staged subprocess.
+_REAL_PROVIDER_VERSION_BANNER = bridge.provider_version_banner
 
 
 @pytest.fixture(autouse=True)
@@ -282,6 +288,81 @@ async def test_the_pane_runs_the_provider_resuming_the_minted_session(
     assert native_tui_launch.kimi_native_launch.resumes_exactly(harness.launched_argv, SESSION_ID)
     assert result["execution_mode"] == em.NATIVE_TUI
     assert result["terminal_id"] == record["terminal_id"]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_but_valid_kimi_version_answer_is_admitted_within_the_provider_bound(
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
+):
+    """COND-0313: the native preflight waits out a slow Kimi ``--version``.
+
+    The live failure, under the fixed 5 s deadline this test rejects:
+    ``native preflight failed: Command '[.../main.mjs', '--version']' timed
+    out after 5.0 seconds`` — recorded against a pinned binary that then
+    answered in 0.37–0.41 s four times. One bounded 20 s observation (the
+    bound the acceptance harness already allows this exact probe) admits
+    the healthy binary; the launch is never replayed.
+    """
+    executable = str(tmp_path / "fake-kimi")
+    observed = {}
+    real_run = subprocess.run
+
+    def _run(argv, *args, **kwargs):
+        if list(argv) == [executable, "--version"]:
+            observed.update(kwargs)
+            if kwargs.get("timeout", 0) < 12.0:
+                # A cold-starting provider that needs 12 s: the old 5 s
+                # bound times out here, the provider bound does not.
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            return SimpleNamespace(returncode=0, stdout=PINNED_VERSION_BANNER + "\n", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr("subprocess.run", _run)
+    monkeypatch.setattr(bridge, "provider_version_banner", _REAL_PROVIDER_VERSION_BANNER)
+
+    record, result = await _launch(worktree, tmp_path)
+
+    assert observed["timeout"] == 20.0
+    assert result["execution_mode"] == em.NATIVE_TUI
+    receipt = _published_receipt(record["reservation_id"])
+    assert receipt["provider_receipt_kind"] == "kimi-native-tui-attached"
+
+
+@pytest.mark.asyncio
+async def test_a_kimi_version_probe_beyond_the_bound_blocks_before_any_pane_session_or_task(
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
+):
+    """Fail closed beyond the provider bound, with zero mutation.
+
+    The blocked record must keep the exact failing command and the
+    deadline that fired (credential-redacted), and no pane, provider
+    session, or task byte may exist: the bootstrap is never constructed
+    and no terminal is created.
+    """
+    executable = str(tmp_path / "fake-kimi")
+    real_run = subprocess.run
+
+    def _run(argv, *args, **kwargs):
+        if list(argv) == [executable, "--version"]:
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr("subprocess.run", _run)
+    monkeypatch.setattr(bridge, "provider_version_banner", _REAL_PROVIDER_VERSION_BANNER)
+
+    _, result = await _launch(worktree, tmp_path)
+
+    assert result["state"] == "preflight_blocked"
+    failure = result["preflight_failure"]
+    assert failure["reason"] == v2.PREFLIGHT_REASON_NATIVE_PREFLIGHT
+    assert failure["task_bytes_submitted"] is False
+    # The exact failing command and the deadline that fired, retained.
+    assert executable in failure["detail"]
+    assert "--version" in failure["detail"]
+    assert "timed out after 20.0 seconds" in failure["detail"]
+    # Zero pane/session/task mutation.
+    assert harness.terminals == []
+    assert harness.bootstrap_kwargs == {}
 
 
 @pytest.mark.asyncio
