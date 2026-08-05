@@ -267,9 +267,10 @@ class TestCopilotCliProviderInitialization:
 
 
 class TestCopilotCliProviderTrustPrompts:
-    @patch("cli_agent_orchestrator.providers.copilot_cli.time.sleep")
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.copilot_cli.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
-    def test_accept_trust_prompts_answers_yes_then_returns(self, mock_tmux, _mock_sleep):
+    async def test_accept_trust_prompts_answers_yes_then_returns(self, mock_tmux, _mock_sleep):
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
 
         with (
@@ -283,22 +284,23 @@ class TestCopilotCliProviderTrustPrompts:
             ),
             patch.object(provider, "_send_enter") as mock_enter,
         ):
-            provider._accept_trust_prompts(timeout=2.0)
+            await provider._accept_trust_prompts(timeout=2.0)
 
         mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "y")
         assert mock_enter.call_count >= 1
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.copilot_cli.logger")
-    @patch("cli_agent_orchestrator.providers.copilot_cli.time.sleep")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.copilot_cli.time.time")
-    def test_accept_trust_prompts_logs_warning_on_timeout(
+    async def test_accept_trust_prompts_logs_warning_on_timeout(
         self, mock_time, _mock_sleep, mock_logger
     ):
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         mock_time.side_effect = [0.0, 0.0, 3.0]
 
         with patch.object(provider, "_history", return_value="still waiting"):
-            provider._accept_trust_prompts(timeout=2.0)
+            await provider._accept_trust_prompts(timeout=2.0)
 
         mock_logger.warning.assert_called_once_with(
             "Trust prompt handler timed out for %s:%s",
@@ -306,9 +308,10 @@ class TestCopilotCliProviderTrustPrompts:
             "window-0",
         )
 
-    @patch("cli_agent_orchestrator.providers.copilot_cli.time.sleep")
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.copilot_cli.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
-    def test_accept_trust_prompts_answers_yes_for_spaced_yes_no_prompt(
+    async def test_accept_trust_prompts_answers_yes_for_spaced_yes_no_prompt(
         self, mock_tmux, _mock_sleep
     ):
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
@@ -324,7 +327,7 @@ class TestCopilotCliProviderTrustPrompts:
             ),
             patch.object(provider, "_send_enter") as mock_enter,
         ):
-            provider._accept_trust_prompts(timeout=2.0)
+            await provider._accept_trust_prompts(timeout=2.0)
 
         mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "y")
         assert mock_enter.call_count >= 1

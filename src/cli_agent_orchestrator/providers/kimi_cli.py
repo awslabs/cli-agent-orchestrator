@@ -25,13 +25,16 @@ Status Detection Strategy:
     - ERROR: Error message patterns or empty output
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
 import shlex
 import shutil
+import stat
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -46,6 +49,15 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_sta
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+# Serializes concurrent _ensure_mcp_timeout() read-modify-writes to
+# ~/.kimi/config.toml -- after the async conversion (issue #494),
+# _build_kimi_command runs inside asyncio.to_thread, so N concurrent inits can
+# enter this method in N threads at once. Without a lock, the check-then-act
+# on _mcp_timeout_configured races (two threads both pass the "not configured
+# yet" check) and the read-modify-write itself races (one thread's write can
+# clobber content another thread already read).
+_KIMI_CONFIG_WRITE_LOCK = threading.Lock()
 
 
 # Custom exception for provider errors
@@ -409,51 +421,82 @@ class KimiCliProvider(BaseProvider):
         1. Multiple Kimi instances may share the config file concurrently
         2. 600s is a strictly better default for anyone using MCP tools
         3. Restoring while other instances are running causes race conditions
+
+        issue #494: ``_build_kimi_command`` (the sole caller) now runs inside
+        ``asyncio.to_thread``, so N concurrent inits can enter this method in N
+        threads at once. ``_KIMI_CONFIG_WRITE_LOCK`` serializes the whole
+        check-then-act (class flag + read-modify-write) so only one thread ever
+        touches ``config.toml`` at a time -- in-process only: a second
+        cao-server process, or the ``kimi`` CLI itself, writing between our read
+        and ``os.replace`` is still a last-writer-wins lost update. The write
+        itself is atomic (tmp file + ``os.replace``) so a concurrent reader
+        (e.g. a ``kimi`` process starting up) never sees a torn/partial file.
         """
-        if cls._mcp_timeout_configured:
-            return
+        with _KIMI_CONFIG_WRITE_LOCK:
+            if cls._mcp_timeout_configured:
+                return
 
-        config_path = Path.home() / ".kimi" / "config.toml"
-        if not config_path.exists():
-            logger.warning(f"Kimi config not found at {config_path}, skipping MCP timeout override")
-            cls._mcp_timeout_configured = True
-            return
-
-        try:
-            content = config_path.read_text()
-
-            # Match the existing timeout line under [mcp.client] section
-            # Format: tool_call_timeout_ms = 60000
-            pattern = r"(tool_call_timeout_ms\s*=\s*)(\d+)"
-            match = re.search(pattern, content)
-            if match:
-                current_value = int(match.group(2))
-                if current_value < 600000:
-                    new_content = re.sub(pattern, r"\g<1>600000", content)
-                    config_path.write_text(new_content)
-                    logger.info(
-                        f"Set MCP tool_call_timeout_ms to 600000 "
-                        f"(was {current_value}) in {config_path}"
-                    )
-            else:
+            config_path = Path.home() / ".kimi" / "config.toml"
+            if not config_path.exists():
                 logger.warning(
-                    f"tool_call_timeout_ms not found in {config_path}, "
-                    "MCP tool calls may time out during handoff"
+                    f"Kimi config not found at {config_path}, skipping MCP timeout override"
                 )
-        except Exception as e:
-            logger.warning(f"Failed to set MCP timeout in {config_path}: {e}")
+                cls._mcp_timeout_configured = True
+                return
 
-        cls._mcp_timeout_configured = True
+            try:
+                content = config_path.read_text()
 
-    def _handle_startup_dialog(
+                # Match the existing timeout line under [mcp.client] section
+                # Format: tool_call_timeout_ms = 60000
+                pattern = r"(tool_call_timeout_ms\s*=\s*)(\d+)"
+                match = re.search(pattern, content)
+                if match:
+                    current_value = int(match.group(2))
+                    if current_value < 600000:
+                        new_content = re.sub(pattern, r"\g<1>600000", content)
+                        existing_mode = stat.S_IMODE(os.stat(config_path).st_mode)
+                        tmp_path = config_path.with_suffix(".toml.tmp")
+                        with open(tmp_path, "w") as f:
+                            f.write(new_content)
+                        os.chmod(tmp_path, existing_mode)
+                        os.replace(tmp_path, config_path)
+                        logger.info(
+                            f"Set MCP tool_call_timeout_ms to 600000 "
+                            f"(was {current_value}) in {config_path}"
+                        )
+                else:
+                    logger.warning(
+                        f"tool_call_timeout_ms not found in {config_path}, "
+                        "MCP tool calls may time out during handoff"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to set MCP timeout in {config_path}: {e}")
+
+            cls._mcp_timeout_configured = True
+
+    async def _handle_startup_dialog(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
     ) -> None:
         """Dismiss kimi's startup upgrade-reminder dialog if it appears.
 
-        Mirrors ClaudeCodeProvider._handle_startup_prompts: polls the pane for
-        the interactive "[s] Skip reminders for version X" menu and answers 's'
-        so kimi can proceed to its ready prompt. Exits early if kimi is already
-        ready (no newer version → no dialog), so a no-update start isn't delayed.
+        Mirrors ClaudeCodeProvider._handle_startup_prompts (once PR #451 lands):
+        polls the pane for the interactive "[s] Skip reminders for version X"
+        menu and answers 's' so kimi can proceed to its ready prompt. Exits
+        early if kimi is already ready (no newer version → no dialog), so a
+        no-update start isn't delayed.
+
+        issue #494: this is a real coroutine, not sync code called from an
+        async caller. This method is awaited directly from initialize(), which
+        runs on cao-server's single asyncio event loop. Every tmux-backed call
+        here (``get_history``/``send_keys``) is a blocking subprocess exec, and
+        a plain ``time.sleep`` would block the WHOLE OS thread -- freezing every
+        other in-flight request -- for as long as this loop runs. All blocking
+        calls are offloaded to a worker thread via ``asyncio.to_thread`` and all
+        sleeps are ``asyncio.sleep``, so this coroutine yields the event loop
+        instead of freezing it (see PR #451 for the ClaudeCodeProvider fix this
+        mirrors, and issue #494 for why this method and its Antigravity/Copilot
+        counterparts needed the same fix).
 
         Idle-gap semantics (see issue #400): a cold or containerized start can
         render the dialog LATE, past the old fixed ~20s window. Rather than a
@@ -491,7 +534,9 @@ class KimiCliProvider(BaseProvider):
                 return
             if any_prompt_handled and now - last_prompt_time >= idle_gap:
                 return  # no new prompt within the idle gap — startup settled
-            output = get_backend().get_history(self.session_name, self.window_name)
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
             if output:
                 clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
                 # Answer the upgrade dialog once; its text lingers in the buffer
@@ -502,11 +547,17 @@ class KimiCliProvider(BaseProvider):
                     logger.info("Kimi upgrade-reminder dialog detected, skipping reminders")
                     status_monitor.notify_input_sent(self.terminal_id)
                     # 's' = "Skip reminders for version X"; single-key menu, no Enter.
-                    get_backend().send_keys(self.session_name, self.window_name, "s", enter_count=0)
+                    await asyncio.to_thread(
+                        get_backend().send_keys,
+                        self.session_name,
+                        self.window_name,
+                        "s",
+                        enter_count=0,
+                    )
                     upgrade_dismissed = True
                     any_prompt_handled = True
                     last_prompt_time = time.monotonic()  # reset idle timer
-                    time.sleep(1.0)
+                    await asyncio.sleep(1.0)
                     continue
                 # Already at a ready prompt → no dialog to handle, stop early.
                 if self.get_status(output) in (
@@ -514,7 +565,7 @@ class KimiCliProvider(BaseProvider):
                     TerminalStatus.COMPLETED,
                 ):
                     return
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
 
     async def initialize(self) -> bool:
         """Initialize Kimi CLI provider by starting the kimi command.
@@ -529,6 +580,15 @@ class KimiCliProvider(BaseProvider):
 
         Raises:
             TimeoutError: If shell or Kimi CLI doesn't start within timeout
+
+        issue #494: ``_build_kimi_command`` does blocking file I/O (mkdtemp,
+        writing system.md/agent.yaml, and the ~/.kimi/config.toml
+        read-modify-write via ``_ensure_mcp_timeout``) and ``get_backend().
+        send_keys`` is a blocking subprocess exec -- both offloaded to a
+        worker thread via ``asyncio.to_thread`` for the same reason as
+        ``_handle_startup_dialog`` (see its docstring): so nothing in
+        initialize() blocks the shared event loop under concurrent session
+        creation.
         """
         # Resolve the per-profile provider_init_timeout override (if any) so it
         # governs the startup-dialog handler's outer cap too, mirroring
@@ -551,14 +611,16 @@ class KimiCliProvider(BaseProvider):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Build properly escaped command string
-        command = self._build_kimi_command()
+        command = await asyncio.to_thread(self._build_kimi_command)
 
         # Send Kimi command to the tmux window
-        get_backend().send_keys(self.session_name, self.window_name, command)
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, command
+        )
 
         # Dismiss the startup upgrade-reminder dialog before waiting for ready:
         # unanswered it blocks kimi from reaching its prompt (init would time out).
-        self._handle_startup_dialog(outer_timeout=ready_timeout)
+        await self._handle_startup_dialog(outer_timeout=ready_timeout)
 
         # Wait for Kimi CLI to reach IDLE or COMPLETED state (prompt visible).
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
