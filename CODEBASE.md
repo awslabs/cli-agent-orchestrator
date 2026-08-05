@@ -28,6 +28,7 @@ to use.
 |---|---|
 | `src/cli_agent_orchestrator/api/` | FastAPI HTTP, SSE, AG-UI, and PTY WebSocket endpoints |
 | `src/cli_agent_orchestrator/cli/` | `cao` commands and command-line validation |
+| `src/cli_agent_orchestrator/tui/` | `cao tui` guided terminal front door — a thin prompt_toolkit shell that composes the `cao` CLI and reads live state over HTTP only |
 | `src/cli_agent_orchestrator/mcp_server/` | In-session orchestration MCP tools |
 | `src/cli_agent_orchestrator/ops_mcp_server/` | External operations MCP tools |
 | `src/cli_agent_orchestrator/services/` | Session, terminal, inbox, workflow, memory, event, configuration, and plugin services |

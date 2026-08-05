@@ -56,6 +56,14 @@ dependencies = [
     # command unconditionally, so tomli must be a RUNTIME dependency on 3.10 —
     # not just a dev dependency — or every `cao` command would fail to import.
     "tomli>=2.0.0; python_version < '3.11'",
+    "prompt_toolkit>=3.0",  # cao tui rendering toolkit
+    # cao tui `[c] copy` -> the real OS clipboard, via prompt_toolkit's
+    # PyperclipClipboard. Reverses ADR-013 (see tui/runner.py's module docstring):
+    # without it the default InMemoryClipboard discarded the text on exit, so the
+    # advertised copy key reached nothing pasteable. Declared explicitly because it
+    # was previously present only transitively via fastmcp, which is not a contract
+    # to rely on. No module under tui/ imports pyperclip directly.
+    "pyperclip>=1.8",
 ]
 
 [project.optional-dependencies]

@@ -18,6 +18,7 @@ from cli_agent_orchestrator.cli.commands.session import session
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
 from cli_agent_orchestrator.cli.commands.skills import skills
 from cli_agent_orchestrator.cli.commands.terminal import terminal
+from cli_agent_orchestrator.cli.commands.tui import tui
 from cli_agent_orchestrator.cli.commands.update import update
 from cli_agent_orchestrator.cli.commands.workflow import workflow
 
@@ -30,7 +31,10 @@ except PackageNotFoundError:
 @click.group()
 @click.version_option(__version__, "-V", "--version", prog_name="cao")
 def cli():
-    """CLI Agent Orchestrator."""
+    """CLI Agent Orchestrator.
+
+    Run `cao tui` for a guided terminal UI.
+    """
 
 
 # Register commands
@@ -49,6 +53,7 @@ cli.add_command(memory)
 cli.add_command(skills)
 cli.add_command(session)
 cli.add_command(terminal)
+cli.add_command(tui)
 cli.add_command(workflow)
 cli.add_command(update)
 
