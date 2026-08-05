@@ -2265,10 +2265,16 @@ async def managed_recovery_capabilities(
     kimi_bin = shutil.which("kimi")
     if kimi_bin and versions["kimi"]:
         try:
+            # The proof binds the canonical absolute path recorded by
+            # run_identity_proof; a PATH entry may spell the same binary
+            # through a symlink (Homebrew: /opt/homebrew/bin/kimi), so
+            # resolve to that same canonical identity before loading.  A
+            # dangling symlink resolves to a nonexistent path and the load
+            # fails closed below.
             kimi_proof = await asyncio.to_thread(
                 kimi_acp_proof.load_valid_proof,
                 state_dir=CAO_HOME_DIR / "recovery",
-                kimi_binary=Path(kimi_bin),
+                kimi_binary=Path(os.path.realpath(kimi_bin)),
                 version_output=versions["kimi"],
             )
         except Exception:  # noqa: BLE001 - absence of proof means disabled
