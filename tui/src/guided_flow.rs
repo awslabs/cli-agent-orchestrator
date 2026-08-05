@@ -22,7 +22,14 @@
 //!
 //! **All of it goes through `server-client`.** BR-1 of that unit says it owns every connection,
 //! and `tests/hermeticity_tripwire.rs` enforces it mechanically — a second production module
-//! naming an HTTP client fails the build. That is also why the fetch is taken through the
+//! naming an HTTP client **fails `cargo test`**. Not "fails the build", which this said before and
+//! which overstates it: the tripwire is a test target (TS-2, deliberately absent from the release
+//! build), so `cargo build` succeeds and the violation surfaces at test time. CI runs both, so the
+//! gate is real either way — but a reader who believes the compiler enforces it will not think to
+//! check that the test still runs. Overstating a guard is how the guard that would have caught the
+//! thing never gets added. (Reported by review on PR #547.)
+//!
+//! That is also why the fetch is taken through the
 //! [`PickerSource`] trait rather than against `ServerClient` directly: it is the same seam
 //! `handoff.rs` uses for `ServerRead`, and it means this unit's own tests exercise the picker
 //! logic with **no socket at all**. A test stub bound on a real port would have to name
@@ -67,15 +74,31 @@
 //! constructed. Collapsing at serialisation instead would leave a window in which a malformed
 //! value exists inside the type, which is precisely what SR-1 forbids.
 //!
-//! # Why `to_params()` maps only 6 of the 12 parameters
+//! # Why `to_params()` maps 7 of the 12 parameters, and what happens to the other 5
 //!
-//! `SessionParams` has six fields, and that is not an oversight in either direction:
-//! `POST /sessions` simply has no parameter for `message`, `--headless`, `--async`,
-//! `--auto-approve`, `--yolo`, or `--memory`. Those six are expressible **only in an argv**, so
-//! they are carried in the field set for the hand-off path that `renderer` builds and are absent
-//! from the HTTP request by construction. See BR-9 of `server-client` for the mirror-image case:
-//! `memory_manager` and `model` exist on the endpoint and are deliberately unused because the CLI
-//! does not expose them. (#321)
+//! **This section previously claimed six, and was wrong in a way that lost operator input.** It
+//! said `POST /sessions` "has no parameter for `message`" and that the unmapped six were "carried
+//! in the field set for the hand-off path that `renderer` builds". Both halves were false:
+//! `CreateSessionBody.initial_message` has been on the endpoint all along (`api/main.py:215`),
+//! and **no such argv-building path exists** — `launch()` does `create_session` plus tmux
+//! navigation and builds no `cao launch` command line. So a typed first prompt was collected and
+//! silently discarded. `message` is now mapped to `initial_message` and travels in the JSON body.
+//! (Reported by review on PR #547.)
+//!
+//! The remaining five — `--headless`, `--async`, `--auto-approve`, `--yolo`, `--memory` — really
+//! do have no endpoint parameter, and they are **not silently dropped**: [`unwirable_flags`]
+//! names them, and the renderer marks each in the form so an operator can see that setting
+//! `--yolo` here will not produce a `--yolo` session. Silence was the actual harm — someone who
+//! ticks `--auto-approve` and then meets an approval prompt in the new window has been misled by
+//! the form, not merely underserved by it.
+//!
+//! `--memory` is the near-miss worth naming: `POST /sessions` *does* take a `memory_manager`
+//! parameter, so it looks wirable. It is not, from here — the CLI option is `is_flag=True`
+//! (`launch.py:130-134`) while the endpoint's parameter is a memory-manager **profile name**
+//! (`Optional[str]`), and the flag carries no name to send. Mapping presence to some invented
+//! default would launch a sidecar the operator never chose. See BR-9 of `server-client` for the
+//! mirror-image case: `memory_manager` and `model` exist on the endpoint and stay unused because
+//! the CLI exposes no value for them. (#321)
 
 use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -117,6 +140,59 @@ pub const ENV_PAIR_SHAPE: &str = "KEY=VALUE";
 /// Rendering is `renderer`'s job. The string lives here because the refusal it describes is
 /// enforced here, in [`GuidedFlow::set`], and the two must say the same thing. (#321)
 pub const UNLOADABLE_MARKER: &str = "unloadable — listed so you can see it, but not selectable";
+
+/// The marker a `cao launch` field carries when the endpoint has no parameter for it.
+///
+/// Same posture as [`UNLOADABLE_MARKER`], for the same reason: the field stays **visible and
+/// explained** rather than hidden. Removing the five flags from the form would be the other
+/// defensible answer, and it was rejected — an operator who knows `cao launch --yolo` exists and
+/// cannot find it in the TUI learns nothing, whereas one who sees it marked learns exactly where
+/// the boundary is and that the CLI is the way across it. (Reported by review on PR #547.)
+pub const NOT_SENT_MARKER: &str = "not sent — POST /sessions has no parameter for this; run it \
+                                   from the CLI if you need it";
+
+/// The `cao launch` parameters that **cannot** reach `POST /sessions`, and are marked as such.
+///
+/// Each is a Click flag with no endpoint counterpart, re-verified against `api/main.py`'s
+/// `POST /sessions` signature (`:1890-1904`) and `CreateSessionBody` (`:219`) rather than carried
+/// forward from the earlier claim — which was wrong about `message` and cost the operator their
+/// typed prompt.
+///
+/// - `--headless`, `--async`, `--auto-approve`, `--yolo` — no parameter, no body field. These are
+///   CLI-process behaviours (detach, don't wait, skip the confirmation prompt), and the two
+///   approval flags are the consequential ones to mark: a session that blocks on approvals when
+///   the operator asked for auto-approve is a misled operator, not a missing feature.
+/// - `--memory` — the near-miss. `POST /sessions` **does** take `memory_manager`, but the CLI
+///   option is `is_flag=True` (`launch.py:130-134`) while the parameter wants a memory-manager
+///   profile **name** (`Optional[str]`). A bare flag carries no name to send, and inventing a
+///   default would spawn a sidecar the operator never chose.
+///
+/// `message` is deliberately **absent from this list**: it is wired, to `initial_message` in the
+/// JSON body. [`the_unwirable_flags_are_exactly_the_unmapped_launch_parameters`] pins that this
+/// list plus the seven mapped fields accounts for all twelve, so a field can be neither dropped
+/// nor marked by accident. (#321)
+pub const UNWIRABLE_LAUNCH_FLAGS: [&str; 5] = [
+    "--headless",
+    "--async",
+    "--auto-approve",
+    "--yolo",
+    "--memory",
+];
+
+/// Whether `field_name` on `command` is a parameter that cannot reach the endpoint.
+///
+/// **Takes the command, not just the name**, because the names are not unique across the catalog:
+/// `cao session send` also declares `--async` (measured — it is the only overlap), and that one is
+/// an in-app concern with nothing to do with `POST /sessions`. Keyed on the name alone, this would
+/// stamp "not sent" onto a `session send` field where the claim is simply untrue — trading a
+/// silent drop for a confident wrong label, which is no better.
+///
+/// A function rather than callers matching on [`UNWIRABLE_LAUNCH_FLAGS`] directly, so the renderer
+/// asks a question instead of re-implementing the answer — the `renderer`-holds-a-second-copy
+/// failure this crate keeps running into. (#321, and review on PR #547)
+pub fn is_unwirable_launch_flag(command: Option<CommandId>, field_name: &str) -> bool {
+    command == Some(CommandId::Launch) && UNWIRABLE_LAUNCH_FLAGS.contains(&field_name)
+}
 
 /// Everything [`GuidedFlow`] can refuse.
 ///
@@ -737,6 +813,12 @@ impl GuidedFlow {
             working_directory: self.text_of("--working-directory"),
             allowed_tools: self.text_of("--allowed-tools"),
             env_vars: self.env_pairs_of("--env"),
+            // `"message"` with no `--` prefix: it is `cao launch`'s trailing POSITIONAL argument
+            // (`launch.py:94`), and `text_of` looks fields up by the catalog's exact spelling.
+            // Asking for `"--message"` here would find nothing and silently drop the prompt
+            // again, which is the whole defect this line fixes — so
+            // `the_typed_launch_message_reaches_the_request` pins the field name.
+            initial_message: self.text_of("message"),
         })
     }
 
@@ -964,9 +1046,11 @@ fn parse_flag(name: &str, value: &str) -> Result<bool, Error> {
 /// - **`launch.py::_parse_env_pairs` (`:60-90`) REJECTS** — it raises `ClickException` for a
 ///   missing `=`, a key outside `[A-Za-z_][A-Za-z0-9_]*`, a blocked prefix, or a value at or
 ///   above the byte cap. This is the CLI's front door, and it is what this function mirrors.
-/// - **`clients/tmux.py::_merge_extra_env` DROPS with a warning** — the later stage, mirrored by
-///   `env_guard::merge`, which never errors (its INV-1) because failing a launch there would be a
-///   behaviour change.
+/// - **`clients/tmux.py::_merge_extra_env` DROPS with a warning** — the later stage, which runs
+///   **server-side** and never errors, because failing a launch there would be a behaviour change.
+///   This crate no longer mirrors it: `env_guard::merge` existed for that purpose and was deleted
+///   for having no reachable caller, since the TUI sends `env_vars` over HTTP and cao-server
+///   performs that merge itself. (Review on PR #547.)
 ///
 /// This unit is the front door, so it rejects: loudly, at entry, naming the cause (SR-3,
 /// deny-by-default). The policy constants and the allowlist-before-prefix ordering are **not**
@@ -999,21 +1083,33 @@ fn parse_env_pairs(raw: &str) -> Result<BTreeMap<String, String>, Error> {
         }
 
         // Deny-by-default, at entry, using the guard that already owns the policy (SR-3).
-        match env_guard::decide(key, value) {
-            EnvDecision::Keep => {}
-            EnvDecision::DropBlocked { key } => {
-                return Err(Error::Invalid(format!(
-                    "--env key {key:?} uses a prefix reserved for provider env \
+        //
+        // Each arm's message ends with `EnvDecision::warning()`, and that is what gives that
+        // method its **production caller**. It had none: it was written for `env_guard::merge`,
+        // which was deleted for the same reason (it mirrored a merge cao-server performs itself),
+        // and the reasons this front door prints were written out a second time here. Two copies
+        // of one policy explanation drift, and the drift is silent — the message an operator reads
+        // would stop matching the rule that rejected them. Now the guard states the decision and
+        // this unit adds the front-door context. (Reported by review on PR #547.)
+        let decision = env_guard::decide(key, value);
+        if let Some(reason) = decision.warning() {
+            return Err(Error::Invalid(match &decision {
+                EnvDecision::DropBlocked { key } => format!(
+                    "{reason}. --env key {key:?} uses a prefix reserved for provider env \
                      ({}); it would cause a nested-session failure",
                     env_guard::BLOCKED_PREFIXES.join(", ")
-                )));
-            }
-            EnvDecision::DropOversized { key, byte_len } => {
-                return Err(Error::Invalid(format!(
-                    "--env value for {key:?} is {byte_len} bytes, at or above the \
-                     {MAX_ENV_VALUE_BYTES}-byte cap (tmux argv limit, PR #246)"
-                )));
-            }
+                ),
+                EnvDecision::DropOversized { .. } => format!(
+                    "{reason}. The {MAX_ENV_VALUE_BYTES}-byte cap is the tmux argv limit \
+                     (PR #246)"
+                ),
+                // `warning()` returns `None` for `Keep`, so this arm is unreachable — stated
+                // rather than silently folded into one of the drops above.
+                EnvDecision::Keep => unreachable!(
+                    "EnvDecision::warning() returns None for Keep, so this branch cannot be \
+                     entered; a warning implies a drop"
+                ),
+            }));
         }
 
         // Later pairs override earlier ones on a key collision, matching `_merge_extra_env`'s
@@ -1041,10 +1137,11 @@ fn is_valid_env_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_fields, is_valid_env_key, Error, Field, FieldKind, FieldValue, GuidedFlow,
-        PickerSource, PickerUpdate, ENV_PAIR_SHAPE, GUIDED_STEP_ORDER, UNLOADABLE_MARKER,
+        build_fields, is_unwirable_launch_flag, is_valid_env_key, Error, Field, FieldKind,
+        FieldValue, GuidedFlow, PickerSource, PickerUpdate, ENV_PAIR_SHAPE, GUIDED_STEP_ORDER,
+        UNLOADABLE_MARKER, UNWIRABLE_LAUNCH_FLAGS,
     };
-    use crate::catalog::CommandId;
+    use crate::catalog::{self, CommandId};
     use crate::error::TuiError;
     use crate::types::{Profile, Provider};
     use std::collections::BTreeSet;
@@ -1465,6 +1562,137 @@ mod tests {
         assert_eq!(params.working_directory, None);
         assert_eq!(params.allowed_tools, None);
         assert_eq!(params.env_vars, None);
+        assert_eq!(params.initial_message, None);
+    }
+
+    /// **The typed launch message reaches `SessionParams`, under the catalog's own field name.**
+    ///
+    /// `to_params()` mapped 6 of 12 parameters and dropped the message, on a module-doc claim
+    /// that `POST /sessions` had no parameter for it. It has one —
+    /// `CreateSessionBody.initial_message` (`api/main.py:215`) — so the prompt an operator typed
+    /// was collected and thrown away. (Reported by review on PR #547.)
+    ///
+    /// **The lookup name is what this test really pins.** `message` is a POSITIONAL argument
+    /// (`launch.py:94`), so the catalog field is `"message"` with no dashes. Reading it as
+    /// `"--message"` compiles, finds nothing, and silently reproduces the original defect — the
+    /// failure is invisible in the type system and invisible in review. Asserting the value
+    /// arrives is the only thing that catches it.
+    #[test]
+    fn the_typed_launch_message_reaches_the_request() {
+        let mut flow = launch_form();
+        flow.set("--agents", "planner").expect("valid profile");
+        flow.set("message", "summarise the release notes")
+            .expect("the positional message is a settable text field");
+
+        let params = flow.to_params().expect("the required field is set");
+
+        assert_eq!(
+            params.initial_message.as_deref(),
+            Some("summarise the release notes"),
+            "the message the operator typed must reach the request rather than being dropped"
+        );
+        assert_eq!(
+            serde_json::to_string(&params).expect("must serialise"),
+            r#"{"agent_profile":"planner","initial_message":"summarise the release notes"}"#,
+            "and it must serialise under the server's own key name"
+        );
+
+        // Blank stays absent: the server rejects `initial_message: ""` outright
+        // (`api/main.py:1949-1950`), so a whitespace-only prompt must not become `Some("")`.
+        let mut blank = launch_form();
+        blank.set("--agents", "planner").expect("valid profile");
+        blank.set("message", "   ").expect("clearing is valid");
+        assert_eq!(
+            blank.to_params().expect("runnable").initial_message,
+            None,
+            "a whitespace-only message must be ABSENT, not sent as an empty string the server \
+             raises on"
+        );
+    }
+
+    /// **The unwirable flags are exactly the launch parameters `to_params()` does not map.**
+    ///
+    /// The accounting test, and the reason a future edit cannot quietly drop a field again: all
+    /// twelve `cao launch` parameters must be either **mapped** to a `SessionParams` field or
+    /// **named** in [`UNWIRABLE_LAUNCH_FLAGS`] so the form can mark them. A parameter in neither
+    /// set is silently discarded — which is precisely what `message` was.
+    ///
+    /// Derived from the catalog rather than from a hand-written list of twelve names, so adding a
+    /// thirteenth parameter to `cao launch` fails here until someone decides which set it belongs
+    /// in. That decision is the whole point; the test exists to force it rather than to check a
+    /// number.
+    #[test]
+    fn the_unwirable_flags_are_exactly_the_unmapped_launch_parameters() {
+        // The seven form fields `to_params()` reads, in its own order. Written out rather than
+        // derived, because this list IS the claim being checked against the catalog.
+        const MAPPED: [&str; 7] = [
+            "--agents",
+            "--provider",
+            "--session-name",
+            "--working-directory",
+            "--allowed-tools",
+            "--env",
+            "message",
+        ];
+
+        let declared: Vec<&str> = catalog::params(CommandId::Launch)
+            .iter()
+            .map(|param| param.name)
+            .collect();
+
+        assert_eq!(
+            declared.len(),
+            MAPPED.len() + UNWIRABLE_LAUNCH_FLAGS.len(),
+            "every `cao launch` parameter must be either mapped to the request or named as \
+             unwirable — one in neither set is silently discarded, which is the defect this \
+             accounting exists to prevent. Declared: {declared:?}"
+        );
+
+        for name in declared {
+            let mapped = MAPPED.contains(&name);
+            let unwirable = UNWIRABLE_LAUNCH_FLAGS.contains(&name);
+            assert!(
+                mapped != unwirable,
+                "{name:?} must be in exactly one of the two sets (mapped={mapped}, \
+                 unwirable={unwirable}); being in neither drops it silently and being in both \
+                 means the form marks a field it does send"
+            );
+        }
+
+        // `message` specifically: it moved from unwirable to mapped, and a regression would put
+        // it back. Named separately so the aggregate above cannot absorb it.
+        assert!(
+            !UNWIRABLE_LAUNCH_FLAGS.contains(&"message"),
+            "`message` IS wirable — it maps to `initial_message` in the JSON body. Listing it as \
+             unwirable would re-document the defect as intended behaviour"
+        );
+    }
+
+    /// The "not sent" marker is scoped to `cao launch`, because the names are not unique.
+    ///
+    /// `cao session send` also declares `--async` (measured: the only overlap across the 61
+    /// commands), and there the claim "POST /sessions has no parameter for this" is simply false.
+    /// A name-only predicate would print a confident wrong label — trading a silent drop for
+    /// misinformation, which is not an improvement.
+    #[test]
+    fn the_not_sent_marker_applies_only_to_the_launch_form() {
+        assert!(
+            is_unwirable_launch_flag(Some(CommandId::Launch), "--async"),
+            "`--async` on the launch form cannot reach POST /sessions and must be marked"
+        );
+        assert!(
+            !is_unwirable_launch_flag(Some(CommandId::SessionSend), "--async"),
+            "`--async` on `cao session send` is a different parameter entirely; marking it \
+             \"not sent\" would be a false statement about a command this list says nothing about"
+        );
+        assert!(
+            !is_unwirable_launch_flag(None, "--async"),
+            "with no command selected there is no claim to make"
+        );
+        assert!(
+            !is_unwirable_launch_flag(Some(CommandId::Launch), "--agents"),
+            "a MAPPED launch field must never be marked as not sent"
+        );
     }
 
     /// A field the operator fills and then clears returns to absent.

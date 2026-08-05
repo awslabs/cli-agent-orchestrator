@@ -249,15 +249,41 @@ impl LayoutMode {
 #[allow(dead_code)] // constructed by `in_app_readiness`; matched by `run_in_app`. (#321)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InAppReadiness {
-    /// A placeholder-free route: it runs for real. **9 of the 22 IN-APP commands, measured.**
-    Runnable,
-    /// The route carries `{token}` placeholders and nothing maps form fields to them.
+    /// Every path placeholder is bound to a form field and no filled field would be ignored.
     ///
-    /// Carries the placeholder names so the rendered error says *which* values are missing rather
-    /// than "not supported" — the difference between a stated gap and a dead end.
+    /// **19 of the 22 IN-APP commands reach this on an empty form, measured** — up from 9. The earlier count was
+    /// not a property of the routes; it was the consequence of `renderer` calling
+    /// `run(id, &[], &[], None, ..)` and therefore treating any route with a `{token}` as
+    /// unreachable, even the 10 whose token a form field plainly supplies.
+    Runnable,
+    /// The route needs a path value **no form field supplies**.
+    ///
+    /// Carries the unbound placeholder names so the rendered error says *which* values are missing
+    /// rather than "not supported" — the difference between a stated gap and a dead end. Only
+    /// `cao session send` and `cao session status` remain here, both needing the session-name →
+    /// terminal-id resolution call the CLI makes first (`session.py:26`).
     NotWired {
-        /// The `{token}` names the route needs, in order.
+        /// The `{token}` names still unsupplied.
         placeholders: Vec<&'static str>,
+    },
+    /// The operator filled a field the route would **silently discard**.
+    ///
+    /// # Why this variant exists, and why it is keyed on FILLED fields
+    ///
+    /// The reported defect was that `run_in_app` sent no query and no body at all, so
+    /// `memory list --scope X` ran as a scan-all and `memory clear`'s required `--scope` was
+    /// dropped. Most of those are now bound. What remains are fields with genuinely nowhere to go:
+    /// `memory export --output` (a local path), `schedule add`'s `file_path` and
+    /// `workflow validate`'s `file` (both need a JSON body this crate cannot yet build).
+    ///
+    /// **Keyed on what the operator actually typed, not on what the command declares.** Refusing
+    /// `memory export` outright because `--output` *could* be filled would break a command that
+    /// works perfectly without it — trading a silent drop for a false blocker. The dishonesty is
+    /// specifically a *value* going nowhere, so that is the trigger.
+    /// (Reported by review on PR #547.)
+    Ignored {
+        /// The filled field names that would not reach the server, in catalog order.
+        fields: Vec<&'static str>,
     },
     /// The command has no HTTP route at all (`profile find`, measured: exactly one).
     NoRoute,
@@ -680,7 +706,14 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
             ),
             // Cause AND remedy, even in the one-line indicator (FR-6.1): "server: error" would
             // tell the operator nothing they could act on.
-            Some(Err(why)) => format!("server: unreachable — {why}"),
+            //
+            // **`{why}` already carries its own label**, so this no longer prefixes "unreachable"
+            // unconditionally. It used to, and the result contradicted itself: with auth enabled
+            // every route answers 401, and the header read `server: unreachable — cao-server
+            // returned HTTP 401` — a server that answered, described as unreachable, with an
+            // implied "start the server" remedy that cannot help. `server_failure_summary` writes
+            // the right label for each variant. (Reported by review on PR #547.)
+            Some(Err(why)) => format!("server: {why}"),
         };
 
         vec![format!("cao-tui {}", env!("CARGO_PKG_VERSION")), status]
@@ -742,7 +775,7 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                     }
                     Focus::CommandList | Focus::Results => false,
                 };
-                render_field(field, focused)
+                render_field(field, focused, self.flow.current())
             })
             .collect()
     }
@@ -1221,12 +1254,32 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
     }
 
     /// Executes work queued by [`Self::run_selected`] after its pending frame has been drawn.
+    ///
+    /// # Why `running` is cleared HERE and not only inside each path
+    ///
+    /// Both `launch()` and `run_in_app()` are synchronous: when they return, nothing is in
+    /// flight. So the flag's lifetime is exactly this call, and clearing it on the way out makes
+    /// that structural instead of a per-branch obligation.
+    ///
+    /// It used to be per-branch, and it leaked. `run_selected` set `running = true`, but
+    /// `launch()`'s `Incomplete` early return and `run_in_app()`'s `NotWired`/`NoRoute` arms
+    /// returned without resetting it — so `cao launch` with `--agents` empty, `[enter]`, then
+    /// `[q]` produced the quit prompt's *"the run continues on the server either way"* for a
+    /// request that was never sent. Misreporting system state is the failure mode this crate
+    /// treats as the worst available, and the per-branch form gives every future early return a
+    /// fresh chance to reintroduce it. (Reported by review on PR #547.)
+    ///
+    /// The paths still clear the flag at their own network boundaries, which is deliberate
+    /// rather than redundant: `launch()` must be false before it renders a hand-off outcome, and
+    /// this is the backstop for every arm that returns earlier.
     fn run_pending_action(&mut self) -> bool {
         match self.pending_action.take() {
             Some(PendingAction::Launch) => self.launch(),
             Some(PendingAction::InApp(id)) => self.run_in_app(id),
             None => return false,
         }
+        // Unconditional: reached by every arm above, including the ones that returned early.
+        self.running = false;
         true
     }
 
@@ -1329,7 +1382,9 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         self.health = Some(
             self.server
                 .health()
-                .map_err(|error: TuiError| error.to_string()),
+                // `server_failure_summary`, not `to_string()`: an auth rejection needs to read as
+                // an auth rejection. See that function for why the raw `Display` was wrong here.
+                .map_err(|error: TuiError| server_failure_summary(&error)),
         );
         self.retryable = Some(Retryable::Pickers);
 
@@ -1618,18 +1673,34 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
             return;
         }
 
-        // The stated gap. `NotWired` and `NoRoute` render an error that NAMES what is missing —
-        // the operator can see the limit rather than meeting a picker that half-works.
-        match in_app_readiness(id) {
+        // The stated gap. `NotWired`, `Ignored` and `NoRoute` render an error that NAMES what is
+        // missing — the operator can see the limit rather than meeting a picker that half-works.
+        match in_app_readiness(id, &self.flow) {
             InAppReadiness::Runnable => {}
             InAppReadiness::NotWired { placeholders } => {
                 self.banner = Some(Banner::error(
                     format!("{id:?} is not yet wired for in-app execution"),
                     format!(
-                        "its route needs the path value(s) {placeholders:?}, and nothing in the \
-                         TUI maps a command's form fields to a route's path values yet"
+                        "its route needs the path value(s) {placeholders:?}, which no form field \
+                         supplies — the CLI resolves them with a second call this TUI does not \
+                         make yet"
                     ),
                     "run it from the CLI for now; this is a stated limit, not a failure",
+                ));
+                return;
+            }
+            // The honesty gate. Enter is refused rather than firing a request that would drop what
+            // the operator typed — the reported defect was a form that taught operators their
+            // input mattered when it did not. Naming the fields is what makes this a stated limit
+            // rather than a dead end. (Review on PR #547.)
+            InAppReadiness::Ignored { fields } => {
+                self.banner = Some(Banner::error(
+                    format!("{id:?} cannot send {fields:?} in-app"),
+                    format!(
+                        "you filled in {fields:?}, and this route has no parameter for them, so \
+                         running it here would silently ignore what you typed"
+                    ),
+                    "clear those fields to run without them, or run it from the CLI",
                 ));
                 return;
             }
@@ -1670,8 +1741,28 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         // `StreamingResponse` (measured at 3.6), so there is no incremental arrival to lose. A
         // non-JSON body passes through unchanged. `PaneSink` remains the streaming path and is
         // still what `push_bytes` is exercised through elsewhere. (#321)
+        // The form's values, resolved through the route's own bindings. Owned `String`s first
+        // because `run` takes `&[&str]`/`&[(&str, &str)]` and the values come out of the form by
+        // value; the borrowed views are built from these and must outlive the call.
+        //
+        // This replaced `run(id, &[], &[], None, ..)` — literally no path values and no query.
+        // That call was why `memory list --scope X` ran as a scan-all and `memory clear`'s
+        // REQUIRED `--scope` was dropped into a guaranteed 422. Readiness has already established
+        // that every placeholder is bound and that nothing filled would be ignored, so what is
+        // built here is complete by construction rather than by hoping. (Review on PR #547.)
+        let path_values: Vec<String> = crate::server::path_values_for(id, &self.flow);
+        let query_pairs: Vec<(&'static str, String)> =
+            crate::server::query_pairs_for(id, &self.flow);
+        let path_refs: Vec<&str> = path_values.iter().map(String::as_str).collect();
+        let query_refs: Vec<(&str, &str)> = query_pairs
+            .iter()
+            .map(|(wire, value)| (*wire, value.as_str()))
+            .collect();
+
         let mut sink = JsonSink::new();
-        let status = self.server.run(id, &[], &[], None, &mut sink);
+        let status = self
+            .server
+            .run(id, &path_refs, &query_refs, None, &mut sink);
         self.pane.push_bytes(sink.rendered().as_bytes());
 
         self.running = false;
@@ -1876,7 +1967,14 @@ fn render_command_path(command: &Command) -> String {
 /// `Field::is_positional` is what decides, rather than a second check on the name — the field kind
 /// is the entity's own statement of the distinction, and `message` acquiring a `--` is exactly
 /// what BR-4 forbids.
-fn render_field(field: &Field, focused: bool) -> String {
+///
+/// `command` is taken so a field the endpoint has no parameter for can say so in the line itself
+/// (`crate::guided_flow::NOT_SENT_MARKER`). Five `cao launch` flags are in that position; before this they
+/// rendered identically to the wired ones, so an operator ticking `--auto-approve` had no way to
+/// learn it would not be applied until an approval prompt appeared in the new window. The
+/// *command* is what makes the claim safe to print — `--async` also exists on `cao session send`,
+/// where "not sent" would be false. (Reported by review on PR #547.)
+fn render_field(field: &Field, focused: bool, command: Option<CommandId>) -> String {
     let marker = if focused { ">" } else { " " };
     let label = if field.is_positional() {
         format!("<{}>", field.name.trim_start_matches('-'))
@@ -1899,8 +1997,13 @@ fn render_field(field: &Field, focused: bool) -> String {
         FieldKind::Text => "text",
         FieldKind::Positional => "positional",
     };
+    let unwirable = if guided_flow::is_unwirable_launch_flag(command, field.name) {
+        format!("  [{}]", guided_flow::NOT_SENT_MARKER)
+    } else {
+        String::new()
+    };
 
-    format!("{marker} {label}{requirement} [{kind}]: {value}")
+    format!("{marker} {label}{requirement} [{kind}]: {value}{unwirable}")
 }
 
 /// The four fields Python's `_searchable_text` tokenizes, lowercased for a case-insensitive match.
@@ -1953,6 +2056,44 @@ fn blocked_reason(missing: &[Field]) -> String {
     format!("blocked: {} required", names.join(", "))
 }
 
+/// One line describing a failed server read, **labelled by what actually went wrong**.
+///
+/// # Why this exists rather than `error.to_string()`
+///
+/// The header prefixed every failure with "unreachable". CAO's auth is opt-in and off by default,
+/// so that was true for the common case — but with auth enabled `get_current_scopes` answers
+/// **401** for a missing or invalid token and `require_any_scope` answers **403** for insufficient
+/// scope (`security/auth.py:435-440`), and this client sends no `Authorization` header at all. The
+/// operator therefore saw `server: unreachable — cao-server returned HTTP 401`: a server that
+/// plainly answered, described as unreachable, with a "start cao-server / check the address"
+/// remedy that cannot possibly work. A self-contradicting diagnosis is worse than a vague one,
+/// because it sends the reader somewhere else entirely.
+///
+/// 401 and 403 are kept **separate**, because the actions differ: 401 means no usable credential
+/// was presented, 403 means the credential is real but lacks the scope. Collapsing them into
+/// "auth failed" would leave the operator guessing which.
+///
+/// This does not add authentication — a bearer-token passthrough is a larger change with its own
+/// configuration surface. It makes the existing failure legible, which is the part that was
+/// actively misleading. (Reported by review on PR #547.)
+fn server_failure_summary(error: &TuiError) -> String {
+    match error {
+        TuiError::Http(401) => "authentication required — cao-server answered HTTP 401 and \
+                                cao-tui sends no credential; run it against a server with auth \
+                                disabled, or use the CLI, which does"
+            .to_string(),
+        TuiError::Http(403) => "not authorised — cao-server answered HTTP 403, so the credential \
+                                it saw lacks the scope this read needs"
+            .to_string(),
+        // Every other status: the server answered, so "unreachable" is still the wrong word.
+        TuiError::Http(code) => format!("cao-server answered HTTP {code}"),
+        // The genuinely-unreachable case. `Unreachable`'s own `Display` names the address tried
+        // and the `CAO_API_HOST` remedy, so it is passed through rather than paraphrased.
+        TuiError::Unreachable(detail) => format!("unreachable — {detail}"),
+        other => other.to_string(),
+    }
+}
+
 /// The rendered state for each `create_session` failure (`launch()` step 2).
 ///
 /// One arm per error variant this call can produce, which is what `error.rs` means by "this enum
@@ -1977,6 +2118,24 @@ fn create_session_banner(error: &TuiError) -> Banner {
             detail.clone(),
             "fix the named field and press [enter] again",
         ),
+        // Auth, named, and placed BEFORE the `>= 500` arm. The guard already excludes 401/403, so
+        // the order is not what makes this correct — it is what makes it readable: a reader
+        // scanning for "how is 401 handled" should not have to evaluate a numeric guard first.
+        //
+        // Retry is deliberately NOT the remedy: `[r]` re-issues the identical credential-free
+        // request, so offering it would loop the operator through a failure that cannot change.
+        // The same misdiagnosis the header carried. (Review on PR #547.)
+        TuiError::Http(401) => Banner::error(
+            "cao-server requires authentication",
+            "it answered HTTP 401, and cao-tui sends no credential".to_string(),
+            "retrying will not help — use the CLI, which authenticates, or point \
+             CAO_API_HOST / CAO_API_PORT at a server with auth disabled",
+        ),
+        TuiError::Http(403) => Banner::error(
+            "cao-server refused the launch",
+            "it answered HTTP 403, so the credential it saw lacks the scope this needs".to_string(),
+            "retrying will not help — grant the write scope, or run `cao launch` from the CLI",
+        ),
         TuiError::Http(code) if *code >= 500 => Banner::error(
             "cao-server failed while creating the session",
             format!("it answered HTTP {code}"),
@@ -1990,28 +2149,49 @@ fn create_session_banner(error: &TuiError) -> Banner {
     }
 }
 
-/// Whether `id`'s route can be called with no path values — **the stated in-app gap**.
+/// Whether `id`'s route can be built from `flow`'s current values — **the stated in-app gap**.
 ///
-/// Derived from `ServerClient`'s own route table via [`crate::server::route_placeholders`], so
-/// there is exactly one source of truth for which routes need what. A hard-coded id list here
-/// would be a second place for the same fact, free to drift silently — and the drift would present
-/// as a 404 on a literal `{run_id}` brace.
+/// Derived from `ServerClient`'s own route table via [`crate::server::unbound_placeholders`] and
+/// [`crate::server::unbound_text_fields`], so there is exactly one source of truth for which
+/// routes need what. A hard-coded id list here would be a second place for the same fact, free to
+/// drift silently — and the drift would present as a 404 on a literal `{run_id}` brace.
 ///
-/// **Measured at this stage: 9 `Runnable`, 12 `NotWired`, 1 `NoRoute` across the 22 IN-APP
-/// commands.** The plan recorded 15 placeholder routes; that figure was not re-derived from
-/// `route()`. `the_in_app_gap_is_nine_runnable_twelve_not_wired_and_one_routeless` pins the real
-/// numbers. (#321)
+/// # It takes the form, and that is the whole correction
+///
+/// It used to take only the `CommandId` and answer "does this route have placeholders?" — which
+/// made every `{token}` route unreachable regardless of whether a field supplied the value, and
+/// said nothing at all about a *filled* field the request would drop. Both halves of the reported
+/// defect lived in that signature.
+///
+/// The order of the checks is deliberate: an unsupplied path value is a harder blocker than an
+/// ignored one, and reporting "needs `{terminal_id}`" is more useful than listing the four fields
+/// that would also be dropped along the way.
+///
+/// **Measured after the fix: 19 `Runnable`, 2 `NotWired`, 1 `NoRoute`** (on an empty form) —
+/// `the_in_app_gap_is_nineteen_runnable_two_not_wired_and_one_routeless` pins the real numbers
+/// rather than a remembered figure. (#321, and review on PR #547)
 #[allow(dead_code)] // called by `run_in_app`; asserted directly by the gap test. (#321)
-pub fn in_app_readiness(id: CommandId) -> InAppReadiness {
-    match crate::server::route_placeholders(id) {
-        None => InAppReadiness::NoRoute,
-        // `Some([])` rather than a `.is_empty()` guard: clippy's `redundant_guards` fires on the
-        // guard form, and the slice pattern says the same thing — a route with no placeholders.
-        Some([]) => InAppReadiness::Runnable,
-        Some(placeholders) => InAppReadiness::NotWired {
-            placeholders: placeholders.to_vec(),
-        },
+pub fn in_app_readiness(id: CommandId, flow: &GuidedFlow) -> InAppReadiness {
+    let Some(unbound) = crate::server::unbound_placeholders(id) else {
+        return InAppReadiness::NoRoute;
+    };
+    if !unbound.is_empty() {
+        return InAppReadiness::NotWired {
+            placeholders: unbound,
+        };
     }
+
+    // Only fields the operator actually FILLED. An unbound field left blank costs nothing, so
+    // refusing on it would block commands that work.
+    let ignored: Vec<&'static str> = crate::server::unbound_text_fields(id)
+        .into_iter()
+        .filter(|name| flow.field(name).is_some_and(|field| field.value.is_some()))
+        .collect();
+    if !ignored.is_empty() {
+        return InAppReadiness::Ignored { fields: ignored };
+    }
+
+    InAppReadiness::Runnable
 }
 
 /// The `Write` adapter: `ServerClient::run`'s sink, forwarding into `ResultsPane::push_bytes`.
@@ -2234,6 +2414,16 @@ mod tests {
         create_session_calls: Cell<usize>,
         create_session_params: RefCell<Vec<SessionParams>>,
         run_calls: RefCell<Vec<CommandId>>,
+        /// The path values each `run` received, one entry per call.
+        ///
+        /// **These were discarded (`_path_values`), and that is why the reported defect was
+        /// invisible to this suite.** `run_in_app` passed `&[]` for every command, and a fake that
+        /// ignores the argument cannot tell an empty slice from a correct one — so tests asserting
+        /// "the command reached the server" passed while the request it built was unusable.
+        /// (Review on PR #547.)
+        run_path_values: RefCell<Vec<Vec<String>>>,
+        /// The query pairs each `run` received, one entry per call. Recorded for the same reason.
+        run_queries: RefCell<Vec<Vec<(String, String)>>>,
         /// The byte counts of each `write` the sink received, in order.
         ///
         /// This is the observation PR-1 needs: a buffered implementation produces one write of the
@@ -2256,6 +2446,8 @@ mod tests {
                 create_session_calls: Cell::new(0),
                 create_session_params: RefCell::new(Vec::new()),
                 run_calls: RefCell::new(Vec::new()),
+                run_path_values: RefCell::new(Vec::new()),
+                run_queries: RefCell::new(Vec::new()),
                 run_write_sizes: RefCell::new(Vec::new()),
             }
         }
@@ -2271,6 +2463,21 @@ mod tests {
                 .session
                 .borrow_mut()
                 .push_back(SessionAnswer::Unreachable(message));
+            server
+        }
+
+        /// A server that ANSWERS, with an HTTP error status. Distinct from [`Self::unreachable`],
+        /// which is the no-answer case — the whole point of the auth arms is that the two must not
+        /// be described the same way.
+        fn answering_http(status: u16) -> Self {
+            let server = Self::healthy();
+            *server.health.borrow_mut() = Some(TuiError::Http(status));
+            *server.profiles.borrow_mut() = Err(format!("cao-server returned HTTP {status}"));
+            *server.providers.borrow_mut() = Err(format!("cao-server returned HTTP {status}"));
+            server
+                .session
+                .borrow_mut()
+                .push_back(SessionAnswer::Http(status));
             server
         }
 
@@ -2296,12 +2503,31 @@ mod tests {
     }
 
     impl ServerRead for FakeServer {
+        /// `TuiError` is not `Clone`, so a recorded failure is re-minted **as its own variant**.
+        ///
+        /// It used to re-mint everything as `Unreachable`:
+        /// `Some(other) => Err(TuiError::Unreachable(other.to_string()))`. That made the variant
+        /// unobservable through this fake — an injected `Http(401)` arrived at the renderer as
+        /// `Unreachable`, so **no test could distinguish the two**, and the header bug of labelling
+        /// an answering server "unreachable" was invisible to the whole suite by construction. A
+        /// fake that flattens the distinction under test is worse than no fake.
+        /// (Reported by review on PR #547.)
         fn health(&self) -> Result<Health, TuiError> {
             match self.health.borrow().as_ref() {
-                // `TuiError` is not `Clone`, so the recorded failure is re-minted from its own
-                // message. Same variant, same `Display` — which is what `renderer` matches on.
                 Some(TuiError::Unreachable(message)) => Err(TuiError::Unreachable(message.clone())),
-                Some(other) => Err(TuiError::Unreachable(other.to_string())),
+                Some(TuiError::Http(status)) => Err(TuiError::Http(*status)),
+                Some(TuiError::Validation(detail)) => Err(TuiError::Validation(detail.clone())),
+                Some(TuiError::NotFound(what)) => Err(TuiError::NotFound(what.clone())),
+                Some(TuiError::Decode(detail)) => Err(TuiError::Decode(detail.clone())),
+                Some(TuiError::NoRoute(what)) => Err(TuiError::NoRoute(what.clone())),
+                // `Io` carries a `std::io::Error`, which cannot be cloned or reconstructed
+                // faithfully. No test injects one; if one ever does, this states why it cannot be
+                // replayed rather than silently mislabelling it as something else.
+                Some(other @ TuiError::Io(_)) => panic!(
+                    "FakeServer cannot re-mint {other:?}: `Io` wraps a non-cloneable \
+                     `std::io::Error`. Inject a different variant, or extend this fake \
+                     deliberately rather than flattening it into another variant"
+                ),
                 None => Ok(Health {
                     status: "ok".to_string(),
                     terminal_backend: self.backend.clone(),
@@ -2362,12 +2588,23 @@ mod tests {
         fn run(
             &self,
             id: CommandId,
-            _path_values: &[&str],
-            _query: &[(&str, &str)],
+            path_values: &[&str],
+            query: &[(&str, &str)],
             _body: Option<&str>,
             sink: &mut dyn Write,
         ) -> Result<u16, TuiError> {
             self.run_calls.borrow_mut().push(id);
+            // Recorded, not ignored: see the field docs. Owned copies, because the borrows do not
+            // outlive this call.
+            self.run_path_values
+                .borrow_mut()
+                .push(path_values.iter().map(|value| value.to_string()).collect());
+            self.run_queries.borrow_mut().push(
+                query
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            );
 
             match self.run_answer.borrow_mut().take() {
                 Some(RunAnswer::Chunks(chunks, status)) => {
@@ -4070,18 +4307,35 @@ mod tests {
 
     /// **The in-app gap, with the numbers MEASURED from `route()` rather than taken from the plan.**
     ///
-    /// The plan recorded "15 of the 21 routed IN-APP commands carry placeholders". Derived from the
-    /// route table itself, the figures are **9 placeholder-free, 12 templated, 1 routeless** across
-    /// the 22 IN-APP commands. The plan's 15 was not re-derived, and correcting an instance without
-    /// re-deriving the count is how a wrong number survives an audit — so this test pins all three
-    /// and they are hard-coded literals, because a figure computed from the thing under test proves
-    /// nothing.
+    /// # The counts moved, and the previous ones were a consequence of the defect
     ///
-    /// It also asserts the operator-visible half: a placeholder route renders an error that **names
-    /// the missing path values**, and a `Runnable` one actually runs. That is what makes this a
-    /// *stated* gap rather than a dead end — the operator can see the limit.
+    /// This test used to pin **9 runnable, 12 not-wired**. Those were real measurements of the
+    /// code as it stood, but what they measured was `renderer` calling
+    /// `run(id, &[], &[], None, ..)` and therefore treating every `{token}` route as unreachable —
+    /// including the 10 whose token a form field plainly supplies. With path bindings the figures
+    /// are **19 runnable, 2 not-wired, 1 routeless** across the 22 IN-APP commands.
+    ///
+    /// The remaining two are `cao session send` and `cao session status`, which need the
+    /// session-name → terminal-id resolution call the CLI makes first (`session.py:26`). That is a
+    /// genuine unimplemented step rather than an unmapped field, which is why they stay `NotWired`
+    /// instead of being bound to something that looks close enough.
+    ///
+    /// Measured on an EMPTY form, which is what makes 19 the honest count: `in_app_readiness` also
+    /// returns `Ignored` for a command whose *filled* fields have nowhere to go, and three
+    /// commands can reach that state (`memory export --output`, `schedule add`, `workflow
+    /// validate`) — asserted separately in
+    /// `a_filled_field_the_route_cannot_send_refuses_the_run_and_names_it`, because it depends on
+    /// form state rather than on the route table.
+    ///
+    /// The literals are hard-coded, because a figure computed from the thing under test proves
+    /// nothing. Correcting an instance without re-deriving the count is how a wrong number
+    /// survives an audit.
+    ///
+    /// It also asserts the operator-visible half: an unsupplied placeholder renders an error that
+    /// **names the missing path values**, and a `Runnable` one actually runs. That is what makes
+    /// this a *stated* gap rather than a dead end — the operator can see the limit.
     #[test]
-    fn the_in_app_gap_is_nine_runnable_twelve_not_wired_and_one_routeless() {
+    fn the_in_app_gap_is_nineteen_runnable_two_not_wired_and_one_routeless() {
         let mut runnable = Vec::new();
         let mut not_wired = Vec::new();
         let mut no_route = Vec::new();
@@ -4090,23 +4344,35 @@ mod tests {
             if catalog::policy(id) != Policy::InApp {
                 continue;
             }
-            match in_app_readiness(id) {
+            // An empty form for every command, so this measures the ROUTE TABLE rather than any
+            // particular form state. `Ignored` cannot arise here — it needs a filled field — and
+            // an arm that panics says so rather than being folded into another bucket.
+            let mut flow = crate::guided_flow::GuidedFlow::new();
+            flow.select(id).expect("an IN-APP command is selectable");
+            match in_app_readiness(id, &flow) {
                 InAppReadiness::Runnable => runnable.push(id),
                 InAppReadiness::NotWired { .. } => not_wired.push(id),
                 InAppReadiness::NoRoute => no_route.push(id),
+                InAppReadiness::Ignored { fields } => panic!(
+                    "{id:?} reported Ignored on an EMPTY form, naming {fields:?} — `Ignored` must \
+                     depend on what the operator FILLED, so this means the filter is keyed on the \
+                     declared field rather than on its value"
+                ),
             }
         }
 
         assert_eq!(
             runnable.len(),
-            9,
-            "9 IN-APP commands have a placeholder-free route and run for real. Found: {runnable:?}"
+            19,
+            "19 IN-APP commands can be built from the form and run for real. Found: {runnable:?}"
         );
         assert_eq!(
-            not_wired.len(),
-            12,
-            "12 IN-APP commands carry route placeholders and render the stated gap. **The plan said \
-             15; that figure was not re-derived from `route()`.** Found: {not_wired:?}"
+            not_wired,
+            vec![CommandId::SessionSend, CommandId::SessionStatus],
+            "exactly two IN-APP commands still carry an UNSUPPLIED placeholder, and it is the same \
+             one for both: `{{terminal_id}}`, which the CLI obtains with a second call \
+             (`session.py:26`). Every other placeholder is now bound to a form field. Found: \
+             {not_wired:?}"
         );
         assert_eq!(
             no_route,
@@ -4120,20 +4386,20 @@ mod tests {
             "the three sets must partition the 22 IN-APP commands with none double-counted"
         );
 
-        // The operator-visible half: a placeholder route states WHAT is missing.
+        // The operator-visible half: an unsupplied placeholder states WHAT is missing.
         let server = FakeServer::healthy();
         let host = FakeHost::outside_tmux();
         let mut shell = Renderer::new(&server, &host, 100, 40);
-        // `workflow status` needs `{run_id}` — one of the 12.
-        shell.run_in_app(CommandId::WorkflowStatus);
+        // `session status` needs `{terminal_id}` — one of the remaining two.
+        shell.run_in_app(CommandId::SessionStatus);
 
-        let banner = shell
-            .banner()
-            .expect("a placeholder route must render a STATED error, not silently do nothing");
+        let banner = shell.banner().expect(
+            "an unsupplied placeholder must render a STATED error, not silently do nothing",
+        );
         assert!(
-            banner.why.contains("run_id"),
+            banner.why.contains("terminal_id"),
             "the stated gap must NAME the missing path value — \"not supported\" is a dead end, \
-             \"needs run_id\" is a stated limit. Got: {:?}",
+             \"needs terminal_id\" is a stated limit. Got: {:?}",
             banner.why
         );
         assert!(
@@ -4144,8 +4410,8 @@ mod tests {
         );
         assert!(
             server.run_calls.borrow().is_empty(),
-            "a placeholder route must NOT be called — a partially-substituted URL would reach the \
-             server as a literal brace and 404 somewhere confusing. Calls: {:?}",
+            "an unsupplied placeholder must NOT be called — a partially-substituted URL would reach \
+             the server as a literal brace and 404 somewhere confusing. Calls: {:?}",
             server.run_calls.borrow()
         );
 
@@ -4164,6 +4430,390 @@ mod tests {
             "a successful placeholder-free run needs no banner. Got: {:?}",
             shell.banner()
         );
+    }
+
+    /// **An auth rejection is not described as "unreachable", and is not offered a retry.**
+    ///
+    /// With auth enabled, `get_current_scopes` answers 401 for a missing or invalid token and
+    /// `require_any_scope` answers 403 for insufficient scope (`security/auth.py:435-440`), and
+    /// this client sends no `Authorization` header at all. The header prefixed every failure with
+    /// "unreachable", so the operator read `server: unreachable — cao-server returned HTTP 401`:
+    /// a server that plainly answered, described as unreachable, with a "start cao-server" remedy
+    /// that cannot help.
+    ///
+    /// Each assertion has a **negative half**, which is where the value is: naming auth while
+    /// still saying "unreachable" would be a half-fix that a positive-only test would pass. The
+    /// 401 and 403 cases are checked separately because the actions differ — no usable credential
+    /// versus a real credential without the scope.
+    /// (Reported by review on PR #547.)
+    #[test]
+    fn an_auth_rejection_is_named_as_auth_and_not_as_unreachable() {
+        let host = FakeHost::outside_tmux();
+
+        for (status, expected) in [(401u16, "authentication"), (403u16, "authoris")] {
+            let server = FakeServer::answering_http(status);
+            let mut shell = Renderer::new(&server, &host, 100, 40);
+            // Selecting a command is what performs the `health()` read (`select` →
+            // `populate_pickers`), so the header has something to report. A bare `new` leaves it
+            // at "not checked yet", which is a third state and not the one under test.
+            assert!(shell.focus_command(CommandId::Launch));
+            assert!(shell.on_key(KeyCode::Enter));
+
+            let header = shell.render().header.join("\n");
+            assert!(
+                header.to_lowercase().contains(expected),
+                "HTTP {status} must be described as an auth failure — the header is the operator's \
+                 only standing indicator. Got: {header:?}"
+            );
+            assert!(
+                !header.contains("unreachable"),
+                "HTTP {status} means the server ANSWERED, so \"unreachable\" is false and its \
+                 implied remedy (start the server / check the address) sends the operator the \
+                 wrong way. Got: {header:?}"
+            );
+            assert!(
+                header.contains(&status.to_string()),
+                "the status code must survive into the message so the operator can look it up. \
+                 Got: {header:?}"
+            );
+        }
+
+        // And the launch banner, which additionally must not promise that `[r]` helps: retry
+        // re-issues the same credential-free request.
+        for status in [401u16, 403u16] {
+            let server = FakeServer::answering_http(status);
+            let mut shell = ready_to_launch(&server, &host);
+            shell.launch();
+
+            let banner = shell
+                .banner()
+                .unwrap_or_else(|| panic!("HTTP {status} must render a banner"));
+            let whole = format!("{} {} {}", banner.what, banner.why, banner.remedy);
+            assert!(
+                whole.contains(&status.to_string()),
+                "the banner must name the status. Got: {whole:?}"
+            );
+            assert!(
+                banner.remedy.contains("will not help"),
+                "the remedy must say retrying cannot work — `[r]` re-sends the identical \
+                 credential-free request, so offering it loops the operator through an \
+                 unchangeable failure. Got: {:?}",
+                banner.remedy
+            );
+        }
+    }
+
+    /// **A command whose placeholder a form field supplies actually RUNS, with the value substituted.**
+    ///
+    /// The other half of the count change above, and the one that matters to an operator: 10
+    /// commands were unreachable purely because `renderer` passed `&[]` for the path values.
+    /// `workflow get NAME` is the representative — `{name}` bound to the CLI's own positional.
+    ///
+    /// Asserted on the **request the stub received**, not on `run_calls` alone: a call that reached
+    /// the server with an unsubstituted `{name}` would satisfy a call-count assertion and 404 in
+    /// production. The path is the property under test.
+    /// (Reported by review on PR #547.)
+    #[test]
+    fn a_bound_placeholder_is_substituted_from_the_form_and_the_command_runs() {
+        let server = FakeServer::healthy().with_run(RunAnswer::Chunks(vec!["{}\n"], 200));
+        let host = FakeHost::outside_tmux();
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+
+        assert!(shell.focus_command(CommandId::WorkflowGet));
+        assert!(shell.on_key(KeyCode::Enter));
+        shell
+            .flow_mut()
+            .set("name", "nightly-audit")
+            .expect("`name` is the positional `cao workflow get` declares");
+
+        shell.run_in_app(CommandId::WorkflowGet);
+
+        assert!(
+            shell.banner().is_none(),
+            "a bound placeholder must not render a not-wired error. Got: {:?}",
+            shell.banner()
+        );
+        assert_eq!(
+            server.run_calls.borrow().as_slice(),
+            &[CommandId::WorkflowGet],
+            "the command must reach the server"
+        );
+        assert_eq!(
+            server.run_path_values.borrow().as_slice(),
+            &[vec!["nightly-audit".to_string()]],
+            "the path value must come FROM THE FORM — an empty slice here is the original defect, \
+             and it reaches the server as a literal `{{name}}` brace"
+        );
+        assert_eq!(shell.pane().state(), PaneState::Complete);
+    }
+
+    /// **A typed query filter reaches the request instead of being silently dropped.**
+    ///
+    /// `memory list --scope global --type user` ran as an unfiltered scan-all, because
+    /// `run_in_app` passed `&[]` for the query. An operator reading a full list would reasonably
+    /// conclude their filter matched everything.
+    ///
+    /// **The wire name is the load-bearing assertion.** `--type` binds to `type`, not
+    /// `memory_type`: FastAPI declares `memory_type: Optional[MemoryType] = Query(alias="type")`
+    /// (`api/main.py:3621`) and the alias is what goes on the wire. Sending `memory_type=user`
+    /// would be silently ignored — an unfiltered list presented as a filtered one, which is the
+    /// same dishonesty in a new place. Only asserting the emitted key catches it.
+    #[test]
+    fn typed_query_filters_reach_the_request_under_the_servers_own_parameter_names() {
+        let server = FakeServer::healthy().with_run(RunAnswer::Chunks(vec!["[]\n"], 200));
+        let host = FakeHost::outside_tmux();
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+
+        assert!(shell.focus_command(CommandId::MemoryList));
+        assert!(shell.on_key(KeyCode::Enter));
+        shell
+            .flow_mut()
+            .set("--scope", "global")
+            .expect("text field");
+        shell.flow_mut().set("--type", "user").expect("text field");
+
+        shell.run_in_app(CommandId::MemoryList);
+
+        let queries = server.run_queries.borrow();
+        let sent = queries.first().expect("the command must reach the server");
+        assert!(
+            sent.contains(&("scope".to_string(), "global".to_string())),
+            "`--scope` must reach the server as `scope`. Sent: {sent:?}"
+        );
+        assert!(
+            sent.contains(&("type".to_string(), "user".to_string())),
+            "`--type` must reach the server as `type` — its FastAPI ALIAS, not the Python \
+             identifier `memory_type`, which would be silently ignored. Sent: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|(key, _)| key == "memory_type"),
+            "`memory_type` is the Python parameter name, not the wire name; sending it filters \
+             nothing while looking wired. Sent: {sent:?}"
+        );
+    }
+
+    /// **A flag that is off is omitted from the query, not sent empty — however it got that way.**
+    ///
+    /// Probed against FastAPI directly: `?flag=` on a `bool` parameter is a **422**
+    /// (`bool_parsing`, "unable to interpret input"), while `?flag=true` and `?flag=1` are
+    /// accepted. So a flag the operator has not asked for must not appear at all — emitting it as
+    /// `""` would turn every unticked box into a rejected request.
+    ///
+    /// # Two ways to be off, and only one of them was covered
+    ///
+    /// A flag field can hold `None` (never touched) or `Some(Flag(false))` (toggled on and back
+    /// off — `toggle_focused_flag` stores the literal `"false"`). They take **different arms** in
+    /// `query_pairs_for`, and the first version of this test exercised only the untouched one: the
+    /// mutation making `Flag(false)` emit `""` left it green. Both are asserted now, because a flag
+    /// the operator deliberately switched off is the likelier of the two to reach here.
+    /// (Reported by review on PR #547; this gap found by mutation.)
+    #[test]
+    fn a_flag_that_is_off_is_absent_from_the_query_and_a_ticked_one_sends_true() {
+        let host = FakeHost::outside_tmux();
+
+        // Case 1: `--include-history` never touched (`value == None`).
+        let server = FakeServer::healthy().with_run(RunAnswer::Chunks(vec!["ok\n"], 200));
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+
+        assert!(shell.focus_command(CommandId::MemoryExport));
+        assert!(shell.on_key(KeyCode::Enter));
+        shell
+            .flow_mut()
+            .set("--scope", "global")
+            .expect("text field");
+        shell
+            .flow_mut()
+            .set("--redact", "true")
+            .expect("`--redact` is a flag");
+
+        shell.run_in_app(CommandId::MemoryExport);
+
+        let queries = server.run_queries.borrow();
+        let sent = queries.first().expect("the command must reach the server");
+        assert!(
+            sent.contains(&("redact".to_string(), "true".to_string())),
+            "a ticked flag must send `true`, which FastAPI parses. Sent: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|(key, _)| key == "include_history"),
+            "an UNTOUCHED flag must be ABSENT — sending it as \"\" is a 422 (`bool_parsing`), \
+             verified against FastAPI. Sent: {sent:?}"
+        );
+        drop(queries);
+
+        // Case 2: `--redact` explicitly OFF (`value == Some(Flag(false))`) — a different arm.
+        let server = FakeServer::healthy().with_run(RunAnswer::Chunks(vec!["ok\n"], 200));
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+
+        assert!(shell.focus_command(CommandId::MemoryExport));
+        assert!(shell.on_key(KeyCode::Enter));
+        shell
+            .flow_mut()
+            .set("--scope", "global")
+            .expect("text field");
+        shell
+            .flow_mut()
+            .set("--redact", "false")
+            .expect("`--redact` is a flag");
+        assert_eq!(
+            shell
+                .flow()
+                .field("--redact")
+                .and_then(|field| field.value.as_ref()),
+            Some(&crate::guided_flow::FieldValue::Flag(false)),
+            "this case is only meaningful if the field really holds an explicit `false` — \
+             otherwise it duplicates case 1 and the `Flag(false)` arm stays unexercised"
+        );
+
+        shell.run_in_app(CommandId::MemoryExport);
+
+        let queries = server.run_queries.borrow();
+        let sent = queries.first().expect("the command must reach the server");
+        assert!(
+            !sent.iter().any(|(key, _)| key == "redact"),
+            "a flag explicitly switched OFF must be omitted too: every bool parameter on these \
+             routes already defaults to False (`api/main.py:3656-3657`), so omission is \
+             equivalent — and `\"\"` is a 422. Sent: {sent:?}"
+        );
+    }
+
+    /// **A FILLED field the route cannot send refuses the run and names the field.**
+    ///
+    /// The honesty gate. `memory export --output` is a local filesystem path with no query
+    /// parameter, so a run that ignored it would write nothing where the operator asked and say
+    /// nothing about it.
+    ///
+    /// Both halves, because the refusal must be keyed on the VALUE and not the declaration:
+    /// filling `--output` refuses, and leaving it blank runs. A gate keyed on the declared field
+    /// would block `memory export` permanently — trading a silent drop for a false blocker, which
+    /// is not an improvement. (Reported by review on PR #547.)
+    #[test]
+    fn a_filled_field_the_route_cannot_send_refuses_the_run_and_names_it() {
+        let host = FakeHost::outside_tmux();
+
+        // Filled: refused, and the field is named.
+        let server = FakeServer::healthy().with_run(RunAnswer::Chunks(vec!["ok\n"], 200));
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+        assert!(shell.focus_command(CommandId::MemoryExport));
+        assert!(shell.on_key(KeyCode::Enter));
+        shell
+            .flow_mut()
+            .set("--scope", "global")
+            .expect("text field");
+        shell
+            .flow_mut()
+            .set("--output", "/tmp/out")
+            .expect("text field");
+
+        shell.run_in_app(CommandId::MemoryExport);
+
+        let banner = shell
+            .banner()
+            .expect("a field that would be discarded must refuse the run, not fire it anyway");
+        assert!(
+            banner.why.contains("--output"),
+            "the refusal must NAME the field, or the operator cannot tell what to clear. Got: {:?}",
+            banner.why
+        );
+        assert!(
+            server.run_calls.borrow().is_empty(),
+            "the request must NOT be sent — sending it is exactly the silent discard being fixed. \
+             Calls: {:?}",
+            server.run_calls.borrow()
+        );
+
+        // Blank: runs. The gate is on the value, not the declaration.
+        let server = FakeServer::healthy().with_run(RunAnswer::Chunks(vec!["ok\n"], 200));
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+        assert!(shell.focus_command(CommandId::MemoryExport));
+        assert!(shell.on_key(KeyCode::Enter));
+        shell
+            .flow_mut()
+            .set("--scope", "global")
+            .expect("text field");
+
+        shell.run_in_app(CommandId::MemoryExport);
+
+        assert_eq!(
+            server.run_calls.borrow().as_slice(),
+            &[CommandId::MemoryExport],
+            "with `--output` left blank there is nothing to discard, so the command must RUN — a \
+             gate keyed on the declared field rather than its value would block this forever"
+        );
+        assert!(
+            shell.banner().is_none(),
+            "a run with nothing ignored needs no banner. Got: {:?}",
+            shell.banner()
+        );
+    }
+
+    /// **A launch flag the endpoint cannot receive says so IN THE RENDERED FRAME.**
+    ///
+    /// The predicate living in `guided_flow` proves nothing on its own — the defect was that the
+    /// form looked identical whether a field was sent or silently discarded, so what matters is
+    /// that an operator reading the screen can tell. This drives the real key path to expand the
+    /// optional section and asserts on `render()`'s output.
+    ///
+    /// Both directions, in one frame: `--yolo` (unwirable) carries the marker and `--env`
+    /// (wired, and in the same collapsed section) does not. A marker on every field would be as
+    /// useless as a marker on none, and only the negative half can catch that.
+    /// (Reported by review on PR #547.)
+    #[test]
+    fn an_unwirable_launch_flag_is_marked_not_sent_in_the_rendered_form() {
+        let server = FakeServer::healthy();
+        let host = FakeHost::outside_tmux();
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+
+        assert!(shell.focus_command(CommandId::Launch));
+        assert!(shell.on_key(KeyCode::Enter));
+        // Move focus to the optional section and expand it — the five unwirable flags all live
+        // there, behind the three guided steps.
+        while shell.focus() != Focus::OptionalSection {
+            assert!(
+                shell.on_key(KeyCode::Tab),
+                "tab must reach the optional section from the form"
+            );
+        }
+        assert!(shell.on_key(KeyCode::Enter), "[enter] expands the section");
+
+        let optional = shell.render().optional_section.join("\n");
+
+        let yolo = optional
+            .lines()
+            .find(|line| line.contains("--yolo"))
+            .unwrap_or_else(|| panic!("`--yolo` must be in the optional section: {optional:?}"));
+        assert!(
+            yolo.contains(crate::guided_flow::NOT_SENT_MARKER),
+            "`--yolo` cannot reach POST /sessions, so its line must say so — otherwise an \
+             operator who ticks it believes they launched an unrestricted session. Got: {yolo:?}"
+        );
+
+        let env = optional
+            .lines()
+            .find(|line| line.contains("--env"))
+            .unwrap_or_else(|| panic!("`--env` must be in the optional section: {optional:?}"));
+        assert!(
+            !env.contains(crate::guided_flow::NOT_SENT_MARKER),
+            "`--env` IS sent (in the JSON body, #248), so marking it would be a false statement \
+             — and a marker on every field conveys nothing. Got: {env:?}"
+        );
+
+        // The message is wired now, and it is a required-section... no: it is the positional in
+        // the guided prefix. Asserted wherever it renders, because a leftover marker on it would
+        // contradict the wiring this PR added.
+        let whole_form = shell.render();
+        let message_line = whole_form
+            .required_fields
+            .iter()
+            .chain(&whole_form.optional_section)
+            .find(|line| line.contains("message"));
+        if let Some(line) = message_line {
+            assert!(
+                !line.contains(crate::guided_flow::NOT_SENT_MARKER),
+                "`message` maps to `initial_message` in the body, so it must NOT be marked as \
+                 not sent. Got: {line:?}"
+            );
+        }
     }
 
     // ── Step 10 — exit while a command runs CONFIRMS first ─────────────────────────────────────
@@ -4286,6 +4936,162 @@ mod tests {
         let _ = QuitProbe {
             observed: RefCell::new(Vec::new()),
         };
+    }
+
+    /// **A run that was never sent must not make `[q]` claim one is still in flight.**
+    /// Regression test for a review finding on PR #547.
+    ///
+    /// `run_selected` sets `running = true` to buy the pending frame, but three arms returned
+    /// without clearing it: `launch()`'s `Incomplete` early return, and `run_in_app()`'s
+    /// `NotWired` and `NoRoute` arms. The flag then leaked into `request_quit`, so `[q]` raised
+    /// *"the run continues on the server either way"* — about a request that never left the
+    /// process.
+    ///
+    /// The repro is the reviewer's, driven through the real key handler rather than by setting
+    /// the flag: select `cao launch`, leave `--agents` empty, `[enter]` (blocked banner), quit.
+    ///
+    /// **Quit is driven by Ctrl+C, not a bare `[q]`**, and that is not a workaround. Both forms
+    /// funnel into the same [`Self::request_quit`], but after selecting a command the focus is a
+    /// text field, where a printable `q` is deliberately TEXT (NFR-3 — see
+    /// `a_q_or_r_typed_into_a_required_field_is_text_and_not_a_command_key`). Ctrl+C is the
+    /// binding that reaches the quit path from any focus, so it is what an operator sitting in a
+    /// half-filled form would actually press. Written with a bare `q` first, this test failed
+    /// for that reason and not for the one it exists to catch.
+    ///
+    /// Every one of the three arms is exercised, because the leak was per-arm and fixing one
+    /// proves nothing about the others. Each asserts BOTH halves — the blocking banner really
+    /// rendered (so the arm under test was the one reached) and the quit went through outright.
+    /// Asserting only `should_quit` would pass against a build where the banner never appeared,
+    /// which is a different defect wearing the same green.
+    #[test]
+    fn quitting_is_immediate_after_a_run_that_was_blocked_before_it_was_sent() {
+        let host = FakeHost::outside_tmux();
+
+        // Arm 1: `launch()`'s `Incomplete` return — `--agents` left empty.
+        let server = FakeServer::healthy().with_session(SessionAnswer::Created(terminal("t-none")));
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+        assert!(shell.focus_command(CommandId::Launch));
+        assert!(shell.on_key(KeyCode::Enter));
+        assert!(shell.on_key(KeyCode::Enter), "Enter must queue the launch");
+        assert!(
+            shell.run_pending_action(),
+            "the queued launch must execute on the next tick"
+        );
+        assert_eq!(
+            server.create_session_calls.get(),
+            0,
+            "the required-field gate must stop this BEFORE any request — if it were sent, a \
+             running flag would be honest and this test would be asserting the wrong thing"
+        );
+        assert_eq!(
+            shell.banner().map(|banner| banner.severity),
+            Some("error"),
+            "the blocked launch must render the missing-field banner"
+        );
+        assert!(shell.on_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(
+            !shell.awaiting_quit_confirmation(),
+            "nothing was sent, so quitting must not claim a run is still in flight"
+        );
+        assert!(
+            shell.should_quit(),
+            "quitting after a blocked launch must exit outright"
+        );
+
+        // Arms 2 and 3: `run_in_app`'s `NotWired` (a route needing path values no form field
+        // supplies) and `Ignored` (a filled field the route cannot send). Both render a stated
+        // limit and send nothing.
+        //
+        // `MemoryShow` used to stand in for `NotWired` here and no longer can — its `{key}` is now
+        // bound to the form's positional, so it RUNS. That is the fix working, and the test moved
+        // to commands still on the refusing arms rather than being weakened to accommodate it.
+        // `ScheduleAdd` reaches `Ignored` once its `file_path` is filled below.
+        for (id, fill) in [
+            (CommandId::SessionSend, None),
+            // `Ignored` is keyed on a FILLED field, so this one has to be filled to reach that arm
+            // at all — which is itself the property that test asserts.
+            (
+                CommandId::ScheduleAdd,
+                Some(("file_path", "nightly.flow.md")),
+            ),
+        ] {
+            let server = FakeServer::healthy();
+            let mut shell = Renderer::new(&server, &host, 100, 40);
+            assert!(shell.focus_command(id), "{id:?} must be selectable");
+            assert!(shell.on_key(KeyCode::Enter));
+            if let Some((field, value)) = fill {
+                shell
+                    .flow_mut()
+                    .set(field, value)
+                    .expect("the field is declared by this command");
+            }
+            assert!(shell.on_key(KeyCode::Enter));
+            assert!(shell.run_pending_action());
+            assert!(
+                server.run_calls.borrow().is_empty(),
+                "{id:?} must not reach the server for this test to mean anything"
+            );
+            assert_eq!(
+                shell.banner().map(|banner| banner.severity),
+                Some("error"),
+                "{id:?} must render its stated limit"
+            );
+            assert!(shell.on_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(
+                !shell.awaiting_quit_confirmation() && shell.should_quit(),
+                "quitting after {id:?} was refused must exit outright — nothing is running"
+            );
+        }
+    }
+
+    /// **No command can leave `running` set once its dispatch returns — checked for ALL of them.**
+    ///
+    /// The three-arm test above pins the reported repro. This one closes the class: it drives the
+    /// full `select → [enter] → [enter] → dispatch` cycle for **every non-HIDE command in the
+    /// catalog** and asserts the flag is clear afterwards. A future arm that early-returns from
+    /// `launch()` or `run_in_app()` fails here without anyone remembering to extend a list.
+    ///
+    /// This is the assertion that actually earns the unconditional reset in
+    /// [`Self::run_pending_action`]: removing that one line reddens this test across many
+    /// commands at once, whereas a per-arm reset can only ever be as complete as the arms
+    /// someone thought to enumerate.
+    ///
+    /// Worth recording why there is **no companion test for the `[r]` retry path**: one was
+    /// written, and it could not fail. `retry()` calls `launch()`/`run_in_app()` directly, and
+    /// both set `running = true` only *after* their gates — `launch()` at its `create_session`
+    /// boundary, `run_in_app()` after `in_app_readiness`. The pre-gate setter is
+    /// `run_selected`'s alone, and that is only on the `[enter]` path. So a blocked retry never
+    /// sets the flag, a reset there is unreachable, and its test passed with the reset deleted.
+    /// Proven by mutation rather than by reading, and the resets were removed rather than kept as
+    /// reassurance. (Reported by review on PR #547.)
+    #[test]
+    fn no_dispatched_command_leaves_the_running_flag_set() {
+        let host = FakeHost::outside_tmux();
+
+        for command in catalog::commands() {
+            let id = command.id;
+            let server = FakeServer::healthy()
+                .with_session(SessionAnswer::Created(terminal("t-sweep")))
+                .with_run(RunAnswer::Chunks(vec!["ok\n"], 200));
+            let mut shell = Renderer::new(&server, &host, 100, 40);
+
+            assert!(
+                shell.focus_command(id),
+                "{id:?} is offered by `commands()` so it must be focusable"
+            );
+            // First Enter selects the command; the second runs it. A command with no fields
+            // treats the second as the run too, which `run_selected` handles.
+            shell.on_key(KeyCode::Enter);
+            shell.on_key(KeyCode::Enter);
+            shell.run_pending_action();
+
+            assert!(
+                !shell.running,
+                "{id:?} left `running` set after its dispatch returned. Both dispatch paths are \
+                 synchronous, so nothing is in flight here — and a stale flag makes the quit \
+                 prompt claim a run continues server-side when none was ever sent"
+            );
+        }
     }
 
     /// **A printable character reaches a TEXT FIELD instead of firing a command key
@@ -4680,13 +5486,14 @@ mod tests {
             host.spawned.borrow().as_slice(),
             &[vec![
                 "tmux".to_string(),
-                "select-window".to_string(),
+                "switch-client".to_string(),
                 "-t".to_string(),
                 "work:planner-1".to_string(),
             ]],
-            "navigation must be `select-window` on the SAME session — never a nested attach (which \
-             tmux refuses outright) and never `switch-client` (which retargets the whole client). \
-             Spawned: {:?}",
+            "navigation must be `switch-client` at the `session:window` target. `POST /sessions` \
+             always creates a NEW session, so this is a CROSS-session move — `select-window` \
+             exits 0 there without moving the client, which made the whole hand-off a silent \
+             no-op. A nested attach is still forbidden (tmux refuses it). Spawned: {:?}",
             host.spawned.borrow()
         );
     }

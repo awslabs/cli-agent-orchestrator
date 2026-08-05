@@ -10,9 +10,25 @@
 //! requirement the same way: **so silently-dropped vars keep failing loudly.** A variable that
 //! vanishes without a message is the original defect — the operator forwards
 //! `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, nothing happens, and there is no way to find out why. So
-//! [`merge`] emits a line naming every dropped variable, and [`EnvDecision`] models the reason
-//! as a **value** rather than returning `bool`, which is what stops the message from being
-//! quietly dropped in a later refactor (BR-5, SR-4).
+//! [`EnvDecision::warning`] names every dropped variable, and [`EnvDecision`] models the reason as
+//! a **value** rather than returning `bool`, which is what stops the message from being quietly
+//! dropped in a later refactor (BR-5, SR-4).
+//!
+//! # What this module deliberately no longer contains
+//!
+//! It used to also export `merge` (a `BTreeMap` merge mirroring `_merge_extra_env`) and
+//! `WriterWarnings`/`WarnSink` (a stderr sink). **All three were unreachable and their doc comments
+//! claimed production callers that could never exist**: `merge` mirrors the stage that assembles a
+//! tmux process environment, and this TUI never does that — it sends `env_vars` in the
+//! `POST /sessions` body and cao-server performs that merge itself. Built-and-never-invoked is the
+//! exact defect class (FR-3.2) this crate's own documentation lectures about, so they were deleted
+//! rather than kept behind an `#[allow(dead_code)]` promising a caller.
+//!
+//! What survives is what the front door actually uses: [`decide`], [`is_blocked`], the policy
+//! constants, and [`EnvDecision::warning`] — now called by `guided_flow::parse_env_pairs`. The
+//! policy tests were kept and repointed at those, since the byte-cap boundary and the
+//! allowlist-before-prefix ordering are properties of `decide`, not of the deleted plumbing.
+//! (Reported by review on PR #547.)
 //!
 //! # Three details a re-implementation working from prose gets wrong
 //!
@@ -53,9 +69,6 @@
 //! problem (Bolt 4); building the argv **vector** they feed — never an interpolated shell
 //! string (T-10, BR-7) — is the caller's, and `Host::run` in `handoff.rs` already makes a shell
 //! string inexpressible at the type level.
-
-use std::collections::BTreeMap;
-use std::io::{self, Write};
 
 /// Provider env prefixes that cause "nested session" errors when CAO runs inside a provider.
 ///
@@ -136,70 +149,6 @@ impl EnvDecision {
     }
 }
 
-/// Where warnings go. One method, because a drop needs exactly one thing: to be told.
-///
-/// A trait rather than a hard-wired `eprintln!` so the tests can assert **that the warning was
-/// emitted**, not merely that the variable is absent from the environment. Those are two
-/// distinct assertions and the second does not imply the first (VR-3) — which is exactly why
-/// BR-14 mandates a mutation that removes the warning while keeping the drop. (#321)
-pub trait WarnSink {
-    /// Record one operator-facing warning line.
-    fn warn(&mut self, message: &str);
-}
-
-/// Collects warnings in order. The test sink, and the reason no test-only type is needed.
-impl WarnSink for Vec<String> {
-    fn warn(&mut self, message: &str) {
-        self.push(message.to_string());
-    }
-}
-
-/// The production sink: one `warning: ` line per drop, on a writer (normally stderr).
-///
-/// Writing to stderr can itself fail — a closed pipe is the ordinary case — and a warning sink
-/// that swallowed that would reintroduce the silence this guard exists to remove. So failures
-/// are **counted** and readable via [`WriterWarnings::write_failures`], letting the caller
-/// report "3 variables were dropped but the warnings could not be written" rather than losing
-/// the fact. Returning `Result` from `warn` was the alternative; it would force every drop site
-/// into error handling for a condition that must not abort the launch (INV-1). (#321)
-#[allow(dead_code)] // constructed by `guided-flow` (Bolt 4); see the note in `types.rs`. (#321)
-pub struct WriterWarnings<W: Write> {
-    writer: W,
-    write_failures: usize,
-}
-
-#[allow(dead_code)] // every method's caller is `guided-flow` (Bolt 4). (#321)
-impl<W: Write> WriterWarnings<W> {
-    /// Wrap any writer.
-    pub fn new(writer: W) -> Self {
-        Self {
-            writer,
-            write_failures: 0,
-        }
-    }
-
-    /// How many warnings could not be written. Non-zero means the operator was not told.
-    pub fn write_failures(&self) -> usize {
-        self.write_failures
-    }
-}
-
-impl WriterWarnings<io::Stderr> {
-    /// The ordinary production sink.
-    #[allow(dead_code)] // constructed by `guided-flow` (Bolt 4). (#321)
-    pub fn stderr() -> Self {
-        Self::new(io::stderr())
-    }
-}
-
-impl<W: Write> WarnSink for WriterWarnings<W> {
-    fn warn(&mut self, message: &str) {
-        if writeln!(self.writer, "warning: {message}").is_err() {
-            self.write_failures += 1;
-        }
-    }
-}
-
 /// Is `key` blocked?
 ///
 /// # THE ORDERING BELOW IS A SECURITY BEHAVIOUR, NOT A STYLE CHOICE (#321)
@@ -226,9 +175,11 @@ pub fn is_blocked(key: &str) -> bool {
 
 /// Decide one variable, without touching any environment.
 ///
-/// Split out from [`merge`] so the boundary logic is directly addressable by a test and by a
-/// mutation: the two lines that matter most in this file are the `is_blocked` call and the `>=`
-/// below, and both are easier to trust when nothing else is happening around them.
+/// A standalone function rather than logic inlined at the call site, so the boundary is directly
+/// addressable by a test and by a mutation: the two lines that matter most in this file are the
+/// `is_blocked` call and the `>=` below, and both are easier to trust when nothing else is
+/// happening around them. (It was originally split out of a `merge` that has since been deleted
+/// for having no production caller; the reason for the split outlived it.)
 ///
 /// # The comparison is `>=` and the length is in BYTES
 ///
@@ -267,52 +218,11 @@ pub fn decide(key: &str, value: &str) -> EnvDecision {
     EnvDecision::Keep
 }
 
-/// Merge operator-supplied `--env` pairs into `environment`, warning on every drop.
-///
-/// Mirrors `_merge_extra_env` (`tmux.py:105-128`): later pairs override earlier ones on a key
-/// collision, and the merge happens **after** the inherited slice so an explicit
-/// `--env AWS_REGION=us-west-2` wins over the inherited value (issue #248, `tmux.py:170-174`).
-///
-/// Returns one [`EnvDecision`] per input pair, in input order. The return value is not the
-/// warning mechanism — `warnings` is — but it lets a caller summarise ("2 of 5 forwarded
-/// variables were dropped") without re-deriving the policy.
-///
-/// **This function never fails** (INV-1). A blocked or oversized variable is dropped with a
-/// warning and the launch proceeds; failing it would diverge from the Python path. (#321)
-#[allow(dead_code)] // the caller is `guided-flow` (Bolt 4), which builds the launch argv. (#321)
-pub fn merge(
-    environment: &mut BTreeMap<String, String>,
-    extra_env: &[(String, String)],
-    warnings: &mut dyn WarnSink,
-) -> Vec<EnvDecision> {
-    let mut decisions = Vec::with_capacity(extra_env.len());
-
-    for (key, value) in extra_env {
-        let decision = decide(key, value);
-
-        // The warning is the control (BR-5, SR-4). Deleting this is the mutation BR-14 makes
-        // mandatory, and `tests::every_drop_emits_a_warning_naming_the_variable` is what turns
-        // red when it goes — a test asserting only that the key is absent from `environment`
-        // stays green while the operator is never told. (#321)
-        if let Some(message) = decision.warning() {
-            warnings.warn(&message);
-        }
-
-        if matches!(decision, EnvDecision::Keep) {
-            environment.insert(key.clone(), value.clone());
-        }
-
-        decisions.push(decision);
-    }
-
-    decisions
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        decide, is_blocked, merge, EnvDecision, WarnSink, WriterWarnings, BLOCKED_PREFIXES,
-        BLOCKED_PREFIX_ALLOWLIST, MAX_ENV_VALUE_BYTES,
+        decide, is_blocked, EnvDecision, BLOCKED_PREFIXES, BLOCKED_PREFIX_ALLOWLIST,
+        MAX_ENV_VALUE_BYTES,
     };
     use std::collections::BTreeMap;
 
@@ -341,21 +251,65 @@ mod tests {
     /// `tmux.py:96`, verbatim.
     const TMUX_PY_CAP_BYTES: usize = 2048;
 
-    /// Run one pair through [`merge`], returning the environment, the decisions, and the
-    /// warnings — so no test can assert on the drop while forgetting the warning.
-    fn merge_one(key: &str, value: &str) -> (BTreeMap<String, String>, EnvDecision, Vec<String>) {
+    /// Applies the guard to `extra_env` exactly as a caller must: decide, warn on every drop, keep
+    /// only what survives. Returns the resulting map, the per-pair decisions, and the warnings.
+    ///
+    /// # This used to call a production `merge`, which had no production caller
+    ///
+    /// `env_guard::merge` and `WriterWarnings` were written for a `guided-flow` caller that the
+    /// `#[allow(dead_code)]` notes promised — and it never arrived, because it never could:
+    /// `merge` mirrors `clients/tmux.py::_merge_extra_env`, which is the stage that assembles a
+    /// **tmux process environment**, and the TUI does not do that. It sends `env_vars` in the
+    /// `POST /sessions` body and cao-server performs that merge itself. So the code was
+    /// unreachable by design while its doc comments claimed production callers — the FR-3.2 defect
+    /// class this crate's own documentation lectures about, in the crate's own source.
+    ///
+    /// The functions were deleted. **The tests were not**: they assert the byte cap boundary, the
+    /// allowlist-before-prefix ordering, and that every drop emits a warning — all real properties
+    /// of `decide`/`warning`, which `guided_flow::parse_env_pairs` genuinely calls. Deleting the
+    /// tests along with the dead code would have thrown away the coverage that matters, so this
+    /// helper does the loop locally instead, over the same two functions the front door uses.
+    /// (Reported by review on PR #547.)
+    fn apply_guard(extra_env: &[(String, String)]) -> (BTreeMap<String, String>, Vec<String>) {
         let mut environment = BTreeMap::new();
+        let warnings = apply_guard_into(&mut environment, extra_env);
+        (environment, warnings)
+    }
+
+    /// The same loop, into an environment that already holds inherited values.
+    ///
+    /// Separate from [`apply_guard`] because the override property — an explicit
+    /// `--env AWS_REGION=us-west-2` beating an inherited `eu-west-1` (issue #248,
+    /// `tmux.py:170-174`) — is only observable when the map is non-empty to begin with. Folding
+    /// the two would have quietly dropped that assertion when the dead `merge` was deleted.
+    fn apply_guard_into(
+        environment: &mut BTreeMap<String, String>,
+        extra_env: &[(String, String)],
+    ) -> Vec<String> {
         let mut warnings: Vec<String> = Vec::new();
+
+        for (key, value) in extra_env {
+            let decision = decide(key, value);
+            // The warning is the control (BR-5, SR-4), so it is emitted here for the same reason
+            // the deleted `merge` emitted it: a test asserting only that the key is absent stays
+            // green while the operator is never told.
+            if let Some(message) = decision.warning() {
+                warnings.push(message);
+            }
+            if matches!(decision, EnvDecision::Keep) {
+                environment.insert(key.clone(), value.clone());
+            }
+        }
+
+        warnings
+    }
+
+    /// One pair through the guard: the environment, its single decision, and the warnings — so no
+    /// test can assert on the drop while forgetting the warning.
+    fn merge_one(key: &str, value: &str) -> (BTreeMap<String, String>, EnvDecision, Vec<String>) {
         let pairs = vec![(key.to_string(), value.to_string())];
-
-        let decisions = merge(&mut environment, &pairs, &mut warnings);
-
-        assert_eq!(
-            decisions.len(),
-            1,
-            "merge must return exactly one decision per input pair"
-        );
-        (environment, decisions[0].clone(), warnings)
+        let (environment, warnings) = apply_guard(&pairs);
+        (environment, decide(key, value), warnings)
     }
 
     /// Test 1 — the byte cap boundary: 2047 keeps, **2048 drops**, 2049 drops (VR-1, BR-3).
@@ -579,8 +533,8 @@ mod tests {
     /// the operator is never told, which is the original defect. So this test asserts on the
     /// **warning text**, for both drop reasons, and checks the variable's name is in it.
     ///
-    /// It is also the test BR-14's mandatory mutation targets: removing the `warn` call in
-    /// [`merge`] while leaving the drop in place turns this red and nothing else.
+    /// It is also the test BR-14's mandatory mutation targets: removing the `warn` call while
+    /// leaving the drop in place turns this red and nothing else.
     #[test]
     fn every_drop_emits_a_warning_naming_the_variable() {
         let oversized = "z".repeat(4096);
@@ -591,13 +545,19 @@ mod tests {
             ("CLAUDE_CODE_USE_BEDROCK".to_string(), "1".to_string()),
         ];
 
-        let mut environment = BTreeMap::new();
-        let mut warnings: Vec<String> = Vec::new();
-        let decisions = merge(&mut environment, &pairs, &mut warnings);
+        let (environment, warnings) = apply_guard(&pairs);
 
-        assert_eq!(decisions.len(), 4, "one decision per input pair");
-
-        // Exactly the two drops warn, and neither keep does.
+        // BOTH halves, and the pairing is the point: the two drops are absent from the environment
+        // AND named in a warning. Asserting only the absence is the original defect — the variable
+        // vanishes and the operator is never told — while asserting only the warning would pass a
+        // guard that warns and then forwards the variable anyway.
+        assert_eq!(
+            environment.keys().collect::<Vec<_>>(),
+            vec!["AWS_REGION", "CLAUDE_CODE_USE_BEDROCK"],
+            "exactly the two keeps reach the environment: `CLAUDE_CODE_USE_BEDROCK` survives its \
+             blocked prefix because the allowlist is tested FIRST (`tmux.py:101-103`), and losing \
+             it breaks Bedrock authentication. Got: {environment:?}"
+        );
         assert_eq!(
             warnings.len(),
             2,
@@ -645,28 +605,18 @@ mod tests {
             );
         }
 
-        // The same drops, on the production sink, must reach the writer verbatim.
-        let mut buffer: Vec<u8> = Vec::new();
-        {
-            let mut sink = WriterWarnings::new(&mut buffer);
-            for warning in &warnings {
-                sink.warn(warning);
-            }
-            assert_eq!(
-                sink.write_failures(),
-                0,
-                "writing to an in-memory buffer cannot fail"
-            );
-        }
-        let written = String::from_utf8(buffer).expect("warnings must be valid UTF-8");
-        assert!(
-            written.contains("CODEX_HOME") && written.contains("HUGE_PAYLOAD"),
-            "the production sink must carry both variable names to the operator: {written:?}"
-        );
+        // What used to follow here replayed the same warnings through `WriterWarnings`, the
+        // stderr sink — which was deleted along with `merge` for having no production caller. The
+        // assertions it made were about that sink's own plumbing (one `writeln!` per warning, a
+        // failure counter for a closed pipe), not about this guard's policy, so nothing this
+        // module is responsible for lost coverage. The warning TEXT is asserted above, which is
+        // the part `guided_flow::parse_env_pairs` actually surfaces to the operator.
+        // (Reported by review on PR #547.)
         assert_eq!(
-            written.lines().count(),
+            warnings.len(),
             2,
-            "one line per warning, so a drop cannot hide inside another line: {written:?}"
+            "re-asserted after the sink block was removed: exactly the two drops warn, and the \
+             count is what a future edit would break silently"
         );
     }
 
@@ -681,12 +631,10 @@ mod tests {
     fn kept_vars_reach_the_environment_and_later_pairs_win() {
         let mut environment = BTreeMap::new();
         environment.insert("AWS_REGION".to_string(), "eu-west-1".to_string());
-        let mut warnings: Vec<String> = Vec::new();
 
         // Empty input is a no-op: nothing inserted, nothing warned.
-        let none = merge(&mut environment, &[], &mut warnings);
-        assert!(none.is_empty(), "no pairs means no decisions");
-        assert!(warnings.is_empty(), "no pairs means no warnings");
+        let none = apply_guard_into(&mut environment, &[]);
+        assert!(none.is_empty(), "no pairs means no warnings");
         assert_eq!(
             environment.len(),
             1,
@@ -697,9 +645,12 @@ mod tests {
             ("AWS_REGION".to_string(), "us-west-2".to_string()),
             ("DO_NOT_TRACK".to_string(), "1".to_string()),
         ];
-        let decisions = merge(&mut environment, &pairs, &mut warnings);
+        let warnings = apply_guard_into(&mut environment, &pairs);
 
-        assert_eq!(decisions, vec![EnvDecision::Keep, EnvDecision::Keep]);
+        assert_eq!(
+            pairs.iter().map(|(k, v)| decide(k, v)).collect::<Vec<_>>(),
+            vec![EnvDecision::Keep, EnvDecision::Keep]
+        );
         assert!(
             warnings.is_empty(),
             "nothing was dropped, so nothing may warn"

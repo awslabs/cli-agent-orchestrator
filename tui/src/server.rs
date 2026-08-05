@@ -49,7 +49,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::time::Duration;
 
-use crate::catalog::CommandId;
+use crate::catalog::{self, CommandId, ParamKind};
 use crate::error::TuiError;
 use crate::types::{Health, Profile, Provider, SessionParams, Terminal};
 
@@ -85,6 +85,24 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// Chunk size for the streaming read in [`ServerClient::run`].
 const STREAM_CHUNK_BYTES: usize = 8 * 1024;
 
+/// `SessionParams` wire keys that must travel in the JSON body and **never** the query string.
+///
+/// Both carry operator content that must stay out of cao-server's HTTP access log:
+///
+/// - `env_vars` — values may be secrets. Issue **#248**, which is why `CreateSessionBody`
+///   exists at all.
+/// - `initial_message` — the launch prompt. Same hazard, stated by the server itself at
+///   `api/main.py:206-212`: prompt content "can be large (URL-length 414 risk) and sensitive
+///   (query strings are routinely captured in HTTP access logs and traces)".
+///
+/// **A named set rather than an inline `if key == "env_vars"`.** The query is built by iterating
+/// `SessionParams`' serialised keys, so anything not listed here goes into the query string by
+/// default — the dangerous direction. Naming the body fields in one place means a future body
+/// field is a one-line addition here instead of a silent leak, and
+/// [`the_body_only_fields_never_reach_the_query_string`] asserts the split for every entry rather
+/// than for the one that happened to be remembered. (#321, and review on PR #547)
+const BODY_ONLY_FIELDS: [&str; 2] = ["env_vars", "initial_message"];
+
 /// The HTTP verb a route is reached with.
 ///
 /// Only the four this crate actually issues. A fifth would be a route the catalog does not
@@ -99,10 +117,29 @@ pub enum Method {
     Delete,
 }
 
-/// A resolved HTTP route: a verb, a path template, and the placeholders the caller must fill.
+/// How one form field reaches one route: which field, and the wire name it travels under.
 ///
-/// `path` is a **template**, and `placeholders` names each `{token}` in it. Both are
-/// `&'static str`, so a route is a compile-time constant with no allocation — the same property
+/// The two names are **separate on purpose**, because they differ and nothing else connects them:
+/// `cao profile show` takes a positional the catalog spells `name_or_path` while the route
+/// placeholder is `{name}`, and `cao memory list --type` maps to a query parameter FastAPI
+/// declares as `alias="type"` over a Python identifier of `memory_type`. Collapsing them into one
+/// string would work for most rows and produce a 404 or a silently-ignored filter for the rest.
+///
+/// This is the same class of trap as `SessionParams`' `agents` → `agent_profile` rename: invisible
+/// to the compiler, visible only as a runtime error. (#321, and review on PR #547)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Binding {
+    /// The form field's name, in the catalog's exact spelling — `--scope`, `key`, `name_or_path`.
+    pub field: &'static str,
+    /// The wire name: a `{placeholder}` token for a path binding, or a query-parameter name.
+    pub wire: &'static str,
+}
+
+/// A resolved HTTP route: a verb, a path template, the placeholders the caller must fill, and how
+/// the form's fields bind to them.
+///
+/// `path` is a **template**, and `placeholders` names each `{token}` in it. All of it is
+/// `&'static`, so a route is a compile-time constant with no allocation — the same property
 /// `catalog.rs`'s rows have, for the same reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Route {
@@ -116,6 +153,23 @@ pub struct Route {
     /// Carried so a caller can tell *which* value a route still needs. Empty for a route that
     /// takes no path parameter.
     pub placeholders: &'static [&'static str],
+    /// Which form field supplies each path placeholder.
+    ///
+    /// **A route with placeholders and no path bindings cannot be run**, and that is the honest
+    /// state rather than a gap to paper over: it means nothing in the form is known to supply the
+    /// value. Before this existed, `renderer` called `run(id, &[], &[], None, ..)` for every
+    /// in-app command — so a route needing `{run_id}` was simply never runnable, and one needing
+    /// no path value ran with the operator's typed filters silently discarded.
+    /// (Review on PR #547.)
+    pub path_bindings: &'static [Binding],
+    /// Which form fields travel as query parameters, and under which names.
+    ///
+    /// Only fields whose wire name was **read at source** appear here. A text field with no entry
+    /// is deliberately not guessed at: sending `?scope=..` to a route that declares no `scope`
+    /// parameter is not a filter, it is an ignored argument, and an operator who typed it would
+    /// believe it applied. `unbound_text_fields` reports exactly those, and the renderer refuses
+    /// the run rather than sending a request that quietly does something else.
+    pub query_bindings: &'static [Binding],
 }
 
 /// The route for `id`, or `None` when the command is served no other way.
@@ -150,15 +204,54 @@ pub struct Route {
 /// Four routes do the work but **not identically** to the CLI. Each carries a comment at its own
 /// arm below rather than only in a document, because the limitation matters at the call site.
 fn route(id: CommandId) -> Option<Route> {
-    /// Shorthand for a route with no path placeholder.
+    /// Shorthand for a route with no path placeholder and no query binding.
     const fn plain(method: Method, path: &'static str) -> Option<Route> {
         Some(Route {
             method,
             path,
             placeholders: &[],
+            path_bindings: &[],
+            query_bindings: &[],
         })
     }
-    /// Shorthand for a route with placeholders.
+    /// Shorthand for a route with no path placeholder that DOES take query parameters.
+    const fn filtered(
+        method: Method,
+        path: &'static str,
+        query_bindings: &'static [Binding],
+    ) -> Option<Route> {
+        Some(Route {
+            method,
+            path,
+            placeholders: &[],
+            path_bindings: &[],
+            query_bindings,
+        })
+    }
+    /// Shorthand for a route whose placeholders are supplied by form fields.
+    ///
+    /// `path_bindings` rather than a bare placeholder list: a placeholder nothing supplies is a
+    /// route that cannot run, and naming the supplying field at the row is what makes it runnable.
+    const fn bound(
+        method: Method,
+        path: &'static str,
+        placeholders: &'static [&'static str],
+        path_bindings: &'static [Binding],
+        query_bindings: &'static [Binding],
+    ) -> Option<Route> {
+        Some(Route {
+            method,
+            path,
+            placeholders,
+            path_bindings,
+            query_bindings,
+        })
+    }
+    /// Shorthand for a route with placeholders that **no form field supplies**.
+    ///
+    /// Kept distinct from [`bound`] so the two `terminal_id` routes read as the deliberate gap
+    /// they are: `cao session send`/`status` resolve a session name to a terminal id with a
+    /// SECOND call (`session.py:26`, `_resolve_conductor`), and this crate does not do that yet.
     const fn templated(
         method: Method,
         path: &'static str,
@@ -168,6 +261,8 @@ fn route(id: CommandId) -> Option<Route> {
             method,
             path,
             placeholders,
+            path_bindings: &[],
+            query_bindings: &[],
         })
     }
 
@@ -221,16 +316,72 @@ fn route(id: CommandId) -> Option<Route> {
         // **requires an explicit `scope_id` for every non-global scope** (`:3574-3578`), while
         // the CLI resolves it from the cwd. Harvestable from `GET /memory` rows, but not a
         // drop-in: a caller that omits it gets a 400, not a clear.
-        CommandId::MemoryClear => plain(Method::Delete, "/memory"),
+        //
+        // `--scope` is bound: the route DECLARES `scope: MemoryScope` as a REQUIRED query
+        // parameter (`:3989`), so an unbound run 422s every time. `--yes` is absent from the
+        // bindings deliberately — it is the CLI's local confirmation prompt, not a server
+        // parameter, and the TUI's own [enter] is the equivalent affordance.
+        CommandId::MemoryClear => filtered(
+            Method::Delete,
+            "/memory",
+            &[Binding {
+                field: "--scope",
+                wire: "scope",
+            }],
+        ),
         // ⚠ FIDELITY GAP 2 of 4 — `memory delete`. Same `scope_id` requirement
         // (`api/main.py:3534-3538`) as `memory clear`, for the same reason.
-        CommandId::MemoryDelete => templated(Method::Delete, "/memory/{key}", &["key"]),
+        //
+        // `key` is the positional the CLI declares (`memory.py:157`) and `{key}` is the route's
+        // placeholder; the two names happen to agree here, and `Binding` states it rather than
+        // relying on that. `scope` defaults to `PROJECT` server-side (`:3951`), so binding
+        // `--scope` is what lets an operator reach any other scope. `--yes` stays local.
+        CommandId::MemoryDelete => bound(
+            Method::Delete,
+            "/memory/{key}",
+            &["key"],
+            &[Binding {
+                field: "key",
+                wire: "key",
+            }],
+            &[Binding {
+                field: "--scope",
+                wire: "scope",
+            }],
+        ),
         // ⚠ FIDELITY GAP 3 of 4 — `memory export`. `GET /memory/export` is **tar.gz streaming
         // only**: the CLI's default OKF *directory* output has no HTTP equivalent, `--prune` is
         // not a query parameter at all, and the route **hard-refuses** the `session`/`agent`
         // scopes the CLI reaches via `--include-private` (`api/main.py:3424-3429`, "the API
         // surface never exports private tiers"). `project` additionally requires `scope_id`.
-        CommandId::MemoryExport => plain(Method::Get, "/memory/export"),
+        //
+        // Three of the seven CLI options bind, each read at `:3653-3657`: `--format` → `format`,
+        // `--scope` → `scope` (REQUIRED there, so an unbound run 422s), `--include-history` →
+        // `include_history`, `--redact` → `redact`. The other two do NOT bind and must not be
+        // invented: `--output` is a local filesystem destination, and `--prune` has no query
+        // parameter at all — the gap named above.
+        CommandId::MemoryExport => filtered(
+            Method::Get,
+            "/memory/export",
+            &[
+                Binding {
+                    field: "--scope",
+                    wire: "scope",
+                },
+                Binding {
+                    field: "--format",
+                    wire: "format",
+                },
+                Binding {
+                    field: "--include-history",
+                    wire: "include_history",
+                },
+                Binding {
+                    field: "--redact",
+                    wire: "redact",
+                },
+            ],
+        ),
         // ⚠ FIDELITY GAP 4 of 4 — `memory list`. `GET /memory` always passes `scan_all=True`
         // (`api/main.py:3385`), so it mirrors `cao memory list --all` and NOT the CLI's default
         // cwd-scoped view. That default needs a `scope_id` the TUI **cannot compute**:
@@ -238,8 +389,43 @@ fn route(id: CommandId) -> Option<Route> {
         // `sha256(realpath(cwd))[:12]` (`memory_service.py:210-250`), and no route exposes
         // "my project id". The gap is unclosable from this side, so it is recorded, not worked
         // around.
-        CommandId::MemoryList => plain(Method::Get, "/memory"),
-        CommandId::MemoryShow => templated(Method::Get, "/memory/{key}", &["key"]),
+        //
+        // **`--type` binds to the wire name `type`, not `memory_type`.** FastAPI declares it as
+        // `memory_type: Optional[MemoryType] = Query(default=None, alias="type")` (`:3621`), and
+        // the ALIAS is what goes on the wire. Sending `memory_type=user` would be silently
+        // ignored — an unfiltered list presented as a filtered one, which is worse than an error.
+        // This is exactly why [`Binding`] carries two names.
+        //
+        // `--all` does not bind: the route hard-codes `scan_all=True` (`:3634`), so it already
+        // behaves as `--all` and there is nothing to send. That is fidelity gap 4, and the
+        // renderer marks the field rather than pretending it applies.
+        CommandId::MemoryList => filtered(
+            Method::Get,
+            "/memory",
+            &[
+                Binding {
+                    field: "--scope",
+                    wire: "scope",
+                },
+                Binding {
+                    field: "--type",
+                    wire: "type",
+                },
+            ],
+        ),
+        CommandId::MemoryShow => bound(
+            Method::Get,
+            "/memory/{key}",
+            &["key"],
+            &[Binding {
+                field: "key",
+                wire: "key",
+            }],
+            &[Binding {
+                field: "--scope",
+                wire: "scope",
+            }],
+        ),
         // HIDE: maintenance sweeps with no route (`memory compact`/`heal` call the LLM compiler
         // and lint repair in-process).
         CommandId::MemoryCompact => None,
@@ -247,6 +433,17 @@ fn route(id: CommandId) -> Option<Route> {
         // HANDOFF, all five — OQ-6. No route exists, and ADR-02 forbids the subprocess that
         // would be the only alternative, so they cannot run captured in-pane at all. The
         // in-process call site is named on each catalog row.
+        // HIDE, all four — `cao memory relationships *`, added by PR #524 (issue #511) and
+        // missing from the catalog until review on PR #547. `None` here because a HIDE command is
+        // unreachable through `commands()` and needs no route, NOT because no route exists: `GET
+        // /memory/relationships` (`api/main.py:3770`) and `POST .../{id}/promote` (`:3854`) are
+        // real. `reject` maps to `PATCH .../{id}` (`:3829`), and `Method` has no `Patch` variant,
+        // so routing that one would widen the transport enum as well. Classifying any of them
+        // IN-APP is a deliberate, reviewable change — they mutate stored memory.
+        CommandId::MemoryRelationshipsInspect => None,
+        CommandId::MemoryRelationshipsList => None,
+        CommandId::MemoryRelationshipsPromote => None,
+        CommandId::MemoryRelationshipsReject => None,
         CommandId::MemoryImport => None,
         CommandId::MemoryLint => None,
         CommandId::MemoryPromote => None,
@@ -259,7 +456,22 @@ fn route(id: CommandId) -> Option<Route> {
         // returns `list_agent_profiles()` directly (`:1485`), so the two project differently;
         // `cao profile show` wants the full parsed profile, which is what the singular route
         // gives. (Note `skeleton-endpoint-verify` asserts the LIST shape only, for that reason.)
-        CommandId::ProfileShow => templated(Method::Get, "/agents/profiles/{name}", &["name"]),
+        //
+        // **The field is `name_or_path`, the placeholder is `{name}`.** The CLI declares
+        // `@click.argument("name_or_path")` (`profile.py:166`) while the route is
+        // `/agents/profiles/{name}`. Binding by placeholder name alone would find no field called
+        // `name` and leave the command unrunnable; binding by field name alone would substitute
+        // nothing into `{name}` and send a literal brace. The pair is the fix.
+        CommandId::ProfileShow => bound(
+            Method::Get,
+            "/agents/profiles/{name}",
+            &["name"],
+            &[Binding {
+                field: "name_or_path",
+                wire: "name",
+            }],
+            &[],
+        ),
         // **`profile find` is the one IN-APP command with no route** — 21 routes for 22
         // commands. `search_profiles` is reachable only from the CLI (`profile.py:385`) and the
         // **stdio-only** MCP server (`mcp_server/server.py:2120`, `mcp.run()`), so it is not
@@ -282,11 +494,45 @@ fn route(id: CommandId) -> Option<Route> {
         // field**, while `flow_service.add_flow` reads and stores one (`flow_service.py:89`,
         // `script = metadata.get("script", "")`). **A flow file with a `script:` key loses it
         // when created over HTTP.**
+        //
+        // Left as `plain`, so it has NO bindings and the renderer refuses it: the only field is
+        // `file_path`, and `POST /flows` wants a five-field `CreateFlowRequest` body
+        // (`name`/`schedule`/`agent_profile`/`provider`/`prompt_template`, `:553-561`) that only a
+        // client-side parse of the `.flow.md` could produce. Sending the path as a query parameter
+        // or a one-key body is a guaranteed 422 — which is what the previous
+        // `run(id, &[], &[], None, ..)` call did on every attempt.
         CommandId::ScheduleAdd => plain(Method::Post, "/flows"),
-        CommandId::ScheduleDisable => templated(Method::Post, "/flows/{name}/disable", &["name"]),
-        CommandId::ScheduleEnable => templated(Method::Post, "/flows/{name}/enable", &["name"]),
+        CommandId::ScheduleDisable => bound(
+            Method::Post,
+            "/flows/{name}/disable",
+            &["name"],
+            &[Binding {
+                field: "name",
+                wire: "name",
+            }],
+            &[],
+        ),
+        CommandId::ScheduleEnable => bound(
+            Method::Post,
+            "/flows/{name}/enable",
+            &["name"],
+            &[Binding {
+                field: "name",
+                wire: "name",
+            }],
+            &[],
+        ),
         CommandId::ScheduleList => plain(Method::Get, "/flows"),
-        CommandId::ScheduleRemove => templated(Method::Delete, "/flows/{name}", &["name"]),
+        CommandId::ScheduleRemove => bound(
+            Method::Delete,
+            "/flows/{name}",
+            &["name"],
+            &[Binding {
+                field: "name",
+                wire: "name",
+            }],
+            &[],
+        ),
         // HANDOFF: `POST /flows/{name}/run` exists (`api/main.py:3282`) but awaits
         // `execute_flow` inline, so its duration is unbounded — the original HANDOFF reason.
         CommandId::ScheduleRun => None,
@@ -298,13 +544,20 @@ fn route(id: CommandId) -> Option<Route> {
         // send` resolves the conductor via `GET /sessions/{name}/terminals` first
         // (`session.py:26`, `_resolve_conductor`), so a caller needs two calls, and the
         // placeholder names what it must supply.
+        //
+        // **`templated` and not `bound`: these two are the deliberate remaining gap.** The form
+        // holds a `session_name`, and `{terminal_id}` is a DIFFERENT identifier — binding the one
+        // to the other would send a session name where a terminal id belongs and 404, or worse
+        // address some unrelated terminal whose id happened to collide. The resolving call is not
+        // implemented here, so the renderer refuses these two and names what is missing. That
+        // refusal is the honest state; a plausible-looking binding would not be.
         CommandId::SessionSend => templated(
             Method::Post,
             "/terminals/{terminal_id}/input",
             &["terminal_id"],
         ),
         // `GET /terminals/{terminal_id}` (`:2003`), matching `session.py:32`'s `_get_terminal`.
-        // Same two-call shape as `session send`.
+        // Same two-call shape as `session send`, and the same refusal.
         CommandId::SessionStatus => {
             templated(Method::Get, "/terminals/{terminal_id}", &["terminal_id"])
         }
@@ -326,18 +579,68 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::TerminalRestore => None,
 
         // ── `cao workflow *` ─────────────────────────────────────────────────────────────
-        CommandId::WorkflowCancel => {
-            templated(Method::Post, "/workflows/runs/{run_id}/cancel", &["run_id"])
-        }
-        CommandId::WorkflowDelete => templated(Method::Delete, "/workflows/{name}", &["name"]),
-        CommandId::WorkflowGet => templated(Method::Get, "/workflows/{name}", &["name"]),
-        CommandId::WorkflowList => plain(Method::Get, "/workflows"),
-        CommandId::WorkflowStatus => {
-            templated(Method::Get, "/workflows/runs/{run_id}", &["run_id"])
-        }
-        // `POST /workflows/validate` (`api/main.py:2330`) takes the spec path in a JSON body
-        // (`{"path": file}`, `workflow.py:55-59`), not a query parameter — the caller supplies
-        // the body, which is why there is no placeholder here.
+        //
+        // The four `{name}`/`{run_id}` routes all take their value from the CLI's own positional
+        // of the same name (`workflow.py:129, 158, 257, 323`). `--json` binds nowhere: it is a
+        // local output-format choice, and the pane renders whatever the route returns — which is
+        // JSON already. `--yes` is likewise the CLI's confirmation prompt.
+        CommandId::WorkflowCancel => bound(
+            Method::Post,
+            "/workflows/runs/{run_id}/cancel",
+            &["run_id"],
+            &[Binding {
+                field: "run_id",
+                wire: "run_id",
+            }],
+            &[],
+        ),
+        CommandId::WorkflowDelete => bound(
+            Method::Delete,
+            "/workflows/{name}",
+            &["name"],
+            &[Binding {
+                field: "name",
+                wire: "name",
+            }],
+            &[],
+        ),
+        CommandId::WorkflowGet => bound(
+            Method::Get,
+            "/workflows/{name}",
+            &["name"],
+            &[Binding {
+                field: "name",
+                wire: "name",
+            }],
+            &[],
+        ),
+        // `--dir` is a real query parameter here: `dir: Optional[str] = Query(default=None)`
+        // (`:2606`).
+        CommandId::WorkflowList => filtered(
+            Method::Get,
+            "/workflows",
+            &[Binding {
+                field: "--dir",
+                wire: "dir",
+            }],
+        ),
+        CommandId::WorkflowStatus => bound(
+            Method::Get,
+            "/workflows/runs/{run_id}",
+            &["run_id"],
+            &[Binding {
+                field: "run_id",
+                wire: "run_id",
+            }],
+            &[],
+        ),
+        // `POST /workflows/validate` (`api/main.py:2549`) takes the spec path in a JSON body
+        // (`WorkflowValidateRequest { path: str }`, `:398-401`), not a query parameter.
+        //
+        // Left `plain` — no bindings — so the renderer refuses it rather than POSTing an empty
+        // body for a guaranteed 422. Wiring it needs a body-building mechanism this crate does not
+        // have; a `query_bindings` entry for `file` would send `?path=..` to a route that reads
+        // only the body, which 422s just as reliably while looking like it was wired.
         CommandId::WorkflowValidate => plain(Method::Post, "/workflows/validate"),
         // HANDOFF: both block until the run finishes. `POST /workflows/runs` and
         // `.../resume` exist, but the CLI itself swaps in `WORKFLOW_RUN_REQUEST_TIMEOUT` for
@@ -348,30 +651,188 @@ fn route(id: CommandId) -> Option<Route> {
     }
 }
 
-/// The `{token}` names `id`'s route needs, or `None` when it has no route at all.
+/// The placeholders `id`'s route needs that **no form field supplies**.
 ///
-/// # Why this accessor exists, and why it returns the placeholders rather than a `bool`
+/// Empty means every placeholder is bound, so the route can be built.
 ///
-/// `renderer` (Bolt 5) needs to know whether an IN-APP command can be run with no path values,
-/// because **nothing in the crate maps an arbitrary command's form fields to a route's path
-/// values** and no artifact specifies how. The operator's ruling at the 3.5 plan gate was "wire
-/// what works, state the gap": the placeholder-free routes run for real, and the rest render a
-/// stated error.
+/// # This replaced `route_placeholders`, which asked the wrong question
 ///
-/// That error must **name what is missing**, which is why this returns the placeholder names and
-/// not a boolean. A `bool` would leave the renderer's message as "not supported", and the
-/// difference between that and "needs `{run_id}`" is the difference between a stated gap and a dead
-/// end.
+/// That accessor returned *every* placeholder, and `renderer` treated a non-empty answer as "not
+/// wired". The question it could answer — "does this route have a `{token}`?" — is not the question
+/// that decides runnability, and using it as though it were left **10 commands unreachable whose
+/// token a form field plainly supplies** (`memory show`, `workflow get`/`cancel`/`status`/`delete`,
+/// `schedule enable`/`disable`/`remove`, and the rest). It was removed rather than kept beside this
+/// one: two accessors differing only in a subtlety like that is how a caller picks the wrong one.
 ///
-/// It is derived from [`route`] rather than duplicated, so there is exactly one route table. A
+/// The rendered error still **names what is missing**, which is why this returns names and not a
+/// `bool` — "needs `{terminal_id}`" is a stated limit where "not supported" is a dead end.
+///
+/// Derived from [`route`] rather than duplicated, so there is exactly one route table. A
 /// hard-coded id list in `renderer` would be a second place for the same fact, free to drift — and
 /// the drift would present as a 404 on a literal `{run_id}` brace, which is the confusing failure
 /// [`ServerClient::run`]'s own docs warn about.
 ///
-/// **Measured across the 22 IN-APP commands: 9 empty, 12 non-empty, 1 `None` (`profile find`).**
-/// (#321)
-pub fn route_placeholders(id: CommandId) -> Option<&'static [&'static str]> {
-    route(id).map(|route| route.placeholders)
+/// Returns `None` for a routeless command, so callers keep one shape for "no route".
+/// (#321, and review on PR #547)
+pub fn unbound_placeholders(id: CommandId) -> Option<Vec<&'static str>> {
+    route(id).map(|route| {
+        route
+            .placeholders
+            .iter()
+            .copied()
+            .filter(|placeholder| {
+                !route
+                    .path_bindings
+                    .iter()
+                    .any(|binding| binding.wire == *placeholder)
+            })
+            .collect()
+    })
+}
+
+/// The **value-carrying** form fields of `id` that the route would ignore, in catalog order.
+///
+/// A field here is one an operator can type into and that would then be **silently discarded** —
+/// the defect this exists to prevent. `renderer` refuses the run and names them rather than
+/// sending a request that does something other than what the form shows.
+///
+/// # What is deliberately NOT reported
+///
+/// - **Flags.** A flag the endpoint has no parameter for is almost always a CLI-local behaviour
+///   (`--json` output formatting, `--yes` confirmation, `--all` where the route already scans
+///   everything). Reporting them would refuse nearly every command over choices that change
+///   nothing about the request.
+/// - **Bound fields**, whether by path or query — those reach the server.
+/// - **`--env`-style pair fields**, which no in-app route takes; none exists outside `cao launch`.
+///
+/// So the report is exactly: *text and positional fields whose value has nowhere to go*. A
+/// command with none of those, and all path placeholders bound, is runnable.
+/// (Review on PR #547.)
+pub fn unbound_text_fields(id: CommandId) -> Vec<&'static str> {
+    let Some(route) = route(id) else {
+        return Vec::new();
+    };
+
+    catalog::params(id)
+        .iter()
+        .filter(|param| param.kind != ParamKind::Flag)
+        .map(|param| param.name)
+        .filter(|name| {
+            let bound_to_path = route.path_bindings.iter().any(|b| b.field == *name);
+            let bound_to_query = route.query_bindings.iter().any(|b| b.field == *name);
+            !bound_to_path && !bound_to_query
+        })
+        .collect()
+}
+
+/// The path values for `id`'s route, read out of `flow`, in the route's placeholder order.
+///
+/// **Order is the contract.** [`ServerClient::run`] zips these against `Route::placeholders`
+/// positionally, so this iterates the placeholders and looks up each one's binding — not the
+/// bindings in declaration order. Every route here has one placeholder today, so a reversed
+/// implementation would pass every current test and break the first two-placeholder route added.
+///
+/// A placeholder whose bound field is empty yields an empty string rather than being skipped:
+/// dropping it would shift every later value one position left, sending a run id where a name
+/// belongs. `in_app_readiness` is what prevents an unfilled required value getting this far; this
+/// function's job is to preserve alignment, not to re-litigate readiness. (Review on PR #547.)
+pub fn path_values_for(id: CommandId, flow: &crate::guided_flow::GuidedFlow) -> Vec<String> {
+    let Some(route) = route(id) else {
+        return Vec::new();
+    };
+
+    order_path_values(route.placeholders, route.path_bindings, &|field| {
+        field_text(flow, field)
+    })
+}
+
+/// Places each binding's value at its **placeholder's** position.
+///
+/// # Why this is a separate function
+///
+/// The ordering rule is the whole content of [`path_values_for`], and it is **unobservable through
+/// the real route table**: every route has exactly one placeholder today, so iterating
+/// `path_bindings` in declaration order gives the identical answer. A mutation doing precisely that
+/// passed all 137 tests — the ordering was asserted by nothing.
+///
+/// Splitting it out lets a test supply a synthetic two-placeholder route whose bindings are
+/// declared in the *opposite* order, where the two implementations disagree. That test would have
+/// caught the mutation, and it will catch the first real two-placeholder route added — which is
+/// otherwise a URL with its path values transposed, 404-ing or, worse, addressing the wrong object.
+///
+/// `lookup` is a closure rather than a `&GuidedFlow` so the test can drive it without building a
+/// form for a command that does not exist. (Found by mutation; review on PR #547.)
+fn order_path_values(
+    placeholders: &[&'static str],
+    bindings: &[Binding],
+    lookup: &dyn Fn(&'static str) -> Option<String>,
+) -> Vec<String> {
+    placeholders
+        .iter()
+        .map(|placeholder| {
+            bindings
+                .iter()
+                .find(|binding| binding.wire == *placeholder)
+                .and_then(|binding| lookup(binding.field))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The query pairs for `id`'s route, read out of `flow`. Unset fields are **omitted**.
+///
+/// Omission rather than an empty value, for two reasons both verified against the server:
+///
+/// - A `bool` parameter rejects `""` outright — probed against FastAPI: `?flag=` is a **422**
+///   (`bool_parsing`, "unable to interpret input"), while `?flag=true` and `?flag=1` are accepted.
+///   So an unticked flag must not appear at all.
+/// - An enum parameter such as `scope: Optional[MemoryScope]` treats `""` as an invalid member,
+///   not as absent, so an untouched filter would turn a working request into a rejected one.
+///
+/// A ticked flag sends `"true"`, which the same probe confirmed. A **false** flag is omitted rather
+/// than sent as `"false"`: every bool parameter on these routes already defaults to `False`
+/// (`:3656-3657`), so the two are equivalent on the wire and omission keeps the URL to what the
+/// operator actually asked for.
+pub fn query_pairs_for(
+    id: CommandId,
+    flow: &crate::guided_flow::GuidedFlow,
+) -> Vec<(&'static str, String)> {
+    let Some(route) = route(id) else {
+        return Vec::new();
+    };
+
+    route
+        .query_bindings
+        .iter()
+        .filter_map(|binding| {
+            let field = flow.field(binding.field)?;
+            match field.value.as_ref()? {
+                crate::guided_flow::FieldValue::Text(text) => Some((binding.wire, text.clone())),
+                // `"true"`, not `"1"`: both parse, and `true` is what reads correctly in a log.
+                crate::guided_flow::FieldValue::Flag(true) => {
+                    Some((binding.wire, "true".to_string()))
+                }
+                crate::guided_flow::FieldValue::Flag(false) => None,
+                // No in-app route takes an env-pair field; `--env` exists only on `cao launch`,
+                // which is HANDOFF. Skipped rather than stringified into something meaningless.
+                crate::guided_flow::FieldValue::EnvPairs(_) => None,
+            }
+        })
+        .collect()
+}
+
+/// One field's text value, or `None` when it is unset or not a text-shaped field.
+///
+/// A ticked flag reads as `"true"` here too, so a flag bound to a *path* placeholder would still
+/// produce something sane — no route does that today, and this keeps the helper total rather than
+/// panicking if one ever does.
+fn field_text(flow: &crate::guided_flow::GuidedFlow, name: &str) -> Option<String> {
+    match flow.field(name)?.value.as_ref()? {
+        crate::guided_flow::FieldValue::Text(text) => Some(text.clone()),
+        crate::guided_flow::FieldValue::Flag(true) => Some("true".to_string()),
+        crate::guided_flow::FieldValue::Flag(false) => None,
+        crate::guided_flow::FieldValue::EnvPairs(_) => None,
+    }
 }
 
 /// The HTTP client. One instance per TUI process.
@@ -496,13 +957,21 @@ impl ServerClient {
     /// | Part | Contents |
     /// |---|---|
     /// | **Query** | `agent_profile` (required), `provider?`, `session_name?`, `working_directory?`, `allowed_tools?` |
-    /// | **JSON body** | `{"env_vars": {..}}` — **only when present** |
+    /// | **JSON body** | `env_vars?`, `initial_message?` — **each only when present** |
     ///
-    /// **`env_vars` travels in the BODY, never the query string. Issue #248.** Values may
-    /// contain secrets and the query string lands in cao-server's HTTP access log. This is the
-    /// server's own design, not a client convention — `CreateSessionBody.env_vars` exists for
-    /// exactly this reason and the endpoint's docstring states it at `:1709-1712`. An empty map
-    /// omits the body entirely rather than sending `{}`.
+    /// **Both body fields travel in the BODY, never the query string.** For `env_vars` that is
+    /// issue **#248**: values may contain secrets and the query string lands in cao-server's
+    /// HTTP access log. `initial_message` is the same class of hazard for the same reason, in the
+    /// server's own words at `api/main.py:206-212` — prompt content "can be large (URL-length
+    /// 414 risk) and sensitive (query strings are routinely captured in HTTP access logs and
+    /// traces)". This is the server's design, not a client convention: `CreateSessionBody`
+    /// exists for exactly this split. With neither field present the body is omitted entirely
+    /// rather than sent as `{}`.
+    ///
+    /// The split is driven by [`BODY_ONLY_FIELDS`] rather than by an `if key == "env_vars"`
+    /// arm, so **adding a body field to `SessionParams` cannot leak it into the query string by
+    /// omission** — a new field lands in the query by default otherwise, which is the failure
+    /// direction that matters here.
     ///
     /// # Why the query is built from `serde_json`'s rendering instead of field by field
     ///
@@ -534,10 +1003,10 @@ impl ServerClient {
             .with_timeout(self.timeout.as_secs());
 
         for (key, value) in fields {
-            // #248: `env_vars` is the ONE field that must not reach the query string. Skipped
-            // here and placed in the body below. The `continue` is the security control, so it
-            // is keyed on the wire name that `SessionParams` itself emits.
-            if key == "env_vars" {
+            // The security control, keyed on the wire names `SessionParams` itself emits: these
+            // fields are skipped here and placed in the body below. #248 for `env_vars`, and the
+            // identical log-exposure reasoning for `initial_message`.
+            if BODY_ONLY_FIELDS.contains(&key.as_str()) {
                 continue;
             }
             // Every remaining field of `SessionParams` is a string on the wire; `as_str` is what
@@ -553,17 +1022,31 @@ impl ServerClient {
             request = request.with_param(key, encode_query_component(text));
         }
 
-        // The body carries `env_vars` and nothing else. Absent or empty -> no body at all,
-        // rather than `{}` — the server treats a missing body as "no env vars" already.
+        // The body carries exactly the present [`BODY_ONLY_FIELDS`]. With none of them present
+        // there is no body at all, rather than `{}` — the server already reads a missing body as
+        // "no env vars, no initial message".
+        //
+        // Built as a map so each field is independently optional: an operator who typed a message
+        // but no `--env` must still get a body, and vice versa. The earlier form hard-coded
+        // `{"env_vars": ..}` and would have dropped a message whenever `--env` was empty.
+        let mut body = serde_json::Map::new();
         if let Some(env_vars) = params
             .env_vars
             .as_ref()
             .filter(|map: &&BTreeMap<String, String>| !map.is_empty())
         {
-            let body = serde_json::json!({ "env_vars": env_vars });
+            body.insert("env_vars".to_string(), serde_json::json!(env_vars));
+        }
+        // No emptiness filter needed: `GuidedFlow::set` collapses blank text to `None` at entry,
+        // so `Some("")` cannot arrive here — and the server rejects the empty string outright
+        // (`api/main.py:1949-1950`), which is the behaviour that would surface if it ever did.
+        if let Some(message) = params.initial_message.as_ref() {
+            body.insert("initial_message".to_string(), serde_json::json!(message));
+        }
+        if !body.is_empty() {
             let encoded = serde_json::to_string(&body).map_err(|error| {
                 TuiError::Decode(format!(
-                    "could not serialise env_vars for the body: {error}"
+                    "could not serialise the JSON body for POST /sessions: {error}"
                 ))
             })?;
             request = request
@@ -913,9 +1396,9 @@ fn encode_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, detail_of, encode_path_segment, encode_query_component, is_profile_entry, route,
-        searchable_text, Method, ServerClient, DEFAULT_API_HOST, DEFAULT_API_PORT,
-        REQUEST_TIMEOUT_SECS,
+        decode, detail_of, encode_path_segment, encode_query_component, is_profile_entry,
+        order_path_values, route, searchable_text, Binding, Method, ServerClient, DEFAULT_API_HOST,
+        DEFAULT_API_PORT, REQUEST_TIMEOUT_SECS,
     };
     use crate::catalog::{policy, CommandId, Policy, DISPLAY_ORDER};
     use crate::error::TuiError;
@@ -1196,6 +1679,7 @@ mod tests {
             working_directory: Some("/tmp/project".to_string()),
             allowed_tools: Some("fs_read,fs_write".to_string()),
             env_vars: Some(env_vars),
+            initial_message: Some("review the diff".to_string()),
         }
     }
 
@@ -1284,6 +1768,189 @@ mod tests {
         }
     }
 
+    /// **Path values are ordered by PLACEHOLDER position, not by binding declaration order.**
+    ///
+    /// `ServerClient::run` zips the values it is given against `Route::placeholders` positionally,
+    /// so a transposed pair produces a URL that addresses the wrong object — a 404 at best, and at
+    /// worst a successful call against something the operator did not name.
+    ///
+    /// # This test exists because a mutation survived without it
+    ///
+    /// Every real route has exactly one placeholder, which makes the ordering **unobservable
+    /// through the route table**: rewriting `path_values_for` to iterate `path_bindings` in
+    /// declaration order passed all 137 tests. Nothing asserted the rule the function exists to
+    /// enforce, and the first two-placeholder route added would have shipped transposed.
+    ///
+    /// So the input is synthetic and deliberately adversarial: two placeholders whose bindings are
+    /// declared in the **opposite** order. Under the correct implementation the values follow the
+    /// placeholders; under the mutation they follow the bindings. A same-order fixture cannot tell
+    /// the two apart, which is exactly why the real table could not.
+    /// (Found by mutation; review on PR #547.)
+    #[test]
+    fn path_values_follow_the_placeholders_and_not_the_binding_order() {
+        // `/x/{beta}/y/{alpha}` — placeholders in one order, bindings in the other.
+        let placeholders = ["beta", "alpha"];
+        let bindings = [
+            Binding {
+                field: "--first",
+                wire: "alpha",
+            },
+            Binding {
+                field: "--second",
+                wire: "beta",
+            },
+        ];
+        let lookup = |field: &'static str| match field {
+            "--first" => Some("ALPHA_VALUE".to_string()),
+            "--second" => Some("BETA_VALUE".to_string()),
+            _ => None,
+        };
+
+        assert_eq!(
+            order_path_values(&placeholders, &bindings, &lookup),
+            vec!["BETA_VALUE".to_string(), "ALPHA_VALUE".to_string()],
+            "the value for `{{beta}}` must come FIRST because `{{beta}}` appears first in the \
+             path — iterating the bindings instead yields [ALPHA_VALUE, BETA_VALUE], which `run` \
+             would substitute into the wrong segments"
+        );
+
+        // A placeholder nothing binds yields an empty string rather than being SKIPPED: skipping
+        // shifts every later value one position left, which silently sends a name where an id
+        // belongs. `in_app_readiness` refuses such a route before it gets here; this keeps the
+        // alignment property true regardless.
+        assert_eq!(
+            order_path_values(&["unbound", "beta"], &bindings, &lookup),
+            vec![String::new(), "BETA_VALUE".to_string()],
+            "an unbound placeholder must hold its POSITION with an empty value, not vanish and \
+             shift the rest left"
+        );
+    }
+
+    /// **The typed launch message reaches the request, in the BODY, and never the query string.**
+    ///
+    /// Two defects in one test, because they are one fix:
+    ///
+    /// 1. **It was dropped entirely.** `GuidedFlow::to_params()` mapped 6 of `cao launch`'s 12
+    ///    parameters and the module docs asserted `POST /sessions` "has no parameter for
+    ///    `message`". It does — `CreateSessionBody.initial_message` (`api/main.py:215`) — so an
+    ///    operator's first prompt was collected by the form and silently discarded.
+    /// 2. **It must not travel in the query string**, for the reason the server itself gives at
+    ///    `api/main.py:206-212`: prompt content is potentially large (414 risk) and sensitive,
+    ///    and query strings land in access logs. Wiring it as a query parameter would have fixed
+    ///    the drop by creating the #248 defect over again.
+    ///
+    /// The `!query.contains` half is the load-bearing one: asserting only that the body carries
+    /// the message would pass even if it were **duplicated** into the query, which is the leak.
+    /// A distinctive message value is used so a substring search cannot match incidentally.
+    /// (Reported by review on PR #547.)
+    #[test]
+    fn the_launch_message_travels_in_the_body_and_never_in_the_query_string() {
+        const MESSAGE: &str = "review the diff";
+
+        let stub = StubServer::new(201, &terminal_body());
+        stub.client()
+            .create_session(&full_params())
+            .expect("a 201 must be a success");
+
+        let request = stub.next_request();
+        let body: serde_json::Value = serde_json::from_str(&request.body)
+            .unwrap_or_else(|error| panic!("body must be JSON: {error}; got {:?}", request.body));
+
+        assert_eq!(
+            body.get("initial_message")
+                .and_then(serde_json::Value::as_str),
+            Some(MESSAGE),
+            "the typed message must reach the server as `initial_message` in the JSON body — the \
+             field the endpoint has had all along. Body was {:?}",
+            request.body
+        );
+
+        assert!(
+            !request.query.contains("initial_message"),
+            "`initial_message` must NOT be a query parameter: prompt content is large and \
+             sensitive, and the query string is logged (`api/main.py:206-212`). Raw query was \
+             {:?}",
+            request.query
+        );
+        assert!(
+            !request.query.contains(MESSAGE) && !request.query.contains("review"),
+            "the message TEXT must not appear anywhere in the query string, under any key name — \
+             a leak wearing a different parameter name is the same leak. Raw query was {:?}",
+            request.query
+        );
+    }
+
+    /// **Each body field is independently optional: a message with no env vars still gets a body.**
+    ///
+    /// The body used to be built as a hard-coded `{"env_vars": ..}` emitted only when `env_vars`
+    /// was non-empty. Adding `initial_message` to that shape would have dropped the message
+    /// whenever the operator set no `--env` — which is the overwhelmingly common case, so the
+    /// fix would have appeared to work in exactly the test that populated both.
+    ///
+    /// All four combinations are asserted, including the both-absent case that must send **no
+    /// body at all** rather than `{}`.
+    #[test]
+    fn the_body_carries_whichever_of_the_two_body_fields_are_present() {
+        let params = |env: Option<BTreeMap<String, String>>, message: Option<&str>| SessionParams {
+            agents: "planner".to_string(),
+            provider: None,
+            session_name: None,
+            working_directory: None,
+            allowed_tools: None,
+            env_vars: env,
+            initial_message: message.map(str::to_string),
+        };
+        let one_var = || {
+            let mut map = BTreeMap::new();
+            map.insert("AWS_REGION".to_string(), "us-east-1".to_string());
+            map
+        };
+
+        // Message only — the case the naive fix would have broken.
+        let stub = StubServer::new(201, &terminal_body());
+        stub.client()
+            .create_session(&params(None, Some("just a prompt")))
+            .expect("201");
+        assert_eq!(
+            stub.next_request().body,
+            r#"{"initial_message":"just a prompt"}"#,
+            "a message with no env vars must still produce a body carrying the message"
+        );
+
+        // Env vars only — unchanged behaviour, asserted so the generalisation did not lose it.
+        let stub = StubServer::new(201, &terminal_body());
+        stub.client()
+            .create_session(&params(Some(one_var()), None))
+            .expect("201");
+        assert_eq!(
+            stub.next_request().body,
+            r#"{"env_vars":{"AWS_REGION":"us-east-1"}}"#,
+            "env vars with no message must produce a body carrying only env_vars"
+        );
+
+        // Both — deterministic order, so an exact body can be asserted (BR-11).
+        let stub = StubServer::new(201, &terminal_body());
+        stub.client()
+            .create_session(&params(Some(one_var()), Some("both")))
+            .expect("201");
+        assert_eq!(
+            stub.next_request().body,
+            r#"{"env_vars":{"AWS_REGION":"us-east-1"},"initial_message":"both"}"#,
+            "both fields must appear together in one body"
+        );
+
+        // Neither — no body at all, not `{}`.
+        let stub = StubServer::new(201, &terminal_body());
+        stub.client()
+            .create_session(&params(None, None))
+            .expect("201");
+        assert_eq!(
+            stub.next_request().body,
+            "",
+            "with neither body field present the request must carry NO body rather than `{{}}`"
+        );
+    }
+
     // ── Mandatory assertion 2 (BR-6a) ────────────────────────────────────────────────────
 
     /// **The outgoing query key is `agent_profile`, not `agents`** (BR-6, BR-6a, `:1690`).
@@ -1354,6 +2021,7 @@ mod tests {
                 working_directory: None,
                 allowed_tools: None,
                 env_vars: None,
+                initial_message: None,
             })
             .expect("a 201 must be a success");
 
@@ -1399,6 +2067,7 @@ mod tests {
                 working_directory: None,
                 allowed_tools: None,
                 env_vars: Some(BTreeMap::new()),
+                initial_message: None,
             })
             .expect("a 201 must be a success");
 
@@ -1790,7 +2459,7 @@ mod tests {
     /// otherwise the guard could never fail, which is the vacuous-guard trap.
     ///
     /// **`handoff.rs` legitimately holds the crate's ONE `Command`**, in `RealHost::run`, for the
-    /// tmux `select-window` navigate. That is the hand-off mechanism, not a CLI fallback, and it
+    /// tmux `switch-client` navigate. That is the hand-off mechanism, not a CLI fallback, and it
     /// is separately constrained by `no_backend_attach_call.rs`. This assertion is scoped to
     /// **this** module, where BR-2 admits no exception at all. (#321)
     #[test]
@@ -2469,6 +3138,7 @@ mod tests {
                 working_directory: None,
                 allowed_tools: None,
                 env_vars: None,
+                initial_message: None,
             })
             .expect("a 201 must be a success");
 

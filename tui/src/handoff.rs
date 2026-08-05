@@ -413,14 +413,36 @@ impl<'a, S: ServerRead, H: Host> HandoffDriver<'a, S, H> {
     /// | Condition | Action |
     /// |---|---|
     /// | herdr | Rely on the backend's existing `herdr tab focus` (`herdr_backend.py:637`) |
-    /// | tmux **and** `$TMUX` set | `tmux select-window -t <session>:<window>` |
+    /// | tmux **and** `$TMUX` set | `tmux switch-client -t <session>:<window>` |
     /// | tmux **and** `$TMUX` unset | Refuse, with the exact attach argv (FR-5.3) |
     ///
-    /// `switch-client` and a nested attach are **forbidden** as navigation (BR-4), with
-    /// reasons: `switch-client` retargets the whole client to another session — the wrong verb
-    /// for same-session navigation — and attaching from inside tmux fails outright, because
-    /// tmux refuses a nested attach by default. That would fail in precisely the case that
-    /// matters. Neither backend's attach helper is called from this crate at all
+    /// # BR-4 said `switch-client` was forbidden. BR-4's premise was wrong, and this is the
+    /// # correction
+    ///
+    /// The rule read: *"`switch-client` retargets the whole client to another session — the wrong
+    /// verb for same-session navigation"*, and prescribed `select-window` instead. **The hand-off
+    /// is not same-session navigation.** `POST /sessions` reaches `create_terminal` with
+    /// `new_session=True` (`services/session_service.py:84`), so the terminal being handed off to
+    /// lives in a session the operator's client is *not* attached to.
+    ///
+    /// `select-window` cannot move a client across sessions, and it does not fail when asked to —
+    /// live-probed on tmux 3.6a with a real client attached to session A:
+    /// `select-window -t B:planner` exits **0** with the client still on A. So `handoff()` returned
+    /// `Ok`, the pane rendered "launched in new window · …", and the operator's screen never
+    /// changed — the confident hand-off that silently does nothing, which the module docs above
+    /// name as the worst available failure. It was the *rule* that was wrong, not the code
+    /// implementing it. (Reported by review on PR #547.)
+    ///
+    /// `switch-client -t <session>:<window>` is one call that covers every case, each verified on
+    /// the same probe: cross-session (client moves, target window becomes active), same-session
+    /// (window changes, still correct if the topology ever changes), a bad session (**exit 1**,
+    /// `can't find session`), and a bad window (**exit 1**, `can't find window`, active window
+    /// untouched). Failing loudly is what lets the `Err` arm below hand back a usable
+    /// `attach-session` argv instead of reporting a move that did not happen.
+    ///
+    /// A nested attach remains forbidden, and that half of BR-4 was right: tmux refuses
+    /// `attach-session` from inside a client by default, so it would fail in exactly the case
+    /// that matters. Neither backend's attach helper is called from this crate at all
     /// (BR-1/INV-2/SR-3); `tests/no_backend_attach_call.rs` is the tripwire. (#321)
     pub fn handoff(&self, terminal: &Terminal) -> Result<Outcome, Refused> {
         let session = terminal.session_name.as_str();
@@ -483,10 +505,12 @@ impl<'a, S: ServerRead, H: Host> HandoffDriver<'a, S, H> {
             Backend::Herdr => Ok(outcome()),
 
             Backend::Tmux => match self.host.tmux_env() {
-                Some(_) => match self.host.run(&select_window_argv(&target)) {
+                Some(_) => match self.host.run(&switch_client_argv(&target)) {
                     Ok(()) => Ok(outcome()),
-                    // The window existed a moment ago and does not now — closed between the
-                    // poll and the navigate. The attach argv still gets the operator there.
+                    // The session or window existed a moment ago and does not now — closed
+                    // between the poll and the navigate. tmux exits non-zero for both cases
+                    // (probed), so this arm is reachable rather than theoretical, and the attach
+                    // argv still gets the operator there.
                     Err(failure) => Err(Refused {
                         reason: format!("could not move the tmux view to {target}: {failure}"),
                         manual_command: Some(render_argv(&attach_argv(&target))),
@@ -506,9 +530,16 @@ impl<'a, S: ServerRead, H: Host> HandoffDriver<'a, S, H> {
     }
 }
 
-/// The navigate argv: same session, different window (TS-1, ADR-01a).
-fn select_window_argv(target: &str) -> [&str; 4] {
-    ["tmux", "select-window", "-t", target]
+/// The navigate argv: move this client to `session:window`, wherever that session is (TS-1).
+///
+/// `switch-client` and not `select-window`, because the target session is a **different** session
+/// from the one the operator's client is attached to — `POST /sessions` always creates a new one.
+/// `select-window` exits 0 without moving a client across sessions, which made the whole hand-off
+/// a silent no-op. A single `session:window` target moves the client *and* selects the window; see
+/// [`HandoffDriver::handoff`] for the probe results behind each claim.
+/// (Reported by review on PR #547.)
+fn switch_client_argv(target: &str) -> [&str; 4] {
+    ["tmux", "switch-client", "-t", target]
 }
 
 /// The argv the operator runs by hand when nothing here can move their view (FR-5.3).
@@ -891,21 +922,30 @@ mod tests {
         );
     }
 
-    /// Test 6 — the tmux **navigate** branch builds `select-window`, and nothing else.
+    /// Test 6 — the tmux **navigate** branch builds `switch-client`, and nothing else.
     ///
     /// # What this proves, and what it explicitly does NOT
     ///
     /// It proves the branch selection keyed on `$TMUX` and the **exact argv constructed** —
-    /// including that the verb is `select-window` and not `switch-client` or an attach, all of
-    /// which BR-4 forbids as navigation.
+    /// including that the verb is `switch-client` and not `select-window` (which cannot move a
+    /// client across sessions) and not an attach (which tmux refuses from inside a client).
     ///
-    /// It does **not** prove that tmux moves a real operator's view, nor that the TUI survives
-    /// it. There is no tmux server running on this machine and the operator declined standing
-    /// one up inside the test, so the live behaviour of this branch is **unproven** and is
-    /// reported as such. `$TMUX` here is an injected value, not an observed one. The branch
-    /// that this machine's server actually selects is herdr. (#321)
+    /// **This assertion was inverted, and the inversion was the defect.** It used to require
+    /// `select-window` on BR-4's stated premise that a hand-off is "same-session navigation". It
+    /// is not: `POST /sessions` always creates a NEW session
+    /// (`services/session_service.py:84`, `new_session=True`), so the target is a session the
+    /// operator's client is not attached to. `select-window` exits **0** there without moving
+    /// anything — live-probed on tmux 3.6a — so this test passed while the feature did nothing.
+    /// A test can be green *because* of the bug; this was that. (Reported by review on PR #547.)
+    ///
+    /// It still does **not** prove that a real operator's view moves, nor that the TUI survives
+    /// it — that is one process spawning `tmux` against a live server, which this unit test does
+    /// not do. What backs the verb choice is a manual probe with a real client attached over a
+    /// pty, recorded in [`HandoffDriver::handoff`]'s docs: cross-session move, same-session move,
+    /// bad session (exit 1) and bad window (exit 1) were each observed. `$TMUX` here remains an
+    /// injected value. The branch this machine's server actually reports is herdr. (#321)
     #[test]
-    fn tmux_inside_tmux_builds_the_select_window_argv_and_nothing_else() {
+    fn tmux_inside_tmux_builds_the_switch_client_argv_and_nothing_else() {
         let server = FakeServer::with_backend("tmux");
         let host = FakeHost::inside_tmux();
         let driver = HandoffDriver::new(&server, &host);
@@ -920,13 +960,23 @@ mod tests {
             *host.spawned.borrow(),
             vec![vec![
                 "tmux".to_string(),
-                "select-window".to_string(),
+                "switch-client".to_string(),
                 "-t".to_string(),
                 "work:planner-1".to_string(),
             ]],
             "exactly one argv, hard-coded here rather than taken from the builder: \
-             `select-window` on the session's window. `switch-client` retargets the whole \
-             client and a nested attach fails outright, so BR-4 forbids both"
+             `switch-client` at the `session:window` target, which moves the client AND selects \
+             the window in one call. `select-window` cannot cross sessions and exits 0 anyway; a \
+             nested attach fails outright"
+        );
+
+        // The negative half, asserted separately so a regression to the old verb cannot hide
+        // behind a passing shape comparison. `select-window` is the specific wrong answer here.
+        let flattened = host.spawned.borrow().concat().join(" ");
+        assert!(
+            !flattened.contains("select-window"),
+            "`select-window` is the verb that made this hand-off a silent no-op; it must not \
+             reappear on the navigate path. Got: {flattened:?}"
         );
     }
 

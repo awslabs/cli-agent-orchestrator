@@ -285,6 +285,29 @@ pub struct SessionParams {
     /// test can assert an exact request body rather than parsing and re-comparing. (#321)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_vars: Option<BTreeMap<String, String>>,
+    /// The launch message — `cao launch`'s trailing POSITIONAL argument.
+    ///
+    /// **This field exists because the form collected the message and threw it away.** The
+    /// module docs of `guided_flow` asserted that `POST /sessions` "has no parameter for
+    /// `message`" and that it was therefore carried for an argv-building hand-off path — and
+    /// both halves were wrong. `CreateSessionBody.initial_message` has been on the endpoint all
+    /// along (`api/main.py:215`, inherited from `CreateTerminalBody`), and no code anywhere
+    /// builds a `cao launch` argv. So an operator who typed a first prompt watched it vanish.
+    /// (Reported by review on PR #547.)
+    ///
+    /// **In the body, never the query string**, for the same reason as `env_vars` and stated in
+    /// the server's own words at `api/main.py:206-212`: prompt content "can be large
+    /// (URL-length 414 risk) and sensitive (query strings are routinely captured in HTTP access
+    /// logs and traces)". A message in a query param would be the #248 defect again with a
+    /// different payload.
+    ///
+    /// `Option`, and an empty message must arrive as `None` rather than `Some("")`: the server
+    /// raises `ValueError("initial_message must not be empty")` on the empty string
+    /// (`api/main.py:1949-1950`, and again in `session_service.py:69-70`). `GuidedFlow::set`
+    /// already collapses blank text to `None` at the point of entry, so that holds by
+    /// construction here rather than by a check at this boundary. (#321)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_message: Option<String>,
 }
 
 /// The `GET /health` projection (`api/main.py:824-827`).
@@ -466,6 +489,7 @@ mod tests {
             working_directory: None,
             allowed_tools: None,
             env_vars: None,
+            initial_message: None,
         };
 
         let value = serde_json::to_value(&params).expect("SessionParams must serialise");
@@ -477,6 +501,11 @@ mod tests {
             "working_directory",
             "allowed_tools",
             "env_vars",
+            // `initial_message` matters more than the others here: the server raises
+            // `ValueError("initial_message must not be empty")` on an empty string
+            // (`api/main.py:1949-1950`), so emitting `""` for an unfilled message would turn a
+            // launch with no prompt into a 400. Omission is the only correct encoding.
+            "initial_message",
         ] {
             assert!(
                 !keys.contains(absent),
@@ -506,6 +535,7 @@ mod tests {
             working_directory: None,
             allowed_tools: None,
             env_vars: None,
+            initial_message: None,
         };
 
         let value = serde_json::to_value(&params).expect("SessionParams must serialise");
@@ -556,6 +586,7 @@ mod tests {
             working_directory: None,
             allowed_tools: None,
             env_vars: Some(env_vars),
+            initial_message: None,
         };
 
         let first = serde_json::to_string(&params(ascending)).expect("must serialise");

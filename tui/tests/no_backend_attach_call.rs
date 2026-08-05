@@ -242,6 +242,40 @@ fn forbidden_needles() -> BTreeMap<String, &'static str> {
         "std::os::unix::process::CommandExt::exec is Rust's os.execvp — it replaces the process \
          image and never returns (FR-5.1)",
     );
+    // **The idiomatic spelling, which the needle above does NOT catch.** Nobody writes
+    // `CommandExt::exec(&mut cmd)`; they write `use std::os::unix::process::CommandExt;` and then
+    // `cmd.exec()`. Probed against this needle set before the fix: that two-line form produced
+    // ZERO hits, so the one mechanism this file exists to forbid was reachable by writing it the
+    // way a Rust programmer actually would.
+    //
+    // The needle is the TRAIT NAME, not `.exec(`. Two reasons, both from trying the alternatives:
+    // `.exec(` is too broad (any method named `exec` on any type trips it), while the trait name
+    // is precise — importing `CommandExt` has exactly one purpose in this crate's context, and
+    // `exec` is the only reason to reach for it. It fires on the `use` line, which is the right
+    // place: the import is the reviewable decision.
+    // (Reported by review on PR #547.)
+    needles.insert(
+        format!("Command{}", "Ext"),
+        "importing std::os::unix::process::CommandExt brings `.exec()` into scope, and `.exec()` \
+         replaces the process image exactly as herdr's os.execvp does. The TUI must outlive every \
+         hand-off (FR-5.1), so the trait has no legitimate use here — this catches the idiomatic \
+         `use CommandExt; cmd.exec()` spelling that the qualified-path needle misses",
+    );
+    // **tmux accepts abbreviated commands**, so `attach` alone is the same call as
+    // `attach-session` — verified: `tmux attach -t X` is the documented short form. The
+    // `attach-session` needle above therefore covers only the long spelling, and spawning the
+    // short one is the identical defect (nested attach fails; from outside tmux it blocks until
+    // the operator detaches).
+    //
+    // Spelt as the ARGV FRAGMENT `"attach"` rather than the bare word, so it fires on a spawn
+    // rather than on prose. `attach_argv`'s legitimate `attach-session` string does not match this
+    // needle, and the word "attach" in a doc comment is stripped before the scan.
+    // (Reported by review on PR #547.)
+    needles.insert(
+        format!("\"att{}\"", "ach"),
+        "tmux accepts abbreviations, so `attach` is `attach-session` — spawning it is the same \
+         defect BR-4 forbids, wearing a shorter name",
+    );
     needles
 }
 
@@ -320,12 +354,26 @@ fn no_rust_source_calls_either_backend_attach_session() {
 
     for line in crate_root.lines() {
         let declaration = line.trim();
+        // `pub mod` and `pub(crate) mod` are matched too. `strip_prefix("mod ")` alone missed
+        // them, so a module declared `pub mod foo;` was invisible to this cross-check and could
+        // be omitted from SOURCES with nothing to say so — the exact silent hole the assertion
+        // exists to close, reachable by a one-word edit. Every module in this crate happens to be
+        // private today, which is why the gap was never observed. (Reported by review on PR #547.)
+        let declaration = declaration
+            .strip_prefix("pub(crate) ")
+            .or_else(|| declaration.strip_prefix("pub "))
+            .unwrap_or(declaration);
         let Some(module) = declaration
             .strip_prefix("mod ")
             .and_then(|rest| rest.strip_suffix(';'))
         else {
             continue;
         };
+        // A `mod foo { .. }` inline module has no file, so it is skipped rather than demanded.
+        // Reached only if someone writes one in `main.rs`; today none exists.
+        if module.contains('{') || module.contains(' ') {
+            continue;
+        }
         let expected = format!("src/{module}.rs");
         assert!(
             SOURCES.iter().any(|(path, _)| *path == expected),
@@ -509,5 +557,114 @@ fn the_attach_verb_is_only_ever_a_printed_string() {
         !handoff.contains("sh -c") && !handoff.contains("bash -c"),
         "no shell may be invoked anywhere in the hand-off path: session and window names come \
          from server responses, so a shell string would make them injection vectors (T-10, SR-1)"
+    );
+}
+
+/// **Every needle is findable in stripped code, and invisible inside a comment.**
+///
+/// The anti-vacuous check this file lacked. `hermeticity_tripwire.rs` has had one all along
+/// (`every_needle_is_actually_findable_in_stripped_code`) for a reason its own docs give: a needle
+/// that cannot match is a guard that cannot fire, and it is invisible to review — the list looks
+/// thorough, every test is green, and nothing is being checked.
+///
+/// Its absence here was not theoretical. Two mechanisms this file exists to forbid were reachable,
+/// and both were verified by probing the needle set directly before the fix:
+///
+/// 1. **`use CommandExt; cmd.exec()`** — the *idiomatic* spelling, and the one anybody porting
+///    herdr's `os.execvp` would write. The `CommandExt::exec` needle matches only the
+///    fully-qualified call nobody writes. Zero hits.
+/// 2. **`tmux attach -t X`** — tmux accepts abbreviations, so this is `attach-session`. The
+///    `attach-session` needle matches only the long spelling. Zero hits.
+///
+/// So this test does both halves: each needle must fire on a line that plainly contains it, and
+/// must NOT fire inside a comment — otherwise documenting this guard would trip it, which is how a
+/// tripwire gets deleted. (Reported by review on PR #547.)
+#[test]
+fn every_needle_is_findable_in_stripped_code_and_inert_in_a_comment() {
+    let needles = forbidden_needles();
+
+    assert!(
+        needles.len() >= 6,
+        "expected at least 6 needles: two attach spellings (long and abbreviated), two exec \
+         spellings (qualified path and trait import), and the two argv shapes. Found {}. A \
+         shrinking needle set is how coverage is lost quietly",
+        needles.len()
+    );
+
+    for (needle, reason) in &needles {
+        assert!(
+            !needle.contains("//"),
+            "needle {needle:?} contains `//`, which `strip_line_comment` cuts at outside a string \
+             literal — it could never match, so it is a guard that cannot fire"
+        );
+        assert!(
+            reason.len() > 30,
+            "needle {needle:?} must carry a reason a reviewer can evaluate, not a label"
+        );
+
+        let planted = format!("let x = {needle};");
+        assert!(
+            code_only(&planted).contains(needle),
+            "needle {needle:?} was not found in a line that plainly contains it — the scan cannot \
+             detect what it claims to detect"
+        );
+
+        let commented = format!("// prose mentioning {needle} harmlessly");
+        assert!(
+            !code_only(&commented).contains(needle),
+            "needle {needle:?} survived comment stripping; prose naming the forbidden vocabulary \
+             must be safe or nobody can document this guard"
+        );
+    }
+}
+
+/// **The two evasions found by review are caught**, asserted on the real needle set.
+///
+/// A regression test for the coverage gap itself rather than for a source file: these are the exact
+/// code shapes that produced zero hits before the needles were extended. Written as synthetic
+/// snippets because the whole point is that no file in the crate contains them — so there is
+/// nothing to scan, and the property has to be checked against the needle set directly.
+///
+/// The `attach_argv` control at the end is what keeps this from being a one-way ratchet: the
+/// legitimate display-only builder must NOT match the new abbreviation needle, or the tripwire
+/// would fire on the very string FR-5.3 requires it to produce.
+#[test]
+fn the_idiomatic_exec_and_the_abbreviated_attach_verb_are_both_caught() {
+    let needles = forbidden_needles();
+    let caught = |snippet: &str| {
+        let code = code_only(snippet);
+        needles.keys().any(|needle| code.contains(needle))
+    };
+
+    assert!(
+        caught("use std::os::unix::process::CommandExt;"),
+        "the CommandExt IMPORT must be caught: `use CommandExt; cmd.exec()` is how process \
+         replacement is actually written, and the qualified-path needle misses it entirely"
+    );
+    assert!(
+        caught("Command::new(\"tmux\").args([\"attach\", \"-t\", target]).status();"),
+        "the ABBREVIATED tmux attach verb must be caught: tmux accepts abbreviations, so `attach` \
+         is `attach-session` and spawning it is the identical defect"
+    );
+
+    // Controls. Both must be caught for the same reason they always were.
+    assert!(
+        caught("Command::new(\"tmux\").args([\"attach-session\", \"-t\", t]).status();"),
+        "the long spelling must still be caught"
+    );
+    assert!(
+        caught("std::os::unix::process::CommandExt::exec(&mut cmd);"),
+        "the qualified path must still be caught"
+    );
+
+    // And the NEGATIVE control: the legitimate refusal-string builder must not match the new
+    // abbreviation needle. A guard that fires on FR-5.3's own output would be deleted within a day.
+    assert!(
+        !needles
+            .keys()
+            .any(|needle| needle == &format!("\"att{}\"", "ach")
+                && code_only("[\"tmux\", \"attach-session\", \"-t\", target]").contains(needle)),
+        "the abbreviation needle must not match the long-form `attach-session` string that \
+         `attach_argv` legitimately builds — that string is budgeted and accounted for elsewhere"
     );
 }

@@ -205,24 +205,89 @@ const HTTP_OWNER: (&str, &str, &str) = (
      all: this is the module where a CLI fallback would be written",
 );
 
-/// Truncates one line at its `//`, so vocabulary named in prose is not mistaken for code.
+/// Returns `line` up to a `//` that is **not inside a string literal**.
 ///
-/// Same stripping rule as `no_backend_attach_call.rs`, and it carries the same caveat: it is not
-/// a lexer, and it can only ever *weaken* this scan by hiding real code — it removes text rather
-/// than adding it, so it cannot manufacture a pass for code that is present. Applied per line
-/// rather than to the whole file because a violation must report its **line number** (BR-10).
+/// Applied per line rather than to the whole file because a violation must report its **line
+/// number** (BR-10).
 ///
-/// **It has one consequence that silently breaks needles, and it is the reason the URL scheme
-/// needles below are spelt without their slashes.** Truncating at the first `//` cuts
-/// `http://host` down to `http:` — so a needle written as the full `http://` would be
-/// **unfindable in stripped code**, matching nothing, ever. That is a needle that cannot fire:
-/// the vacuous-guard failure mode, in a form no amount of reading catches.
-/// [`every_needle_is_actually_findable_in_stripped_code`] exists specifically to catch it. (#321)
+/// # This used to cut at the first `//` anywhere, and that weakened the scan
+///
+/// The claim justifying the simpler form was that it "can only ever *weaken* this scan by hiding
+/// real code", which is true and was treated as acceptable. It is not: hiding real code is exactly
+/// how a forbidden call goes unnoticed. `no_backend_attach_call.rs` fixed its copy of this function
+/// for that reason, and this one was left behind still carrying a comment claiming the two were the
+/// same rule — so the doc asserted parity that no longer existed.
+///
+/// **Measured across the crate before this change: 21 lines where the naive form hides code the
+/// string-aware form keeps.** They are not hypothetical: `src/server.rs:871` builds
+/// `format!("http://{{host}}:{{port}}")`, so everything after the scheme's `//` on that line — the
+/// live URL construction in the module that owns all HTTP — was invisible to this scan.
+///
+/// The obvious alternative repair, stripping only lines whose trimmed form *starts* with `//`,
+/// fails in the worse direction: a trailing `let x = 1; // never call TcpStream` would survive into
+/// the scanned text and fire the tripwire on prose, and this crate has many such trailing comments.
+/// So the scan tracks whether it is inside a string literal, which is enough for this crate's
+/// syntax and no more.
+///
+/// The URL scheme needles below stay spelt without their slashes. That is now belt-and-braces
+/// rather than a requirement, and [`every_needle_is_actually_findable_in_stripped_code`] is what
+/// keeps it honest either way. (#321, and review on PR #547)
 fn strip_comment(line: &str) -> &str {
-    match line.find("//") {
-        Some(comment_start) => &line[..comment_start],
-        None => line,
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            // An escape inside a string consumes the next byte, so `\"` does not end the literal.
+            b'\\' if in_string => index += 1,
+            b'"' => in_string = !in_string,
+            b'/' if !in_string && bytes.get(index + 1) == Some(&b'/') => return &line[..index],
+            _ => {}
+        }
+        index += 1;
     }
+    line
+}
+
+/// The stripper keeps code after a URL literal, and still strips trailing comments.
+///
+/// Both directions, because the two plausible implementations each fail one of them, and a test
+/// asserting only one would license the other bug. The first case is taken from real code —
+/// `src/server.rs` builds `http://{host}:{port}` — which is what made the previous
+/// implementation's stated assumption false here just as it was in the sibling file.
+/// (Review on PR #547.)
+#[test]
+fn the_stripper_keeps_code_after_a_url_literal_and_still_strips_trailing_comments() {
+    let scheme = format!("http{}", "://");
+    // Assembled from fragments, like every needle in this file, so THIS TEST's own body does not
+    // contain the forbidden vocabulary contiguously. Written out verbatim first, and the run
+    // failed: the stricter stripper — which is the whole point of the change — no longer hid these
+    // strings, so the tripwire fired on itself at three lines. That is the same self-exemption trap
+    // `forbidden_needles`' docs record about its `reason` strings, met from the other side.
+    let stream = format!("Tcp{}", "Stream");
+    let socket = format!("Udp{}", "Socket");
+
+    // A needle after a URL literal on the same line must survive stripping.
+    let line = format!("let url = \"{scheme}host\"; let leak = {stream}::connect(addr);");
+    let stripped = strip_comment(&line);
+    assert!(
+        stripped.contains(&stream),
+        "code after a URL literal must survive: cutting at the `//` inside the scheme hides it, \
+         and a hidden forbidden call is a scan that reports success. Got: {stripped:?}"
+    );
+
+    // A genuine trailing comment must still be removed, or prose trips the guard.
+    let commented = format!("let x = 1; // never call {stream}::connect");
+    assert_eq!(
+        strip_comment(&commented).trim(),
+        "let x = 1;",
+        "a trailing comment must still be stripped, or documenting this guard becomes a hazard"
+    );
+
+    // A whole-line comment strips to nothing.
+    let prose = format!("    // prose about {socket}");
+    assert_eq!(strip_comment(&prose).trim(), "");
 }
 
 /// The forbidden network vocabulary, each mapped to why it is forbidden.

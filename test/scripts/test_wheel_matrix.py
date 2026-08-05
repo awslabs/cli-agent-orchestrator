@@ -462,6 +462,113 @@ class TestMacosCrossCompileTarget:
             build_tui._requested_macos_arch()
 
 
+class TestReleaseToolchainInstallsEveryCrossTarget:
+    """Every cross-compiled leg must INSTALL the Rust target it asks cargo to build for.
+
+    The defect this locks in was real and release-only: the toolchain step installed
+    ``stable`` with no ``targets:`` while ``build_tui.py`` passed
+    ``--target x86_64-apple-darwin`` under cibuildwheel's ``ARCHFLAGS=-arch x86_64``. The
+    runner images ship host-target-only rustup, so that leg failed on "target may not be
+    installed" — and ``publish-testpypi`` ``needs: build-wheels``, so the first release after
+    merge would have died. No PR check could catch it: this workflow runs only on release and
+    ``workflow_dispatch``. (Reported by review on PR #547.)
+
+    Asserted against the PARSED yaml and against ``build_tui.py``'s own arch map, not against
+    a string in the file. A grep for ``targets:`` would keep passing if a fifth leg were added
+    later without one, which is the same silence the original defect had.
+    """
+
+    WORKFLOW = REPO_ROOT / ".github" / "workflows" / "publish-to-pypi.yml"
+
+    @staticmethod
+    def _wheel_matrix() -> list:
+        import yaml
+
+        workflow = yaml.safe_load(
+            TestReleaseToolchainInstallsEveryCrossTarget.WORKFLOW.read_text(encoding="utf-8")
+        )
+        return workflow["jobs"]["build-wheels"]["strategy"]["matrix"]["include"]
+
+    @staticmethod
+    def _toolchain_step() -> dict:
+        import yaml
+
+        workflow = yaml.safe_load(
+            TestReleaseToolchainInstallsEveryCrossTarget.WORKFLOW.read_text(encoding="utf-8")
+        )
+        steps = workflow["jobs"]["build-wheels"]["steps"]
+        matches = [s for s in steps if "dtolnay/rust-toolchain" in str(s.get("uses", ""))]
+        assert len(matches) == 1, (
+            f"expected exactly one rust-toolchain step in build-wheels, found {len(matches)}; "
+            "this test reads that one step's `targets:` input"
+        )
+        return matches[0]
+
+    def test_the_toolchain_step_installs_the_matrix_target(self):
+        """The step must take its target FROM the matrix, not hard-code one leg's triple."""
+        step = self._toolchain_step()
+        targets = step.get("with", {}).get("targets")
+        assert targets is not None, (
+            "the rust-toolchain step declares no `targets:` input, so a cross-compiled leg "
+            "builds for a target whose std was never installed — release-only breakage"
+        )
+        assert targets.strip() == "${{ matrix.rust-target }}", (
+            "`targets:` must be driven by the matrix so each leg installs its OWN target; "
+            f"got {targets!r}"
+        )
+
+    def test_every_leg_declares_a_rust_target_key(self):
+        """A leg with no key at all silently expands to an empty target — the original bug.
+
+        An absent key and an intentionally-empty one look identical to the action, so the key
+        is required on every leg to force the choice to be made once per platform.
+        """
+        missing = [leg["label"] for leg in self._wheel_matrix() if "rust-target" not in leg]
+        assert not missing, f"these wheel legs declare no `rust-target`: {missing}"
+
+    def test_macos_cross_legs_name_the_triple_build_tui_will_pass_to_cargo(self):
+        """The matrix triple and `build_tui.py`'s ARCHFLAGS map must be the same string.
+
+        Two independent copies of one triple; a typo in either produces a leg that installs
+        one target and builds for another. Derived from the script's map rather than repeated
+        as a literal, so the two cannot drift apart without failing here.
+        """
+        host_arch_for_macos_runner = "arm64"  # `macos-latest` has been arm64 since macOS 14
+        for leg in self._wheel_matrix():
+            if not str(leg["os"]).startswith("macos"):
+                continue
+            expected = (
+                ""
+                if leg["archs"] == host_arch_for_macos_runner
+                else build_tui._ARCHFLAGS_TO_RUST_TARGET[leg["archs"]]
+            )
+            assert leg["rust-target"] == expected, (
+                f"leg {leg['label']!r} builds for arch {leg['archs']!r}, which "
+                f"build_tui.py maps to {expected!r}, but the matrix installs "
+                f"{leg['rust-target']!r}"
+            )
+
+    def test_a_non_host_arch_leg_cannot_declare_an_empty_target(self):
+        """The guard's own negative control: it must REJECT the pre-fix configuration.
+
+        Without this, `test_macos_cross_legs_name_the_triple...` could be satisfied by a map
+        that returns `""` for everything. Here the x86_64 leg is forced back to the empty
+        value the workflow shipped with, and the same comparison must fail.
+        """
+        pre_fix_leg = {
+            "os": "macos-latest",
+            "label": "macOS x86_64",
+            "archs": "x86_64",
+            "rust-target": "",
+        }
+        expected = build_tui._ARCHFLAGS_TO_RUST_TARGET[pre_fix_leg["archs"]]
+        assert expected, "the arch map must yield a non-empty triple for a cross-built arch"
+        assert pre_fix_leg["rust-target"] != expected, (
+            "the pre-fix configuration must not compare equal to the fixed one, or the "
+            "assertion above cannot fail on the defect it exists to catch"
+        )
+
+
 # ---------------------------------------------------------------------------------------
 # Configuration invariants
 # ---------------------------------------------------------------------------------------

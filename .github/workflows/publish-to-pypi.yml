@@ -41,10 +41,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `rust-target` is the triple rustup must INSTALL for this leg, and it is empty for
+          # every leg that builds for its own host. It exists because a cross-build needs the
+          # target's std installed BEFORE cargo runs, and the runner images ship
+          # host-target-only rustup — a missing one fails with "target may not be installed",
+          # which no PR check can see because this whole workflow runs only at release time.
+          # It must stay in lock-step with `scripts/build_tui.py`'s `_ARCHFLAGS_TO_RUST_TARGET`;
+          # `test_wheel_matrix.py` asserts that agreement rather than trusting it. (#321)
+          #
           # macOS arm64 — native on GitHub's `macos-latest` (arm64 since macOS 14).
           - os: macos-latest
             label: macOS arm64
             archs: arm64
+            rust-target: ''
           # macOS x86_64 — CROSS-COMPILED from the same arm64 runner. cibuildwheel sets
           # ARCHFLAGS, hatchling's tag inference honours it, and scripts/build_tui.py maps it
           # to `--target x86_64-apple-darwin`. See the UNVERIFIED note below: the binary
@@ -52,12 +61,15 @@ jobs:
           - os: macos-latest
             label: macOS x86_64
             archs: x86_64
+            rust-target: x86_64-apple-darwin
           - os: ubuntu-latest
             label: Linux x86_64
             archs: x86_64
+            rust-target: ''
           - os: windows-latest
             label: Windows AMD64
             archs: AMD64
+            rust-target: ''
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
@@ -84,10 +96,20 @@ jobs:
       # SHA-pinned, not `@stable`: `stable` is a mutable BRANCH on this action's repo, so
       # `@stable` re-resolves on every run and is unreviewable supply chain. The toolchain
       # channel is selected by the `toolchain` input, which is what `@stable` really did.
+      #
+      # `targets:` is what makes the macOS x86_64 leg compile at all. `build_tui.py` passes
+      # `--target x86_64-apple-darwin` whenever cibuildwheel sets `ARCHFLAGS=-arch x86_64`,
+      # and cargo cannot build for a target whose std is not installed. Without this the leg
+      # dies on "target may not be installed", and because `publish-testpypi` `needs:
+      # build-wheels`, the FIRST release after this lands would fail outright. The action
+      # expands the input to `rustup toolchain install <channel> --target <triple>`; an empty
+      # value expands to nothing, which is correct for the three host-target legs.
+      # (Reported by review on PR #547.)
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable @ 2026-07-16
         if: runner.os != 'Linux'
         with:
           toolchain: stable
+          targets: ${{ matrix.rust-target }}
 
       # Builds, repairs, and SMOKE-TESTS one wheel per platform. The smoke test
       # (`[tool.cibuildwheel] test-command`) installs the wheel and RUNS `cao tui`, so a

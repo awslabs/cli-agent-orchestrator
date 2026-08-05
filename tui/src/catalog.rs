@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **61 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **65 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,14 +64,22 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **61, not the 60 the design records** — and the discrepancy is a prediction coming true
+/// **65 as of this branch.** The four `cao memory relationships *` leaves were added to the CLI by
+/// PR #524 (issue #511, commit `8e8695a`, 2026-08-03) and landed on `main` before this branch
+/// merged it — and this table was never updated, so the TUI simply did not know they existed. That
+/// is the exact silence `CommandId`'s docs claim the closed enum eliminated: the enum makes an
+/// *unclassified variant* a compile error, but nothing made a *missing* variant anything at all.
+/// `test/test_command_catalog_matches_click.py` now walks the live Click tree and fails on the
+/// difference, which is the check that was absent. (Reported by review on PR #547.)
+///
+/// The count below the four additions was **61, not the 60 the design records** — and the discrepancy is a prediction coming true
 /// rather than a defect. `business-logic-model.md` wrote that `cao tui` was "absent from the
 /// table … `skeleton-wheel-bundle` adds the subcommand"; Bolt 1 then added it. The affirmed
 /// distribution of 33/5/22 no longer summed, so `cao tui` was classified — HIDE, because the TUI
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 61;
+const COMMAND_COUNT: usize = 65;
 
 /// What the TUI does with a command.
 ///
@@ -168,7 +176,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 61 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 65 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -203,6 +211,10 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::MemoryLint,
     CommandId::MemoryList,
     CommandId::MemoryPromote,
+    CommandId::MemoryRelationshipsInspect,
+    CommandId::MemoryRelationshipsList,
+    CommandId::MemoryRelationshipsPromote,
+    CommandId::MemoryRelationshipsReject,
     CommandId::MemoryRepair,
     CommandId::MemoryShow,
     CommandId::ProfileCreate,
@@ -235,7 +247,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkflowValidate,
 ];
 
-/// One variant per leaf command — **all 61**.
+/// One variant per leaf command — **all 65**.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -316,6 +328,14 @@ pub enum CommandId {
     MemoryList,
     /// `cao memory promote`
     MemoryPromote,
+    /// `cao memory relationships inspect`
+    MemoryRelationshipsInspect,
+    /// `cao memory relationships list`
+    MemoryRelationshipsList,
+    /// `cao memory relationships promote`
+    MemoryRelationshipsPromote,
+    /// `cao memory relationships reject`
+    MemoryRelationshipsReject,
     /// `cao memory repair`
     MemoryRepair,
     /// `cao memory show`
@@ -727,6 +747,66 @@ fn entry(id: CommandId) -> Command {
                 "no HTTP route: PromotionService is in-process (memory.py:815); OQ-6",
             ),
         },
+        // ── `cao memory relationships *` — all four HIDE ────────────────────────────────
+        //
+        // Added to the CLI by PR #524 (issue #511) and MISSING from this table until review on
+        // PR #547 caught it. HIDE is not a shrug: `project.md`'s mandated rule is that a new or
+        // unclassified CAO command **defaults to HIDE in the TUI** until it is deliberately
+        // classified, so that an unvetted command cannot surface half-working. Classifying them
+        // IN-APP is a separate, reviewable decision.
+        //
+        // Routes DO exist (`GET /memory/relationships` at `api/main.py:3770`, `POST` at `:3801`,
+        // `PATCH /{relationship_id}` at `:3829`, `POST /{relationship_id}/promote` at `:3854`),
+        // and `promote`/`reject` are curation actions that MUTATE stored memory — which is
+        // exactly the kind of command that must not become reachable by accident. `reject` maps
+        // to the PATCH route, and `Method` here has no `Patch` variant, so wiring it would widen
+        // the transport enum too.
+        CommandId::MemoryRelationshipsInspect => Command {
+            id: CommandId::MemoryRelationshipsInspect,
+            parent: Some("memory relationships"),
+            leaf_name: "inspect",
+            summary: "Show one relationship's endpoints, provenance, status, and timestamps.",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "relationship_id", required: true, kind: ParamKind::Text },
+                Param { name: "--format", required: false, kind: ParamKind::Text },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::MemoryRelationshipsList => Command {
+            id: CommandId::MemoryRelationshipsList,
+            parent: Some("memory relationships"),
+            leaf_name: "list",
+            summary: "List relationships (default: active).",
+            policy: Policy::Hidden,
+            params: &[
+                Param { name: "--scope", required: false, kind: ParamKind::Text },
+                Param { name: "--scope-id", required: false, kind: ParamKind::Text },
+                Param { name: "--source-key", required: false, kind: ParamKind::Text },
+                Param { name: "--status", required: false, kind: ParamKind::Text },
+                Param { name: "--stale", required: false, kind: ParamKind::Flag },
+                Param { name: "--format", required: false, kind: ParamKind::Text },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::MemoryRelationshipsPromote => Command {
+            id: CommandId::MemoryRelationshipsPromote,
+            parent: Some("memory relationships"),
+            leaf_name: "promote",
+            summary: "Promote a proposal to active.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "relationship_id", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
+        CommandId::MemoryRelationshipsReject => Command {
+            id: CommandId::MemoryRelationshipsReject,
+            parent: Some("memory relationships"),
+            leaf_name: "reject",
+            summary: "Reject a proposal.",
+            policy: Policy::Hidden,
+            params: &[Param { name: "relationship_id", required: true, kind: ParamKind::Text }],
+            handoff_reason: None,
+        },
         CommandId::MemoryRepair => Command {
             id: CommandId::MemoryRepair,
             parent: Some("memory"),
@@ -1098,7 +1178,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 33 IN-APP / 5 HANDOFF / 23 HIDE, totalling 61.**
+    /// Test 1 — **the policy distribution is 22 IN-APP / 16 HANDOFF / 27 HIDE, totalling 65.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1123,28 +1203,36 @@ mod tests {
     /// so they cannot run captured in-pane at all. `decisions.md:121` had claimed "33 of 38 IN-APP
     /// commands have a route" — the real figure is 21 served plus `profile find` client-side.
     /// The count reached 22/16/23 only after being wrong at 38/7/15, 33/5/22, and 33/5/24. (#321)
+    ///
+    /// **Then four commands turned up that had been missing entirely.** `cao memory relationships`
+    /// {list, inspect, promote, reject} were added to the CLI by PR #524 (issue #511) and never
+    /// reached this table, so the figures were 22/16/23 = 61 while the Click tree had 65 leaves.
+    /// All four are HIDE, per `project.md`'s mandated default for an unclassified command, giving
+    /// **22/16/27 = 65**. Note what the shape of this failure was: every count here was internally
+    /// consistent and every test green, because nothing compared the table against the CLI. That
+    /// is what `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
     #[test]
-    fn the_policy_distribution_is_twentytwo_sixteen_twentythree() {
+    fn the_policy_distribution_is_twentytwo_sixteen_twentyseven() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 22, "expected 22 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 16, "expected 16 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 23, "expected 23 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 27, "expected 27 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            61,
-            "the three policy counts must account for all 61 leaf commands of the Click tree"
+            65,
+            "the three policy counts must account for all 65 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 61 does not prove 61 *distinct* commands were counted: a
+        // The three counts summing to 65 does not prove 65 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            61,
-            "DISPLAY_ORDER must list 61 DISTINCT commands; a duplicate would let one command go \
+            65,
+            "DISPLAY_ORDER must list 65 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1166,7 +1254,7 @@ mod tests {
     ///
     /// Neither existing guard catches it. [`the_policy_distribution_is_twentytwo_sixteen_twentythree`]
     /// counts what `DISPLAY_ORDER` *contains*, so a variant missing from it is simply never
-    /// counted; and its `distinct.len() == 61` assertion detects a **duplicate**, which is the
+    /// counted; and its `distinct.len() == 65` assertion detects a **duplicate**, which is the
     /// opposite direction. [`COMMAND_COUNT`] pins the array's *length*, never its membership.
     ///
     /// # Why an exhaustive match and NOT a discriminant trick
@@ -1242,6 +1330,10 @@ mod tests {
                     CommandId::MemoryLint => CommandId::MemoryLint,
                     CommandId::MemoryList => CommandId::MemoryList,
                     CommandId::MemoryPromote => CommandId::MemoryPromote,
+                    CommandId::MemoryRelationshipsInspect => CommandId::MemoryRelationshipsInspect,
+                    CommandId::MemoryRelationshipsList => CommandId::MemoryRelationshipsList,
+                    CommandId::MemoryRelationshipsPromote => CommandId::MemoryRelationshipsPromote,
+                    CommandId::MemoryRelationshipsReject => CommandId::MemoryRelationshipsReject,
                     CommandId::MemoryRepair => CommandId::MemoryRepair,
                     CommandId::MemoryShow => CommandId::MemoryShow,
                     CommandId::ProfileCreate => CommandId::ProfileCreate,
@@ -1308,6 +1400,10 @@ mod tests {
                 CommandId::MemoryLint,
                 CommandId::MemoryList,
                 CommandId::MemoryPromote,
+                CommandId::MemoryRelationshipsInspect,
+                CommandId::MemoryRelationshipsList,
+                CommandId::MemoryRelationshipsPromote,
+                CommandId::MemoryRelationshipsReject,
                 CommandId::MemoryRepair,
                 CommandId::MemoryShow,
                 CommandId::ProfileCreate,
