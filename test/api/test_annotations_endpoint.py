@@ -500,14 +500,21 @@ class TestUnknownKindsAreIgnored:
         `LANE_SCOPES` table in the service would have passed here. Both sides of
         the seam are now guarded by the same list.
         """
-        for term in ("track_id", "lane_source", "lane_scope", "cross-lane",
-                     "task-prefix", "worktree", "base_branch", "commit_short",
-                     "vcs"):
+        for term in (
+            "track_id",
+            "lane_source",
+            "lane_scope",
+            "cross-lane",
+            "task-prefix",
+            "worktree",
+            "base_branch",
+            "commit_short",
+            "vcs",
+        ):
             assert term in _CONDUCTOR_TERMS
         # It must be able to FAIL: a term planted in a literal is caught.
-        planted = ['annotations', 'lane_scope', 'coverage']
-        assert [t for t in planted
-                if any(term in t for term in _CONDUCTOR_TERMS)] == ['lane_scope']
+        planted = ["annotations", "lane_scope", "coverage"]
+        assert [t for t in planted if any(term in t for term in _CONDUCTOR_TERMS)] == ["lane_scope"]
         # And the field this feature added is not itself a vocabulary term.
         assert not any(term in "colour_key" for term in _CONDUCTOR_TERMS)
 
@@ -887,9 +894,7 @@ class TestOpaqueIdentityToken:
         body = client.get("/annotations").json()
         assert body["annotations"][0]["colour_key"] is None
 
-    def test_a_token_that_is_not_a_string_is_refused_rather_than_stringified(
-        self, client, root
-    ):
+    def test_a_token_that_is_not_a_string_is_refused_rather_than_stringified(self, client, root):
         """A number is not an opaque token, and coercing one would invent a colour."""
         for value in (12, True, None, {"a": 1}, ["x"]):
             _publish(root, "campaign", {"annotations": [_item(colour_key=value)]})
