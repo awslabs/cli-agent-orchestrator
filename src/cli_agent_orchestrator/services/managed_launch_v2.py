@@ -386,8 +386,11 @@ _PINNED_PROVIDER = {
 # Provider startup includes profile MCP handshakes. Ten seconds was shorter
 # than a healthy Codex 0.146.0 cold start with the campaign's MCP inventory,
 # producing a permanently false readiness receipt for a pane that became idle
-# moments later. Match the existing provider-initialization runway.
-NATIVE_PANE_READY_TIMEOUT_SECONDS = 60.0
+# moments later.  The value is the shared native cold-start runway defined in
+# ``native_tui_launch`` -- the same boot the Kimi rendered-header proof waits
+# on at an earlier phase, so both layers take it from the one constant rather
+# than from two literals that can drift back into contradiction (COND-0314).
+NATIVE_PANE_READY_TIMEOUT_SECONDS = native_tui_launch.NATIVE_COLD_START_RUNWAY_SECONDS
 _NATIVE_PANE_READY_POLL_SECONDS = 0.1
 
 #: Machine-readable reasons for a native admission that wrote no bytes.

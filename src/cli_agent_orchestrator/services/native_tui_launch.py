@@ -85,12 +85,30 @@ LAUNCH_SCHEMA = "cao-native-tui-launch-v1"
 OBSERVATION_SCHEMA = "cao-native-tui-pane-observation-v1"
 INNER_EXEC_CONVERGENCE_TIMEOUT_SECONDS = 2.0
 INNER_EXEC_CONVERGENCE_POLL_SECONDS = 0.05
+#: The cold-start runway one native provider boot is allowed, defined once
+#: for every launch-phase wait that observes that boot.  The v2 seam lets a
+#: launched pane take this long to become input-ready
+#: (``managed_launch_v2.NATIVE_PANE_READY_TIMEOUT_SECONDS`` is this same
+#: constant): provider startup includes profile MCP handshakes, and a
+#: healthy cold start on a loaded host does not fit in a short boot window.
+#: One constant rather than per-layer literals, because the layers observe
+#: the *same* boot at different phases -- two independent values already
+#: drifted into contradiction once (COND-0314), and no layer may quietly
+#: widen or narrow a boot another layer's evidence depends on.
+NATIVE_COLD_START_RUNWAY_SECONDS = 60.0
 #: How long to wait for a title-rewriting Kimi build to render the native
 #: header that proves the resumed session, and how often to re-read it.  The
-#: header paints during boot, well before the composer is ready, so this bound
-#: is a slow-boot backstop rather than a steady-state wait; a pane that never
-#: renders it freezes rather than publishing an unproven attachment.
-KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS = 15.0
+#: header is the first thing the boot paints, so the window must cover the
+#: whole cold-start runway the launch tolerates: the installed 15 s backstop
+#: froze a legitimate cold/loaded Kimi 0.31.0 boot whose exact header painted
+#: after it (COND-0314 -- the same stable pane subsequently rendered the
+#: exact bound session, version, and worktree, too late to be admitted; the
+#: launch had already failed closed before task delivery).  One adequate
+#: bounded observation window, never a retry: a pane that never renders the
+#: header within the runway freezes rather than publishing an unproven
+#: attachment, and the freeze detail names the exact deadline it observed
+#: under.
+KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS = NATIVE_COLD_START_RUNWAY_SECONDS
 KIMI_RENDER_CONVERGENCE_POLL_SECONDS = 0.1
 ENV_EXECUTABLE = os.path.realpath("/usr/bin/env")
 MAX_SHEBANG_LINE_BYTES = 512

@@ -410,6 +410,63 @@ async def test_a_kimi_0310_pane_that_rewrote_its_title_is_certified_via_the_rend
 
 
 @pytest.mark.asyncio
+async def test_a_kimi_0310_pane_that_never_renders_within_the_runway_blocks_with_zero_task_bytes(
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
+):
+    """COND-0314, the production r4 shape: freeze before task delivery.
+
+    The live failure ended ``pane_render_does_not_show_bound_session: the
+    pane did not render a native header proving session '...' within 15
+    seconds`` with ``task_bytes_submitted=false``.  The bound is now the
+    shared cold-start runway; a pane that still never proves its session
+    inside it must fail the same closed way — blocked before delivery, no
+    readiness receipt, the attachment frozen — never admitted, retried, or
+    replayed.
+    """
+    monkeypatch.setattr(bridge, "provider_version_banner", lambda *a, **k: "kimi 0.31.0")
+    # A short stand-in for the runway: the deadline path is what is under
+    # test here, not its wall-clock length.  The exact value and its boundary
+    # behaviour are pinned in the native_tui_launch suite against a fake
+    # clock; this seam test must not pay the real 60-second boot budget.
+    monkeypatch.setattr(native_tui_launch, "KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(native_tui_launch, "KIMI_RENDER_CONVERGENCE_POLL_SECONDS", 0.01)
+
+    rewritten_argv = ["kimi-code", "", "", "", ""]
+
+    def _rewritten_observe(self):
+        return {
+            "pane_id": "%7",
+            "pid": harness.observed_pid,
+            "start_marker": "Thu Jul 24 10:00:00 2026",
+            "argv": list(rewritten_argv),
+            "cwd": self._record["working_directory"],
+        }
+
+    monkeypatch.setattr(v2._V2NativePane, "observe", _rewritten_observe)
+    # The pane paints a boot screen forever: the bound session's header
+    # never renders inside the runway.
+    monkeypatch.setattr(v2._V2NativePane, "capture_render", lambda self, pane_id: ["booting"])
+
+    record, result = await _launch(worktree, tmp_path)
+
+    assert result["state"] == "preflight_blocked"
+    failure = result["preflight_failure"]
+    assert failure["reason"] == v2.PREFLIGHT_REASON_TUI_LAUNCH_REFUSED
+    assert failure["task_bytes_submitted"] is False
+    assert "pane_render_does_not_show_bound_session" in failure["detail"]
+    assert "did not render" in failure["detail"]
+    # Zero delivery anywhere: no readiness receipt, no provider turn, and
+    # the attachment frozen against any later claim.
+    with pytest.raises(Exception):
+        _published_receipt(record["reservation_id"])
+    assert "session/prompt" not in harness.transport.calls
+    attachment = native_attachment.get("kimi_cli", SESSION_ID)
+    assert attachment is not None
+    assert attachment["state"] == native_attachment.AMBIGUOUS
+    assert attachment["ambiguity_reason"] == "pane_render_does_not_show_bound_session"
+
+
+@pytest.mark.asyncio
 async def test_the_native_launch_starts_no_acp_bridge(
     isolated_memory_db, worktree, tmp_path, harness
 ):
