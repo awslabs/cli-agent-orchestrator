@@ -11,13 +11,17 @@ import {
   activeFilterCount,
   callerVocabulary,
   collectFacetDimensions,
+  collectLabelDimensions,
+  dimensionMerit,
   displayStatus,
   emptyFacetSelection,
   emptyFilters,
+  facetStats,
   fleetWideFacetKeys,
   groupDimensions,
   isFilterActive,
   isFleetWide,
+  LABEL_DIMENSION_PREFIX,
   lifecycleVocabulary,
   matchesFilters,
   profileVocabulary,
@@ -436,5 +440,170 @@ describe('filter activity accounting', () => {
     expect(isFilterActive(f)).toBe(true)
     // Two selected pills are ONE constrained dimension.
     expect(activeFilterCount(f)).toBe(3)
+  })
+})
+
+describe('label dimensions: one per kind, values are the annotations’ labels', () => {
+  it('collects a label:-prefixed dimension per kind, in first-appearance order', () => {
+    const rows = [
+      {
+        annotations: [
+          annotation({ kind: 'display', label: 'reported' }),
+          annotation({ kind: 'badge', label: 'cond-01' }),
+        ],
+      },
+      {
+        annotations: [
+          annotation({ kind: 'display', label: 'waiting' }),
+          annotation({ kind: 'badge', label: 'cond-01' }),
+        ],
+      },
+    ]
+    const dims = collectLabelDimensions(rows)
+    expect(dims.map(d => d.key)).toEqual([`${LABEL_DIMENSION_PREFIX}display`, `${LABEL_DIMENSION_PREFIX}badge`])
+    const badge = dims[1]
+    // Row-counted, like facet values: two rows carry cond-01.
+    expect(badge.values).toEqual([{ value: 'cond-01', rows: 2 }])
+    expect(badge.carriers).toBe(2)
+    expect(badge.control).toBe('pills')
+  })
+
+  it('counts a repeated label on one row once', () => {
+    const rows = [{
+      annotations: [
+        annotation({ kind: 'display', label: 'waiting' }),
+        annotation({ kind: 'display', label: 'waiting', priority: 10 }),
+      ],
+    }]
+    const [dim] = collectLabelDimensions(rows)
+    expect(dim.values).toEqual([{ value: 'waiting', rows: 1 }])
+    expect(dim.carriers).toBe(1)
+  })
+
+  it('humanises the kind for the label without parsing it', () => {
+    const [dim] = collectLabelDimensions([
+      { annotations: [annotation({ kind: 'some-producer.kind_2031', label: 'x' })] },
+    ])
+    expect(dim.label).toBe('some producer kind 2031')
+  })
+
+  it('treats round-suffixed labels as identity-shaped by shape, never by parsing the suffix', () => {
+    // "parked · r1" … "parked · r13": thirteen distinct labels over thirteen
+    // rows. Nothing here reads the ' · rN' format; the cardinality does the
+    // talking and the merit ranking demotes it like any identity column.
+    const rows = Array.from({ length: 13 }, (_, i) => ({
+      annotations: [annotation({ label: `waiting · r${i + 1}` })],
+    }))
+    const [dim] = collectLabelDimensions(rows)
+    expect(dim.control).toBe('typeahead')
+    expect(dimensionMerit(facetStats(dim), 13).tier).toBe('niche')
+  })
+
+  it('matches a label selection within its own kind only', () => {
+    const row = projectedTerminal({ id: 'term-001' })
+    const annotations = [
+      annotation({ kind: 'display', label: 'waiting' }),
+      annotation({ kind: 'badge', label: 'cond-01' }),
+    ]
+    const f = emptyFilters()
+    f.facets = { [`${LABEL_DIMENSION_PREFIX}badge`]: { ...emptyFacetSelection(), values: ['cond-01'] } }
+    expect(matchesFilters(row, annotations, f)).toBe(true)
+    // The same WORD under another kind is a different fact: 'waiting' belongs
+    // to 'display', so selecting it under 'badge' must not match.
+    f.facets = { [`${LABEL_DIMENSION_PREFIX}badge`]: { ...emptyFacetSelection(), values: ['waiting'] } }
+    expect(matchesFilters(row, annotations, f)).toBe(false)
+    f.facets = { [`${LABEL_DIMENSION_PREFIX}display`]: { ...emptyFacetSelection(), values: ['waiting'] } }
+    expect(matchesFilters(row, annotations, f)).toBe(true)
+  })
+
+  it('ANDs a label dimension with a detail facet and supports the substring needle', () => {
+    const row = projectedTerminal({ id: 'term-001' })
+    const annotations = [annotation({ kind: 'badge', label: 'cond-01', details: { task: 't-1' } })]
+    const f = emptyFilters()
+    f.facets = {
+      [`${LABEL_DIMENSION_PREFIX}badge`]: { ...emptyFacetSelection(), values: ['cond-01'] },
+      task: { ...emptyFacetSelection(), values: ['t-2'] },
+    }
+    expect(matchesFilters(row, annotations, f)).toBe(false)
+    f.facets.task = { ...emptyFacetSelection(), values: ['t-1'] }
+    expect(matchesFilters(row, annotations, f)).toBe(true)
+    f.facets[`${LABEL_DIMENSION_PREFIX}badge`] = { ...emptyFacetSelection(), text: 'COND' }
+    expect(matchesFilters(row, annotations, f)).toBe(true)
+    // A row carrying no annotations matches no label selection.
+    expect(matchesFilters(row, undefined, f)).toBe(false)
+  })
+})
+
+describe('opaque values are text-matched, never pill-picked', () => {
+  const rowsOf = (...bags: Array<Record<string, string>>) =>
+    bags.map(details => ({ annotations: [annotation({ details })] }))
+
+  it('forces a long-hex facet to the text control by value shape', () => {
+    // A 40-char sha is under the 64-char length rule, so without the opaque
+    // rule this would have been a pill row of hashes.
+    const [dim] = collectFacetDimensions(rowsOf({ ref: 'a'.repeat(40) }))
+    expect(dim.control).toBe('text')
+    expect(dim.opaque).toBe(true)
+  })
+
+  it('leaves short ids alone — a human can pick those from a list', () => {
+    const [dim] = collectFacetDimensions(rowsOf({ ref: 'a1b2c3d4' }, { ref: 'e5f60718' }))
+    expect(dim.control).toBe('pills')
+    expect(dim.opaque).toBe(false)
+  })
+
+  it('does not mistake an ISO timestamp for a hash — the range test still stands first', () => {
+    const [dim] = collectFacetDimensions(rowsOf({ when: PAST }))
+    expect(dim.control).toBe('range')
+    expect(dim.opaque).toBe(false)
+  })
+})
+
+describe('dimensionMerit ranks by shape, never by key name', () => {
+  const stats = (overrides: Partial<Parameters<typeof dimensionMerit>[0]>) => ({
+    control: 'pills' as const,
+    distinct: 3,
+    carriers: 43,
+    opaque: false,
+    ...overrides,
+  })
+
+  it('omits a single-value dimension the whole scope carries', () => {
+    // The measured fleet: one provenance value on 43 of 43 rows — selecting
+    // it could only ever pass, so the picker does not offer it at all.
+    const merit = dimensionMerit(stats({ distinct: 1, carriers: 43 }), 43)
+    expect(merit.tier).toBeNull()
+    expect(merit.note).toContain('one value')
+  })
+
+  it('keeps a single-value dimension some rows carry — a presence question', () => {
+    const merit = dimensionMerit(stats({ distinct: 1, carriers: 5 }), 43)
+    expect(merit.tier).toBe('secondary')
+  })
+
+  it('ranks few-shared-values dimensions primary', () => {
+    expect(dimensionMerit(stats({ distinct: 4, carriers: 43 }), 43).tier).toBe('primary')
+    expect(dimensionMerit(stats({ control: 'tri-state', distinct: 2 }), 43).tier).toBe('primary')
+  })
+
+  it('never demotes a timestamp as identity-shaped, though distinct ≈ carriers', () => {
+    expect(dimensionMerit(stats({ control: 'range', distinct: 10, carriers: 10 }), 43).tier).toBe('primary')
+  })
+
+  it('demotes opaque values to niche however many rows carry them', () => {
+    expect(dimensionMerit(stats({ control: 'text', distinct: 3, opaque: true }), 43).tier).toBe('niche')
+  })
+
+  it('demotes identity-shaped dimensions once the scope is big enough to mean it', () => {
+    // 48 distinct commits over 48 rows was the measurement.
+    expect(dimensionMerit(stats({ control: 'typeahead', distinct: 48, carriers: 48 }), 48).tier).toBe('niche')
+    expect(dimensionMerit(stats({ distinct: 10, carriers: 10 }), 10).tier).toBe('niche')
+  })
+
+  it('does not demote small scopes or real vocabularies on the ratio alone', () => {
+    // 4 distinct over 4 carriers is a small fleet, not an identity column.
+    expect(dimensionMerit(stats({ distinct: 4, carriers: 4 }), 4).tier).toBe('primary')
+    // 30 distinct over 43 carriers is a real, large vocabulary: secondary.
+    expect(dimensionMerit(stats({ control: 'typeahead', distinct: 30, carriers: 43 }), 43).tier).toBe('secondary')
   })
 })
