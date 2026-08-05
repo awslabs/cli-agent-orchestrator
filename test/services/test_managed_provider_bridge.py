@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import pathlib
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -170,6 +172,138 @@ def test_codex_version_gate_fails_closed_off_pin(tmp_path, monkeypatch, banner):
     session = bridge._ProviderSession(request)
     with pytest.raises(bridge.BridgeError, match="unsupported provider version"):
         session._version(str(executable), bridge.SUPPORTED_CODEX_VERSION)
+
+
+def _version_probe_run(observed, *, banner, slow_seconds=None):
+    """A fake ``subprocess.run`` for the provider ``--version`` probe.
+
+    ``slow_seconds`` models a provider that needs that long to answer: any
+    observation deadline below it times out, exactly as the healthy pinned
+    Kimi binary did under startup load against the fixed 5 s bound
+    (cond-0313). No test sleeps; the slowness is simulated by what the
+    fake accepts, not by wall clock.
+    """
+
+    def fake_run(argv, **kwargs):
+        observed.update(kwargs)
+        timeout = kwargs.get("timeout", 0)
+        if slow_seconds is not None and timeout < slow_seconds:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return SimpleNamespace(returncode=0, stdout=banner, stderr="")
+
+    return fake_run
+
+
+def test_kimi_version_banner_observes_under_the_provider_bounded_deadline(tmp_path, monkeypatch):
+    """COND-0313: a slow-but-valid Kimi ``--version`` is admitted, once.
+
+    One bounded observation under the provider-appropriate deadline (20 s —
+    the bound the native-TUI acceptance harness already allows for this
+    exact probe), not a replayed launch and not the generic 5 s that
+    failed a healthy pinned binary under startup load.
+    """
+    request = _request(tmp_path, provider="kimi_cli")
+    observed = {}
+    monkeypatch.setattr(
+        "subprocess.run",
+        _version_probe_run(observed, banner="kimi 0.31.0\n", slow_seconds=12.0),
+    )
+    banner = bridge.provider_version_banner(request, environment={"PATH": "/usr/bin"})
+    assert banner == "kimi 0.31.0"
+    assert observed["timeout"] == 20.0
+    # The probe still runs in the exact child environment it was handed.
+    assert observed["env"] == {"PATH": "/usr/bin"}
+
+
+@pytest.mark.parametrize("provider", ["codex", "claude_code"])
+def test_other_providers_keep_the_generic_version_deadline(tmp_path, monkeypatch, provider):
+    # Only Kimi's runway is widened; every other provider observes under
+    # the unchanged generic bound.
+    request = _request(tmp_path, provider=provider)
+    observed = {}
+    monkeypatch.setattr("subprocess.run", _version_probe_run(observed, banner="x 1.0\n"))
+    bridge.provider_version_banner(request, environment={"PATH": "/usr/bin"})
+    assert observed["timeout"] == 5.0
+
+
+def test_an_explicit_version_deadline_is_honored(tmp_path, monkeypatch):
+    request = _request(tmp_path, provider="kimi_cli")
+    observed = {}
+    monkeypatch.setattr("subprocess.run", _version_probe_run(observed, banner="kimi 0.31.0\n"))
+    bridge.provider_version_banner(request, timeout=7.5, environment={"PATH": "/usr/bin"})
+    assert observed["timeout"] == 7.5
+
+
+def test_kimi_version_banner_beyond_the_provider_bound_fails_closed(tmp_path, monkeypatch):
+    # The deadline stays finite, and the error keeps the exact failing
+    # command and the deadline that fired.
+    request = _request(tmp_path, provider="kimi_cli")
+
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        bridge.provider_version_banner(request, environment={"PATH": "/usr/bin"})
+    assert "'--version'" in str(excinfo.value)
+    assert "timed out after 20.0 seconds" in str(excinfo.value)
+
+
+def test_version_banner_nonzero_exit_fails_closed(tmp_path, monkeypatch):
+    request = _request(tmp_path, provider="kimi_cli")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
+    )
+    with pytest.raises(bridge.BridgeError, match="provider --version exited 1"):
+        bridge.provider_version_banner(request, environment={"PATH": "/usr/bin"})
+
+
+def test_kimi_bridge_version_gate_observes_under_the_provider_bounded_deadline(
+    tmp_path, monkeypatch
+):
+    # The ACP bridge's own admission gate observes under the same
+    # provider-appropriate bound as the native preflight banner.
+    request = _request(tmp_path, provider="kimi_cli")
+    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+    session = bridge._ProviderSession(request)
+    observed = {}
+    monkeypatch.setattr(
+        "subprocess.run",
+        _version_probe_run(observed, banner="0.31.0\n", slow_seconds=12.0),
+    )
+    version = session._version(request["provider_executable"], bridge.SUPPORTED_KIMI_VERSIONS)
+    assert version == "0.31.0"
+    assert observed["timeout"] == 20.0
+
+
+def test_codex_bridge_version_gate_keeps_the_generic_deadline(tmp_path, monkeypatch):
+    request = _request(tmp_path, provider="codex")
+    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+    session = bridge._ProviderSession(request)
+    observed = {}
+    monkeypatch.setattr(
+        "subprocess.run", _version_probe_run(observed, banner="codex-cli 0.146.0\n")
+    )
+    version = session._version(request["provider_executable"], (bridge.SUPPORTED_CODEX_VERSION,))
+    assert version == "codex-cli 0.146.0"
+    assert observed["timeout"] == 5.0
+
+
+def test_bridge_version_gate_fails_closed_on_digest_drift_before_any_probe(tmp_path, monkeypatch):
+    # Digest drift is detected before the probe runs at all: no provider
+    # process may be started against an unpinned binary.
+    request = _request(tmp_path, provider="kimi_cli")
+    request["provider_executable_sha256"] = "0" * 64
+    monkeypatch.setattr(bridge, "_profile_material", lambda *_: _material())
+    session = bridge._ProviderSession(request)
+
+    def forbidden_run(*args, **kwargs):
+        raise AssertionError("the version probe must not run after digest drift")
+
+    monkeypatch.setattr("subprocess.run", forbidden_run)
+    with pytest.raises(bridge.BridgeError, match="digest changed after reservation"):
+        session._version(request["provider_executable"], bridge.SUPPORTED_KIMI_VERSIONS)
 
 
 class _KimiRpc:

@@ -156,7 +156,10 @@ def attest_kimi_route(
             check=False,
             capture_output=True,
             text=True,
-            timeout=5,
+            # The provider-appropriate bounded deadline (cond-0313): a
+            # healthy pinned build answered in 0.37–0.41 s warm yet missed
+            # a fixed 5 s deadline once under startup load.
+            timeout=provider_contracts.KIMI_VERSION_PROBE_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise KimiRouteProbeError(f"could not execute Kimi version probe: {exc}") from exc
