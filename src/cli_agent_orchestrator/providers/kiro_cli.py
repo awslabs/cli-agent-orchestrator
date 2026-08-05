@@ -346,11 +346,10 @@ class KiroCliProvider(BaseProvider):
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
-        if not await wait_until_status(
-            self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=float(get_server_settings()["provider_init_timeout"]),
-        ):
+        # _wait_ready_accepting_trust_dialog also auto-answers the
+        # --trust-all-tools startup consent dialog (see its docstring), which
+        # kiro-cli >= 2.1 shows in the default TUI *and* under --legacy-ui.
+        if not await self._wait_ready_accepting_trust_dialog():
             if yolo:
                 # Yolo already launched with --legacy-ui; no further fallback.
                 raise TimeoutError("Kiro CLI initialization timed out with --legacy-ui (yolo mode)")
@@ -378,15 +377,71 @@ class KiroCliProvider(BaseProvider):
             legacy_command = shlex.join(legacy_args)
             status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, legacy_command)
-            if not await wait_until_status(
-                self.terminal_id,
-                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=float(get_server_settings()["provider_init_timeout"]),
-            ):
+            if not await self._wait_ready_accepting_trust_dialog():
                 raise TimeoutError("Kiro CLI initialization timed out with TUI and `--legacy-ui`")
 
         self._initialized = True
         return True
+
+    async def _wait_ready_accepting_trust_dialog(self) -> bool:
+        """Wait for the agent prompt, auto-answering the trust-all-tools dialog.
+
+        CAO always launches kiro-cli with ``--trust-all-tools`` (there is no
+        human at the terminal to answer per-tool permission prompts in headless
+        orchestration; CAO enforces tool scoping at its own profile/MCP layers).
+        Since kiro-cli 2.1, ``--trust-all-tools`` opens a one-time startup
+        consent dialog *before* the chat prompt is interactive:
+
+            ❯ No, exit
+              Yes, I accept
+              Yes, and don't ask again
+
+        The default TUI shows this dialog on kiro-cli 2.16.1 (verified), so the
+        earlier "force --legacy-ui to skip it" workaround no longer helps and
+        init just times out on the dialog. This helper is applied to the
+        ``--legacy-ui`` fallback path too, so if a kiro build shows the dialog
+        there as well it is handled without a version check. get_status()
+        already classifies the dialog as WAITING_USER_ANSWER, so here we wait
+        for that alongside IDLE/COMPLETED and, when it appears, select
+        **"Yes, I accept"** (Down, Enter) — the one-line-down option.
+        We deliberately do NOT pick "Yes, and don't ask again", which would
+        persist a trust-all-tools bypass into the user's kiro config; CAO's
+        acceptance is scoped to this ephemeral session only.
+
+        Returns:
+            True if the terminal reached IDLE or COMPLETED (dialog answered if
+            it was shown), False if it timed out before becoming ready.
+        """
+        init_timeout = float(get_server_settings()["provider_init_timeout"])
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        ready = await wait_until_status(
+            self.terminal_id,
+            {
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+                TerminalStatus.WAITING_USER_ANSWER,
+            },
+            timeout=init_timeout,
+        )
+        if not ready:
+            return False
+        if status_monitor.get_status(self.terminal_id) != TerminalStatus.WAITING_USER_ANSWER:
+            return True
+
+        # Trust-all-tools consent dialog is up: select "Yes, I accept".
+        logger.info(
+            "kiro_cli: answering --trust-all-tools startup consent dialog "
+            "with 'Yes, I accept' (session-scoped)"
+        )
+        backend = get_backend()
+        backend.send_special_key(self.session_name, self.window_name, "Down")
+        backend.send_special_key(self.session_name, self.window_name, "Enter")
+        return await wait_until_status(
+            self.terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=init_timeout,
+        )
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kiro CLI status by analyzing terminal output.

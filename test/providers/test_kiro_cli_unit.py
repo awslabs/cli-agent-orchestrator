@@ -275,6 +275,60 @@ class TestKiroCliProviderInitialization:
             "--model claude-opus-4.6 --agent developer",
         )
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_initialize_answers_trust_all_tools_dialog(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile, mock_status_monitor
+    ):
+        """--trust-all-tools startup dialog is auto-answered with 'Yes, I accept'.
+
+        kiro-cli >= 2.1 shows a consent dialog before the chat prompt. The
+        provider must detect WAITING_USER_ANSWER, send Down+Enter (select the
+        one-line-down 'Yes, I accept' option, NOT 'Yes, and don't ask again'),
+        then wait again for the prompt — without falling back to --legacy-ui.
+        """
+        mock_wait_shell.return_value = True
+        # First wait resolves to WAITING_USER_ANSWER (dialog up); second wait
+        # (after we answer) resolves to the prompt.
+        mock_wait_status.side_effect = [True, True]
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        result = await provider.initialize()
+
+        assert result is True
+        # Exactly one launch — the dialog is answered in place, no /exit + relaunch.
+        assert mock_tmux.return_value.send_keys.call_count == 1
+        # "Yes, I accept" = one Down then Enter (two special keys total).
+        special_keys = [c.args[2] for c in mock_tmux.return_value.send_special_key.call_args_list]
+        assert special_keys == ["Down", "Enter"]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    async def test_initialize_no_dialog_sends_no_special_keys(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile, mock_status_monitor
+    ):
+        """When the terminal reaches IDLE directly, no dialog keys are sent."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        result = await provider.initialize()
+
+        assert result is True
+        mock_tmux.return_value.send_special_key.assert_not_called()
+
     def test_initialization_with_different_agent_profiles(self):
         """Test initialization with various agent profile names."""
         test_profiles = ["developer", "code-reviewer", "test_agent", "agent123"]
