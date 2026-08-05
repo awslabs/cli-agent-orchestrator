@@ -70,6 +70,28 @@ class StepRow:
     call_fingerprint: Optional[str] = None
 
 
+@dataclass
+class RunSummaryRow:
+    """A narrow ``workflow_run`` projection for the list view (U1, domain-entities).
+
+    A deliberately narrower sibling of ``RunRow`` over the same table: it holds
+    exactly the seven columns a list row renders and omits the large
+    ``spec_snapshot`` / ``inputs_json`` payloads (never needed to render a list)
+    and the drive-internal ``generation`` counter. Omitting the two large columns
+    keeps a multi-row list response small. It is an inert read snapshot with no
+    lifecycle of its own — the ``state`` it carries reflects the run lifecycle
+    owned elsewhere (U2/U7). Returned by ``list_runs``.
+    """
+
+    run_id: str
+    workflow_name: str
+    state: str
+    tier: str
+    started_at: str
+    finished_at: Optional[str]
+    current_step_id: Optional[str]
+
+
 def _connect() -> sqlite3.Connection:
     """Open a connection to the shared SQLite file (self-connecting, like B2).
 
@@ -138,6 +160,67 @@ def insert_run(
         )
 
 
+def insert_run_with_steps(
+    run_id: str,
+    workflow_name: str,
+    spec_snapshot: str,
+    inputs_json: str,
+    state: str,
+    started_at: str,
+    steps: Sequence[Tuple[str, str]],
+    updated_at: str,
+    tier: str = "yaml",
+    generation: str = "1",
+) -> None:
+    """Atomically INSERT the run row AND seed its step rows in ONE transaction (U2, TR-1).
+
+    The async submission path (``POST /workflows/runs:submit``) needs the run
+    row and its seeded step rows to be durable **together** before it acks a run
+    with 202 (the ``run-id-allocated-before-ack`` invariant). Calling
+    :func:`insert_run` then :func:`insert_steps` back-to-back is NOT atomic — each
+    self-connects and commits independently, so a failure of the second commit
+    would leave a committed ``workflow_run`` row with no step rows: a phantom
+    RUNNING run that ``list_runs`` / ``get_run_status`` report forever with no
+    background task to terminate it.
+
+    This helper opens ONE ``_connect()`` connection and does both INSERTs inside a
+    SINGLE ``with conn:`` transaction (one commit). If EITHER statement raises a
+    ``sqlite3.Error`` (e.g. the step seed violates a constraint after the run row
+    INSERT), the ``with conn`` block rolls the whole transaction back — NEITHER row
+    is committed — and the error **propagates** to the caller. Unlike the engine's
+    best-effort write-through (:func:`~workflow_service._journal_insert_run`, which
+    swallows), this insert is a HARD precondition of the async ack, so its failure
+    is surfaced (the caller maps it to 500 and emits NO 202), never swallowed.
+
+    ``insert_run`` / ``insert_steps`` are deliberately left unchanged — the
+    blocking engines still call them (INV-1). This is a NEW additive sibling that
+    composes the same two INSERTs into one transaction for the async path.
+    """
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO workflow_run "
+            "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
+            " current_step_id, started_at, finished_at, tier, generation) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)",
+            (
+                run_id,
+                workflow_name,
+                spec_snapshot,
+                inputs_json,
+                state,
+                started_at,
+                tier,
+                generation,
+            ),
+        )
+        conn.executemany(
+            "INSERT OR REPLACE INTO workflow_run_step "
+            "(run_id, step_id, state, attempts, output_json, error, updated_at) "
+            "VALUES (?, ?, ?, 0, NULL, NULL, ?)",
+            [(run_id, step_id, step_state, updated_at) for step_id, step_state in steps],
+        )
+
+
 def insert_steps(run_id: str, steps: Sequence[Tuple[str, str]], updated_at: str) -> None:
     """INSERT one ``workflow_run_step`` row per ``(step_id, state)`` (E2).
 
@@ -186,12 +269,50 @@ def update_run_state(run_id: str, state: str, finished_at: Optional[str]) -> Non
 
     ``finished_at`` is set on a terminal transition and cleared (``None``) when a
     resume re-opens a previously-settled run (business-logic-model §3).
+
+    UNCONDITIONAL BY CONTRACT. Do NOT add a ``WHERE state = ...`` predicate here:
+    the resume path calls this to write state BACK to ``running`` on an already
+    terminal row (``script_runner.resume_script_run`` and
+    ``workflow_service.resume_from_last_completed``), so any "only if still
+    running" guard would silently turn every resume into a no-op. A caller that
+    needs the guarded write wants ``settle_run_state_if_running`` below.
     """
     with _connect() as conn:
         conn.execute(
             "UPDATE workflow_run SET state = ?, finished_at = ? WHERE run_id = ?",
             (state, finished_at, run_id),
         )
+
+
+def settle_run_state_if_running(run_id: str, state: str, finished_at: Optional[str]) -> bool:
+    """Settle a run's state ONLY while the row is still ``running``; report whether it did.
+
+    The conditional sibling of ``update_run_state``, added for the background
+    drive's FAILED backstop (issue #505 review). The backstop exists so a
+    scheduling bug cannot orphan a run in ``running`` forever — but written
+    unconditionally it also overwrites a run the engine ALREADY settled, so a
+    drive that raised during post-settlement bookkeeping turned a true
+    ``completed``/``cancelled`` into a false ``failed``. That is worse than the
+    hole it was closing: the journal row is the durable record of what actually
+    happened, and a wrong terminal state is indistinguishable from a real one.
+
+    The state test lives in the SQL (``AND state = 'running'``) rather than in a
+    read-then-write on the caller's side, so the check and the write are one
+    atomic statement and no concurrent settle can land between them.
+
+    Returns ``True`` when a row was updated and ``False`` when the row was
+    already terminal (or absent) — the caller logs the distinction, because a
+    silent no-op is indistinguishable from a broken guard when reading logs
+    after an incident.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE workflow_run SET state = ?, finished_at = ? " "WHERE run_id = ? AND state = ?",
+            (state, finished_at, run_id, RunState.RUNNING.value),
+        )
+        return cursor.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +396,66 @@ def get_step(run_id: str, step_id: str) -> Optional[StepRow]:
         updated_at=row[6],
         call_fingerprint=row[7],
     )
+
+
+def list_runs(
+    state: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> List[RunSummaryRow]:
+    """List ``workflow_run`` rows newest-first as narrow summaries (U1, FR-3.1).
+
+    One parameterized SELECT over the ``workflow_run`` table returning a list of
+    :class:`RunSummaryRow`. The projection is narrow (seven columns; no
+    ``spec_snapshot`` / ``inputs_json``) so a multi-row list stays small.
+
+    - ``state`` — when not ``None``, a ``WHERE state = ?`` clause filters to that
+      one RunState string. Legality of the value is validated one layer up; a
+      well-formed but unmatched string simply returns ``[]`` (QR-2, LR-2). The
+      value binds through a ``?`` placeholder — never string-interpolated, so a
+      value carrying SQL metacharacters is a harmless literal (QR-1).
+    - ``limit`` — clamped to ``[1, 500]`` (values ``< 1`` become ``1``, values
+      ``> 500`` become ``500``); ``offset`` is floored at ``0``. The clamp bounds
+      a single list response regardless of the caller.
+    - Ordering is ``started_at DESC, run_id DESC``. The ``run_id DESC`` tiebreaker
+      is mandatory, not decoration: ``started_at`` is a whole-second ISO string,
+      so two runs started in the same second collide on the primary key; without
+      the tiebreaker their order — and offset paging — would be undefined (QR-3).
+
+    An empty result (empty table or a filter that matches nothing) is a valid
+    answer returned as ``[]``, never an error (LR-3). Like the sibling reads
+    (``get_run`` / ``get_steps``) this raises ``sqlite3.Error`` on a DB failure
+    rather than swallowing it — a silently empty list would hide a broken
+    database from a human who explicitly asked to list runs (ER-1).
+    """
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+
+    sql = (
+        "SELECT run_id, workflow_name, state, tier, started_at, "
+        "finished_at, current_step_id FROM workflow_run"
+    )
+    params: List[object] = []
+    if state is not None:
+        sql += " WHERE state = ?"
+        params.append(state)
+    sql += " ORDER BY started_at DESC, run_id DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+
+    with _connect() as conn:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    return [
+        RunSummaryRow(
+            run_id=r[0],
+            workflow_name=r[1],
+            state=r[2],
+            tier=r[3],
+            started_at=r[4],
+            finished_at=r[5],
+            current_step_id=r[6],
+        )
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -4,8 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [2.4.1] - 2026-08-04
 
-## [Unreleased]
+### Fixed
+
+- force fast-uri 3.1.5 in aidlc-portfolio examples (#551) (#552)
+
+
+### Other
+
+- bump cryptography from 48.0.1 to 50.0.0 (#548)
+
+- bump fast-uri from 3.1.4 to 3.1.5 in /docusaurus (#549)
+
+- bump postcss from 8.5.21 to 8.5.25 in /docusaurus (#550)
+
+## [2.4.0] - 2026-08-04
 
 ### Added
 
@@ -19,12 +33,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Validated by a 20-package controlled A/B experiment: +11 mean points on work items with headroom (6/6 wins, sign test p = 0.016), neutral at the ceiling — `docs/self-learning-validation.md`
 - `cao profile find <query>` CLI verb and `find_profiles` MCP tool for keyword/BM25 profile discovery over metadata (name, description, tags, capabilities); metadata-only, never exposes prompt bodies (#340)
 - Optional `capabilities` and `tags` arrays in the agent profile frontmatter schema (#340)
+- **Asynchronous workflow-run lifecycle** — runs are now submittable without holding a connection open for their whole duration (#505):
+  - `POST /workflows/runs:submit` acks `202 {run_id, state, links}` the instant the run is durably journaled, then drives it in a background task. The blocking `POST /workflows/runs` is retained and byte-compatible. `GET /workflows/runs` lists journaled runs newest-first (`?state=`, `?limit=`), and `GET /workflows/runs/{run_id}/result` returns the full retained result for a detached, in-flight, or post-restart run
+  - four CLI verbs: `cao workflow runs` (list recorded runs), `wait` (follow an already-submitted run), `result` (full detail), `events` (live SSE progress); `run` now submits-and-follows by default, with `--detach` to submit and exit and `--wait` for the retained blocking path
+  - six MCP tools: `workflow_start`, `workflow_status`, `workflow_result`, `workflow_list`, `workflow_wait`, `workflow_events`. Note `workflow_list` lists **runs**, whereas the CLI's `list` lists **specs** — see the CLI ↔ MCP name mapping in `docs/workflows.md`
+  - `GET /workflows/runs` and `GET /workflows/runs/{run_id}/result` require a read scope (`cao:read`, `cao:write`, or `cao:admin`) when auth is enabled
 
 ### Changed
 
-- consolidate local agent-store persistence into `services/profile_store.py` so the store write path, profile-name validation, and store-path containment live in one service instead of being spread across `install_service`, `cli/commands/install`, and `cli/commands/profile`. `cao profile remove` now reports "Invalid profile name" instead of "not found in local store" for names that fail `[A-Za-z0-9_-]{1,64}` but are still contained (for example `has space`, `has.dot`, or over 64 characters); the exit code is unchanged (#543)
+- **BREAKING** — `cao workflow run --json` output shape (#505). It previously echoed the complete `WorkflowRunResult` (`run_id`, `workflow_name`, `state`, `steps[]`, timestamps, `kind`); because the default path now submits-and-follows rather than blocking, it emits only the stable terminal object `{"run_id": ..., "state": ...}`. A non-TTY plain `run` emits the same JSON. **Scripts reading `steps[]` or `workflow_name` off `run --json` must change** — use `cao workflow result <id> --json` for full detail, or `cao workflow status <id> --json` for a mid-run snapshot. `run --wait --json` is unaffected and still returns the complete `WorkflowRunResult`. Exit codes are unchanged across TTY, non-TTY, and `--json`
+- **BREAKING** — the run-level `output` field is no longer returned by `GET /workflows/runs/{run_id}/result` or by the `workflow_result` / `workflow_wait` MCP tools (#505). Run-level output is not journaled, so the field was structurally always `null` on those journal-assembled surfaces; it is dropped rather than advertised. Per-step outputs are unaffected (`steps[].output`), and the blocking `run --wait` path still returns run-level output for script-tier runs
+- memory + stub providers (#348 B2) (#416)
+
+- API routes + OKF/Obsidian/GraphML sinks (#348 B3) (#424)
+
+- add read_session_output tool for typed worker-output readback (#422)
+
+- Sigma renderer + web graph view + projection cache (#348 B4) (#442)
+
+- script-tier run surface + author shim — U5+U6 (#312) (#399)
+
+- runtime inputs + cao-workflow authoring skill (#420) (#450)
+
+- AG-UI protocol adapter + generative UI — PR #387 Phase-A (reconciled) (#436)
+
+- add source-aware `cao update` command (#26) (#445)
+
+- add profile discovery via cao profile find + find_prof… (#438)
+
+- validate Markdown links repository-wide (#474)
+
+- secret scanning + leak-response runbook (#457) (#477)
+
+- AG-UI Phase 2 — L2 construct library (#458) (#485)
+
+- modernize integration for herdr 0.7.x (broadcast events, api snapshot, native --env) (#502)
+
+- add agent profile routing (#486)
+
+- add an explicit model override to handoff/assign (#501)
+
+- make CAO_HOME_DIR env-overridable (#467)
+
+- pass model and initial message when launching sessions (#513)
+
+- opt-in self-learning loop — outcome capture, retrospection, instruction promotion (#514) (#515)
+
+- add read-only profile search, template and preview endpoints (#523)
+
+- add explicit v2/KAS engine selection (#470)
+
+- add AI-DLC portfolio orchestration example (#521)
+
+- typed memory relationship store (#511) (#524)
+
+
+### Changed
+
+- extract local-store persistence into profile_store (#543)
+
+
+### Documentation
+
+- add Simplified Chinese README (#439)
+
+- add tags and capabilities to aws example profiles (#484)
+
+- improve README and documentation navigation (#472)
+
+- reconcile historical implementation records (#499)
+
+- sync provider lists/tables with all 9 registered providers (#490)
+
+- add Docusaurus documentation site and interactive courses (#531)
+
+- link the documentation site from both READMEs (#536)
+
 
 ### Fixed
+
+- workflow: the background drive's FAILED backstop no longer overwrites an already-settled run (#505). It fired unconditionally on any exception, so a drive that raised *after* the engine journaled COMPLETED/CANCELLED — during post-settlement bookkeeping — rewrote that terminal state to FAILED, making the durable record misreport the run's outcome. The write is now a conditional `UPDATE ... WHERE state = 'running'` in the journal DAL (atomic, so no concurrent settle can interleave), covering both the `Exception` and `CancelledError` arms; a run that raises *before* settling still lands FAILED as before, so no run is left orphaned in `running`
+- workflow: `cao workflow events` closes its streamed SSE response on every exit path (#505). The follower breaks out of its loop on a terminal frame and abandons the generator on each reconnect, so without an explicit close the socket survived until garbage collection and a long follow with repeated reconnects accumulated live file descriptors. The equivalent MCP tool was already hardened
+- workflow: a caller-supplied `run_id` that loses a concurrent-submit race now returns `409` instead of `500` (#505). The uniqueness pre-check and the durable insert are not one atomic operation, so both submits can pass the pre-check; the loser's `IntegrityError` is now mapped to the same `409` the serialized case reports
 
 - profile store writes are now atomic and inter-process safe. Both store writes were previously bare `write_text` calls, so a concurrent `cao profile` write and a server-side write could interleave or leave a partial file. Adds `locked_atomic_write` to `utils/atomic_file.py` as the blind-write sibling of `locked_atomic_rewrite` (#492): it shares the same lock, temp file, fsync, mode preservation and `os.replace`, but skips the read, so a corrupt or non-UTF-8 file in the agent store can still be replaced by the install that would have repaired it instead of failing with `UnicodeDecodeError` (#543)
 - self-healing pipe-pane liveness watchdog for silently-stalled FIFO forwarding (fixes #388) (#397), including detection of a stall that settles into a new static frame before the next poll and of a pipe that never delivers a single byte from terminal creation (cold start, harness-control#93) — see `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` / `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` in `docs/configuration.md`
@@ -32,11 +122,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - honor profile frontmatter `provider:` during install (flag > frontmatter > default) (#414)
 - deliver messages with `tmux paste-buffer -p` on tmux >= 3.7, which sanitizes pasted buffers through vis(3) and rendered the previously hand-crafted `ESC [200~`/`ESC [201~` markers as literal `^[[200~` garbage in the receiving TUI; tmux < 3.7 keeps the hand-crafted wrap so TUIs that never enable DECSET 2004 (e.g. kiro-cli) still receive multi-line messages as a single input (#413)
 - handoff workers now inherit the supervisor's working directory server-side in run_agent_step (#423)
+- sync devcontainer feature version with pyproject.toml on release (#419)
 
-### Security
+- TOML-escape MCP command/args/env in -c overrides (#404)
 
-- clear three `py/path-injection` CodeQL alerts (code-scanning alerts #166/#167/#168) in `workflow_spec_service` by colocating the path-containment `SafeAccessCheck` with each filesystem sink. `_safe_spec_path` resolved + contained a spec path and then *returned* it, but CodeQL's `str.startswith` barrier is flow-sensitive and function-local, so the "contained" state was dropped at the call boundary and the caller's `open()` / `os.path.isfile()` sink still saw an unchecked path. The read/probe now happen inside guarded helpers (`_read_contained_spec_bytes`, `_contained_spec_file`) where a single positive `startswith(base + os.sep)` guard dominates the sink. Containment semantics are unchanged (a spec whose realpath escapes its validated base still raises `ValueError`); the byte-cap, single-read TOCTOU guarantee, and never-raise `validate_only` contract are all preserved
-- clear the `py/clear-text-storage-sensitive-data` CodeQL false positive (code-scanning alert #142) by renaming the local `secret` fixture variable in two `memory_service` secret-gate tests to `gated_content`. CodeQL's name-based heuristic classified the variable named `secret` as a sensitive-data source and traced it into the memory-wiki write (an intentionally plaintext, by-design markdown sink). The literal is the canonical AWS documentation example key, not a real credential; the value and all assertions are unchanged, so the federated secret-gate rejection and global-scope allow paths are still exercised exactly. No production behavior change
+- roll back DB terminal row when create_terminal fails (#421)
+
+- stop logging full send_keys payloads at INFO (#427)
+
+- enable Jinja2 autoescape in agent-profile scaffolding (#429)
+
+- make Jinja2 autoescape safety net real + lock it with a test (#429 follow-up) (#434)
+
+- stop bump_version clobbering mypy python_version (#435)
+
+- clear CodeQL clear-text-storage false positive in memory tests (#142) (#440)
+
+- honor frontmatter provider with flag > frontmatter > default precedence (fixes #414) (#431)
+
+- attach terminals through configured backend (#417)
+
+- self-healing pipe-pane liveness watchdog (fixes #388) (#397)
+
+- allow containerized/wrapped provider agents to initialize (#400) (#428)
+
+- gate first paste on real input readiness (settle check) (#441)
+
+- validate MCP server names and env keys in -c override paths (#426)
+
+- kill orphaned window on init failure for new_session=False (harness-control#186) (#446)
+
+- isolate wait_until_input_ready in claude_code init-timeout tests (#452)
+
+- repair metadata projections after database replacement (#449)
+
+- scrub personal PII from provider fixtures + add recurrence guard (#456)
+
+- inline select_autoescape so bandit B701 recognizes the autoescape config (#462)
+
+- inherit supervisor working directory server-side in run_agent_step (#423)
+
+- colocate CodeQL path-injection guards with filesystem sinks (#166/#167/#168) (#461)
+
+- exclude own-line effort footer from response-marker detection (#466)
+
+- content-based staleness guard prevents stale COMPLETED (#407) (#480)
+
+- detect trust prompt v2 + block delivery into dead terminals (#482)
+
+- verify deferred-init worker started and re-submit dropped input (#479)
+
+- oversize pyte screen to 400x200 so taller attached terminals reach IDLE (#478)
+
+- bottom-anchor dialog detection + plan-approval dismissal (#405) (#481)
+
+- gate live integration tests + classify trust-all-tools dialog (#483)
+
+- suppress and dismiss startup update-available dialog (#488)
+
+- add autouse fixture to strip leaked CAO env vars (#489)
+
+- suppress pytest warnings summary in pre-push hook to avoid BlockingIOError (#491)
+
+- validate CAO terminal ID before API requests (#475)
+
+- use paste-buffer -p instead of hand-crafted bracketed-paste markers (fixes #413) (#430)
+
+- prevent deferred-init retry loop from re-pasting into working OpenCode workers (#496)
+
+- bound graph lint projection (#507)
+
+- skip bracketed-paste wrap when the pane is a bare shell (#500)
+
+- mock cleanup-nudge lookup in assign tests to stop live-server leakage (#508)
+
+- submit orchestrated/flow tasks reliably on Gemini 3.x agy (#517)
+
+- make the state-detection rolling buffer size configurable, raise default to 32KB (#425)
+
+- detect v0.145 idle composer at startup (#527)
+
+- reset backend registry singleton between tests (#522) (#528)
+
+- inter-process-safe atomic read-modify-write for memory/skill files (caom-47e) (#492)
+
+- upgrade postcss to >=8.5.18 in web (#535)
+
+- validate Origin on terminal WebSocket to block cross-site WebSocket hijacking (CWE-1385) (#533)
+
+- convert kimi/antigravity/copilot startup-prompt handling to async (#509)
+
+
+### Other
+
+- bump mcp from 1.26.0 to 1.28.1 (#455)
+
+- bump postcss from 8.5.16 to 8.5.25 in /cao_mcp_apps (#530)
+
+- pin paste submission overrides (#544)
+
+- release v2.4.0
 
 ## [2.3.0] - 2026-07-12
 
@@ -45,21 +230,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add reconciliation sweep for orphaned PENDING messages (#266)
 
 - add provider support (#272)
-
-- add script-tier workflows: a `.py` workflow spec is now runnable via `cao workflow run` (and the `workflow_run`/`workflow_cancel` MCP tools), with the same `resume`/`cancel`/`status` support as YAML workflows — tier is detected automatically from the file extension (#312)
-- add optional `skills` field to `AgentProfile` to scope the per-agent skill catalog via an fnmatch allowlist; runtime-prompt providers only, `load_skill` resolution unchanged (#351)
-
-- **AG-UI typed-event stream** — new `/agui/v1/stream` Server-Sent Events endpoint that maps CAO's normalized fleet events to [AG-UI](https://github.com/ag-ui-protocol/ag-ui) typed events (`RUN_*`, `STEP_*`, `TEXT_MESSAGE_CONTENT`, `TOOL_CALL_START`, `STATE_SNAPSHOT`, `STATE_DELTA`, `GENERATIVE_UI`, `RUN_ERROR`), so any AG-UI-compatible client renders CAO with no custom adapter. Default-off via `CAO_AGUI_ENABLED`; supports `?since=` history replay and, when auth is enabled, a `?access_token=` query-parameter JWT for browser `EventSource` clients. Message bodies are never carried (metadata-only by construction).
-
-- **Generative UI** — agents author allow-listed UI components (approval cards, choice prompts, diff summaries, progress/metrics, agent cards) via the `emit_ui` MCP tool / `POST /agui/v1/emit_ui`. Intents are validated **server-side** against a frozen allow-list (no arbitrary markup) and rendered uniformly across heterogeneous providers. See [docs/agui.md](docs/agui.md#generative-ui).
-
-- **OpenTelemetry GenAI instrumentation** — opt-in, shipped as the `[otel]` optional extra (`pip install cli-agent-orchestrator[otel]`); the base install degrades to no-ops. The inter-agent dispatch seam (`send_message` / `handoff` / `assign`) emits a GenAI `execute_tool` span and a `cao.orchestration.dispatches` counter over OTLP, and propagates W3C trace context (`traceparent`) into plugin events. GenAI `invoke_agent` / `chat` span helpers ship for instrumenting agent- and model-level calls. See [docs/otel-deployment.md](docs/otel-deployment.md).
-
-- **Native multi-agent workflow spec** — a trusted-author YAML workflow grammar with authoring/validation endpoints, a run-engine seam, and `workflow_run` / `workflow_return` / `workflow_cancel` MCP tools (#312).
-
-- **`mock_cli` provider** — a credentials-free mock agent for deterministic CI of orchestration logic without real CLI binaries or secrets. See [docs/mock-cli-provider.md](docs/mock-cli-provider.md).
-
-- add Antigravity CLI (`agy`) provider — Google's terminal-native coding agent and the successor to the Gemini CLI after the free "Login with Google" path was retired (#323)
 
 - add herdr terminal backend with event-driven inbox delivery (#271)
 
@@ -215,6 +385,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bump ws from 8.20.0 to 8.21.0 in /web (#398)
 
 - [Feat] cao profile — profile lifecycle management (#395)
+
+- release v2.3.0
 
 ## [2.2.0] - 2026-06-02
 
@@ -655,3 +827,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
+
+

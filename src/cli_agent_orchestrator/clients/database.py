@@ -294,6 +294,7 @@ def init_db() -> None:
     _migrate_add_related_keys()
     _migrate_workflow_index()
     _migrate_workflow_run()
+    _migrate_workflow_run_indexes()
     _migrate_workflow_run_step()
     _migrate_workflow_outcome_indexes()
     # Appended LAST (issue #511). Disjoint from the workflow_run* tables that
@@ -823,6 +824,41 @@ def _migrate_workflow_outcome_indexes() -> None:
             )
     except Exception as e:
         logger.debug(f"workflow_outcomes index migration skipped: {e}")
+
+
+def _migrate_workflow_run_indexes() -> None:
+    """Add explicit indexes on ``workflow_run`` for list-query performance (U1, FR-3.2).
+
+    Two single-column indexes serving the two shapes ``list_runs`` produces: the
+    unfiltered newest-first list orders by ``started_at`` alone (served by
+    ``idx_workflow_run_started_at``), and the state-filtered list narrows on
+    ``state`` (served by ``idx_workflow_run_state``). Two single-column indexes
+    cover both paths; a single composite ``(state, started_at)`` would not serve
+    the unfiltered ``started_at``-only ordering (ADR-6, IR-1).
+
+    Zero-arg, self-connecting, and idempotent — mirrors ``_migrate_memory_indexes``.
+    Each statement uses ``CREATE INDEX IF NOT EXISTS`` so a second ``init_db()`` is
+    a no-op (IR-2); no destructive migration, no Alembic (NFR-5). It creates only
+    indexes, never columns — so the C-4 exact-column migration test is untouched
+    (IR-4). Registered AFTER ``_migrate_workflow_run`` in ``init_db`` so the base
+    table exists first. Failure is logged at debug and never raised: a missing
+    index degrades to a table scan, not a crash (IR-3).
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_workflow_run_started_at "
+                "ON workflow_run (started_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_workflow_run_state ON workflow_run (state)"
+            )
+    except Exception as e:  # noqa: BLE001 — missing index degrades to a scan (IR-3)
+        logger.debug(f"workflow_run index migration skipped: {e}")
 
 
 def _migrate_terminals_schema() -> None:
