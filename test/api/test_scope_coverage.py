@@ -115,3 +115,74 @@ def test_admin_token_admitted_on_admin_route(client, auth_on):
     app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_ADMIN])
     resp = client.delete("/memory/some-key")
     assert resp.status_code != 403
+
+
+# --------------------------------------------------------------------------- #
+# PR #525 review — the two NEW #505 run-read routes carry a read-scope gate.
+#
+# Scoped deliberately to the two routes issue #505 ADDED. The three pre-existing
+# sibling reads (``GET /workflows``, ``GET /workflows/{name}``,
+# ``GET /workflows/runs/{run_id}``) are equally ungated and are left alone: gating
+# them would change the auth posture of shipped routes and could break an existing
+# unauthenticated reader, which is a bigger risk than the residual asymmetry.
+# --------------------------------------------------------------------------- #
+_NEW_505_READ_ROUTES = [
+    ("GET", "/workflows/runs"),
+    ("GET", "/workflows/runs/{run_id}/result"),
+]
+
+
+@pytest.mark.parametrize("method,path", _NEW_505_READ_ROUTES)
+def test_new_505_read_routes_declare_a_scope_dependency(method, path):
+    """Structural guard: the dependency is present on the route object.
+
+    This is the half that CANNOT be faked by ambient config. ``is_auth_enabled()`` is
+    default-off (true only when ``AUTH0_DOMAIN`` or ``CAO_AUTH_JWKS_URI`` is set) and
+    ``require_any_scope`` hands back the full scope set when auth is off — so a plain
+    "the route still returns 200" test passes whether or not the dependency exists at
+    all. Asserting on the route table instead makes the guard real.
+    """
+    matches = [
+        r
+        for r in app.routes
+        if getattr(r, "path", None) == path and method in (getattr(r, "methods", None) or set())
+    ]
+    assert matches, f"{method} {path} is not registered"
+    assert _has_scope_dependency(matches[0]), f"{method} {path} has no require_any_scope dependency"
+
+
+def test_scopeless_token_forbidden_on_run_list(client, auth_on):
+    """Enforcement: a token holding none of read/write/admin is 403'd on the run list.
+
+    403 (not 401) is the correct expectation here: ``require_any_scope`` itself raises
+    403 for a token that authenticated but lacks the scope, while 401 comes from
+    ``get_current_scopes`` upstream on a missing/invalid token.
+    """
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([])
+    resp = client.get("/workflows/runs")
+    assert resp.status_code == 403
+
+
+def test_scopeless_token_forbidden_on_run_result(client, auth_on):
+    """Enforcement: same for the result route, which exposes per-step output blobs."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([])
+    resp = client.get("/workflows/runs/whatever/result")
+    assert resp.status_code == 403
+
+
+def test_read_token_admitted_on_run_list(client, auth_on):
+    """A cao:read token PASSES the gate (not 403) — the point of including SCOPE_READ.
+
+    Guards the over-restriction failure mode: gating these reads on write/admin only
+    would lock out exactly the read-only callers they exist for.
+    """
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    resp = client.get("/workflows/runs")
+    assert resp.status_code != 403
+
+
+def test_write_token_still_admitted_on_run_list(client, auth_on):
+    """A cao:write token keeps working — existing write-scoped callers must not break."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_WRITE])
+    resp = client.get("/workflows/runs")
+    assert resp.status_code != 403

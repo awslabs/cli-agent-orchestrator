@@ -2614,6 +2614,66 @@ async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> L
     return [row.model_dump() for row in rows]
 
 
+# --------------------------------------------------------------------------- #
+# ROUTE-ORDERING HAZARD (U4, issue #505, RO-1/RO-2). ``GET /workflows/runs`` MUST
+# be declared IMMEDIATELY BEFORE the ``GET /workflows/{name}`` catch-all below.
+# FastAPI matches routes in declaration order, and ``{name}`` is a SINGLE path
+# segment, so if the catch-all were declared first it would capture the literal
+# segment ``runs`` as ``name="runs"`` and this list route would be dead. Do NOT
+# "tidy" this route back below the catch-all. Only this bare single-segment
+# collection route collides; the deeper two-segment run routes
+# (``/workflows/runs/{run_id}`` and ``/workflows/runs/{run_id}/result``) can never
+# be shadowed by a single-segment ``{name}`` and are safe at any position. The
+# NFR-2a regression test (mirroring the #510 ``/agents/profiles/search`` precedent)
+# is the load-bearing guard against a future reorder.
+# --------------------------------------------------------------------------- #
+@app.get("/workflows/runs")
+async def list_workflow_runs_endpoint(
+    state: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> List[Dict]:
+    """List journaled workflow runs newest-first as narrow summaries (U4, FR-3.3).
+
+    Journal-authoritative read: a thin mapper over U1's
+    ``workflow_journal.list_runs`` (RunSummaryRow projection, ORDER BY
+    ``started_at DESC, run_id DESC``). The state-legality check that the DAL
+    deliberately omits lives at this REST boundary (LR-1): an illegal ``state``
+    filter is a 400; a legal-but-unmatched value simply yields ``[]``. ``limit`` is
+    clamped to ``[1, 500]`` by FastAPI at the boundary (LR-2). An empty result is a
+    200 with ``[]`` (LR-3), never a 404. A ``sqlite3.Error`` from the DAL maps to
+    500 (LR-4) — a silently empty list would hide a broken database from a human
+    who explicitly asked to list runs.
+
+    No-id ``status`` floor (SR-1, FR-4.8): ``?limit=1`` returns the
+    most-recently-started run (any state), which U5/U6 consume to resolve
+    ``status`` with no explicit run id.
+    """
+    import sqlite3
+    from dataclasses import asdict
+
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+    from cli_agent_orchestrator.services import workflow_journal
+
+    if state is not None:
+        try:
+            RunState(state)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"illegal run state filter '{state}'",
+            )
+
+    try:
+        rows = workflow_journal.list_runs(state=state, limit=limit)
+    except sqlite3.Error as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"failed to list runs: {e}",
+        )
+    return [asdict(row) for row in rows]
+
+
 @app.get("/workflows/{name}")
 async def get_workflow_endpoint(name: str) -> Dict:
     """Return the parsed/validated spec for a workflow name (FR-2.1, A1).
@@ -2701,6 +2761,185 @@ async def record_step_output_endpoint(
 # tool. Error mapping (C5 / B3-BR-14): unknown run/spec -> 404, invalid spec/inputs
 # -> 400, cancel-of-finished -> 409, NotBuiltYetError (reserved seam) -> 501,
 # WorkflowEngineError -> 500. Narrow exceptions in the service; mapped here.
+
+
+_EVENTS_ROUTE_PATH = "/workflows/runs/{run_id}/events"
+
+
+def _events_route_registered() -> bool:
+    """Whether THIS build actually serves the events route (CD-1).
+
+    The events route is owned by issue #504 and is absent from this branch, so
+    advertising it unconditionally put a link that 404s into EVERY accepted-run
+    response. Rather than hard-code either answer — which would need a follow-up
+    edit the moment the merge order changed — ask the running app what it serves.
+    The check is over the app's own route table (no I/O, no network) and it
+    self-heals: the link appears automatically once #504's route is registered,
+    with no code change at the rebase.
+    """
+    return any(getattr(r, "path", None) == _EVENTS_ROUTE_PATH for r in app.routes)
+
+
+def _run_links(run_id: str) -> Dict[str, str]:
+    """Build the 202 body's ``links`` map for a submitted run (U2, ADR-1, RR-2).
+
+    Each value is a **relative** URL (host/port/scheme-agnostic so they work behind
+    a proxy and in the test client, which joins them onto its own base URL).
+    ``cancel`` resolves to the existing cancel route; ``self``/``status`` both point
+    at the snapshot route.
+
+    ``events`` is CONDITIONAL (CD-1): it is present only when this build actually
+    serves the route (#504). A ``links`` map is a capability advertisement, and a
+    role that 404s is worse than an absent one — a client that feature-detects by
+    key presence does the right thing either way, whereas one that trusts an
+    advertised role gets a 404 on its first call. Clients must therefore treat
+    ``events`` as optional; the four unconditional roles are always present.
+    """
+    links = {
+        "self": f"/workflows/runs/{run_id}",
+        "status": f"/workflows/runs/{run_id}",
+        "result": f"/workflows/runs/{run_id}/result",
+        "cancel": f"/workflows/runs/{run_id}/cancel",
+    }
+    if _events_route_registered():
+        links["events"] = f"/workflows/runs/{run_id}/events"
+    return links
+
+
+# --- Background-drive task registry + admission bound (issue #505 review) ---
+#
+# STRONG REFERENCES (BG-1). ``asyncio`` keeps only a WEAK reference to a task, so a
+# bare ``asyncio.create_task(...)`` whose Task object is discarded can be garbage
+# collected while it is suspended on a future it alone roots — the drive simply
+# stops, and the journal row it was going to settle stays RUNNING forever. Those
+# rows are the durable record this feature exists to provide, so every drive task
+# is held in this module-level set until it completes and discards itself via a
+# done-callback.
+_background_drives: "set[asyncio.Task]" = set()
+
+# ADMISSION BOUND (AB-1). See WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES: the async
+# route has none of the blocking route's natural back-pressure, so the semaphore is
+# the only thing standing between N submits and N concurrent drives. Created lazily
+# because a module-level asyncio primitive binds to whatever loop is current at
+# import time, which is not necessarily the loop the app runs on (notably under
+# TestClient, which creates a fresh loop per client).
+_drive_semaphore: "Optional[asyncio.Semaphore]" = None
+
+
+def _get_drive_semaphore() -> asyncio.Semaphore:
+    """Return the process-wide background-drive admission semaphore (AB-1, lazy)."""
+    from cli_agent_orchestrator.constants import WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES
+
+    global _drive_semaphore
+    if _drive_semaphore is None:
+        _drive_semaphore = asyncio.Semaphore(WORKFLOW_MAX_CONCURRENT_BACKGROUND_DRIVES)
+    return _drive_semaphore
+
+
+def _schedule_background_drive(
+    record: Any, spec: Any, run_id: str, tier: str, inputs: Dict[str, Any]
+) -> "asyncio.Task":
+    """Schedule a background drive, holding a STRONG reference to its Task (BG-1).
+
+    The done-callback discards the reference on EVERY completion path (normal,
+    exception, cancellation), so the set cannot grow without bound. Returns the
+    Task so a caller/test can await or cancel it.
+    """
+    task = asyncio.create_task(
+        _run_in_background(record, spec, run_id, tier, inputs),
+        name=f"workflow-drive-{run_id}",
+    )
+    _background_drives.add(task)
+    task.add_done_callback(_background_drives.discard)
+    return task
+
+
+async def _run_in_background(
+    record: Any, spec: Any, run_id: str, tier: str, inputs: Dict[str, Any]
+) -> None:
+    """The fire-and-forget background drive for an async-submitted run (U2, C2).
+
+    Scheduled with ``asyncio.create_task`` AFTER the durable insert committed and
+    the 202 was returned — it holds no client socket. It invokes ONLY the dedicated
+    **prepared** engine entries (``start_run_prepared`` /
+    ``run_script_workflow_prepared``), never the blocking ``start_run`` /
+    ``run_script_workflow`` (which would re-admit and re-insert — the double-insert
+    / double-admission hazard, ADR-3 / DR-1). The prepared entries' own
+    write-through settles the terminal state.
+
+    BR-1: it NEVER re-raises into the event loop — every exception is terminal for
+    the task. BR-2: if an exception escaped BEFORE the engine settled the row, it
+    best-effort marks the run FAILED (its own ``try``/``except``) so a scheduling
+    bug can never orphan a run stuck in RUNNING. The ``ScriptRunRecord`` carries no
+    ``inputs`` field, so the resolved inputs are threaded in explicitly to build the
+    script spawn env via the single-homed public ``build_env`` seam.
+
+    BR-2a (issue #505 review): the backstop covers CANCELLATION too. ``CancelledError``
+    derives from ``BaseException``, NOT ``Exception``, so an ``except Exception``
+    backstop does not see it — on interpreter shutdown (or any task cancel) the
+    exception would propagate straight out and leave the journal row stuck in
+    RUNNING forever, exactly the outcome BR-2 exists to prevent. It is handled in its
+    OWN arm that writes the same FAILED backstop and then RE-RAISES, because
+    swallowing a cancellation would break cooperative-cancellation semantics for the
+    caller. The semaphore (AB-1) is acquired here rather than in the handler so a
+    queued run still holds its durable row and its already-returned 202.
+
+    BR-2b (PR #525 review): the backstop is STATE-GUARDED. Written unconditionally it
+    fired on any exception, including one raised AFTER the engine had already settled
+    the row — turning a true COMPLETED/CANCELLED into a false FAILED. The journal row
+    is the durable record of what actually happened, so a wrong terminal state is
+    worse than the orphaned-RUNNING hole BR-2 closes: an orphan is visibly stuck,
+    whereas a wrong terminal state is indistinguishable from a real one. The guard is
+    a conditional UPDATE in the DAL (``settle_run_state_if_running``), atomic rather
+    than a read-then-write here, so no concurrent settle can land between the check
+    and the write. The never-settled case still lands FAILED — BR-2's guarantee is
+    narrowed, not removed.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+    from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+
+    def _failed_backstop(why: str) -> None:
+        """Mark the run FAILED **only if still RUNNING**; itself guarded so it can never re-raise."""
+        try:
+            settled = workflow_journal.settle_run_state_if_running(
+                run_id, RunState.FAILED.value, workflow_service._now()
+            )
+            if not settled:
+                # BR-2b: the engine already settled this row. Logged explicitly —
+                # an unobservable no-op is indistinguishable from a broken guard
+                # when this is read back after an incident.
+                logger.info(
+                    "background workflow run '%s' already settled; FAILED backstop "
+                    "not written (%s)",
+                    run_id,
+                    why,
+                )
+        except Exception:  # noqa: BLE001 — the backstop is itself best-effort
+            logger.error(
+                "background workflow run '%s' FAILED-backstop journal write failed (%s)",
+                run_id,
+                why,
+                exc_info=True,
+            )
+
+    try:
+        async with _get_drive_semaphore():
+            if tier == "yaml":
+                await workflow_service.start_run_prepared(record)
+            else:
+                env = script_runner.build_env(run_id, "1", inputs)
+                await script_runner.run_script_workflow_prepared(record, spec.path, env)
+    except asyncio.CancelledError:
+        # BR-2a: cancellation is NOT an Exception subclass — settle the durable row
+        # before letting the cancellation continue to propagate.
+        logger.warning("background workflow run '%s' drive cancelled; marking FAILED", run_id)
+        _failed_backstop("cancelled")
+        raise
+    except Exception:  # noqa: BLE001 — BR-1: the task must never re-raise into the loop
+        logger.error("background workflow run '%s' drive failed", run_id, exc_info=True)
+        # BR-2: the engine's own write-through normally settles the terminal state;
+        # this only fires if the exception escaped before the engine settled the row.
+        _failed_backstop("drive raised")
 
 
 @app.post("/workflows/runs")
@@ -2793,6 +3032,253 @@ async def start_workflow_run_endpoint(
     return result.model_dump()
 
 
+@app.post("/workflows/runs:submit", status_code=status.HTTP_202_ACCEPTED)
+async def submit_workflow_run_endpoint(
+    body: WorkflowRunRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Submit a workflow run asynchronously: durably record it, ack 202, drive in background.
+
+    THE SPINE (U2, FR-2.1..FR-2.6). Unlike the blocking ``POST /workflows/runs``
+    (untouched, byte-compatible), this route acks with **202** the instant the run
+    is durably journaled, then drives the run in a fire-and-forget background task.
+    It upholds two invariants on the write side: ``run-id-allocated-before-ack``
+    (INV-1 — the durable insert is awaited and complete before the 202) and
+    no-orphan-RUNNING-row (validate/lint/reserved-mode/insert are ordered so no 202
+    or RUNNING row exists for a rejected run).
+
+    The steps run STRICTLY in order — reordering breaks one of the two invariants:
+
+    0. Key-shape validation THEN the admission gate, both for a caller-supplied id
+       and both BEFORE spec resolve (OR-4). A malformed ``body.run_id`` returns 400
+       and a colliding one returns 409, in each case even when ``name_or_path``
+       names a nonexistent spec — so neither is masked by a 404. Validating the key
+       shape HERE (not only inside the engine entry) is load-bearing: the prepared
+       background entries are reached only AFTER the durable insert and the 202, so
+       an engine-side ``_validate_key_part`` failure would surface as a background
+       task error on an already-acked run instead of the blocking twin's 400.
+    1. Resolve the spec (same error mapping as the blocking route).
+    2. Mint or accept the run id (identical to the blocking route).
+    3. Validate + cap inputs BEFORE any create (OR-1, NFR-4) — no row yet.
+    4. Script tier: lint gate -> 422 (OR-2); reserved YAML mode -> 501 (OR-3) —
+       both BEFORE any insert, so a rejected run leaves NO durable row and NO 202.
+    5. The awaited HARD atomic durable insert (INV-1, TR-1) — a ``sqlite3.Error``
+       aborts with 500 and NO 202. This is the one deliberate deviation from the
+       engines' best-effort write. An ``IntegrityError`` is special-cased FIRST
+       (it is an ``Error`` subclass, so arm order is load-bearing) and maps to
+       409: it means a concurrent submit won the race for this run id, which is
+       the same collision step 0 reports as 409 when it can see it serially.
+    6. Register the tier-appropriate in-process record (the SAME record C2 drives).
+    7. Schedule the background drive through ``_schedule_background_drive`` — the
+       registry helper, NOT a bare ``asyncio.create_task`` (see BG-1 at step 7).
+    8. Return 202 ``{run_id, state:"running", links}``.
+    """
+    import sqlite3
+    import uuid
+
+    from cli_agent_orchestrator.constants import WORKFLOW_INPUTS_MAX_BYTES
+    from cli_agent_orchestrator.models.workflow import (
+        NotBuiltYetError,
+        ScriptSpec,
+        TierCollisionError,
+    )
+    from cli_agent_orchestrator.models.workflow_runtime import RunState, StepState
+    from cli_agent_orchestrator.services import (
+        script_runner,
+        workflow_journal,
+        workflow_service,
+        workflow_spec_service,
+    )
+
+    # --- Step 0: admission gate FIRST for a caller-supplied id (OR-4) ---
+    # BEFORE spec resolve, so a colliding id + nonexistent spec returns 409, not
+    # 404. A minted id has no step-0 gate (collision probability negligible; the
+    # atomic insert's IntegrityError is the backstop).
+    #
+    # TWO checks, in the SAME order the blocking twin runs them (workflow_service
+    # .start_run L795-796): FORMAT first (_validate_key_part -> 400), then
+    # UNIQUENESS (_check_run_id_available -> 409). Both are required here because
+    # the async path's prepared engine entry (``start_run_prepared``) is the
+    # drive-only tail of ``start_run`` — it deliberately re-runs NO admission, so
+    # it never validates the key. Without this line the twins split their contract:
+    # the same malformed id yields 400 on POST /workflows/runs and 202 here, and a
+    # durable journal row commits for a run that can never execute while the caller
+    # holds a run_id and a ``links`` block that will never resolve. (Nothing escapes
+    # onto disk either way — ``step_output_store`` re-validates both key parts at
+    # its own boundary, L129-130 — so this is a contract defect, not traversal.)
+    if body.run_id:
+        try:
+            workflow_service._validate_key_part(body.run_id, "run_id")
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        try:
+            workflow_service._check_run_id_available(body.run_id)
+        except KeyError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+    # --- Step 1: resolve the spec (mapping identical to the blocking route) ---
+    try:
+        spec = workflow_spec_service.get_workflow(body.name_or_path)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown workflow '{body.name_or_path}'",
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except TierCollisionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    # --- Step 2: mint or accept the run id (identical to the blocking route) ---
+    run_id = body.run_id or f"run-{uuid.uuid4().hex[:16]}"
+
+    # --- Step 3: validate + cap inputs BEFORE any create (OR-1, NFR-4). No row
+    # yet — a validation failure never leaves an orphan RUNNING row. ---
+    try:
+        resolved = workflow_service._validate_inputs(spec, body.inputs)
+        payload = json.dumps(resolved, separators=(",", ":"))
+        if len(payload.encode("utf-8")) > WORKFLOW_INPUTS_MAX_BYTES:
+            raise ValueError(f"workflow inputs exceed {WORKFLOW_INPUTS_MAX_BYTES} bytes")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    started_at = workflow_service._now()
+    record: Any
+    tier: str
+
+    # Steps 4-6 branch by tier via ONE ``isinstance`` check (mirrors the blocking
+    # route's tier split). Each arm: (4) its pre-insert gate, which raises BEFORE
+    # any insert so a rejected run leaves NO durable row and NO 202; (5) the awaited
+    # HARD durable insert; (6) the in-process record C2 will drive.
+    if isinstance(spec, ScriptSpec):
+        # Step 4 — script lint gate (OR-2): a lint fail -> 422 with a findings body,
+        # in the handler's validation phase (never deferred into the background
+        # task, where a 202 + RUNNING row would already exist).
+        lint_result = script_runner.lint_script(spec.source, spec.path)
+        if lint_result.status == "fail":
+            raise HTTPException(
+                status_code=422,
+                detail={"findings": workflow_spec_service.render_findings(lint_result.findings)},
+            )
+        spec_snapshot = json.dumps(
+            {"source": spec.source, "path": spec.path, "content_hash": spec.content_hash}
+        )
+        # Step 5 — the script row is a single INSERT (no seed steps), already
+        # atomic on its own connection. This is the one deliberate deviation from
+        # the engines' best-effort write: awaited, and its failure aborts with 500.
+        try:
+            await asyncio.to_thread(
+                workflow_journal.insert_run,
+                run_id,
+                spec.name,
+                spec_snapshot,
+                payload,
+                RunState.RUNNING.value,
+                started_at,
+                "script",
+                "1",
+            )
+        except sqlite3.IntegrityError:
+            # TOCTOU (PR #525 review): step 0's uniqueness check and this insert are
+            # not one atomic operation, so two concurrent submits carrying the SAME
+            # caller-supplied run_id can both pass step 0. The loser's PRIMARY KEY
+            # violation is the same collision step 0 reports as 409 when it sees it
+            # serially, so it must answer 409 too — a 500 would tell the caller the
+            # server broke when in fact their run id was simply taken. Ordered BEFORE
+            # the generic arm: IntegrityError is a sqlite3.Error subclass.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run id '{run_id}' already exists",
+            )
+        except sqlite3.Error as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"failed to durably record run '{run_id}': {e}",
+            )
+        # Step 6 — the live script record.
+        record = script_runner.ScriptRunRecord(
+            run_id=run_id,
+            workflow_name=spec.name,
+            state=RunState.RUNNING,
+            cancelled=False,
+            current_step_id=None,
+            step_states={},
+            process=None,
+            generation="1",
+            started_at=started_at,
+            finished_at=None,
+            tier="script",
+        )
+        tier = "script"
+    else:
+        # Step 4 — reserved-mode guard (OR-3): the prepared YAML entry skips the
+        # blocking path's pre-drive reserved-mode rejection, so the handler runs it
+        # here and maps NotBuiltYetError -> 501 pre-journal.
+        if spec.mode != "sequential":
+            try:
+                workflow_service._dispatch_reserved_mode(spec)
+            except NotBuiltYetError as e:
+                raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
+        # Step 5 — the awaited HARD ATOMIC durable insert (INV-1, TR-1): the run row
+        # AND its seeded step rows commit in ONE transaction, so a failure leaves
+        # NEITHER (no phantom RUNNING row). Its failure aborts with 500 + NO 202.
+        try:
+            await asyncio.to_thread(
+                workflow_journal.insert_run_with_steps,
+                run_id,
+                spec.name,
+                spec.model_dump_json(),
+                payload,
+                RunState.RUNNING.value,
+                started_at,
+                [(step.id, StepState.PENDING.value) for step in spec.steps],
+                started_at,
+                "yaml",
+                "1",
+            )
+        except sqlite3.IntegrityError:
+            # Same TOCTOU → 409 mapping as the script arm above; ordered before the
+            # generic sqlite3.Error arm because IntegrityError subclasses it.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run id '{run_id}' already exists",
+            )
+        except sqlite3.Error as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"failed to durably record run '{run_id}': {e}",
+            )
+        # Step 6 — the live YAML record (step_states seeded from spec.steps).
+        record = workflow_service.RunRecord(
+            run_id=run_id,
+            workflow_name=spec.name,
+            spec=spec,
+            inputs=resolved,
+            state=RunState.RUNNING,
+            current_step_id=None,
+            cancelled=False,
+            step_states={
+                step.id: workflow_service.StepRunState(step_id=step.id) for step in spec.steps
+            },
+            started_at=started_at,
+        )
+        tier = "yaml"
+
+    workflow_service.run_registry[run_id] = record
+
+    # --- Step 7: schedule the fire-and-forget background drive (C2). ---
+    # Via the registry helper, NOT a bare create_task: the Task must be strongly
+    # referenced or it can be collected mid-drive (BG-1), and the drive itself is
+    # admission-bounded (AB-1) inside the task.
+    _schedule_background_drive(record, spec, run_id, tier, resolved)
+
+    # --- Step 8: ack 202. The insert (step 5) is awaited and durable before this,
+    # so the instant this returns, get_run(run_id) finds the row (INV-1). ---
+    return {"run_id": run_id, "state": RunState.RUNNING.value, "links": _run_links(run_id)}
+
+
 @app.get("/workflows/runs/{run_id}")
 async def get_workflow_run_endpoint(run_id: str) -> Dict:
     """Return a point-in-time status snapshot for a run (FR-5.5)."""
@@ -2803,6 +3289,224 @@ async def get_workflow_run_endpoint(run_id: str) -> Dict:
     except KeyError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
     return status_snapshot.model_dump()
+
+
+def _json_or_none(output_json: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Parse a persisted step ``output_json`` blob, degrading a corrupt value to
+    ``None`` rather than failing the whole result (U4, RR-3).
+
+    Per-row corruption tolerance mirroring
+    ``workflow_service._rebuild_record_from_journal``'s ``_record_from_json``: a
+    single unparseable OR non-object ``output_json`` yields ``None`` for that one
+    step's output (``StepResult.output`` is an ``Optional[Dict]``), never a 500 for
+    the entire run result.
+    """
+    if output_json is None:
+        return None
+    try:
+        data = json.loads(output_json)
+    except (ValueError, TypeError):
+        logger.debug("result assembly: dropping unparseable step output_json")
+        return None
+    if not isinstance(data, dict):
+        logger.debug("result assembly: dropping non-object step output_json")
+        return None
+    return data
+
+
+def _durable_error_kind(steps: List[Any]) -> Optional[str]:
+    """Read the durable ``error_kind`` off the step projection, if present (U9, RP-1).
+
+    The column-first swap target (ADR-5): #504 persists a durable ``error_kind`` on
+    the ``workflow_run_step`` projection. Once that column lands and ``StepRow``
+    surfaces it, this returns the first non-null durable kind found on a step —
+    authoritative over any inference (RP-1). Until then, ``StepRow`` carries no
+    ``error_kind`` attribute, so ``getattr`` yields ``None`` for every row and this
+    helper is INERT (returns ``None``), leaving the inference floor in force (RP-2).
+
+    Reading via ``getattr(step, "error_kind", None)`` makes the rebase a clean swap
+    confined to this one helper (RP-5): when the column arrives no call site changes.
+    """
+    # TODO(#504-rebase): prefer durable step.error_kind once the column lands — the
+    # getattr below activates automatically the moment StepRow surfaces the field.
+    for s in steps:
+        durable = getattr(s, "error_kind", None)
+        if durable:
+            return str(durable)
+    return None
+
+
+def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
+    """Resolve the terminal ``kind`` for an assembled ``WorkflowRunResult`` (U4 seam).
+
+    U4 shipped the CALL SITE plus the ADR-5 inference FLOOR; U9 enriches this SAME
+    function with column-first precedence (kept a single module-level function so
+    the swap is confined, RP-5). Precedence:
+
+    1. Column-first (RP-1): a durable ``error_kind`` on the step projection wins
+       authoritatively — the inference is NOT consulted. INERT until #504's column
+       lands (``_durable_error_kind`` returns ``None`` for pre-migration rows).
+    2. Inference fallback (RP-2, pre-migration rows only) — the RR-4 floor:
+
+       - CANCELLED run                                 -> ``"cancelled"``
+       - FAILED run with a step error matching /timeout/i -> ``"timeout"``
+       - FAILED run otherwise                          -> ``"error"``
+       - COMPLETED / RUNNING / anything else           -> ``None``
+
+    The timeout branch is a conservative case-insensitive substring match, never a
+    parse, and no kind is ever fabricated for a completed/non-terminal run (RP-4).
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
+
+    # Column-first (RP-1): authoritative when present; inert (None) pre-migration.
+    durable = _durable_error_kind(steps)
+    if durable is not None:
+        return durable
+
+    # Inference fallback (RP-2) — the ADR-5 floor for pre-migration rows.
+    try:
+        run_state = RunState(row.state)
+    except ValueError:
+        return None
+
+    if run_state == RunState.CANCELLED:
+        return "cancelled"
+    if run_state == RunState.FAILED:
+        for s in steps:
+            if s.error and re.search(r"timeout", s.error, re.IGNORECASE):
+                return "timeout"
+        return "error"
+    return None
+
+
+def _build_failure_envelope(
+    row: Any, step_results: List[Any], run_id: str, error_kind: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Assemble the FR-7.1 failure envelope from journal state (U9, EF-1..EF-5).
+
+    A presentation value object — NOT a persisted entity (EF-5). Returned only for a
+    terminal-failed/cancelled run; a completed/non-terminal run yields ``None`` so a
+    successful run's result stays byte-identical (NFR-3 stable ``--json``). Assembled
+    purely from ``get_run`` + ``get_steps`` state, so it is answerable on the
+    detached / post-restart path with no live registry entry (JP-1, FR-6.2). Fields:
+
+    - ``failing_step`` — the first ``StepResult`` whose state is FAILED, else the
+      run's ``current_step_id`` at failure (EF-1).
+    - ``attempt`` — that step's ``attempts`` (EF-2).
+    - ``error_kind`` — the ``_resolve_error_kind`` result (already resolved).
+    - ``terminal_reference`` — the ``run_id`` (the durable handle, EF-3).
+    - ``next_command`` — a fixed literal hint keyed on the run id (EF-4, ST-1); the
+      shape does not drift, so ``--json`` consumers can parse it across releases.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState, StepState
+
+    if row.state not in (RunState.FAILED.value, RunState.CANCELLED.value):
+        return None
+
+    failed = next((s for s in step_results if s.state == StepState.FAILED), None)
+    if failed is not None:
+        failing_step: Optional[str] = failed.id
+        attempt: Optional[int] = failed.attempts
+    else:
+        # No FAILED step (e.g. a cancelled run) — fall back to the live step at
+        # failure and read its attempt count when that row is present (EF-1/EF-2).
+        failing_step = row.current_step_id
+        match = next((s for s in step_results if s.id == failing_step), None)
+        attempt = match.attempts if match is not None else None
+
+    return {
+        "failing_step": failing_step,
+        "attempt": attempt,
+        "error_kind": error_kind,
+        "terminal_reference": run_id,
+        "next_command": f"cao workflow result {run_id}",
+    }
+
+
+@app.get("/workflows/runs/{run_id}/result")
+async def get_workflow_run_result_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Return the complete retained ``WorkflowRunResult`` for a run (U4, FR-7.2).
+
+    A two-segment path (safe at any declaration position, RO-2). Journal-authoritative
+    (FR-6.2, A-5): the result is assembled purely from ``get_run`` + ``get_steps``,
+    with NO dependency on a live ``run_registry`` entry — so a detached or
+    post-restart run's full retained result is still answerable (RR-2). An absent
+    run (``get_run`` is ``None``) is a 404 (RR-1). A single corrupt step
+    ``output_json`` degrades to ``output=None`` for that step, not a 500 for the
+    whole result (RR-3). ``kind`` is resolved through the single
+    ``_resolve_error_kind`` seam (RR-4).
+
+    U9 (FR-7.1): a terminal-FAILED/CANCELLED run additionally carries a
+    ``failure_envelope`` (failing step, attempt, error kind, terminal reference,
+    next-command hint), assembled from the same journal rows (JP-1). A
+    COMPLETED/non-terminal run omits the key, so a successful run's ``--json`` shape
+    stays byte-identical (NFR-3).
+
+    NOT returned (PR #525 review): a run-level ``output``. The journal has no column
+    for one, so the key was always null here; it is dropped rather than advertised.
+    Per-step outputs are unaffected and still populate ``steps[].output``. A caller
+    that needs a script run's run-level output must use the blocking
+    ``POST /workflows/runs``, whose live return path carries it.
+    """
+    from cli_agent_orchestrator.models.workflow_runtime import (
+        RunState,
+        StepResult,
+        StepState,
+        WorkflowRunResult,
+    )
+    from cli_agent_orchestrator.services import workflow_journal
+
+    row = workflow_journal.get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+
+    steps = workflow_journal.get_steps(run_id)
+    step_results = [
+        StepResult(
+            id=s.step_id,
+            state=StepState(s.state),
+            attempts=s.attempts,
+            output=_json_or_none(s.output_json),
+            error=s.error,
+        )
+        for s in steps
+    ]
+    error_kind = _resolve_error_kind(row, steps)
+    result = WorkflowRunResult(
+        run_id=row.run_id,
+        workflow_name=row.workflow_name,
+        state=RunState(row.state),
+        steps=step_results,
+        started_at=row.started_at,
+        finished_at=row.finished_at,
+        kind=error_kind,
+    )
+    body = result.model_dump()
+
+    # PR #525 review: DROP the run-level ``output`` key from this route's body.
+    # It was advertised in three places but STRUCTURALLY always None here: there is
+    # no run-level output column on ``workflow_run`` and ``RunRow`` has no such
+    # field, so a journal-assembled result has nothing to populate it from. (Only
+    # the LIVE script-tier return path fills it — ``script_runner._finalize`` — which
+    # the blocking route still returns, so the model field stays.) The pop is
+    # explicit because Pydantic's ``model_dump`` emits defaulted fields: simply not
+    # passing ``output=`` above leaves the key present as null, which is exactly the
+    # false advertisement being removed. Advertising a field that can never carry a
+    # value is worse than omitting it — a client feature-detecting on key presence
+    # wires up a code path that can never fire.
+    body.pop("output", None)
+
+    # U9 (FR-7.1): attach the failure envelope ONLY for a terminal-failed/cancelled
+    # run (a completed/non-terminal run keeps its byte-identical shape, NFR-3). The
+    # envelope is assembled from journal state alone (JP-1), so it is present on the
+    # detached / post-restart path with an empty registry.
+    envelope = _build_failure_envelope(row, step_results, run_id, error_kind)
+    if envelope is not None:
+        body["failure_envelope"] = envelope
+    return body
 
 
 @app.post("/workflows/runs/{run_id}/cancel")
@@ -2822,6 +3526,13 @@ async def cancel_workflow_run_endpoint(
     row CANCELLED directly rather than calling ``cancel_run`` (which would
     unconditionally raise ``KeyError`` here and mask every crash-remnant cancel
     as a 404).
+
+    U7 (issue #505, FR-9.1/FR-9.2) note: this is the route the 202 submit body's
+    ``links.cancel`` (built by ``_run_links``) points at — the SAME acknowledged
+    run id round-trips back here. It is the ONLY cancel handler; U7 adds no new
+    route (NR-1). The registry-miss journal-fallback arm above is what makes a
+    detached async-submitted run, or one whose registry entry was lost to a
+    restart, still cancellable from the journal alone (journal-is-authoritative).
     """
     from cli_agent_orchestrator.models.workflow_runtime import RunState
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service

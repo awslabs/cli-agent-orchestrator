@@ -93,8 +93,20 @@ than calling these routes directly.
 ### Workflows
 
 - `/workflows*` validates and inspects workflow specifications.
-- `/workflows/runs*` starts, inspects, cancels, and resumes runs and retrieves
-  run output.
+- `POST /workflows/runs` starts a run **inline** and holds the connection until it
+  finishes, returning the complete result.
+- `POST /workflows/runs:submit` starts a run **asynchronously**: it returns `202` with
+  `{run_id, state, links}` as soon as the run is durably journaled, then drives the run in
+  the background. The `links` map always carries `self`/`status`/`result`/`cancel`;
+  `events` appears only on a build that serves the events route, so treat it as optional.
+- `GET /workflows/runs` lists journaled runs newest-first (`?state=`, `?limit=`).
+- `GET /workflows/runs/{run_id}` returns a point-in-time status snapshot.
+- `GET /workflows/runs/{run_id}/result` returns the complete retained result. It is
+  assembled from the journal, so it answers for a **detached, in-flight, or post-restart**
+  run — not only a finished one. No run-level `output` field is returned (run-level output
+  is not journaled); per-step outputs are on `steps[].output`.
+- `POST /workflows/runs/{run_id}/cancel` cooperatively cancels a run;
+  `POST /workflows/runs/{run_id}/resume` re-drives a crashed/failed one.
 
 See [Workflows](workflows.md).
 
