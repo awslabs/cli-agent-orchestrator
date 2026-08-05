@@ -186,7 +186,12 @@ class TestCodexBuildCommand:
     def test_build_command_with_mcp_servers(self, mock_load_profile):
         mock_profile = MagicMock()
         mock_profile.model = None
-        mock_profile.system_prompt = "You are a supervisor."
+        # Empty -- these assertions only care about the MCP -c overrides, not the
+        # developer_instructions temp file, so there's nothing to gain from writing
+        # one to disk (and every write outside a patched CAO_HOME_DIR touches the
+        # real ~/.aws/cli-agent-orchestrator/tmp/, same convention as
+        # test_build_command_with_mcp_servers_env below).
+        mock_profile.system_prompt = ""
         mock_profile.mcpServers = {
             "cao-mcp-server": {
                 "type": "stdio",
@@ -217,7 +222,8 @@ class TestCodexBuildCommand:
         before being emitted as a -c override."""
         mock_profile = MagicMock()
         mock_profile.model = None
-        mock_profile.system_prompt = "You are a supervisor."
+        # Empty -- see test_build_command_with_mcp_servers's comment above.
+        mock_profile.system_prompt = ""
         mock_profile.mcpServers = {
             "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
         }
@@ -244,7 +250,8 @@ class TestCodexBuildCommand:
         -c override stays a valid TOML basic string."""
         mock_profile = MagicMock()
         mock_profile.model = None
-        mock_profile.system_prompt = "You are a supervisor."
+        # Empty -- see test_build_command_with_mcp_servers's comment above.
+        mock_profile.system_prompt = ""
         mock_profile.mcpServers = {
             "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
         }

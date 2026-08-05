@@ -2,9 +2,11 @@
 
 import asyncio
 import logging
+import os
 import re
 import shlex
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -348,6 +350,16 @@ class CodexProvider(BaseProvider):
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
 
+    def _developer_instructions_file_path(self) -> Path:
+        """Path of this terminal's developer_instructions temp file.
+
+        Single source of truth for the path -- both `_build_codex_command` (which
+        writes it) and `cleanup` (which removes it) call this instead of each
+        re-deriving the same `CAO_HOME_DIR / "tmp" / f"{...}.codex_developer_instructions"`
+        expression independently, which would let the two silently drift apart.
+        """
+        return CAO_HOME_DIR / "tmp" / f"{self.terminal_id}.codex_developer_instructions"
+
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
 
@@ -448,25 +460,36 @@ class CodexProvider(BaseProvider):
                 # command-substitution approach reaches the same practical outcome (a short launch
                 # line) without needing that.
                 #
+                # Deliberate, documented shell-scope trade-off (not an oversight): $(...) command
+                # substitution is POSIX and works identically on every shell CAO's own
+                # BRACKETED_PASTE_INCOMPATIBLE_SHELLS (constants.py) already tracks as a shell
+                # class *except* csh/tcsh, which use `cmd` backticks instead and do not recognize
+                # `$(` as substitution syntax at all -- launching codex from a pane whose bare
+                # shell is csh/tcsh would break outright with this fragment malformed/rejected by
+                # the shell, not merely degrade. bash/zsh/dash/sh/ksh/mksh/ash/fish are all fine.
+                # No code here detects or special-cases the pane's shell before writing this
+                # fragment (unlike BRACKETED_PASTE_INCOMPATIBLE_SHELLS' own runtime
+                # #{pane_current_command} probe) -- csh/tcsh support, if ever needed, is scoped
+                # out of this fix rather than silently assumed to already work.
+                #
                 # Not covering here (disclosed, not silently assumed away): the other -c overrides
                 # below (per-MCP-server config, codexConfig) are NOT routed through this same
                 # mechanism and remain inlined directly -- they are typically far smaller than
                 # developer_instructions, but a profile configuring many MCP servers could in
                 # theory still accumulate enough inline -c overrides to hit the same limit. Left
                 # as a known, scoped-out follow-up rather than expanding this fix's surface.
-                developer_instructions_dir = CAO_HOME_DIR / "tmp"
-                developer_instructions_dir.mkdir(parents=True, exist_ok=True)
-                developer_instructions_file = (
-                    developer_instructions_dir / f"{self.terminal_id}.codex_developer_instructions"
+                developer_instructions_file = self._developer_instructions_file_path()
+                developer_instructions_file.parent.mkdir(parents=True, exist_ok=True)
+                # Open with mode 0o600 baked into the O_CREAT call itself (rather than
+                # write_text() followed by a separate chmod()) so the file is never
+                # briefly world/group-readable between creation and permission-tightening --
+                # the permissions are correct from the very first byte written.
+                fd = os.open(
+                    developer_instructions_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
                 )
-                developer_instructions_file.write_text(_toml_scalar(system_prompt), encoding="utf-8")
-                try:
-                    developer_instructions_file.chmod(0o600)
-                except OSError:
-                    pass
-                developer_instructions_fragment = (
-                    f'-c "developer_instructions=$(cat {shlex.quote(str(developer_instructions_file))})"'
-                )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(_toml_scalar(system_prompt))
+                developer_instructions_fragment = f'-c "developer_instructions=$(cat {shlex.quote(str(developer_instructions_file))})"'
 
             # Add MCP servers via -c config overrides (per-session, no global config changes).
             # Each server field is set via dotted path: mcp_servers.<name>.<field>=<value>
@@ -684,6 +707,17 @@ class CodexProvider(BaseProvider):
         # reaching IDLE/COMPLETED, and CAO would tear the terminal down on every single
         # attempt before an operator had any real chance to open the session and complete
         # login themselves.
+        #
+        # Known, disclosed-but-NOT-yet-fixed gap (see PR #540/#539 review discussion):
+        # CodexProvider does not override `blocks_orchestrated_input_while_waiting_user_answer`
+        # (base.py default False, unlike hermes.py/antigravity_cli.py which opt in), so
+        # terminal_service.py's send_input guard does not block an assign/handoff delivery
+        # while status is WAITING_USER_ANSWER. Now that initialize() accepts WAITING_USER_ANSWER
+        # as a success outcome, an assign/handoff launch that lands on this exact login menu can
+        # proceed to paste the orchestrated task text (+ Enter) into the live menu, which reads
+        # as an option selection -- the same composition hazard PR #539's review flagged for
+        # ClaudeCodeProvider's own choice-prompt widening. Not fixed here to keep this PR's scope
+        # to the review round-2 items; tracked as an open follow-up.
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
@@ -980,8 +1014,9 @@ class CodexProvider(BaseProvider):
         self._initialized = False
         # Remove the developer_instructions temp file written by _build_codex_command, if any --
         # same convention claude_code.py's own cleanup() uses for its analogous .prompt file.
-        tmp_file = CAO_HOME_DIR / "tmp" / f"{self.terminal_id}.codex_developer_instructions"
+        # Path comes from _developer_instructions_file_path() (single source of truth shared
+        # with _build_codex_command) so the write site and the cleanup site can't drift apart.
         try:
-            tmp_file.unlink(missing_ok=True)
+            self._developer_instructions_file_path().unlink(missing_ok=True)
         except OSError:
             pass
