@@ -10,8 +10,10 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import annotationsLibSource from '../lib/annotations.ts?raw'
+import filtersLibSource from '../lib/filters.ts?raw'
 import annotationChipsSource from '../components/AnnotationChips.tsx?raw'
 import annotationDetailsSource from '../components/AnnotationDetails.tsx?raw'
+import filterBarSource from '../components/FilterBar.tsx?raw'
 import identityColourSource from '../lib/identityColour.ts?raw'
 import { render, cleanup, screen, waitFor, within, fireEvent } from '@testing-library/react'
 import { DashboardHome } from '../components/DashboardHome'
@@ -628,6 +630,12 @@ describe('the renderer holds no conductor vocabulary either', () => {
     ['src/lib/identityColour.ts', identityColourSource],
     ['src/components/AnnotationChips.tsx', annotationChipsSource],
     ['src/components/AnnotationDetails.tsx', annotationDetailsSource],
+    // The filter module and its bar: the two places a `phase` dropdown with
+    // hard-coded values would naturally be written, and therefore the two the
+    // guard must reach. Their derived-dimension code is where "no allowlist,
+    // ever" is actually load-bearing.
+    ['src/lib/filters.ts', filtersLibSource],
+    ['src/components/FilterBar.tsx', filterBarSource],
   ]
 
   // The eight terms the Python guard forbids, plus the vocabulary this

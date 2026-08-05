@@ -80,13 +80,15 @@ describe('DashboardHome session-card header (§7.6)', () => {
 
     const name = screen.getByText('cao-fleet')
     const count = screen.getByText('1 agent')
-    // 'reviewer' also appears in the agent-type filter row; the card's type
-    // badge is the one inside the selectable metadata container.
+    // 'reviewer' also appears in the filter bar's Agent profile row; the card's
+    // type badge is the one inside the selectable metadata container.
     const badge = screen.getAllByText('reviewer').find(el => el.closest('div.select-text'))!
-    // `Active` is the only timestamp line a projected row can produce: there
-    // is no `created_at` on the projection, so the old `Started …` assertion
-    // was covering a branch the server can never reach.
-    const active = screen.getByText(/^Active \d/)
+    // `Last sent` is the only timestamp line a projected row can produce:
+    // there is no `created_at` on the projection, so the old `Started …`
+    // assertion was covering a branch the server can never reach. The label is
+    // honest about what the value measures — when CAO last sent input to a
+    // pane — because on a v2 managed row it is frozen at row creation.
+    const active = screen.getByText(/^Last sent /)
 
     for (const el of [name, count, badge, active]) {
       fireEvent.click(el)
@@ -107,7 +109,7 @@ describe('DashboardHome session-card header (§7.6)', () => {
     collapseCard()
 
     const name = screen.getByText('cao-fleet')
-    const active = screen.getByText(/^Active \d/)
+    const active = screen.getByText(/^Last sent /)
 
     fireEvent.doubleClick(name)
     fireEvent.doubleClick(active)

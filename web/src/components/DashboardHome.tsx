@@ -9,46 +9,36 @@ import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 import { CampaignAnnotations, TerminalAnnotations } from './AnnotationChips'
 import { WorkStateInfoButton } from './AnnotationDetails'
+import { GlobalFilterBar, SessionFilterBar } from './FilterBar'
 import { placeAnnotations, readAnnotations } from '../lib/annotations'
 import { fmtAbs, fmtRel } from '../lib/time'
+import {
+  activeFilterCount,
+  callerVocabulary,
+  collectFacetDimensions,
+  displayStatus,
+  emptyFilters,
+  fleetWideFacetKeys,
+  groupDimensions,
+  isFilterActive,
+  lifecycleVocabulary,
+  matchesFilters,
+  profileVocabulary,
+  providerVocabulary,
+  STATUS_ORDER,
+  FacetDimension,
+  FilterState,
+} from '../lib/filters'
 
-// Render/filter order for the per-session status summary and the status filter
-// pills. NOT_FIFO_MONITORED sits second, immediately after PROCESSING, because
-// the two share the `info` semantic role in design-tokens/status.json: both are
-// "this agent is alive" statements, and keeping them adjacent keeps that read at
-// the head of the row. It is not first, because PROCESSING is the stronger claim
-// (a turn is running) while NOT_FIFO_MONITORED is only reachability.
-//
-// Omitting it was a real defect, not a style choice: every managed native-TUI
-// worker reports NOT_FIFO_MONITORED (terminal_projection.project_row assigns it
-// to any lifecycle-live native-TUI row), so on a native-TUI fleet nearly every
-// agent was uncounted by StatusSummary and unreachable from the filter pills.
-//
-// Every entry here MUST have a counterpart in the generated STATUS_CONFIG (or
-// be the hand-added 'UNKNOWN' below): STATUS_META is built only from
-// STATUS_CONFIG, and `STATUS_META[s].dot` is dereferenced unguarded in both
-// StatusSummary and the status-filter pill row, so an entry with no
-// counterpart is a TypeError at render, not a missing dot.
-const STATUS_ORDER = ['PROCESSING', 'NOT_FIFO_MONITORED', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
-
-// The statuses the summary and the filter row can actually draw. Held as a
-// set so the counting site can ask "is this renderable?" against the same list
-// that governs rendering, rather than against a second hand-kept copy.
-const RENDERABLE_STATUSES = new Set(STATUS_ORDER)
-
-// The single status accessor for counting AND filtering. A row whose reported
-// status has no chip (the lifecycle vocabulary 'dead' / 'superseded' /
-// 'unknown-liveness' that terminal_projection assigns to non-live rows) folds
-// to UNKNOWN so it stays visible in the totals.
-//
-// Counting and filtering MUST use this same fold. Folding only at the counting
-// site produces an Unknown chip reading "2" whose pill then matches nothing and
-// empties the card — a count the operator cannot click through to.
-function displayStatus(raw: string | undefined): string {
-  const reported = raw || 'UNKNOWN'
-  return RENDERABLE_STATUSES.has(reported) ? reported : 'UNKNOWN'
-}
-
+// STATUS_ORDER / RENDERABLE_STATUSES / displayStatus live in lib/filters.ts
+// now: the fold exists so that counting and filtering can never drift, and the
+// filter predicate is the second consumer that forced it out of this file. The
+// comments recording the two omissions that made it a defect (NOT_FIFO_MONITORED
+// uncounted on a native-TUI fleet; STOPPED silently folding to UNKNOWN) moved
+// with it. The render-side tables built from it stay here, because
+// STATUS_META[s].dot is dereferenced unguarded below and every STATUS_ORDER
+// entry MUST have a STATUS_CONFIG counterpart — see
+// dashboardStatusOrderContract.test.tsx for what happens when one does not.
 const STATUS_META: Record<string, { label: string; dot: string; text: string; pulse?: boolean }> = Object.fromEntries(
   Object.entries(STATUS_CONFIG).map(([k, v]) => [k, { label: v.label, dot: v.dotClass, text: v.textClass, pulse: v.pulse }])
 )
@@ -70,6 +60,7 @@ const STATUS_ACTIVE_BG: Record<string, string> = {
   WAITING_USER_ANSWER: 'bg-amber-900/40 border-amber-500/50 text-amber-300',
   ERROR: 'bg-red-900/40 border-red-500/50 text-red-300',
   COMPLETED: 'bg-purple-900/40 border-purple-500/50 text-purple-300',
+  STOPPED: 'bg-gray-800/40 border-gray-500/50 text-gray-300',
   UNKNOWN: 'bg-gray-800/40 border-gray-500/50 text-gray-300',
 }
 
@@ -111,8 +102,21 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   const [sendInputOpen, setSendInputOpen] = useState<Record<string, boolean>>({})
   const [sendInputValues, setSendInputValues] = useState<Record<string, string>>({})
   const [sendingInput, setSendingInput] = useState<string | null>(null)
-  const [agentTypeFilter, setAgentTypeFilter] = useState<string | null>(null)
-  const [statusFilter, setStatusFilter] = useState<string | null>(null)
+  // Filter state. In-memory only, deliberately: the dashboard is served
+  // unauthenticated over `tailscale serve`, so adding the first persisted or
+  // URL-shared state is its own decision and not this one's. Global filters
+  // gate session VISIBILITY; per-session filters narrow rows inside a
+  // surviving card, keyed by session name so they survive collapse/expand and
+  // the 5s refetch exactly the way expandedSessions does.
+  const [globalFilters, setGlobalFilters] = useState<FilterState>(emptyFilters)
+  const [sessionFilters, setSessionFilters] = useState<Record<string, FilterState>>({})
+  // Collapsed by default below sm: a fully expanded bar measured over half the
+  // 844px phone screen before a single session card. jsdom has no matchMedia;
+  // the guarded default keeps the bar OPEN in unit tests so every control is
+  // queryable without an expand click first.
+  const [filtersOpen, setFiltersOpen] = useState<boolean>(() =>
+    typeof window.matchMedia === 'function' ? window.matchMedia('(min-width: 640px)').matches : true,
+  )
   const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc')
   const [pendingDeleteSession, setPendingDeleteSession] = useState<string | null>(null)
   const [deletingSession, setDeletingSession] = useState(false)
@@ -125,26 +129,23 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
 
   const totalTerminals = sessionData.reduce((sum, s) => sum + s.terminals.length, 0)
 
-  const allAgentTypes = useMemo(() => {
-    const types = new Set<string>()
-    sessionData.forEach(s => s.terminals.forEach(t => { types.add(t.agent_profile || 'default') }))
-    return [...types].sort()
-  }, [sessionData])
+  const fleetRows = useMemo(() => sessionData.flatMap(s => s.terminals), [sessionData])
 
-  const filteredSessions = useMemo(() => {
-    const filtered = sessionData.filter(s =>
-      s.terminals.length === 0 || s.terminals.some(t => {
-        const matchAgent = !agentTypeFilter || (t.agent_profile || 'default') === agentTypeFilter
-        const matchStatus = !statusFilter || displayStatus(terminalStatuses[t.id]) === statusFilter
-        return matchAgent && matchStatus
-      })
-    )
-    return filtered.sort((a, b) => {
-      const latestA = Math.max(...a.terminals.map(t => t.last_active ? new Date(t.last_active).getTime() : 0))
-      const latestB = Math.max(...b.terminals.map(t => t.last_active ? new Date(t.last_active).getTime() : 0))
-      return sortOrder === 'desc' ? latestB - latestA : latestA - latestB
-    })
-  }, [sessionData, agentTypeFilter, statusFilter, sortOrder, terminalStatuses])
+  // Layer-1 vocabularies, scanned from the fleet. The bars decide whether a
+  // scanned dimension is worth drawing (fewer than two options is not a
+  // filter); these just report what is there.
+  const livenessOptions = useMemo(() => lifecycleVocabulary(fleetRows), [fleetRows])
+  const profileOptions = useMemo(() => profileVocabulary(fleetRows), [fleetRows])
+  const providerOptions = useMemo(() => providerVocabulary(fleetRows), [fleetRows])
+  const sessionOptions = useMemo(() => sessionData.map(s => s.name), [sessionData])
+
+  // id -> caller_id, for the spawned-by subtree walk in matchesFilters. Built
+  // over the WHOLE fleet: a caller in one session may have spawned a row in
+  // another, and an unresolved hop is simply the top of the known tree.
+  const callerOf = useMemo(() => {
+    const map = new Map(fleetRows.map(t => [t.id, t.caller_id] as const))
+    return (id: string) => map.get(id)
+  }, [fleetRows])
 
   // Total-preserving by construction: StatusSummary draws only the statuses in
   // STATUS_ORDER, so a count filed under anything else is drawn by nothing and
@@ -284,6 +285,112 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   const annotationsFor = (terminalId: string): Annotation[] | undefined =>
     placement.byTerminal[terminalId]
 
+  // "Available" means the payload CARRIES annotations, not merely that the
+  // route answered: an empty envelope and an absent route are the same
+  // no-data fleet, and the byte-identical-DOM test pins them rendering alike.
+  // `degraded` folds the envelope's own coverage report, the held-stale flag
+  // and the server's omission count into the one marker the bars repeat. It
+  // requires a payload to exist at all — the campaign surface uses the same
+  // guard, because "unverified" is a claim about data ON screen, and with no
+  // payload there is nothing on screen to be unverified.
+  const annotationsAvailable = annotations !== null && annotations.annotations.length > 0
+  const annotationsDegraded =
+    annotations !== null &&
+    (staleFetch ||
+      annotations.coverage === 'partial' ||
+      annotations.coverage === 'truncated' ||
+      annotations.items_omitted > 0)
+
+  // Derived facet dimensions, computed against the FULL fleet — never the
+  // filtered subset, for the same reason placement is: a dimension discovered
+  // only on visible rows would vanish the moment it did its job.
+  //
+  // THE GLOBAL/PER-SESSION SPLIT IS THREE SHAPE RULES (fleetWideFacetKeys),
+  // not a key list: pill-shaped for the whole fleet, emitted in at least two
+  // sessions, and carrying a vocabulary the sessions SHARE rather than
+  // partition. A dimension tied to one campaign — a lane, a round, a task id,
+  // a PR state — stays in its session's bar, which is what keeps an unbounded
+  // or operator-action-dependent vocabulary off the fleet surface. Nothing
+  // here knows what any facet is CALLED.
+  const sessionDimensions = useMemo(() => {
+    const out: Record<string, FacetDimension[]> = {}
+    for (const s of sessionData) {
+      out[s.name] = collectFacetDimensions(
+        s.terminals.map(t => ({ annotations: placement.byTerminal[t.id] })),
+      )
+    }
+    return out
+  }, [sessionData, placement])
+  const fleetDimensions = useMemo(
+    () => collectFacetDimensions(fleetRows.map(t => ({ annotations: placement.byTerminal[t.id] }))),
+    [fleetRows, placement],
+  )
+  const globalKeys = useMemo(
+    () =>
+      fleetWideFacetKeys(
+        fleetDimensions,
+        Object.values(sessionDimensions).map(dimensions => ({ dimensions })),
+      ),
+    [fleetDimensions, sessionDimensions],
+  )
+  const globalGroups = useMemo(
+    () => groupDimensions(fleetDimensions.filter(d => globalKeys.has(d.key))),
+    [fleetDimensions, globalKeys],
+  )
+  const sessionGroups = useMemo(() => {
+    const out: Record<string, ReturnType<typeof groupDimensions>> = {}
+    for (const [name, dims] of Object.entries(sessionDimensions)) {
+      out[name] = groupDimensions(dims.filter(d => !globalKeys.has(d.key)))
+    }
+    return out
+  }, [sessionDimensions, globalKeys])
+  const sessionCallers = useMemo(() => {
+    const out: Record<string, ReturnType<typeof callerVocabulary>> = {}
+    for (const s of sessionData) out[s.name] = callerVocabulary(s.terminals)
+    return out
+  }, [sessionData])
+
+  // Global filters run FIRST and gate session visibility — the behaviour the
+  // old two-dimension version had, now over the full FilterState. A session
+  // with zero terminals is always kept (the pre-existing rule), and the sort
+  // key no longer comes from Math.max(...[]): that is -Infinity for an empty
+  // session, -Infinity - -Infinity is NaN, and a NaN comparator is undefined
+  // Array.prototype.sort behaviour — exactly the sessions this gate always
+  // keeps were comparing against each other.
+  const filteredSessions = useMemo(() => {
+    const filtered = sessionData.filter(s =>
+      s.terminals.length === 0 ||
+      s.terminals.some(t =>
+        matchesFilters(t, placement.byTerminal[t.id], globalFilters, {
+          status: terminalStatuses[t.id],
+          callerOf,
+        }),
+      ),
+    )
+    const sentAt = (s: SessionWithTerminals) =>
+      s.terminals.reduce((latest, t) => {
+        const at = t.last_active ? new Date(t.last_active).getTime() : 0
+        return at > latest ? at : latest
+      }, 0)
+    return filtered.sort((a, b) => {
+      const latestA = sentAt(a)
+      const latestB = sentAt(b)
+      return sortOrder === 'desc' ? latestB - latestA : latestA - latestB
+    })
+  }, [sessionData, globalFilters, sortOrder, terminalStatuses, placement, callerOf])
+
+  const globalFilterCount = activeFilterCount(globalFilters)
+
+  const updateSessionFilters = (name: string, next: FilterState) =>
+    setSessionFilters(prev => ({ ...prev, [name]: next }))
+  const clearSessionFilters = (name: string) =>
+    setSessionFilters(prev => {
+      if (!(name in prev)) return prev
+      const next = { ...prev }
+      delete next[name]
+      return next
+    })
+
   const handleDeleteTerminal = async () => {
     if (!pendingClose) return
     setClosingTerminal(pendingClose.id)
@@ -419,37 +526,101 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
               Each session is a workspace where one or more AI agents run and collaborate.
             </p>
           </div>
+          {/* `last_active` is when CAO last SENT input to a pane (only
+              send_input / send_special_key move it), and on a v2 managed row
+              it is frozen at row creation — so the sort is labelled by what
+              it actually measures, and no "recently active" control exists
+              anywhere for it to feed. */}
           <button onClick={() => setSortOrder(o => o === 'desc' ? 'asc' : 'desc')} className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-200 bg-gray-800 hover:bg-gray-700 px-3 py-1.5 rounded-lg transition-colors">
             <ArrowDownUp size={12} />
-            {sortOrder === 'desc' ? 'Newest first' : 'Oldest first'}
+            {sortOrder === 'desc' ? 'Newest sent first' : 'Oldest sent first'}
           </button>
         </div>
       </div>
 
-      {/* Agent type filter */}
-      {allAgentTypes.length > 0 && (
+      {/* The filter bar. Reachability renders FIRST and unconditionally —
+          outside the collapsible region — because it predates the bar and
+          three suites pin its contract (it must render with no session or
+          terminal data, and its button container must hold exactly the pills
+          below and no other control). Everything else lives behind the
+          toggle so the bar does not eat half a phone screen.
+
+          Named "Reachability", never "status" and never "working": every live
+          native-TUI v2 row reports NOT_FIFO_MONITORED unconditionally, which
+          is a "this pane exists and answers" claim and says nothing about
+          activity. Multi-select: OR within the dimension, AND across the
+          dimensions in the panel below. */}
+      <div data-testid="filter-bar" className="space-y-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            type="button"
+            onClick={() => setFiltersOpen(o => !o)}
+            aria-expanded={filtersOpen}
+            aria-controls="global-filter-panel"
+            className="flex items-center gap-2 min-h-[44px] px-3 rounded-lg border border-gray-700 text-xs text-gray-300 hover:text-white hover:bg-gray-800 transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500"
+          >
+            <Filter size={12} />
+            Filters
+            {globalFilterCount > 0 && (
+              <span className="text-emerald-300">{globalFilterCount} active</span>
+            )}
+            {filtersOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          </button>
+          {globalFilterCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setGlobalFilters(emptyFilters())}
+              className="min-h-[44px] px-3 rounded-lg border border-gray-700 text-xs text-gray-300 hover:text-white hover:bg-gray-800 transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500"
+            >
+              Clear all
+            </button>
+          )}
+        </div>
         <div className="flex items-center gap-2 flex-wrap">
           <Filter size={12} className="text-gray-500" />
-          <button onClick={() => setAgentTypeFilter(null)} className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${!agentTypeFilter ? 'bg-emerald-900/40 border-emerald-500/50 text-emerald-300' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}>All</button>
-          {allAgentTypes.map(t => (
-            <button key={t} onClick={() => setAgentTypeFilter(agentTypeFilter === t ? null : t)} className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${agentTypeFilter === t ? 'bg-emerald-900/40 border-emerald-500/50 text-emerald-300' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}>{t}</button>
-          ))}
+          <span className="text-[10px] uppercase tracking-wide text-gray-400">Reachability</span>
+          <button
+            onClick={() => setGlobalFilters(f => ({ ...f, reachability: [] }))}
+            className={`text-xs min-h-[44px] px-3 rounded-full border transition-colors ${globalFilters.reachability.length === 0 ? 'bg-gray-700 border-gray-500/50 text-gray-200' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+          >
+            Any status
+          </button>
+          {STATUS_ORDER.map(s => {
+            const meta = STATUS_META[s]
+            const selected = globalFilters.reachability.includes(s)
+            return (
+              <button
+                key={s}
+                aria-pressed={selected}
+                onClick={() =>
+                  setGlobalFilters(f => ({
+                    ...f,
+                    reachability: selected ? f.reachability.filter(x => x !== s) : [...f.reachability, s],
+                  }))
+                }
+                className={`flex items-center gap-1.5 text-xs min-h-[44px] px-3 rounded-full border transition-colors ${selected ? STATUS_ACTIVE_BG[s] : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${meta.dot}`} />
+                {meta.label}
+              </button>
+            )
+          })}
         </div>
-      )}
-
-      {/* Status filter */}
-      <div className="flex items-center gap-2 flex-wrap -mt-3">
-        <Filter size={12} className="text-gray-500" />
-        <button onClick={() => setStatusFilter(null)} className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${!statusFilter ? 'bg-gray-700 border-gray-500/50 text-gray-200' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}>Any status</button>
-        {STATUS_ORDER.map(s => {
-          const meta = STATUS_META[s]
-          return (
-            <button key={s} onClick={() => setStatusFilter(statusFilter === s ? null : s)} className={`flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border transition-colors ${statusFilter === s ? STATUS_ACTIVE_BG[s] : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${meta.dot}`} />
-              {meta.label}
-            </button>
-          )
-        })}
+        {filtersOpen && (
+          <div id="global-filter-panel">
+            <GlobalFilterBar
+              filters={globalFilters}
+              onChange={setGlobalFilters}
+              liveness={livenessOptions}
+              profiles={profileOptions}
+              providers={providerOptions}
+              sessions={sessionOptions}
+              groups={globalGroups}
+              annotationsAvailable={annotationsAvailable}
+              degraded={annotationsDegraded}
+            />
+          </div>
+        )}
       </div>
 
       {/* Sessions */}
@@ -462,17 +633,49 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
               <p className="text-gray-600 text-xs mt-1">Go to the <span className="text-emerald-400 cursor-pointer" onClick={() => onNavigate('agents')}>Agents tab</span> to spawn your first agent.</p>
             </>
           ) : (
-            <p className="text-gray-400 text-sm">No sessions match the current filter.</p>
+            <>
+              {/* The cause is named: the fleet is not empty, the FILTERS are
+                  what hid it — and the recovery is one click, not a manual
+                  tour of every dimension. */}
+              <p className="text-gray-400 text-sm">No sessions match the current filter.</p>
+              {globalFilterCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setGlobalFilters(emptyFilters())}
+                  className="mt-3 min-h-[44px] px-4 rounded-lg border border-gray-700 text-xs text-gray-300 hover:text-white hover:bg-gray-800 transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                >
+                  Clear all filters
+                </button>
+              )}
+            </>
           )}
         </div>
       ) : (
         <div className="space-y-3">
           {filteredSessions.map(session => {
-            const visibleTerminals = session.terminals.filter(t => {
-              const matchAgent = !agentTypeFilter || t.agent_profile === agentTypeFilter
-              const matchStatus = !statusFilter || displayStatus(terminalStatuses[t.id]) === statusFilter
-              return matchAgent && matchStatus
-            })
+            // Per-session filters run SECOND, inside the surviving card, AND-ed
+            // with the global result. They can never remove the card — a
+            // session-scoped question is meaningless the moment it deletes the
+            // session it was asked about.
+            const sessionFilter = sessionFilters[session.name]
+            const visibleTerminals = session.terminals.filter(t =>
+              matchesFilters(t, placement.byTerminal[t.id], globalFilters, {
+                status: terminalStatuses[t.id],
+                callerOf,
+              }) &&
+              (!sessionFilter ||
+                matchesFilters(t, placement.byTerminal[t.id], sessionFilter, {
+                  status: terminalStatuses[t.id],
+                  callerOf,
+                })),
+            )
+            const sessionFilterActive = !!sessionFilter && isFilterActive(sessionFilter)
+            // The "N of M shown" counter is a THIRD thing beside the status
+            // summary (which keeps counting ALL terminals — pinned by
+            // dashboardStatusOrder.test.tsx) and the session-visibility gate:
+            // the summary describes the session, the gate decides the card,
+            // this describes the view.
+            const counterVisible = isFilterActive(globalFilters) || sessionFilterActive
             const statusCounts = getStatusCounts(session.terminals)
             const sortedTerminals = [...visibleTerminals].sort((a, b) => {
               const ta = a.last_active ? new Date(a.last_active).getTime() : 0
@@ -532,6 +735,12 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                         <Users size={14} className="text-emerald-400" />
                         <span className="text-sm font-mono text-gray-200">{session.name}</span>
                         <span className="text-xs text-gray-500">{session.terminals.length} agent{session.terminals.length !== 1 ? 's' : ''}</span>
+                        {/* Session filters survive a collapsed card (by design,
+                            keyed by session name), so the card says when it is
+                            holding rows back out of view. */}
+                        {sessionFilterActive && (
+                          <span className="text-[10px] text-emerald-400/80">filtered</span>
+                        )}
                       </div>
                       <div className="ml-8 mt-1.5 flex flex-col gap-1">
                         <div className="flex items-center gap-2 flex-wrap">
@@ -541,7 +750,16 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                         </div>
                         <StatusSummary counts={statusCounts} />
                         <div className="flex items-center gap-3 text-[10px] text-gray-600">
-                          {sessionLastActive && <span title={fmtAbs(sessionLastActive) || ''}>Active {fmtRel(sessionLastActive)}</span>}
+                          {/* "Last sent", not "Active": on a v2 managed row this
+                              timestamp is frozen at row creation (only
+                              send_input moves it, and only on the v1 table),
+                              so calling it activity was a false claim made on
+                              every managed fleet. */}
+                          {sessionLastActive && (
+                            <span title={fmtAbs(sessionLastActive) ? `${fmtAbs(sessionLastActive)} — when CAO last sent input to a pane in this session` : ''}>
+                              Last sent {fmtRel(sessionLastActive)}
+                            </span>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -551,7 +769,37 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                 {/* Terminals grouped by agent type */}
                 {isExpanded && (
                   <div id={terminalsRegionId} className="border-t border-gray-700/30 px-4 pb-4 space-y-3 pt-3">
-                    {Object.entries(grouped).map(([agentType, terminals]) => (
+                    <SessionFilterBar
+                      filters={sessionFilter ?? emptyFilters()}
+                      onChange={next => updateSessionFilters(session.name, next)}
+                      onClear={() => clearSessionFilters(session.name)}
+                      callers={sessionCallers[session.name] ?? []}
+                      groups={sessionGroups[session.name] ?? []}
+                      shown={visibleTerminals.length}
+                      total={session.terminals.length}
+                      counterVisible={counterVisible}
+                      degraded={annotationsDegraded}
+                    />
+                    {visibleTerminals.length === 0 ? (
+                      // Reachable only through the SESSION filters: the global
+                      // gate keeps a card only when at least one row matches
+                      // it. The card stays, the count says so, and recovery is
+                      // one click — the silently-empty card the drifted
+                      // predicates produced is the defect this replaces.
+                      <div className="text-center py-4 space-y-2">
+                        <p className="text-xs text-gray-500">
+                          0 of {session.terminals.length} shown — the session filters hide every row.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => clearSessionFilters(session.name)}
+                          className="min-h-[44px] px-4 rounded-lg border border-gray-700 text-xs text-gray-300 hover:text-white hover:bg-gray-800 transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                        >
+                          Clear session filters
+                        </button>
+                      </div>
+                    ) : (
+                    Object.entries(grouped).map(([agentType, terminals]) => (
                       <div key={agentType}>
                         <div className="flex items-center gap-2 mb-2">
                           <Bot size={11} className="text-gray-500" />
@@ -612,9 +860,17 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                 {/* Timestamps. `last_active` is the only one
                                     the projection publishes — there is no
                                     `created_at` on a projected row, and the
-                                    branch that read one could never fire. */}
+                                    branch that read one could never fire.
+                                    Labelled by what it measures: when CAO last
+                                    SENT input to this pane (frozen at row
+                                    creation on a v2 managed row), never
+                                    "activity". */}
                                 <div className="flex items-center gap-3 text-[10px] text-gray-600">
-                                  {relActive && <span title={fmtAbs(t.last_active) || ''}>↻ {relActive}</span>}
+                                  {relActive && (
+                                    <span title={fmtAbs(t.last_active) ? `${fmtAbs(t.last_active)} — when CAO last sent input to this pane` : ''}>
+                                      sent {relActive}
+                                    </span>
+                                  )}
                                 </div>
                                 {/* Quick Send */}
                                 {!sendInputOpen[t.id] ? (
@@ -630,7 +886,8 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                           })}
                         </div>
                       </div>
-                    ))}
+                    ))
+                    )}
                   </div>
                 )}
               </div>

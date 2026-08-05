@@ -191,6 +191,12 @@ function json(route: Route, body: unknown, status = 200): Promise<void> {
   });
 }
 
+export interface StubSession {
+  id: string;
+  name: string;
+  status: string;
+}
+
 export async function stubBackend(page: Page, options?: {
   macros?: StubMacro[];
   /** §8.6: omit the operator_message/image blocks (old-server degradation). */
@@ -213,11 +219,27 @@ export async function stubBackend(page: Page, options?: {
    * one and every other spec keeps the single row it was written against.
    */
   terminals?: typeof stubTerminals;
+  /**
+   * Several sessions, when a spec needs them.
+   *
+   * SAME RULE AS `terminals`: defaulted to the one `cao-fleet` session every
+   * pre-existing spec was written against, so a spec that wants a multi-
+   * session fleet says so and nobody else's page changes underneath them.
+   * `terminals` fills `cao-fleet` when `terminalsBySession` is not given.
+   */
+  sessions?: StubSession[];
+  /** Per-session rows, keyed by session name. Unknown sessions 404, as the
+   * real server does for a name tmux does not have. */
+  terminalsBySession?: Record<string, typeof stubTerminals>;
 }): Promise<StubHarness> {
+  const sessions = options?.sessions ?? [{ id: "s-1", name: "cao-fleet", status: "active" }];
+  const terminalsBySession = options?.terminalsBySession ?? {
+    "cao-fleet": options?.terminals ?? stubTerminals,
+  };
   // Everything below serves THIS list. `/terminals/{id}` is resolved by
   // LOOKUP rather than by index: `stubTerminals[0]` happens to be `t-native`
   // today, and an index is a silent lie the moment the list has two entries.
-  const terminals = options?.terminals ?? stubTerminals;
+  const terminals = Object.values(terminalsBySession).flat();
   const laneC = options?.laneC ?? true;
   const interactiveStreaming = options?.interactiveStreaming ?? false;
   let controlInputPostNumber = 0;
@@ -262,12 +284,14 @@ export async function stubBackend(page: Page, options?: {
     if (path === "/settings/memory") return json(route, { enabled: false });
     if (path === "/agents/profiles") return json(route, []);
     if (path === "/sessions" && method === "GET") {
-      return json(route, [{ id: "s-1", name: "cao-fleet", status: "active" }]);
+      return json(route, sessions);
     }
-    if (path === "/sessions/cao-fleet" && method === "GET") {
+    const sessionMatch = /^\/sessions\/([^/]+)$/.exec(path);
+    if (sessionMatch && method === "GET" && sessionMatch[1] in terminalsBySession) {
+      const name = sessionMatch[1];
       return json(route, {
-        session: { id: "s-1", name: "cao-fleet", status: "active" },
-        terminals,
+        session: sessions.find((s) => s.name === name),
+        terminals: terminalsBySession[name],
       });
     }
     if (path === "/annotations" && method === "GET") {
