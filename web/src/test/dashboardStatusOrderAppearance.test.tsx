@@ -35,6 +35,11 @@ describe('DashboardHome status filter row appearance', () => {
     await renderDashboard()
 
     const labels = [...statusFilterRow().querySelectorAll('button')].map(b => b.textContent)
+    // 'Stopped' joined the row when STOPPED was added to STATUS_ORDER: it ships
+    // in the generated STATUS_CONFIG and previously folded silently to
+    // Unknown. The container must STILL hold exactly these buttons — a
+    // clear-all, a multi-select summary, or an overflow control in this parent
+    // is the regression this assertion exists to catch.
     expect(labels).toEqual([
       'Any status',
       'Processing',
@@ -43,6 +48,7 @@ describe('DashboardHome status filter row appearance', () => {
       'Awaiting Input',
       'Error',
       'Completed',
+      'Stopped',
       'Unknown',
     ])
   })

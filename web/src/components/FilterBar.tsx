@@ -57,7 +57,11 @@ function patchFacet(filters: FilterState, key: string, patch: Partial<FacetSelec
 }
 
 /** The one pill. 44px tall, aria-pressed, emerald when on — the treatment the
- *  old agent-type row already wore. */
+ *  old agent-type row already wore. `max-w-full` with a truncating label:
+ *  facet values are producer data and a 40-char sha cannot be allowed to
+ *  force the bar wider than the card at 390px (the mobile clipping gate in
+ *  workstate-annotations.spec.ts measures exactly this). The full value stays
+ *  in the accessible name and the detail popover. */
 function Pill({
   selected,
   onClick,
@@ -75,7 +79,7 @@ function Pill({
       aria-pressed={selected}
       aria-label={label}
       onClick={onClick}
-      className={`flex items-center gap-1.5 min-h-[44px] px-3 rounded-full border text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500 ${
+      className={`flex items-center gap-1.5 min-h-[44px] max-w-full px-3 rounded-full border text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500 ${
         selected
           ? 'bg-emerald-900/40 border-emerald-500/50 text-emerald-300'
           : 'border-gray-700 text-gray-400 hover:text-gray-200'
@@ -124,8 +128,8 @@ function ValuePicker({
       <>
         {values.map(v => (
           <Pill key={v.value} selected={selected.includes(v.value)} onClick={() => onToggle(v.value)}>
-            {v.label}
-            {v.count !== undefined && <span className="text-gray-400">{v.count}</span>}
+            <span className="min-w-0 truncate">{v.label}</span>
+            {v.count !== undefined && <span className="shrink-0 text-gray-400">{v.count}</span>}
           </Pill>
         ))}
       </>
@@ -140,7 +144,7 @@ function ValuePicker({
         onChange={e => {
           if (e.target.value) onToggle(e.target.value)
         }}
-        className="min-h-[44px] rounded border border-gray-700 bg-gray-950 px-2 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none"
+        className="min-h-[44px] max-w-full rounded border border-gray-700 bg-gray-950 px-2 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none"
       >
         <option value="" disabled>
           {ariaLabel}…
@@ -156,8 +160,8 @@ function ValuePicker({
       </select>
       {selected.map(value => (
         <Pill key={value} selected onClick={() => onToggle(value)} label={`Remove ${labelFor(value)}`}>
-          {labelFor(value)}
-          <X size={12} aria-hidden />
+          <span className="min-w-0 truncate">{labelFor(value)}</span>
+          <X size={12} aria-hidden className="shrink-0" />
         </Pill>
       ))}
     </>
@@ -207,7 +211,7 @@ function FacetControl({
           aria-label={`${dim.label} from`}
           value={sel.from}
           onChange={e => onPatch({ from: e.target.value })}
-          className="min-h-[44px] rounded border border-gray-700 bg-gray-950 px-2 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none"
+          className="min-h-[44px] max-w-full rounded border border-gray-700 bg-gray-950 px-2 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none"
         />
         <span className="text-[10px] text-gray-400">to</span>
         <input
@@ -215,7 +219,7 @@ function FacetControl({
           aria-label={`${dim.label} to`}
           value={sel.to}
           onChange={e => onPatch({ to: e.target.value })}
-          className="min-h-[44px] rounded border border-gray-700 bg-gray-950 px-2 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none"
+          className="min-h-[44px] max-w-full rounded border border-gray-700 bg-gray-950 px-2 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none"
         />
       </>
     )
@@ -227,7 +231,7 @@ function FacetControl({
       placeholder="contains…"
       value={sel.text}
       onChange={e => onPatch({ text: e.target.value })}
-      className="min-h-[44px] rounded border border-gray-700 bg-gray-950 px-2 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none"
+      className="min-h-[44px] max-w-full rounded border border-gray-700 bg-gray-950 px-2 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none"
     />
   )
 }
@@ -292,7 +296,7 @@ export function CoverageNote({ degraded }: { degraded: boolean }) {
 }
 
 const inputClass =
-  'min-h-[44px] rounded border border-gray-700 bg-gray-950 px-2 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none'
+  'min-h-[44px] max-w-full rounded border border-gray-700 bg-gray-950 px-2 text-xs text-gray-200 focus:border-emerald-500 focus:outline-none'
 
 /**
  * The global bar: fleet-stable vocabulary. Reachability is deliberately NOT
