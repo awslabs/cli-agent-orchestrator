@@ -6,7 +6,7 @@
 // (dashboardStatusOrderAppearance.test.tsx), so a fixture change cannot make
 // the two suites disagree about what the dashboard was shown.
 import { vi, expect } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { DashboardHome } from '../components/DashboardHome'
 import { useStore } from '../store'
 import { projectedTerminal } from './projectedTerminal'
@@ -133,9 +133,31 @@ export function summaryTotal(): number {
   return Object.values(summaryCounts()).reduce((a, b) => a + b, 0)
 }
 
-/** The status filter row, identified by its "Any status" reset button. */
-export function statusFilterRow(): HTMLElement {
-  return screen.getByRole('button', { name: 'Any status' }).parentElement as HTMLElement
+/**
+ * The reachability editor's options container — the chip-bar successor of
+ * the old always-on pill row, and the container the appearance suite pins.
+ *
+ * THE CONTAINER MOVED, THE CONTRACT DID NOT. Reachability is a chip now: the
+ * options live in the chip's popover editor, reached from the "+ Filter"
+ * picker (or by clicking the chip once it is active). The container still
+ * holds exactly the STATUS_ORDER entries and nothing else — a stray
+ * clear-all or overflow control inside it fails the appearance suite exactly
+ * as it did when the container was the always-on row.
+ *
+ * Opening it here, in the fixture, keeps every caller honest about the same
+ * path the operator takes.
+ */
+export function openReachabilityEditor(): HTMLElement {
+  const existing = screen.queryByTestId('global-editor-options')
+  if (existing) return existing
+  const chip = document.querySelector('[data-testid="global-chip"][data-dimension="reachability"] button')
+  if (chip) {
+    fireEvent.click(chip)
+  } else {
+    fireEvent.click(screen.getByTestId('global-picker-button'))
+    fireEvent.click(within(screen.getByTestId('global-picker')).getByText('Reachability'))
+  }
+  return screen.getByTestId('global-editor-options')
 }
 
 export function visibleTerminalIds(terminals: TerminalFixture[] = TERMINALS): string[] {
