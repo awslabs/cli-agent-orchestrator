@@ -1866,6 +1866,48 @@ class TestCodexBulletFormatExtraction:
 
         assert message == "The bug is fixed."
 
+    def test_extract_skips_multiple_tree_rows_before_prose_reply(self):
+        """All tree rows in the final activity cell stay before the reply."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "• Ran pytest -q\n"
+            "  └ pytest -q\n"
+            "  └ 170 passed\n"
+            "\n"
+            "All green.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "All green."
+
+    def test_extract_skips_indented_tree_output_before_prose_reply(self):
+        """Indented output belonging to the final tree row is not returned."""
+        output = (
+            "› inspect the provider\n"
+            "• Explored\n"
+            "  └ Read codex.py\n"
+            "\n"
+            "• Ran pytest -q\n"
+            "  └ 170 passed\n"
+            "    3 skipped\n"
+            "\n"
+            "All green.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "All green."
+
     def test_extract_skips_three_activity_cells_before_prose_reply(self):
         """All complete activity cells are removed before a prose reply."""
         output = (

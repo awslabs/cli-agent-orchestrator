@@ -359,9 +359,16 @@ def _find_response_marker(text: str) -> Optional[re.Match[str]]:
         if continuation and not contains_mcp_call:
             complete_cells.append(index)
             if index == len(matches) - 1:
-                following = re.search(r"\S", cell_tail[continuation.end() :])
-                if following:
-                    candidate = line_end(match.start()) + continuation.end() + following.start()
+                remaining = cell_tail[continuation.end() :]
+                separator = re.search(r"^[^\S\n]*\n", remaining, re.MULTILINE)
+                following = re.search(r"\S", remaining[separator.end() :]) if separator else None
+                if separator and following:
+                    candidate = (
+                        line_end(match.start())
+                        + continuation.end()
+                        + separator.end()
+                        + following.start()
+                    )
                     if text[candidate] != "›":
                         prose_start = candidate
 
