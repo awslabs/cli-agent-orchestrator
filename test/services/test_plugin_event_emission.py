@@ -141,6 +141,7 @@ class TestTerminalPluginEvents:
     """Verify terminal lifecycle events are emitted correctly."""
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog", return_value="")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
@@ -165,6 +166,7 @@ class TestTerminalPluginEvents:
         mock_load_agent_profile,
         mock_build_skill_catalog,
         mock_log_dir,
+        mock_delete_terminals_by_session,
     ):
         """Terminal creation should emit only after persistence and startup complete."""
         registry = _registry_mock()
@@ -225,6 +227,7 @@ class TestTerminalPluginEvents:
         assert event.provider == "kiro_cli"
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog", return_value="")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
@@ -249,6 +252,7 @@ class TestTerminalPluginEvents:
         mock_load_agent_profile,
         mock_build_skill_catalog,
         mock_log_dir,
+        mock_delete_terminals_by_session,
     ):
         """Terminal creation failures must not emit post_create_terminal."""
         registry = _registry_mock()
