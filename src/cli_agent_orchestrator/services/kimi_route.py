@@ -150,6 +150,13 @@ def attest_kimi_route(
     except provider_contracts.ProviderContractError as exc:
         raise KimiRouteProbeError(str(exc)) from exc
 
+    env = dict(os.environ)
+    # The provider's own deterministic updater kill-switch rides every
+    # process this probe starts (cond-0315): the version observation below
+    # and the ACP client both run the provider's update preflight, and the
+    # reservation-owned suppression must win over any ambient value — an
+    # update mid-attestation would move the binary this receipt describes.
+    env.update(provider_contracts.kimi_update_suppression_env())
     try:
         version_proc = subprocess.run(
             [kimi_bin, "--version"],
@@ -160,6 +167,7 @@ def attest_kimi_route(
             # healthy pinned build answered in 0.37–0.41 s warm yet missed
             # a fixed 5 s deadline once under startup load.
             timeout=provider_contracts.KIMI_VERSION_PROBE_TIMEOUT_SECONDS,
+            env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise KimiRouteProbeError(f"could not execute Kimi version probe: {exc}") from exc
@@ -172,7 +180,6 @@ def attest_kimi_route(
 
     config_path = user_config_path or pathlib.Path(os.path.expanduser("~/.kimi/config.toml"))
     before = _digest_or_absent(config_path)
-    env = dict(os.environ)
     # A route that selects no effort contributes no override here, and the
     # inherited environment must not supply one either: a stale
     # KIMI_MODEL_THINKING_EFFORT in the parent would otherwise reach the

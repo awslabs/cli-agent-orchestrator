@@ -192,6 +192,45 @@ _KIMI_0310_RENDERED_EVIDENCE = (
     "689fc2a123dfc3145dab26a8e6a86c71a5dc8552b13fe0449679e065ce96774e."
 )
 
+_KIMI_0320_RENDERED_EVIDENCE = (
+    "live-verified on the installed Kimi Code 0.32.0 (COND-0315, 2026-08-05, "
+    "private tmux stage on a disposable socket/worktree, zero-prompt ACP-minted "
+    "session_d9aea239-7b68-4a76-99b9-186e6128c5c6): the build rewrites "
+    "process.title to 'kimi-code' after parsing its argv, so Darwin "
+    "KERN_PROCARGS2 returns ['kimi-code','','',''] and the resumed "
+    "--session <id> is no longer observable in the kernel argv. The TUI "
+    "resumed the exact minted session with no picker and renders the strict "
+    "native boot header -- exactly one each of Directory, Session, Model, and "
+    "Version label lines, framed by box verticals -- with the Session line "
+    "naming the minted session, the Version line 0.32.0, and the Directory "
+    "line the bound worktree. Installed bundle dist/main.mjs sha256 "
+    "b02ebfe77dda7d9f38cf61c5a923567eb7ff4f3bc914dff24b02b5fd22b4ff79 "
+    "(matches the npm-published digest; the process.title = PROCESS_NAME "
+    "rewrite and the header infoLines read byte-identical to the "
+    "npm-published 0.31.0 bundle)."
+)
+
+_KIMI_0330_RENDERED_EVIDENCE = (
+    "live-verified on the installed Kimi Code 0.33.0 (COND-0315, 2026-08-05, "
+    "private tmux stage on a disposable socket/worktree, zero-prompt ACP-minted "
+    "session_4b587189-e4ee-45a4-a85e-bf864d45f123, KIMI_CODE_NO_AUTO_UPDATE=1): "
+    "the build rewrites process.title to 'kimi-code' after parsing its argv, "
+    "so Darwin KERN_PROCARGS2 returns ['kimi-code','','',''] and the resumed "
+    "--session <id> is no longer observable in the kernel argv. The TUI "
+    "resumed the exact minted session with no picker and renders the strict "
+    "native boot header -- exactly one each of Directory, Session, Model, and "
+    "Version label lines (an MCP line may follow), framed by box verticals "
+    "inside the one-cell GutterContainer the parser tolerates -- with the "
+    "Session line naming the minted session, the Version line 0.33.0, and the "
+    "Directory line the bound worktree. Installed bundle dist/main.mjs sha256 "
+    "0e77b9c64e67a4eecb96aae011750668aab11bd781564fe3e4855513812247b2 "
+    "(matches the npm-published digest; the process.title = PROCESS_NAME "
+    "rewrite and the header infoLines read byte-identical to the "
+    "npm-published 0.32.0 bundle; the natively reimplemented ACP surface was "
+    "proven live, including the durable session/new->kill->session/load "
+    "proof)."
+)
+
 #: Per-build rendered-header session proofs.  A build is present only when its
 #: post-parse process-title rewrite *and* its native header layout were both
 #: read, so the proof never silently applies to a build nobody has examined.
@@ -204,6 +243,16 @@ _RENDERED_SESSION_PROVEN_BUILDS: dict[str, RenderedSessionProof] = {
         provider="kimi_cli",
         rule=RULE_KIMI_NATIVE_HEADER,
         evidence=_KIMI_0310_RENDERED_EVIDENCE,
+    ),
+    "0.32.0": RenderedSessionProof(
+        provider="kimi_cli",
+        rule=RULE_KIMI_NATIVE_HEADER,
+        evidence=_KIMI_0320_RENDERED_EVIDENCE,
+    ),
+    "0.33.0": RenderedSessionProof(
+        provider="kimi_cli",
+        rule=RULE_KIMI_NATIVE_HEADER,
+        evidence=_KIMI_0330_RENDERED_EVIDENCE,
     ),
 }
 
@@ -248,7 +297,16 @@ def parse_native_header(rows: object) -> Optional[dict[str, str]]:
     for raw in rows:
         if not isinstance(raw, str):
             return None
-        match = _HEADER_LABEL_RE.match(raw.strip(_NATIVE_HEADER_FRAME_CHARS).strip())
+        # Whitespace first, then the frame, then whitespace again: the TUI
+        # mounts the boot header inside a one-cell ``GutterContainer`` (read
+        # from the 0.31.0/0.32.0/0.33.0 bundles alike), so a painted row is
+        # ``" │  Label: value ... │  "`` -- a one-cell left pad before the
+        # box vertical and capture padding after it.  Stripping the frame
+        # before the gutter would stop at the leading space and never match
+        # the screen the proof actually reads; the label cells are what
+        # carry meaning either way, and the exactly-once rule below is the
+        # strictness that guards them.
+        match = _HEADER_LABEL_RE.match(raw.strip().strip(_NATIVE_HEADER_FRAME_CHARS).strip())
         if match is None:
             continue
         label = match.group("label").lower()

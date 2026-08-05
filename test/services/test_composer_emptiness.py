@@ -83,10 +83,10 @@ class TestEmptinessPins:
     def test_non_live_verified_kimi_builds_are_honestly_unpinned(self):
         """Only 0.29.2's composer is live-verified (§10.3): every other
         accepted build — including the text-proven 0.30.0 and 0.31.0 (cond-0310)
-        — refuses provider-unsupported rather than borrow a region
-        determination nobody has read on them. Adding a build to the version
-        set never grants it a composer-emptiness pin."""
-        for build in ("0.29.0", "0.29.1", "0.30.0", "0.31.0"):
+        and 0.32.0/0.33.0 (cond-0315) — refuses provider-unsupported rather than
+        borrow a region determination nobody has read on them. Adding a build
+        to the version set never grants it a composer-emptiness pin."""
+        for build in ("0.29.0", "0.29.1", "0.30.0", "0.31.0", "0.32.0", "0.33.0"):
             assert npi.composer_emptiness_pin_for("kimi_cli", build) is None, build
 
     def test_version_banners_normalize_like_the_adapter_pins(self):

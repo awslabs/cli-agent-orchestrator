@@ -160,8 +160,27 @@ class TestRenderedSessionProofGate:
         assert "689fc2a123dfc3145dab26a8e6a86c71a5dc8552b13fe0449679e065ce96774e" in proof.evidence
         assert "kimi-code" in proof.evidence
 
+    def test_the_stage_verified_0320_build_has_a_rendered_session_proof(self):
+        # cond-0315: 0.32.0 keeps the title rewrite, so it earns its own
+        # keyed proof — never an inheritance from 0.31.0.
+        proof = knl.rendered_session_proof_for("0.32.0")
+        assert proof is not None
+        assert proof.rule == "kimi-native-header-v1"
+        assert "b02ebfe77dda7d9f38cf61c5a923567eb7ff4f3bc914dff24b02b5fd22b4ff79" in proof.evidence
+        assert "kimi-code" in proof.evidence
+
+    def test_the_stage_verified_0330_build_has_a_rendered_session_proof(self):
+        # cond-0315: 0.33.0 keeps the title rewrite, so it earns its own
+        # keyed proof — never an inheritance from 0.31.0 or 0.32.0.
+        proof = knl.rendered_session_proof_for("0.33.0")
+        assert proof is not None
+        assert proof.rule == "kimi-native-header-v1"
+        assert "0e77b9c64e67a4eecb96aae011750668aab11bd781564fe3e4855513812247b2" in proof.evidence
+        assert "kimi-code" in proof.evidence
+
     @pytest.mark.parametrize(
-        "version", ["0.30.0", "0.29.2", "0.29.1", "0.29.0", "0.31.1", "0.32.0", ""]
+        "version",
+        ["0.30.0", "0.29.2", "0.29.1", "0.29.0", "0.31.1", "0.32.1", "0.33.1", "0.34.0", ""],
     )
     def test_every_other_build_is_unproven_and_must_fail_closed(self, version):
         """Only a build whose title-rewrite + header were read earns the
@@ -265,3 +284,78 @@ class TestRenderedSessionParserIsStrict:
         ]
         parsed = knl.parse_native_header(rows)
         assert parsed is not None and parsed["session"] == SESSION
+
+
+def _gutter_header_rows(
+    *,
+    session: str = SESSION,
+    directory: str = DIRECTORY,
+    version: str = PINNED_0310,
+    model: str = "K3",
+    mcp: bool = False,
+) -> list[str]:
+    """The header the way a real ``capture-pane`` paints it.
+
+    The TUI mounts the boot header inside ``GutterContainer(1, 1)`` (read
+    from the 0.31.0, 0.32.0, and 0.33.0 bundles), so every painted row
+    carries a one-cell left pad before the box vertical and trailing pad
+    after it.  A parse that requires the row to *start* with the vertical
+    never matches the screen the proof actually reads.
+    """
+    rows = [
+        " ╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
+        " │  Welcome to Kimi Code!                                                                                                                                    │",
+        f" │  Directory: {directory}                                                                                                                                    │",
+        f" │  Session:   {session}                                                                                                                                      │",
+        f" │  Model:     {model}                                                                                                                                        │",
+        f" │  Version:   {version}                                                                                                                                      │",
+    ]
+    if mcp:
+        rows.append(
+            " │  MCP:       5 connected                                                                                                                                    │"
+        )
+    rows.append(
+        " ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯"
+    )
+    return rows
+
+
+class TestRealGeometryRenderedHeader:
+    """The painted gutter is chrome too: the proof must read the real screen."""
+
+    def test_the_gutter_padded_header_parses(self):
+        parsed = knl.parse_native_header(_gutter_header_rows())
+        assert parsed is not None
+        assert parsed["session"] == SESSION
+        assert parsed["version"] == PINNED_0310
+        assert parsed["directory"] == DIRECTORY
+        assert parsed["model"] == "K3"
+
+    def test_the_gutter_padded_header_with_an_mcp_row_parses(self):
+        # A live boot with MCP servers paints one extra ignorable label row.
+        parsed = knl.parse_native_header(_gutter_header_rows(mcp=True))
+        assert parsed is not None and parsed["session"] == SESSION
+
+    def test_the_gutter_padded_header_proves_the_exact_session(self):
+        assert (
+            knl.renders_session_exactly(
+                _gutter_header_rows(), SESSION, provider_version=PINNED_0310
+            )
+            is True
+        )
+
+    def test_a_gutter_padded_wrong_session_proves_nothing(self):
+        assert (
+            knl.renders_session_exactly(
+                _gutter_header_rows(session="session_deadbeef"),
+                SESSION,
+                provider_version=PINNED_0310,
+            )
+            is False
+        )
+
+    def test_a_gutter_padded_duplicated_label_fails_closed(self):
+        rows = _gutter_header_rows() + [
+            f" │  Session:   session_other                                                                                                                                  │"
+        ]
+        assert knl.parse_native_header(rows) is None

@@ -52,14 +52,41 @@ PROVIDER_CLAUDE_CODE = "claude_code"
 #: authority; this map is the representative head of each accepted tuple.
 PINNED_VERSIONS = {
     PROVIDER_CODEX: "0.146.0",
-    PROVIDER_KIMI: "0.31.0",
+    PROVIDER_KIMI: "0.33.0",
     PROVIDER_CLAUDE: "2.1.220",
 }
 
 #: Every exact version accepted for a provider, current first.  A tuple of
 #: exact strings, never a range: which builds are proven is a fact about
 #: each specific build, and a range would silently assert something about
-#: builds nobody has read.  Kimi accepts ``0.31.0`` (cond-0310: the
+#: builds nobody has read.  Kimi accepts ``0.33.0`` (cond-0315: the
+#: provider's supported background updater installed it over 0.32.0
+#: mid-verification — ``~/.kimi-code/updates/`` ``rollout.log``
+#: ``startup-cache reason:"eligible"`` at 2026-08-05T09:54:47Z,
+#: ``install.json.lastSuccess`` at 09:54:49Z — and every gate refused it
+#: fail-closed; the installed 0.33.0 bundle ``main.mjs`` sha256
+#: 0e77b9c64e67a4eecb96aae011750668aab11bd781564fe3e4855513812247b2,
+#: matching the npm-published digest, declares the composer-newline/submit,
+#: paste-burst, steer-chord, process-title-rewrite, resume-option, and
+#: native-header facts byte-identical to the attested 0.32.0 bundle.  Its
+#: ACP surface is natively reimplemented, so it was proven live rather than
+#: by bytes: bounded ``--version`` (0.38–0.47 s warm), zero-prompt ACP
+#: K3/max select+read-back with ``agentInfo.version`` agreement, the
+#: durable ACP session/new→kill→session/load proof on the installed
+#: binary, and a private-tmux resume rendering the strict boot header with
+#: the kernel argv rewritten to ``['kimi-code','','','']``), accepts
+#: ``0.32.0`` (cond-0315: the
+#: operator's binary auto-updated again and the managed launcher refused
+#: it fail-closed — run cond-0303-pr74-review-k3-r5, zero task bytes; the
+#: installed 0.32.0 bundle ``main.mjs`` sha256
+#: b02ebfe77dda7d9f38cf61c5a923567eb7ff4f3bc914dff24b02b5fd22b4ff79,
+#: matching the npm-published digest, declares the composer-newline/submit,
+#: paste-burst, steer-chord, process-title-rewrite, resume-option, and
+#: native-header facts byte-identical to the attested 0.31.0 bundle — and
+#: the build was live-verified: bounded ``--version``, zero-prompt ACP
+#: K3/max route observation, exact ``--session <id>`` resume continuity,
+#: and the rendered boot header on a private tmux stage), accepts
+#: ``0.31.0`` (cond-0310: the
 #: operator's binary auto-updated again; the installed 0.31.0 bundle
 #: ``main.mjs`` sha256
 #: 689fc2a123dfc3145dab26a8e6a86c71a5dc8552b13fe0449679e065ce96774e
@@ -79,8 +106,8 @@ PINNED_VERSIONS = {
 #: matching the npm-published digest; the three-way 0.29.0/0.29.1/0.29.2
 #: bundle comparison proved the composer, paste-burst, and steer-chord
 #: facts byte-identical).  Image delivery authority stays pinned to
-#: ``0.29.2`` alone — no image block is advertised for ``0.30.0`` or
-#: ``0.31.0``.
+#: ``0.29.2`` alone — no image block is advertised for ``0.30.0``,
+#: ``0.31.0``, ``0.32.0``, or ``0.33.0``.
 #:
 #: Claude accepts only ``2.1.220``, the stage-verified installed build
 #: (``versions/2.1.220`` sha256
@@ -97,7 +124,7 @@ PINNED_VERSIONS = {
 #: observed differences are property ordering or additive optional fields.
 SUPPORTED_VERSIONS: dict[str, tuple[str, ...]] = {
     PROVIDER_CODEX: ("0.146.0",),
-    PROVIDER_KIMI: ("0.31.0", "0.30.0", "0.29.2", "0.29.1", "0.29.0"),
+    PROVIDER_KIMI: ("0.33.0", "0.32.0", "0.31.0", "0.30.0", "0.29.2", "0.29.1", "0.29.0"),
     PROVIDER_CLAUDE: ("2.1.220",),
 }
 # The current pin must always be an accepted version — asserted here so the
@@ -345,6 +372,40 @@ def kimi_effort_env(effort: Optional[str]) -> dict:
     default and nothing here claims to know what that is.
     """
     return {"KIMI_MODEL_THINKING_EFFORT": effort} if route_selects_effort(effort) else {}
+
+
+#: The provider's own deterministic updater kill-switch, as an environment
+#: fragment for every managed Kimi process.
+#:
+#: Kimi Code's supported background updater replaced the installed binary
+#: mid-campaign four times running (0.30.0, 0.31.0, 0.32.0, and 0.33.0 —
+#: the last *during* the 0.32.0 stage verification, two seconds after an
+#: interactive stage pane made the device rollout-eligible).  Every CLI
+#: entry point runs the update preflight, and its first check is this
+#: variable (bundle-read from the installed 0.33.0:
+#: ``isAutoUpdateDisabledByEnv`` returns before any update check,
+#: background install, or pre-boot install prompt — the prompt alone would
+#: stall a managed pane until the render-convergence deadline froze it,
+#: and the config-file knob does not suppress it).  Live-verified across
+#: ``--version``, a zero-prompt ACP session, and an interactive TUI boot:
+#: zero updater-state writes.
+#:
+#: This is a per-process atomicity fence, nothing more: it makes the one
+#: Kimi process a managed launch selected — its preflight probe, its
+#: bootstrap, its bridge child, its resumed TUI — immutable for the life
+#: of that process, so the bytes that were attested are the bytes that run
+#: and the bytes that keep running.  It is scoped to CAO-managed child
+#: environments and changes nothing outside them: the operator's PATH
+#: installation stays free to update on its own schedule, and nothing here
+#: freezes, manages, or replaces it.  Pinned by the reservation rather than
+#: inherited from the ambient shell, so an operator-supplied conflicting
+#: value cannot re-enable the updater inside a managed child.  The fence
+#: stays useful when a content-addressed runtime vault exists: the vault
+#: chooses which bytes run, and this keeps a chosen process self-identical
+#: until it exits.
+def kimi_update_suppression_env() -> dict:
+    """A fresh ``{"KIMI_CODE_NO_AUTO_UPDATE": "1"}`` per call."""
+    return {"KIMI_CODE_NO_AUTO_UPDATE": "1"}
 
 
 # Resume outcome codes (the public CLI contract).

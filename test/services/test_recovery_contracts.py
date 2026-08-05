@@ -23,7 +23,7 @@ from cli_agent_orchestrator.services.recovery_capabilities import build_capabili
 
 def test_pinned_versions():
     # The current pin is the stage-verified installed build.
-    assert pc.PINNED_VERSIONS == {"codex": "0.146.0", "kimi": "0.31.0", "claude": "2.1.220"}
+    assert pc.PINNED_VERSIONS == {"codex": "0.146.0", "kimi": "0.33.0", "claude": "2.1.220"}
     pc.check_pinned_version("codex", "0.146.0")
     pc.check_pinned_version("codex", "codex-cli 0.146.0")
     with pytest.raises(pc.ProviderVersionDrift):
@@ -35,19 +35,41 @@ def test_pinned_versions():
 
 
 def test_kimi_accepts_both_pinned_and_retained_versions_but_never_a_range():
-    # Exact-set acceptance: 0.31.0 is the current pin (cond-0310: the
-    # operator's binary auto-updated; the 0.31.0 bundle's composer/submit/
-    # paste-burst/steer facts read byte-identical to the 0.29.x/0.30.0 line),
-    # 0.30.0 (cond-0198) and 0.29.2/0.29.1/0.29.0 are retained for
-    # already-minted sessions.  Nothing between or beyond is accepted — this
-    # is a set of proven builds, not a version range.
-    assert pc.SUPPORTED_VERSIONS["kimi"] == ("0.31.0", "0.30.0", "0.29.2", "0.29.1", "0.29.0")
+    # Exact-set acceptance: 0.33.0 is the current pin (cond-0315: the
+    # provider's background updater installed it over 0.32.0 mid-verification;
+    # the 0.33.0 bundle's composer/submit/paste-burst/steer/title-rewrite/
+    # header facts read byte-identical to the attested 0.32.0 line and its
+    # reimplemented ACP surface plus live boot were proven on a private
+    # stage), 0.32.0 (cond-0315), 0.31.0 (cond-0310), 0.30.0 (cond-0198) and
+    # 0.29.2/0.29.1/0.29.0 are retained for already-minted sessions.  Nothing
+    # between or beyond is accepted — this is a set of proven builds, not a
+    # version range.
+    assert pc.SUPPORTED_VERSIONS["kimi"] == (
+        "0.33.0",
+        "0.32.0",
+        "0.31.0",
+        "0.30.0",
+        "0.29.2",
+        "0.29.1",
+        "0.29.0",
+    )
+    pc.check_pinned_version("kimi", "kimi 0.33.0")
+    pc.check_pinned_version("kimi", "kimi 0.32.0")
     pc.check_pinned_version("kimi", "kimi 0.31.0")
     pc.check_pinned_version("kimi", "kimi 0.30.0")
     pc.check_pinned_version("kimi", "kimi 0.29.2")
     pc.check_pinned_version("kimi", "kimi 0.29.1")
     pc.check_pinned_version("kimi", "kimi 0.29.0")
-    for rejected in ("0.28.0", "0.29.3", "0.30.1", "0.31.1", "1.29.0"):
+    for rejected in (
+        "0.28.0",
+        "0.29.3",
+        "0.30.1",
+        "0.31.1",
+        "0.32.1",
+        "0.33.1",
+        "0.34.0",
+        "1.29.0",
+    ):
         with pytest.raises(pc.ProviderVersionDrift):
             pc.check_pinned_version("kimi", rejected)
     # The current pin is always an accepted build.

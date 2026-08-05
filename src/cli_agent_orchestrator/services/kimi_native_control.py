@@ -339,6 +339,57 @@ _PROVEN_COMPOSER_NEWLINE: dict[str, dict[str, Any]] = {
             "(bundle read per cond-0310)"
         ),
     },
+    # 0.32.0 is likewise a *separate* proven entry, not a range widening:
+    # read from the installed 0.32.0 bundle (main.mjs sha256
+    # b02ebfe77dda7d9f38cf61c5a923567eb7ff4f3bc914dff24b02b5fd22b4ff79,
+    # matching the npm-published digest), which declares the same composer
+    # facts as the 0.29.x/0.30.0/0.31.0 line — the ['shift+enter', 'ctrl+j']
+    # newLine defaultKeys, the 'enter' submit, the
+    # expandPasteMarkers(this.state.lines.join("\n")).trim() submit
+    # computation, and PASTE_ENTER_SUPPRESS_WINDOW_MS = 120 with the
+    # content-neutral reset — each snippet verified byte-identical against
+    # the npm-published 0.31.0 bundle (cond-0315; the 0.32.0 boot was also
+    # observed live on a private tmux stage).  Same proven behaviour, so the
+    # same normalization identifier; no behavioral drift is claimed.
+    "0.32.0": {
+        "keystroke": "C-j",
+        "burst_reset_keystroke": "End",
+        "submit_settle_seconds": 0.25,
+        "normalization": NORMALIZATION_JOIN_LF_THEN_TRIM,
+        "evidence": (
+            "installed 0.32.0 dist/main.mjs (sha256 b02ebfe77dda7d9f38cf61c"
+            "5a923567eb7ff4f3bc914dff24b02b5fd22b4ff79, matches the "
+            "npm-published digest) declares the ['shift+enter', 'ctrl+j'] "
+            "newLine defaultKeys and 'enter' submit, and computes "
+            "expandPasteMarkers(this.state.lines.join('\\n')).trim() on "
+            "submit; PASTE_ENTER_SUPPRESS_WINDOW_MS = 120 with "
+            "content-neutral reset — byte-identical to the npm-published "
+            "0.31.0 bundle facts (bundle read per cond-0315)"
+        ),
+    },
+    # 0.33.0 is likewise a *separate* proven entry, not a range widening:
+    # read from the installed 0.33.0 bundle (main.mjs sha256
+    # 0e77b9c64e67a4eecb96aae011750668aab11bd781564fe3e4855513812247b2,
+    # matching the npm-published digest), which declares the same composer
+    # facts as the 0.29.x/0.30.0/0.31.0/0.32.0 line — each snippet verified
+    # byte-identical against the npm-published 0.32.0 bundle (cond-0315;
+    # the 0.33.0 boot was also observed live on a private tmux stage).
+    "0.33.0": {
+        "keystroke": "C-j",
+        "burst_reset_keystroke": "End",
+        "submit_settle_seconds": 0.25,
+        "normalization": NORMALIZATION_JOIN_LF_THEN_TRIM,
+        "evidence": (
+            "installed 0.33.0 dist/main.mjs (sha256 0e77b9c64e67a4eecb96aae"
+            "011750668aab11bd781564fe3e4855513812247b2, matches the "
+            "npm-published digest) declares the ['shift+enter', 'ctrl+j'] "
+            "newLine defaultKeys and 'enter' submit, and computes "
+            "expandPasteMarkers(this.state.lines.join('\\n')).trim() on "
+            "submit; PASTE_ENTER_SUPPRESS_WINDOW_MS = 120 with "
+            "content-neutral reset — byte-identical to the npm-published "
+            "0.32.0 bundle facts (bundle read per cond-0315)"
+        ),
+    },
 }
 
 #: The steer chords proven for each pinned Kimi build.  Distinct from
@@ -363,6 +414,16 @@ _PROVEN_STEER_CHORDS: dict[str, frozenset[str]] = {
     # 0.29.x/0.30.0 line (bundle read per cond-0310; sha256 keyed in
     # _PROVEN_COMPOSER_NEWLINE).
     "0.31.0": frozenset({"C-s"}),
+    # Key.ctrl("s") exists in the installed 0.32.0 bundle exactly as in the
+    # 0.29.x/0.30.0/0.31.0 line — the matchesKey(normalized, Key.ctrl("s"))
+    # dispatch is byte-identical to the npm-published 0.31.0 bundle (bundle
+    # read per cond-0315; sha256 keyed in _PROVEN_COMPOSER_NEWLINE).
+    "0.32.0": frozenset({"C-s"}),
+    # Key.ctrl("s") exists in the installed 0.33.0 bundle exactly as in the
+    # 0.29.x–0.32.0 line — the matchesKey(normalized, Key.ctrl("s"))
+    # dispatch is byte-identical to the npm-published 0.32.0 bundle (bundle
+    # read per cond-0315; sha256 keyed in _PROVEN_COMPOSER_NEWLINE).
+    "0.33.0": frozenset({"C-s"}),
 }
 
 
