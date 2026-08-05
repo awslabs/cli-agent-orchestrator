@@ -227,6 +227,7 @@ class TestTerminalPluginEvents:
         assert event.provider == "kiro_cli"
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog", return_value="")
@@ -253,6 +254,7 @@ class TestTerminalPluginEvents:
         mock_build_skill_catalog,
         mock_log_dir,
         mock_delete_terminals_by_session,
+        mock_db_delete_terminal,
     ):
         """Terminal creation failures must not emit post_create_terminal."""
         registry = _registry_mock()
@@ -340,6 +342,8 @@ class TestMessagePluginEvents:
     """Verify message delivery emits the correct event payloads."""
 
     @pytest.mark.parametrize("orchestration_type", ["send_message", "assign", "handoff"])
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -350,10 +354,13 @@ class TestMessagePluginEvents:
         mock_provider_manager,
         mock_tmux,
         mock_update_last_active,
+        mock_status_monitor,
+        mock_memory_service,
         orchestration_type,
     ):
         """Every successful delivery should emit one post_send_message event."""
         registry = _registry_mock()
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
         call_order: list[str] = []
 
         async def record_dispatch(*_args):
@@ -390,11 +397,12 @@ class TestMessagePluginEvents:
         assert event.message == "Hello from supervisor"
         assert event.orchestration_type == orchestration_type
 
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_does_not_dispatch_on_failure(
-        self, mock_get_metadata, mock_provider_manager, mock_tmux
+        self, mock_get_metadata, mock_provider_manager, mock_tmux, mock_status_monitor
     ):
         """Message delivery failures must not emit post_send_message."""
         registry = _registry_mock()
