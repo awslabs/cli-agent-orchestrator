@@ -63,7 +63,14 @@ def _reserve_payload(worktree, tmp_path, **changes):
     return payload
 
 
-def test_recovery_capabilities_truthful(client):
+def test_recovery_capabilities_truthful(client, tmp_path, monkeypatch):
+    # Hermetic: an empty CAO home means zero durable proofs.  Never read the
+    # operator's real home — an installed binary with a valid proof there is
+    # a truthful capability (COND-0317), not ambient state this test may
+    # depend on.
+    home = tmp_path / "cao-home"
+    home.mkdir()
+    monkeypatch.setattr("cli_agent_orchestrator.constants.CAO_HOME_DIR", home)
     response = client.get("/managed/recovery-capabilities")
     assert response.status_code == 200
     payload = response.json()
@@ -76,6 +83,91 @@ def test_recovery_capabilities_truthful(client):
     }
     assert payload["resume"]["kimi"]["identity_available"] is False
     assert payload["resource_registry_version"] == 1
+
+
+def _kimi_acp_driver(session_id="session_abc"):
+    """A driver proving one exact session id across new→kill→load."""
+
+    def drive(_binary):
+        return {
+            "session_id": session_id,
+            "resumed": True,
+            "exchange": {
+                "session_new_id": session_id,
+                "killed": True,
+                "session_load_id": session_id,
+                "transcript_sha256": hashlib.sha256(b"acp-transcript").hexdigest(),
+            },
+        }
+
+    return drive
+
+
+def _homebrew_kimi(tmp_path, monkeypatch, *, version="kimi 0.33.0"):
+    """A Homebrew-shaped install: PATH exposes a symlink to the canonical CLI."""
+    import os
+    import shutil
+
+    from cli_agent_orchestrator.api import main as api_main
+
+    canonical = tmp_path / "Cellar" / "kimi" / "0.33.0" / "dist" / "main.mjs"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text("// kimi 0.33.0 bundle\n")
+    link_dir = tmp_path / "homebrew-bin"
+    link_dir.mkdir()
+    link = link_dir / "kimi"
+    link.symlink_to(canonical)
+    assert os.path.realpath(link) == str(canonical) != str(link)
+    home = tmp_path / "cao-home"
+    home.mkdir()
+    monkeypatch.setattr("cli_agent_orchestrator.constants.CAO_HOME_DIR", home)
+    monkeypatch.setattr(shutil, "which", lambda name: str(link) if name == "kimi" else None)
+    monkeypatch.setattr(
+        api_main,
+        "_provider_version_output",
+        lambda binary: version if binary == "kimi" else None,
+    )
+    return home, canonical, link
+
+
+def test_recovery_capabilities_consumes_kimi_proof_through_a_symlinked_path_executable(
+    client, isolated_memory_db, tmp_path, monkeypatch
+):
+    """COND-0317 regression: the endpoint must resolve the PATH symlink to
+    the same canonical absolute identity ``run_identity_proof`` recorded —
+    on Homebrew ``which("kimi")`` is /opt/homebrew/bin/kimi, a symlink to
+    the canonical dist/main.mjs, and the proof binds the canonical path."""
+    from cli_agent_orchestrator.services import kimi_acp_proof as kap
+
+    home, canonical, _ = _homebrew_kimi(tmp_path, monkeypatch)
+    kap.run_identity_proof(
+        kimi_binary=canonical,
+        version_output="kimi 0.33.0",
+        state_dir=home / "recovery",
+        acp_driver=_kimi_acp_driver(),
+    )
+
+    payload = client.get("/managed/recovery-capabilities").json()
+
+    assert payload["resume"]["kimi"]["identity_available"] is True
+
+
+def test_recovery_capabilities_kimi_proof_fails_closed_on_a_dangling_symlink(
+    client, isolated_memory_db, tmp_path, monkeypatch
+):
+    """A PATH symlink whose target is gone resolves to a nonexistent
+    canonical path: the proof load fails closed — no capability, no error."""
+    import os
+    import shutil
+
+    home, canonical, link = _homebrew_kimi(tmp_path, monkeypatch)
+    canonical.unlink()  # the target vanishes after the link was published
+    assert not os.path.exists(os.path.realpath(link))
+    monkeypatch.setattr(shutil, "which", lambda name: str(link) if name == "kimi" else None)
+
+    payload = client.get("/managed/recovery-capabilities").json()
+
+    assert payload["resume"]["kimi"]["identity_available"] is False
 
 
 def test_v2_reserve_query_roundtrip(client, isolated_memory_db, worktree, tmp_path):

@@ -283,6 +283,51 @@ def test_version_drift_blocks_proof(kimi_binary, tmp_path):
         )
 
 
+def test_symlink_spelling_never_matches_the_canonical_proof(kimi_binary, tmp_path):
+    # COND-0317: the receipt's binary_path binding stays exact — a symlink
+    # spelling of the same file is not the recorded canonical identity, so
+    # consumers must resolve the executable to its canonical absolute path
+    # before loading (the API layer does); the proof itself never follows
+    # a symlink.
+    import os
+
+    kap.run_identity_proof(
+        kimi_binary=kimi_binary,
+        version_output="kimi 0.29.0",
+        state_dir=tmp_path / "state",
+        acp_driver=_acp_driver(),
+    )
+    link_dir = tmp_path / "bin"
+    link_dir.mkdir()
+    link = link_dir / "kimi"
+    link.symlink_to(kimi_binary)
+    assert (
+        kap.load_valid_proof(
+            state_dir=tmp_path / "state", kimi_binary=link, version_output="kimi 0.29.0"
+        )
+        is None
+    )
+    # Resolving to the same canonical identity the proof recorded validates.
+    from pathlib import Path
+
+    resolved = Path(os.path.realpath(link))
+    assert resolved == kimi_binary
+    assert (
+        kap.load_valid_proof(
+            state_dir=tmp_path / "state", kimi_binary=resolved, version_output="kimi 0.29.0"
+        )
+        is not None
+    )
+    # A dangling symlink resolves to a nonexistent path and fails closed.
+    kimi_binary.unlink()
+    assert (
+        kap.load_valid_proof(
+            state_dir=tmp_path / "state", kimi_binary=resolved, version_output="kimi 0.29.0"
+        )
+        is None
+    )
+
+
 # ------------------------------------------------------------ old-binary rig
 
 
