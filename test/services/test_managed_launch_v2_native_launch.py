@@ -288,7 +288,7 @@ async def test_the_pane_runs_the_provider_resuming_the_minted_session(
 async def test_a_kimi_0310_pane_that_rewrote_its_title_is_certified_via_the_rendered_header(
     isolated_memory_db, worktree, tmp_path, harness, monkeypatch
 ):
-    """cond-0311 end to end: a title-rewriting 0.31.0 pane still certifies.
+    """COND-0312 end to end: a title-rewriting 0.31.0 pane still certifies.
 
     Kimi Code 0.31.0 rewrites ``process.title`` to ``kimi-code`` after parsing,
     so the kernel argv the observer reads no longer carries the resumed
@@ -318,7 +318,7 @@ async def test_a_kimi_0310_pane_that_rewrote_its_title_is_certified_via_the_rend
         }
 
     monkeypatch.setattr(v2._V2NativePane, "observe", _rewritten_observe)
-    monkeypatch.setattr(v2._V2NativePane, "capture_render", lambda self: list(header_rows))
+    monkeypatch.setattr(v2._V2NativePane, "capture_render", lambda self, pane_id: list(header_rows))
 
     record, result = await _launch(worktree, tmp_path)
 

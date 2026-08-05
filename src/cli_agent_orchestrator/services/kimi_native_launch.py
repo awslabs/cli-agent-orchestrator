@@ -117,7 +117,7 @@ def resumes_exactly(argv: Sequence[str], session_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Rendered native-header exact-session proof (cond-0311)
+# Rendered native-header exact-session proof (COND-0312)
 #
 # Kimi Code 0.31.0 rewrites ``process.title`` to ``kimi-code`` *after* parsing
 # its argv.  On Darwin that overwrite lands in the same buffer
@@ -180,7 +180,7 @@ class RenderedSessionProof:
 
 
 _KIMI_0310_RENDERED_EVIDENCE = (
-    "live-verified on the installed Kimi Code 0.31.0 (cond-0311, 2026-08-05, "
+    "live-verified on the installed Kimi Code 0.31.0 (COND-0312, 2026-08-05, "
     "run cond-0303-pr74-review-k3-r2 / pane %47): the build rewrites "
     "process.title to 'kimi-code' after parsing its argv, so Darwin "
     "KERN_PROCARGS2 returns ['kimi-code','','','',...] and the resumed "

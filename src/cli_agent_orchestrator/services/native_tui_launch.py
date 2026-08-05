@@ -107,6 +107,19 @@ OUTCOME_RECONCILED = "reconciled"
 
 OUTCOMES = frozenset({OUTCOME_LAUNCHED, OUTCOME_ALREADY_ATTACHED, OUTCOME_RECONCILED})
 
+#: The bound-session proof channel a launch published under.  A closed
+#: vocabulary so success evidence is typed like the freeze evidence: a reader
+#: of the launch result (or a later auditor) learns *how* the resumed session
+#: was proven rather than inferring it from the argv.  ``SESSION_PROOF_ARGV``
+#: is the kernel-argv proof every provider and build uses when the resumed id
+#: is still readable there; ``SESSION_PROOF_KIMI_RENDERED`` is the rendered
+#: native-header proof (rule ``kimi-native-header-v1``) used only by a Kimi
+#: build proven to rewrite its process title after parsing.  Any other value
+#: reaching publication fails closed rather than silently behaving like argv.
+SESSION_PROOF_ARGV = "argv"
+SESSION_PROOF_KIMI_RENDERED = kimi_native_launch.RULE_KIMI_NATIVE_HEADER
+SESSION_PROOFS = frozenset({SESSION_PROOF_ARGV, SESSION_PROOF_KIMI_RENDERED})
+
 #: Freeze reasons.  Each names the exact boundary that was crossed with
 #: an unknown result, because "ambiguous" alone tells a later reconciler
 #: nothing about where to look.
@@ -198,13 +211,16 @@ class NativePaneTransport(Protocol):
         must raise: an observation missing it is unreadable, not exempt.
         """
 
-    def capture_render(self) -> list[str]:
-        """The pane's rendered rows right now; raise on any failure to read.
+    def capture_render(self, pane_id: str) -> list[str]:
+        """The rendered rows of one exact pane right now; raise on any failure.
 
-        A distinct, read-only evidence channel from :meth:`observe`.  The
-        process table proves *which process* the pane is; the rendered screen
-        proves *which session that process's TUI is running* for a provider
-        that rewrites its process title after parsing and so leaves the resumed
+        A distinct, read-only evidence channel from :meth:`observe`, targeted
+        at the immutable ``pane_id`` of the observation that fences the proof
+        rather than at a session/window (which resolves to the *active* pane
+        and could flip between the observation and the capture).  The process
+        table proves *which process* the pane is; the rendered screen proves
+        *which session that process's TUI is running* for a provider that
+        rewrites its process title after parsing and so leaves the resumed
         session id unreadable from the argv.  Deliberately still only a read:
         nothing is sent to the pane, so the discipline against growing an input
         side is preserved.  A capture that could not be made must raise -- an
@@ -673,7 +689,17 @@ def _await_kimi_rendered_session_proof(
     the header is awaited (which would prove the session off a stranger) all
     leave the attachment frozen rather than published.
 
-    Returns the settled observation and the rendered rows that proved the
+    A successful match is fenced by a fresh observation too.  The header rows
+    come from a capture taken *after* the observation that seeded this
+    identity, so a same-pane process replacement in that window (a TUI
+    self-restart, an active-pane flip caught by the exact-pane capture) would
+    otherwise let the launch publish the stale ``pid``/``start_marker`` of a
+    dead process while the session proof came from pixels the replacement
+    re-rendered.  The match is therefore only accepted once a re-observation
+    confirms ``(pane_id, pid, start_marker)`` unchanged, and the fenced
+    observation -- not the stale seed -- is what publication records.
+
+    Returns the fenced observation and the rendered rows that proved the
     session, so publication can re-check the same evidence independently.
     """
     identity = (
@@ -684,7 +710,7 @@ def _await_kimi_rendered_session_proof(
     deadline = time.monotonic() + KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS
     while True:
         try:
-            rows = list(transport.capture_render())
+            rows = list(transport.capture_render(observation["pane_id"]))
         except Exception as exc:  # noqa: BLE001 - an unreadable render is never "no header"
             _freeze(
                 provider=provider,
@@ -695,7 +721,35 @@ def _await_kimi_rendered_session_proof(
         if kimi_native_launch.renders_session_exactly(
             rows, native_session_id, provider_version=provider_version
         ):
-            return observation, rows
+            # Fence the match.  The rows were read from a capture taken after
+            # the observation that seeded ``identity``; a process replacement
+            # in that window would make this header the replacement's own
+            # statement while the recorded identity was the dead process's.
+            # Re-observe and require unchanged before accepting, then return
+            # the fenced observation so publication records the live one.
+            fenced = _observe(
+                transport,
+                provider=provider,
+                native_session_id=native_session_id,
+                absent_reason=absent_reason,
+            )
+            fenced_identity = (
+                fenced["pane_id"],
+                fenced["pid"],
+                fenced["start_marker"],
+            )
+            if fenced_identity != identity:
+                _freeze(
+                    provider=provider,
+                    native_session_id=native_session_id,
+                    reason=AMBIGUOUS_PROCESS_IMAGE_MISMATCH,
+                    detail=(
+                        "the pane process identity changed between the rendered-header "
+                        "match and its fencing re-observation: "
+                        f"expected {identity!r}, observed {fenced_identity!r}"
+                    ),
+                )
+            return fenced, rows
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             _freeze(
@@ -747,12 +801,13 @@ def _settle_session_proof(
 ) -> tuple[dict[str, Any], str, Optional[list[str]]]:
     """Resolve the bound-session proof the launch will publish under.
 
-    Returns ``(observation, session_proof, rendered_rows)``.  For a Kimi build
-    proven to rewrite its title, the resumed session id is unreadable from the
-    argv, so the binding is converged from the rendered header and the rows are
-    handed back for an independent re-check at publication.  For every other
-    provider and build the argv is still the proof, nothing is captured, and
-    publication verifies from the observation's argv.
+    Returns ``(observation, session_proof, rendered_rows)`` where
+    ``session_proof`` is one of :data:`SESSION_PROOFS`.  For a Kimi build proven
+    to rewrite its title, the resumed session id is unreadable from the argv, so
+    the binding is converged from the rendered header and the rows are handed
+    back for an independent re-check at publication.  For every other provider
+    and build the argv is still the proof, nothing is captured, and publication
+    verifies from the observation's argv.
     """
     if _kimi_rendered_proof_active(provider, provider_version):
         observation, rendered_rows = _await_kimi_rendered_session_proof(
@@ -763,8 +818,8 @@ def _settle_session_proof(
             observation=observation,
             absent_reason=absent_reason,
         )
-        return observation, "kimi_rendered", rendered_rows
-    return observation, "argv", None
+        return observation, SESSION_PROOF_KIMI_RENDERED, rendered_rows
+    return observation, SESSION_PROOF_ARGV, None
 
 
 def _publish(
@@ -776,7 +831,7 @@ def _publish(
     working_directory: str,
     observation: Mapping[str, Any],
     expected_inner_executable: Optional[str] = None,
-    session_proof: str = "argv",
+    session_proof: str = SESSION_PROOF_ARGV,
     proven_rendered_rows: Optional[Sequence[str]] = None,
     provider_version: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -797,7 +852,7 @@ def _publish(
     both are re-checked here rather than trusted from the convergence that
     preceded publication.
     """
-    if session_proof == "kimi_rendered":
+    if session_proof == SESSION_PROOF_KIMI_RENDERED:
         _verify_rendered_session(
             provider=provider,
             native_session_id=native_session_id,
@@ -810,12 +865,26 @@ def _publish(
             working_directory=working_directory,
             observation=observation,
         )
-    else:
+    elif session_proof == SESSION_PROOF_ARGV:
         _verify_bound_session_and_cwd(
             provider=provider,
             native_session_id=native_session_id,
             working_directory=working_directory,
             observation=observation,
+        )
+    else:
+        # A closed vocabulary: an unknown proof channel never falls back to
+        # argv.  The pane is live by here, so this freezes (rather than a
+        # clean refusal) the way every other unresolved publication does.
+        _freeze(
+            provider=provider,
+            native_session_id=native_session_id,
+            reason=AMBIGUOUS_PUBLISH_FAILED,
+            detail=(
+                f"unknown session-proof channel {session_proof!r}; publication requires one "
+                f"of {sorted(SESSION_PROOFS)}, and an unrecognised value must never be read "
+                "as the argv proof"
+            ),
         )
     if expected_inner_executable is not None:
         observed_executable = observation["argv"][0] if observation["argv"] else ""
@@ -867,6 +936,7 @@ def _result(
     pane_handle: Optional[str],
     observation: Optional[Mapping[str, Any]],
     attachment: Mapping[str, Any],
+    session_proof: Optional[str] = None,
 ) -> dict[str, Any]:
     return {
         "schema": LAUNCH_SCHEMA,
@@ -888,6 +958,14 @@ def _result(
         "pane_handle": pane_handle,
         "pane_observation": dict(observation) if observation is not None else None,
         "attachment": dict(attachment),
+        # How the resumed session was proven this launch -- ``SESSION_PROOF_ARGV``
+        # or ``SESSION_PROOF_KIMI_RENDERED`` (the rendered-header rule) -- so the
+        # proof channel is named on success the way the freeze reason names it on
+        # failure.  ``None`` when this call proved nothing (the generation was
+        # already attached); the rule is not durable on the attachment because
+        # that would need a schema migration, and inventing a parallel store is
+        # worse than recording it on the launch result the caller already reads.
+        "session_proof": session_proof,
         "completed_at": _now(),
     }
 
@@ -1138,6 +1216,7 @@ def start(
             pane_handle=observation["pane_id"],
             observation=observation,
             attachment=attachment,
+            session_proof=session_proof,
             **common,
         )
 
@@ -1216,6 +1295,7 @@ def start(
         pane_handle=handle,
         observation=observation,
         attachment=attachment,
+        session_proof=session_proof,
         **common,
     )
 
@@ -1263,25 +1343,30 @@ class TmuxNativePane:
         )
         return str(handle)
 
-    def capture_render(self, *, deadline_monotonic: Optional[float] = None) -> list[str]:
-        """The rendered rows of this window's pane; raised on any read failure.
+    def capture_render(
+        self, pane_id: str, *, deadline_monotonic: Optional[float] = None
+    ) -> list[str]:
+        """The rendered rows of one exact pane; raised on any read failure.
 
         Read without ``-e`` so the rows are the composited viewport the
-        provider's own detectors read, and not a raw stream of escape
-        sequences.  Targeted at the bound window rather than a pane handle so a
-        re-entry that never saw the handle reads the same screen a fresh launch
-        would.  A capture that fails is raised, never returned empty: the
-        rendered header is the session proof for a title-rewriting build, and an
-        unreadable render is an unresolved observation.
+        provider's own detectors read, and not a raw stream of escape sequences.
+        Targeted at the immutable ``pane_id`` of the observation that fences the
+        proof (``-t %N``), never at the session/window: a window resolves to its
+        *active* pane, which can flip between the observation and the capture,
+        whereas a pane id names one pane for the life of the server.  A capture
+        that fails is raised, never returned empty: the rendered header is the
+        session proof for a title-rewriting build, and an unreadable render is an
+        unresolved observation.
         """
         from cli_agent_orchestrator.clients.tmux import tmux_binary
 
+        target = _require_text(pane_id, field="pane_id")
         argv = [
             tmux_binary(),
             "capture-pane",
             "-p",
             "-t",
-            f"{self._session_name}:{self._window_name}",
+            target,
         ]
         try:
             proc = subprocess.run(
@@ -1293,19 +1378,16 @@ class TmuxNativePane:
             )
         except subprocess.TimeoutExpired as exc:
             raise NativeLaunchUnavailable(
-                f"the rendered screen of {self._session_name}:{self._window_name} could not "
-                f"be captured within the bound: {exc}"
+                f"the rendered screen of pane {target} could not be captured within "
+                f"the bound: {exc}"
             ) from exc
         except OSError as exc:
             raise NativeLaunchUnavailable(
-                f"the rendered screen of {self._session_name}:{self._window_name} could not "
-                f"be captured: {exc}"
+                f"the rendered screen of pane {target} could not be captured: {exc}"
             ) from exc
         if proc.returncode != 0:
             detail = (proc.stderr or "").strip() or f"tmux exited {proc.returncode}"
-            raise NativeLaunchUnavailable(
-                f"could not capture {self._session_name}:{self._window_name}: {detail}"
-            )
+            raise NativeLaunchUnavailable(f"could not capture pane {target}: {detail}")
         return (proc.stdout or "").splitlines()
 
     def observe(self, *, deadline_monotonic: Optional[float] = None) -> Optional[Mapping[str, Any]]:

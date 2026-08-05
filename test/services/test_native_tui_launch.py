@@ -78,6 +78,7 @@ class FakePane:
         self.created: list[list[str]] = []
         self.observe_calls = 0
         self.render_calls = 0
+        self.render_targets: list[str] = []
 
     def create_pane(self, *, argv: Sequence[str]) -> str:
         self.created.append(list(argv))
@@ -91,11 +92,12 @@ class FakePane:
             raise self.observe_error
         return self.observation
 
-    def capture_render(self) -> list[str]:
-        # The rendered-screen evidence channel (cond-0311): a separate
-        # read from the same pane, raised rather than empty when the pane
+    def capture_render(self, pane_id: str) -> list[str]:
+        # The rendered-screen evidence channel (COND-0312): a separate read
+        # from the exact observed pane, raised rather than empty when the pane
         # cannot be looked at.
         self.render_calls += 1
+        self.render_targets.append(pane_id)
         if self.render_error is not None:
             raise self.render_error
         return list(self.rendered)
@@ -169,7 +171,7 @@ def _start(pinned: tuple[str, str], transport: Any, **overrides: Any) -> dict[st
 
 # Kimi Code 0.31.0 rewrites its process title to ``kimi-code`` after parsing,
 # so the kernel argv the pane observer reads no longer carries the resumed
-# ``--session <id>`` (cond-0311).  These two constants model that live defect
+# ``--session <id>`` (COND-0312).  These two constants model that live defect
 # for the regression suite below.
 _REWRITTEN_ARGV = ["kimi-code", "", "", "", ""]
 PINNED_0310 = "0.31.0"
@@ -883,14 +885,14 @@ def test_a_pane_not_resuming_the_bound_session_freezes_and_never_attaches(
 
 # --------------------------------------------------------------------------
 # Kimi 0.31.0 process-title rewrite: the rendered native header is the proof
-# (cond-0311)
+# (COND-0312)
 # --------------------------------------------------------------------------
 
 
 def test_a_kimi_0310_pane_that_rewrote_its_title_attaches_via_the_rendered_header(
     isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
 ) -> None:
-    """The exact live defect (cond-0311).
+    """The exact live defect (COND-0312).
 
     Kimi Code 0.31.0 rewrites ``process.title`` to ``kimi-code`` after parsing,
     so the kernel argv the observer reads back is ``['kimi-code', '', ...]`` and
@@ -910,6 +912,13 @@ def test_a_kimi_0310_pane_that_rewrote_its_title_attaches_via_the_rendered_heade
 
     assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
     assert pane.render_calls >= 1
+    # The capture is targeted at the exact observed pane id, never the window.
+    assert pane.render_targets
+    assert all(target == "%7" for target in pane.render_targets)
+    # Success evidence names the proof channel like the freeze reason does:
+    # the rendered-header rule, not an inferred argv proof.
+    assert result["session_proof"] == native_tui_launch.SESSION_PROOF_KIMI_RENDERED
+    assert result["session_proof"] == native_tui_launch.kimi_native_launch.RULE_KIMI_NATIVE_HEADER
     stored = native_attachment.get(PROVIDER, SESSION)
     assert stored is not None and stored["state"] == native_attachment.ATTACHED
 
@@ -1039,8 +1048,9 @@ def test_a_replaced_process_identity_while_waiting_for_the_header_freezes(
                 return self.observation
             return self._observations.pop(0)
 
-        def capture_render(self) -> list[str]:
+        def capture_render(self, pane_id: str) -> list[str]:
             self.render_calls += 1
+            self.render_targets.append(pane_id)
             return []  # still not rendered, so the loop re-observes
 
     with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
@@ -1048,6 +1058,46 @@ def test_a_replaced_process_identity_while_waiting_for_the_header_freezes(
 
     assert caught.value.reason == native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH
     _assert_frozen(native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH)
+
+
+def test_a_process_replaced_just_before_an_already_matching_header_freezes(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    """The matching capture itself must be fenced by a fresh observation.
+
+    The hole this closes (COND-0312 P1): the rendered header that proves the
+    session is read from a capture taken *after* the observation that seeded
+    the identity, and a same-pane process replacement in that window would let
+    the launch publish the stale ``pid``/``start_marker`` of a dead process
+    while the session proof came from pixels the replacement re-rendered.  The
+    argv path binds session and identity in one read; the rendered path splits
+    them, so the match is only accepted after a re-observation confirms the
+    identity unchanged.  Freeze, never publish a stale identity.
+    """
+    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+
+    class _ImmediateMatchReplacedPane(FakePane):
+        def __init__(self) -> None:
+            super().__init__(
+                observation=_observation(_REWRITTEN_ARGV, pid=4321),
+                rendered=_native_header_rows(),  # already matching on capture #1
+            )
+
+        def observe(self) -> Optional[Mapping[str, Any]]:
+            self.observe_calls += 1
+            # The initial seed (call 1, in start()) names pid 4321; the live
+            # process is then replaced before the first capture, so the fence
+            # re-observation (call 2) names a different process.
+            return _observation(_REWRITTEN_ARGV, pid=4321 if self.observe_calls == 1 else 9999)
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, _ImmediateMatchReplacedPane(), provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PROCESS_IMAGE_MISMATCH)
+    # The replacement was caught at the fence, not papered over: nothing was
+    # published under the stale identity.
+    assert native_attachment.get(PROVIDER, SESSION)["state"] == native_attachment.AMBIGUOUS
 
 
 def test_a_rewritten_title_pane_in_the_wrong_directory_freezes(
@@ -1124,6 +1174,57 @@ def test_a_non_rewriting_build_keeps_using_the_argv_proof_unchanged(
 
     assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
     assert pane.render_calls == 0
+    # An argv launch records the argv proof channel by name.
+    assert result["session_proof"] == native_tui_launch.SESSION_PROOF_ARGV
+
+
+def test_the_session_proof_vocabulary_is_closed_and_unknown_values_freeze(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str]
+) -> None:
+    """Success evidence is typed over a closed vocabulary (COND-0312 P2-2).
+
+    ``SESSION_PROOFS`` is exactly the argv channel and the rendered-header
+    rule.  An unrecognised proof channel reaching publication must never be
+    read as the argv proof: the pane is live by then, so it freezes the way
+    every other unresolved publication does rather than silently falling
+    through to argv behaviour.
+    """
+    assert native_tui_launch.SESSION_PROOFS == frozenset(
+        {native_tui_launch.SESSION_PROOF_ARGV, native_tui_launch.SESSION_PROOF_KIMI_RENDERED}
+    )
+    assert (
+        native_tui_launch.SESSION_PROOF_KIMI_RENDERED
+        == native_tui_launch.kimi_native_launch.RULE_KIMI_NATIVE_HEADER
+    )
+
+    path, _ = pinned_binary
+    native_attachment.declare(
+        provider=PROVIDER,
+        native_session_id=SESSION,
+        terminal_id=TERMINAL,
+        generation=GENERATION,
+        execution_mode=em.NATIVE_TUI,
+        intent=_intent(),
+    )
+    native_attachment.mark_starting(
+        provider=PROVIDER,
+        native_session_id=SESSION,
+        terminal_id=TERMINAL,
+        generation=GENERATION,
+        execution_mode=em.NATIVE_TUI,
+    )
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        native_tui_launch._publish(
+            provider=PROVIDER,
+            native_session_id=SESSION,
+            terminal_id=TERMINAL,
+            generation=GENERATION,
+            working_directory=_canonical_workdir(),
+            observation=_observation(_expected_argv(path)),
+            session_proof="not-a-real-proof-channel",
+        )
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PUBLISH_FAILED
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PUBLISH_FAILED)
 
 
 def test_a_frozen_session_refuses_every_later_launch(
@@ -1334,6 +1435,95 @@ def test_tmux_transport_execs_the_argv_directly() -> None:
     handle = _pane(backend).create_pane(argv=["/bin/kimi", "--session", SESSION])
     assert handle == "w1"
     assert backend.calls == [("cao", "w1", TERMINAL, ("/bin/kimi", "--session", SESSION))]
+
+
+# --------------------------------------------------------------------------
+# The concrete tmux rendered-screen capture (COND-0312 P2-3)
+# --------------------------------------------------------------------------
+
+
+class _CompletedProcess:
+    def __init__(self, *, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _patch_tmux_binary(monkeypatch: pytest.MonkeyPatch, path: str = "/usr/bin/tmux") -> None:
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.tmux.tmux_binary", lambda: path, raising=False
+    )
+
+
+def test_capture_render_targets_the_exact_pane_id_and_is_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``capture-pane -p -t %N`` -- the exact pane, no escapes, nothing sent.
+
+    Pins the real subprocess wrapper: the argv is exactly the read-only
+    capture against the fencing observation's pane id (never the session/window
+    active pane), with no ``-e`` so the rows are the composited viewport, and
+    ``capture-pane`` sends nothing to the pane.
+    """
+    pane = _pane(FakeBackend())
+    captured: dict[str, Any] = {}
+
+    def fake_run(argv: Any, **_kwargs: Any) -> Any:
+        captured["argv"] = list(argv)
+        return _CompletedProcess(stdout="Welcome\nSession:   x\n")
+
+    monkeypatch.setattr(native_tui_launch.subprocess, "run", fake_run)
+    _patch_tmux_binary(monkeypatch)
+
+    rows = pane.capture_render("%47")
+
+    assert captured["argv"] == ["/usr/bin/tmux", "capture-pane", "-p", "-t", "%47"]
+    assert "capture-pane" == captured["argv"][1]
+    assert "-e" not in captured["argv"]
+    assert "send-keys" not in captured["argv"]
+    assert rows == ["Welcome", "Session:   x"]
+
+
+def test_capture_render_refuses_an_empty_pane_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    pane = _pane(FakeBackend())
+    _patch_tmux_binary(monkeypatch)
+    monkeypatch.setattr(
+        native_tui_launch.subprocess, "run", lambda *a, **k: _CompletedProcess(stdout="x")
+    )
+    with pytest.raises(native_tui_launch.NativeLaunchInvalid, match="pane_id"):
+        pane.capture_render("")
+
+
+@pytest.mark.parametrize(
+    ("failure", "matcher"),
+    [
+        # A capture that cannot complete in the bound is an unresolved
+        # observation, never an empty header.
+        ("timeout", "captured within the bound"),
+        # A non-zero tmux exit (e.g. a pane that died) must raise, not return
+        # empty -- an empty return would read as "no header" and freeze on a
+        # lie rather than on an unreadable pane.
+        ("nonzero", "could not capture pane %47"),
+        # An OS-level failure to spawn tmux is likewise unreadable, not absent.
+        ("oserror", "could not be captured"),
+    ],
+)
+def test_capture_render_maps_every_read_failure_to_unavailable(
+    monkeypatch: pytest.MonkeyPatch, failure: str, matcher: str
+) -> None:
+    pane = _pane(FakeBackend())
+    _patch_tmux_binary(monkeypatch)
+
+    def fake_run(argv: Any, **_kwargs: Any) -> Any:
+        if failure == "timeout":
+            raise native_tui_launch.subprocess.TimeoutExpired(argv, 1)
+        if failure == "oserror":
+            raise OSError("nope")
+        return _CompletedProcess(returncode=1, stderr="can't find pane")
+
+    monkeypatch.setattr(native_tui_launch.subprocess, "run", fake_run)
+    with pytest.raises(native_tui_launch.NativeLaunchUnavailable, match=matcher):
+        pane.capture_render("%47")
 
 
 def test_tmux_transport_reports_a_missing_window_as_absent() -> None:

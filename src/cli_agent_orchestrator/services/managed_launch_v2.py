@@ -3403,7 +3403,7 @@ class _V2NativePane:
             terminal_id=self._record["terminal_id"],
         ).observe()
 
-    def capture_render(self) -> Any:
+    def capture_render(self, pane_id: str) -> Any:
         from cli_agent_orchestrator.services import native_tui_launch, terminal_service
 
         return native_tui_launch.TmuxNativePane(
@@ -3411,7 +3411,7 @@ class _V2NativePane:
             session_name=self._record["session_name"],
             window_name=self._window,
             terminal_id=self._record["terminal_id"],
-        ).capture_render()
+        ).capture_render(pane_id)
 
 
 async def _teardown_published_native_terminal(

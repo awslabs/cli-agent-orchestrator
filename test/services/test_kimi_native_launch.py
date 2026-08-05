@@ -112,7 +112,7 @@ class TestResumesExactly:
 
 
 # ---------------------------------------------------------------------------
-# Rendered native-header exact-session proof (cond-0311)
+# Rendered native-header exact-session proof (COND-0312)
 #
 # Kimi Code 0.31.0 rewrites its process title to ``kimi-code`` after parsing,
 # so the resumed ``--session <id>`` is no longer observable in the kernel
