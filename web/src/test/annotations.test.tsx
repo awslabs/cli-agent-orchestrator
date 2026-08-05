@@ -14,6 +14,7 @@ import filtersLibSource from '../lib/filters.ts?raw'
 import annotationChipsSource from '../components/AnnotationChips.tsx?raw'
 import annotationDetailsSource from '../components/AnnotationDetails.tsx?raw'
 import filterBarSource from '../components/FilterBar.tsx?raw'
+import floatingCardSource from '../components/FloatingCard.tsx?raw'
 import identityColourSource from '../lib/identityColour.ts?raw'
 import { render, cleanup, screen, waitFor, within, fireEvent } from '@testing-library/react'
 import { DashboardHome } from '../components/DashboardHome'
@@ -636,6 +637,11 @@ describe('the renderer holds no conductor vocabulary either', () => {
     // ever" is actually load-bearing.
     ['src/lib/filters.ts', filtersLibSource],
     ['src/components/FilterBar.tsx', filterBarSource],
+    // Extracted from AnnotationDetails when the chip bar needed the same
+    // anchored popover; listed because every new module joins the guard, and
+    // a shared overlay primitive is exactly where a future "position the lane
+    // chip's card differently" shortcut would try to live.
+    ['src/components/FloatingCard.tsx', floatingCardSource],
   ]
 
   // The eight terms the Python guard forbids, plus the vocabulary this

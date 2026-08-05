@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { useStore } from '../store'
 import { api, Annotation, AnnotationsResponse, TerminalMeta } from '../api'
-import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileText, LogOut, Send, ChevronRight, ChevronDown, Users, Filter, ArrowDownUp } from 'lucide-react'
+import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileText, LogOut, Send, ChevronRight, ChevronDown, Users, ArrowDownUp } from 'lucide-react'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
@@ -10,16 +10,17 @@ import { OutputViewer } from './OutputViewer'
 import { CampaignAnnotations, TerminalAnnotations } from './AnnotationChips'
 import { WorkStateInfoButton } from './AnnotationDetails'
 import { GlobalFilterBar, SessionFilterBar } from './FilterBar'
+import type { StatusOption } from './FilterBar'
 import { placeAnnotations, readAnnotations } from '../lib/annotations'
 import { fmtAbs, fmtRel } from '../lib/time'
 import {
   activeFilterCount,
   callerVocabulary,
   collectFacetDimensions,
+  collectLabelDimensions,
   displayStatus,
   emptyFilters,
   fleetWideFacetKeys,
-  groupDimensions,
   isFilterActive,
   lifecycleVocabulary,
   matchesFilters,
@@ -110,13 +111,6 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   // the 5s refetch exactly the way expandedSessions does.
   const [globalFilters, setGlobalFilters] = useState<FilterState>(emptyFilters)
   const [sessionFilters, setSessionFilters] = useState<Record<string, FilterState>>({})
-  // Collapsed by default below sm: a fully expanded bar measured over half the
-  // 844px phone screen before a single session card. jsdom has no matchMedia;
-  // the guarded default keeps the bar OPEN in unit tests so every control is
-  // queryable without an expand click first.
-  const [filtersOpen, setFiltersOpen] = useState<boolean>(() =>
-    typeof window.matchMedia === 'function' ? window.matchMedia('(min-width: 640px)').matches : true,
-  )
   const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc')
   const [pendingDeleteSession, setPendingDeleteSession] = useState<string | null>(null)
   const [deletingSession, setDeletingSession] = useState(false)
@@ -301,6 +295,29 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
       annotations.coverage === 'truncated' ||
       annotations.items_omitted > 0)
 
+  // The reachability dimension's options, handed to the global chip bar.
+  //
+  // Computed UNCONDITIONALLY on every render, and the STATUS_META dereference
+  // is deliberately unguarded: dashboardStatusOrderContract.test.tsx renders
+  // the dashboard against a STATUS_CONFIG missing an entry and requires the
+  // throw to happen at render, with no session or terminal data staged. When
+  // the reachability row became a chip+popover, this eager build is what kept
+  // the unguarded `STATUS_META[s].dot` lookup on the unconditional render
+  // path — a missing counterpart must go blank loudly, never silently.
+  const statusOptions = useMemo<StatusOption[]>(
+    () =>
+      STATUS_ORDER.map(s => ({
+        value: s,
+        // `.dot` is dereferenced FIRST, on purpose: the contract suite pins
+        // the property name in the throw, and it is the lookup the
+        // StatusSummary and the old pill row have always made.
+        dot: STATUS_META[s].dot,
+        label: STATUS_META[s].label,
+        activeClass: STATUS_ACTIVE_BG[s],
+      })),
+    [],
+  )
+
   // Derived facet dimensions, computed against the FULL fleet — never the
   // filtered subset, for the same reason placement is: a dimension discovered
   // only on visible rows would vanish the moment it did its job.
@@ -312,19 +329,22 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   // a PR state — stays in its session's bar, which is what keeps an unbounded
   // or operator-action-dependent vocabulary off the fleet surface. Nothing
   // here knows what any facet is CALLED.
+  //
+  // Each scope's list is the detail facets PLUS the label dimensions (one per
+  // annotation kind, values = the annotations' labels): the lane identity is
+  // a label, and collectFacetDimensions alone could never see it.
   const sessionDimensions = useMemo(() => {
     const out: Record<string, FacetDimension[]> = {}
     for (const s of sessionData) {
-      out[s.name] = collectFacetDimensions(
-        s.terminals.map(t => ({ annotations: placement.byTerminal[t.id] })),
-      )
+      const rows = s.terminals.map(t => ({ annotations: placement.byTerminal[t.id] }))
+      out[s.name] = [...collectFacetDimensions(rows), ...collectLabelDimensions(rows)]
     }
     return out
   }, [sessionData, placement])
-  const fleetDimensions = useMemo(
-    () => collectFacetDimensions(fleetRows.map(t => ({ annotations: placement.byTerminal[t.id] }))),
-    [fleetRows, placement],
-  )
+  const fleetDimensions = useMemo(() => {
+    const rows = fleetRows.map(t => ({ annotations: placement.byTerminal[t.id] }))
+    return [...collectFacetDimensions(rows), ...collectLabelDimensions(rows)]
+  }, [fleetRows, placement])
   const globalKeys = useMemo(
     () =>
       fleetWideFacetKeys(
@@ -333,14 +353,14 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
       ),
     [fleetDimensions, sessionDimensions],
   )
-  const globalGroups = useMemo(
-    () => groupDimensions(fleetDimensions.filter(d => globalKeys.has(d.key))),
+  const globalDimensions = useMemo(
+    () => fleetDimensions.filter(d => globalKeys.has(d.key)),
     [fleetDimensions, globalKeys],
   )
-  const sessionGroups = useMemo(() => {
-    const out: Record<string, ReturnType<typeof groupDimensions>> = {}
+  const sessionLocalDimensions = useMemo(() => {
+    const out: Record<string, FacetDimension[]> = {}
     for (const [name, dims] of Object.entries(sessionDimensions)) {
-      out[name] = groupDimensions(dims.filter(d => !globalKeys.has(d.key)))
+      out[name] = dims.filter(d => !globalKeys.has(d.key))
     }
     return out
   }, [sessionDimensions, globalKeys])
@@ -538,90 +558,33 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
         </div>
       </div>
 
-      {/* The filter bar. Reachability renders FIRST and unconditionally —
-          outside the collapsible region — because it predates the bar and
-          three suites pin its contract (it must render with no session or
-          terminal data, and its button container must hold exactly the pills
-          below and no other control). Everything else lives behind the
-          toggle so the bar does not eat half a phone screen.
+      {/* The global filter bar: one chip row. Only ACTIVE filters occupy
+          pixels — each a chip reading `Dimension: selection` that opens its
+          own popover editor — and everything else is one "+ Filter" picker
+          (ranked by derived usefulness, so the pill-shaped phase-like
+          vocabularies sort to the top on their measured merit) or the
+          Advanced modal away. Reachability is a chip like any other; its
+          editor's options container holds exactly the STATUS_ORDER entries,
+          which is what the status-order suites pin now.
 
           Named "Reachability", never "status" and never "working": every live
           native-TUI v2 row reports NOT_FIFO_MONITORED unconditionally, which
           is a "this pane exists and answers" claim and says nothing about
-          activity. Multi-select: OR within the dimension, AND across the
-          dimensions in the panel below. */}
-      <div data-testid="filter-bar" className="space-y-2">
-        <div className="flex items-center gap-2 flex-wrap">
-          <button
-            type="button"
-            onClick={() => setFiltersOpen(o => !o)}
-            aria-expanded={filtersOpen}
-            aria-controls="global-filter-panel"
-            className="flex items-center gap-2 min-h-[44px] px-3 rounded-lg border border-gray-700 text-xs text-gray-300 hover:text-white hover:bg-gray-800 transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500"
-          >
-            <Filter size={12} />
-            Filters
-            {globalFilterCount > 0 && (
-              <span className="text-emerald-300">{globalFilterCount} active</span>
-            )}
-            {filtersOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-          </button>
-          {globalFilterCount > 0 && (
-            <button
-              type="button"
-              onClick={() => setGlobalFilters(emptyFilters())}
-              className="min-h-[44px] px-3 rounded-lg border border-gray-700 text-xs text-gray-300 hover:text-white hover:bg-gray-800 transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500"
-            >
-              Clear all
-            </button>
-          )}
-        </div>
-        <div className="flex items-center gap-2 flex-wrap">
-          <Filter size={12} className="text-gray-500" />
-          <span className="text-[10px] uppercase tracking-wide text-gray-400">Reachability</span>
-          <button
-            onClick={() => setGlobalFilters(f => ({ ...f, reachability: [] }))}
-            className={`text-xs min-h-[44px] px-3 rounded-full border transition-colors ${globalFilters.reachability.length === 0 ? 'bg-gray-700 border-gray-500/50 text-gray-200' : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
-          >
-            Any status
-          </button>
-          {STATUS_ORDER.map(s => {
-            const meta = STATUS_META[s]
-            const selected = globalFilters.reachability.includes(s)
-            return (
-              <button
-                key={s}
-                aria-pressed={selected}
-                onClick={() =>
-                  setGlobalFilters(f => ({
-                    ...f,
-                    reachability: selected ? f.reachability.filter(x => x !== s) : [...f.reachability, s],
-                  }))
-                }
-                className={`flex items-center gap-1.5 text-xs min-h-[44px] px-3 rounded-full border transition-colors ${selected ? STATUS_ACTIVE_BG[s] : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}
-              >
-                <span className={`w-1.5 h-1.5 rounded-full ${meta.dot}`} />
-                {meta.label}
-              </button>
-            )
-          })}
-        </div>
-        {filtersOpen && (
-          <div id="global-filter-panel">
-            <GlobalFilterBar
-              filters={globalFilters}
-              onChange={setGlobalFilters}
-              liveness={livenessOptions}
-              profiles={profileOptions}
-              providers={providerOptions}
-              sessions={sessionOptions}
-              groups={globalGroups}
-              annotationsAvailable={annotationsAvailable}
-              degraded={annotationsDegraded}
-            />
-          </div>
-        )}
-      </div>
+          activity. */}
+      <GlobalFilterBar
+        filters={globalFilters}
+        onChange={setGlobalFilters}
+        onClear={() => setGlobalFilters(emptyFilters())}
+        statusOptions={statusOptions}
+        liveness={livenessOptions}
+        profiles={profileOptions}
+        providers={providerOptions}
+        sessions={sessionOptions}
+        dimensions={globalDimensions}
+        totalRows={fleetRows.length}
+        annotationsAvailable={annotationsAvailable}
+        degraded={annotationsDegraded}
+      />
 
       {/* Sessions */}
       {filteredSessions.length === 0 ? (
@@ -774,11 +737,14 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                       onChange={next => updateSessionFilters(session.name, next)}
                       onClear={() => clearSessionFilters(session.name)}
                       callers={sessionCallers[session.name] ?? []}
-                      groups={sessionGroups[session.name] ?? []}
+                      callerRows={session.terminals.reduce((n, t) => n + (t.caller_id ? 1 : 0), 0)}
+                      dimensions={sessionLocalDimensions[session.name] ?? []}
+                      totalRows={session.terminals.length}
                       shown={visibleTerminals.length}
                       total={session.terminals.length}
                       counterVisible={counterVisible}
                       degraded={annotationsDegraded}
+                      idPrefix={`session-${session.name}`}
                     />
                     {visibleTerminals.length === 0 ? (
                       // Reachable only through the SESSION filters: the global

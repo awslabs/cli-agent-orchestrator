@@ -154,6 +154,35 @@ function visibleIds(cardName: string): string[] {
   return ALL_ROWS.map(t => t.id).filter(id => within(region).queryByText(id.slice(0, 8)) !== null)
 }
 
+// ── Chip-bar drivers ──────────────────────────────────────────────────────
+//
+// The bar shows only ACTIVE filters as chips; everything else is reached
+// through the "+ Filter" picker (or the chip, once active) and edited in the
+// chip's popover. These helpers walk that exact path: open the bar's picker,
+// choose the dimension by its label, land in its editor. The popovers are
+// portalled to document.body, so they are fetched by their testids rather
+// than through the card.
+function openGlobalEditor(dimensionLabel: string): HTMLElement {
+  fireEvent.click(screen.getByTestId('global-picker-button'))
+  const picker = screen.getByTestId('global-picker')
+  fireEvent.click(within(picker).getByText(dimensionLabel, { exact: true }))
+  return screen.getByTestId('global-editor')
+}
+
+function openSessionEditor(cardName: string, dimensionLabel: string): HTMLElement {
+  const card = sessionCard(cardName)
+  fireEvent.click(within(card).getByTestId(`session-${cardName}-picker-button`))
+  const picker = screen.getByTestId(`session-${cardName}-picker`)
+  fireEvent.click(within(picker).getByText(dimensionLabel, { exact: true }))
+  return screen.getByTestId(`session-${cardName}-editor`)
+}
+
+function openSessionAdvanced(cardName: string): HTMLElement {
+  const card = sessionCard(cardName)
+  fireEvent.click(within(card).getByTestId(`session-${cardName}-advanced-button`))
+  return screen.getByTestId(`session-${cardName}-advanced`)
+}
+
 beforeEach(() => {
   useStore.setState({ sessions: SESSION_LIST, terminalStatuses: {} })
   stubFetch()
@@ -171,6 +200,7 @@ describe('the collapsed predicates defect: one predicate at both gates', () => {
     // The row gate used to compare `t.agent_profile === filter` with no
     // fallback while the session gate folded to 'default' — the card stayed
     // and rendered zero rows. Both gates now call matchesFilters.
+    openGlobalEditor('Agent profile')
     fireEvent.click(screen.getByRole('button', { name: 'default' }))
     expect(cardPresent('cao-alpha')).toBe(true)
     expect(visibleIds('cao-alpha')).toEqual(['aa-0003'])
@@ -201,8 +231,9 @@ describe('STOPPED reaches the summary and the pills as itself', () => {
     expect(within(meta).getByText('Unknown')).toBeTruthy()
   })
 
-  it('filters the fleet to stopped rows from the Stopped pill', async () => {
+  it('filters the fleet to stopped rows from the Stopped option', async () => {
     await renderDashboard()
+    openGlobalEditor('Reachability')
     fireEvent.click(screen.getByRole('button', { name: 'Stopped' }))
     expect(visibleIds('cao-alpha')).toEqual(['aa-0004'])
     expect(cardPresent('cao-beta')).toBe(false)
@@ -210,6 +241,7 @@ describe('STOPPED reaches the summary and the pills as itself', () => {
 
   it('filters liveness on the row’s own word, separate from the folded chip', async () => {
     await renderDashboard()
+    openGlobalEditor('Liveness')
     fireEvent.click(screen.getByRole('button', { name: 'dead' }))
     expect(visibleIds('cao-alpha')).toEqual(['aa-0005'])
     expect(cardPresent('cao-beta')).toBe(false)
@@ -217,14 +249,16 @@ describe('STOPPED reaches the summary and the pills as itself', () => {
 })
 
 describe('reachability is multi-select: OR within, AND across', () => {
-  it('selecting two reachability pills shows the union', async () => {
+  it('selecting two reachability options shows the union', async () => {
     await renderDashboard()
+    openGlobalEditor('Reachability')
     fireEvent.click(screen.getByRole('button', { name: 'Managed Live' }))
     fireEvent.click(screen.getByRole('button', { name: 'Processing' }))
     expect(visibleIds('cao-alpha')).toEqual(['aa-0001', 'aa-0002'])
     // bb-0002 is itself a managed worker: OR within the dimension means both.
     expect(visibleIds('cao-beta')).toEqual(['bb-0001', 'bb-0002'])
     // AND across dimensions: adding the spec-writer profile leaves only bb-0001.
+    openGlobalEditor('Agent profile')
     fireEvent.click(screen.getByRole('button', { name: 'spec-writer' }))
     expect(cardPresent('cao-alpha')).toBe(false)
     expect(visibleIds('cao-beta')).toEqual(['bb-0001'])
@@ -232,46 +266,54 @@ describe('reachability is multi-select: OR within, AND across', () => {
 })
 
 describe('the derived dimensions appear where their shape puts them', () => {
-  it('offers fleet-wide pill facets in the global bar, with counts', async () => {
+  it('offers fleet-wide pill facets in the global picker, with counts', async () => {
     await renderDashboard()
-    const panel = document.getElementById('global-filter-panel')!
-    expect(within(panel).getByText('phase')).toBeTruthy()
-    expect(within(panel).getByText('attention')).toBeTruthy()
-    expect(within(panel).getByRole('button', { name: /^reported/ }).textContent).toContain('2')
+    fireEvent.click(screen.getByTestId('global-picker-button'))
+    const picker = screen.getByTestId('global-picker')
+    expect(within(picker).getByText('phase')).toBeTruthy()
+    expect(within(picker).getByText('attention')).toBeTruthy()
     // The 13-value task facet is NOT here — an unbounded pill wall is exactly
     // what the per-session bar exists to prevent.
-    expect(within(panel).queryByLabelText('task')).toBeNull()
+    expect(within(picker).queryByText('task')).toBeNull()
+
+    // The editor shows the value counts next to each option.
+    fireEvent.click(within(picker).getByText('phase', { exact: true }))
+    const editor = screen.getByTestId('global-editor')
+    expect(within(editor).getByRole('button', { name: /^reported/ }).textContent).toContain('2')
   })
 
   it('gates session visibility from a global facet selection', async () => {
     await renderDashboard()
-    const panel = document.getElementById('global-filter-panel')!
-    fireEvent.click(within(panel).getByRole('button', { name: /^reported/ }))
+    openGlobalEditor('phase')
+    fireEvent.click(screen.getByRole('button', { name: /^reported/ }))
     expect(visibleIds('cao-alpha')).toEqual(['aa-0001'])
     expect(visibleIds('cao-beta')).toEqual(['bb-0001'])
     expect(within(sessionCard('cao-alpha')).getByTestId('session-filter-count').textContent).toBe('1 of 5 shown')
   })
 
-  it('offers the typeahead, range, tri-state and text facets inside the session card', async () => {
+  it('offers the typeahead, range, tri-state and text facets in the session Advanced sheet', async () => {
     await renderDashboard()
-    const card = sessionCard('cao-alpha')
+    // The Advanced sheet is where the old always-on rows went: every derived
+    // dimension of the session, opt-in and dense.
+    const modal = openSessionAdvanced('cao-alpha')
     // The typeahead is a real select, labelled by its own facet name.
-    expect(within(card).getByLabelText('task')).toBeTruthy()
+    expect(within(modal).getByLabelText('task')).toBeTruthy()
     // The timestamp facet earned a range control.
-    expect(within(card).getByLabelText('parked at from')).toBeTruthy()
-    expect(within(card).getByLabelText('parked at to')).toBeTruthy()
+    expect(within(modal).getByLabelText('parked at from')).toBeTruthy()
+    expect(within(modal).getByLabelText('parked at to')).toBeTruthy()
     // The boolean facet earned a tri-state.
-    expect(within(card).getByRole('button', { name: 'true' })).toBeTruthy()
+    expect(within(modal).getByRole('button', { name: 'true' })).toBeTruthy()
     // The long branch value is substring-only, under its provenance heading.
-    expect(within(card).getByText('observed')).toBeTruthy()
-    expect(within(card).getByLabelText('branch contains')).toBeTruthy()
+    expect(within(modal).getByText('observed')).toBeTruthy()
+    expect(within(modal).getByLabelText('branch contains')).toBeTruthy()
   })
 
   it('narrows rows from a per-session facet and never removes the card', async () => {
     await renderDashboard()
-    const card = sessionCard('cao-alpha')
-    const select = within(card).getByLabelText('task')
-    fireEvent.change(select, { target: { value: 't-02' } })
+    // task is a 13-value typeahead: its editor narrows by typing first.
+    const editor = openSessionEditor('cao-alpha', 'task')
+    fireEvent.change(within(editor).getByLabelText('Find task value'), { target: { value: 't-02' } })
+    fireEvent.click(within(editor).getByRole('button', { name: /^t-02/ }))
     expect(cardPresent('cao-alpha')).toBe(true)
     expect(visibleIds('cao-alpha')).toEqual(['aa-0002'])
     // Other cards are untouched: the session bar is AND-ed inside its own card.
@@ -280,8 +322,8 @@ describe('the derived dimensions appear where their shape puts them', () => {
 
   it('filters a range facet between its bounds', async () => {
     await renderDashboard()
-    const card = sessionCard('cao-alpha')
-    fireEvent.change(within(card).getByLabelText('parked at from'), { target: { value: '2026-07-21T00:00' } })
+    const editor = openSessionEditor('cao-alpha', 'parked at')
+    fireEvent.change(within(editor).getByLabelText('parked at from'), { target: { value: '2026-07-21T00:00' } })
     // Only PAST_B (aa-0002) is past the bound; PAST_A (aa-0001) is before it.
     expect(visibleIds('cao-alpha')).toEqual(['aa-0002'])
   })
@@ -305,8 +347,8 @@ describe('the per-session zero-result state names its cause and recovers in one 
 describe('the summary chips keep counting ALL terminals while a filter runs', () => {
   it('diverges from the shown counter deliberately', async () => {
     await renderDashboard()
-    const panel = document.getElementById('global-filter-panel')!
-    fireEvent.click(within(panel).getByRole('button', { name: /^reported/ }))
+    openGlobalEditor('phase')
+    fireEvent.click(screen.getByRole('button', { name: /^reported/ }))
 
     const card = sessionCard('cao-alpha')
     // One row survives…
@@ -338,8 +380,8 @@ describe('free text is case-insensitive on both sides, end to end', () => {
 describe('spawned-by is a subtree question', () => {
   it('selecting the caller shows the row it spawned', async () => {
     await renderDashboard()
-    const card = sessionCard('cao-alpha')
-    fireEvent.click(within(card).getByRole('button', { name: /implementer · aa-0001/ }))
+    const editor = openSessionEditor('cao-alpha', 'Spawned by')
+    fireEvent.click(within(editor).getByRole('button', { name: /implementer · aa-0001/ }))
     expect(visibleIds('cao-alpha')).toEqual(['aa-0002'])
   })
 })
@@ -349,6 +391,7 @@ describe('the global empty state names the filters and offers the clear', () => 
     const twoSessions = SESSION_LIST.slice(0, 2)
     stubFetch(twoSessions)
     await renderDashboard(twoSessions)
+    openGlobalEditor('Reachability')
     fireEvent.click(screen.getByRole('button', { name: 'Error' }))
     expect(cardPresent('cao-alpha')).toBe(false)
     expect(screen.getByText('No sessions match the current filter.')).toBeTruthy()
@@ -361,25 +404,28 @@ describe('degraded coverage is named beside the controls that depend on it', () 
   it('shows the partial-data note when the envelope reports partial coverage', async () => {
     stubFetch(SESSION_LIST, payload(annotations(), { coverage: 'partial', sources_failed: 1 }))
     await renderDashboard()
-    const panel = document.getElementById('global-filter-panel')!
-    expect(within(panel).getByTestId('filter-coverage-note').textContent).toContain('partial')
+    const bar = screen.getByTestId('filter-bar')
+    expect(within(bar).getByTestId('filter-coverage-note').textContent).toContain('partial')
   })
 })
 
-describe('the collapsed bar still says how much is hidden behind it', () => {
-  it('counts constrained dimensions, not selected pills', async () => {
+describe('the bar itself is the summary of what is hidden', () => {
+  // The pre-chip bar had a collapsed "Filters · N active" toggle; the chip bar
+  // IS the summary — every active filter is a visible chip reading
+  // `Dimension: selection`, and recovery is the always-visible Clear all.
+  it('shows each active filter as a chip with its selection, and clears in one click', async () => {
     await renderDashboard()
+    openGlobalEditor('Reachability')
     fireEvent.click(screen.getByRole('button', { name: 'Managed Live' }))
     fireEvent.click(screen.getByRole('button', { name: 'Processing' }))
-    const toggle = screen.getByRole('button', { name: /Filters/ })
-    expect(toggle.textContent).toContain('1 active')
-    fireEvent.click(toggle) // collapse
-    expect(document.getElementById('global-filter-panel')).toBeNull()
-    expect(screen.getByRole('button', { name: /Filters/ }).textContent).toContain('1 active')
-    // The reachability row is NOT inside the collapsed region: it renders
-    // unconditionally, pinned by dashboardStatusOrderContract.test.tsx.
-    expect(screen.getByRole('button', { name: 'Any status' })).toBeTruthy()
-    // And Clear all survives the collapse, so recovery never needs the expand.
-    expect(screen.getByRole('button', { name: 'Clear all' })).toBeTruthy()
+
+    const bar = screen.getByTestId('filter-bar')
+    const chip = bar.querySelector('[data-testid="global-chip"][data-dimension="reachability"]')!
+    expect(chip.textContent).toContain('Managed Live')
+    expect(chip.textContent).toContain('Processing')
+
+    fireEvent.click(within(bar).getByRole('button', { name: 'Clear all' }))
+    expect(bar.querySelector('[data-testid="global-chip"]')).toBeNull()
+    expect(visibleIds('cao-alpha')).toEqual(ALPHA.map(t => t.id))
   })
 })

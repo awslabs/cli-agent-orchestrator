@@ -6,8 +6,8 @@ import {
   TERMINALS,
   TERMINALS_WITH_UNRENDERABLE,
   metadata,
+  openReachabilityEditor,
   renderDashboard,
-  statusFilterRow,
   stubDashboardFetch,
   summaryCounts,
   summaryTotal,
@@ -57,31 +57,37 @@ describe('DashboardHome status order (NOT_FIFO_MONITORED)', () => {
     expect(summaryTotal()).toBe(TERMINALS.length)
   })
 
-  it('offers a Managed Live status filter pill', async () => {
+  it('offers a Managed Live reachability option', async () => {
     await renderDashboard()
 
-    const pill = screen.getByRole('button', { name: 'Managed Live' })
-    expect(statusFilterRow().contains(pill)).toBe(true)
+    // The option lives in the chip's popover editor now; the container it is
+    // found in is the one the appearance suite pins to exactly STATUS_ORDER.
+    const options = openReachabilityEditor()
+    const option = screen.getByRole('button', { name: 'Managed Live' })
+    expect(options.contains(option)).toBe(true)
   })
 
-  it('filters the terminal list to managed native workers when the pill is selected', async () => {
+  it('filters the terminal list to managed native workers when the option is selected', async () => {
     await renderDashboard()
     expect(visibleTerminalIds()).toEqual(['nfm-0001', 'nfm-0002', 'idle-001'])
 
+    openReachabilityEditor()
     fireEvent.click(screen.getByRole('button', { name: 'Managed Live' }))
     expect(visibleTerminalIds()).toEqual(['nfm-0001', 'nfm-0002'])
 
-    // Selecting it again clears the filter rather than sticking.
+    // Selecting it again clears the filter rather than sticking — the editor
+    // stays open across toggles, so the second click lands on the same option.
     fireEvent.click(screen.getByRole('button', { name: 'Managed Live' }))
     expect(visibleTerminalIds()).toEqual(['nfm-0001', 'nfm-0002', 'idle-001'])
   })
 
-  it('gives the selected Managed Live pill a real background, not an undefined class', async () => {
+  it('gives the selected Managed Live option a real background, not an undefined class', async () => {
     await renderDashboard()
 
     // A STATUS_ORDER entry with no STATUS_ACTIVE_BG key still typechecks
     // (Record<string, string>, no noUncheckedIndexedAccess) and renders
-    // `class="... undefined"` — a selected pill with no selected appearance.
+    // `class="... undefined"` — a selected option with no selected appearance.
+    openReachabilityEditor()
     fireEvent.click(screen.getByRole('button', { name: 'Managed Live' }))
     expect(screen.getByRole('button', { name: 'Managed Live' }).className).not.toContain('undefined')
   })
@@ -89,6 +95,7 @@ describe('DashboardHome status order (NOT_FIFO_MONITORED)', () => {
   it('still filters an existing status, so the added entry did not disturb them', async () => {
     await renderDashboard()
 
+    openReachabilityEditor()
     fireEvent.click(screen.getByRole('button', { name: 'Idle' }))
     expect(visibleTerminalIds()).toEqual(['idle-001'])
     expect(screen.getByRole('button', { name: 'Idle' }).className).not.toContain('undefined')
@@ -138,10 +145,10 @@ describe('DashboardHome status summary totals (unrenderable statuses)', () => {
     // through to is worse than no count: it reads as a broken dashboard.
     expect(summaryCounts()['Unknown']).toBe(2)
 
-    const unknownPill = Array.from(statusFilterRow().querySelectorAll('button'))
+    const unknownOption = Array.from(openReachabilityEditor().querySelectorAll('button'))
       .find(b => (b.textContent || '').includes('Unknown'))
-    expect(unknownPill).toBeTruthy()
-    fireEvent.click(unknownPill!)
+    expect(unknownOption).toBeTruthy()
+    fireEvent.click(unknownOption!)
 
     // The session card survives the filter, and shows exactly the two rows the
     // Unknown chip was counting.
