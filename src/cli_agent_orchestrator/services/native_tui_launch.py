@@ -107,7 +107,10 @@ NATIVE_COLD_START_RUNWAY_SECONDS = 60.0
 #: bounded observation window, never a retry: a pane that never renders the
 #: header within the runway freezes rather than publishing an unproven
 #: attachment, and the freeze detail names the exact deadline it observed
-#: under.
+#: under.  The window is enforced against the monotonic deadline itself --
+#: a final poll that resumes late under scheduler or host load freezes
+#: rather than capturing past the bound; the overshoot is real time, not
+#: an epsilon the contract absorbs.
 KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS = NATIVE_COLD_START_RUNWAY_SECONDS
 KIMI_RENDER_CONVERGENCE_POLL_SECONDS = 0.1
 ENV_EXECUTABLE = os.path.realpath("/usr/bin/env")
@@ -707,6 +710,18 @@ def _await_kimi_rendered_session_proof(
     the header is awaited (which would prove the session off a stranger) all
     leave the attachment frozen rather than published.
 
+    The monotonic deadline is the authority on observation, not merely on
+    waiting.  A requested final sleep can resume *after* the deadline under
+    scheduler or host load -- real overshoot, not an epsilon -- and a capture
+    taken then would admit a header that painted out of bounds (the exact
+    shape of the COND-0314 follow-up counterexample).  Every capture after
+    the initial launch-time one is therefore taken only while
+    ``now <= deadline``; the boundary itself is still observed, so a header
+    visible exactly at the deadline is admitted, and a wake that resumes
+    past it freezes without reading the screen again.  This phase and the
+    v2 pane-ready watch are sequential and each may consume the shared
+    cold-start runway, but each is genuinely bounded by its own deadline.
+
     A successful match is fenced by a fresh observation too.  The header rows
     come from a capture taken *after* the observation that seeded this
     identity, so a same-pane process replacement in that window (a TUI
@@ -725,8 +740,31 @@ def _await_kimi_rendered_session_proof(
         observation["pid"],
         observation["start_marker"],
     )
+
+    def _never_rendered_in_bound() -> NoReturn:
+        """Freeze: the bound header was not observed inside the runway."""
+        _freeze(
+            provider=provider,
+            native_session_id=native_session_id,
+            reason=AMBIGUOUS_PANE_RENDER_MISMATCH,
+            detail=(
+                f"the pane did not render a native header proving session "
+                f"{native_session_id!r} within "
+                f"{KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS:g} seconds"
+            ),
+        )
+
     deadline = time.monotonic() + KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS
+    initial_capture = True
     while True:
+        # Enforce the deadline *before* reading the screen, on every capture
+        # after the initial one: a sleep that resumed late must not be
+        # followed by a capture whose header is then admitted.  The initial
+        # capture is exempt -- a launch always looks at the screen once
+        # immediately, even under a zero bound.
+        if not initial_capture and time.monotonic() > deadline:
+            _never_rendered_in_bound()
+        initial_capture = False
         try:
             rows = list(transport.capture_render(observation["pane_id"]))
         except Exception as exc:  # noqa: BLE001 - an unreadable render is never "no header"
@@ -768,18 +806,12 @@ def _await_kimi_rendered_session_proof(
                     ),
                 )
             return fenced, rows
+        # A capture that itself crossed the deadline settles the window: the
+        # header was not observed in bounds, so the wait ends here rather
+        # than sleeping into a capture the pre-capture check would refuse.
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            _freeze(
-                provider=provider,
-                native_session_id=native_session_id,
-                reason=AMBIGUOUS_PANE_RENDER_MISMATCH,
-                detail=(
-                    f"the pane did not render a native header proving session "
-                    f"{native_session_id!r} within "
-                    f"{KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS:g} seconds"
-                ),
-            )
+            _never_rendered_in_bound()
         time.sleep(min(KIMI_RENDER_CONVERGENCE_POLL_SECONDS, remaining))
         # Re-observe for continuity only: a changed pane_id/pid/start-marker
         # means the pane is no longer the admitted process, and proving the

@@ -122,16 +122,20 @@ class _FakeClock:
     The render-convergence loop derives its deadline from ``time.monotonic``
     and waits out each poll with ``time.sleep``; driving both from one fake
     makes deadline behaviour exact — no real sleeps, no wall-clock races.
+    ``overshoot`` models scheduler/host delay: every requested sleep resumes
+    that much *late*, so the deadline is tested against real oversleep
+    rather than an assumed epsilon.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, overshoot: float = 0.0) -> None:
         self.now = 1_000.0
+        self.overshoot = overshoot
 
     def monotonic(self) -> float:
         return self.now
 
     def sleep(self, seconds: float) -> None:
-        self.now += seconds
+        self.now += seconds + self.overshoot
 
 
 @pytest.fixture
@@ -148,17 +152,20 @@ class _SlowBootPane(FakePane):
     Models a cold/loaded Kimi boot: captures before ``render_at`` show a
     boot screen with no header, captures at or after it show the exact
     bound-session header.  Arrival time is a function of the launch's own
-    clock, so a test controls it to the poll.
+    clock, so a test controls it to the poll.  Capture times are recorded
+    so a test can prove no read ever happened past the deadline.
     """
 
     def __init__(self, clock: _FakeClock, *, render_at: float) -> None:
         super().__init__(observation=_observation(_REWRITTEN_ARGV))
         self._clock = clock
         self._render_at = render_at
+        self.capture_times: list[float] = []
 
     def capture_render(self, pane_id: str) -> list[str]:
         self.render_calls += 1
         self.render_targets.append(pane_id)
+        self.capture_times.append(self._clock.now)
         if self._clock.now < self._render_at:
             return ["│  Welcome to Kimi Code!  (booting)"]
         return _native_header_rows()
@@ -1285,10 +1292,13 @@ def test_a_slow_but_valid_exact_header_is_admitted_once_within_the_runway(
 def test_a_header_arriving_exactly_at_the_runway_boundary_is_admitted(
     isolated_memory_db: Any, pinned_binary: tuple[str, str], fake_clock: _FakeClock
 ) -> None:
-    """The boundary is inclusive: the deadline bounds waiting, not painting.
+    """The boundary is inclusive: the deadline bounds observation, not painting.
 
-    A capture happens before the remaining-time check, so a header visible
-    exactly when the runway is exhausted is still observed and admitted.
+    After the initial launch-time capture, a capture is taken only while the
+    monotonic clock has not passed the deadline, so a header visible exactly
+    when the runway is exhausted (``now == deadline``) is still observed and
+    admitted.  A wake that resumes *after* it is not observed at all — see
+    the oversleep cases below.
     """
     pane = _SlowBootPane(
         fake_clock,
@@ -1345,6 +1355,64 @@ def test_a_header_that_never_paints_freezes_at_the_exact_runway_deadline(
     assert "did not render" in caught.value.detail
     assert "within 60 seconds" in caught.value.detail
     _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH)
+
+
+def test_a_header_painted_after_the_deadline_freezes_when_the_final_sleep_overshoots(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    """The monotonic deadline — not the requested sleep — bounds observation.
+
+    The deterministic counterexample from review (probe output
+    ``ADMITTED_AFTER_DEADLINE capture=1060.2 deadline=1060.0 overrun=0.2``):
+    every requested sleep resumes 0.25 s late under scheduler/host load, the
+    header paints 0.05 s *after* the deadline, and the capture-before-check
+    loop admitted it from a capture taken 0.2 s out of bounds.  The overshoot
+    is real time, not an epsilon the contract absorbs.  After the initial
+    capture the loop must reject ``now > deadline`` before reading the
+    screen: no capture ever happens past the bound, and the launch freezes
+    with the exact deadline named.
+    """
+    clock = _FakeClock(overshoot=0.25)
+    monkeypatch.setattr(native_tui_launch.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(native_tui_launch.time, "sleep", clock.sleep)
+    deadline = clock.now + native_tui_launch.KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS
+    pane = _SlowBootPane(clock, render_at=deadline + 0.05)
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH
+    assert "did not render" in caught.value.detail
+    assert "within 60 seconds" in caught.value.detail
+    assert pane.capture_times, "the initial launch-time capture always happens"
+    assert max(pane.capture_times) <= deadline, "no capture may read the screen out of bounds"
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH)
+
+
+def test_a_header_visible_at_the_last_in_bound_capture_is_admitted_despite_oversleep(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    """Oversleep tightens the window; it never invents a freeze.
+
+    With the same 0.25 s late resumes, a header that *is* visible at the
+    last capture inside the bound is a legitimate slow boot and is admitted
+    exactly once: the deadline bounds observation, it does not make a
+    healthy slow pane less admissible.
+    """
+    clock = _FakeClock(overshoot=0.25)
+    monkeypatch.setattr(native_tui_launch.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(native_tui_launch.time, "sleep", clock.sleep)
+    deadline = clock.now + native_tui_launch.KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS
+    # Visible at the last in-bound capture, before the overslept wake that
+    # resumes past the deadline.
+    pane = _SlowBootPane(clock, render_at=deadline - 0.2)
+
+    result = _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert len(pane.created) == 1, "one launch, never a retry"
+    assert pane.capture_times and max(pane.capture_times) <= deadline
+    assert native_attachment.get(PROVIDER, SESSION)["state"] == native_attachment.ATTACHED
 
 
 def test_other_providers_never_consult_the_kimi_render_runway(
