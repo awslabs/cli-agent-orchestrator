@@ -1,17 +1,22 @@
-"""Exact Kimi Code 0.29.1 support, retained alongside 0.29.0 under the 0.29.2 pin.
+"""Exact Kimi Code version support under the current pin (cond-0310: 0.31.0).
 
-0.29.1 was added as a *separate proven build*, not a range widening, and
-stays admitted after the current pin moved to 0.29.2: already-minted
-0.29.1/0.29.0 sessions must keep validating.  This suite pins the three
+Each accepted build was added as a *separate proven build*, never a range
+widening, and stays admitted as the current pin moves forward: already-minted
+sessions under older builds must keep validating.  This suite pins the three
 properties that support turns on:
 
-1.  every version gate (contract, route, bridge) accepts 0.29.2, 0.29.1,
-    and 0.29.0, and rejects everything else — an exact set, never a range;
+1.  every version gate (contract, route, bridge) accepts 0.31.0, 0.30.0,
+    0.29.2, 0.29.1, and 0.29.0, and rejects everything else — an exact set,
+    never a range;
 2.  a multi-line message on any accepted session is deliverable, because
     the composer-newline table carries a separate proven entry per build
     whose keystroke plans are byte-identical; and
 3.  a receipt records the *actual* installed version, so a 0.29.1 binary
-    is never described by a 0.29.0 or 0.29.2 constant (or the reverse).
+    is never described by a 0.29.0, 0.30.0, or 0.31.0 constant (or the reverse).
+
+This exact ACCEPTED tuple is the cross-repo parity contract: it must equal
+the conductor's capability.accepted_versions("kimi_cli"), and each side's
+suite pins it so a future drift fails its own run.
 """
 
 from __future__ import annotations
@@ -27,15 +32,16 @@ from cli_agent_orchestrator.services import kimi_native_control as knc
 from cli_agent_orchestrator.services import kimi_route
 from cli_agent_orchestrator.services import provider_contracts as pc
 
-CURRENT = "0.30.0"
+CURRENT = "0.31.0"
+PIN_0300 = "0.30.0"
 PIN_0292 = "0.29.2"
 RETAINED = "0.29.1"
 OLDEST = "0.29.0"
-ACCEPTED = (CURRENT, PIN_0292, RETAINED, OLDEST)
+ACCEPTED = (CURRENT, PIN_0300, PIN_0292, RETAINED, OLDEST)
 
 
 # --------------------------------------------------------------------
-# The version gates accept exactly {0.30.0, 0.29.2, 0.29.1, 0.29.0}
+# The version gates accept exactly {0.31.0, 0.30.0, 0.29.2, 0.29.1, 0.29.0}
 # --------------------------------------------------------------------
 
 
@@ -53,7 +59,7 @@ def test_check_pinned_version_accepts_every_accepted_build(banner):
     pc.check_pinned_version("kimi", banner)
 
 
-@pytest.mark.parametrize("bad", ["0.29.3", "0.28.9", "0.30.1", "1.0.0", "kimi", ""])
+@pytest.mark.parametrize("bad", ["0.29.3", "0.28.9", "0.30.1", "0.31.1", "1.0.0", "kimi", ""])
 def test_check_pinned_version_rejects_everything_outside_the_set(bad):
     with pytest.raises(pc.ProviderVersionDrift):
         pc.check_pinned_version("kimi", bad)
@@ -74,12 +80,24 @@ def test_the_composer_newline_table_keeps_the_separate_proven_0291_entry():
 
 
 def test_the_composer_newline_table_keeps_the_separate_proven_0300_entry():
-    entry = knc._PROVEN_COMPOSER_NEWLINE.get(CURRENT)
+    entry = knc._PROVEN_COMPOSER_NEWLINE.get(PIN_0300)
     assert entry is not None, "0.30.0 must be a separate keyed entry, never a range"
     # The same composer facts as the 0.29.x line, read from the installed bundle.
     assert entry["keystroke"] == knc._PROVEN_COMPOSER_NEWLINE[OLDEST]["keystroke"]
     assert entry["normalization"] == knc.NORMALIZATION_JOIN_LF_THEN_TRIM
     assert "49ad0553cff0b5f60f83ba85df56bb5ccdbcb908158c80d9363d0e5a529ea51c" in entry["evidence"]
+
+
+def test_the_composer_newline_table_keeps_the_separate_proven_0310_entry():
+    entry = knc._PROVEN_COMPOSER_NEWLINE.get(CURRENT)
+    assert entry is not None, "0.31.0 must be a separate keyed entry, never a range"
+    # cond-0310: the installed 0.31.0 bundle declares the same composer facts as
+    # the 0.29.x/0.30.0 line (newLine ['shift+enter','ctrl+j'], submit 'enter',
+    # expandPasteMarkers(lines.join("\n")).trim(), PASTE_ENTER_SUPPRESS_WINDOW_MS
+    # = 120) — read directly from dist/main.mjs, never copied without comparison.
+    assert entry["keystroke"] == knc._PROVEN_COMPOSER_NEWLINE[OLDEST]["keystroke"]
+    assert entry["normalization"] == knc.NORMALIZATION_JOIN_LF_THEN_TRIM
+    assert "689fc2a123dfc3145dab26a8e6a86c71a5dc8552b13fe0449679e065ce96774e" in entry["evidence"]
 
 
 @pytest.mark.parametrize("version", ACCEPTED)

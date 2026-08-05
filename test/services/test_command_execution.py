@@ -72,9 +72,12 @@ class TestExecutionPins:
         assert pin is not None and pin.rule == "codex-compaction-signal" and pin.styled
 
     def test_unpinned_builds_have_no_execution_pin(self):
-        # Same honesty as the emptiness pins: no live evidence, no pin.
-        assert npi.command_execution_pin_for("kimi_cli", "0.29.0") is None
-        assert npi.command_execution_pin_for("kimi_cli", "0.29.1") is None
+        # Same honesty as the emptiness pins: no live evidence, no pin. The
+        # text-proven 0.30.0 and 0.31.0 builds (cond-0310) are still unpinned
+        # here — /compact execution-evidence authority is live-verified on
+        # 0.29.2 only and is never inherited by version-set membership.
+        for build in ("0.29.0", "0.29.1", "0.30.0", "0.31.0"):
+            assert npi.command_execution_pin_for("kimi_cli", build) is None, build
         assert npi.command_execution_pin_for("claude_code", "2.1.218") is None
         assert npi.command_execution_pin_for("codex", "0.145.0") is None
         assert npi.command_execution_pin_for(None, "0.29.2") is None

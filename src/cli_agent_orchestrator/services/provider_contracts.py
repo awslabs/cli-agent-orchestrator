@@ -52,24 +52,35 @@ PROVIDER_CLAUDE_CODE = "claude_code"
 #: authority; this map is the representative head of each accepted tuple.
 PINNED_VERSIONS = {
     PROVIDER_CODEX: "0.146.0",
-    PROVIDER_KIMI: "0.30.0",
+    PROVIDER_KIMI: "0.31.0",
     PROVIDER_CLAUDE: "2.1.220",
 }
 
 #: Every exact version accepted for a provider, current first.  A tuple of
 #: exact strings, never a range: which builds are proven is a fact about
 #: each specific build, and a range would silently assert something about
-#: builds nobody has read.  Kimi accepts ``0.30.0`` (cond-0198: the
-#: operator's binary auto-updated; the installed 0.30.0 bundle's composer,
-#: paste-burst, and steer-chord facts read byte-identical to the 0.29.x
-#: line, with the text/control path live-proven on the real build) and
-#: retains ``0.29.2``, ``0.29.1``, and ``0.29.0`` so sessions minted under
-#: them still validate (installed 0.29.2 bundle ``main.mjs`` sha256
-#: 2ee6e2f15d68bffdce532d1c8e50f8d40e0230090b3a0dd1dbcdb7c29bf532db,
+#: builds nobody has read.  Kimi accepts ``0.31.0`` (cond-0310: the
+#: operator's binary auto-updated again; the installed 0.31.0 bundle
+#: ``main.mjs`` sha256
+#: 689fc2a123dfc3145dab26a8e6a86c71a5dc8552b13fe0449679e065ce96774e
+#: declares the composer-newline/submit, paste-burst, and steer-chord facts
+#: byte-identical to the 0.29.x/0.30.0 line — ``tui.input.newLine``
+#: ``['shift+enter','ctrl+j']`` with ``tui.input.submit`` ``'enter'``,
+#: ``submitValue()`` computes ``expandPasteMarkers(lines.join('\\n')).trim()``,
+#: ``PASTE_ENTER_SUPPRESS_WINDOW_MS = 120``, and ``Key.ctrl("s")`` for steer),
+#: so its bundle-read tier is proven; live text/control EFFECT on the real
+#: build remains a separate post-review acceptance gate), accepts ``0.30.0``
+#: (cond-0198: the operator's binary auto-updated; the installed 0.30.0
+#: bundle's composer, paste-burst, and steer-chord facts read byte-identical
+#: to the 0.29.x line, with the text/control path live-proven on the real
+#: build) and retains ``0.29.2``, ``0.29.1``, and ``0.29.0`` so sessions
+#: minted under them still validate (installed 0.29.2 bundle ``main.mjs``
+#: sha256 2ee6e2f15d68bffdce532d1c8e50f8d40e0230090b3a0dd1dbcdb7c29bf532db,
 #: matching the npm-published digest; the three-way 0.29.0/0.29.1/0.29.2
 #: bundle comparison proved the composer, paste-burst, and steer-chord
 #: facts byte-identical).  Image delivery authority stays pinned to
-#: ``0.29.2`` alone — no image block is advertised for ``0.30.0``.
+#: ``0.29.2`` alone — no image block is advertised for ``0.30.0`` or
+#: ``0.31.0``.
 #:
 #: Claude accepts only ``2.1.220``, the stage-verified installed build
 #: (``versions/2.1.220`` sha256
@@ -86,7 +97,7 @@ PINNED_VERSIONS = {
 #: observed differences are property ordering or additive optional fields.
 SUPPORTED_VERSIONS: dict[str, tuple[str, ...]] = {
     PROVIDER_CODEX: ("0.146.0",),
-    PROVIDER_KIMI: ("0.30.0", "0.29.2", "0.29.1", "0.29.0"),
+    PROVIDER_KIMI: ("0.31.0", "0.30.0", "0.29.2", "0.29.1", "0.29.0"),
     PROVIDER_CLAUDE: ("2.1.220",),
 }
 # The current pin must always be an accepted version — asserted here so the
