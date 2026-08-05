@@ -381,6 +381,7 @@ class TestCreateTerminal:
         mock_tmux.create_window.assert_called_once()
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
@@ -393,6 +394,7 @@ class TestCreateTerminal:
         mock_gen_session,
         mock_gen_window,
         mock_tmux,
+        mock_db_delete,
     ):
         """Test creating terminal when session not found."""
         mock_gen_id.return_value = "test1234"
@@ -405,6 +407,7 @@ class TestCreateTerminal:
             await create_terminal("kiro_cli", "developer", session_name="cao-nonexistent")
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
@@ -417,6 +420,7 @@ class TestCreateTerminal:
         mock_gen_session,
         mock_gen_window,
         mock_tmux,
+        mock_db_delete,
     ):
         """Test creating terminal when session already exists."""
         mock_gen_id.return_value = "test1234"
@@ -1189,12 +1193,23 @@ class TestGetWorkingDirectory:
 class TestSendInput:
     """Tests for send_input function."""
 
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_send_input_success(self, mock_get_metadata, mock_tmux, mock_pm, mock_update):
+    def test_send_input_success(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        mock_status_monitor,
+        mock_memory_service,
+    ):
         """Test sending input successfully."""
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
@@ -1216,6 +1231,7 @@ class TestSendInput:
         )
         mock_update.assert_called_once_with("test1234")
 
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -1228,6 +1244,7 @@ class TestSendInput:
         mock_pm,
         mock_update,
         mock_status_monitor,
+        mock_memory_service,
     ):
         """send_input clears the byte buffer AFTER arming the sticky latch.
 
@@ -1243,6 +1260,7 @@ class TestSendInput:
         placeholders from the pre-task buffer combining with input_received=
         True to trigger a false COMPLETED (the handoff-worker-killed-in-8s bug).
         """
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
@@ -1328,6 +1346,7 @@ class TestSendInput:
         mock_tmux.send_keys.assert_not_called()
         mock_update.assert_not_called()
 
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -1340,8 +1359,10 @@ class TestSendInput:
         mock_pm,
         mock_update,
         mock_status_monitor,
+        mock_memory_service,
     ):
         """Manual input can still answer clarify/approval prompts."""
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
