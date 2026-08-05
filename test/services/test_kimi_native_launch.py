@@ -109,3 +109,159 @@ class TestResumesExactly:
 
     def test_the_short_form_is_recognized_when_auditing_a_foreign_argv(self):
         assert knl.resumes_exactly(["kimi", "-S", SESSION], SESSION) is True
+
+
+# ---------------------------------------------------------------------------
+# Rendered native-header exact-session proof (COND-0312)
+#
+# Kimi Code 0.31.0 rewrites its process title to ``kimi-code`` after parsing,
+# so the resumed ``--session <id>`` is no longer observable in the kernel
+# argv (Darwin ``KERN_PROCARGS2`` returns the rewritten title).  The TUI
+# instead renders a strict native header whose ``Session:`` line names the
+# session it is running.  These tests pin the parser that turns that header
+# into an exact-session proof, and the version gate that makes the proof
+# fail closed for any build whose title-rewrite + header behaviour was not
+# read.
+# ---------------------------------------------------------------------------
+
+PINNED_0310 = "0.31.0"
+DIRECTORY = "/Users/colin/Projects/cao/worktree"
+
+
+def _header_rows(
+    *,
+    session: str = SESSION,
+    directory: str = DIRECTORY,
+    version: str = PINNED_0310,
+    model: str = "K3",
+) -> list[str]:
+    """The Kimi native header, framed the way ``capture-pane`` renders it.
+
+    The label rows sit inside the rounded box's ``│`` verticals exactly as
+    the live 0.31.0 pane paints them, so the parser must tolerate that
+    chrome rather than be handed pre-stripped text.
+    """
+    return [
+        "│  Welcome to Kimi Code!                                                                              │",
+        "│  Send /help for help information.                                                                   │",
+        f"│  Directory: {directory}                                                                              │",
+        f"│  Session:   {session}                                                                                │",
+        f"│  Model:     {model}                                                                                  │",
+        f"│  Version:   {version}                                                                                │",
+    ]
+
+
+class TestRenderedSessionProofGate:
+    def test_the_live_verified_0310_build_has_a_rendered_session_proof(self):
+        proof = knl.rendered_session_proof_for(PINNED_0310)
+        assert proof is not None
+        assert proof.rule == "kimi-native-header-v1"
+        # The evidence must name the build's bytes and the rewrite it proves.
+        assert "689fc2a123dfc3145dab26a8e6a86c71a5dc8552b13fe0449679e065ce96774e" in proof.evidence
+        assert "kimi-code" in proof.evidence
+
+    @pytest.mark.parametrize(
+        "version", ["0.30.0", "0.29.2", "0.29.1", "0.29.0", "0.31.1", "0.32.0", ""]
+    )
+    def test_every_other_build_is_unproven_and_must_fail_closed(self, version):
+        """Only a build whose title-rewrite + header were read earns the
+        rendered proof.  Everything else is None so the launch keeps using
+        the argv proof (or freezes, if that build also rewrote its title)."""
+        assert knl.rendered_session_proof_for(version) is None
+
+
+class TestParsesRenderedSession:
+    def test_the_live_0310_header_proves_the_exact_session(self):
+        assert (
+            knl.renders_session_exactly(_header_rows(), SESSION, provider_version=PINNED_0310)
+            is True
+        )
+
+    def test_a_wrong_session_is_not_proven(self):
+        assert (
+            knl.renders_session_exactly(
+                _header_rows(session="session_deadbeef"), SESSION, provider_version=PINNED_0310
+            )
+            is False
+        )
+
+    def test_an_unproven_build_is_not_proven_even_with_a_perfect_header(self):
+        # A header shaped like 0.31.0's must not prove anything for a build
+        # whose behaviour was never read -- this is the negative that keeps
+        # an unknown future build from inheriting the proof by accident.
+        assert (
+            knl.renders_session_exactly(_header_rows(), SESSION, provider_version="0.30.0") is False
+        )
+
+    def test_the_rendered_version_must_equal_the_proven_build(self):
+        # The header is the TUI's own statement of which version is running;
+        # a mismatch with the proven build is unproven rather than coerced.
+        assert (
+            knl.renders_session_exactly(
+                _header_rows(version="0.30.0"), SESSION, provider_version=PINNED_0310
+            )
+            is False
+        )
+
+
+class TestRenderedSessionParserIsStrict:
+    """Every "unproven" answer below is a freeze, never a pass."""
+
+    def test_no_header_at_all_is_unproven(self):
+        # A pane that has not rendered yet -- a cold boot, or a pane running
+        # something else entirely -- proves nothing.
+        assert knl.parse_native_header(["", "auto  K3 thinking: max"]) is None
+
+    def test_a_missing_session_label_is_unproven(self):
+        rows = [r for r in _header_rows() if "Session:" not in r]
+        assert knl.parse_native_header(rows) is None
+
+    def test_a_duplicated_session_label_is_unproven(self):
+        """Two Session lines means which one is real is unknowable from here."""
+        rows = _header_rows() + [
+            f"│  Session:   session_other                                            │"
+        ]
+        assert knl.parse_native_header(rows) is None
+
+    def test_a_duplicated_version_label_is_unproven(self):
+        rows = _header_rows() + [
+            f"│  Version:   0.30.0                                                   │"
+        ]
+        assert knl.parse_native_header(rows) is None
+
+    def test_a_missing_directory_label_is_unproven(self):
+        rows = [r for r in _header_rows() if "Directory:" not in r]
+        assert knl.parse_native_header(rows) is None
+
+    def test_an_empty_session_value_is_unproven(self):
+        # The picker hazard, rendered: a Session line with no id.
+        rows = [r for r in _header_rows() if "Session:" not in r]
+        rows.append("│  Session:                                                            │")
+        assert knl.parse_native_header(rows) is None
+
+    def test_a_header_scattered_among_other_rendering_is_still_parsed(self):
+        # The header is not the only thing on screen; a transcript or status
+        # bar around it must not defeat the parse, and must not supply a
+        # second stray Session line either.
+        rows = [
+            "auto  K3 thinking: max  .../worktree  review/branch   /model: switch model",
+            *_header_rows(),
+            " >",
+            "context: 0% (0/1M)",
+        ]
+        parsed = knl.parse_native_header(rows)
+        assert parsed is not None
+        assert parsed["session"] == SESSION
+        assert parsed["version"] == PINNED_0310
+        assert parsed["directory"] == DIRECTORY
+        assert parsed["model"] == "K3"
+
+    def test_a_stray_session_substring_outside_a_label_is_not_a_match(self):
+        # The session id can appear in a transcript echo; only a labelled
+        # ``Session:`` line is the header's own statement.
+        rows = [
+            f"resuming {SESSION}...",
+            *_header_rows(),
+        ]
+        parsed = knl.parse_native_header(rows)
+        assert parsed is not None and parsed["session"] == SESSION

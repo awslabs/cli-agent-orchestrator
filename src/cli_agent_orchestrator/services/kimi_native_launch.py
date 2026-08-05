@@ -21,6 +21,7 @@ cannot be word-split or globbed on its way to the process either.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Optional, Sequence
 
 #: The pinned resume option.  The long form is used deliberately: ``-S``
@@ -113,3 +114,183 @@ def resumes_exactly(argv: Sequence[str], session_id: str) -> bool:
     if position + 1 >= len(argv):
         return False
     return argv[position + 1] == session_id
+
+
+# ---------------------------------------------------------------------------
+# Rendered native-header exact-session proof (COND-0312)
+#
+# Kimi Code 0.31.0 rewrites ``process.title`` to ``kimi-code`` *after* parsing
+# its argv.  On Darwin that overwrite lands in the same buffer
+# ``KERN_PROCARGS2`` exposes, so the pane observer reads back an argv of
+# ``['kimi-code', '', '', ...]`` -- the resumed ``--session <id>`` is gone, and
+# :func:`resumes_exactly` necessarily returns ``False`` on it.  That is the
+# exact live defect that grounded p1-closure: a launch whose pane was running
+# the right session, proved only by an argv the build had just erased.
+#
+# The TUI renders a strict native boot header instead, and the session it is
+# running is named on its ``Session:`` line.  The functions below turn that
+# header into an exact-session proof that is independent of the (now-unreadable)
+# argv but tied to the admitted pane: the capture is read from the same pane the
+# observer proved the pid/start-marker of, so a header that names the bound
+# session is the admitted process's own statement of which session it holds.
+#
+# The proof is fail-closed and per-build.  A build appears in
+# :data:`_RENDERED_SESSION_PROVEN_BUILDS` only when its title-rewrite and its
+# header layout were both read, so an unknown future build that also rewrites
+# its title cannot inherit the proof by accident: it freezes, and earns the
+# proof only when somebody reads it.  Same discipline as the composer/execution
+# pins -- a separate proven build, never a range widening.
+# ---------------------------------------------------------------------------
+
+#: The rule name recorded on a rendered-header session proof.
+RULE_KIMI_NATIVE_HEADER = "kimi-native-header-v1"
+
+#: The four labels of the Kimi native boot header, read from the installed
+#: 0.31.0 pane.  Each must appear exactly once with a non-empty value for the
+#: header to be the proof -- a label that is missing, empty, or duplicated is
+#: not the header this proof was read against, and "unproven" here is a freeze.
+_NATIVE_HEADER_LABELS = ("Directory", "Session", "Model", "Version")
+
+#: Box-drawing verticals that frame each header row when the pane is captured
+#: without escape sequences.  Stripped from a row's ends before it is matched
+#: as a label line, so the proof reads the header the renderer painted rather
+#: than its chrome.  Deliberately only the verticals: the label text and its
+#: value are the cells that carry meaning, and stripping more would risk
+#: eating a value that begins or ends with a box glyph.
+_NATIVE_HEADER_FRAME_CHARS = "│┃║"
+
+_HEADER_LABEL_RE = re.compile(
+    r"\A\s*(?P<label>Directory|Session|Model|Version)\s*:\s*(?P<value>.*?)\s*\Z"
+)
+
+
+@dataclass(frozen=True)
+class RenderedSessionProof:
+    """How one Kimi build's rendered native header proves its session.
+
+    ``evidence`` records what was read for this build (the bundle digest and
+    the title-rewrite fact), so review can check it without re-walking the
+    tree.  A build is absent from the table unless both its rewrite and its
+    header layout were read.
+    """
+
+    provider: str
+    rule: str
+    evidence: str
+
+
+_KIMI_0310_RENDERED_EVIDENCE = (
+    "live-verified on the installed Kimi Code 0.31.0 (COND-0312, 2026-08-05, "
+    "run cond-0303-pr74-review-k3-r2 / pane %47): the build rewrites "
+    "process.title to 'kimi-code' after parsing its argv, so Darwin "
+    "KERN_PROCARGS2 returns ['kimi-code','','','',...] and the resumed "
+    "--session <id> is no longer observable in the kernel argv. The TUI "
+    "instead renders a strict native boot header -- exactly one each of "
+    "Directory, Session, Model, and Version label lines, framed by box "
+    "verticals -- and the Session line names the session the pane is "
+    "running. Installed bundle dist/main.mjs sha256 "
+    "689fc2a123dfc3145dab26a8e6a86c71a5dc8552b13fe0449679e065ce96774e."
+)
+
+#: Per-build rendered-header session proofs.  A build is present only when its
+#: post-parse process-title rewrite *and* its native header layout were both
+#: read, so the proof never silently applies to a build nobody has examined.
+#: 0.29.x/0.30.0 are deliberately absent: they preserve the resumed argv (the
+#: title rewrite is new in 0.31.0), so they keep proving from the argv and the
+#: rendered proof is not claimed for them.  Adding a build here never widens a
+#: range -- it is a separate keyed entry, read against its own bytes.
+_RENDERED_SESSION_PROVEN_BUILDS: dict[str, RenderedSessionProof] = {
+    "0.31.0": RenderedSessionProof(
+        provider="kimi_cli",
+        rule=RULE_KIMI_NATIVE_HEADER,
+        evidence=_KIMI_0310_RENDERED_EVIDENCE,
+    ),
+}
+
+
+def rendered_session_proof_for(provider_version: Optional[str]) -> Optional[RenderedSessionProof]:
+    """The rendered-header proof for this exact build, or ``None``.
+
+    ``None`` means "this build's title-rewrite and header layout were not
+    read", and a caller that needs the proof must fail closed rather than
+    guess at a header it has never seen.  The version is normalized the way
+    the rest of the per-build tables normalize theirs, so a bare ``0.31.0``
+    and a banner ``kimi 0.31.0`` name the same build.
+    """
+    if not isinstance(provider_version, str) or not provider_version.strip():
+        return None
+    from cli_agent_orchestrator.services import provider_contracts
+
+    return _RENDERED_SESSION_PROVEN_BUILDS.get(
+        provider_contracts.normalized_version(provider_version)
+    )
+
+
+def parse_native_header(rows: object) -> Optional[dict[str, str]]:
+    """The Kimi native header as one value per label, or ``None`` when unproven.
+
+    Strict by design: every ``None`` is a freeze, never a pass.  Requires each
+    of ``Directory``, ``Session``, ``Model``, and ``Version`` to appear exactly
+    once as a ``Label: value`` line (after the box verticals are stripped) with
+    a non-empty value.  Absence, duplication, or emptiness of any label is
+    ``None`` -- a header missing its ``Session`` line is the picker hazard
+    rendered, and a header with two ``Session`` lines is a session that cannot
+    be picked out from here.
+
+    Non-label rows are ignored, so a header scattered among a status bar or a
+    transcript still parses -- but a *second* labelled line of any kind is a
+    duplication, so a stray ``Session:`` in surrounding rendering fails closed
+    rather than silently picking one.
+    """
+    if not isinstance(rows, (list, tuple)):
+        return None
+    values: dict[str, str] = {}
+    for raw in rows:
+        if not isinstance(raw, str):
+            return None
+        match = _HEADER_LABEL_RE.match(raw.strip(_NATIVE_HEADER_FRAME_CHARS).strip())
+        if match is None:
+            continue
+        label = match.group("label").lower()
+        value = match.group("value").strip()
+        if label in values:
+            return None
+        values[label] = value
+    for label in _NATIVE_HEADER_LABELS:
+        if not values.get(label.lower()):
+            return None
+    return dict(values)
+
+
+def renders_session_exactly(
+    rows: object, session_id: str, *, provider_version: Optional[str]
+) -> bool:
+    """True when the rendered native header proves exactly ``session_id``.
+
+    Three independent conditions, all required, all fail-closed:
+
+    * the build is one whose title-rewrite and header were read
+      (:func:`rendered_session_proof_for` is not ``None``) -- so an unknown
+      build cannot inherit the proof;
+    * the header parses to exactly one of each label
+      (:func:`parse_native_header` is not ``None``) -- so a missing,
+      empty, or duplicated session line proves nothing;
+    * the header's ``Session`` value is exactly ``session_id`` and its
+      ``Version`` value is exactly the proven build -- so a pane rendering a
+      different session, or a different version, is not the one claimed.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return False
+    if not isinstance(provider_version, str) or not provider_version.strip():
+        return False
+    proof = rendered_session_proof_for(provider_version)
+    if proof is None:
+        return False
+    parsed = parse_native_header(rows)
+    if parsed is None:
+        return False
+    from cli_agent_orchestrator.services import provider_contracts
+
+    return parsed["session"] == session_id and parsed[
+        "version"
+    ] == provider_contracts.normalized_version(provider_version)
