@@ -20,6 +20,7 @@ The provider detects the following terminal states:
 import logging
 import re
 import shlex
+import time
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -415,6 +416,7 @@ class KiroCliProvider(BaseProvider):
         init_timeout = float(get_server_settings()["provider_init_timeout"])
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+        start = time.monotonic()
         ready = await wait_until_status(
             self.terminal_id,
             {
@@ -435,12 +437,19 @@ class KiroCliProvider(BaseProvider):
             "with 'Yes, I accept' (session-scoped)"
         )
         backend = get_backend()
+        # Arm the PROCESSING latch before the keystrokes, like every other
+        # send_special_key path, so answering the dialog isn't blocked by the
+        # WAITING_USER_ANSWER we just observed.
+        status_monitor.notify_input_sent(self.terminal_id)
         backend.send_special_key(self.session_name, self.window_name, "Down")
         backend.send_special_key(self.session_name, self.window_name, "Enter")
+        # Bound the post-accept wait by the time already spent, so total startup
+        # stays within provider_init_timeout rather than up to 2x it.
+        remaining = max(0.0, init_timeout - (time.monotonic() - start))
         return await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=init_timeout,
+            timeout=remaining,
         )
 
     def get_status(self, output: str) -> TerminalStatus:

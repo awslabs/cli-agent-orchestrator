@@ -307,6 +307,8 @@ class TestKiroCliProviderInitialization:
         # "Yes, I accept" = one Down then Enter (two special keys total).
         special_keys = [c.args[2] for c in mock_tmux.return_value.send_special_key.call_args_list]
         assert special_keys == ["Down", "Enter"]
+        # The PROCESSING latch must be armed before answering the dialog.
+        mock_status_monitor.notify_input_sent.assert_called_with("test1234")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
