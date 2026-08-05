@@ -116,6 +116,61 @@ class SequencedPane(FakePane):
         return self.observations[index]
 
 
+class _FakeClock:
+    """A monotonic clock that advances only when the code under test sleeps.
+
+    The render-convergence loop derives its deadline from ``time.monotonic``
+    and waits out each poll with ``time.sleep``; driving both from one fake
+    makes deadline behaviour exact — no real sleeps, no wall-clock races.
+    ``overshoot`` models scheduler/host delay: every requested sleep resumes
+    that much *late*, so the deadline is tested against real oversleep
+    rather than an assumed epsilon.
+    """
+
+    def __init__(self, *, overshoot: float = 0.0) -> None:
+        self.now = 1_000.0
+        self.overshoot = overshoot
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds + self.overshoot
+
+
+@pytest.fixture
+def fake_clock(monkeypatch: Any) -> _FakeClock:
+    clock = _FakeClock()
+    monkeypatch.setattr(native_tui_launch.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(native_tui_launch.time, "sleep", clock.sleep)
+    return clock
+
+
+class _SlowBootPane(FakePane):
+    """A rewritten-title pane whose header paints at a set fake-clock time.
+
+    Models a cold/loaded Kimi boot: captures before ``render_at`` show a
+    boot screen with no header, captures at or after it show the exact
+    bound-session header.  Arrival time is a function of the launch's own
+    clock, so a test controls it to the poll.  Capture times are recorded
+    so a test can prove no read ever happened past the deadline.
+    """
+
+    def __init__(self, clock: _FakeClock, *, render_at: float) -> None:
+        super().__init__(observation=_observation(_REWRITTEN_ARGV))
+        self._clock = clock
+        self._render_at = render_at
+        self.capture_times: list[float] = []
+
+    def capture_render(self, pane_id: str) -> list[str]:
+        self.render_calls += 1
+        self.render_targets.append(pane_id)
+        self.capture_times.append(self._clock.now)
+        if self._clock.now < self._render_at:
+            return ["│  Welcome to Kimi Code!  (booting)"]
+        return _native_header_rows()
+
+
 def _canonical_workdir() -> str:
     """A real, existing, canonical directory the launcher will accept.
 
@@ -924,9 +979,14 @@ def test_a_kimi_0310_pane_that_rewrote_its_title_attaches_via_the_rendered_heade
 
 
 def test_a_rewritten_title_pane_with_a_wrong_rendered_session_freezes(
-    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], fake_clock: _FakeClock
 ) -> None:
-    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
+    """A header naming another session is observed for the whole runway.
+
+    A wrong session is not "no header": the loop keeps watching in case the
+    bound header still paints, and only the deadline ends the wait.  Frozen
+    with the exact runway named, never published.
+    """
     pane = FakePane(
         observation=_observation(_REWRITTEN_ARGV),
         rendered=_native_header_rows(session="session_someone_else"),
@@ -936,14 +996,14 @@ def test_a_rewritten_title_pane_with_a_wrong_rendered_session_freezes(
         _start(pinned_binary, pane, provider_version=PINNED_0310)
 
     assert caught.value.reason == native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH
+    assert "within 60 seconds" in caught.value.detail
     _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH)
 
 
 def test_a_rewritten_title_pane_with_no_session_label_freezes(
-    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], fake_clock: _FakeClock
 ) -> None:
     # The picker hazard, rendered: a header with no Session line at all.
-    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
     rows = [row for row in _native_header_rows() if "Session:" not in row]
     pane = FakePane(observation=_observation(_REWRITTEN_ARGV), rendered=rows)
 
@@ -955,9 +1015,8 @@ def test_a_rewritten_title_pane_with_no_session_label_freezes(
 
 
 def test_a_rewritten_title_pane_with_a_duplicated_session_label_freezes(
-    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], fake_clock: _FakeClock
 ) -> None:
-    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
     rows = [
         *_native_header_rows(),
         "│  Session:   session_other                                           │",
@@ -972,11 +1031,10 @@ def test_a_rewritten_title_pane_with_a_duplicated_session_label_freezes(
 
 
 def test_a_rewritten_title_pane_whose_rendered_version_is_unproven_freezes(
-    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], fake_clock: _FakeClock
 ) -> None:
     # A header that names a version whose behaviour was never read must not
     # inherit the proof -- even when its Session line would otherwise match.
-    monkeypatch.setattr(native_tui_launch.time, "sleep", lambda _: None)
     pane = FakePane(
         observation=_observation(_REWRITTEN_ARGV),
         rendered=_native_header_rows(version="0.30.0"),
@@ -1176,6 +1234,217 @@ def test_a_non_rewriting_build_keeps_using_the_argv_proof_unchanged(
     assert pane.render_calls == 0
     # An argv launch records the argv proof channel by name.
     assert result["session_proof"] == native_tui_launch.SESSION_PROOF_ARGV
+
+
+# --------------------------------------------------------------------------
+# The rendered-proof window is the shared cold-start runway (COND-0314)
+# --------------------------------------------------------------------------
+
+
+def test_the_render_bound_is_the_native_cold_start_runway() -> None:
+    """The two layers that wait on the same boot share one constant.
+
+    COND-0314 was a contradiction between timeout layers: the v2 seam
+    tolerates a 60-second cold start before a launched pane becomes
+    input-ready, while the rendered-header proof that same boot paints
+    *first* froze at 15 seconds.  Both waits now take the one runway
+    constant, so the relationship cannot drift back into contradiction.
+    """
+    from cli_agent_orchestrator.services import managed_launch_v2
+
+    assert native_tui_launch.NATIVE_COLD_START_RUNWAY_SECONDS == 60.0
+    assert (
+        native_tui_launch.KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS
+        == native_tui_launch.NATIVE_COLD_START_RUNWAY_SECONDS
+    )
+    assert (
+        managed_launch_v2.NATIVE_PANE_READY_TIMEOUT_SECONDS
+        == native_tui_launch.NATIVE_COLD_START_RUNWAY_SECONDS
+    )
+
+
+def test_a_slow_but_valid_exact_header_is_admitted_once_within_the_runway(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], fake_clock: _FakeClock
+) -> None:
+    """The live r4 failure shape (COND-0314): a legitimate slow boot, admitted.
+
+    The installed 15 s bound froze the production reviewer before task
+    delivery with ``pane_render_does_not_show_bound_session`` — and the same
+    stable pane then rendered the exact bound session, model, version, and
+    worktree, too late to be admitted.  A boot that paints the exact header
+    inside the cold-start runway the launch already tolerates must converge
+    and publish exactly once: no relaunch, no second pane, no replay.
+    """
+    # Twenty seconds in: past the old 15 s bound, well inside the runway.
+    pane = _SlowBootPane(fake_clock, render_at=fake_clock.now + 20.0)
+
+    result = _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert result["session_proof"] == native_tui_launch.SESSION_PROOF_KIMI_RENDERED
+    assert len(pane.created) == 1, "one launch, never a retry or a recreated pane"
+    assert pane.render_calls >= 1
+    assert all(target == "%7" for target in pane.render_targets)
+    stored = native_attachment.get(PROVIDER, SESSION)
+    assert stored is not None and stored["state"] == native_attachment.ATTACHED
+
+
+def test_a_header_arriving_exactly_at_the_runway_boundary_is_admitted(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], fake_clock: _FakeClock
+) -> None:
+    """The boundary is inclusive: the deadline bounds observation, not painting.
+
+    After the initial launch-time capture, a capture is taken only while the
+    monotonic clock has not passed the deadline, so a header visible exactly
+    when the runway is exhausted (``now == deadline``) is still observed and
+    admitted.  A wake that resumes *after* it is not observed at all — see
+    the oversleep cases below.
+    """
+    pane = _SlowBootPane(
+        fake_clock,
+        render_at=fake_clock.now + native_tui_launch.KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS,
+    )
+
+    result = _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert native_attachment.get(PROVIDER, SESSION)["state"] == native_attachment.ATTACHED
+
+
+def test_a_header_arriving_one_poll_past_the_runway_freezes_with_the_exact_deadline(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], fake_clock: _FakeClock
+) -> None:
+    """Past the bound is past the bound: frozen, with truthful evidence.
+
+    The freeze detail names the exact deadline the launch observed under,
+    so a later reconciler knows how long the pane was watched.  The value
+    pinned here is the shared cold-start runway (60 seconds).
+    """
+    pane = _SlowBootPane(
+        fake_clock,
+        render_at=fake_clock.now
+        + native_tui_launch.KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS
+        + native_tui_launch.KIMI_RENDER_CONVERGENCE_POLL_SECONDS,
+    )
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH
+    assert "did not render" in caught.value.detail
+    assert "within 60 seconds" in caught.value.detail
+    assert len(pane.created) == 1, "a freeze never relaunches"
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH)
+
+
+def test_a_header_that_never_paints_freezes_at_the_exact_runway_deadline(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], fake_clock: _FakeClock
+) -> None:
+    """One bounded window, then fail closed — never a retry or a replay.
+
+    Distinct from the zero-timeout case above: this drives the real bound
+    to its deadline on the fake clock and pins both the freeze and the
+    exact runway named in its detail.
+    """
+    pane = _SlowBootPane(fake_clock, render_at=float("inf"))
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH
+    assert "did not render" in caught.value.detail
+    assert "within 60 seconds" in caught.value.detail
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH)
+
+
+def test_a_header_painted_after_the_deadline_freezes_when_the_final_sleep_overshoots(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    """The monotonic deadline — not the requested sleep — bounds observation.
+
+    The deterministic counterexample from review (probe output
+    ``ADMITTED_AFTER_DEADLINE capture=1060.2 deadline=1060.0 overrun=0.2``):
+    every requested sleep resumes 0.25 s late under scheduler/host load, the
+    header paints 0.05 s *after* the deadline, and the capture-before-check
+    loop admitted it from a capture taken 0.2 s out of bounds.  The overshoot
+    is real time, not an epsilon the contract absorbs.  After the initial
+    capture the loop must reject ``now > deadline`` before reading the
+    screen: no capture ever happens past the bound, and the launch freezes
+    with the exact deadline named.
+    """
+    clock = _FakeClock(overshoot=0.25)
+    monkeypatch.setattr(native_tui_launch.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(native_tui_launch.time, "sleep", clock.sleep)
+    deadline = clock.now + native_tui_launch.KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS
+    pane = _SlowBootPane(clock, render_at=deadline + 0.05)
+
+    with pytest.raises(native_tui_launch.NativeLaunchAmbiguous) as caught:
+        _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert caught.value.reason == native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH
+    assert "did not render" in caught.value.detail
+    assert "within 60 seconds" in caught.value.detail
+    assert pane.capture_times, "the initial launch-time capture always happens"
+    assert max(pane.capture_times) <= deadline, "no capture may read the screen out of bounds"
+    _assert_frozen(native_tui_launch.AMBIGUOUS_PANE_RENDER_MISMATCH)
+
+
+def test_a_header_visible_at_the_last_in_bound_capture_is_admitted_despite_oversleep(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    """Oversleep tightens the window; it never invents a freeze.
+
+    With the same 0.25 s late resumes, a header that *is* visible at the
+    last capture inside the bound is a legitimate slow boot and is admitted
+    exactly once: the deadline bounds observation, it does not make a
+    healthy slow pane less admissible.
+    """
+    clock = _FakeClock(overshoot=0.25)
+    monkeypatch.setattr(native_tui_launch.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(native_tui_launch.time, "sleep", clock.sleep)
+    deadline = clock.now + native_tui_launch.KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS
+    # Visible at the last in-bound capture, before the overslept wake that
+    # resumes past the deadline.
+    pane = _SlowBootPane(clock, render_at=deadline - 0.2)
+
+    result = _start(pinned_binary, pane, provider_version=PINNED_0310)
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert len(pane.created) == 1, "one launch, never a retry"
+    assert pane.capture_times and max(pane.capture_times) <= deadline
+    assert native_attachment.get(PROVIDER, SESSION)["state"] == native_attachment.ATTACHED
+
+
+def test_other_providers_never_consult_the_kimi_render_runway(
+    isolated_memory_db: Any, pinned_binary: tuple[str, str], monkeypatch: Any
+) -> None:
+    """The runway is Kimi's; no other provider inherits or even reads it.
+
+    The rendered-proof window exists because one Kimi build erases the
+    resumed session id from its kernel argv.  Every other provider proves
+    from the argv, so the loop — and its timeout — must not exist for them:
+    patched to zero here, a consult would freeze this launch instantly, and
+    a capture would show up in ``render_calls``.
+    """
+    path, _ = pinned_binary
+    codex_session = "3f6c5c4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f"
+    argv = native_tui_launch.codex_native_launch.build_resume_argv(
+        session_id=codex_session, codex_binary=path, extra_args=None
+    )
+    monkeypatch.setattr(native_tui_launch, "KIMI_RENDER_CONVERGENCE_TIMEOUT_SECONDS", 0.0)
+    pane = FakePane(observation=_observation(argv))
+
+    result = _start(
+        pinned_binary,
+        pane,
+        provider="codex",
+        native_session_id=codex_session,
+        provider_version=PINNED_0310,
+    )
+
+    assert result["outcome"] == native_tui_launch.OUTCOME_LAUNCHED
+    assert result["session_proof"] == native_tui_launch.SESSION_PROOF_ARGV
+    assert pane.render_calls == 0
 
 
 def test_the_session_proof_vocabulary_is_closed_and_unknown_values_freeze(
