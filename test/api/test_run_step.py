@@ -268,3 +268,38 @@ class TestRunStepEndpoint:
 
         assert resp.status_code == 400
         assert "not inside a git repository" in resp.json()["detail"]
+
+    def test_terminal_input_blocked_error_maps_to_504_not_500(self, client):
+        """PR #539 review (call-me-ram, round 3, "ask 1"): by this head,
+        TerminalInputBlockedError is no longer raised by initialize()'s
+        init-failure fallback -- that outer raise was reverted back to a bare
+        TimeoutError in round 3, once send_input's own WAITING_USER_ANSWER
+        guard took over as the keep-alive signal for the deferred-init path.
+        The one producer that can still reach run_agent_step's synchronous
+        `terminal_service.send_input` call (which never states an
+        orchestration_type, so the WAITING guard itself can't fire here) is
+        send_input's ERROR-state guard: a terminal whose provider process has
+        already exited (or flips to ERROR between the readiness wait and the
+        send) raises TerminalInputBlockedError to refuse pasting into a dead
+        terminal. Without a dedicated except-arm for that, it would fall
+        through to the generic `except Exception -> 500` below -- silently
+        shifting this synchronous caller's (handoff MCP client, future run
+        engine) response from 504 Gateway Timeout to 500 Internal Server
+        Error, and from the structured {message, kind, terminal_id} shape to
+        a plain string. This confirms the restored 504 + structured
+        kind="timeout" body for that ERROR-state case."""
+        from cli_agent_orchestrator.services.terminal_service import TerminalInputBlockedError
+
+        with patch(
+            _RUN_STEP,
+            new=AsyncMock(
+                side_effect=TerminalInputBlockedError(
+                    "Terminal abc12345 provider is in ERROR state "
+                    "(provider process may have exited). Refusing to deliver input."
+                )
+            ),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+        assert resp.status_code == 504
+        detail = resp.json()["detail"]
+        assert detail["kind"] == "timeout"

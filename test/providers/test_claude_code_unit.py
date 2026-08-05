@@ -1967,13 +1967,28 @@ class TestClaudeCodeProviderStartupPrompts:
         accept-set."""
         output = (
             "Some future unrecognized prompt this file has no special case for\n\n"
-            "  ❱ 1. Option one\n    2. Option two\n\n  Enter to confirm · Esc to cancel"
+            "  ❯ 1. Option one\n    2. Option two\n\n  Enter to confirm · Esc to cancel"
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status(output)
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_completed_response_mentioning_enter_to_confirm_is_not_waiting(self):
+        """PR #539 review (call-me-ram): a settled/completed turn whose response TEXT happens to
+        contain the bare prose "Enter to confirm" within the bottom_chrome window (get_status's
+        last-6-lines anchor) must NOT misclassify as WAITING_USER_ANSWER. Only the real Ink footer
+        -- "Enter to confirm" immediately followed by the "·" chrome separator, e.g. "Enter to
+        confirm · Esc to cancel" (see test_get_status_real_fullscreen_upsell_prompt_is_waiting_user_answer
+        above, which still matches) -- should trigger WAITING_USER_ANSWER. This is a real ⏺
+        response marker + idle prompt, i.e. a genuinely finished turn, so it must read COMPLETED."""
+        output = "⏺ Please press Enter to confirm your changes were saved.\n❯ "
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.COMPLETED
 
     def test_get_status_real_fullscreen_upsell_prompt_is_waiting_user_answer(self):
         """The real, live-captured "Try the new fullscreen renderer?" onboarding upsell must
@@ -1982,7 +1997,7 @@ class TestClaudeCodeProviderStartupPrompts:
         this file answers the prompt on the operator's behalf -- this only lets CAO recognize the
         terminal is alive and blocked on something a human needs to see."""
         output = (
-            "Try the new fullscreen renderer?\n\n  ❱ 1. Yes, try it\n    2. Not now\n\n"
+            "Try the new fullscreen renderer?\n\n  ❯ 1. Yes, try it\n    2. Not now\n\n"
             "  Enter to confirm · Esc to cancel"
         )
 
@@ -2551,3 +2566,18 @@ class TestWaitUntilInputReady:
 
         provider = ClaudeCodeProvider("t5", "sess", "win")
         assert await BaseProvider.wait_until_input_ready(provider) is True
+
+
+class TestBlocksOrchestratedInputWhileWaitingUserAnswer:
+    """PR #539 review (call-me-ram, gutosantos82), BLOCKING: initialize() now
+    succeeds (WAITING_USER_ANSWER) on a recognized startup choice-prompt instead
+    of timing out. Without opting in here, send_input's orchestrated-input guard
+    (services/terminal_service.py) never fires for claude_code, so a deferred-init
+    assign/handoff would paste the task straight into the live Ink Select widget
+    and auto-confirm whichever option is highlighted -- exactly what issue #538
+    says was deliberately rejected. Same opt-in pattern as antigravity_cli/hermes.
+    """
+
+    def test_blocks_orchestrated_input_while_waiting_user_answer(self):
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.blocks_orchestrated_input_while_waiting_user_answer is True

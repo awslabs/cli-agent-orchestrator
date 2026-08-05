@@ -2787,7 +2787,26 @@ async def run_step(
             status_code=code,
             detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},
         )
-    except TimeoutError as e:
+    except (TimeoutError, TerminalInputBlockedError) as e:
+        # TerminalInputBlockedError (PR #539) is kept a DISTINCT type from
+        # TimeoutError rather than collapsed into it, because
+        # _schedule_deferred_init's async path genuinely needs to tell
+        # "blocked on a recognized user prompt, worker still alive" (leave it
+        # running for answer_user_prompt) apart from "generic failure, worker
+        # dead" (tear down) -- see terminal_service.py's own
+        # _schedule_deferred_init. run_step never goes through that deferred
+        # path, though: run_agent_step calls terminal_service.send_input with
+        # no orchestration_type, so the WAITING_USER_ANSWER guard can never
+        # fire here -- the only producer reachable from run_step is
+        # send_input's ERROR-state guard (a terminal whose provider process
+        # has already exited, or flips to ERROR between the readiness wait
+        # and the send). Since run_step is the SYNCHRONOUS caller (handoff
+        # MCP client's step call, and the future run engine), there is no
+        # deferred worker to keep alive either way -- the call has simply
+        # failed to complete, so this maps to the same kind="timeout" / 504
+        # outcome as a plain TimeoutError. This preserves the pre-PR-#539 504
+        # status code for this exact failure instead of silently falling
+        # through to the generic kind-less 500 below.
         _settle_step(None, str(e))
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
