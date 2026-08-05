@@ -350,6 +350,20 @@ class CodexProvider(BaseProvider):
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
 
+    @property
+    def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
+        """The first-run login/auth menu consumes pasted text as a menu selection.
+
+        Now that ``initialize()`` accepts ``WAITING_USER_ANSWER`` as a successful init
+        outcome (for a credential-less account parked on the login menu), an assign/handoff
+        launch that lands there must not have its orchestrated task text pasted into the
+        live menu -- it would be read as an option selection, not delivered as a task.
+        Opting in (matching hermes.py/antigravity_cli.py) makes terminal_service's send_input
+        guard hold orchestrated delivery until the prompt clears, while still allowing an
+        explicit answer_user_prompt call through.
+        """
+        return True
+
     def _developer_instructions_file_path(self) -> Path:
         """Path of this terminal's developer_instructions temp file.
 
@@ -708,16 +722,11 @@ class CodexProvider(BaseProvider):
         # attempt before an operator had any real chance to open the session and complete
         # login themselves.
         #
-        # Known, disclosed-but-NOT-yet-fixed gap (see PR #540/#539 review discussion):
-        # CodexProvider does not override `blocks_orchestrated_input_while_waiting_user_answer`
-        # (base.py default False, unlike hermes.py/antigravity_cli.py which opt in), so
-        # terminal_service.py's send_input guard does not block an assign/handoff delivery
-        # while status is WAITING_USER_ANSWER. Now that initialize() accepts WAITING_USER_ANSWER
-        # as a success outcome, an assign/handoff launch that lands on this exact login menu can
-        # proceed to paste the orchestrated task text (+ Enter) into the live menu, which reads
-        # as an option selection -- the same composition hazard PR #539's review flagged for
-        # ClaudeCodeProvider's own choice-prompt widening. Not fixed here to keep this PR's scope
-        # to the review round-2 items; tracked as an open follow-up.
+        # CodexProvider now overrides `blocks_orchestrated_input_while_waiting_user_answer`
+        # (see the property above) specifically so this WAITING_USER_ANSWER init-success
+        # path can't let an assign/handoff paste the orchestrated task into the live login
+        # menu -- the same composition hazard PR #539's review flagged for ClaudeCodeProvider's
+        # own choice-prompt widening, fixed here the same way rather than left open.
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},

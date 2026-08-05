@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
     CodexProvider,
@@ -2552,3 +2553,68 @@ class TestCodexLaunchFlagsValidity:
             assert (
                 probe.returncode == 0 and "unexpected argument" not in probe.stderr
             ), f"Flag '{flag}' in launch command rejected by codex binary"
+
+
+class TestCodexProviderBlocksOrchestratedInputWhileWaitingUserAnswer:
+    """PR #540 follow-up (raised during the round-2 review pass): CodexProvider must
+    opt into `blocks_orchestrated_input_while_waiting_user_answer` -- otherwise, now
+    that `initialize()` accepts WAITING_USER_ANSWER (the first-run login menu) as a
+    success outcome, an assign/handoff's deferred-init `send_input` would paste the
+    orchestrated task straight into the live login menu instead of being held for
+    `answer_user_prompt`. Same hazard PR #539's review flagged for ClaudeCodeProvider,
+    fixed here the same way (a property override matching hermes.py/antigravity_cli.py).
+    """
+
+    def test_property_is_true(self):
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        assert provider.blocks_orchestrated_input_while_waiting_user_answer is True
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_waiting_on_login_menu_leaves_worker_alive_task_undelivered(
+        self, mock_tmux, mock_pm, mock_status_monitor, mock_meta, mock_notify
+    ):
+        """RED (pre-fix, property False): send_input's guard no-ops, the task text
+        is pasted into the live login menu via `send_keys`, and the deferred-init
+        path treats delivery as having succeeded -- `_notify_caller_of_deferred_failure`
+        is never called at all, so this test's own assertion of a undelivered/alive
+        worker fails outright (no call to assert on).
+        GREEN (post-fix, property True): `send_input` raises `TerminalInputBlockedError`
+        before any `send_keys` call, `_schedule_deferred_init` catches it and leaves the
+        worker alive (`delete_worker=False`) with nothing pasted.
+        """
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {
+            "caller_id": "super123",
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        # Real provider instance (not a generic mock) so its actual
+        # blocks_orchestrated_input_while_waiting_user_answer property value is
+        # what send_input's guard consults -- this is the thing under test.
+        real_provider = CodexProvider("worker99", "cao-session", "developer-abcd")
+        mock_pm.get_provider.return_value = real_provider
+
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True  # succeeded: WAITING_USER_ANSWER reached
+        provider_instance.shell_baseline = None
+
+        before_tasks = set(_deferred_init_tasks)
+        _schedule_deferred_init(
+            provider_instance, "worker99", "do the task", OrchestrationType.ASSIGN, None
+        )
+        (task,) = set(_deferred_init_tasks) - before_tasks
+        await task
+
+        mock_tmux.send_keys.assert_not_called()
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args.kwargs["delete_worker"] is False
