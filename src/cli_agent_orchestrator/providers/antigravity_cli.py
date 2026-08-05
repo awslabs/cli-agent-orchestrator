@@ -39,11 +39,15 @@ presence of ``? for shortcuts`` means IDLE / COMPLETED (split on a turn
 counter, since the TUI looks identical in both states).
 """
 
+import asyncio
 import json
 import logging
+import os
 import re
 import shlex
 import shutil
+import stat
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -59,6 +63,22 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_sta
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+# Serializes concurrent _register_mcp_servers()/_unregister_mcp_servers()
+# read-modify-writes to ~/.gemini/config/mcp_config.json -- after the async
+# conversion (issue #494), both paths run on worker threads (initialize() via
+# asyncio.to_thread, cleanup() via loop.run_in_executor), so N concurrent
+# inits/teardowns can race the shared file. Without a lock, one thread's write
+# can clobber another's read-before-write, silently dropping a concurrently-
+# registered (or unregistered) server.
+_MCP_CONFIG_WRITE_LOCK = threading.Lock()
+
+
+def _log_cleanup_exception(fut: asyncio.Future) -> None:
+    """Done-callback for the offloaded _unregister_mcp_servers future."""
+    exc = fut.exception()
+    if exc is not None:
+        logger.error("_unregister_mcp_servers raised during cleanup: %s", exc, exc_info=exc)
 
 
 class ProviderError(Exception):
@@ -335,104 +355,187 @@ class AntigravityCliProvider(BaseProvider):
         non-CAO servers), forwarding ``CAO_TERMINAL_ID`` into each server's env
         so cao-mcp-server can resolve the current terminal for handoff / assign.
 
-        Concurrency: the file is shared across terminals, but CAO serializes
-        launches (initialize() waits for the agent to become ready before the
-        next terminal launches), so each agy process reads the config and spawns
-        its MCP subprocess with the correct terminal id before the next write.
+        Each entry is keyed as ``{server_name}-{terminal_id}`` so concurrent
+        inits write to distinct keys and an earlier terminal's entry cannot be
+        overwritten before its agy process reads the config at startup.
+
+        Concurrency: the file is shared across terminals. issue #494:
+        ``_build_agy_command`` (the sole caller, via initialize()) now runs
+        inside ``asyncio.to_thread``, so N concurrent inits can enter this
+        method in N threads at once -- ``_MCP_CONFIG_WRITE_LOCK`` (shared with
+        ``_unregister_mcp_servers``) serializes the read-modify-write so one
+        thread's write can never clobber another's concurrently-registered
+        entry. In-process only: a second cao-server process, or agy itself,
+        writing between our read and write is still a last-writer-wins lost
+        update.
         """
         path = self._mcp_config_path()
-        try:
-            if path.exists() and path.stat().st_size > 0:
-                with open(path) as f:
-                    config = json.load(f)
-            else:
-                path.parent.mkdir(parents=True, exist_ok=True)
+        with _MCP_CONFIG_WRITE_LOCK:
+            try:
+                if path.exists() and path.stat().st_size > 0:
+                    with open(path) as f:
+                        config = json.load(f)
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    config = {}
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("Could not read %s, starting fresh: %s", path, exc)
                 config = {}
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Could not read %s, starting fresh: %s", path, exc)
-            config = {}
 
-        # The file is shared with the user's own agy config; tolerate a valid-
-        # but-unexpected shape (e.g. a JSON list/string) instead of raising.
-        if not isinstance(config, dict):
-            logger.warning(
-                "MCP config root in %s is %s, not an object; resetting",
-                path,
-                type(config).__name__,
-            )
-            config = {}
+            # The file is shared with the user's own agy config; tolerate a
+            # valid-but-unexpected shape (e.g. a JSON list/string) instead of
+            # raising.
+            if not isinstance(config, dict):
+                logger.warning(
+                    "MCP config root in %s is %s, not an object; resetting",
+                    path,
+                    type(config).__name__,
+                )
+                config = {}
 
-        servers = config.setdefault("mcpServers", {})
-        if not isinstance(servers, dict):
-            logger.warning(
-                "'mcpServers' in %s is %s, not an object; replacing",
-                path,
-                type(servers).__name__,
-            )
-            servers = {}
-            config["mcpServers"] = servers
-        for server_name, server_config in mcp_servers.items():
-            if isinstance(server_config, dict):
-                cfg = dict(server_config)
-            else:
-                cfg = server_config.model_dump(exclude_none=True)
-            # Resolve the bundled cao-mcp-server console script to a
-            # PATH-independent invocation. persisted=True: this command is
-            # written to mcp_config.json and read by agy at later launches,
-            # so prefer the stable PATH launcher over the versioned venv path.
-            command, args = resolve_cao_mcp_command(
-                cfg.get("command", ""), cfg.get("args", []) or [], persisted=True
-            )
-            entry: dict = {
-                "command": command,
-                "args": args,
-            }
-            env = dict(cfg.get("env", {}))
-            env["CAO_TERMINAL_ID"] = self.terminal_id
-            entry["env"] = env
-            servers[server_name] = entry
-            self._mcp_server_names.append(server_name)
+            servers = config.setdefault("mcpServers", {})
+            if not isinstance(servers, dict):
+                logger.warning(
+                    "'mcpServers' in %s is %s, not an object; replacing",
+                    path,
+                    type(servers).__name__,
+                )
+                servers = {}
+                config["mcpServers"] = servers
 
-        with open(path, "w") as f:
-            json.dump(config, f, indent=2)
+            # GC: prune entries left by terminals that crashed/were killed
+            # without a graceful cleanup(). We're already holding the lock and
+            # about to write — cheap to check liveness now.
+            self._prune_stale_mcp_entries(servers)
+
+            for server_name, server_config in mcp_servers.items():
+                if isinstance(server_config, dict):
+                    cfg = dict(server_config)
+                else:
+                    cfg = server_config.model_dump(exclude_none=True)
+                # Resolve the bundled cao-mcp-server console script to a
+                # PATH-independent invocation. persisted=True: this command is
+                # written to mcp_config.json and read by agy at later launches,
+                # so prefer the stable PATH launcher over the versioned venv path.
+                command, args = resolve_cao_mcp_command(
+                    cfg.get("command", ""), cfg.get("args", []) or [], persisted=True
+                )
+                entry: dict = {
+                    "command": command,
+                    "args": args,
+                }
+                env = dict(cfg.get("env", {}))
+                env["CAO_TERMINAL_ID"] = self.terminal_id
+                entry["env"] = env
+                # Use a per-terminal key so concurrent inits don't overwrite
+                # each other's entry before agy reads the config at startup.
+                unique_key = f"{server_name}-{self.terminal_id}"
+                servers[unique_key] = entry
+                self._mcp_server_names.append(unique_key)
+
+            tmp_path = path.with_suffix(".json.tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(config, f, indent=2)
+            if path.exists():
+                os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
+            os.replace(tmp_path, path)
 
     def _unregister_mcp_servers(self) -> None:
-        """Remove the MCP servers this provider registered."""
+        """Remove the MCP servers this provider registered.
+
+        Scheduled via ``loop.run_in_executor`` (fire-and-forget) from
+        ``cleanup()`` when called on the event-loop thread, or run inline
+        when already on a worker thread. Shares ``_MCP_CONFIG_WRITE_LOCK``
+        with ``_register_mcp_servers`` so this can't interleave with another
+        terminal's concurrent registration and corrupt the shared
+        ``mcp_config.json`` read-modify-write.
+
+        An ownership check ensures only entries whose
+        ``env.CAO_TERMINAL_ID`` matches this instance's terminal_id are
+        removed — entries belonging to a newer terminal that re-registered
+        under the same server name are left intact, making fire-and-forget
+        scheduling safe regardless of executor ordering.
+        """
         if not self._mcp_server_names:
             return
         path = self._mcp_config_path()
         if not path.exists():
             self._mcp_server_names = []
             return
-        try:
-            with open(path) as f:
-                config = json.load(f)
-            servers = config.get("mcpServers") if isinstance(config, dict) else None
-            if isinstance(servers, dict):
-                for name in self._mcp_server_names:
-                    servers.pop(name, None)
-                with open(path, "w") as f:
-                    json.dump(config, f, indent=2)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to unregister MCP servers from %s: %s", path, exc)
-        finally:
-            # Always clear our state so a malformed config can never leave stale
-            # names behind and block terminal teardown.
-            self._mcp_server_names = []
+        with _MCP_CONFIG_WRITE_LOCK:
+            try:
+                with open(path) as f:
+                    config = json.load(f)
+                servers = config.get("mcpServers") if isinstance(config, dict) else None
+                if isinstance(servers, dict):
+                    for name in self._mcp_server_names:
+                        entry = servers.get(name)
+                        env = entry.get("env", {}) if isinstance(entry, dict) else {}
+                        if (
+                            isinstance(entry, dict)
+                            and isinstance(env, dict)
+                            and env.get("CAO_TERMINAL_ID") != self.terminal_id
+                        ):
+                            continue  # belongs to a different terminal — leave it
+                        servers.pop(name, None)
+                    tmp_path = path.with_suffix(".json.tmp")
+                    with open(tmp_path, "w") as f:
+                        json.dump(config, f, indent=2)
+                    os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
+                    os.replace(tmp_path, path)
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("Failed to unregister MCP servers from %s: %s", path, exc)
+            finally:
+                # Always clear our state so a malformed config can never leave
+                # stale names behind and block terminal teardown.
+                self._mcp_server_names = []
 
-    def _handle_startup_dialog(
+    def _prune_stale_mcp_entries(self, servers: dict) -> None:
+        """Remove entries whose CAO_TERMINAL_ID no longer maps to a live terminal.
+
+        Called inside _register_mcp_servers while holding _MCP_CONFIG_WRITE_LOCK.
+        Uses the database client directly (sync, safe — we're on a worker thread).
+        """
+        from cli_agent_orchestrator.clients import database as _db
+
+        stale_keys: list[str] = []
+        for key, entry in servers.items():
+            env = entry.get("env", {}) if isinstance(entry, dict) else {}
+            tid = env.get("CAO_TERMINAL_ID") if isinstance(env, dict) else None
+            if tid is None:
+                continue  # not a CAO-managed entry — leave it
+            if _db.get_terminal_metadata(tid) is None:
+                stale_keys.append(key)
+        for key in stale_keys:
+            del servers[key]
+        if stale_keys:
+            logger.info("Pruned %d stale MCP config entries: %s", len(stale_keys), stale_keys)
+
+    async def _handle_startup_dialog(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
     ) -> None:
         """Dismiss agy's blocking startup dialogs (workspace-trust, survey).
 
-        Mirrors ClaudeCodeProvider._handle_startup_prompts / KimiCliProvider.
-        Polls the pane and answers, in whatever order they appear:
+        Mirrors ClaudeCodeProvider._handle_startup_prompts (once PR #451
+        lands) / KimiCliProvider._handle_startup_dialog. Polls the pane and
+        answers, in whatever order they appear:
         - workspace-trust picker → Enter (accepts the pre-selected "Yes")
         - feedback survey → "0" + Enter (Skip)
         Both can appear in ONE startup (trust first, survey after), so a
         dismissal continues the loop rather than returning. Exits once agy is
         at its ready footer with no dialog on screen — the survey renders ON
         TOP of the footer, so the survey check must run before the idle exit.
+
+        issue #494: this is a real coroutine, not sync code called from an
+        async caller. This method is awaited directly from initialize(), which
+        runs on cao-server's single asyncio event loop. Every tmux-backed call
+        here (``get_history``/``send_special_key``/``send_keys``) is a
+        blocking subprocess exec, and a plain ``time.sleep`` would block the
+        WHOLE OS thread -- freezing every other in-flight request -- for as
+        long as this loop runs. All blocking calls are offloaded to a worker
+        thread via ``asyncio.to_thread`` and all sleeps are ``asyncio.sleep``,
+        so this coroutine yields the event loop instead of freezing it (see PR
+        #451 for the ClaudeCodeProvider fix this mirrors).
 
         Idle-gap semantics (see issue #400): a cold or containerized start can
         render these dialogs LATE and in sequence, past the old fixed ~20s
@@ -475,33 +578,45 @@ class AntigravityCliProvider(BaseProvider):
                 return
             if any_prompt_handled and now - last_prompt_time >= idle_gap:
                 return  # no new prompt within the idle gap — startup settled
-            output = get_backend().get_history(self.session_name, self.window_name)
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
             if output:
                 clean = strip_terminal_escapes(output)
                 if not trust_done and re.search(TRUST_PROMPT_PATTERN, clean):
                     logger.info("Antigravity workspace-trust dialog detected, accepting")
                     status_monitor.notify_input_sent(self.terminal_id)
-                    get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                    await asyncio.to_thread(
+                        get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                    )
                     trust_done = True
                     any_prompt_handled = True
                     last_prompt_time = time.monotonic()  # reset idle timer — survey may follow
-                    time.sleep(1.0)
+                    await asyncio.sleep(1.0)
                     continue
                 if not survey_done and re.search(SURVEY_PROMPT_PATTERN, clean):
                     logger.info("Antigravity feedback survey detected, skipping")
                     status_monitor.notify_input_sent(self.terminal_id)
-                    get_backend().send_keys(self.session_name, self.window_name, "0", enter_count=0)
-                    time.sleep(0.5)
-                    get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                    await asyncio.to_thread(
+                        get_backend().send_keys,
+                        self.session_name,
+                        self.window_name,
+                        "0",
+                        enter_count=0,
+                    )
+                    await asyncio.sleep(0.5)
+                    await asyncio.to_thread(
+                        get_backend().send_special_key, self.session_name, self.window_name, "Enter"
+                    )
                     survey_done = True
                     any_prompt_handled = True
                     last_prompt_time = time.monotonic()  # reset idle timer
-                    time.sleep(1.0)
+                    await asyncio.sleep(1.0)
                     continue
                 # At the ready footer with no dialog pending → done.
                 if re.search(IDLE_FOOTER_PATTERN, clean):
                     return
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
 
     async def initialize(self) -> bool:
         """Initialize the Antigravity CLI provider by starting ``agy``.
@@ -512,11 +627,19 @@ class AntigravityCliProvider(BaseProvider):
 
         Raises:
             TimeoutError: If the shell or agy initialization times out.
+
+        issue #494: ``_build_agy_command`` does blocking I/O (``shutil.which``
+        and the ~/.gemini/config/mcp_config.json read-modify-write via
+        ``_register_mcp_servers``) and ``get_backend().send_keys`` is a
+        blocking subprocess exec -- both offloaded to a worker thread via
+        ``asyncio.to_thread`` for the same reason as ``_handle_startup_dialog``
+        (see its docstring): so nothing in initialize() blocks the shared
+        event loop under concurrent session creation.
         """
         if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
-        command = self._build_agy_command()
+        command = await asyncio.to_thread(self._build_agy_command)
 
         # Arm the StatusMonitor stickiness gate so the launch drives a fresh
         # PROCESSING transition past any stale ready latch. Imported lazily to
@@ -524,7 +647,9 @@ class AntigravityCliProvider(BaseProvider):
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         status_monitor.notify_input_sent(self.terminal_id)
-        get_backend().send_keys(self.session_name, self.window_name, command)
+        await asyncio.to_thread(
+            get_backend().send_keys, self.session_name, self.window_name, command
+        )
 
         # Resolve the per-profile provider_init_timeout override (if any) so it
         # governs both the startup-dialog handler's outer cap and the readiness
@@ -537,7 +662,7 @@ class AntigravityCliProvider(BaseProvider):
 
         # Accept the workspace-trust dialog if agy shows one (first launch in an
         # untrusted cwd). Unanswered it blocks init — the picker never reads IDLE.
-        self._handle_startup_dialog(outer_timeout=max(default_ready_timeout, init_timeout))
+        await self._handle_startup_dialog(outer_timeout=max(default_ready_timeout, init_timeout))
 
         # agy startup + first MCP connection + the -i acknowledgment can take
         # a while.
@@ -772,8 +897,28 @@ class AntigravityCliProvider(BaseProvider):
         return "/quit"
 
     def cleanup(self) -> None:
-        """Remove the MCP servers this provider registered and reset state."""
-        self._unregister_mcp_servers()
+        """Remove the MCP servers this provider registered and reset state.
+
+        _unregister_mcp_servers acquires _MCP_CONFIG_WRITE_LOCK and does file
+        I/O. When cleanup() is called on the event-loop thread (e.g. from
+        flow_service.execute_flow → cleanup_provider), running it inline would
+        block the loop. Offload to a worker thread so the lock is never held
+        on the event-loop thread — mirroring how _register_mcp_servers is
+        already offloaded via asyncio.to_thread in initialize().
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            # On the event-loop thread — offload blocking I/O + lock to a worker.
+            # Retain the future so exceptions are surfaced (not silently swallowed).
+            fut = loop.run_in_executor(None, self._unregister_mcp_servers)
+            fut.add_done_callback(_log_cleanup_exception)
+        else:
+            # Already on a worker thread (e.g. api delete_terminal path) — safe
+            # to run inline.
+            self._unregister_mcp_servers()
         self._initialized = False
 
     def mark_input_received(self) -> None:

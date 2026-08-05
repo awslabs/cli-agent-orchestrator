@@ -212,7 +212,7 @@ def _scan_sentinel(stdout_text: str) -> Tuple[Optional[Any], List[str]]:
 # ---------------------------------------------------------------------------
 # Env construction (INV-2) — constructed allowlist, nothing inherited-and-extended
 # ---------------------------------------------------------------------------
-def _build_env(
+def build_env(
     run_id: str,
     generation: str,
     inputs: Optional[Dict[str, Any]] = None,
@@ -220,6 +220,13 @@ def _build_env(
     resume: bool = False,
 ) -> Dict[str, str]:
     """Build the exact 6-key constructed spawn env (INV-2, NFR-SEC-2, BR-26, BR-A5).
+
+    U2 (issue #505) promotes this from the module-private ``_build_env`` to a
+    PUBLIC seam (ADR-3): the async submission path's background task in
+    ``api/main.py`` constructs the script env here rather than reaching into a
+    leading-underscore name, and the 6-key env-construction contract stays
+    single-homed in this module. ``_build_env`` remains as a backward-compat alias
+    (below) so existing internal/test callers are byte-identical (CR-1).
 
     The spawn env is CONSTRUCTED, never ``os.environ`` inherited-and-extended:
     exactly ``{CAO_WORKFLOW_RUN_ID, CAO_WORKFLOW_GENERATION, CAO_API_BASE_URL,
@@ -248,6 +255,12 @@ def _build_env(
     if resume:
         env["CAO_WORKFLOW_RESUME"] = "1"
     return env
+
+
+# Backward-compat alias for the pre-U2 module-private name. The 6-key env contract
+# is single-homed in ``build_env`` (above); this alias keeps existing internal
+# callers and tests byte-identical (CR-1) — it is the SAME function object.
+_build_env = build_env
 
 
 def _now() -> str:
@@ -853,12 +866,40 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     # EVERY exit path (complete, fail, timeout) so a settled run stays resumable.
     # Deliver the RESOLVED inputs (already validated + capped at the route, and
     # journaled above as json.dumps(inputs)) to the child via CAO_WORKFLOW_INPUTS.
-    env = _build_env(run_id, "1", inputs, resume=False)
+    env = build_env(run_id, "1", inputs, resume=False)
     _active_drives.add(run_id)
     try:
         return await _drive_process(record, spec.path, env)
     finally:
         _active_drives.discard(run_id)
+
+
+async def run_script_workflow_prepared(
+    record: ScriptRunRecord, spec_path: str, env: Dict[str, str]
+) -> WorkflowRunResult:
+    """Drive an already-linted, already-journaled, already-registered script run (U2, ADR-3).
+
+    The DEDICATED prepared entry the async submission path's background task
+    (``_run_in_background``) invokes for the script tier. It is the EXACT tail of
+    :func:`run_script_workflow` (the ``_active_drives.add`` -> ``_drive_process``
+    -> ``finally discard`` block) with the pre-drive key-validate, lint gate,
+    record build, registration, and durable insert REMOVED — the async handler
+    (C1) has already done all of those BEFORE acking with 202.
+
+    Re-entering the blocking :func:`run_script_workflow` here would re-run the lint
+    gate and re-``insert_run`` (a plain INSERT -> ``IntegrityError`` on the
+    already-journaled id) and would ack a lint-failing script only AFTER a 202 +
+    RUNNING row already existed (ADR-3). This drive-only entry re-runs none of that;
+    ``_drive_process`` is reused UNCHANGED so the async drive spawns, drains, reaps,
+    and settles the terminal state / journal write-throughs identically to a
+    blocking run. The ``finally`` clears the ``_active_drives`` liveness mark on
+    EVERY exit path so a settled run stays resumable.
+    """
+    _active_drives.add(record.run_id)
+    try:
+        return await _drive_process(record, spec_path, env)
+    finally:
+        _active_drives.discard(record.run_id)
 
 
 # ---------------------------------------------------------------------------

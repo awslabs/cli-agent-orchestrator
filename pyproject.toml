@@ -1,6 +1,6 @@
 [project]
 name = "cli-agent-orchestrator"
-version = "2.3.0"
+version = "2.4.1"
 description = "CLI Agent Orchestrator"
 readme = "README.md"
 requires-python = ">=3.10"
