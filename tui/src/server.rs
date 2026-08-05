@@ -634,6 +634,43 @@ fn route(id: CommandId) -> Option<Route> {
             }],
             &[],
         ),
+        // The four leaves PR #525 (issue #505) added, missing from the catalog until CI caught it
+        // on PR #547.
+        //
+        // `--state` and `--limit` are real query parameters on `GET /workflows/runs`
+        // (`api/main.py:2632-2633`); `--json` binds nowhere, being a local output-format choice.
+        CommandId::WorkflowRuns => filtered(
+            Method::Get,
+            "/workflows/runs",
+            &[
+                Binding {
+                    field: "--state",
+                    wire: "state",
+                },
+                Binding {
+                    field: "--limit",
+                    wire: "limit",
+                },
+            ],
+        ),
+        // `GET /workflows/runs/{run_id}/result` (`:3426`) — a two-segment path, safe at any
+        // declaration position, taking its value from the CLI's own `run_id` positional.
+        CommandId::WorkflowResult => bound(
+            Method::Get,
+            "/workflows/runs/{run_id}/result",
+            &["run_id"],
+            &[Binding {
+                field: "run_id",
+                wire: "run_id",
+            }],
+            &[],
+        ),
+        // HANDOFF, both: unbounded duration. `wait` polls until the run terminates and `events`
+        // consumes an SSE stream with reconnect-on-drop, so neither fits a request/response call
+        // with a 30s timeout on a single-threaded event loop — the same reason `workflow run` and
+        // `resume` are HANDOFF. Routes exist for both; that is not the constraint.
+        CommandId::WorkflowEvents => None,
+        CommandId::WorkflowWait => None,
         // `POST /workflows/validate` (`api/main.py:2549`) takes the spec path in a JSON body
         // (`WorkflowValidateRequest { path: str }`, `:398-401`), not a query parameter.
         //
@@ -2575,7 +2612,7 @@ mod tests {
     ///    because the CLI itself conceals the group (issue #378). A route there would make a
     ///    deprecated alias trivially resurrectable. (#321)
     #[test]
-    fn the_route_table_serves_twentyone_of_the_twentytwo_in_app_commands() {
+    fn the_route_table_serves_twentythree_of_the_twentyfour_in_app_commands() {
         let mut in_app_with_route = Vec::new();
         let mut in_app_without_route = Vec::new();
         let mut non_in_app_with_route = Vec::new();
@@ -2592,8 +2629,8 @@ mod tests {
 
         assert_eq!(
             in_app_with_route.len(),
-            21,
-            "21 of the 22 IN-APP commands must have a route; found {}. Missing a route for an \
+            23,
+            "23 of the 24 IN-APP commands must have a route; found {}. Missing a route for an \
              IN-APP command is a run-time NoRoute in the operator's face. With routes: {:?}",
             in_app_with_route.len(),
             in_app_with_route
@@ -2604,7 +2641,7 @@ mod tests {
             "`profile find` is the ONLY IN-APP command with no route, and that is by design \
              (OQ-6 Q2): no search route exists — `search_profiles` is reachable only from the \
              CLI and the stdio-only MCP server — so it is served client-side by `find_profiles`. \
-             Do not read the 21-vs-22 gap as an oversight. Found: {in_app_without_route:?}"
+             Do not read the 23-vs-24 gap as an oversight. Found: {in_app_without_route:?}"
         );
         assert!(
             non_in_app_with_route.is_empty(),
@@ -2621,9 +2658,9 @@ mod tests {
             .filter(|id| policy(**id) == Policy::InApp)
             .count();
         assert_eq!(
-            in_app, 22,
-            "the settled distribution is 22 IN-APP / 16 HANDOFF / 23 HIDE = 61; if this moved, \
-             the 21-route figure above needs re-deriving rather than adjusting"
+            in_app, 24,
+            "the settled distribution is 24 IN-APP / 18 HANDOFF / 27 HIDE = 69; if this moved, \
+             the 23-route figure above needs re-deriving rather than adjusting"
         );
     }
 

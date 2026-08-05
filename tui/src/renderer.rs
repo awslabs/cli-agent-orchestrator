@@ -251,7 +251,7 @@ impl LayoutMode {
 pub enum InAppReadiness {
     /// Every path placeholder is bound to a form field and no filled field would be ignored.
     ///
-    /// **19 of the 22 IN-APP commands reach this on an empty form, measured** — up from 9. The earlier count was
+    /// **21 of the 24 IN-APP commands reach this on an empty form, measured** — up from 9. The earlier count was
     /// not a property of the routes; it was the consequence of `renderer` calling
     /// `run(id, &[], &[], None, ..)` and therefore treating any route with a `{token}` as
     /// unreachable, even the 10 whose token a form field plainly supplies.
@@ -2167,8 +2167,8 @@ fn create_session_banner(error: &TuiError) -> Banner {
 /// ignored one, and reporting "needs `{terminal_id}`" is more useful than listing the four fields
 /// that would also be dropped along the way.
 ///
-/// **Measured after the fix: 19 `Runnable`, 2 `NotWired`, 1 `NoRoute`** (on an empty form) —
-/// `the_in_app_gap_is_nineteen_runnable_two_not_wired_and_one_routeless` pins the real numbers
+/// **Measured after the fix: 21 `Runnable`, 2 `NotWired`, 1 `NoRoute`** (on an empty form) —
+/// `the_in_app_gap_is_twentyone_runnable_two_not_wired_and_one_routeless` pins the real numbers
 /// rather than a remembered figure. (#321, and review on PR #547)
 #[allow(dead_code)] // called by `run_in_app`; asserted directly by the gap test. (#321)
 pub fn in_app_readiness(id: CommandId, flow: &GuidedFlow) -> InAppReadiness {
@@ -4313,14 +4313,15 @@ mod tests {
     /// code as it stood, but what they measured was `renderer` calling
     /// `run(id, &[], &[], None, ..)` and therefore treating every `{token}` route as unreachable —
     /// including the 10 whose token a form field plainly supplies. With path bindings the figures
-    /// are **19 runnable, 2 not-wired, 1 routeless** across the 22 IN-APP commands.
+    /// are **21 runnable, 2 not-wired, 1 routeless** across the 24 IN-APP commands (`workflow runs`
+    /// and `workflow result`, from PR #525, are the two most recent additions).
     ///
     /// The remaining two are `cao session send` and `cao session status`, which need the
     /// session-name → terminal-id resolution call the CLI makes first (`session.py:26`). That is a
     /// genuine unimplemented step rather than an unmapped field, which is why they stay `NotWired`
     /// instead of being bound to something that looks close enough.
     ///
-    /// Measured on an EMPTY form, which is what makes 19 the honest count: `in_app_readiness` also
+    /// Measured on an EMPTY form, which is what makes 21 the honest count: `in_app_readiness` also
     /// returns `Ignored` for a command whose *filled* fields have nowhere to go, and three
     /// commands can reach that state (`memory export --output`, `schedule add`, `workflow
     /// validate`) — asserted separately in
@@ -4335,7 +4336,7 @@ mod tests {
     /// **names the missing path values**, and a `Runnable` one actually runs. That is what makes
     /// this a *stated* gap rather than a dead end — the operator can see the limit.
     #[test]
-    fn the_in_app_gap_is_nineteen_runnable_two_not_wired_and_one_routeless() {
+    fn the_in_app_gap_is_twentyone_runnable_two_not_wired_and_one_routeless() {
         let mut runnable = Vec::new();
         let mut not_wired = Vec::new();
         let mut no_route = Vec::new();
@@ -4363,8 +4364,8 @@ mod tests {
 
         assert_eq!(
             runnable.len(),
-            19,
-            "19 IN-APP commands can be built from the form and run for real. Found: {runnable:?}"
+            21,
+            "21 IN-APP commands can be built from the form and run for real. Found: {runnable:?}"
         );
         assert_eq!(
             not_wired,
@@ -4382,8 +4383,8 @@ mod tests {
         );
         assert_eq!(
             runnable.len() + not_wired.len() + no_route.len(),
-            22,
-            "the three sets must partition the 22 IN-APP commands with none double-counted"
+            24,
+            "the three sets must partition the 24 IN-APP commands with none double-counted"
         );
 
         // The operator-visible half: an unsupplied placeholder states WHAT is missing.

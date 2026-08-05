@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **65 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **69 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,7 +64,14 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **65 as of this branch.** The four `cao memory relationships *` leaves were added to the CLI by
+/// **69 as of this branch.** Two separate merges from `main` each brought four new leaf commands
+/// that this table did not know about, and both were caught by
+/// `test/test_command_catalog_matches_click.py` rather than by review — the second one in CI,
+/// because CI tests the PR MERGED against `main` while a local run only sees the branch. That is
+/// the guard doing exactly what it exists for, twice.
+///
+/// The four `cao workflow *` leaves — `runs`, `wait`, `result`, `events` — arrived with PR #525
+/// (issue #505, commit `e2e6318`). The four `cao memory relationships *` leaves were added by
 /// PR #524 (issue #511, commit `8e8695a`, 2026-08-03) and landed on `main` before this branch
 /// merged it — and this table was never updated, so the TUI simply did not know they existed. That
 /// is the exact silence `CommandId`'s docs claim the closed enum eliminated: the enum makes an
@@ -79,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 65;
+const COMMAND_COUNT: usize = 69;
 
 /// What the TUI does with a command.
 ///
@@ -176,7 +183,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 65 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 69 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -239,15 +246,19 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::TerminalRestore,
     CommandId::WorkflowCancel,
     CommandId::WorkflowDelete,
+    CommandId::WorkflowEvents,
     CommandId::WorkflowGet,
     CommandId::WorkflowList,
+    CommandId::WorkflowResult,
     CommandId::WorkflowResume,
     CommandId::WorkflowRun,
+    CommandId::WorkflowRuns,
     CommandId::WorkflowStatus,
+    CommandId::WorkflowWait,
     CommandId::WorkflowValidate,
 ];
 
-/// One variant per leaf command — **all 65**.
+/// One variant per leaf command — **all 69**.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -396,16 +407,24 @@ pub enum CommandId {
     WorkflowCancel,
     /// `cao workflow delete`
     WorkflowDelete,
+    /// `cao workflow events`
+    WorkflowEvents,
     /// `cao workflow get`
     WorkflowGet,
     /// `cao workflow list`
     WorkflowList,
+    /// `cao workflow result`
+    WorkflowResult,
     /// `cao workflow resume`
     WorkflowResume,
     /// `cao workflow run`
     WorkflowRun,
+    /// `cao workflow runs`
+    WorkflowRuns,
     /// `cao workflow status`
     WorkflowStatus,
+    /// `cao workflow wait`
+    WorkflowWait,
     /// `cao workflow validate`
     WorkflowValidate,
 }
@@ -1064,6 +1083,71 @@ fn entry(id: CommandId) -> Command {
             params: &[Param { name: "--dir", required: false, kind: ParamKind::Text }, Param { name: "--json", required: false, kind: ParamKind::Flag }],
             handoff_reason: None,
         },
+        // ── The four `cao workflow *` leaves added by PR #525 (issue #505) ──────────────
+        //
+        // Missing from this table until CI caught it on PR #547 — CI tests the PR merged against
+        // `main`, so it saw four commands a local run could not.
+        //
+        // `runs` and `result` are ordinary journal reads and are classified IN-APP: their routes
+        // (`GET /workflows/runs` at `api/main.py:2630`, `GET /workflows/runs/{run_id}/result` at
+        // `:3426`) return buffered JSON and terminate. `wait` and `events` are HANDOFF for the
+        // reason `workflow run`/`resume` already are — unbounded duration, which the single-
+        // threaded event loop cannot host.
+        CommandId::WorkflowEvents => Command {
+            id: CommandId::WorkflowEvents,
+            parent: Some("workflow"),
+            leaf_name: "events",
+            summary: "Follow a run's live event stream, rendering per-run ordered progress.",
+            policy: Policy::Handoff,
+            params: &[
+                Param { name: "run_id", required: true, kind: ParamKind::Text },
+                Param { name: "--follow", required: false, kind: ParamKind::Flag },
+                Param { name: "--after-seq", required: false, kind: ParamKind::Text },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: Some(
+                "an SSE stream consumed with `Accept: text/event-stream` and reconnect-on-drop                  (`workflow.py:929-955`): unbounded duration, and `ServerClient::run` is a                  request/response call with a 30s timeout — it cannot follow a live stream",
+            ),
+        },
+        CommandId::WorkflowResult => Command {
+            id: CommandId::WorkflowResult,
+            parent: Some("workflow"),
+            leaf_name: "result",
+            summary: "Show the complete retained result for a (finished or in-flight) run.",
+            policy: Policy::InApp,
+            params: &[
+                Param { name: "run_id", required: true, kind: ParamKind::Text },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::WorkflowRuns => Command {
+            id: CommandId::WorkflowRuns,
+            parent: Some("workflow"),
+            leaf_name: "runs",
+            summary: "List workflow RUNS newest-first (distinct from `list`, which lists specs).",
+            policy: Policy::InApp,
+            params: &[
+                Param { name: "--state", required: false, kind: ParamKind::Text },
+                Param { name: "--limit", required: false, kind: ParamKind::Text },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: None,
+        },
+        CommandId::WorkflowWait => Command {
+            id: CommandId::WorkflowWait,
+            parent: Some("workflow"),
+            leaf_name: "wait",
+            summary: "Follow an existing run by polling its status until it reaches a terminal state.",
+            policy: Policy::Handoff,
+            params: &[
+                Param { name: "run_id", required: true, kind: ParamKind::Text },
+                Param { name: "--json", required: false, kind: ParamKind::Flag },
+            ],
+            handoff_reason: Some(
+                "polls until the run reaches a terminal state (`workflow.py:624`), so its duration                  is the run's duration — unbounded, and it would block the single-threaded event                  loop for as long as the workflow takes",
+            ),
+        },
         CommandId::WorkflowResume => Command {
             id: CommandId::WorkflowResume,
             parent: Some("workflow"),
@@ -1178,7 +1262,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 22 IN-APP / 16 HANDOFF / 27 HIDE, totalling 65.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 27 HIDE, totalling 69.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1207,32 +1291,35 @@ mod tests {
     /// **Then four commands turned up that had been missing entirely.** `cao memory relationships`
     /// {list, inspect, promote, reject} were added to the CLI by PR #524 (issue #511) and never
     /// reached this table, so the figures were 22/16/23 = 61 while the Click tree had 65 leaves.
-    /// All four are HIDE, per `project.md`'s mandated default for an unclassified command, giving
-    /// **22/16/27 = 65**. Note what the shape of this failure was: every count here was internally
+    /// All four are HIDE, per `project.md`'s mandated default for an unclassified command. A second
+    /// merge then brought `cao workflow` {`runs`, `result`, `wait`, `events`} from PR #525 — caught
+    /// in CI, which tests the PR merged against `main` and so saw four commands a local run could
+    /// not. `runs`/`result` are ordinary journal reads (IN-APP); `wait`/`events` are unbounded
+    /// (HANDOFF). That gives **24/18/27 = 69**. Note what the shape of this failure was: every count here was internally
     /// consistent and every test green, because nothing compared the table against the CLI. That
     /// is what `test/test_command_catalog_matches_click.py` now does. (Review on PR #547.)
     #[test]
-    fn the_policy_distribution_is_twentytwo_sixteen_twentyseven() {
+    fn the_policy_distribution_is_twentyfour_eighteen_twentyseven() {
         let (in_app, handoff, hidden) = distribution();
 
-        assert_eq!(in_app, 22, "expected 22 IN-APP commands, found {in_app}");
-        assert_eq!(handoff, 16, "expected 16 HANDOFF commands, found {handoff}");
+        assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
+        assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
         assert_eq!(hidden, 27, "expected 27 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            65,
-            "the three policy counts must account for all 65 leaf commands of the Click tree"
+            69,
+            "the three policy counts must account for all 69 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 65 does not prove 65 *distinct* commands were counted: a
+        // The three counts summing to 69 does not prove 69 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            65,
-            "DISPLAY_ORDER must list 65 DISTINCT commands; a duplicate would let one command go \
+            69,
+            "DISPLAY_ORDER must list 69 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1254,7 +1341,7 @@ mod tests {
     ///
     /// Neither existing guard catches it. [`the_policy_distribution_is_twentytwo_sixteen_twentythree`]
     /// counts what `DISPLAY_ORDER` *contains*, so a variant missing from it is simply never
-    /// counted; and its `distinct.len() == 65` assertion detects a **duplicate**, which is the
+    /// counted; and its `distinct.len() == 69` assertion detects a **duplicate**, which is the
     /// opposite direction. [`COMMAND_COUNT`] pins the array's *length*, never its membership.
     ///
     /// # Why an exhaustive match and NOT a discriminant trick
@@ -1358,11 +1445,15 @@ mod tests {
                     CommandId::TerminalRestore => CommandId::TerminalRestore,
                     CommandId::WorkflowCancel => CommandId::WorkflowCancel,
                     CommandId::WorkflowDelete => CommandId::WorkflowDelete,
+                    CommandId::WorkflowEvents => CommandId::WorkflowEvents,
                     CommandId::WorkflowGet => CommandId::WorkflowGet,
                     CommandId::WorkflowList => CommandId::WorkflowList,
+                    CommandId::WorkflowResult => CommandId::WorkflowResult,
                     CommandId::WorkflowResume => CommandId::WorkflowResume,
                     CommandId::WorkflowRun => CommandId::WorkflowRun,
+                    CommandId::WorkflowRuns => CommandId::WorkflowRuns,
                     CommandId::WorkflowStatus => CommandId::WorkflowStatus,
+                    CommandId::WorkflowWait => CommandId::WorkflowWait,
                     CommandId::WorkflowValidate => CommandId::WorkflowValidate,
                 }
             }
@@ -1428,11 +1519,15 @@ mod tests {
                 CommandId::TerminalRestore,
                 CommandId::WorkflowCancel,
                 CommandId::WorkflowDelete,
+                CommandId::WorkflowEvents,
                 CommandId::WorkflowGet,
                 CommandId::WorkflowList,
+                CommandId::WorkflowResult,
                 CommandId::WorkflowResume,
                 CommandId::WorkflowRun,
+                CommandId::WorkflowRuns,
                 CommandId::WorkflowStatus,
+                CommandId::WorkflowWait,
                 CommandId::WorkflowValidate,
             ]
             .into_iter()
@@ -1491,8 +1586,8 @@ mod tests {
 
         assert_eq!(
             offered.len(),
-            38,
-            "commands() must offer the 33 IN-APP plus 5 HANDOFF commands and nothing else; an \
+            42,
+            "commands() must offer the 24 IN-APP plus 18 HANDOFF commands and nothing else; an \
              empty or short list would satisfy the Hidden check below while offering nothing"
         );
 
@@ -1576,10 +1671,12 @@ mod tests {
                 "skills add",
                 "skills list",
                 "skills remove",
+                "workflow events",
                 "workflow resume",
-                "workflow run"
+                "workflow run",
+                "workflow wait"
             ],
-            "expected exactly these 16 HANDOFF commands; without this assertion the loop above \
+            "expected exactly these 18 HANDOFF commands; without this assertion the loop above \
              passes vacuously when zero entries are HANDOFF"
         );
     }
