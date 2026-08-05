@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from types import SimpleNamespace
 
@@ -190,6 +191,48 @@ def test_a_version_probe_beyond_the_provider_bound_fails_closed(tmp_path, monkey
     assert "could not execute Kimi version probe" in message
     assert "'--version'" in message
     assert "timed out after 20.0 seconds" in message
+
+
+def test_the_probe_suppresses_the_updater_for_both_kimi_processes(tmp_path, monkeypatch):
+    """COND-0315: the attestor's ``--version`` and ``acp`` children both run
+    under the deterministic kill-switch, and an ambient conflicting value
+    cannot re-enable the updater for a CAO-managed attestation."""
+    observed = {}
+    clients = []
+
+    class _FakeAcp0330(_FakeAcpClient):
+        def request(self, method, params):
+            if method == "initialize":
+                return {
+                    "protocolVersion": 1,
+                    "agentInfo": {"name": "Kimi Code CLI", "version": "0.33.0"},
+                }
+            return super().request(method, params)
+
+    def fake_run(argv, **kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="0.33.0\n", stderr="")
+
+    def fake_client(argv, env, timeout):
+        client = _FakeAcp0330(argv, env, timeout)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("cli_agent_orchestrator.services.kimi_route._AcpClient", fake_client)
+    monkeypatch.setattr(os, "environ", {"KIMI_CODE_NO_AUTO_UPDATE": "0", "HOME": "/home/test"})
+    receipt = attest_kimi_route(
+        str(tmp_path.resolve()),
+        expected_model="kimi-code/k3",
+        expected_effort="max",
+        user_config_path=tmp_path / "absent.toml",
+    )
+
+    assert receipt["kimi_version"] == "0.33.0"
+    # The bounded --version probe observes under suppression...
+    assert observed["env"]["KIMI_CODE_NO_AUTO_UPDATE"] == "1"
+    # ...and so does the ACP client, regardless of the ambient conflict.
+    assert clients[0].env["KIMI_CODE_NO_AUTO_UPDATE"] == "1"
 
 
 def test_managed_kimi_command_forces_attested_route_last():

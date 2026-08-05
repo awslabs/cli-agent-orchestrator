@@ -467,6 +467,159 @@ async def test_a_kimi_0310_pane_that_never_renders_within_the_runway_blocks_with
 
 
 @pytest.mark.asyncio
+async def test_a_kimi_0320_pane_that_rewrote_its_title_is_certified_via_the_rendered_header(
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
+):
+    """COND-0315 end to end: the stage-verified 0.32.0 build certifies.
+
+    The installed 0.32.0 keeps the 0.31.0 title rewrite, so the kernel argv
+    still reads ``['kimi-code', '', ...]`` and the resumed session is proven
+    from the rendered native header, which names the bound session, the
+    0.32.0 version line, and the bound worktree.  Before the stage
+    attestation this exact launch failed closed at the bootstrap --
+    ``kimi version drift: accepted [...], installed '0.32.0'`` (run
+    cond-0303-pr74-review-k3-r5, zero task bytes) -- and it must now publish
+    the native readiness receipt the same way 0.31.0 does.
+    """
+    monkeypatch.setattr(bridge, "provider_version_banner", lambda *a, **k: "kimi 0.32.0")
+
+    rewritten_argv = ["kimi-code", "", "", "", ""]
+    header_rows = [
+        "│  Welcome to Kimi Code!                                                                              │",
+        f"│  Directory: {worktree}                                                                               │",
+        f"│  Session:   {SESSION_ID}                                                                             │",
+        "│  Model:     K3                                                                                       │",
+        "│  Version:   0.32.0                                                                                   │",
+    ]
+
+    def _rewritten_observe(self):
+        return {
+            "pane_id": "%7",
+            "pid": harness.observed_pid,
+            "start_marker": "Thu Jul 24 10:00:00 2026",
+            "argv": list(rewritten_argv),
+            "cwd": harness.observed_cwd or self._record["working_directory"],
+        }
+
+    monkeypatch.setattr(v2._V2NativePane, "observe", _rewritten_observe)
+    monkeypatch.setattr(v2._V2NativePane, "capture_render", lambda self, pane_id: list(header_rows))
+
+    record, result = await _launch(worktree, tmp_path)
+
+    receipt = _published_receipt(record["reservation_id"])
+    assert receipt["provider_receipt_kind"] == "kimi-native-tui-attached"
+    # The receipt records the provider's banner verbatim, and the bind-time
+    # check normalizes it against the accepted set.
+    assert receipt["provider_version"] == "kimi 0.32.0"
+    assert result["execution_mode"] == em.NATIVE_TUI
+    assert result["terminal_id"] == record["terminal_id"]
+    assert "session/prompt" not in harness.transport.calls
+
+
+@pytest.mark.asyncio
+async def test_a_kimi_0321_banner_still_blocks_before_any_pane_session_or_task(
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
+):
+    """An unproven neighbour of 0.32.0 stays refused, with zero mutation.
+
+    The admission is exact-set membership, never a range: 0.32.1 was not
+    read, so the same fail-closed drift refusal that 0.32.0 hit before its
+    stage attestation must still fire — before any pane, provider session,
+    or task byte.
+    """
+    monkeypatch.setattr(bridge, "provider_version_banner", lambda *a, **k: "kimi 0.32.1")
+
+    _, result = await _launch(worktree, tmp_path)
+
+    assert result["state"] == "preflight_blocked"
+    failure = result["preflight_failure"]
+    assert failure["reason"] == v2.PREFLIGHT_REASON_SESSION_BOOTSTRAP
+    assert failure["task_bytes_submitted"] is False
+    assert "version drift" in failure["detail"]
+    assert "0.32.1" in failure["detail"]
+    # Zero pane/session/task mutation: no pane was created and the bootstrap
+    # transport saw no ACP method at all — the refusal precedes initialize.
+    assert harness.terminals == []
+    assert harness.transport.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_kimi_0330_pane_is_certified_via_the_rendered_header_on_the_real_geometry(
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
+):
+    """COND-0315 end to end: the stage-verified 0.33.0 build certifies.
+
+    The current pin.  The header rows below are the shape a real
+    ``capture-pane`` paints on 0.33.0: the one-cell ``GutterContainer``
+    left pad before every box vertical, and an ``MCP:`` row after the four
+    proof labels when servers connect.  The launch must publish the native
+    readiness receipt against that real geometry, with zero task bytes.
+    """
+    monkeypatch.setattr(bridge, "provider_version_banner", lambda *a, **k: "kimi 0.33.0")
+
+    rewritten_argv = ["kimi-code", "", "", "", ""]
+    header_rows = [
+        " ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
+        " │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                  │",
+        " │  ▐█████▌  Send /help for help information.                                                                                       │",
+        " │                                                                                                                                  │",
+        f" │  Directory: {worktree}                                                                                                           │",
+        f" │  Session:   {SESSION_ID}                                                                                                         │",
+        " │  Model:     K3                                                                                                                   │",
+        " │  Version:   0.33.0                                                                                                               │",
+        " │  MCP:       5 connected                                                                                                          │",
+        " │                                                                                                                                  │",
+        " ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+    ]
+
+    def _rewritten_observe(self):
+        return {
+            "pane_id": "%7",
+            "pid": harness.observed_pid,
+            "start_marker": "Thu Jul 24 10:00:00 2026",
+            "argv": list(rewritten_argv),
+            "cwd": harness.observed_cwd or self._record["working_directory"],
+        }
+
+    monkeypatch.setattr(v2._V2NativePane, "observe", _rewritten_observe)
+    monkeypatch.setattr(v2._V2NativePane, "capture_render", lambda self, pane_id: list(header_rows))
+
+    record, result = await _launch(worktree, tmp_path)
+
+    receipt = _published_receipt(record["reservation_id"])
+    assert receipt["provider_receipt_kind"] == "kimi-native-tui-attached"
+    assert receipt["provider_version"] == "kimi 0.33.0"
+    assert result["execution_mode"] == em.NATIVE_TUI
+    assert result["terminal_id"] == record["terminal_id"]
+    assert "session/prompt" not in harness.transport.calls
+
+
+@pytest.mark.asyncio
+async def test_a_kimi_0331_banner_still_blocks_before_any_pane_session_or_task(
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
+):
+    """The build beyond the current pin stays refused, with zero mutation.
+
+    Exact-set membership, never a range: 0.33.1 was not read, so the same
+    fail-closed drift refusal that 0.32.0 and 0.33.0 each hit before their
+    stage attestations must still fire — before any pane, provider session,
+    or task byte.
+    """
+    monkeypatch.setattr(bridge, "provider_version_banner", lambda *a, **k: "kimi 0.33.1")
+
+    _, result = await _launch(worktree, tmp_path)
+
+    assert result["state"] == "preflight_blocked"
+    failure = result["preflight_failure"]
+    assert failure["reason"] == v2.PREFLIGHT_REASON_SESSION_BOOTSTRAP
+    assert failure["task_bytes_submitted"] is False
+    assert "version drift" in failure["detail"]
+    assert "0.33.1" in failure["detail"]
+    assert harness.terminals == []
+    assert harness.transport.calls == []
+
+
+@pytest.mark.asyncio
 async def test_the_native_launch_starts_no_acp_bridge(
     isolated_memory_db, worktree, tmp_path, harness
 ):

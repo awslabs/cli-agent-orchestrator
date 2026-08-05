@@ -789,6 +789,21 @@ class TestKimiNativeProfileMaterial:
         assert (private_home / "sessions").resolve() == (provider_home / "sessions").resolve()
         assert environment["PATH"] == "/bin"
 
+    def test_the_profile_environment_preserves_the_updater_kill_switch(self, monkeypatch, tmp_path):
+        # COND-0315: the generation-private Kimi home rewrites only
+        # KIMI_CODE_HOME; the reservation-pinned updater suppression the
+        # base environment carries must reach the native pane untouched.
+        monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companions")
+        environment = v2._kimi_profile_environment(
+            record={"terminal_id": "term", "generation": "gen"},
+            profile_material=self._material(allowed_tools=["*"]),
+            base_environment={
+                "KIMI_CODE_NO_AUTO_UPDATE": "1",
+                "PATH": "/bin",
+            },
+        )
+        assert environment["KIMI_CODE_NO_AUTO_UPDATE"] == "1"
+
 
 class TestOneCompletenessRuleForBindAndProjection:
     """Bind and the projection must answer the same question identically.

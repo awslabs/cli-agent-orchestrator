@@ -236,6 +236,18 @@ def _provider_route_environment(request: dict[str, Any]) -> dict[str, str]:
     trap: the first launch that took one would silently reinstate the
     override, and it would surface as a provider protocol error nowhere near
     its cause.
+
+    It is likewise the one place the Kimi updater kill-switch
+    (``provider_contracts.kimi_update_suppression_env``) is pinned for every
+    managed Kimi child — the ACP bridge child, the preflight ``--version``
+    probe, the session bootstrap, and the resumed native TUI all compose
+    their environment through this seam, and it applies *after* the ambient
+    passthrough, so an operator-supplied conflicting value cannot re-enable
+    the provider's background self-updater inside a managed child process
+    (cond-0315).  The fence is strictly per-process: it keeps the selected
+    child self-identical until it exits and says nothing about the
+    operator's PATH installation, which stays free to update on its own
+    schedule.
     """
     if request["provider"] == "kimi_cli":
         effort = request.get("effort")
@@ -245,7 +257,10 @@ def _provider_route_environment(request: dict[str, Any]) -> dict[str, str]:
         # not the sentinel, and not a substituted default. The provider
         # then applies its own, which is the only value anyone here has
         # grounds to run under.
-        return provider_contracts.kimi_effort_env(effort)
+        return {
+            **provider_contracts.kimi_update_suppression_env(),
+            **provider_contracts.kimi_effort_env(effort),
+        }
     return {}
 
 

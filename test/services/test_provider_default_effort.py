@@ -122,7 +122,13 @@ class TestNoEffortReachesTheProviderChild:
         return {"provider": provider, "model": K27, "effort": effort}
 
     def test_the_sentinel_contributes_no_environment_variable(self):
-        assert bridge._provider_route_environment(self._request(SENTINEL)) == {}
+        route_env = bridge._provider_route_environment(self._request(SENTINEL))
+        # No effort variable: the sentinel selects none, so none is sent.
+        assert "KIMI_MODEL_THINKING_EFFORT" not in route_env
+        # The updater kill-switch is not an effort control — it fences
+        # every managed Kimi child process against self-update mid-run
+        # (cond-0315), the sentinel route included.
+        assert route_env == {"KIMI_CODE_NO_AUTO_UPDATE": "1"}
 
     def test_the_native_child_environment_carries_no_effort_override(self):
         """The path the acceptance gate exercises with --execution-mode native_tui.

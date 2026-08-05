@@ -603,6 +603,66 @@ def test_provider_error_items_become_generation_bound_refusal_receipts(tmp_path,
     )
 
 
+# -- COND-0315: the updater kill-switch is a managed-launch invariant ------
+
+
+def test_the_route_environment_pins_the_kimi_updater_kill_switch(tmp_path):
+    # The provider's supported background updater replaced the installed
+    # binary mid-campaign four times running (0.30/0.31/0.32/0.33); the
+    # deterministic kill-switch is pinned by the reservation, not by the
+    # operator's ambient shell.
+    route_env = bridge._provider_route_environment(
+        _request(tmp_path, provider="kimi_cli", model="kimi-code/k3", effort="max")
+    )
+    assert route_env["KIMI_CODE_NO_AUTO_UPDATE"] == "1"
+    assert route_env["KIMI_MODEL_THINKING_EFFORT"] == "max"
+
+
+def test_the_kill_switch_never_reaches_a_non_kimi_route(tmp_path):
+    codex_env = bridge._provider_route_environment(_request(tmp_path, provider="codex"))
+    claude_env = bridge._provider_route_environment(
+        _request(tmp_path, provider="claude_code", model="claude-x", effort="high")
+    )
+    assert "KIMI_CODE_NO_AUTO_UPDATE" not in codex_env
+    assert "KIMI_CODE_NO_AUTO_UPDATE" not in claude_env
+
+
+def test_an_ambient_conflicting_value_cannot_reenable_updates(tmp_path, monkeypatch):
+    # The reservation-owned value wins over the ambient passthrough: an
+    # operator shell carrying KIMI_CODE_NO_AUTO_UPDATE=0 (or any other
+    # value) must not re-enable the updater for a CAO-managed Kimi launch.
+    ambient = {
+        "HOME": "/home/test",
+        "KIMI_CODE_NO_AUTO_UPDATE": "0",
+    }
+    monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", None)
+    bridge_env, provider_env, _ = bridge._provider_bound_environments("kimi_cli", ambient)
+    assert provider_env["KIMI_CODE_NO_AUTO_UPDATE"] == "0"  # passthrough, pre-override
+    monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", provider_env)
+    child_env = bridge._provider_child_environment(
+        _request(tmp_path, provider="kimi_cli", model="kimi-code/k3", effort="max")
+    )
+    assert child_env["KIMI_CODE_NO_AUTO_UPDATE"] == "1"
+
+
+def test_the_version_banner_probe_observes_under_the_kill_switch(tmp_path, monkeypatch):
+    # The preflight ``--version`` probe runs the update preflight too
+    # (bundle-read: every CLI entry runs it), so it must observe under the
+    # same suppression.
+    request = _request(tmp_path, provider="kimi_cli", model="kimi-code/k3", effort="max")
+    observed = {}
+
+    def _run(argv, **kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="0.33.0\n", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _run)
+    monkeypatch.setattr(bridge, "_BOUND_PROVIDER_ENV", {"HOME": "/home/test"})
+
+    assert bridge.provider_version_banner(request) == "0.33.0"
+    assert observed["env"]["KIMI_CODE_NO_AUTO_UPDATE"] == "1"
+
+
 def test_bridge_environment_is_pruned_to_minimal_allowlist(monkeypatch):
     # The bridge and provider child are both composed from bounded inputs.
     # Foreign provider controls are removed before the fail-closed guard,

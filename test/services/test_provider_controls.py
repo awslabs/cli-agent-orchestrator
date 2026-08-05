@@ -26,7 +26,7 @@ CODEX = provider_contracts.PROVIDER_CODEX
 COMPACT_EVENTS = [{"type": "text", "text": "/compact"}, {"type": "key", "key": "Enter"}]
 STOP_EVENTS = [{"type": "key", "key": "Escape"}]
 
-KIMI_PINNED_BUILDS = ("0.29.0", "0.29.1", "0.29.2", "0.30.0", "0.31.0")
+KIMI_PINNED_BUILDS = ("0.29.0", "0.29.1", "0.29.2", "0.30.0", "0.31.0", "0.32.0", "0.33.0")
 
 # The §8.6 Lane C blocks, restated exactly (a test may pin a literal;
 # production code may not).
@@ -224,15 +224,16 @@ class TestPerTerminalBlock:
         block = provider_controls.controls_block_for(KIMI, "9.9.9")
         assert block["steer_chords"] == []
 
-    @pytest.mark.parametrize("build", ["0.30.0", "0.31.0"])
+    @pytest.mark.parametrize("build", ["0.30.0", "0.31.0", "0.32.0", "0.33.0"])
     def test_a_text_proven_build_does_not_inherit_image_authority(self, build):
-        # cond-0310: 0.31.0 (and retained 0.30.0) are text/multiline/steer
-        # proven — their bundle composer facts are read, so they advertise the
-        # operator_message block and the C-s steer chord — but the image block
-        # is gated by the separate IMAGE_PROVEN_BUILDS table (0.29.2 only). A
-        # build whose staged-path image transport+consumption was never
-        # live-proven must NOT inherit 0.29.2's image authority. Image stays
-        # fail-closed; adding the build to SUPPORTED_VERSIONS never grants it.
+        # cond-0310/cond-0315: 0.31.0, 0.32.0, and 0.33.0 (and retained 0.30.0)
+        # are text/multiline/steer proven — their bundle composer facts are read, so
+        # they advertise the operator_message block and the C-s steer chord —
+        # but the image block is gated by the separate IMAGE_PROVEN_BUILDS table
+        # (0.29.2 only). A build whose staged-path image transport+consumption
+        # was never live-proven must NOT inherit 0.29.2's image authority.
+        # Image stays fail-closed; adding the build to SUPPORTED_VERSIONS never
+        # grants it.
         block = provider_controls.controls_block_for(KIMI, build)
         assert block["steer_chords"] == ["C-s"]
         assert block["operator_message"] == OPERATOR_MESSAGE_BLOCK
