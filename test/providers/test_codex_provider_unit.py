@@ -2266,6 +2266,95 @@ class TestCodexProviderApprovalModal:
             "╭─ Command Approval Required ─╮\n│ [a] Accept  [d] Decline     │\n"
         )
 
+    def test_get_status_modal_quoted_as_indented_transcript_is_completed(self):
+        """The model quoting a modal TRANSCRIPT back must not be read as the modal.
+
+        Harder than prose: the quoted block reproduces the modal's per-line
+        structure exactly (header alone on its line, choice keys starting their
+        line), so it satisfies the corroboration and line-structure guards. Only
+        the left-margin guard separates it — the quote is indented under its
+        bullet, the real box is drawn at the margin.
+        """
+        output = load_fixture("codex_approval_modal_quoted_in_reply.txt")
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.COMPLETED
+
+    def test_get_status_modal_quoted_as_markdown_table_is_completed(self):
+        """A modal transcribed into a markdown table must not be read as the modal.
+
+        Motivates excluding ASCII ``+-|`` from MODAL_FRAME_CHARS: were they
+        stripped as frame chrome, these rows would reduce to the modal shape
+        while sitting at the left margin, defeating every guard.
+        """
+        output = (
+            "› document the approval modal\n"
+            "• I documented it as:\n"
+            "| Command Approval Required |\n"
+            "| [a] Accept | [d] Decline |\n"
+            "› \n"
+            "  ? for shortcuts                     90% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.COMPLETED
+
+    def test_get_status_approval_modal_heavy_box(self):
+        """A modal framed in heavy box-drawing glyphs still classifies as WAITING.
+
+        Defensive: only light glyphs have been observed in the wild, but the
+        frame style is not contractual and missing a real modal is the costly
+        direction.
+        """
+        output = load_fixture("codex_approval_modal_heavy_box.txt")
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_approval_modal_double_box(self):
+        """Double-line frame glyphs are stripped as chrome too."""
+        output = (
+            "› run the deploy script\n"
+            "╔═ Command Approval Required ═╗\n"
+            "║ [a] Accept  [d] Decline    ║\n"
+            "╚════════════════════════════╝\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_has_approval_modal_accepts_framed_box_with_whitespace_gutter(self):
+        """A framed box indented as a whole is still a modal.
+
+        The left-margin guard rejects a leading run of whitespace ONLY; a run
+        containing frame glyphs is chrome regardless of surrounding padding, so
+        indenting the box does not break detection.
+        """
+        assert _has_approval_modal_in_bottom(
+            "    ╭─ Command Approval Required ─╮\n    │ [a] Accept  [d] Decline    │\n"
+        )
+
+    def test_has_approval_modal_accepts_unframed_modal_at_left_margin(self):
+        """An unframed modal at column 0 is accepted — no indent, so no prose signal."""
+        assert _has_approval_modal_in_bottom("Command Approval Required\n[a] Accept  [d] Decline\n")
+
+    def test_has_approval_modal_requires_both_halves_at_left_margin(self):
+        """One half framed and the other indented is a quote, not a box."""
+        assert not _has_approval_modal_in_bottom(
+            "╭─ Command Approval Required ─╮\n    [a] Accept  [d] Decline\n"
+        )
+        assert not _has_approval_modal_in_bottom(
+            "    Command Approval Required\n│ [a] Accept  [d] Decline │\n"
+        )
+
     def test_startup_blocking_input_pattern_still_vetoes_readiness(self):
         """Splitting the startup pattern must not weaken the startup-path veto."""
         assert not _has_startup_idle_composer(
