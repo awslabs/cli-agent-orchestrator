@@ -66,6 +66,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::Terminal as RatatuiTerminal;
 
@@ -74,6 +75,7 @@ use crate::error::TuiError;
 use crate::guided_flow::{self, Field, FieldKind, GuidedFlow, PickerState, UNLOADABLE_MARKER};
 use crate::handoff::{HandoffDriver, Host, ServerRead};
 use crate::results_pane::{PaneState, ResultsPane};
+use crate::theme::Theme;
 use crate::types::{Health, Profile, Provider, Readiness, SessionParams, Terminal, TerminalStatus};
 
 /// The minimum terminal the two-column layout needs (NFR-6). Below either bound the layout
@@ -149,8 +151,12 @@ pub struct Fatal(pub String);
 /// Which region has keyboard focus. Focus order follows FR-2.1's step order.
 ///
 /// A closed enum with an exhaustive `match` in [`Renderer::on_key`], following `catalog.rs`'s
-/// idiom: a sixth region is a compile error rather than a region that silently cannot be reached
+/// idiom: a further region is a compile error rather than a region that silently cannot be reached
 /// by `Tab` — which, for a keyboard-only UI (NFR-3), is the same as not existing. (#321)
+///
+/// [`Self::AgentPicker`] and [`Self::ProviderPicker`] were added when the pickers became foldable:
+/// a fold the operator cannot focus is a fold they cannot open, so the two regions are what make
+/// collapsed-by-default safe rather than lossy.
 #[allow(dead_code)] // every variant is constructed by `on_key`'s focus ring. (#321)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -160,6 +166,10 @@ pub enum Focus {
     RequiredFields,
     /// The collapsed-by-default optional section header (FR-2.3).
     OptionalSection,
+    /// The collapsed-by-default agent picker. `Enter` folds, `Up`/`Down` scroll when expanded.
+    AgentPicker,
+    /// The collapsed-by-default provider picker. Same keys as [`Self::AgentPicker`].
+    ProviderPicker,
     /// The results pane. `[k]` cancels here, and **only while running**.
     Results,
 }
@@ -171,10 +181,12 @@ impl Focus {
     /// A `const` array rather than an `impl` with four arms so the *order* is readable as data —
     /// FR-2.1 specifies a step order, and a chain of `match` arms makes it something a reader has
     /// to reconstruct.
-    const ORDER: [Self; 4] = [
+    const ORDER: [Self; 6] = [
         Self::CommandList,
         Self::RequiredFields,
         Self::OptionalSection,
+        Self::AgentPicker,
+        Self::ProviderPicker,
         Self::Results,
     ];
 
@@ -426,32 +438,46 @@ enum PendingAction {
 /// is blank when every rendered string is empty or whitespace. So [`Self::is_blank`] asks "is
 /// there at least one non-whitespace glyph", not `frame != Frame::default()` — the latter passes
 /// while the screen is visually empty. (#321)
+/// # Why the regions are `Line<'static>` and not `String` (#556)
+///
+/// The semantic colour layer has to attach a style to *part* of a line — the `>` focus marker, an
+/// unset field's `(required)` — and a `Vec<String>` has nowhere to put one. Carrying the style in
+/// the `Frame` rather than applying it in [`Renderer::draw`] keeps the property this type exists
+/// for: the widget path and the assertion path see the same data, styles included, so a styling
+/// mistake is assertable without a terminal.
+///
+/// `'static` and not `'_`: a borrowed lifetime would tie `Frame` to `&self`, which
+/// `render(&self) -> Frame` cannot return. Every string in here is already owned, so this costs
+/// nothing.
+///
+/// **Every pre-#556 test asserts on content, not style**, and they were repointed at
+/// [`Self::plain_lines`] rather than rewritten — a rewritten assertion is a chance to weaken one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     /// The layout NFR-6 chose for the current size.
     pub layout: LayoutMode,
     /// App title plus the server-status indicator, textual.
-    pub header: Vec<String>,
+    pub header: Vec<Line<'static>>,
     /// The navigable command list — **HIDE rows already excluded** by `commands()` (FR-4.3).
-    pub command_list: Vec<String>,
+    pub command_list: Vec<Line<'static>>,
     /// The required fields, always visible.
-    pub required_fields: Vec<String>,
+    pub required_fields: Vec<Line<'static>>,
     /// The optional section: its header always, its fields only when expanded (FR-2.3).
-    pub optional_section: Vec<String>,
+    pub optional_section: Vec<Line<'static>>,
     /// The two pickers' states, each stating cause and remedy when failed (FR-6.1).
-    pub pickers: Vec<String>,
+    pub pickers: Vec<Line<'static>>,
     /// The results pane's own lines, pulled from the pane.
-    pub results: Vec<String>,
+    pub results: Vec<Line<'static>>,
     /// The banner, when there is one.
-    pub banner: Vec<String>,
+    pub banner: Vec<Line<'static>>,
     /// Gating reason | key hints (FR-6.2, NFR-3).
-    pub footer: Vec<String>,
+    pub footer: Vec<Line<'static>>,
 }
 
 #[allow(dead_code)] // `is_blank` is SR-2's predicate, asserted by this module's tests. (#321)
 impl Frame {
     /// Every line in the frame, in render order.
-    fn all_lines(&self) -> impl Iterator<Item = &String> {
+    fn all_lines(&self) -> impl Iterator<Item = &Line<'static>> {
         self.header
             .iter()
             .chain(&self.command_list)
@@ -463,12 +489,32 @@ impl Frame {
             .chain(&self.footer)
     }
 
+    /// Every line's **text**, styles discarded, in render order.
+    ///
+    /// This is the strip-styling seam (FR-5.2) and it does double duty. It is what the pre-#556
+    /// tests assert on, so the `Vec<String>` → `Vec<Line>` migration did not have to touch them;
+    /// and it is what the FR-5.2 guards use to prove no state is conveyed by colour alone, because
+    /// what it returns is exactly what an operator on a monochrome terminal reads.
+    ///
+    /// Uses `Line::to_string`, which concatenates the spans' content — so a line assembled from
+    /// three styled spans yields the same string as the single unstyled span it replaced. That
+    /// equivalence is what `the_frames_plain_text_survived_the_line_migration` pins.
+    pub fn plain_lines(&self) -> Vec<String> {
+        self.all_lines().map(Line::to_string).collect()
+    }
+
     /// Is there **no** non-whitespace glyph anywhere in the frame?
     ///
     /// The definition `frontend-components.md:167` insists on, because a blank screen is
     /// indistinguishable from a hang (SR-2) and a weaker definition makes the guard vacuous.
+    ///
+    /// **Unchanged by #556, deliberately.** This is SR-2's predicate, and it still asks about
+    /// *glyphs*: a styled-but-empty `Line` is blank, exactly as an empty `String` was. Letting a
+    /// style count as content would retire a safety property silently (FR-4.3).
     pub fn is_blank(&self) -> bool {
-        !self.all_lines().any(|line| !line.trim().is_empty())
+        !self
+            .all_lines()
+            .any(|line| !line.to_string().trim().is_empty())
     }
 }
 
@@ -497,6 +543,21 @@ pub struct Renderer<'a, S: ServerApi, H: Host> {
     focus: Focus,
     /// `false` by default (FR-2.3): the optional section is collapsed but **present**.
     optional_expanded: bool,
+    /// `false` by default: the agent list is collapsed to a counted header but **present**.
+    ///
+    /// The left column does not scroll — `draw` renders it as one `Paragraph`, so anything past the
+    /// last row is simply clipped. With 25 agents the picker pushed the *banner* off-screen, which
+    /// meant a failure the operator needed to read was invisible. Collapsing by default is what
+    /// keeps the column bounded regardless of how many profiles the machine has.
+    agents_expanded: bool,
+    /// `false` by default, for the same reason as [`Self::agents_expanded`].
+    providers_expanded: bool,
+    /// First visible row within the expanded agent list — the viewport offset, not a selection.
+    ///
+    /// A separate scroll offset per picker, because scrolling one must not move the other.
+    agent_scroll: usize,
+    /// First visible row within the expanded provider list.
+    provider_scroll: usize,
     cols: u16,
     rows: u16,
     banner: Option<Banner>,
@@ -527,6 +588,14 @@ pub struct Renderer<'a, S: ServerApi, H: Host> {
     edit_buffer: Option<(usize, String)>,
     /// Set by `[q]` (or a confirmed quit) and read by the event loop.
     should_quit: bool,
+    /// The semantic palette (#556). The **only** presentation-only field on this struct.
+    ///
+    /// Held rather than read from the environment at each `render()`: `Theme::from_env` is resolved
+    /// once at startup (`main`), so a `NO_COLOR` change mid-session cannot make the screen
+    /// half-coloured, and `render()` stays a pure function of state. It is also what makes
+    /// [`Self::set_theme`] enough to test both palettes without touching process environment —
+    /// which matters, because `std::env::set_var` is racy across Rust's threaded test harness.
+    theme: Theme,
 }
 
 #[allow(dead_code)] // `main` reaches `new`/`run`/`render`; the rest await the event loop. (#321)
@@ -551,6 +620,10 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
             field_cursor: 0,
             focus: Focus::CommandList,
             optional_expanded: false,
+            agents_expanded: false,
+            providers_expanded: false,
+            agent_scroll: 0,
+            provider_scroll: 0,
             cols,
             rows,
             banner: None,
@@ -563,7 +636,22 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
             confirm_quit: false,
             edit_buffer: None,
             should_quit: false,
+            // Colour by default, and `main` overrides it with `Theme::from_env()`. The default is
+            // deliberately the LOUD one: a forgotten `set_theme` then shows up as colour with
+            // `NO_COLOR` set, which somebody reports, rather than as a permanently monochrome TUI,
+            // which looks like working code. (#556)
+            theme: Theme::default(),
         }
+    }
+
+    /// Installs the palette, once, at startup.
+    ///
+    /// Separate from [`Self::new`] because `render()`'s signature cannot take a theme — it is
+    /// `Widget::render(self, area, buf)` downstream — and because reading the environment inside a
+    /// constructor would make every test's rendering depend on the ambient `NO_COLOR`. (#556)
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        self.pane.set_theme(theme);
     }
 
     /// Installs the production concurrent picker source.
@@ -680,20 +768,114 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
     /// unconditional — that alone makes [`Frame::is_blank`] false even with the server down, both
     /// pickers failed and no command selected, which is the total-failure case the never-blank
     /// test exercises.
+    /// The producers below still return `Vec<String>`, and #556 converts at **this** boundary
+    /// rather than retyping each of them. Two reasons: a producer that builds plain text cannot
+    /// accidentally apply a colour, so the "only `theme.rs` names a `Color`" property is easier to
+    /// hold; and it kept the `Vec<String>` → `Vec<Line>` migration to one place, which is what let
+    /// `the_frames_plain_text_survived_the_line_migration` isolate a wrapping regression from a
+    /// styling mistake. `style_*` below then re-splits the lines that need a styled span.
     pub fn render(&self) -> Frame {
         let layout = LayoutMode::of(self.cols, self.rows);
 
         Frame {
             layout,
-            header: self.header_lines(),
-            command_list: self.command_list_lines(),
-            required_fields: self.field_lines(true),
-            optional_section: self.optional_section_lines(),
-            pickers: self.picker_lines(),
-            results: self.results_lines(),
-            banner: self.banner.as_ref().map(Banner::lines).unwrap_or_default(),
-            footer: self.footer_lines(),
+            // Unstyled, deliberately. The header's server line already carries its own cause and
+            // remedy as words (FR-6.1); colouring it `error` would add nothing an operator acts on
+            // and would put a second, redundant signal on the crate's most-read line.
+            header: plain(self.header_lines()),
+            command_list: self.style_focus_marker(self.command_list_lines()),
+            required_fields: self.style_form(self.field_lines(true)),
+            optional_section: self.style_form(self.optional_section_lines()),
+            pickers: style_pickers(self.picker_lines(), &self.theme),
+            // Unstyled here: the pane styles ITSELF (T-4). These lines are read back out of the
+            // pane's own rendered buffer, so restyling them would be a second opinion about a
+            // decision the pane already made — and the two could disagree.
+            results: plain(self.results_lines()),
+            banner: plain(self.banner.as_ref().map(Banner::lines).unwrap_or_default()),
+            footer: self.style_footer(self.footer_lines()),
         }
+    }
+
+    /// `theme.focus` on the focus marker **and its whole line** (FR-4.4, FR-4.5).
+    ///
+    /// The line, not just the `>`: a one-character cue is what NFR-3 item 7 calls insufficient
+    /// visible focus, and the marker is already structural — the colour is a second channel on the
+    /// same fact, which is exactly what decoration-only colour means.
+    ///
+    /// There is **no border and no selected-row widget to style instead** (design C-2, P-22): this
+    /// crate renders one `Block::new()`, borderless, and uses no `List`/`Table`/`highlight_style`.
+    /// The issue's palette table says focus applies to the "focused region border, selected row";
+    /// applying it to the existing `>` marker is the honest translation of that intent.
+    fn style_focus_marker(&self, lines: Vec<String>) -> Vec<Line<'static>> {
+        lines
+            .into_iter()
+            .map(|line| {
+                if line.starts_with('>') {
+                    Line::styled(line, self.theme.focus)
+                } else if line.contains(SCROLL_RESIDUE_MARKER) {
+                    // The windowed list's residue line is navigational chrome, same as a picker's.
+                    Line::styled(line, self.theme.dim)
+                } else {
+                    Line::raw(line)
+                }
+            })
+            .collect()
+    }
+
+    /// The form's two regions: `focus` on the marked row, `required` on an **unset** `(required)`,
+    /// `dim` on the `[not sent — …]` marker (FR-4.4).
+    ///
+    /// # Why `(required)` is only styled while the field is unset
+    ///
+    /// A satisfied required field is not a thing the operator has to act on, and colouring it
+    /// keeps a warning on screen after the warning is answered — which trains the operator to
+    /// ignore the colour. The "unset" test is the rendered `: —` value that [`render_field`] writes
+    /// for `None`, read back rather than re-derived from `GuidedFlow`: re-deriving would let the
+    /// style disagree with the text on the same line.
+    fn style_form(&self, lines: Vec<String>) -> Vec<Line<'static>> {
+        lines
+            .into_iter()
+            .map(|line| {
+                // A focused row takes `focus` for the whole line, so the two roles cannot fight
+                // over the same cells. Focus is the more urgent of the two — it says where the
+                // keyboard is.
+                if line.starts_with('>') {
+                    return Line::styled(line, self.theme.focus);
+                }
+
+                let unset_required =
+                    line.contains(REQUIREMENT_SUFFIX) && line.trim_end().ends_with(UNSET_VALUE);
+                if unset_required {
+                    return split_styled(&line, REQUIREMENT_SUFFIX, self.theme.required);
+                }
+
+                let not_sent = format!("[{}]", guided_flow::NOT_SENT_MARKER);
+                if line.contains(&not_sent) {
+                    return split_styled(&line, &not_sent, self.theme.dim);
+                }
+
+                Line::raw(line)
+            })
+            .collect()
+    }
+
+    /// The footer's blocked reason takes `required` (FR-4.4).
+    ///
+    /// `required` and not `error`: a blocked form is not a failure, it is an unfinished one, and the
+    /// reason names the field the operator still has to fill. Reaching for `error` here would report
+    /// a problem where there is only an incomplete step — and the palette already has a role that
+    /// means "you need to supply this".
+    fn style_footer(&self, lines: Vec<String>) -> Vec<Line<'static>> {
+        lines
+            .into_iter()
+            .map(|line| {
+                if line.starts_with(BLOCKED_PREFIX) {
+                    Line::styled(line, self.theme.required)
+                } else {
+                    Line::raw(line)
+                }
+            })
+            .collect()
     }
 
     /// Title plus the server indicator, textual (NFR-3).
@@ -719,12 +901,77 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         vec![format!("cao-tui {}", env!("CARGO_PKG_VERSION")), status]
     }
 
-    /// The command list. `Hidden` rows are **absent**, not disabled (FR-4.3, SR-3).
+    /// The command list, **windowed around the cursor**. `Hidden` rows are absent (FR-4.3, SR-3).
     ///
     /// The focus marker is a structural `>` rather than a colour, per NFR-3 item 1 — a screen
     /// whose focus is only a hue is unnavigable for anyone who cannot see it, and item 7 makes
     /// visible focus a hard requirement.
+    ///
+    /// # Why this is windowed, and why folding the pickers alone was not enough
+    ///
+    /// The catalog offers **42 commands**, and at 120 columns several wrap, so the full list needs
+    /// roughly 55 screen rows. The left column is one non-scrolling `Paragraph`, so on any terminal
+    /// shorter than that the list consumed the whole column and the form, the pickers and the
+    /// banner were all clipped away — measured in a real pty at both 40 and 70 rows, where the
+    /// pickers never appeared at all regardless of how few agents the machine had.
+    ///
+    /// That means the reported "can't see the agents" had **two** independent causes: a long agent
+    /// list (fixed by the fold) and this. Folding the pickers while leaving the list unbounded
+    /// would have produced a fold the operator still could not see, so the fix is only complete
+    /// with both.
+    ///
+    /// The window follows the cursor rather than being a fixed slice, because the list is what
+    /// `Up`/`Down` move through: a fixed slice would let the cursor walk off the visible rows,
+    /// which is the same invisible-focus defect one region over.
     fn command_list_lines(&self) -> Vec<String> {
+        let rows: Vec<String> = self.command_rows();
+        let window = self.command_list_window();
+        if rows.len() <= window {
+            return rows;
+        }
+
+        // Centre the cursor, then clamp to the ends so the first and last screens are full rather
+        // than half-empty — a half-empty last screen reads as the end of a shorter list.
+        let half = window / 2;
+        let start = self
+            .cursor
+            .saturating_sub(half)
+            .min(rows.len().saturating_sub(window));
+        let end = (start + window).min(rows.len());
+
+        let mut lines: Vec<String> = Vec::with_capacity(window + 1);
+        lines.extend(rows[start..end].iter().cloned());
+        // The residue names what is off-screen in each direction, so a partial list never reads as
+        // the whole catalog.
+        let (above, below) = (start, rows.len() - end);
+        if above > 0 || below > 0 {
+            let mut parts = Vec::new();
+            if above > 0 {
+                parts.push(format!("{above} above"));
+            }
+            if below > 0 {
+                parts.push(format!("{below} below"));
+            }
+            lines.push(format!(
+                "  … {} of {} commands, {SCROLL_RESIDUE_MARKER}",
+                parts.join(", "),
+                rows.len()
+            ));
+        }
+        lines
+    }
+
+    /// How many rows the command list may occupy.
+    ///
+    /// A third of the terminal, floored at 3: the list shares the column with the form, the two
+    /// picker folds and the banner, and a list that takes the whole height is the defect being
+    /// fixed. The floor keeps it navigable at the smallest size the crate renders at.
+    fn command_list_window(&self) -> usize {
+        usize::from(self.rows / 3).max(3)
+    }
+
+    /// Every command as a line, unwindowed — [`Self::command_list_lines`] slices this.
+    fn command_rows(&self) -> Vec<String> {
         self.commands
             .iter()
             .enumerate()
@@ -773,7 +1020,10 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                     Focus::OptionalSection => {
                         !guided && self.optional_expanded && self.field_cursor == offset + index
                     }
-                    Focus::CommandList | Focus::Results => false,
+                    Focus::CommandList
+                    | Focus::AgentPicker
+                    | Focus::ProviderPicker
+                    | Focus::Results => false,
                 };
                 render_field(field, focused, self.flow.current())
             })
@@ -833,21 +1083,36 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                 lines.push("agents: none found on this machine".to_string());
             }
             PickerState::Loaded(profiles) => {
-                lines.push(format!("agents ({}):", profiles.len()));
-                for profile in profiles {
-                    // The unselectable marker travels WITH its row (FR-1.5): an unloadable profile
-                    // is shown and explained, never filtered out.
-                    if profile.loadable {
-                        lines.push(format!("  {}", profile.name));
-                    } else {
-                        lines.push(format!("  {} [{UNLOADABLE_MARKER}]", profile.name));
-                    }
-                }
+                // The unselectable marker travels WITH its row (FR-1.5): an unloadable profile
+                // is shown and explained, never filtered out.
+                let rows: Vec<String> = profiles
+                    .iter()
+                    .map(|profile| {
+                        if profile.loadable {
+                            format!("  {}", profile.name)
+                        } else {
+                            format!("  {} [{UNLOADABLE_MARKER}]", profile.name)
+                        }
+                    })
+                    .collect();
+                let unavailable = profiles.iter().filter(|p| !p.loadable).count();
+                lines.extend(self.fold_lines(
+                    "agents",
+                    &rows,
+                    unavailable,
+                    "unloadable",
+                    self.agents_expanded,
+                    self.agent_scroll,
+                    self.focus == Focus::AgentPicker,
+                ));
             }
             PickerState::Failed(error) => {
                 // `[ctrl+r]`, not `[r]`: a plain `r` is TEXT in a field, so naming it here would
                 // promise an affordance that types instead of retrying — the `[c] clear` failure
                 // again, where a documented key did nothing. (#321)
+                //
+                // NEVER FOLDED, in any state: a failure the operator has to act on must not need a
+                // keystroke to become visible, and this line already fits in one row.
                 lines.push(format!(
                     "agents: unavailable — {error}. Press [ctrl+r] to retry"
                 ));
@@ -860,17 +1125,29 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                 lines.push("providers: none reported".to_string());
             }
             PickerState::Loaded(providers) => {
-                lines.push(format!("providers ({}):", providers.len()));
-                for provider in providers {
-                    // `installed` is DISPLAY information, never a filter (FR-1.7): the endpoint
-                    // serves a hard-coded nine-entry map against a ten-value enum, so hiding an
-                    // uninstalled provider would hide real drift.
-                    if provider.installed {
-                        lines.push(format!("  {}", provider.name));
-                    } else {
-                        lines.push(format!("  {} (not installed)", provider.name));
-                    }
-                }
+                // `installed` is DISPLAY information, never a filter (FR-1.7): the endpoint
+                // serves a hard-coded nine-entry map against a ten-value enum, so hiding an
+                // uninstalled provider would hide real drift.
+                let rows: Vec<String> = providers
+                    .iter()
+                    .map(|provider| {
+                        if provider.installed {
+                            format!("  {}", provider.name)
+                        } else {
+                            format!("  {} {NOT_INSTALLED_MARKER}", provider.name)
+                        }
+                    })
+                    .collect();
+                let unavailable = providers.iter().filter(|p| !p.installed).count();
+                lines.extend(self.fold_lines(
+                    "providers",
+                    &rows,
+                    unavailable,
+                    "not installed",
+                    self.providers_expanded,
+                    self.provider_scroll,
+                    self.focus == Focus::ProviderPicker,
+                ));
             }
             PickerState::Failed(error) => lines.push(format!(
                 "providers: unavailable — {error}. Press [ctrl+r] to retry"
@@ -878,6 +1155,89 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         }
 
         lines
+    }
+
+    /// One picker as a fold: a counted header, plus a scrolled window of `rows` when expanded.
+    ///
+    /// # Why the count of unavailable rows is in the *collapsed* header
+    ///
+    /// FR-1.5 and FR-1.7 keep an unloadable profile and an uninstalled provider **listed** so the
+    /// operator learns the thing exists and why it is unavailable. A fold that simply hid them
+    /// would undo exactly that, and would do it silently. So the header carries the diagnosis
+    /// forward — `agents (25, 2 unloadable)` — and the per-row explanation is one keystroke away
+    /// rather than gone. Hiding the *rows* is a layout decision; hiding the *fact* would be a
+    /// regression against those two requirements.
+    ///
+    /// # Why a scrolled window rather than a `… N more` cap
+    ///
+    /// A cap leaves the tail unreachable on screen, which is the defect being fixed one level in:
+    /// the operator with 25 agents still could not see agent 25. The window moves, so every row is
+    /// reachable by `Up`/`Down`, and the residue count names what is off-window in each direction
+    /// so a partial view never reads as a complete one.
+    #[allow(clippy::too_many_arguments)] // seven small values, all of them the caller's own state.
+    fn fold_lines(
+        &self,
+        label: &str,
+        rows: &[String],
+        unavailable: usize,
+        unavailable_word: &str,
+        expanded: bool,
+        scroll: usize,
+        focused: bool,
+    ) -> Vec<String> {
+        let marker = if focused { ">" } else { " " };
+        let glyph = if expanded { "▾" } else { "▸" };
+        let diagnosis = if unavailable > 0 {
+            format!(", {unavailable} {unavailable_word}")
+        } else {
+            String::new()
+        };
+        let action = if expanded { "collapse" } else { "expand" };
+        let mut lines = vec![format!(
+            "{marker} {glyph} {label} ({count}{diagnosis}) — [enter] {action}",
+            count = rows.len()
+        )];
+
+        if !expanded {
+            return lines;
+        }
+
+        let window = self.picker_window();
+        // `min` against a saturating end, so a scroll offset left over from a longer list cannot
+        // index past a shorter one — the pickers are re-fetched by `[ctrl+r]` and the new answer
+        // may be shorter than the old.
+        let start = scroll.min(rows.len().saturating_sub(1));
+        let end = (start + window).min(rows.len());
+        lines.extend(rows[start..end].iter().cloned());
+
+        // The residue in BOTH directions: a window showing rows 10-20 of 25 with no note reads
+        // exactly like a complete list of 11.
+        let hidden_above = start;
+        let hidden_below = rows.len().saturating_sub(end);
+        if hidden_above > 0 || hidden_below > 0 {
+            let mut parts = Vec::new();
+            if hidden_above > 0 {
+                parts.push(format!("{hidden_above} above"));
+            }
+            if hidden_below > 0 {
+                parts.push(format!("{hidden_below} below"));
+            }
+            lines.push(format!(
+                "    … {}, {SCROLL_RESIDUE_MARKER}",
+                parts.join(", ")
+            ));
+        }
+        lines
+    }
+
+    /// How many rows an expanded picker may occupy.
+    ///
+    /// Derived from the terminal height rather than a constant: a fixed window that fits an 80x24
+    /// wastes two thirds of a tall terminal, and one sized for a tall terminal re-creates the
+    /// clipping on a short one. The `2` floor keeps the window non-empty at the smallest size the
+    /// crate renders at, so an expanded picker always shows *something*.
+    fn picker_window(&self) -> usize {
+        usize::from(self.rows / 4).max(2)
     }
 
     /// The pane's region, as the operator sees it, plus its state as text.
@@ -937,6 +1297,13 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
 
         match self.flow.blocked_reason() {
             Some(reason) => lines.push(reason),
+            // The gating line must name what `[enter]` ACTUALLY does right now. While anything is
+            // folded the first press reveals rather than runs, and "ready — [enter] run" would be
+            // the same broken promise as a documented key that does nothing — the operator presses
+            // it expecting a run, gets an expansion, and learns to distrust the footer.
+            None if self.has_folded_options() => {
+                lines.push("ready — [enter] show all options, then [enter] to run".to_string());
+            }
             None => lines.push("ready — [enter] run".to_string()),
         }
 
@@ -1036,6 +1403,28 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                 }
                 _ => false,
             },
+            // `rows` and `window` are read into locals FIRST: both are `&self` reads, and taking
+            // them inline would overlap the `&mut` borrows of the two fields below.
+            Focus::AgentPicker => {
+                let (rows, window) = (self.agent_row_count(), self.picker_window());
+                Self::on_key_fold(
+                    key,
+                    &mut self.agents_expanded,
+                    &mut self.agent_scroll,
+                    rows,
+                    window,
+                )
+            }
+            Focus::ProviderPicker => {
+                let (rows, window) = (self.provider_row_count(), self.picker_window());
+                Self::on_key_fold(
+                    key,
+                    &mut self.providers_expanded,
+                    &mut self.provider_scroll,
+                    rows,
+                    window,
+                )
+            }
             // `[k]` cancels **only while running**, and `cancel()`'s `NotRunning` is NOT
             // surfaced — `handle_key` swallows it and reports `false`, so pressing `[k]` with
             // nothing running does nothing visible. A key that does not apply is not an
@@ -1110,6 +1499,11 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
             Focus::RequiredFields => true,
             // Text only once expanded; collapsed, it is a single activatable control.
             Focus::OptionalSection => self.optional_expanded,
+            // The picker folds are navigation, never text entry: nothing is typed into them in
+            // either state, so `[q]` and `[r]` must keep working while one is focused. This is the
+            // same reasoning that made `RequiredFields` unconditional above, applied to a region
+            // that happens to be foldable — foldable is not the same as editable.
+            Focus::AgentPicker | Focus::ProviderPicker => false,
             Focus::CommandList | Focus::Results => false,
         }
     }
@@ -1163,6 +1557,13 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         // so field 0 of the NEW form would otherwise inherit the old form's partial text. (#321)
         self.edit_buffer = None;
         self.optional_expanded = false;
+        // The folds reset with the form. Carrying an expansion across a command change would make
+        // the first `Enter` run immediately for the second command but not the first, so the
+        // reveal-then-run shape would depend on history rather than on what is on screen.
+        self.agents_expanded = false;
+        self.providers_expanded = false;
+        self.agent_scroll = 0;
+        self.provider_scroll = 0;
         self.populate_pickers();
     }
 
@@ -1183,7 +1584,7 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
 
         if start == end {
             return if key == KeyCode::Enter {
-                self.run_selected()
+                self.reveal_options_or_run()
             } else {
                 false
             };
@@ -1199,7 +1600,7 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                 self.field_cursor = (self.field_cursor + 1).min(end - 1);
                 true
             }
-            KeyCode::Enter => self.run_selected(),
+            KeyCode::Enter => self.reveal_options_or_run(),
             KeyCode::Char(' ') if self.focused_field_kind() == Some(FieldKind::Flag) => {
                 self.toggle_focused_flag()
             }
@@ -1212,6 +1613,136 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// A fold's keys: `Enter`/`Space` toggles, `Up`/`Down` scroll, `Esc` collapses.
+    ///
+    /// An associated function taking `&mut` to the two pieces of state rather than a method, so
+    /// the agent and provider arms share one implementation instead of two copies that can drift —
+    /// a scroll clamp fixed in one and not the other is precisely the kind of divergence this
+    /// avoids. It cannot be a `&mut self` method because the caller already holds `&mut` borrows of
+    /// the individual fields.
+    ///
+    /// Scrolling is clamped to the last *window*, not the last row: allowing `scroll` to reach
+    /// `len - 1` would let the operator scroll into a view holding a single row with empty space
+    /// below it, which reads as the end of a shorter list.
+    fn on_key_fold(
+        key: KeyCode,
+        expanded: &mut bool,
+        scroll: &mut usize,
+        rows: usize,
+        window: usize,
+    ) -> bool {
+        // NOTHING TO FOLD: a `Loading`, `Failed` or empty picker renders one unfoldable line, so
+        // every key here is a no-op. Reporting `false` rather than toggling an invisible flag
+        // follows this module's rule that "a key that does not apply is not an operator-facing
+        // error" — and it keeps `[enter]` reaching nothing rather than appearing to work. Without
+        // this the flag flipped, the screen did not change, and the keypress claimed success.
+        if rows == 0 {
+            return false;
+        }
+
+        match key {
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                *expanded = !*expanded;
+                // Collapsing resets the viewport: re-expanding to a remembered offset shows the
+                // middle of the list with no indication that the top was skipped.
+                if !*expanded {
+                    *scroll = 0;
+                }
+                true
+            }
+            KeyCode::Up if *expanded => {
+                *scroll = scroll.saturating_sub(1);
+                true
+            }
+            KeyCode::Down if *expanded => {
+                let last = rows.saturating_sub(window);
+                *scroll = (*scroll + 1).min(last);
+                true
+            }
+            KeyCode::Esc if *expanded => {
+                *expanded = false;
+                *scroll = 0;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// How many rows the expanded agent list holds. `0` unless the fetch succeeded.
+    ///
+    /// `Loading` and `Failed` are 0 because neither renders a scrollable list — they render one
+    /// line each, and a scroll clamp computed against a phantom row count would let the viewport
+    /// move over content that is not there.
+    fn agent_row_count(&self) -> usize {
+        match self.flow.agent_choices() {
+            PickerState::Loaded(profiles) => profiles.len(),
+            PickerState::Loading | PickerState::Failed(_) => 0,
+        }
+    }
+
+    /// How many rows the expanded provider list holds. `0` unless the fetch succeeded.
+    fn provider_row_count(&self) -> usize {
+        match self.flow.provider_choices() {
+            PickerState::Loaded(providers) => providers.len(),
+            PickerState::Loading | PickerState::Failed(_) => 0,
+        }
+    }
+
+    /// `Enter` in the form: **reveal the options first, run on the second press.**
+    ///
+    /// # The defect this fixes
+    ///
+    /// `Enter` used to call [`Self::run_selected`] directly. Combined with the optional section
+    /// being collapsed by default (FR-2.3), that made the *first* `Enter` after choosing a command
+    /// execute it — so the nine optional parameters behind the fold were unreachable in the one
+    /// flow every operator takes. The operator asking for this described running the CLI by
+    /// accident while trying to open the options, which is the failure exactly: a keystroke that
+    /// looks like "show me more" performed an irreversible side effect instead.
+    ///
+    /// So the first `Enter` expands whatever is still folded and the second runs. Returning to the
+    /// command list and re-selecting re-collapses everything ([`Self::select_at_cursor`]), which
+    /// keeps the two-press shape stable rather than depending on what the operator opened last time.
+    ///
+    /// # Why this does not simply gate on "has the operator pressed Enter once"
+    ///
+    /// A press counter would be a second source of truth about the same thing and would drift from
+    /// what is on screen — an operator who expanded the section with `Space` would still owe a
+    /// wasted `Enter`. The condition is therefore the *visible state*: if anything is folded, this
+    /// press unfolds it. Once the screen shows everything, `Enter` means run, which is what the
+    /// footer advertises.
+    fn reveal_options_or_run(&mut self) -> bool {
+        if self.has_folded_options() {
+            self.expand_all_options();
+            return true;
+        }
+        self.run_selected()
+    }
+
+    /// Is any part of the form still folded away?
+    ///
+    /// The pickers count only when they actually hold rows: a `Failed` or empty picker renders one
+    /// unfoldable line, so treating it as "folded" would make the first `Enter` a no-op that never
+    /// becomes a run — the operator would press `Enter` forever with the server down.
+    fn has_folded_options(&self) -> bool {
+        let optional = !self.optional_expanded && !self.field_lines(false).is_empty();
+        let agents = !self.agents_expanded && self.agent_row_count() > 0;
+        let providers = !self.providers_expanded && self.provider_row_count() > 0;
+        optional || agents || providers
+    }
+
+    /// Unfolds every foldable region, so the second `Enter` runs against a fully visible form.
+    fn expand_all_options(&mut self) {
+        if !self.field_lines(false).is_empty() {
+            self.optional_expanded = true;
+        }
+        if self.agent_row_count() > 0 {
+            self.agents_expanded = true;
+        }
+        if self.provider_row_count() > 0 {
+            self.providers_expanded = true;
         }
     }
 
@@ -1881,7 +2412,7 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
         paragraph(&frame.header).render(header, buf);
         paragraph(&frame.footer).render(footer, buf);
 
-        let mut left: Vec<String> = Vec::new();
+        let mut left: Vec<Line<'static>> = Vec::new();
         left.extend(frame.command_list.iter().cloned());
         left.extend(frame.required_fields.iter().cloned());
         left.extend(frame.optional_section.iter().cloned());
@@ -1937,9 +2468,27 @@ impl<'a, S: ServerApi, H: Host> Renderer<'a, S, H> {
     }
 }
 
+/// Owned strings as unstyled [`Line`]s — the identity conversion for a region with no roles.
+///
+/// A region that carries no styling still has to be `Vec<Line<'static>>`, and going through this
+/// rather than `Line::from` at each call site makes the unstyled regions greppable: `plain(` marks
+/// every place #556 deliberately left alone.
+fn plain(lines: Vec<String>) -> Vec<Line<'static>> {
+    lines.into_iter().map(Line::raw).collect()
+}
+
 /// A `Paragraph` over owned lines, wrapping rather than truncating (NFR-6).
-fn paragraph(lines: &[String]) -> Paragraph<'_> {
-    Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false })
+///
+/// # Why `Text::from(Vec<Line>)` and not `lines.join("\n")` (#556, OQ-4)
+///
+/// The pre-#556 path handed `Paragraph` a single string with embedded newlines. Whether that wraps
+/// identically to a `Vec<Line>` under `Wrap { trim: false }` was an **open question in the design,
+/// not an assumption** — a wrapping regression here would be an NFR-6 violation, and NFR-6 is
+/// "wrap, never truncate". It was settled by measurement: a full buffer dump at 100x40, 70x20 and
+/// 40x12 across three shell states was captured before the type change and compared after.
+/// `the_frames_plain_text_survived_the_line_migration` is the standing form of that check.
+fn paragraph(lines: &[Line<'static>]) -> Paragraph<'static> {
+    Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false })
 }
 
 /// The pane's state as a word, so no state is conveyed by colour alone (NFR-3).
@@ -1952,6 +2501,113 @@ fn pane_state_word(state: PaneState) -> &'static str {
         PaneState::Cancelled => "cancelled",
         PaneState::Refused => "refused",
     }
+}
+
+/// The `(required)` suffix [`render_field`] writes, and the marker `style_form` looks for.
+///
+/// One constant read by both, so the style cannot drift from the wording. Retyping it at the
+/// styling site is how a role silently stops applying after a copy edit. (#556)
+const REQUIREMENT_SUFFIX: &str = " (required)";
+
+/// What [`render_field`] renders for a field with no value — the em dash, not an empty string.
+///
+/// `style_form` tests for this to decide whether a `(required)` suffix is still outstanding, which
+/// keeps the style agreeing with the text on its own line rather than re-deriving "unset" from
+/// `GuidedFlow`. (#556)
+const UNSET_VALUE: &str = "—";
+
+/// The prefix `GuidedFlow::blocked_reason` puts on the footer's gating reason.
+///
+/// Matched rather than reconstructed, for the same reason as [`REQUIREMENT_SUFFIX`]. The wording
+/// itself lives in `guided_flow.rs` with the rule that produces it. (#556)
+const BLOCKED_PREFIX: &str = "blocked:";
+
+/// The substring that marks a picker line as a FAILURE, as `picker_lines` writes it.
+///
+/// `": unavailable — "` and not bare `"unavailable"`: the word also occurs inside
+/// `UNLOADABLE_MARKER`'s explanatory text and in a provider row, and matching it loosely would
+/// paint a working picker's row as a region failure. (#556)
+const PICKER_FAILURE_MARKER: &str = ": unavailable — ";
+
+/// The suffix `picker_lines` puts on an uninstalled provider row. (#556)
+const NOT_INSTALLED_MARKER: &str = "(not installed)";
+
+/// The substring marking an expanded picker's off-window residue line, as `fold_lines` writes it.
+///
+/// A named constant rather than a literal in both the producer and `style_pickers`, so the two
+/// cannot drift into a residue line that is never styled — the failure mode that a hand-matched
+/// marker always eventually reaches.
+const SCROLL_RESIDUE_MARKER: &str = "[↑↓] scroll";
+
+/// A line split into three spans, the middle one styled: `before`, `needle`, `after`.
+///
+/// The concatenation is **exactly** the input, so [`Frame::plain_lines`] is unchanged by styling —
+/// which is what lets the FR-5.2 guards assert on plain text and the pre-#556 tests keep passing.
+/// A line whose plain text changed when a style was added would be a content change wearing a
+/// styling change's clothes.
+///
+/// Falls back to an unstyled line when the needle is absent rather than panicking: a caller that
+/// checked `contains` first cannot reach that branch, and a missing needle means "nothing to
+/// style", not a broken invariant. `styling_a_line_preserves_its_plain_text` covers both. (#556)
+fn split_styled(line: &str, needle: &str, style: Style) -> Line<'static> {
+    match line.split_once(needle) {
+        Some((before, after)) => Line::from(vec![
+            Span::raw(before.to_string()),
+            Span::styled(needle.to_string(), style),
+            Span::raw(after.to_string()),
+        ]),
+        None => Line::raw(line.to_string()),
+    }
+}
+
+/// A failed picker's line takes `error`; a listed-but-unusable *row* takes `dim` (FR-4.4).
+///
+/// # The one place FR-4.4 needed a ruling
+///
+/// FR-4.4 asks for both "a picker's failure line (`theme.error`)" and "an `unavailable` line
+/// (`theme.dim`)" — and in this crate those are **the same string**: a failed picker renders
+/// `agents: unavailable — {error}. Press [ctrl+r] to retry`. One line cannot carry two roles.
+///
+/// Resolved by the design's own role docs, which gloss `dim` as `[unavailable]` — a bracketed *row*
+/// marker, not a region failure. So the split is by what the line reports:
+///
+/// - the picker **failed** → `error`. The whole read is unavailable and there is a remedy to press.
+/// - a **row** is listed but unusable (`[unloadable — …]`, `(not installed)`) → `dim`, on the marker
+///   only. The picker worked; this entry is informational, and FR-1.5/FR-1.7 require it be *shown*
+///   rather than filtered. Dimming the whole row would work against that.
+///
+/// A `Loading` or `none reported` line is left unstyled: neither is a failure, and `none reported`
+/// is a valid answer from a machine with no profiles — colouring it `error` would report a fault
+/// where there is none, which is the exact conflation `picker_lines` is written to avoid.
+fn style_pickers(lines: Vec<String>, theme: &Theme) -> Vec<Line<'static>> {
+    let unloadable = format!("[{UNLOADABLE_MARKER}]");
+
+    lines
+        .into_iter()
+        .map(|line| {
+            if line.contains(PICKER_FAILURE_MARKER) {
+                return Line::styled(line, theme.error);
+            }
+            if line.contains(&unloadable) {
+                return split_styled(&line, &unloadable, theme.dim);
+            }
+            if line.contains(NOT_INSTALLED_MARKER) {
+                return split_styled(&line, NOT_INSTALLED_MARKER, theme.dim);
+            }
+            // A focused fold header, same `>`-prefix convention and same `focus` role as every
+            // other region's marked row (FR-4.4/FR-4.5). Checked AFTER the markers above so a
+            // focused header that also carries a dim marker keeps the diagnosis visible — but a
+            // header only ever holds a count, so in practice these do not overlap.
+            if line.starts_with('>') {
+                return Line::styled(line, theme.focus);
+            }
+            // The scroll residue is navigational chrome, not content the operator acts on.
+            if line.contains(SCROLL_RESIDUE_MARKER) {
+                return Line::styled(line, theme.dim);
+            }
+            Line::raw(line)
+        })
+        .collect()
 }
 
 /// `cao session list`, from a catalog row. `None` parent means a top-level leaf.
@@ -2356,12 +3012,57 @@ mod tests {
     use crate::guided_flow::PickerState;
     use crate::handoff::{Host, ServerRead};
     use crate::results_pane::PaneState;
+    use crate::theme::Theme;
     use crate::types::{Health, Profile, Provider, SessionParams, Terminal, TerminalStatus};
     use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::style::Color;
+    use ratatui::text::Line;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::io::Write;
     use std::time::Duration;
+
+    /// One region's text, styles discarded — the `Vec<Line>` replacement for `region.join(sep)`.
+    ///
+    /// #556 retyped `Frame`'s regions from `Vec<String>` to `Vec<Line<'static>>`, which broke the
+    /// pre-existing `.join()` calls. The tests were **repointed here, not rewritten**: every one of
+    /// them asserts on content, and a rewritten assertion is a chance to weaken one. This discards
+    /// exactly what those tests never looked at.
+    fn joined(region: &[Line<'static>], separator: &str) -> String {
+        region
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join(separator)
+    }
+
+    /// Presses `[enter]` until it means "run" — i.e. consumes the reveal press.
+    ///
+    /// `[enter]` on the form reveals the folded options on its first press and runs on the second
+    /// (`Renderer::reveal_options_or_run`). Tests that care about *running* went through this rather
+    /// than gaining a second bare `on_key(Enter)` each: a literal extra press states nothing about
+    /// why it is there, and the next person to change the fold count has to find every one of them.
+    ///
+    /// Asserts the reveal press was CONSUMED, so this cannot silently degrade into a no-op if the
+    /// two-press behaviour is removed — it would then run on the first press and this helper's
+    /// second press would land on a running form.
+    fn press_enter_to_run<S: ServerApi, H: Host>(shell: &mut Renderer<'_, S, H>) {
+        if shell.has_folded_options() {
+            assert!(
+                shell.on_key(KeyCode::Enter),
+                "the reveal press must be handled — an unhandled [enter] leaves the options folded"
+            );
+            assert!(
+                !shell.has_folded_options(),
+                "one reveal press must unfold EVERYTHING, or the operator owes an unpredictable \
+                 number of presses before a run"
+            );
+        }
+        assert!(
+            shell.on_key(KeyCode::Enter),
+            "[enter] must be handled on a fully revealed form"
+        );
+    }
 
     /// **This module's own source text**, embedded at compile time.
     ///
@@ -2918,7 +3619,7 @@ mod tests {
         // The RENDERED region, not the ring buffer: the outcome line comes from the pane's own
         // `Widget` impl and is absent from `lines()`. Asserting on `lines()` here reported an empty
         // pane after a successful hand-off — the defect this frame accessor was corrected for.
-        let rendered = shell.render().results.join("\n");
+        let rendered = joined(&shell.render().results, "\n");
         assert!(
             rendered.contains("launched in new window") && rendered.contains("session: work"),
             "HANDOFF's completion shape is the STRUCTURED OUTCOME LINE, because the command's \
@@ -2941,7 +3642,7 @@ mod tests {
             "the FR-5.3 refusal arm must leave the pane `refused`. Pane: {:?}",
             shell.pane()
         );
-        let rendered = shell.render().results.join("\n");
+        let rendered = joined(&shell.render().results, "\n");
         assert!(
             rendered.contains("$TMUX is unset"),
             "the refusal must carry the reason. Got: {rendered:?}"
@@ -3146,10 +3847,7 @@ mod tests {
         // The footer carries it too, since that is where the operator looks before pressing enter.
         let frame = shell.render();
         assert!(
-            frame
-                .footer
-                .iter()
-                .any(|line| line.contains("blocked: --agents required")),
+            joined(&frame.footer, "\n").contains("blocked: --agents required"),
             "the gating reason must be in the footer as text. Footer: {:?}",
             frame.footer
         );
@@ -3192,13 +3890,11 @@ mod tests {
             "a blank screen is indistinguishable from a hang (SR-2). Frame: {frame:?}"
         );
 
-        let all = frame
-            .header
-            .iter()
-            .chain(&frame.pickers)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
+        let all = format!(
+            "{}\n{}",
+            joined(&frame.header, "\n"),
+            joined(&frame.pickers, "\n")
+        );
         assert!(
             all.contains("unreachable") || all.contains("unavailable"),
             "the state must say WHAT failed. Got: {all:?}"
@@ -3640,16 +4336,28 @@ mod tests {
         // And the definition itself is not vacuous: a frame of empty and whitespace-only strings
         // IS blank by it. Without this, `is_blank` could be `|| false` and every case above would
         // still pass.
+        //
+        // #556 note: the whitespace lines are **STYLED**, which is the new way to get this wrong.
+        // `is_blank` asks about glyphs, so a bold empty line is still blank; had the migration let
+        // a style count as content, this fixture would stop being blank and SR-2's predicate would
+        // have been retired silently (FR-4.3). That is why the styles are here rather than in a
+        // separate test — the anti-vacuity fixture is the right place for the harder case.
+        let styled_blank = |text: &str| {
+            Line::styled(
+                text.to_string(),
+                ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::BOLD),
+            )
+        };
         let whitespace_only = Frame {
             layout: LayoutMode::Stacked,
-            header: vec![String::new(), "   ".to_string()],
-            command_list: vec!["\t".to_string()],
+            header: vec![styled_blank(""), styled_blank("   ")],
+            command_list: vec![styled_blank("\t")],
             required_fields: Vec::new(),
             optional_section: Vec::new(),
-            pickers: vec!["\n".to_string()],
+            pickers: vec![styled_blank("\n")],
             results: Vec::new(),
             banner: Vec::new(),
-            footer: vec!["  ".to_string()],
+            footer: vec![styled_blank("  ")],
         };
         assert!(
             whitespace_only.is_blank(),
@@ -3761,7 +4469,7 @@ mod tests {
             PaneState::Cancelled,
             "`[k]` while running must cancel (stop following)"
         );
-        let rendered = shell.render().results.join("\n");
+        let rendered = joined(&shell.render().results, "\n");
         assert!(
             rendered.contains("still running"),
             "SR-4: the cancelled wording must not claim the command stopped — `[k]` stops FOLLOWING \
@@ -3794,6 +4502,21 @@ mod tests {
             Some(&crate::guided_flow::FieldValue::Text("planner".to_string())),
             "keyboard entry must mutate the production GuidedFlow, not a renderer-only buffer"
         );
+        // FIRST Enter reveals the folded options; it must NOT run. An operator reported the old
+        // behaviour as running the CLI by accident while trying to open the options.
+        assert!(shell.on_key(KeyCode::Enter));
+        assert_eq!(
+            server.create_session_calls.get(),
+            0,
+            "the first [enter] must reveal the folded options, never reach the network"
+        );
+        assert!(
+            shell.pending_action.is_none(),
+            "the first [enter] must not even QUEUE a run — a queued launch executes on the next \
+             tick, so queueing here is the same defect one frame later"
+        );
+
+        // SECOND Enter runs, because nothing is folded any more.
         assert!(shell.on_key(KeyCode::Enter));
         assert_eq!(
             server.create_session_calls.get(),
@@ -3818,7 +4541,7 @@ mod tests {
         let mut shell = Renderer::new(&server, &host, 100, 40);
         assert!(shell.focus_command(CommandId::SessionList));
         assert!(shell.on_key(KeyCode::Enter));
-        assert!(shell.on_key(KeyCode::Enter));
+        press_enter_to_run(&mut shell);
         assert!(
             server.run_calls.borrow().is_empty(),
             "the keypress must queue the in-app run until after the pending draw"
@@ -3856,7 +4579,7 @@ mod tests {
         let host = FakeHost::outside_tmux();
         let mut shell = Renderer::new(&server, &host, 200, 60);
 
-        let rendered = shell.render().command_list.join("\n");
+        let rendered = joined(&shell.render().command_list, "\n");
         let mut hidden_seen = Vec::new();
         let mut offered_missing = Vec::new();
 
@@ -3925,20 +4648,32 @@ mod tests {
                 "{id:?} must be unreachable: {why}"
             );
         }
+        // ABSENCE IS ASSERTED AGAINST THE UNWINDOWED ROWS, not the visible slice.
+        //
+        // The list is now windowed around the cursor (42 commands do not fit a column), so a needle
+        // missing from `render()` proves nothing — it may simply be below the window. Checking
+        // `command_rows()` asks the question FR-4.3 actually cares about: is the row generated at
+        // all? Asserting on the windowed text here would have been an absence check satisfied by
+        // scrolling, which is the weakest kind of green.
+        let all_rows = shell.command_rows().join("\n");
+        for needle in ["cao tui", "cao shutdown"] {
+            assert!(
+                !all_rows.contains(needle),
+                "{needle:?} must not appear ANYWHERE in the list's rows, windowed or not. \
+                 Got: {all_rows:?}"
+            );
+        }
+        // Positive control on the same string, so the absence checks are not passing because the
+        // rows are empty.
         assert!(
-            !rendered.contains("cao tui"),
-            "`cao tui` must not appear in the rendered list. Got: {rendered:?}"
+            all_rows.contains("cao launch") && all_rows.contains("cao session list"),
+            "the rows must include the commands the catalog DOES offer, or the absence checks are \
+             vacuous. Got: {all_rows:?}"
         );
+        // And the windowed rendering is non-empty, so the region the operator sees is populated.
         assert!(
-            !rendered.contains("cao shutdown"),
-            "`cao shutdown` must not appear in the rendered list. Got: {rendered:?}"
-        );
-        // Positive control on the rendering itself, so the two assertions above are not passing
-        // because the list renders nothing at all.
-        assert!(
-            rendered.contains("cao launch") && rendered.contains("cao session list"),
-            "the list must render the commands it DOES offer, or the absence checks are vacuous. \
-             Got: {rendered:?}"
+            rendered.contains("cao install"),
+            "the rendered window must show the rows at the cursor. Got: {rendered:?}"
         );
 
         // A programmatic caller holding a HIDE id is refused rather than silently doing nothing.
@@ -4154,7 +4889,7 @@ mod tests {
 
         // And the footer must ADVERTISE it: an escape hatch nobody can discover is not an escape.
         let shell = Renderer::new(&server, &host, 100, 40);
-        let footer = shell.render().footer.join(" ");
+        let footer = joined(&shell.render().footer, " ");
         assert!(
             footer.contains("[←]"),
             "the footer must name `[←]`, or the operator has no way to learn the key exists — the \
@@ -4285,7 +5020,7 @@ mod tests {
         //  is the pane's own render path — the same accessor a prior test was
         // corrected to use, because `lines()` omits the completion line and reported an empty pane
         // after a successful run.
-        let cells = shell.render().results.join("\n");
+        let cells = joined(&shell.render().results, "\n");
         assert!(
             !cells.contains("has no HTTP route"),
             "`profile find` must NOT report a missing route — it is served client-side per OQ-6 Q2. \
@@ -4460,7 +5195,7 @@ mod tests {
             assert!(shell.focus_command(CommandId::Launch));
             assert!(shell.on_key(KeyCode::Enter));
 
-            let header = shell.render().header.join("\n");
+            let header = joined(&shell.render().header, "\n");
             assert!(
                 header.to_lowercase().contains(expected),
                 "HTTP {status} must be described as an auth failure — the header is the operator's \
@@ -4777,7 +5512,7 @@ mod tests {
         }
         assert!(shell.on_key(KeyCode::Enter), "[enter] expands the section");
 
-        let optional = shell.render().optional_section.join("\n");
+        let optional = joined(&shell.render().optional_section, "\n");
 
         let yolo = optional
             .lines()
@@ -4807,6 +5542,7 @@ mod tests {
             .required_fields
             .iter()
             .chain(&whole_form.optional_section)
+            .map(Line::to_string)
             .find(|line| line.contains("message"));
         if let Some(line) = message_line {
             assert!(
@@ -4907,7 +5643,7 @@ mod tests {
             "`[q]` while running must raise a confirmation"
         );
 
-        let footer = shell.render().footer.join("\n");
+        let footer = joined(&shell.render().footer, "\n");
         assert!(
             footer.contains("still running"),
             "the confirmation must say a command is still running. Got: {footer:?}"
@@ -4973,7 +5709,7 @@ mod tests {
         let mut shell = Renderer::new(&server, &host, 100, 40);
         assert!(shell.focus_command(CommandId::Launch));
         assert!(shell.on_key(KeyCode::Enter));
-        assert!(shell.on_key(KeyCode::Enter), "Enter must queue the launch");
+        press_enter_to_run(&mut shell);
         assert!(
             shell.run_pending_action(),
             "the queued launch must execute on the next tick"
@@ -5026,7 +5762,7 @@ mod tests {
                     .set(field, value)
                     .expect("the field is declared by this command");
             }
-            assert!(shell.on_key(KeyCode::Enter));
+            press_enter_to_run(&mut shell);
             assert!(shell.run_pending_action());
             assert!(
                 server.run_calls.borrow().is_empty(),
@@ -5581,6 +6317,1119 @@ mod tests {
             &[CommandId::WorkflowList, CommandId::WorkflowList],
             "the retry must re-run the SAME command. Calls: {:?}",
             server.run_calls.borrow()
+        );
+    }
+
+    // ── #556: the semantic colour layer ──────────────────────────────────────────────────────
+
+    /// Renders `shell` and returns every cell as `(symbol, fg)`.
+    fn drawn_cells<S: ServerApi, H: Host>(
+        shell: &Renderer<'_, S, H>,
+        width: u16,
+        height: u16,
+    ) -> Vec<(String, Color)> {
+        let area = ratatui::layout::Rect::new(0, 0, width, height);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        shell.draw(area, &mut buffer);
+        (0..height)
+            .flat_map(|row| {
+                (0..width)
+                    .map(move |column| (column, row))
+                    .collect::<Vec<_>>()
+            })
+            .map(|(column, row)| {
+                let cell = &buffer[(column, row)];
+                (cell.symbol().to_string(), cell.fg)
+            })
+            .collect()
+    }
+
+    /// The foreground `needle` is drawn in, located by scanning rendered rows. Panics if absent, so
+    /// "the style is right" cannot degrade into "the text was not there".
+    fn drawn_foreground<S: ServerApi, H: Host>(
+        shell: &Renderer<'_, S, H>,
+        width: u16,
+        height: u16,
+        needle: &str,
+    ) -> Color {
+        assert!(needle.is_ascii(), "row indexing here is by byte offset");
+        let cells = drawn_cells(shell, width, height);
+        for row in cells.chunks(width as usize) {
+            let text: String = row.iter().map(|(symbol, _)| symbol.as_str()).collect();
+            if let Some(start) = text.find(needle) {
+                let colours: Vec<Color> = row[start..start + needle.len()]
+                    .iter()
+                    .map(|(_, fg)| *fg)
+                    .collect();
+                let first = colours[0];
+                assert!(
+                    colours.iter().all(|fg| *fg == first),
+                    "{needle:?} is drawn in more than one colour ({colours:?})"
+                );
+                return first;
+            }
+        }
+        let all: String = cells.iter().map(|(symbol, _)| symbol.as_str()).collect();
+        panic!("{needle:?} was not rendered, so its style could not be read. Got: {all:?}");
+    }
+
+    /// A shell with the pickers failed, which is the state most of the roles are visible in.
+    fn shell_with_failed_pickers<'a>(
+        server: &'a FakeServer,
+        host: &'a FakeHost,
+    ) -> Renderer<'a, FakeServer, FakeHost> {
+        let mut shell = Renderer::new(server, host, 100, 40);
+        assert!(shell.focus_command(CommandId::Launch));
+        assert!(shell.on_key(KeyCode::Enter));
+        shell
+    }
+
+    /// **FR-4.2 / OQ-4 — the `Vec<String>` → `Vec<Line>` migration changed no text.**
+    ///
+    /// # This test answers an open question, and the answer was measured
+    ///
+    /// The old draw path handed `Paragraph` one string with embedded newlines; the new one hands it
+    /// a `Vec<Line>`. Whether those wrap identically under `Wrap { trim: false }` was OQ-4 in the
+    /// design — flagged as **unverified**, because a wrapping regression here is an NFR-6 violation
+    /// and NFR-6 is "wrap, never truncate".
+    ///
+    /// It was settled by capturing a full buffer dump at 100x40, 70x20 and 40x12 across three shell
+    /// states **before** the type change and diffing after: 23,237 bytes, identical, including
+    /// wrapped continuation rows at 40 columns. **The answer to OQ-4 is yes, they wrap the same.**
+    ///
+    /// This is the standing form of that check. It re-derives the plain text from the frame and
+    /// compares it to the same text read out of the rendered buffer, at three sizes — so a future
+    /// change that makes styling alter the *text* fails here rather than in a screenshot.
+    #[test]
+    fn the_frames_plain_text_survived_the_line_migration() {
+        let server = FakeServer::unreachable();
+        let host = FakeHost::outside_tmux();
+        let shell = shell_with_failed_pickers(&server, &host);
+
+        // A styled line's plain text must equal the string the producer built. `split_styled`
+        // guarantees this by construction (its three spans concatenate to the input) and this is
+        // where that guarantee is checked rather than assumed.
+        let frame = shell.render();
+        for (region_name, region) in [
+            ("required_fields", &frame.required_fields),
+            ("optional_section", &frame.optional_section),
+            ("pickers", &frame.pickers),
+            ("footer", &frame.footer),
+            ("command_list", &frame.command_list),
+        ] {
+            for line in region {
+                let from_spans: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                assert_eq!(
+                    line.to_string(),
+                    from_spans,
+                    "in {region_name}, a styled line's text must be exactly its spans concatenated \
+                     — if styling can change the text, every plain-text guard in this crate is \
+                     asserting on something the operator does not see"
+                );
+            }
+        }
+
+        // And nothing is empty, or the loop above proved nothing.
+        assert!(
+            frame
+                .plain_lines()
+                .iter()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+                > 10,
+            "the fixture must produce real content. Got: {:?}",
+            frame.plain_lines()
+        );
+    }
+
+    /// **FR-4.4 / FR-4.5 — `focus` is on the marker's LINE, and there is no border to put it on.**
+    ///
+    /// The issue's palette table assigns `focus` to the "focused region border, selected row". This
+    /// crate has **neither**: one borderless `Block::new()`, no `List`/`Table`/`highlight_style`
+    /// (design C-2, P-22). So the role goes on the structural `>` marker's row, and this test reads
+    /// it off the rendered cells to prove the translation actually happened.
+    ///
+    /// The viewport is 120x90 rather than 100x40 deliberately: at 40 rows the 30-row command list
+    /// fills the form region and the focused field row is **scrolled off**, so the assertion would
+    /// panic on absence rather than on the wrong colour. Measured, not guessed.
+    #[test]
+    fn the_focus_marker_row_carries_the_focus_role() {
+        let server = FakeServer::unreachable();
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_with_failed_pickers(&server, &host);
+        shell.set_theme(Theme::colour());
+
+        let expected = Theme::colour().focus.fg.expect("`focus` sets a foreground");
+        assert_eq!(
+            drawn_foreground(&shell, 120, 90, "> --agents"),
+            expected,
+            "the focused row must carry `focus`. There is no border and no selected-row widget in \
+             this crate, so the `>` marker's line IS where FR-4.5 puts it"
+        );
+    }
+
+    /// **FR-4.4 — an unset required field's `(required)` carries `required`, and a set one does not.**
+    ///
+    /// The second half is the point. Colouring a *satisfied* required field keeps a warning on
+    /// screen after the warning has been answered, which trains the operator to ignore the colour —
+    /// so "the style is present" is only half a requirement, and a test that checked only presence
+    /// would pass on an implementation that never turns it off.
+    ///
+    /// Read from the frame rather than the cells because the focused row takes `focus` for its whole
+    /// line, which would mask the `required` span: the field must be unset AND unfocused to see it,
+    /// and that combination is easier to construct honestly at the frame level.
+    #[test]
+    fn a_required_suffix_is_styled_only_while_the_field_is_unset() {
+        let server = FakeServer::healthy();
+        let host = FakeHost::outside_tmux();
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+        shell.set_theme(Theme::colour());
+        assert!(shell.focus_command(CommandId::Launch));
+        assert!(shell.on_key(KeyCode::Enter));
+
+        let required_fg = Theme::colour()
+            .required
+            .fg
+            .expect("`required` sets a foreground");
+
+        // Move focus off the fields so `focus` does not take the whole row.
+        let styled_suffix = |shell: &Renderer<'_, FakeServer, FakeHost>| -> Vec<Color> {
+            shell
+                .render()
+                .required_fields
+                .iter()
+                .filter(|line| !line.to_string().starts_with('>'))
+                .flat_map(|line| line.spans.clone())
+                .filter(|span| span.content.contains("(required)"))
+                .filter_map(|span| span.style.fg)
+                .collect()
+        };
+
+        // Unfocus the form: `[←]` returns to the command list.
+        assert!(shell.on_key(KeyCode::Left));
+        let unset = styled_suffix(&shell);
+        assert_eq!(
+            unset,
+            vec![required_fg],
+            "an UNSET required field's `(required)` must carry the `required` role. Frame: {:?}",
+            shell
+                .render()
+                .required_fields
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+        );
+
+        // Now satisfy it — by TYPING, through `on_key`, which is how an operator does it. A
+        // test-only setter would have let the assertion pass against a state the keyboard cannot
+        // reach.
+        assert!(
+            shell.on_key(KeyCode::Tab),
+            "[tab] moves focus into the form"
+        );
+        for character in "researcher".chars() {
+            assert!(
+                shell.on_key(KeyCode::Char(character)),
+                "typing {character:?} into the focused field must be consumed"
+            );
+        }
+        assert!(shell.on_key(KeyCode::Left));
+
+        let plain = shell.render();
+        let text = joined(&plain.required_fields, "\n");
+        assert!(
+            text.contains("(required)"),
+            "the WORDING must survive — a satisfied required field is still required, and NFR-3 \
+             says the text carries the meaning. Got: {text:?}"
+        );
+        assert_eq!(
+            styled_suffix(&shell),
+            Vec::<Color>::new(),
+            "a SATISFIED required field must NOT be coloured. Leaving the warning up after it is \
+             answered is how an operator learns to ignore the colour. Got: {text:?}"
+        );
+    }
+
+    /// **FR-4.4 — a failed picker's line carries `error`; a listed-but-unusable row carries `dim`.**
+    ///
+    /// # The one place FR-4.4 needed a ruling, recorded
+    ///
+    /// FR-4.4 asks for both "a picker's failure line (`theme.error`)" and "an `unavailable` line
+    /// (`theme.dim`)", and in this crate **those are the same string** — a failed picker renders
+    /// `agents: unavailable — {error}. Press [ctrl+r] to retry`. One line cannot carry two roles.
+    ///
+    /// Resolved against the design's own role docs, which gloss `dim` as `[unavailable]` — a
+    /// bracketed *row* marker, not a region failure. A failed picker is a failure with a remedy to
+    /// press, so it is `error`; an unloadable profile row is informational and FR-1.5 requires it be
+    /// shown rather than filtered, so only its marker dims.
+    #[test]
+    fn a_failed_picker_line_carries_error() {
+        let server = FakeServer::unreachable();
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_with_failed_pickers(&server, &host);
+        shell.set_theme(Theme::colour());
+
+        let expected = Theme::colour().error.fg.expect("`error` sets a foreground");
+        for picker in ["agents: unavailable", "providers: unavailable"] {
+            assert_eq!(
+                drawn_foreground(&shell, 120, 90, picker),
+                expected,
+                "a failed picker must carry `error` — the read is unavailable and there is a \
+                 [ctrl+r] remedy. {picker:?}"
+            );
+        }
+    }
+
+    /// **FR-4.4 — the footer's blocked reason carries `required`, not `error`.**
+    ///
+    /// A blocked form is not a failure, it is an unfinished one: the reason names the field the
+    /// operator still has to fill. `error` here would report a problem where there is only an
+    /// incomplete step, and the palette already has a role meaning "you need to supply this".
+    /// Asserted as an inequality too, so the distinction is load-bearing rather than incidental.
+    #[test]
+    fn the_footers_blocked_reason_carries_required_not_error() {
+        let server = FakeServer::healthy();
+        let host = FakeHost::outside_tmux();
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+        shell.set_theme(Theme::colour());
+        assert!(shell.focus_command(CommandId::Launch));
+        assert!(shell.on_key(KeyCode::Enter));
+
+        let theme = Theme::colour();
+        let required_fg = theme.required.fg.expect("`required` sets a foreground");
+        let error_fg = theme.error.fg.expect("`error` sets a foreground");
+        assert_ne!(
+            required_fg, error_fg,
+            "precondition: if `required` and `error` were the same colour this test could not fail"
+        );
+
+        let actual = drawn_foreground(&shell, 100, 40, "blocked:");
+        assert_eq!(
+            actual, required_fg,
+            "the blocked reason must carry `required`: the form is unfinished, not broken"
+        );
+        assert_ne!(
+            actual, error_fg,
+            "and specifically NOT `error` — a gate the operator can clear by typing a value is \
+             not a failure to report"
+        );
+    }
+
+    /// **FR-5.2 / FR-5.4 — THE RENDERER'S STRIP-STYLING GUARD. Read before changing wording.**
+    ///
+    /// Four states, each identifiable from **plain text alone**: nothing selected, a required field
+    /// unset, a picker failed, and a run finished with a non-zero exit. This is NFR-3's "no state by
+    /// colour alone" in executable form for the renderer, and the property it defends is not about
+    /// colour — it is about whether the words are sufficient.
+    ///
+    /// Reads [`Frame::plain_lines`], which discards every style. That is what a screen reader, a
+    /// pipe, a `TERM=dumb` terminal and a monochrome operator receive.
+    ///
+    /// **Mutation-proven (FR-5.4):** removing the footer's `blocked:` reason turns this red.
+    #[test]
+    fn every_renderer_state_is_identifiable_from_plain_text() {
+        let healthy = FakeServer::healthy();
+        let unreachable = FakeServer::unreachable();
+        let failing_server = FakeServer::healthy().with_run(RunAnswer::Chunks(vec!["boom\n"], 500));
+        let host = FakeHost::outside_tmux();
+
+        // (label, shell, the marker the state must be identifiable BY)
+        let mut cases: Vec<(&str, Renderer<'_, FakeServer, FakeHost>, &str)> = Vec::new();
+
+        // 1. Nothing selected. The footer says so rather than showing an inert control (FR-6.2).
+        let mut nothing = Renderer::new(&healthy, &host, 100, 40);
+        nothing.set_theme(Theme::colour());
+        cases.push(("nothing selected", nothing, "no command selected"));
+
+        // 2. A command selected with its required field unset.
+        let mut unset = Renderer::new(&healthy, &host, 100, 40);
+        unset.set_theme(Theme::colour());
+        assert!(unset.focus_command(CommandId::Launch));
+        assert!(unset.on_key(KeyCode::Enter));
+        cases.push(("required field unset", unset, "blocked: --agents required"));
+
+        // 3. A picker failed. Cause AND remedy, both textual (FR-6.1).
+        let mut failed = shell_with_failed_pickers(&unreachable, &host);
+        failed.set_theme(Theme::colour());
+        cases.push(("picker failed", failed, "unavailable"));
+
+        // 4. A run complete with a NON-ZERO exit, reached through the REAL path: `run_in_app`
+        // maps an HTTP status >= 400 to `complete(1)`, so a fake 500 produces `exit 1` the same way
+        // production does. A test-only setter would have asserted about a state the API cannot make.
+        let mut failing = Renderer::new(&failing_server, &host, 100, 40);
+        failing.set_theme(Theme::colour());
+        failing.run_in_app(CommandId::SessionList);
+        assert_eq!(
+            failing.pane().state(),
+            PaneState::Complete,
+            "precondition: the fixture must have reached a terminal state with a code"
+        );
+        cases.push(("non-zero exit", failing, "exit 1"));
+
+        assert_eq!(
+            cases.len(),
+            4,
+            "FR-5.2 names four states; all four must be covered"
+        );
+
+        for (label, shell, marker) in cases {
+            let plain = shell.render().plain_lines().join("\n");
+            assert!(
+                plain.contains(marker),
+                "the {label:?} state is NOT identifiable from plain text.\n\
+                 \n\
+                 Expected {marker:?} somewhere in the frame's plain lines, got:\n{plain}\n\
+                 \n\
+                 This is FR-5.2 and NFR-3: no state may be conveyed by colour alone. If you got \
+                 here by moving a distinction into a hue, move it back into the words."
+            );
+        }
+    }
+
+    /// The renderer's palette **actually reaches the cells** — the anti-vacuity floor for T-5.
+    ///
+    /// [`every_renderer_state_is_identifiable_from_plain_text`] passes *by design* when nothing is
+    /// styled, and the monochrome test below passes trivially. Without this, the whole styling half
+    /// of T-5 could be a no-op with a green suite.
+    #[test]
+    fn the_renderers_palette_reaches_the_rendered_cells() {
+        let server = FakeServer::unreachable();
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_with_failed_pickers(&server, &host);
+        shell.set_theme(Theme::colour());
+
+        let palette: Vec<Color> = Theme::colour()
+            .roles()
+            .iter()
+            .filter_map(|(_, style)| style.fg)
+            .collect();
+
+        let coloured: Vec<(String, Color)> = drawn_cells(&shell, 120, 90)
+            .into_iter()
+            .filter(|(_, fg)| *fg != Color::Reset)
+            .collect();
+
+        assert!(
+            coloured.len() > 20,
+            "only {} cells carried any colour. The renderer's styling is a no-op, and every other \
+             styling assertion in this module is satisfied by that",
+            coloured.len()
+        );
+        for (symbol, fg) in coloured {
+            assert!(
+                palette.contains(&fg),
+                "a cell {symbol:?} was drawn in {fg:?}, which is not one of the theme's roles \
+                 ({palette:?}). A colour that is not a role is one `NO_COLOR` cannot switch off \
+                 (FR-1.4)"
+            );
+        }
+    }
+
+    /// **FR-3.3 end-to-end for the renderer — under `NO_COLOR`, every cell is `Color::Reset`.**
+    ///
+    /// The half that catches a colour applied *outside* the theme: an inline `Color::Green` at a
+    /// call site satisfies every assertion in `theme.rs` and fails here.
+    #[test]
+    fn under_no_color_the_whole_renderer_draws_in_reset() {
+        let server = FakeServer::unreachable();
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_with_failed_pickers(&server, &host);
+        shell.set_theme(Theme::monochrome());
+
+        for (symbol, fg) in drawn_cells(&shell, 120, 90) {
+            assert_eq!(
+                fg,
+                Color::Reset,
+                "cell {symbol:?} was drawn in {fg:?} under NO_COLOR. Every monochrome role is \
+                 Color::Reset, so a coloured cell means a style bypassed the theme — an inline \
+                 colour `from_env` cannot switch off (FR-3.3, FR-1.4)"
+            );
+        }
+    }
+
+    /// A styled [`Line`] `Display`s **without escape codes**, which the piped path in `main` relies on.
+    ///
+    /// `main`'s non-interactive branch writes `frame.header`/`footer` with `{line}` straight to a
+    /// pipe. That is only safe because `Span`'s `Display` writes content and no SGR sequences — true
+    /// in ratatui-core 0.1.2, and now asserted, because a dependency on an upstream `Display` impl
+    /// with no test behind it is what silently breaks on a minor-version bump (SR-1).
+    #[test]
+    fn a_styled_line_displays_without_escape_codes() {
+        let server = FakeServer::unreachable();
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_with_failed_pickers(&server, &host);
+        shell.set_theme(Theme::colour());
+        let frame = shell.render();
+
+        // Anti-vacuity: the fixture must actually BE styled, or this proves nothing about styling.
+        assert!(
+            frame.pickers.iter().any(|line| line.style.fg.is_some()
+                || line.spans.iter().any(|span| span.style.fg.is_some())),
+            "the fixture must contain a styled line for this test to mean anything"
+        );
+
+        for line in frame
+            .header
+            .iter()
+            .chain(&frame.footer)
+            .chain(&frame.pickers)
+        {
+            let displayed = line.to_string();
+            assert!(
+                !displayed.bytes().any(|byte| byte == 0x1b),
+                "a styled Line must Display without an ESC byte — main pipes these straight to \
+                 stdout when stdout is not a terminal. Got: {displayed:?}"
+            );
+            assert!(
+                !displayed.contains("[3") && !displayed.contains("[0m"),
+                "no SGR residue either. Got: {displayed:?}"
+            );
+        }
+    }
+    /// **FR-4.5 — the command list's own marked row carries `focus`.**
+    ///
+    /// # Why this exists as a separate test from the form's marked row
+    ///
+    /// Two different functions put `focus` on a `>` row: [`Renderer::style_focus_marker`] serves
+    /// `command_list`, and [`Renderer::style_form`] serves the two form regions. They are separate
+    /// because the form's mapping also has to reach `(required)` and `[not sent — …]` spans, which
+    /// the command list has no equivalent of.
+    ///
+    /// A mutation proved the split matters: reducing `style_focus_marker` to a bare `Line::raw`
+    /// left the whole suite green, because every other `focus` assertion in this module targets a
+    /// *form* row (`> --agents`) and so exercises `style_form` instead. This test is the one that
+    /// fails when `style_focus_marker` stops styling.
+    ///
+    /// The needle is a prefix, not the whole 86-character row, so it cannot be pushed onto a
+    /// second visual line by wrapping — `drawn_foreground` reads a needle out of one rendered row.
+    #[test]
+    fn the_command_lists_marked_row_carries_the_focus_role() {
+        let server = FakeServer::healthy();
+        let host = FakeHost::outside_tmux();
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+        shell.set_theme(Theme::colour());
+        assert_eq!(
+            shell.focus(),
+            Focus::CommandList,
+            "the command list is focused on open, which is what puts a `>` in it at all"
+        );
+
+        let expected = Theme::colour().focus.fg.expect("`focus` sets a foreground");
+        assert_eq!(
+            drawn_foreground(&shell, 120, 90, ">  cao install"),
+            expected,
+            "the command list's marked row must carry `focus`; without this the region's whole \
+             styling function can be deleted with the suite still green"
+        );
+
+        // And the unmarked rows must not: a list where every row is cyan says nothing about focus.
+        let unmarked = drawn_foreground(&shell, 120, 90, "  cao launch");
+        assert_ne!(
+            unmarked, expected,
+            "an unmarked command row must not carry `focus`, or the colour stops distinguishing \
+             the cursor's row from the other 41"
+        );
+    }
+
+    /// **FR-4.4 — every `dim` marker: `[not sent — …]`, `[unloadable — …]`, `(not installed)`.**
+    ///
+    /// # Why all three in one test, and why each has a negative half
+    ///
+    /// These are the three strings the design's `dim` gloss covers, and they come from two
+    /// different functions ([`Renderer::style_form`] and [`style_pickers`]). Asserting one and
+    /// trusting the other two is how the [`Renderer::style_focus_marker`] gap happened: a role can
+    /// be "covered" while a whole call site of it is unstyled.
+    ///
+    /// `dim` goes on the **marker only**, never the row, and that is the point of the negative
+    /// half. FR-1.5 and FR-1.7 require an unloadable profile and an uninstalled provider to be
+    /// *shown* rather than filtered; dimming the whole row would work against the requirement it
+    /// is meant to serve, by making the row that most needs reading the hardest to read.
+    ///
+    /// Needles are ASCII prefixes of each marker — [`drawn_foreground`] indexes a row by byte
+    /// offset, and all three markers contain an em dash or run past one screen row.
+    #[test]
+    fn every_dim_marker_dims_its_marker_and_not_its_row() {
+        let server = FakeServer::healthy();
+        // An unloadable profile and an uninstalled provider, alongside usable ones — the usable
+        // rows are what the negative half needs.
+        *server.profiles.borrow_mut() =
+            Ok(vec![profile("planner", true), profile("broken", false)]);
+        *server.providers.borrow_mut() = Ok(vec![provider("kiro_cli", false)]);
+        let host = FakeHost::outside_tmux();
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+        shell.set_theme(Theme::colour());
+        assert!(shell.focus_command(CommandId::Launch));
+        assert!(shell.on_key(KeyCode::Enter));
+
+        let dim = Theme::colour().dim.fg.expect("`dim` sets a foreground");
+
+        // The pickers are collapsed by default, so their ROWS are off-screen until expanded. Driven
+        // through the real key handler rather than by setting the flags, so a fold that cannot be
+        // opened by keyboard fails here rather than being asserted around.
+        for region in [Focus::AgentPicker, Focus::ProviderPicker] {
+            while shell.focus() != region {
+                assert!(
+                    shell.on_key(KeyCode::Tab),
+                    "tab must reach {region:?} — an unreachable fold cannot be opened at all"
+                );
+            }
+            assert!(
+                shell.on_key(KeyCode::Enter),
+                "[enter] must expand {region:?}"
+            );
+        }
+
+        // Two picker row markers.
+        assert_eq!(
+            drawn_foreground(&shell, 160, 90, "[unloadable"),
+            dim,
+            "an unloadable profile's marker must be `dim`: the picker worked, this row is \
+             informational"
+        );
+        assert_eq!(
+            drawn_foreground(&shell, 160, 90, "(not installed)"),
+            dim,
+            "an uninstalled provider's marker must be `dim` — `installed` is display information, \
+             never a filter (FR-1.7)"
+        );
+        // ...and neither row is dimmed as a whole, or FR-1.5/FR-1.7's "shown, not hidden" is
+        // undone by the styling.
+        for row in ["broken", "kiro_cli"] {
+            assert_ne!(
+                drawn_foreground(&shell, 160, 90, row),
+                dim,
+                "{row:?} is the name the operator has to read; only its marker dims"
+            );
+        }
+
+        // The `[not sent — …]` marker, in the collapsed optional section.
+        while shell.focus() != Focus::OptionalSection {
+            assert!(
+                shell.on_key(KeyCode::Tab),
+                "tab must reach the optional section from the form"
+            );
+        }
+        assert!(shell.on_key(KeyCode::Enter), "[enter] expands the section");
+
+        assert_eq!(
+            drawn_foreground(&shell, 160, 90, "[not sent"),
+            dim,
+            "the `[not sent — …]` marker must be `dim`: the field is present and explained, and \
+             the explanation is secondary to the field's own name"
+        );
+        assert_ne!(
+            drawn_foreground(&shell, 160, 90, "--yolo"),
+            dim,
+            "the flag's own name must not dim — an operator hunting for `--yolo` has to be able \
+             to find it (FR-1.5's posture, applied to the form)"
+        );
+    }
+
+    // ── The picker folds ──────────────────────────────────────────────────────────────────────
+
+    /// A server answering with `count` agents, named `agent-00`.. so each row is findable.
+    fn server_with_many_agents(count: usize) -> FakeServer {
+        let server = FakeServer::healthy();
+        *server.profiles.borrow_mut() = Ok((0..count)
+            .map(|index| profile(&format!("agent-{index:02}"), true))
+            .collect());
+        server
+    }
+
+    /// Selects `cao launch` and returns the shell, pickers populated.
+    fn shell_on_the_launch_form<'a, S: ServerApi, H: Host>(
+        server: &'a S,
+        host: &'a H,
+        cols: u16,
+        rows: u16,
+    ) -> Renderer<'a, S, H> {
+        let mut shell = Renderer::new(server, host, cols, rows);
+        assert!(shell.focus_command(CommandId::Launch));
+        assert!(shell.on_key(KeyCode::Enter));
+        shell
+    }
+
+    /// **25 agents must not push the rest of the column off the screen.**
+    ///
+    /// The reported defect: the left column is one `Paragraph` and does not scroll, so with 25
+    /// profiles the agent list ran past the last row and took the *banner* with it — a failure the
+    /// operator needed to read became invisible because a list above it was long.
+    ///
+    /// Asserted as a bound on the region's own height rather than by eyeballing a screenshot: the
+    /// fold's whole purpose is that picker height stops tracking profile count, and `<= 3` is the
+    /// two collapsed headers plus slack. A regression to the unfolded list makes this 28.
+    ///
+    /// The negative half is what stops the fold from being a delete: the count and the `[enter]`
+    /// that opens it must both still be on screen, or the operator has no way to learn 25 agents
+    /// exist. That is the FR-1.5/FR-1.7 posture applied to the fold.
+    #[test]
+    fn a_long_agent_list_stays_bounded_and_still_states_its_count() {
+        let server = server_with_many_agents(25);
+        let host = FakeHost::outside_tmux();
+        let shell = shell_on_the_launch_form(&server, &host, 100, 40);
+
+        let frame = shell.render();
+        assert!(
+            frame.pickers.len() <= 3,
+            "25 agents must not occupy 25 rows — the column does not scroll, so a long list \
+             clips the banner off the bottom. Got {} lines: {:?}",
+            frame.pickers.len(),
+            frame.plain_lines()
+        );
+
+        let pickers = joined(&frame.pickers, "\n");
+        assert!(
+            pickers.contains("agents (25)"),
+            "the collapsed header must state the COUNT — a fold that hides the number leaves the \
+             operator unable to tell 25 agents from none. Got: {pickers:?}"
+        );
+        assert!(
+            pickers.contains("[enter]"),
+            "the collapsed header must name the key that opens it; an unadvertised fold is a \
+             hidden list (NFR-3). Got: {pickers:?}"
+        );
+    }
+
+    /// **Every one of 25 agents is reachable by keyboard once expanded.**
+    ///
+    /// This is the half a `… N more` cap could not satisfy, and the reason scrolling was chosen
+    /// over one: the operator with 25 agents has to be able to *see agent 25*. Scrolls to the
+    /// bottom through the real key handler and asserts the last row arrived.
+    ///
+    /// The `assert_ne!` on the first row is the anti-vacuity floor. Without it a build whose window
+    /// never moved would still pass the "last row is visible" check if the window happened to be
+    /// tall enough to hold everything — the test would then be asserting the window size, not the
+    /// scrolling. At 40 rows the window is 10 and the list is 25, so the two views must differ.
+    #[test]
+    fn every_agent_is_reachable_by_scrolling_the_expanded_fold() {
+        let server = server_with_many_agents(25);
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_on_the_launch_form(&server, &host, 100, 40);
+
+        while shell.focus() != Focus::AgentPicker {
+            assert!(shell.on_key(KeyCode::Tab), "tab must reach the agent fold");
+        }
+        assert!(shell.on_key(KeyCode::Enter), "[enter] must expand the fold");
+
+        let expanded = joined(&shell.render().pickers, "\n");
+        assert!(
+            expanded.contains("agent-00"),
+            "an expanded fold must show the top of the list. Got: {expanded:?}"
+        );
+        assert!(
+            !expanded.contains("agent-24"),
+            "the window must be SMALLER than the list at 40 rows, or this test cannot tell \
+             scrolling from a window that already fits everything. Got: {expanded:?}"
+        );
+
+        // 25 presses is more than the clamp needs, which is the point: over-scrolling must stop at
+        // the last window rather than running off the end.
+        for _ in 0..25 {
+            shell.on_key(KeyCode::Down);
+        }
+        let bottom = joined(&shell.render().pickers, "\n");
+        assert!(
+            bottom.contains("agent-24"),
+            "the LAST agent must be reachable by scrolling — an unreachable tail is the defect \
+             the fold was meant to fix, one level in. Got: {bottom:?}"
+        );
+        assert_ne!(
+            bottom, expanded,
+            "the viewport must actually have MOVED. Identical views would mean `Down` was \
+             swallowed and the assertion above was passing on window size alone"
+        );
+
+        // And it clamps rather than scrolling into empty space below the last row.
+        assert!(
+            bottom.contains("above"),
+            "a scrolled window must state what is off-screen ABOVE it, or a partial view reads as \
+             a complete list. Got: {bottom:?}"
+        );
+    }
+
+    /// **The collapsed header carries the unavailable count** (FR-1.5, FR-1.7).
+    ///
+    /// FR-1.5 and FR-1.7 require an unloadable profile and an uninstalled provider to be *listed*
+    /// so the operator learns the thing exists and why it is unavailable. Folding the rows away is a
+    /// layout decision; folding away the *fact* would be a regression against both, and a silent
+    /// one — the screen would simply read `agents (25)` with nothing missing-looking about it.
+    ///
+    /// Written after mutation testing found this unguarded: deleting the whole `diagnosis` clause
+    /// from `fold_lines` left all 183 tests green. `a_long_agent_list_stays_bounded_…` asserts
+    /// `agents (25)`, which is a *prefix* of `agents (25, 2 unloadable)` and so cannot tell the two
+    /// apart. This asserts the count itself, in both pickers, plus a zero case so the clause is not
+    /// simply always-on.
+    #[test]
+    fn a_collapsed_fold_still_states_how_many_rows_are_unavailable() {
+        let server = FakeServer::healthy();
+        *server.profiles.borrow_mut() = Ok(vec![
+            profile("planner", true),
+            profile("broken", false),
+            profile("also-broken", false),
+        ]);
+        *server.providers.borrow_mut() =
+            Ok(vec![provider("kiro_cli", true), provider("codex", false)]);
+        let host = FakeHost::outside_tmux();
+        let shell = shell_on_the_launch_form(&server, &host, 100, 40);
+
+        let pickers = joined(&shell.render().pickers, "\n");
+        assert!(
+            pickers.contains("agents (3, 2 unloadable)"),
+            "the COLLAPSED header must state how many profiles are unloadable — FR-1.5 requires \
+             the operator learn an unavailable profile exists, and a fold that drops the count \
+             hides exactly that. Got: {pickers:?}"
+        );
+        assert!(
+            pickers.contains("providers (2, 1 not installed)"),
+            "and the same for uninstalled providers (FR-1.7): `installed` is display information, \
+             so the count must survive the fold. Got: {pickers:?}"
+        );
+
+        // The zero case: with everything usable there is no diagnosis to report, and appending
+        // `, 0 unloadable` to a healthy list would be noise the operator learns to ignore.
+        let healthy = server_with_many_agents(4);
+        let clean = shell_on_the_launch_form(&healthy, &host, 100, 40);
+        let clean_pickers = joined(&clean.render().pickers, "\n");
+        assert!(
+            clean_pickers.contains("agents (4)") && !clean_pickers.contains("unloadable"),
+            "with nothing unavailable the header must be a bare count — otherwise the clause is \
+             always-on and says nothing. Got: {clean_pickers:?}"
+        );
+    }
+
+    /// **A failed picker is never folded** — a failure must not need a keystroke to be read.
+    ///
+    /// The fold exists to bound a long *list*. A failure line is one row and carries the `[ctrl+r]`
+    /// remedy, so folding it would hide the one picker state the operator has to act on. Asserted
+    /// with the fold flags at their default, which is exactly the state a failure appears in.
+    #[test]
+    fn a_failed_picker_is_never_folded_away() {
+        let server = FakeServer::unreachable();
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_with_failed_pickers(&server, &host);
+
+        let pickers = joined(&shell.render().pickers, "\n");
+        for expected in ["agents: unavailable", "providers: unavailable", "[ctrl+r]"] {
+            assert!(
+                pickers.contains(expected),
+                "{expected:?} must be visible with no keystroke — a folded failure is a failure \
+                 the operator cannot see. Got: {pickers:?}"
+            );
+        }
+        assert!(
+            !pickers.contains("[enter] expand"),
+            "a failure line must not be presented as a fold: there is nothing to expand, so the \
+             key would do nothing. Got: {pickers:?}"
+        );
+
+        // And `[enter]` on the region does not silently start a run either.
+        while shell.focus() != Focus::AgentPicker {
+            assert!(shell.on_key(KeyCode::Tab));
+        }
+        assert!(
+            !shell.on_key(KeyCode::Enter),
+            "[enter] on a failed picker must report UNHANDLED rather than toggling a fold that \
+             has no rows"
+        );
+    }
+
+    // ── Reveal-then-run ───────────────────────────────────────────────────────────────────────
+
+    /// **The first `[enter]` reveals the options; only the second runs.**
+    ///
+    /// The reported defect: with the optional section and both pickers collapsed by default, the
+    /// first `[enter]` after choosing a command *executed* it, so the nine optional parameters
+    /// behind the fold were unreachable in the one flow every operator takes. The operator
+    /// described running the CLI by accident while trying to open the options.
+    ///
+    /// Asserts on the SERVER, not on a flag: `create_session_calls` is the irreversible side
+    /// effect, and a test that only checked `pending_action` would pass against a build that queued
+    /// the launch and fired it one tick later — the same defect, one frame further on. Both are
+    /// checked here for that reason.
+    #[test]
+    fn the_first_enter_reveals_the_options_and_the_second_one_runs() {
+        let server =
+            server_with_many_agents(25).with_session(SessionAnswer::Created(terminal("t")));
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_on_the_launch_form(&server, &host, 100, 40);
+        shell
+            .flow_mut()
+            .set("--agents", "agent-00")
+            .expect("a loadable profile in the fake's answer");
+
+        // Everything is folded, so this press must REVEAL.
+        assert!(
+            shell.on_key(KeyCode::Enter),
+            "the reveal press must be handled"
+        );
+        assert_eq!(
+            server.create_session_calls.get(),
+            0,
+            "the first [enter] must not run the command — this is the reported defect"
+        );
+        assert!(
+            shell.pending_action.is_none(),
+            "nor may it QUEUE a run: a queued launch fires on the next tick, which is the same \
+             accidental execution one frame later"
+        );
+
+        let revealed = joined(&shell.render().pickers, "\n");
+        assert!(
+            revealed.contains("agent-00"),
+            "the reveal press must actually open the folds, or it is a wasted keystroke that \
+             teaches the operator the key is broken. Got: {revealed:?}"
+        );
+
+        // Nothing is folded now, so this press must RUN.
+        assert!(
+            shell.on_key(KeyCode::Enter),
+            "the run press must be handled"
+        );
+        assert!(
+            shell.pending_action.is_some(),
+            "the second [enter] must queue the run"
+        );
+        assert!(shell.run_pending_action());
+        assert_eq!(
+            server.create_session_calls.get(),
+            1,
+            "the second [enter] must reach `launch()` — reveal-then-run must not become \
+             reveal-then-nothing, which would make the command unrunnable"
+        );
+    }
+
+    /// **The footer states which of the two things `[enter]` will do right now.**
+    ///
+    /// A footer reading `ready — [enter] run` while the first press actually expands is the same
+    /// broken promise as a documented key that does nothing: the operator presses it expecting a
+    /// run, gets an expansion, and stops trusting the footer. Both phases are asserted, so a build
+    /// that hard-codes either wording fails.
+    #[test]
+    fn the_footer_promises_reveal_before_run_and_run_after() {
+        let server = server_with_many_agents(25);
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_on_the_launch_form(&server, &host, 100, 40);
+        shell
+            .flow_mut()
+            .set("--agents", "agent-00")
+            .expect("a loadable profile in the fake's answer");
+
+        let folded = joined(&shell.render().footer, " ");
+        assert!(
+            folded.contains("show all options"),
+            "while options are folded the footer must say the press REVEALS. Got: {folded:?}"
+        );
+
+        assert!(shell.on_key(KeyCode::Enter));
+        let revealed = joined(&shell.render().footer, " ");
+        assert!(
+            revealed.contains("[enter] run") && !revealed.contains("show all options"),
+            "once everything is revealed the footer must promise a RUN — a stale reveal hint \
+             leaves the operator unsure whether the command ever starts. Got: {revealed:?}"
+        );
+    }
+
+    /// **A form with nothing to reveal runs on the first `[enter]`.**
+    ///
+    /// The reveal step is a consequence of something being *hidden*. A command with no optional
+    /// fields and both pickers empty has nothing to show, so demanding a first press there would
+    /// be a keystroke that visibly does nothing — and the operator would press `[enter]` forever
+    /// with the server down. This is the case `has_folded_options` exists to exclude, and without
+    /// it the two-press rule would be a hang rather than a safeguard.
+    #[test]
+    fn a_form_with_nothing_folded_runs_on_the_first_enter() {
+        let server = FakeServer::healthy().with_run(RunAnswer::Chunks(vec!["out\n"], 200));
+        // Both pickers empty: `Loaded(vec![])` is a valid answer, and it is NOT foldable.
+        *server.profiles.borrow_mut() = Ok(vec![]);
+        *server.providers.borrow_mut() = Ok(vec![]);
+        let host = FakeHost::outside_tmux();
+
+        let mut shell = Renderer::new(&server, &host, 100, 40);
+        // `profile list` declares NO parameters at all — the only shape with genuinely nothing to
+        // reveal once both pickers are empty. `session list` was the obvious choice and is wrong:
+        // it has a `--json` flag, so it is foldable and this test's own floor caught it.
+        assert!(shell.focus_command(CommandId::ProfileList));
+        assert!(shell.on_key(KeyCode::Enter));
+
+        assert!(
+            !shell.has_folded_options(),
+            "this test is only meaningful if nothing is folded; otherwise it asserts the reveal \
+             path and its name lies"
+        );
+
+        assert!(shell.on_key(KeyCode::Enter));
+        assert!(
+            shell.run_pending_action(),
+            "with nothing to reveal the FIRST [enter] must run — an unconditional reveal press \
+             would be a keystroke that does nothing visible, and the run would never start"
+        );
+        assert_eq!(
+            server.run_calls.borrow().as_slice(),
+            &[CommandId::ProfileList]
+        );
+    }
+
+    /// **Re-selecting a command re-collapses the folds.**
+    ///
+    /// Otherwise reveal-then-run depends on history: an operator who expanded the pickers for one
+    /// command would find the next command running on its *first* `[enter]`, which is the original
+    /// accidental-execution defect returning for everyone who had used the TUI for more than one
+    /// command. The two-press shape has to be a property of the screen, not of the session.
+    #[test]
+    fn selecting_another_command_re_collapses_the_folds() {
+        let server = server_with_many_agents(25);
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_on_the_launch_form(&server, &host, 100, 40);
+
+        assert!(shell.on_key(KeyCode::Enter), "reveal everything");
+        assert!(
+            !shell.has_folded_options(),
+            "the reveal press must have opened the folds for this test to mean anything"
+        );
+
+        // Back to the list and pick a different command.
+        assert!(shell.on_key(KeyCode::Left));
+        assert!(shell.focus_command(CommandId::MemoryList));
+        assert!(shell.on_key(KeyCode::Enter));
+
+        let pickers = joined(&shell.render().pickers, "\n");
+        assert!(
+            pickers.contains("[enter] expand"),
+            "a newly selected command must start COLLAPSED — inheriting the previous command's \
+             expansion makes the first [enter] run, which is the reported defect. Got: {pickers:?}"
+        );
+        assert!(
+            !pickers.contains("agent-00"),
+            "and the rows themselves must be folded away again. Got: {pickers:?}"
+        );
+    }
+
+    /// **Every region fits on screen at once — the whole point of the fold and the window.**
+    ///
+    /// This is the operator's actual complaint, asserted end to end: with 25 agents, is the picker
+    /// visible *at the same time as* the form and the banner? Folding the pickers alone did not
+    /// achieve that, and the fold's own unit test could not tell — it asserted on `frame.pickers`,
+    /// a region that exists whether or not it survives layout.
+    ///
+    /// Measured in a real pty at 40 and 70 rows, the pickers never appeared at all: the **42-command
+    /// list** is rendered first into a non-scrolling column and consumed the whole height. So the
+    /// assertion here is on the DRAWN BUFFER, which is the only thing that can catch a region that
+    /// renders correctly and is then clipped away.
+    #[test]
+    fn at_a_realistic_size_every_region_survives_the_layout() {
+        let server = server_with_many_agents(25);
+        let host = FakeHost::outside_tmux();
+        let shell = shell_on_the_launch_form(&server, &host, 120, 40);
+
+        let drawn: String = drawn_cells(&shell, 120, 40)
+            .chunks(120)
+            .map(|row| {
+                let text: String = row.iter().map(|(symbol, _)| symbol.as_str()).collect();
+                format!("{}\n", text.trim_end())
+            })
+            .collect();
+
+        // One needle per region, each of which was invisible before the window was added.
+        for (region, needle) in [
+            ("the command list", "cao install"),
+            ("the required fields", "--agents"),
+            ("the optional fold", "optional ("),
+            ("the agent fold", "agents (25)"),
+            ("the provider fold", "providers ("),
+            ("the footer", "[tab]"),
+        ] {
+            assert!(
+                drawn.contains(needle),
+                "{region} must be VISIBLE at 120x40 — {needle:?} was not drawn. A region that \
+                 renders into the frame and is then clipped by the layout is invisible to the \
+                 operator, which is the reported defect. Screen:\n{drawn}"
+            );
+        }
+
+        // And the list states that it is showing a window, so 42 commands do not read as 13.
+        assert!(
+            drawn.contains("of 42 commands"),
+            "the windowed list must say how many commands there are in total, or the operator \
+             cannot tell a window from the whole catalog. Screen:\n{drawn}"
+        );
+    }
+
+    /// **The command-list window follows the cursor, so focus is never off-screen.**
+    ///
+    /// A fixed slice would bound the height just as well and would let `Down` walk the cursor past
+    /// the last visible row — the invisible-focus defect (NFR-3 item 7) one region over, and
+    /// indistinguishable from a frozen UI. Drives the cursor to the last command and asserts the
+    /// marked row is on screen.
+    #[test]
+    fn the_command_window_follows_the_cursor_to_the_end_of_the_list() {
+        let server = FakeServer::healthy();
+        let host = FakeHost::outside_tmux();
+        let mut shell = Renderer::new(&server, &host, 120, 40);
+
+        let total = shell.command_rows().len();
+        assert!(
+            total > shell.command_list_window(),
+            "this test needs a list LONGER than the window ({total} rows) or it proves nothing"
+        );
+
+        for _ in 0..total {
+            shell.on_key(KeyCode::Down);
+        }
+
+        let rendered = joined(&shell.render().command_list, "\n");
+        let marked = rendered
+            .lines()
+            .find(|line| line.starts_with('>'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the focus marker must be ON SCREEN after scrolling to the end — a cursor \
+                        outside the window is invisible focus, and the TUI looks frozen. \
+                        Got:\n{rendered}"
+                )
+            });
+        assert!(
+            marked.contains("cao workflow validate"),
+            "the window must have followed the cursor to the LAST command. Marked row: {marked:?}"
+        );
+        assert!(
+            rendered.contains("above"),
+            "and it must state what is off-screen above it. Got:\n{rendered}"
+        );
+    }
+
+    /// **A focused fold header carries the `focus` role, and an unfocused one does not.** (#556)
+    ///
+    /// The two new regions are focusable, so they need the same visible-focus guarantee as every
+    /// other region (NFR-3 item 7): a region the operator can Tab into with no cue looks like a
+    /// keystroke that did nothing. The negative half is what makes this a test of *focus* rather
+    /// than of "fold headers are cyan".
+    #[test]
+    fn the_focused_fold_header_carries_the_focus_role() {
+        let server = server_with_many_agents(3);
+        let host = FakeHost::outside_tmux();
+        let mut shell = shell_on_the_launch_form(&server, &host, 120, 90);
+        shell.set_theme(Theme::colour());
+
+        while shell.focus() != Focus::AgentPicker {
+            assert!(shell.on_key(KeyCode::Tab));
+        }
+
+        let focus_fg = Theme::colour().focus.fg.expect("`focus` sets a foreground");
+        assert_eq!(
+            drawn_foreground(&shell, 120, 90, "agents (3)"),
+            focus_fg,
+            "the focused fold header must carry `focus`; a region with no visible cue is one the \
+             operator cannot tell they are in (NFR-3 item 7)"
+        );
+        assert_ne!(
+            drawn_foreground(&shell, 120, 90, "providers ("),
+            focus_fg,
+            "the UNFOCUSED fold must not carry `focus` — if both are styled the same, the colour \
+             says nothing about where the keyboard is"
         );
     }
 }
