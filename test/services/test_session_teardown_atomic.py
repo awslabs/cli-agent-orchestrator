@@ -36,7 +36,7 @@ from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.backends.registry import set_backend
 from cli_agent_orchestrator.clients import database
-from cli_agent_orchestrator.services import session_service, terminal_service
+from cli_agent_orchestrator.services import session_env, session_service, terminal_service
 
 # Any thread join / lock acquire in these tests must be bounded: a self-deadlock
 # or a lock never released has to FAIL the test, not hang the whole run.
@@ -72,6 +72,14 @@ class FakeTmuxBackend:
     # --- test helpers ---
     def add_session(self, session_name: str, windows: Set[str]) -> None:
         self._sessions[session_name] = set(windows)
+
+    def windows(self, session_name: str) -> Set[str]:
+        """The live windows of ``session_name`` (empty set if it is gone).
+
+        Lets a test assert WHICH windows survived a partial teardown, not merely
+        that the session still exists.
+        """
+        return set(self._sessions.get(session_name, set()))
 
     # --- backend surface used by delete_session / terminal teardown ---
     def session_exists(self, session_name: str) -> bool:
@@ -1227,3 +1235,99 @@ def test_tail_guard_does_not_mask_an_unconfirmed_kill(real_db, runtime, monkeypa
     assert backend.session_exists("cao-tailsafe") is True
     assert {r["id"] for r in database.list_terminals_by_session("cao-tailsafe")} == {"t1"}
     assert runtime.is_fully_live("t1")
+
+
+# --- Atomicity of the locked CREATE closure itself -------------------------
+#
+# The tests above pin the teardown side and the create-vs-teardown ordering. The
+# two below pin the create's OWN all-or-nothing property: the closure holding the
+# lifecycle lock makes the backend resource AND its registry row, and a failure
+# between them must not leave the backend resource behind.
+
+
+def _create_in_thread_kw(**kwargs):
+    """Run the async create_terminal from a worker thread with explicit kwargs.
+
+    Same as ``_create_in_thread`` but for the cases that need to vary
+    ``new_session`` / ``env_vars``.
+    """
+    import asyncio
+
+    return asyncio.run(
+        terminal_service.create_terminal(
+            provider="claude_code",
+            agent_profile="developer",
+            **kwargs,
+        )
+    )
+
+
+def test_row_write_failure_kills_the_session_it_just_created(real_db, runtime, monkeypatch):
+    """new_session=True: a mid-closure failure must not orphan the tmux session.
+
+    The registry write is the LAST step of the locked critical section, and it is
+    the one that realistically fails: ``clients/database.py`` builds its engine
+    with neither ``busy_timeout`` nor WAL, so a concurrent writer makes
+    "database is locked" an ordinary outcome rather than a pathological one.
+
+    The regression this catches: the closure returns its
+    ``(window_name, session_created, window_created)`` tuple only on FULL
+    success, so when it raises after ``create_session`` landed, the outer
+    ``session_created`` flag the ``except`` block keys its teardown off is still
+    False — nothing is killed, and a live tmux session is left with no registry
+    row. That is precisely the divergence #498 exists to eliminate, produced by
+    the create path instead of the teardown path. Pre-#498 code set the flag
+    immediately after ``create_session``, so any later failure killed it.
+    """
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    monkeypatch.setattr(terminal_service, "db_create_terminal", _db_locked)
+
+    with pytest.raises(OperationalError, match="database is locked"):
+        _create_in_thread_kw(
+            session_name="cao-rollback",
+            new_session=True,
+            env_vars={"SECRET": "s3cret"},
+        )
+
+    # The session this call created is GONE — not left running behind a failed
+    # create, and not waiting on an out-of-band reconciliation to notice it.
+    assert backend.session_exists("cao-rollback") is False
+    assert backend.kill_session_calls == 1
+    # Neither store holds anything for the name: no orphan in EITHER direction.
+    assert database.list_terminals_by_session("cao-rollback") == []
+    # Forwarded env is dropped with the session, so the secret cannot linger in
+    # memory or bleed into a future reuse of the name.
+    assert session_env.get_session_env("cao-rollback") == {}
+
+
+def test_row_write_failure_kills_only_the_window_it_added(real_db, runtime, monkeypatch):
+    """new_session=False: kill the added WINDOW, leave the session and its peers.
+
+    This is the branch every MCP spawn/assign-into-an-existing-session call
+    takes, and its rollback is NOT the session-level one: the session pre-existed
+    this call, so tearing it down would destroy terminals the failed create never
+    owned. Only the one window added under the lock may go.
+
+    Same regression as the session branch — ``window_created`` is also assigned
+    only from a successful return, so a mid-closure failure left the pane alive
+    with no row: invisible to every list/tree view (the row is gone), never
+    reconciled, sitting there indefinitely.
+    """
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _seed(backend, "cao-existing", [("t-peer", "w-peer")], runtime)
+    monkeypatch.setattr(terminal_service, "db_create_terminal", _db_locked)
+
+    with pytest.raises(OperationalError, match="database is locked"):
+        _create_in_thread_kw(session_name="cao-existing", new_session=False)
+
+    # The added window is gone...
+    assert backend.kill_window_calls == 1
+    # ...and the pre-existing session survived with its own window untouched.
+    assert backend.session_exists("cao-existing") is True
+    assert backend.windows("cao-existing") == {"w-peer"}
+    assert backend.kill_session_calls == 0
+    # The peer terminal is untouched in both stores.
+    assert {r["id"] for r in database.list_terminals_by_session("cao-existing")} == {"t-peer"}
+    assert runtime.is_fully_live("t-peer")

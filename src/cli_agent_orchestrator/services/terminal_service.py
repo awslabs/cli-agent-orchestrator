@@ -155,6 +155,49 @@ SOFT_ENFORCEMENT_PROVIDERS = {
 }
 
 
+def _roll_back_backend_create_locked(
+    session_name: str,
+    window_name: str,
+    *,
+    created_session: bool,
+) -> None:
+    """Undo the backend resource a create just made. CALLER MUST HOLD the
+    lifecycle lock for ``session_name``.
+
+    Used by ``create_terminal``'s locked critical section so a failure between
+    the backend create and the registry write cannot leave a live tmux
+    session/window with no row. Both branches matter and they are NOT the same
+    teardown:
+
+    * ``created_session=True`` — this call created the whole session, so kill the
+      session and drop any forwarded env stashed for the name, so secrets don't
+      linger in memory or bleed into a future reuse of the name.
+    * ``created_session=False`` — this call only added a WINDOW to a session that
+      already existed (``new_session=False``: every MCP spawn/assign-into-an-
+      existing-session call). Kill ONLY that window. The pre-existing session
+      must stay up and its other terminals must be untouched; killing this one
+      window cannot collapse it, since the session pre-existed and therefore
+      still holds at least one other window.
+
+    Best-effort and never raises: it runs while an exception is already in
+    flight, and that original failure is the one the caller must see.
+    """
+    if created_session:
+        try:
+            get_backend().kill_session(session_name)
+        except Exception:
+            logger.exception(f"Rollback: failed to kill session {session_name}")
+        try:
+            clear_session_env(session_name)
+        except Exception:
+            logger.exception(f"Rollback: failed to clear session env for {session_name}")
+    else:
+        try:
+            get_backend().kill_window(session_name, window_name)
+        except Exception:
+            logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -217,6 +260,12 @@ async def create_terminal(
         TimeoutError: If provider initialization times out
     """
     terminal_id: Optional[str] = None
+    # Both flags are assigned ONLY from a successful return of the locked
+    # closure below, so they mean "this call created backend state that OUTLIVED
+    # the critical section" — i.e. the cleanup path owns it. A failure INSIDE the
+    # closure leaves them False on purpose: the closure has already rolled its
+    # own backend create back, under the lock, so there is nothing left for the
+    # `except` to tear down (see _roll_back_backend_create_locked).
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
     # already-existing session (the `new_session=False` branch below — what
@@ -354,6 +403,30 @@ async def create_terminal(
             Returns (window_name, session_created, window_created) — the caller
             needs all three: create_window may rename the window, and the
             failure path keys its cleanup off which one this call created.
+
+            A failure ANYWHERE after the backend create rolls the backend
+            resource back HERE, still holding the lock, before re-raising, so
+            this function is all-or-nothing: on return the tmux session/window
+            and its registry row both exist; on raise neither does. Without that
+            the outer flags below would still be False (they are only assigned
+            from a successful RETURN), the `except` cleanup would tear down
+            nothing, and the failure would leave a live tmux session with no
+            registry row — the exact divergence #498 exists to eliminate. A
+            "database is locked" OperationalError out of db_create_terminal is
+            an ordinary outcome under CAO's concurrent writers, so this is a
+            routine path, not a pathological one.
+
+            Why the rollback is INSIDE the lock rather than reported out to the
+            outer cleanup path: the lock's entire purpose is that, for one
+            session NAME, create and teardown are serialized so the name is
+            never observable half-built. Rolling back after release would reopen
+            that window — between the release and the kill, another thread can
+            acquire the name and legitimately succeed (a new_session=False
+            create adding a window to what it sees as a live session, or a
+            teardown plus a fresh new_session=True create rebuilding the name) —
+            and the late kill would then destroy an incarnation this call does
+            not own, leaving ITS row pointing at nothing. Under the lock the
+            name goes free -> free with no observable intermediate state.
             """
             assert session_name is not None  # narrowed by the caller
             with session_lifecycle_lock(session_name):
@@ -377,12 +450,6 @@ async def create_terminal(
                     )
                     created_window_name = window_name
                     created_session, created_window = True, False
-
-                    # Persist forwarded env only after the tmux session actually
-                    # exists; the failure path clears it if a later step tears
-                    # the session back down.
-                    if env_vars:
-                        set_session_env(session_name, env_vars)
                 else:
                     # Add window to existing session. Same lock, same reason: a
                     # window added mid-teardown would otherwise survive the
@@ -403,23 +470,42 @@ async def create_terminal(
                     )
                     created_session, created_window = False, True
 
-                # Persist the registry row INSIDE the critical section so the
-                # tmux session/window and its row become visible together. A
-                # teardown that observes the new tmux state is then guaranteed to
-                # also observe the row, instead of killing a session whose row it
-                # cannot see and leaving it orphaned. The row carries the launch
-                # policy already resolved above (allowed_tools, engine), so API
-                # reads and snapshots report what was actually launched.
-                db_create_terminal(
-                    terminal_id,
-                    session_name,
-                    created_window_name,
-                    provider,
-                    agent_profile,
-                    allowed_tools,
-                    caller_id=caller_id,
-                    engine=resolved_engine.value if resolved_engine is not None else None,
-                )
+                # From here the backend resource EXISTS, so every remaining step
+                # is guarded: on failure the resource is rolled back under this
+                # same lock before the exception leaves the closure. See the
+                # docstring for why the rollback belongs here and not in the
+                # caller's `except`.
+                try:
+                    if created_session and env_vars:
+                        # Persist forwarded env only after the tmux session
+                        # actually exists; rolled back below if a later step
+                        # tears the session down again.
+                        set_session_env(session_name, env_vars)
+
+                    # Persist the registry row INSIDE the critical section so the
+                    # tmux session/window and its row become visible together. A
+                    # teardown that observes the new tmux state is then guaranteed to
+                    # also observe the row, instead of killing a session whose row it
+                    # cannot see and leaving it orphaned. The row carries the launch
+                    # policy already resolved above (allowed_tools, engine), so API
+                    # reads and snapshots report what was actually launched.
+                    db_create_terminal(
+                        terminal_id,
+                        session_name,
+                        created_window_name,
+                        provider,
+                        agent_profile,
+                        allowed_tools,
+                        caller_id=caller_id,
+                        engine=resolved_engine.value if resolved_engine is not None else None,
+                    )
+                except BaseException:
+                    _roll_back_backend_create_locked(
+                        session_name,
+                        created_window_name,
+                        created_session=created_session,
+                    )
+                    raise
                 return created_window_name, created_session, created_window
 
         window_name, session_created, window_created = await asyncio.to_thread(
