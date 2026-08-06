@@ -50,6 +50,41 @@ _FORWARDED_ENV_PREFIX_ALLOWLIST = frozenset(
 )
 _FORWARDED_ENV_MAX_VALUE_BYTES = 2048
 
+# How long the CLI waits for a freshly created terminal to report ready before
+# attaching / sending MESSAGE. Also the FLOOR on the ``POST /sessions`` read
+# budget (see ``_create_session_timeout``): the two must not disagree about how
+# long provider init is allowed to take, or the create call gives up on work
+# the very next step is still willing to wait for.
+_READINESS_WAIT_TIMEOUT = 120
+
+
+def _create_session_timeout(settings):
+    """Read budget for ``POST /sessions``, which initializes the provider inline.
+
+    ``POST /sessions`` runs the provider's FULL ``initialize()`` synchronously
+    server-side (``session_service.create_session`` -> ``create_terminal`` ->
+    ``await provider_instance.initialize()``), so this request's read budget has
+    to cover ``provider_init_timeout`` — NOT the generic ``mcp_request_timeout``
+    (30s) meant for ordinary tool calls.
+
+    With the 30s budget, a slow provider cold start (codex with MCP servers, on
+    a container, under a concurrent fan-out) outlived the client: ``requests``
+    raised ``ReadTimeout``, ``launch`` turned that into "Failed to connect to
+    cao-server", and the create-then-send flow below never ran — so MESSAGE was
+    silently never delivered even though the session, the terminal, and a
+    healthy idle TUI all existed server-side. Nothing retried, because from the
+    server's point of view the launch had succeeded.
+
+    Server-side, ``provider_init_timeout`` applies TWICE per init — once to
+    ``wait_for_shell``, again to the final ``wait_until_status`` — with the
+    startup-prompt/trust-dialog handler in between, so cover the sum rather
+    than a single init timeout.
+    """
+    return max(
+        2 * settings["provider_init_timeout"] + settings["startup_prompt_handler_timeout"],
+        _READINESS_WAIT_TIMEOUT,
+    )
+
 
 def _parse_env_pairs(pairs):
     """Parse repeated ``KEY=VALUE`` entries into a dict, validating each.
@@ -297,8 +332,8 @@ def launch(
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.
         # See issue #248.
-        request_timeout = get_server_settings()["mcp_request_timeout"]
-        post_kwargs: dict = {"params": params, "timeout": request_timeout}
+        settings = get_server_settings()
+        post_kwargs: dict = {"params": params, "timeout": _create_session_timeout(settings)}
         if forwarded_env:
             post_kwargs["json"] = {"env_vars": forwarded_env}
 
@@ -324,13 +359,14 @@ def launch(
             ready = wait_until_terminal_status(
                 terminal["id"],
                 {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
+                timeout=_READINESS_WAIT_TIMEOUT,
             )
             if not ready:
                 click.echo(
                     click.style(
-                        f"  Warning: {terminal['id']} did not reach idle within 120s — "
-                        "attaching anyway; input may be unreliable until init completes.",
+                        f"  Warning: {terminal['id']} did not reach idle within "
+                        f"{_READINESS_WAIT_TIMEOUT}s — attaching anyway; input may be "
+                        "unreliable until init completes.",
                         fg="yellow",
                     )
                 )
@@ -339,17 +375,17 @@ def launch(
             ready = wait_until_terminal_status(
                 terminal["id"],
                 {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-                timeout=120,
+                timeout=_READINESS_WAIT_TIMEOUT,
             )
             if not ready:
                 raise click.ClickException(
-                    f"Conductor {terminal['id']} did not become ready within 120s"
+                    f"Conductor {terminal['id']} did not become ready within "
+                    f"{_READINESS_WAIT_TIMEOUT}s"
                 )
-            request_timeout = get_server_settings()["mcp_request_timeout"]
             response = requests.post(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/input",
                 params={"message": message},
-                timeout=request_timeout,
+                timeout=settings["mcp_request_timeout"],
             )
             response.raise_for_status()
             time.sleep(3)
@@ -357,11 +393,10 @@ def launch(
                 click.echo(f"Message sent to {terminal['name']}. Running in background.")
                 return
             poll_until_done(terminal["id"], timeout=300)
-            request_timeout = get_server_settings()["mcp_request_timeout"]
             output_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",
                 params={"mode": "last"},
-                timeout=request_timeout,
+                timeout=settings["mcp_request_timeout"],
             )
             output_resp.raise_for_status()
             output = output_resp.json().get("output", "")

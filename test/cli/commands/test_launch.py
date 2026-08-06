@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs, launch
+from cli_agent_orchestrator.cli.commands.launch import (
+    _READINESS_WAIT_TIMEOUT,
+    _parse_env_pairs,
+    launch,
+)
 
 # ── Backend auto-detection (issue #308) ──────────────────────────────
 
@@ -962,3 +966,160 @@ def test_launch_rejects_blocked_env_prefix_before_calling_api():
         assert result.exit_code != 0
         assert "blocked prefix" in result.output
         mock_post.assert_not_called()
+
+
+# ── POST /sessions read budget (caom-7it) ─────────────────────────────
+
+
+def test_launch_create_session_timeout_covers_provider_init():
+    """``POST /sessions`` must be given a read budget that covers server-side
+    provider init, not the 30s ``mcp_request_timeout`` meant for tool calls.
+
+    Regression guard for caom-7it: ``POST /sessions`` runs the provider's full
+    ``initialize()`` inline server-side. Under the old 30s budget a slow codex
+    cold start outlived the client, ``requests`` raised ``ReadTimeout``, and
+    ``launch`` reported "Failed to connect to cao-server" — so the
+    create-then-send flow never ran and MESSAGE was silently never delivered
+    even though a healthy session and terminal existed.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+    ):
+        mock_settings.return_value = {
+            "mcp_request_timeout": 30,
+            "provider_init_timeout": 60,
+            "startup_prompt_handler_timeout": 20,
+        }
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        # 2 * provider_init_timeout + startup_prompt_handler_timeout = 140.
+        # The old behaviour passed mcp_request_timeout (30) here.
+        assert mock_post.call_args.kwargs["timeout"] == 140
+
+
+def test_launch_create_session_timeout_never_below_readiness_wait():
+    """The create budget must not undercut the readiness wait that follows it.
+
+    If ``POST /sessions`` gave up sooner than the CLI's own
+    ``_READINESS_WAIT_TIMEOUT`` poll is willing to wait, the create call would
+    abandon work the very next step still expects to complete — the same
+    silent-drop shape as caom-7it. Small configured init timeouts must floor at
+    the readiness wait rather than shrink below it.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+    ):
+        mock_settings.return_value = {
+            "mcp_request_timeout": 30,
+            "provider_init_timeout": 5,
+            "startup_prompt_handler_timeout": 1,
+        }
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        assert mock_post.call_args.kwargs["timeout"] == _READINESS_WAIT_TIMEOUT
+
+
+def test_launch_create_session_timeout_scales_with_configured_init_timeout():
+    """An operator who raises ``provider_init_timeout`` for a slow host must get
+    a proportionally larger create budget — otherwise widening the server-side
+    allowance has no effect on the client that gives up first."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+    ):
+        mock_settings.return_value = {
+            "mcp_request_timeout": 30,
+            "provider_init_timeout": 180,
+            "startup_prompt_handler_timeout": 45,
+        }
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        assert mock_post.call_args.kwargs["timeout"] == 405
+
+
+def test_launch_headless_message_send_still_uses_mcp_request_timeout():
+    """Only the create call gets the widened budget. The follow-up ``/input``
+    and ``/output`` calls are ordinary requests and must keep using
+    ``mcp_request_timeout`` — widening those would mask a genuinely hung
+    server instead of tolerating a slow one-time init."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+    ):
+        mock_settings.return_value = {
+            "mcp_request_timeout": 30,
+            "provider_init_timeout": 60,
+            "startup_prompt_handler_timeout": 20,
+        }
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        poll_resp = MagicMock()
+        poll_resp.raise_for_status.return_value = None
+        poll_resp.json.return_value = {"status": "completed"}
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": "task done"}
+        mock_get.side_effect = [poll_resp, output_resp]
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "test-agent", "--headless", "--yolo", "do something"],
+        )
+
+        assert result.exit_code == 0
+        create_call, input_call = mock_post.call_args_list
+        assert create_call.kwargs["timeout"] == 140
+        assert input_call.kwargs["timeout"] == 30
+        assert mock_get.call_args_list[-1].kwargs["timeout"] == 30

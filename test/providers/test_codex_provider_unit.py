@@ -2342,3 +2342,169 @@ class TestCodexLaunchFlagsValidity:
             assert (
                 probe.returncode == 0 and "unexpected argument" not in probe.stderr
             ), f"Flag '{flag}' in launch command rejected by codex binary"
+
+
+class TestCodexInitEventLoopBlocking:
+    """Codex init must not block cao-server's single shared event loop (caom-7it).
+
+    Every backend call in ``initialize()`` / ``_handle_trust_prompt()`` is a
+    blocking subprocess exec. cao-server runs ONE event loop, so leaving them
+    loop-side froze every concurrent request — including every other terminal's
+    own init — for the duration. Codex was the slowest provider still doing
+    this: with two codex workers in a fan-out, the self-inflicted queueing
+    pushed ``POST /sessions`` past the CLI's read budget, the CLI reported
+    "Failed to connect to cao-server", and the initial MESSAGE was never sent.
+
+    These tests assert the property directly by running an independent heartbeat
+    task concurrently: a starved loop cannot tick it.
+    """
+
+    @staticmethod
+    async def _heartbeat_gap(coro) -> "tuple[float, int]":
+        """Run ``coro`` while a 10ms heartbeat runs; return (max gap, tick count).
+
+        The LONGEST interval between two ticks is the metric, not the tick
+        total: it measures the stall itself, so it is bounded by the size of
+        the blocking call rather than by the coroutine's total runtime. A total
+        would also be inflated by the ``await asyncio.sleep()`` gaps in
+        ``initialize()`` (which correctly yield), making the threshold depend
+        on scheduler load. The tick count is returned alongside only so a
+        caller can reject a run where the heartbeat never got to sample.
+        """
+        import asyncio
+        import time as _t
+
+        ticks = 0
+        max_gap = 0.0
+
+        async def heartbeat() -> None:
+            nonlocal ticks, max_gap
+            last = _t.monotonic()
+            while True:
+                await asyncio.sleep(0.01)
+                now = _t.monotonic()
+                max_gap = max(max_gap, now - last)
+                last = now
+                ticks += 1
+
+        beat = asyncio.create_task(heartbeat())
+        try:
+            # Let the heartbeat actually START before the measured coroutine
+            # runs. ``create_task`` only schedules it, and the first thing
+            # ``initialize()`` awaits is a mocked coroutine that completes
+            # without yielding — so without this the coroutine's synchronous
+            # backend calls all execute before the heartbeat's first tick and
+            # the stall goes unobserved (the metric silently passes).
+            while ticks < 1:
+                await asyncio.sleep(0.01)
+            await coro
+            # And let it tick ONCE MORE afterwards. A gap is only recorded when
+            # the heartbeat resumes, so a coroutine that blocks and then returns
+            # without ever suspending (the trust-prompt happy path: one blocking
+            # get_history, ready frame, return) would be measured as gap-free
+            # because ``beat.cancel()`` fires first.
+            final = ticks
+            while ticks == final:
+                await asyncio.sleep(0.01)
+        finally:
+            beat.cancel()
+        return max_gap, ticks
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_handle_trust_prompt_does_not_starve_the_loop(self, mock_backend):
+        """A slow ``get_history`` must not freeze other coroutines.
+
+        The backend is stubbed to a genuinely BLOCKING ``time.sleep`` (not an
+        awaitable) so it stands in for the real subprocess exec. Only a call
+        offloaded via ``asyncio.to_thread`` lets the heartbeat run.
+        """
+        import time as _time
+
+        def slow_blocking_get_history(*_a, **_kw):
+            _time.sleep(0.2)
+            # Ready frame so the handler returns after this single poll.
+            return "OpenAI Codex (v0.145.0)\n› Explain this codebase\n  gpt-5.6-sol high · /tmp\n"
+
+        mock_backend.return_value.get_history.side_effect = slow_blocking_get_history
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        max_gap, ticks = await self._heartbeat_gap(provider._handle_trust_prompt(timeout=20.0))
+
+        # Offloaded, the worst gap stays near the 10ms heartbeat period; left on
+        # the loop it is >= the full 0.2s blocking call. 0.1s sits far from both.
+        assert ticks > 0, "heartbeat never sampled"
+        assert (
+            max_gap < 0.1
+        ), f"event loop was starved during _handle_trust_prompt (max gap {max_gap:.3f}s)"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_initialize_does_not_starve_the_loop(
+        self, mock_backend, mock_wait_shell, mock_wait_status, mock_settings
+    ):
+        """``initialize()``'s own send_keys / get_pane_current_command are
+        blocking subprocess execs too, not just the trust-prompt poll."""
+        import time as _time
+
+        mock_settings.return_value = {
+            "provider_init_timeout": 60,
+            "startup_prompt_handler_timeout": 20,
+        }
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+
+        def slow_send_keys(*_a, **_kw):
+            _time.sleep(0.1)
+
+        def slow_get_pane_current_command(*_a, **_kw):
+            _time.sleep(0.1)
+            return "zsh"
+
+        mock_backend.return_value.send_keys.side_effect = slow_send_keys
+        mock_backend.return_value.get_pane_current_command.side_effect = (
+            slow_get_pane_current_command
+        )
+        mock_backend.return_value.get_history.return_value = (
+            "OpenAI Codex (v0.145.0)\n› Explain this codebase\n  gpt-5.6-sol high · /tmp\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        max_gap, ticks = await self._heartbeat_gap(provider.initialize())
+
+        # Worst-gap, not tick total: initialize()'s own ``await asyncio.sleep``
+        # gaps keep ticking the heartbeat, so a total could pass while fully
+        # blocking. Each stubbed backend call blocks 0.1s, so a loop-side call
+        # produces a >= 0.1s gap; offloaded, gaps stay near the 10ms period.
+        assert ticks > 0, "heartbeat never sampled"
+        assert max_gap < 0.09, f"event loop was starved during initialize (max gap {max_gap:.3f}s)"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_initialize_uses_configured_startup_prompt_timeout(
+        self, mock_backend, mock_wait_shell, mock_wait_status, mock_settings
+    ):
+        """The trust-prompt budget comes from settings, not a hard-coded 20.0.
+
+        An operator on a slow/containerized host must be able to widen it via
+        ``startup_prompt_handler_timeout`` without a code change.
+        """
+        mock_settings.return_value = {
+            "provider_init_timeout": 60,
+            "startup_prompt_handler_timeout": 45,
+        }
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_handle_trust_prompt", new_callable=AsyncMock) as mock_trust:
+            await provider.initialize()
+
+        mock_trust.assert_awaited_once_with(timeout=45.0)
