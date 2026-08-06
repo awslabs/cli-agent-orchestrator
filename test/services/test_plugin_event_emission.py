@@ -23,6 +23,8 @@ from cli_agent_orchestrator.services.terminal_service import (
     send_input,
 )
 
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+
 
 def _registry_mock() -> MagicMock:
     """Build a registry double whose async dispatch can be asserted directly."""
@@ -397,12 +399,18 @@ class TestMessagePluginEvents:
         assert event.message == "Hello from supervisor"
         assert event.orchestration_type == orchestration_type
 
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_does_not_dispatch_on_failure(
-        self, mock_get_metadata, mock_provider_manager, mock_tmux, mock_status_monitor
+        self,
+        mock_get_metadata,
+        mock_provider_manager,
+        mock_tmux,
+        mock_status_monitor,
+        mock_memory_service,
     ):
         """Message delivery failures must not emit post_send_message."""
         registry = _registry_mock()

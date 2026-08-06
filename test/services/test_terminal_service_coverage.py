@@ -10,6 +10,8 @@ import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+
 
 class TestCreateTerminalCleanup:
     """Test error cleanup paths in create_terminal."""
