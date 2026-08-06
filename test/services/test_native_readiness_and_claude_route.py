@@ -753,6 +753,7 @@ class TestKimiNativeProfileMaterial:
         provider_home = tmp_path / "provider-home"
         (provider_home / "sessions").mkdir(parents=True)
         (provider_home / "oauth").mkdir()
+        (provider_home / "workspace-trust").mkdir()
         (provider_home / "mcp.json").write_text(
             '{"mcpServers":{"agentmemory":{"command":"ambient"}}}'
         )
@@ -787,6 +788,8 @@ class TestKimiNativeProfileMaterial:
             == "chess-shakedown"
         )
         assert (private_home / "sessions").resolve() == (provider_home / "sessions").resolve()
+        assert not (private_home / "workspace-trust").exists()
+        assert not (private_home / "workspace-trust").is_symlink()
         assert environment["PATH"] == "/bin"
 
     def test_the_profile_environment_preserves_the_updater_kill_switch(self, monkeypatch, tmp_path):
@@ -803,6 +806,48 @@ class TestKimiNativeProfileMaterial:
             },
         )
         assert environment["KIMI_CODE_NO_AUTO_UPDATE"] == "1"
+
+    def test_profile_environment_pre_authorizes_the_exact_kimi_worktree(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(v2, "COMPANION_DIR", tmp_path / "companions")
+        worktree = (tmp_path / "worktree").resolve()
+        worktree.mkdir()
+
+        environment = v2._kimi_profile_environment(
+            record={"terminal_id": "term", "generation": "gen"},
+            profile_material=self._material(allowed_tools=["*"]),
+            base_environment={"KIMI_CODE_HOME": str(tmp_path / "provider-home"), "PATH": "/bin"},
+        )
+        trust_path = v2.kimi_native_launch.preauthorize_workspace(
+            kimi_home=environment["KIMI_CODE_HOME"],
+            working_directory=str(worktree),
+        )
+
+        path = Path(trust_path)
+        record = json.loads(path.read_text())
+        assert path.parent.name == "workspace-trust"
+        assert record["root"] == str(worktree)
+        assert isinstance(record["trustedAt"], int)
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.parent.stat().st_mode & 0o777 == 0o700
+
+    def test_workspace_trust_refuses_a_conflicting_existing_record(self, tmp_path):
+        worktree = (tmp_path / "worktree").resolve()
+        worktree.mkdir()
+        home = tmp_path / "kimi-home"
+        trust_dir = home / "workspace-trust"
+        trust_dir.mkdir(parents=True)
+        key = v2.kimi_native_launch._workspace_trust_key(str(worktree))
+        (trust_dir / key).write_text(
+            json.dumps({"root": str(tmp_path / "another"), "trustedAt": 1})
+        )
+
+        with pytest.raises(v2.kimi_native_launch.KimiNativeLaunchError, match="different root"):
+            v2.kimi_native_launch.preauthorize_workspace(
+                kimi_home=str(home),
+                working_directory=str(worktree),
+            )
 
 
 class TestOneCompletenessRuleForBindAndProjection:
