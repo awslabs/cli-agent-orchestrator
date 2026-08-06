@@ -33,7 +33,8 @@ from typing import Optional
 PROVIDER_CODEX = "codex"
 PROVIDER_KIMI = "kimi"
 PROVIDER_CLAUDE = "claude"
-PROVIDERS = (PROVIDER_CODEX, PROVIDER_KIMI, PROVIDER_CLAUDE)
+PROVIDER_MUSE = "muse"
+PROVIDERS = (PROVIDER_CODEX, PROVIDER_KIMI, PROVIDER_CLAUDE, PROVIDER_MUSE)
 
 #: The *canonical wire keys*, which are a different namespace from the
 #: three above. Those name the executable and key the version-pin tables;
@@ -45,6 +46,7 @@ PROVIDERS = (PROVIDER_CODEX, PROVIDER_KIMI, PROVIDER_CLAUDE)
 PROVIDER_CODEX_WIRE = "codex"
 PROVIDER_KIMI_CLI = "kimi_cli"
 PROVIDER_CLAUDE_CODE = "claude_code"
+PROVIDER_MUSE_CLI = "muse_cli"
 
 #: The single *current* pin per provider: the version a fresh mint/proof
 #: is expected to run, and the one a receipt records when it cannot read a
@@ -54,6 +56,7 @@ PINNED_VERSIONS = {
     PROVIDER_CODEX: "0.146.0",
     PROVIDER_KIMI: "0.33.0",
     PROVIDER_CLAUDE: "2.1.220",
+    PROVIDER_MUSE: "0.1.0",
 }
 
 #: Every exact version accepted for a provider, current first.  A tuple of
@@ -126,6 +129,7 @@ SUPPORTED_VERSIONS: dict[str, tuple[str, ...]] = {
     PROVIDER_CODEX: ("0.146.0",),
     PROVIDER_KIMI: ("0.33.0", "0.32.0", "0.31.0", "0.30.0", "0.29.2", "0.29.1", "0.29.0"),
     PROVIDER_CLAUDE: ("2.1.220",),
+    PROVIDER_MUSE: ("0.1.0",),
 }
 # The current pin must always be an accepted version — asserted here so the
 # two maps cannot silently drift apart.
@@ -170,6 +174,11 @@ NATIVE_ID_SOURCES = {
     PROVIDER_CODEX: "app_server_thread_start",  # app-server thread/start id
     PROVIDER_KIMI: "acp_session_new",  # ACP session/new sessionId
     PROVIDER_CLAUDE: "cli_session_id",  # explicit --session-id <uuid> at start
+    # Muse Code binds a caller-provided --session-id only on the headless
+    # `muse exec` surface (the interactive TUI rejects the flag); the id source
+    # is the minted session id passed to `muse exec`. native_tui is a
+    # documented follow-up until the TUI's session-creation path is proven.
+    PROVIDER_MUSE: "muse_exec_session_id",
 }
 
 #: The reserved ``expected_effort`` meaning "this route selects no effort;

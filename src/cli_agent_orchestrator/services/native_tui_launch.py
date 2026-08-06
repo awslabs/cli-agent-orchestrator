@@ -79,7 +79,8 @@ from typing import Any, Mapping, NoReturn, Optional, Protocol, Sequence
 
 from cli_agent_orchestrator.services import claude_native_launch, codex_native_launch
 from cli_agent_orchestrator.services import execution_mode as em
-from cli_agent_orchestrator.services import kimi_native_launch, native_attachment
+from cli_agent_orchestrator.services import kimi_native_launch, muse_native_launch
+from cli_agent_orchestrator.services import native_attachment
 
 LAUNCH_SCHEMA = "cao-native-tui-launch-v1"
 OBSERVATION_SCHEMA = "cao-native-tui-pane-observation-v1"
@@ -1060,6 +1061,20 @@ def _claude_argv(
         raise NativeLaunchInvalid(str(exc)) from exc
 
 
+def _muse_argv(
+    *, session_id: str, binary: str, extra_args: Optional[Sequence[str]], launch_kind: str
+) -> list[str]:
+    # Muse Code 0.1.0 binds --session-id only on `muse exec` (headless,
+    # one-shot); the interactive TUI rejects the flag. Both launch and recovery
+    # therefore re-run the exec command bound to the minted session id.
+    try:
+        return muse_native_launch.build_launch_argv(
+            session_id=session_id, muse_binary=binary, extra_args=extra_args,
+        )
+    except muse_native_launch.MuseNativeLaunchError as exc:
+        raise NativeLaunchInvalid(str(exc)) from exc
+
+
 def _codex_argv(
     *, session_id: str, binary: str, extra_args: Optional[Sequence[str]], launch_kind: str
 ) -> list[str]:
@@ -1087,6 +1102,7 @@ _ARGV_BINDERS: dict[str, dict[str, Any]] = {
     "codex": {"build": _codex_argv, "binds_exactly": codex_native_launch.resumes_exactly},
     "kimi_cli": {"build": _kimi_argv, "binds_exactly": kimi_native_launch.resumes_exactly},
     "claude_code": {"build": _claude_argv, "binds_exactly": claude_native_launch.binds_exactly},
+    "muse_cli": {"build": _muse_argv, "binds_exactly": muse_native_launch.binds_exactly},
 }
 
 SUPPORTED_NATIVE_PROVIDERS = frozenset(_ARGV_BINDERS)

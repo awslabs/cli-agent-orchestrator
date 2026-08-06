@@ -15,6 +15,7 @@ from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
+from cli_agent_orchestrator.providers.muse_cli import MuseCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,17 @@ class ProviderManager:
                 )
             elif provider_type == ProviderType.KIMI_CLI.value:
                 provider = KimiCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    expected_model=expected_model,
+                    expected_effort=expected_effort,
+                )
+            elif provider_type == ProviderType.MUSE_CLI.value:
+                provider = MuseCliProvider(
                     terminal_id,
                     tmux_session,
                     tmux_window,

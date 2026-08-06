@@ -247,6 +247,50 @@ class TestTerminalCreationWithWorkingDirectory:
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
             assert call_kwargs.get("working_directory") == "/session/path"
 
+    def test_create_terminal_forwards_expected_model_and_effort(self, client):
+        """expected_model/expected_effort in the body must reach the provider.
+
+        Native-CLI workers (e.g. muse_cli) select the model at spawn time from
+        these fields; dropping them would silently launch the profile default
+        tier instead of the caller's chosen standard/Contributor model.
+        """
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="muse_cli",
+                    agent_profile="implementer-muse",
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "muse_cli",
+                    "agent_profile": "implementer-muse",
+                    "defer_init": "true",
+                },
+                json={
+                    "initial_message": "do work",
+                    "expected_model": "muse-spark-1.2-contributor",
+                    "expected_effort": "high",
+                },
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("expected_model") == "muse-spark-1.2-contributor"
+            assert call_kwargs.get("expected_effort") == "high"
+            assert call_kwargs.get("initial_message") == "do work"
+
     def test_create_terminal_rejects_initial_message_without_defer_init(self, client):
         """initial_message is only delivered on the deferred-init path; sending
         it with defer_init=false must 400 rather than silently drop the payload."""

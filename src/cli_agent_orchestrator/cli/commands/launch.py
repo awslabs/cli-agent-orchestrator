@@ -32,6 +32,7 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "hermes",
     "kimi_cli",
     "kiro_cli",
+    "muse_cli",
     "opencode_cli",
 }
 

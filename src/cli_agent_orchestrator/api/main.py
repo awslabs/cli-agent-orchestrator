@@ -253,6 +253,8 @@ class CreateTerminalBody(BaseModel):
 
     initial_message: Optional[str] = None
     initial_message_orchestration_type: Optional[str] = None
+    expected_model: Optional[str] = None
+    expected_effort: Optional[str] = None
 
 
 class RunStepRequest(BaseModel):
@@ -2682,6 +2684,13 @@ async def create_terminal_in_session(
                     ),
                 )
 
+        # Forward managed-launch model/effort overrides so native-CLI providers
+        # (e.g. muse_cli, kimi_cli) launch the caller-selected model — one
+        # profile can then target either tier (muse-spark-1.2 vs
+        # muse-spark-1.2-contributor) at spawn time.
+        expected_model = body.expected_model if body else None
+        expected_effort = body.expected_effort if body else None
+
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -2694,6 +2703,8 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            expected_model=expected_model,
+            expected_effort=expected_effort,
         )
         return result
     except HTTPException:
