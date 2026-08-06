@@ -11,6 +11,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
     CodexProvider,
     ProviderError,
+    _has_approval_modal_in_bottom,
     _has_startup_idle_composer,
     _toml_override,
     _toml_scalar,
@@ -2148,6 +2149,131 @@ class TestCodexProviderUpdateDialog:
 
         assert "check_for_update_on_startup=true" in command
         assert command.endswith("-c check_for_update_on_startup=false")
+
+
+class TestCodexProviderApprovalModal:
+    """Tests for Codex's boxed command-approval modal appearing at RUNTIME.
+
+    The modal's copy was previously only consulted on the startup path
+    (STARTUP_BLOCKING_INPUT_PATTERN in _has_startup_idle_composer), so a pane
+    blocked on it mid-session was classified COMPLETED/PROCESSING and the
+    conductor would keep sending work into a pane hard-blocked on a keystroke.
+    """
+
+    def test_get_status_approval_modal_waiting(self):
+        """Active approval modal classifies as WAITING_USER_ANSWER."""
+        output = load_fixture("codex_approval_modal.txt")
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_approval_modal_below_tui_footer_is_not_completed(self):
+        """Composer chrome above the modal must not win over the modal.
+
+        This is the dangerous shape: the TUI keeps rendering the idle composer
+        and status bar while the modal is up, so the idle-prompt check reported
+        COMPLETED — telling the conductor the agent was free.
+        """
+        output = (
+            "› run the deploy script\n"
+            "• I'll run the deploy script now.\n"
+            "› \n"
+            "  ? for shortcuts                     92% context left\n"
+            "╭─ Command Approval Required ─╮\n"
+            "│ [a] Accept  [d] Decline     │\n"
+            "╰─────────────────────────────╯\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_approval_modal_unframed(self):
+        """Modal without box-drawing chrome still classifies as WAITING.
+
+        The frame glyphs have changed across Codex releases while the copy has
+        not, so detection must not depend on them.
+        """
+        output = "› run the deploy script\nCommand Approval Required\n[a] Accept  [d] Decline\n"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_approval_modal_in_scrollback_is_completed(self):
+        """An already-answered modal scrolled out of the bottom region must not latch."""
+        output = load_fixture("codex_approval_modal_scrollback.txt")
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.COMPLETED
+
+    def test_get_status_approval_modal_quoted_in_assistant_reply_is_completed(self):
+        """The model describing the modal in prose must not be read as the modal.
+
+        Cannot be excluded by the assistant_after_last_user gate — a real modal
+        also appears after assistant bullets — so it is excluded structurally:
+        prose embeds the copy mid-sentence instead of owning its own line.
+        """
+        output = (
+            "› why did the last run stall?\n"
+            "• The pane was blocked on Codex's Command Approval Required modal, "
+            "which offers [a] Accept and [d] Decline and cannot be answered by CAO.\n"
+            '• Switch the profile to approval_policy = "never" to avoid it.\n'
+            "› \n"
+            "  ? for shortcuts                     91% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.COMPLETED
+
+    def test_get_status_choice_keys_without_header_is_completed(self):
+        """Choice keys alone are not a modal — both halves must corroborate."""
+        output = (
+            "› list the approval keys\n"
+            "• [a] Accept and [d] Decline are the approval keys.\n"
+            "› \n"
+            "  ? for shortcuts                     91% context left\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.COMPLETED
+
+    def test_get_status_header_without_choice_keys_is_not_waiting(self):
+        """Header alone is not a modal — the choice line must be present too."""
+        output = "› run the deploy script\n╭─ Command Approval Required ─╮\n"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+
+    def test_has_approval_modal_requires_header_above_choices(self):
+        """Choice keys ABOVE the header are a partial/scrolled frame, not a live modal."""
+        assert not _has_approval_modal_in_bottom(
+            "│ [a] Accept  [d] Decline     │\n╭─ Command Approval Required ─╮\n"
+        )
+        assert _has_approval_modal_in_bottom(
+            "╭─ Command Approval Required ─╮\n│ [a] Accept  [d] Decline     │\n"
+        )
+
+    def test_startup_blocking_input_pattern_still_vetoes_readiness(self):
+        """Splitting the startup pattern must not weaken the startup-path veto."""
+        assert not _has_startup_idle_composer(
+            "› Write tests for @filename\n"
+            "  gpt-5.6-sol medium · Context 100% left\n"
+            "╭─ Command Approval Required ─╮\n"
+            "│ [a] Accept  [d] Decline     │\n"
+        )
 
 
 class TestCodexProviderUpdateDialogLive:
