@@ -100,10 +100,12 @@ class TestClaudeCodeProviderInitialization:
     async def test_initialize_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
         """Test initialization timeout when no Claude markers appear.
 
-        This now raises TerminalInputBlockedError, not a bare TimeoutError -- see initialize()'s
-        own comment on that raise site. The message text is unchanged (downstream consumers may
-        regex-match it for retry-worthiness), only the exception TYPE changed, so this still needs
-        updating: TerminalInputBlockedError is not a TimeoutError subclass.
+        Round-3 review fix (call-me-ram): reverted back to a bare TimeoutError -- the
+        keep-worker-alive signal for a *recognized* WAITING_USER_ANSWER prompt no longer needs to
+        flow through this raise site as of the round-2 fix (it now comes from send_input's own
+        guard), so this genuinely-unrecognized-status fallback goes back to TimeoutError, matching
+        main's clean teardown behavior for a broken launch instead of leaking an unreapable
+        UNKNOWN-status worker. The message text is unchanged.
         """
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
@@ -117,9 +119,7 @@ class TestClaudeCodeProviderInitialization:
             patch("cli_agent_orchestrator.providers.claude_code.time.time", side_effect=[0, 31]),
             patch("cli_agent_orchestrator.providers.claude_code.time.sleep"),
         ):
-            with pytest.raises(
-                TerminalInputBlockedError, match="Claude Code initialization timed out"
-            ):
+            with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
                 await provider.initialize()
 
     @pytest.mark.asyncio

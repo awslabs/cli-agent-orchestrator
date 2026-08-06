@@ -2203,3 +2203,61 @@ class TestDeferredInitWaitingUserAnswerSurvival:
         # surfaced to the caller.
         mock_notify.assert_called_once()
         assert mock_notify.call_args.kwargs["delete_worker"] is False
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_no_orchestration_type_still_blocked_post_sessions_bypass(
+        self, mock_tmux, mock_pm, mock_status_monitor, mock_meta, mock_notify
+    ):
+        """Round-3 review fix (call-me-ram): a raw POST /sessions caller supplying
+        initial_message with NO initial_message_orchestration_type reaches
+        _schedule_deferred_init with orchestration_type=None -- session_service.create_session
+        never requires one. Before this fix, send_input's WAITING_USER_ANSWER guard only fires
+        for OrchestrationType.ASSIGN/HANDOFF, so a None type sailed straight past it: the initial
+        task text would be pasted into a live choice widget same as the round-2 bug, just via a
+        different (unauthenticated-orchestration) entry point.
+
+        _schedule_deferred_init now defaults an unstated orchestration_type to ASSIGN for guard
+        purposes -- correct because every call reaching this function is by construction an
+        unattended initial-task delivery, never an interactive human answer (those go through
+        answer_user_prompt's own separate /terminals/{id}/input path, which never routes through
+        this function at all, so this default cannot affect it).
+
+        Without the fix (orchestration_type=None passed through unchanged to send_input): the
+        guard's `orchestration_value in {ASSIGN, HANDOFF}` check is False for an empty type,
+        send_keys IS called, and _notify_caller_of_deferred_failure is never invoked -- same
+        failure shape as the round-2 bug this test's sibling proves.
+        """
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {
+            "caller_id": None,  # POST /sessions has no supervisor caller
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        real_provider = ClaudeCodeProvider("worker99", "cao-session", "developer-abcd")
+        mock_pm.get_provider.return_value = real_provider
+
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+
+        before_tasks = set(_deferred_init_tasks)
+        # orchestration_type=None -- exactly what session_service.create_session passes when
+        # the caller doesn't set initial_message_orchestration_type.
+        _schedule_deferred_init(provider_instance, "worker99", "do the task", None, None)
+        (task,) = set(_deferred_init_tasks) - before_tasks
+        await task
+
+        mock_tmux.send_keys.assert_not_called()
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args.kwargs["delete_worker"] is False
