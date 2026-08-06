@@ -100,9 +100,44 @@ UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
 UPDATE_DIALOG_FOOTER = TRUST_PROMPT_FOOTER
 STARTUP_PROMPT_BOTTOM_LINES = 15
 STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+# Codex's boxed command-approval modal, e.g.
+#   ╭─ Command Approval Required ─╮
+#   │ [a] Accept  [d] Decline     │
+#   ╰─────────────────────────────╯
+# Split into header and choice-key halves because the two paths that consume
+# them need different strictness. The startup path (_has_startup_idle_composer)
+# uses the permissive OR below as a NEGATIVE gate — any one token vetoes
+# "ready", and a false veto merely keeps polling, so over-matching is free.
+# get_status() uses them as a POSITIVE classifier where over-matching would
+# strand a healthy pane in WAITING_USER_ANSWER, so it corroborates the two
+# halves separately (see _has_approval_modal_in_bottom). Box-drawing characters
+# are deliberately NOT required: the frame chrome has changed across Codex
+# releases while this copy has not.
+APPROVAL_MODAL_HEADER_PATTERN = r"Command Approval Required"
+APPROVAL_MODAL_CHOICE_PATTERN = r"(?:\[[aA]\]\s+Accept\b|\[[dD]\]\s+Decline\b)"
+# Box-drawing frame and padding stripped from a modal line before matching, so a
+# framed line ("│ [a] Accept  [d] Decline     │") reduces to its text content.
+# Stripped as a character SET from both ends, hence no ordering assumption about
+# corner/edge glyphs. Light, heavy, and double variants are all covered because
+# only light glyphs have been observed and the frame style is not contractual.
+#
+# ASCII frame characters (+ - |) are deliberately EXCLUDED. They are markdown
+# table syntax, so including them would let a table the model wrote in its own
+# reply ("| Command Approval Required |" / "| [a] Accept | [d] Decline |")
+# reduce to the exact modal shape. No Codex release has been observed using
+# ASCII frames, so that trade buys a hypothetical false negative at the cost of
+# a plausible false positive.
+#
+# Note this set also strips leading whitespace, so an INDENTED plain-text quote
+# reduces to the modal shape too. That look-alike is excluded positionally
+# instead — see _has_approval_modal_in_bottom.
+MODAL_FRAME_CHARS = "─│╭╮╰╯├┤━┃┏┓┗┛┣┫═║╔╗╚╝╠╣ \t"
+# The same set minus padding, used to tell "this line began with box chrome"
+# from "this line began with a prose indent".
+MODAL_FRAME_GLYPHS = frozenset(MODAL_FRAME_CHARS) - frozenset(" \t")
 STARTUP_BLOCKING_INPUT_PATTERN = (
-    r"(?:Command Approval Required|\[[aA]\]\s+Accept\b|"
-    r"\[[dD]\]\s+Decline\b|Press enter to continue)"
+    rf"(?:{APPROVAL_MODAL_HEADER_PATTERN}|{APPROVAL_MODAL_CHOICE_PATTERN}|"
+    rf"{TRUST_PROMPT_FOOTER})"
 )
 STARTUP_IDLE_PLACEHOLDER_PATTERN = (
     rf"^\s*{IDLE_PROMPT_PATTERN}[^\S\n]+(?:"
@@ -250,6 +285,110 @@ def _has_update_dialog_in_bottom(clean_output: str) -> bool:
         and re.search(UPDATE_DIALOG_MENU_PATTERN, bottom) is not None
         and re.search(UPDATE_DIALOG_FOOTER, bottom) is not None
     )
+
+
+def _modal_line_content(line: str) -> Optional[str]:
+    """Reduce one line to its modal text, or None if the line reads as prose.
+
+    Strips frame glyphs and padding so ``"│ [a] Accept  [d] Decline   │"``
+    reduces to ``"[a] Accept  [d] Decline"``. Returns None when the leading run
+    removed was whitespace ONLY while being non-empty — i.e. the line is
+    indented plain text.
+
+    That indent test is the discriminator against the model quoting a modal
+    transcript back in its own reply:
+
+        • The terminal output showed:
+            Command Approval Required
+            [a] Accept  [d] Decline
+          so it was waiting on approval.
+
+    Those quoted lines reproduce the modal's per-line structure exactly, so
+    line structure alone cannot separate them. Position can: Codex draws the
+    modal box flush at the left margin, whereas quoted or continuation prose is
+    indented under its bullet. So a leading run of frame glyphs is accepted, a
+    leading run of spaces/tabs is not, and column 0 is accepted either way
+    (an unframed modal would still start there).
+    """
+    content = line.strip(MODAL_FRAME_CHARS)
+    if not content:
+        return None
+    lead = line[: len(line) - len(line.lstrip(MODAL_FRAME_CHARS))]
+    if lead and not (MODAL_FRAME_GLYPHS & set(lead)):
+        return None
+    return content
+
+
+def _has_active_spinner(lines: list) -> bool:
+    """Return True when any of ``lines`` carries Codex's live progress spinner."""
+    return any(re.search(TUI_PROGRESS_PATTERN, line) for line in lines)
+
+
+def _has_approval_modal_in_bottom(clean_output: str) -> bool:
+    """Return True when Codex's boxed command-approval modal is active at the bottom.
+
+    Bottom-anchored and doubly corroborated for the same reason as trust-v2 and
+    the update dialog: the copy can appear in scrollback from an already-answered
+    turn, or inside the model's own prose ("I hit Command Approval Required with
+    [a] Accept / [d] Decline"). Five independent guards separate the live modal
+    from those look-alikes:
+
+    1. **Region.** Only the bottom ``STARTUP_PROMPT_BOTTOM_LINES`` are searched.
+       As the pane scrolls the header leaves the region before the choice keys
+       do, so guard 2 fails first and an answered modal cannot stay latched.
+       This assumes the modal is at most that tall — true whenever the box is
+       the bottom of the pane, which is how Codex renders it.
+    2. **Corroboration.** Both the header AND a choice key must be present, in
+       that vertical order — the modal always renders header-above-keys.
+    3. **Line structure.** Each half must own its line: after reduction, the
+       header line is *exactly* the header text and the choice line *starts*
+       with a choice key. Prose embeds the phrases mid-sentence, so it fails
+       this even when it names both halves.
+    4. **Left-margin position.** Each half must sit at the box's left margin
+       rather than under a prose indent — see :func:`_modal_line_content`. This
+       is what separates a live modal from a quoted transcript, which satisfies
+       guards 1-3.
+    5. **No spinner below the choice line.** An ANSWERED modal whose work has
+       resumed but not yet scrolled the box out of the region still satisfies
+       guards 1-4, and reporting WAITING there withholds work from a pane that
+       is actively running. A live modal blocks execution, so nothing can be
+       spinning *below* it; a resumed one renders "• Working (Ns • esc to
+       interrupt)" there. Guard 1 eventually clears this case on its own, so
+       this closes a transient window rather than a permanent misread.
+
+       Scoped to lines strictly BELOW the choice line, not the whole region:
+       with ``--no-alt-screen`` a spinner from earlier in the same turn can
+       survive in scrollback ABOVE the box, and a region-wide test would then
+       suppress a genuinely live modal.
+
+    Deliberately does NOT key on whether the idle composer/footer appears below
+    the box, even though a live modal blocks input: get_status's own TUI-progress
+    comment records that with ``--no-alt-screen`` the footer is rendered at the
+    bottom *even while processing*, so "footer below" is likely true of real
+    modals too and would false-negative every one of them. The spinner in guard 5
+    is a narrower signal — it means work is actually executing, which a live
+    modal precludes.
+    """
+    bottom_lines = clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:]
+
+    header_idx = None
+    for index, line in enumerate(bottom_lines):
+        content = _modal_line_content(line)
+        if content is not None and re.fullmatch(
+            APPROVAL_MODAL_HEADER_PATTERN, content, re.IGNORECASE
+        ):
+            header_idx = index
+            break
+    if header_idx is None:
+        return False
+
+    # Choice keys render on a later line than the header, never above it.
+    for offset, line in enumerate(bottom_lines[header_idx + 1 :]):
+        content = _modal_line_content(line)
+        if content is not None and re.match(APPROVAL_MODAL_CHOICE_PATTERN, content, re.IGNORECASE):
+            choice_idx = header_idx + 1 + offset
+            return not _has_active_spinner(bottom_lines[choice_idx + 1 :])
+    return False
 
 
 def _has_startup_idle_composer(clean_output: str) -> bool:
@@ -677,6 +816,28 @@ class CodexProvider(BaseProvider):
         # where a queued message or blind Enter could select "Update now".
         # Eager inbox delivery is not a vector: accepts_input_while_processing=False.
         if _has_update_dialog_in_bottom(clean_output):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # Boxed command-approval modal ("Command Approval Required" / "[a] Accept"
+        # / "[d] Decline"). Reuses the copy that STARTUP_BLOCKING_INPUT_PATTERN
+        # already vetoes readiness on at startup — the same modal can appear at
+        # RUNTIME under any approval-prompting codexProfile, and only the startup
+        # path used to notice it.
+        #
+        # Bottom-anchored like trust-v2 and the update dialog, and placed BEFORE
+        # the idle/COMPLETED classification for the same reason: the TUI composer
+        # and status bar keep rendering while the modal is up, so the idle-prompt
+        # check below would otherwise report COMPLETED (or PROCESSING when the
+        # composer has scrolled off) for a pane that is hard-blocked on a
+        # keystroke. A COMPLETED there is the dangerous case — it tells the
+        # conductor the agent is free and invites more work into a dead pane.
+        #
+        # NOT gated on `not assistant_after_last_user` (unlike WAITING_PROMPT_PATTERN
+        # below): the modal is raised mid-turn, after the model has already emitted
+        # bullets, so that gate would suppress every real occurrence. Prose that
+        # merely quotes the copy is excluded structurally instead — see
+        # _has_approval_modal_in_bottom.
+        if _has_approval_modal_in_bottom(clean_output):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Check bottom of captured output for idle prompt.
