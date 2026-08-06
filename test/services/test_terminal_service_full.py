@@ -20,6 +20,8 @@ from cli_agent_orchestrator.services.terminal_service import (
     send_input,
 )
 
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+
 
 class TestCreateTerminal:
     """Tests for create_terminal function."""

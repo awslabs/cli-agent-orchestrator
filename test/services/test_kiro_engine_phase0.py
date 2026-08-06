@@ -21,6 +21,9 @@ from cli_agent_orchestrator.services.terminal_service import create_terminal
 _MODULE = "cli_agent_orchestrator.services.terminal_service"
 
 
+pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+
+
 @pytest.mark.asyncio
 async def test_capability_probe_does_not_block_event_loop():
     """A synchronous capability probe runs in a worker while async work advances."""
