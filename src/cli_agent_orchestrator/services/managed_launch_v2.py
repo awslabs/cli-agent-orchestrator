@@ -63,6 +63,7 @@ from cli_agent_orchestrator.services import (
     generation_fence,
     glm_native_launch,
     heartbeat_store,
+    kimi_native_launch,
     native_attachment,
     native_tui_launch,
     provider_contracts,
@@ -303,7 +304,11 @@ def _kimi_profile_environment(
 
     if provider_home.exists():
         for source in provider_home.iterdir():
-            if source.name == "mcp.json":
+            # The managed launcher owns both profile MCP material and the
+            # workspace-trust record. Do not symlink either back to the
+            # user's shared Kimi home: trust is generation-private and must
+            # not leave stale leased-worktree records behind after teardown.
+            if source.name in {"mcp.json", "workspace-trust"}:
                 continue
             destination = private_home / source.name
             if destination.exists() or destination.is_symlink():
@@ -3553,6 +3558,15 @@ async def _launch_native_tui(
                 record=record,
                 profile_material=profile_material,
                 base_environment=environment,
+            )
+            # Kimi's v2 TUI asks for workspace trust before it accepts any
+            # input, even when the project has no MCP servers.  Pre-authorize
+            # the exact canonical leased worktree through Kimi's own durable
+            # workspace-trust store; typing through this interstitial would
+            # violate the zero-keystroke delivery boundary.
+            kimi_native_launch.preauthorize_workspace(
+                kimi_home=environment["KIMI_CODE_HOME"],
+                working_directory=record["working_directory"],
             )
     except Exception as exc:  # noqa: BLE001 - nothing was started
         return _mark_preflight_blocked(

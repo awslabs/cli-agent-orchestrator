@@ -20,8 +20,14 @@ cannot be word-split or globbed on its way to the process either.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
+import tempfile
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Sequence
 
 #: The pinned resume option.  The long form is used deliberately: ``-S``
@@ -41,6 +47,112 @@ class KimiNativeLaunchError(ValueError):
     """The native launch argv could not be built safely."""
 
     code = "kimi-native-launch-error"
+
+
+# Kimi Code's agent-core-v2 workspace trust service persists one JSON document
+# addressed by ``(scope, key)`` through its file storage backend.  The scope,
+# key shape, and record fields below are the provider's observed 0.31--0.34
+# contract, not a CAO-owned parallel trust database.  The managed launcher
+# writes this record before the TUI process starts so the provider never
+# reaches an interactive trust dialog (which is indistinguishable from a
+# task-delivery interstitial at the CAO boundary).
+WORKSPACE_TRUST_SCOPE = "workspace-trust"
+_WORKSPACE_TRUST_KEY_PREFIX = "wd_"
+_WORKSPACE_TRUST_HASH_LENGTH = 12
+_WORKSPACE_TRUST_SLUG_LENGTH = 40
+
+
+def _workspace_trust_key(work_dir: str) -> str:
+    """Return Kimi's exact workspace-trust document key for ``work_dir``."""
+    normalized = os.path.realpath(work_dir).replace("\\", "/").rstrip("/") or "/"
+    name = normalized.rsplit("/", 1)[-1] or normalized
+    slug = re.sub(r"[^a-z0-9._-]+", "-", name.lower())
+    slug = slug.strip("-")[:_WORKSPACE_TRUST_SLUG_LENGTH].strip("-")
+    if slug in {"", ".", ".."}:
+        slug = "workspace"
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:_WORKSPACE_TRUST_HASH_LENGTH]
+    return f"{_WORKSPACE_TRUST_KEY_PREFIX}{slug}_{digest}"
+
+
+def preauthorize_workspace(*, kimi_home: str, working_directory: str) -> str:
+    """Atomically pre-authorize one canonical worktree for native Kimi.
+
+    Kimi's v2 TUI presents a trust interstitial before it creates a session,
+    including when no project MCP file exists.  CAO cannot type through that
+    interstitial: doing so would make a rendered prompt look like a delivered
+    task.  The provider's own ``WorkspaceTrustService.trust()`` writes the
+    record reproduced here, so managed launch performs the same state change
+    before process creation and then reads it back as a proof.
+
+    The home and worktree are generation-private/canonical inputs supplied by
+    the managed launch boundary.  Existing records are accepted only when
+    their root and timestamp are structurally valid; a conflicting or
+    malformed record fails closed rather than silently authorizing another
+    directory.
+    """
+    home = Path(kimi_home).expanduser()
+    if (
+        not os.path.isabs(working_directory)
+        or os.path.realpath(working_directory) != working_directory
+    ):
+        raise KimiNativeLaunchError(
+            f"Kimi workspace trust requires a canonical worktree; got {working_directory!r}"
+        )
+    root = os.path.realpath(working_directory).replace("\\", "/").rstrip("/") or "/"
+    if not os.path.isabs(root) or not os.path.isdir(root):
+        raise KimiNativeLaunchError(
+            f"Kimi workspace trust requires an existing absolute worktree; got {working_directory!r}"
+        )
+    trust_dir = home / WORKSPACE_TRUST_SCOPE
+    trust_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = trust_dir / _workspace_trust_key(root)
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise KimiNativeLaunchError(
+                f"Kimi workspace trust record is unreadable: {path}"
+            ) from exc
+        if not isinstance(existing, dict) or existing.get("root") != root:
+            raise KimiNativeLaunchError(
+                f"Kimi workspace trust record names a different root: {path}"
+            )
+        trusted_at = existing.get("trustedAt")
+        if (
+            isinstance(trusted_at, bool)
+            or not isinstance(trusted_at, (int, float))
+            or trusted_at <= 0
+        ):
+            raise KimiNativeLaunchError(
+                f"Kimi workspace trust record has no valid timestamp: {path}"
+            )
+    else:
+        payload = {"root": root, "trustedAt": int(time.time() * 1000)}
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=trust_dir)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
+    try:
+        proof = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise KimiNativeLaunchError(
+            f"Kimi workspace trust proof could not be read: {path}"
+        ) from exc
+    if not isinstance(proof, dict) or proof.get("root") != root:
+        raise KimiNativeLaunchError(f"Kimi workspace trust proof drifted: {path}")
+    return str(path)
 
 
 def validate_session_id(session_id: object) -> str:

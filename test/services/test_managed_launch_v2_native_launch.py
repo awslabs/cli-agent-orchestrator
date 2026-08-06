@@ -273,7 +273,7 @@ def _published_receipt(reservation_id: str) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 async def test_the_pane_runs_the_provider_resuming_the_minted_session(
-    isolated_memory_db, worktree, tmp_path, harness
+    isolated_memory_db, worktree, tmp_path, harness, monkeypatch
 ):
     """The pane's own primary process is the provider, not a bridge.
 
@@ -282,10 +282,21 @@ async def test_the_pane_runs_the_provider_resuming_the_minted_session(
     the pane, which is what makes the TUI the user's real terminal
     rather than a rendering of one.
     """
+    trust_call = {}
+
+    def _preauthorize(**kwargs):
+        trust_call.update(kwargs)
+        return str(tmp_path / "workspace-trust-record")
+
+    monkeypatch.setattr(v2.kimi_native_launch, "preauthorize_workspace", _preauthorize)
     record, result = await _launch(worktree, tmp_path)
 
     assert harness.launched_argv[0] == record["request"]["provider_executable"]
     assert native_tui_launch.kimi_native_launch.resumes_exactly(harness.launched_argv, SESSION_ID)
+    assert trust_call == {
+        "kimi_home": harness.terminals[0]["env_vars"]["KIMI_CODE_HOME"],
+        "working_directory": record["working_directory"],
+    }
     assert result["execution_mode"] == em.NATIVE_TUI
     assert result["terminal_id"] == record["terminal_id"]
 
