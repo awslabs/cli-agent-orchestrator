@@ -319,13 +319,18 @@ def _modal_line_content(line: str) -> Optional[str]:
     return content
 
 
+def _has_active_spinner(lines: list) -> bool:
+    """Return True when any of ``lines`` carries Codex's live progress spinner."""
+    return any(re.search(TUI_PROGRESS_PATTERN, line) for line in lines)
+
+
 def _has_approval_modal_in_bottom(clean_output: str) -> bool:
     """Return True when Codex's boxed command-approval modal is active at the bottom.
 
     Bottom-anchored and doubly corroborated for the same reason as trust-v2 and
     the update dialog: the copy can appear in scrollback from an already-answered
     turn, or inside the model's own prose ("I hit Command Approval Required with
-    [a] Accept / [d] Decline"). Four independent guards separate the live modal
+    [a] Accept / [d] Decline"). Five independent guards separate the live modal
     from those look-alikes:
 
     1. **Region.** Only the bottom ``STARTUP_PROMPT_BOTTOM_LINES`` are searched.
@@ -343,12 +348,26 @@ def _has_approval_modal_in_bottom(clean_output: str) -> bool:
        rather than under a prose indent — see :func:`_modal_line_content`. This
        is what separates a live modal from a quoted transcript, which satisfies
        guards 1-3.
+    5. **No spinner below the choice line.** An ANSWERED modal whose work has
+       resumed but not yet scrolled the box out of the region still satisfies
+       guards 1-4, and reporting WAITING there withholds work from a pane that
+       is actively running. A live modal blocks execution, so nothing can be
+       spinning *below* it; a resumed one renders "• Working (Ns • esc to
+       interrupt)" there. Guard 1 eventually clears this case on its own, so
+       this closes a transient window rather than a permanent misread.
+
+       Scoped to lines strictly BELOW the choice line, not the whole region:
+       with ``--no-alt-screen`` a spinner from earlier in the same turn can
+       survive in scrollback ABOVE the box, and a region-wide test would then
+       suppress a genuinely live modal.
 
     Deliberately does NOT key on whether the idle composer/footer appears below
     the box, even though a live modal blocks input: get_status's own TUI-progress
     comment records that with ``--no-alt-screen`` the footer is rendered at the
     bottom *even while processing*, so "footer below" is likely true of real
-    modals too and would false-negative every one of them.
+    modals too and would false-negative every one of them. The spinner in guard 5
+    is a narrower signal — it means work is actually executing, which a live
+    modal precludes.
     """
     bottom_lines = clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:]
 
@@ -364,10 +383,11 @@ def _has_approval_modal_in_bottom(clean_output: str) -> bool:
         return False
 
     # Choice keys render on a later line than the header, never above it.
-    for line in bottom_lines[header_idx + 1 :]:
+    for offset, line in enumerate(bottom_lines[header_idx + 1 :]):
         content = _modal_line_content(line)
         if content is not None and re.match(APPROVAL_MODAL_CHOICE_PATTERN, content, re.IGNORECASE):
-            return True
+            choice_idx = header_idx + 1 + offset
+            return not _has_active_spinner(bottom_lines[choice_idx + 1 :])
     return False
 
 

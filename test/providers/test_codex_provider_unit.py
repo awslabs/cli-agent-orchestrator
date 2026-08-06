@@ -2355,6 +2355,65 @@ class TestCodexProviderApprovalModal:
             "    Command Approval Required\n│ [a] Accept  [d] Decline │\n"
         )
 
+    def test_get_status_answered_modal_with_work_resumed_is_not_waiting(self):
+        """An answered modal still in-window, with work running below it, is not WAITING.
+
+        The box has not scrolled out yet, so guards 1-4 all pass; only the
+        spinner below the choice line reveals that the modal was answered and
+        execution resumed. Reporting WAITING here withholds work from a pane
+        that is actively running.
+        """
+        output = (
+            "╭─ Command Approval Required ─╮\n"
+            "│ [a] Accept   [d] Decline    │\n"
+            "╰─────────────────────────────╯\n"
+            "• Accepted. Running deploy...\n"
+            "• Working (3s • esc to interrupt)\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.PROCESSING
+
+    def test_get_status_live_modal_without_spinner_is_still_waiting(self):
+        """Control for the spinner guard: no spinner below the box means WAITING."""
+        output = (
+            "› run the deploy script\n"
+            "• I'll run the deploy script now.\n"
+            "╭─ Command Approval Required ─╮\n"
+            "│ [a] Accept   [d] Decline    │\n"
+            "╰─────────────────────────────╯\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_get_status_live_modal_with_stale_spinner_above_is_waiting(self):
+        """A spinner in scrollback ABOVE the box must not suppress a live modal.
+
+        Why the spinner guard is scoped to lines strictly below the choice line
+        rather than the whole bottom region: with --no-alt-screen a spinner from
+        earlier in the same turn can survive above the box, and a region-wide
+        test would then miss a genuinely blocked pane.
+        """
+        output = (
+            "› run the deploy script\n"
+            "• Working (5s • esc to interrupt)\n"
+            "• I need approval to run this.\n"
+            "╭─ Command Approval Required ─╮\n"
+            "│ [a] Accept   [d] Decline    │\n"
+            "╰─────────────────────────────╯\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
     def test_startup_blocking_input_pattern_still_vetoes_readiness(self):
         """Splitting the startup pattern must not weaken the startup-path veto."""
         assert not _has_startup_idle_composer(
