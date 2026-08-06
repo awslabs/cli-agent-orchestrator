@@ -126,9 +126,29 @@ UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
 UPDATE_DIALOG_FOOTER = TRUST_PROMPT_FOOTER
 STARTUP_PROMPT_BOTTOM_LINES = 15
 STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+# Codex's boxed command-approval modal, e.g.
+#   ╭─ Command Approval Required ─╮
+#   │ [a] Accept  [d] Decline     │
+#   ╰─────────────────────────────╯
+# Split into header and choice-key halves because the two paths that consume
+# them need different strictness. The startup path (_has_startup_idle_composer)
+# uses the permissive OR below as a NEGATIVE gate — any one token vetoes
+# "ready", and a false veto merely keeps polling, so over-matching is free.
+# get_status() uses them as a POSITIVE classifier where over-matching would
+# strand a healthy pane in WAITING_USER_ANSWER, so it corroborates the two
+# halves separately (see _has_approval_modal_in_bottom). Box-drawing characters
+# are deliberately NOT required: the frame chrome has changed across Codex
+# releases while this copy has not.
+APPROVAL_MODAL_HEADER_PATTERN = r"Command Approval Required"
+APPROVAL_MODAL_CHOICE_PATTERN = r"(?:\[[aA]\]\s+Accept\b|\[[dD]\]\s+Decline\b)"
+# Box-drawing frame and padding stripped from a modal line before matching, so a
+# framed line ("│ [a] Accept  [d] Decline     │") reduces to its text content.
+# Stripped as a character SET from both ends, hence no ordering assumption about
+# corner/edge glyphs.
+MODAL_FRAME_CHARS = "─│╭╮╰╯├┤ \t"
 STARTUP_BLOCKING_INPUT_PATTERN = (
-    r"(?:Command Approval Required|\[[aA]\]\s+Accept\b|"
-    r"\[[dD]\]\s+Decline\b|Press enter to continue)"
+    rf"(?:{APPROVAL_MODAL_HEADER_PATTERN}|{APPROVAL_MODAL_CHOICE_PATTERN}|"
+    rf"{TRUST_PROMPT_FOOTER})"
 )
 STARTUP_IDLE_PLACEHOLDER_PATTERN = (
     rf"^\s*{IDLE_PROMPT_PATTERN}[^\S\n]+(?:"
@@ -275,6 +295,46 @@ def _has_update_dialog_in_bottom(clean_output: str) -> bool:
         re.search(UPDATE_DIALOG_PATTERN, bottom) is not None
         and re.search(UPDATE_DIALOG_MENU_PATTERN, bottom) is not None
         and re.search(UPDATE_DIALOG_FOOTER, bottom) is not None
+    )
+
+
+def _has_approval_modal_in_bottom(clean_output: str) -> bool:
+    """Return True when Codex's boxed command-approval modal is active at the bottom.
+
+    Bottom-anchored and doubly corroborated for the same reason as trust-v2 and
+    the update dialog: the copy can appear in scrollback from an already-answered
+    turn, or inside the model's own prose ("I hit Command Approval Required with
+    [a] Accept / [d] Decline"). Three independent guards separate the live modal
+    from those look-alikes:
+
+    1. **Region.** Only the bottom ``STARTUP_PROMPT_BOTTOM_LINES`` are searched.
+       As the pane scrolls the header leaves the region before the choice keys
+       do, so guard 2 fails first and an answered modal cannot stay latched.
+    2. **Corroboration.** Both the header AND a choice key must be present, in
+       that vertical order — the modal always renders header-above-keys.
+    3. **Line structure.** Each half must own its line: with box-drawing chrome
+       and whitespace stripped, the header line is *exactly* the header text and
+       the choice line *starts* with a choice key. Prose embeds the phrases
+       mid-sentence, so it fails this even when it names both halves.
+
+    Deliberately does not require box-drawing characters: the frame chrome has
+    changed across Codex releases while this copy has not.
+    """
+    bottom_lines = clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:]
+
+    header_idx = None
+    for index, line in enumerate(bottom_lines):
+        bare = line.strip(MODAL_FRAME_CHARS)
+        if re.fullmatch(APPROVAL_MODAL_HEADER_PATTERN, bare, re.IGNORECASE):
+            header_idx = index
+            break
+    if header_idx is None:
+        return False
+
+    # Choice keys render on a later line than the header, never above it.
+    return any(
+        re.match(APPROVAL_MODAL_CHOICE_PATTERN, line.strip(MODAL_FRAME_CHARS), re.IGNORECASE)
+        for line in bottom_lines[header_idx + 1 :]
     )
 
 
@@ -891,6 +951,28 @@ class CodexProvider(BaseProvider):
         if re.search(LOGIN_MENU_PATTERN, bottom_region) and re.search(
             LOGIN_MENU_FOOTER, bottom_region
         ):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # Boxed command-approval modal ("Command Approval Required" / "[a] Accept"
+        # / "[d] Decline"). Reuses the copy that STARTUP_BLOCKING_INPUT_PATTERN
+        # already vetoes readiness on at startup — the same modal can appear at
+        # RUNTIME under any approval-prompting codexProfile, and only the startup
+        # path used to notice it.
+        #
+        # Bottom-anchored like trust-v2 and the update dialog, and placed BEFORE
+        # the idle/COMPLETED classification for the same reason: the TUI composer
+        # and status bar keep rendering while the modal is up, so the idle-prompt
+        # check below would otherwise report COMPLETED (or PROCESSING when the
+        # composer has scrolled off) for a pane that is hard-blocked on a
+        # keystroke. A COMPLETED there is the dangerous case — it tells the
+        # conductor the agent is free and invites more work into a dead pane.
+        #
+        # NOT gated on `not assistant_after_last_user` (unlike WAITING_PROMPT_PATTERN
+        # below): the modal is raised mid-turn, after the model has already emitted
+        # bullets, so that gate would suppress every real occurrence. Prose that
+        # merely quotes the copy is excluded structurally instead — see
+        # _has_approval_modal_in_bottom.
+        if _has_approval_modal_in_bottom(clean_output):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Check bottom of captured output for idle prompt.
