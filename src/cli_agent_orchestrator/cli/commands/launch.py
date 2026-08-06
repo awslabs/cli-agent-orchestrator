@@ -57,8 +57,53 @@ _FORWARDED_ENV_MAX_VALUE_BYTES = 2048
 # the very next step is still willing to wait for.
 _READINESS_WAIT_TIMEOUT = 120
 
+# Slack added to the create budget on top of the two init-timeout windows.
+# Server-side, ``POST /sessions`` also spends time that NEITHER init timeout
+# bounds: pane/window creation runs BEFORE ``initialize()``
+# (``terminal_service.create_session``/``create_window``), and inside
+# ``initialize()`` there are fixed unbudgeted gaps — e.g. codex's
+# ``await asyncio.sleep(2.0)`` shell warm-up, plus send_keys latency and the
+# tail of a 1s poll interval on either side of each bounded wait. Without this,
+# the sum of those steps could exceed the budget even when the client and
+# server agree exactly on the init timeouts (a 60/20 config leaves the client
+# at 140s against a worst-case ~141s server path), reopening the same
+# silent-drop hole this constant's neighbours exist to close.
+_CREATE_OVERHEAD_MARGIN = 30
 
-def _create_session_timeout(settings):
+
+def _effective_init_timeout(agent_profile, settings):
+    """Largest ``provider_init_timeout`` the server might apply for this launch.
+
+    Providers do NOT agree on where this value comes from, so the client cannot
+    assume either source: ``claude_code``/``antigravity_cli``/``kimi_cli`` route
+    through ``BaseProvider.get_init_timeout(profile)``, which prefers the
+    profile's own ``provider_init_timeout`` override (that override exists so a
+    containerized profile whose wrapped CLI is slow can raise its init cap
+    without touching global config), while ``codex``/``copilot_cli`` read the
+    global setting directly. Take the MAX of the two: it is the only bound
+    guaranteed to cover whichever the target provider actually uses, and being
+    generous here only ever costs an unused ceiling on a request that succeeds
+    or fails on its own long before it.
+
+    A profile that cannot be loaded (missing / malformed) falls back to the
+    global value, matching ``get_init_timeout``'s own no-profile behaviour.
+    """
+    global_timeout = int(settings["provider_init_timeout"])
+    try:
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+        override = load_agent_profile(agent_profile).provider_init_timeout
+    except Exception:
+        # Deliberately broad: this is a timeout hint, never a reason to fail a
+        # launch the server would have accepted. The real profile load happens
+        # server-side and reports its own errors.
+        return global_timeout
+    if override is None:
+        return global_timeout
+    return max(global_timeout, int(override))
+
+
+def _create_session_timeout(settings, agent_profile=None):
     """Read budget for ``POST /sessions``, which initializes the provider inline.
 
     ``POST /sessions`` runs the provider's FULL ``initialize()`` synchronously
@@ -75,13 +120,23 @@ def _create_session_timeout(settings):
     healthy idle TUI all existed server-side. Nothing retried, because from the
     server's point of view the launch had succeeded.
 
-    Server-side, ``provider_init_timeout`` applies TWICE per init — once to
+    Server-side, the init timeout applies TWICE per init — once to
     ``wait_for_shell``, again to the final ``wait_until_status`` — with the
     startup-prompt/trust-dialog handler in between, so cover the sum rather
-    than a single init timeout.
+    than a single init timeout, plus ``_CREATE_OVERHEAD_MARGIN`` for the steps
+    neither window bounds. The init timeout is resolved per-launch via
+    ``_effective_init_timeout``, so a profile that raises its own cap widens
+    this budget with it instead of leaving the client to give up first.
+
+    ``settings.get`` for the handler timeout: a hand-edited partial
+    settings.json that omits the key must not turn a widened budget into a
+    ``KeyError`` traceback at launch.
     """
+    init_timeout = _effective_init_timeout(agent_profile, settings)
     return max(
-        2 * settings["provider_init_timeout"] + settings["startup_prompt_handler_timeout"],
+        2 * init_timeout
+        + int(settings.get("startup_prompt_handler_timeout", 20))
+        + _CREATE_OVERHEAD_MARGIN,
         _READINESS_WAIT_TIMEOUT,
     )
 
@@ -333,7 +388,10 @@ def launch(
         # contain secrets) don't end up in cao-server's HTTP access log.
         # See issue #248.
         settings = get_server_settings()
-        post_kwargs: dict = {"params": params, "timeout": _create_session_timeout(settings)}
+        post_kwargs: dict = {
+            "params": params,
+            "timeout": _create_session_timeout(settings, agents),
+        }
         if forwarded_env:
             post_kwargs["json"] = {"env_vars": forwarded_env}
 
