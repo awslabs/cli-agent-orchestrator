@@ -2029,7 +2029,13 @@ async def get_session(session_name: str) -> Dict:
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        return session_service.get_session(session_name)
+        # session_service.get_session() calls status_monitor.get_status() per terminal in the
+        # session, which for a PROCESSING terminal can shell out to a real tmux capture-pane
+        # subprocess (the stale-PROCESSING fallback). A session with N processing terminals would
+        # otherwise fork N times inline on the event loop per request -- this endpoint is polled
+        # by the web UI, so run it off the loop, matching GET /terminals/{id}'s own established
+        # pattern just below for the identical hazard.
+        return await asyncio.to_thread(session_service.get_session, session_name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
