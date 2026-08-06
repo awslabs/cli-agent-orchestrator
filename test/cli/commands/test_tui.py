@@ -68,6 +68,22 @@ class TestMissingBinaryError:
         # ...and mentions the platform-mismatch cause.
         assert "platform" in output.lower()
 
+    def test_missing_binary_points_at_the_remedy_an_installed_user_can_actually_use(self):
+        """Since #560 the build compiles the binary itself, so a MISSING one means no cargo.
+
+        Asserted because the pre-#560 wording led with `python scripts/build_tui.py build`,
+        which an operator who installed a wheel cannot run — `scripts/` ships in the sdist,
+        not the wheel. Pointing someone at a file they do not have is a dead end, so the
+        message must name the toolchain-and-reinstall route too.
+        """
+        message = tui_module._missing_binary_message(Path("/somewhere/cao-tui"))
+
+        assert "rustup.rs" in message, "the operator needs the toolchain link"
+        assert "reinstall" in message.lower(), (
+            "an installed user's actual remedy is to install Rust and reinstall, since they "
+            "have no scripts/ directory to run the build from"
+        )
+
     def test_missing_binary_raises_no_traceback(self, mocker):
         """The operator boundary contract: one styled line, never a stack trace."""
         mocker.patch.object(tui_module, "_locate_binary", return_value=None)

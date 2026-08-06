@@ -66,11 +66,27 @@ So the hook is inert unless it can see the staged binary. It also refuses to gue
 binary is present but the environment asked for a pure wheel (or vice versa), that
 disagreement is a hard error rather than a silent choice, because "silently produced the
 wrong tag" is the defect class this whole file exists to close. (#321)
+
+THE HOOK ALSO BUILDS THE BINARY, NOT JUST TAGS IT (#560)
+--------------------------------------------------------
+Tagging alone left a hole: the binary only ever reached a wheel via cibuildwheel's
+``before-build``, which runs at RELEASE time. Every source install — ``pip install .``,
+``pip install <sdist>``, ``uv tool install <git-url>`` — shipped no TUI, because the
+``artifacts`` glob matched nothing and hatchling treats that as a silent no-op. An operator
+installed from git and got "the TUI binary 'cao-tui' is not present in this installation".
+
+So ``autobuild_binary()`` runs ``scripts/build_tui.py build`` when no binary is staged, making
+a working ``cao tui`` a property of the BUILD rather than of the release pipeline. It degrades
+quietly — no cargo, or a failed compile, means a pure wheel and the existing clear message from
+``cao tui``, never a failed install. See that function's docstring for why None, not raise.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -93,6 +109,15 @@ CIBUILDWHEEL_ENV = "CIBUILDWHEEL"
 # Explicit local override, for building a platform wheel outside cibuildwheel (which is
 # how the macOS path was proven locally). "1"/"true"/"yes"/"on" enable it.
 FORCE_ENV = "CAO_TUI_PLATFORM_WHEEL"
+
+# Opt OUT of the automatic cargo build below. Set falsey to get the pre-#560 behaviour: the
+# binary is staged only by an explicit `python scripts/build_tui.py build`. Exists for a
+# build that must not spend time on cargo (or must not touch the network) even where a
+# toolchain is present.
+AUTOBUILD_ENV = "CAO_TUI_AUTOBUILD"
+
+# Relative to the project root — the staging script this hook shells out to.
+BUILD_SCRIPT_RELATIVE = "scripts/build_tui.py"
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -124,6 +149,94 @@ def staged_binaries(root: str) -> List[Path]:
     return sorted(p for p in package_dir.glob(f"{BINARY_STEM}*") if p.is_file())
 
 
+def autobuild_binary(root: str) -> Optional[Path]:
+    """Compile and stage the TUI binary at build time, or return None if that is not possible.
+
+    THIS IS WHAT MAKES ``cao tui`` WORK FROM A SOURCE INSTALL. (#560)
+
+    Before this existed, the binary reached the wheel by exactly ONE route: cibuildwheel's
+    ``before-build`` hook, which runs only in ``publish-to-pypi.yml`` at release time. Every
+    other path — ``pip install .``, ``pip install <sdist>``, ``uv tool install <git-url>`` —
+    produced a wheel with no binary, because the ``artifacts`` glob pointing at the staging
+    directory matched nothing and hatchling treats that as a SILENT no-op. Measured on a clean
+    clone of ``main``: ``uv build --wheel`` emitted ``py3-none-any`` with no ``cao-tui`` member,
+    and the operator only discovered it at ``cao tui`` time. An operator hit exactly this after
+    a ``uv tool install`` from git.
+
+    So the staging step moves from "something the release pipeline remembers to do" to
+    "something the build itself does". The sdist ships both ``scripts/build_tui.py`` and the
+    full ``tui/`` crate (verified in a real sdist), so this works from an unpacked sdist and
+    not just a git checkout.
+
+    RETURNS None RATHER THAN RAISING, AND THAT IS THE POINT
+    ------------------------------------------------------
+    A missing Rust toolchain must NOT fail the install. ``cao`` is a Python tool whose TUI is
+    one subcommand of many; a contributor with no cargo, and every existing CI job that builds
+    without Rust, must keep working. ``cli/commands/tui.py`` already degrades with a clear,
+    actionable operator message when the binary is absent, so the graceful path is genuinely
+    graceful rather than a silent hole. The caller therefore treats None as "no binary, build a
+    pure wheel" — the pre-existing behaviour, unchanged.
+
+    A cargo build that FAILS is treated the same way, deliberately: a compile error in the
+    crate should not make ``pip install cli-agent-orchestrator`` impossible. It prints cargo's
+    own output (this does not capture it), so the failure is visible in the build log rather
+    than swallowed.
+
+    NOT USED BY cibuildwheel, WHICH KEEPS ITS OWN EXPLICIT STEP
+    ----------------------------------------------------------
+    ``[tool.cibuildwheel] before-build`` still runs ``build_tui.py build`` itself, and must:
+    there a missing binary is a HARD error (``resolve_build_data`` raises), because a release
+    wheel silently missing its binary is the defect this whole file exists to close. This
+    function only fills the gap for builds nobody configured. It is a no-op when the binary is
+    already staged, so the two never fight.
+    """
+    if _env_flag(AUTOBUILD_ENV) is False:
+        print(f"{AUTOBUILD_ENV} is falsey — not building the TUI binary automatically")
+        return None
+
+    script = Path(root) / BUILD_SCRIPT_RELATIVE
+    if not script.is_file():
+        # A wheel built from a tree with no scripts/ (not a shape this repo produces, but
+        # cheap to survive) simply gets no TUI.
+        return None
+
+    # Checked HERE as well as inside build_tui.py so the common no-toolchain case prints one
+    # calm line instead of the script's error path. build_tui.py keeps its own check because
+    # it is also invoked directly, where failing loudly is correct.
+    if shutil.which("cargo") is None:
+        print(
+            "cargo not found — building without the bundled TUI binary. Everything except "
+            "`cao tui` works; install the Rust toolchain (https://rustup.rs) and reinstall "
+            "to enable it."
+        )
+        return None
+
+    print(f"building the TUI binary ({script.name} build) — this needs cargo and may take a minute")
+    try:
+        result = subprocess.run([sys.executable, str(script), "build"], cwd=root, check=False)
+    except OSError as exc:
+        print(f"could not run {script}: {exc} — building without the bundled TUI binary")
+        return None
+
+    if result.returncode != 0:
+        # Loud but non-fatal: cargo's own diagnostics already went to the build log.
+        print(
+            f"{script.name} build failed (exit {result.returncode}) — building without the "
+            "bundled TUI binary. `cao tui` will report it is unavailable."
+        )
+        return None
+
+    staged = staged_binaries(root)
+    if not staged:
+        # Reported success but staged nothing. Do not raise: same graceful contract as above.
+        print(
+            f"{script.name} reported success but staged no {BINARY_STEM} binary — building "
+            "without it."
+        )
+        return None
+    return staged[0]
+
+
 def resolve_build_data(
     root: str,
     target_name: str,
@@ -148,11 +261,27 @@ def resolve_build_data(
     if target_name != "wheel":
         return
 
-    binaries = staged_binaries(root)
     requested = _env_flag(FORCE_ENV)
     if requested is None and os.environ.get(CIBUILDWHEEL_ENV):
         # Under cibuildwheel a platform wheel is the entire point of the run.
         requested = True
+
+    binaries = staged_binaries(root)
+
+    # Build the binary if nobody staged one. This is what turns `pip install .` /
+    # `uv tool install <git-url>` into installs that actually carry a working `cao tui`,
+    # instead of only the release pipeline producing one. (#560)
+    #
+    # ORDERING IS LOAD-BEARING: this must run BEFORE the tag decision below, because that
+    # decision reads `binaries`. Staging after it would leave the binary in the wheel while
+    # the wheel claimed `py3-none-any` — issue #321's original defect, reintroduced.
+    #
+    # SKIPPED when the caller explicitly asked for a pure wheel: compiling a binary only to
+    # raise the contradiction error below would waste a cargo build to produce a failure, and
+    # `CAO_TUI_PLATFORM_WHEEL=0` is how a caller asks for a genuinely pure wheel.
+    if not binaries and requested is not False:
+        autobuild_binary(root)
+        binaries = staged_binaries(root)
 
     # A caller that explicitly asked for a pure wheel while a native binary is staged would
     # get a py3-none-any wheel CONTAINING that binary — precisely the defect. Refuse rather

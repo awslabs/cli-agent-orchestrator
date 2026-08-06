@@ -64,16 +64,25 @@ def _missing_binary_message(expected: Path) -> str:
     matched nothing at build time (defect D1's failure mode), so the wheel installs
     cleanly and only fails here. The message therefore names the exact missing file and
     both remedies rather than leaving the operator to guess.
+
+    THE MOST LIKELY CAUSE CHANGED WITH #560. The build now compiles the binary itself when
+    cargo is available, so "installed from source and forgot to build it" is no longer the
+    common case — a source install without a Rust toolchain is. The old wording sent an
+    operator to `python scripts/build_tui.py build`, which is unavailable from an INSTALLED
+    package (scripts/ ships in the sdist, not the wheel), so the first advice they got could
+    not be followed. Reinstalling with cargo present is the actionable fix. (#560)
     """
     return (
         f"the TUI binary '{_binary_filename()}' is not present in this installation "
         f"(expected at: {expected}).\n"
         "This usually means one of two things:\n"
-        "  1. You installed from source or an editable checkout and have not built it yet.\n"
-        "     Build it with:  python scripts/build_tui.py build\n"
+        "  1. You installed from source without a Rust toolchain, so the binary could not\n"
+        "     be compiled. Install Rust (https://rustup.rs), then reinstall CAO — the\n"
+        "     build compiles and bundles the TUI automatically when cargo is present.\n"
+        "     From a source checkout you can also build it directly:\n"
+        "         python scripts/build_tui.py build\n"
         "  2. The installed wheel was built without the Rust binary, or for a different\n"
-        "     platform. Reinstall a wheel built for this platform, or install from source\n"
-        "     with a Rust toolchain available (https://rustup.rs).\n"
+        "     platform. Reinstall a wheel built for this platform.\n"
         "Everything else in CAO works without it — only `cao tui` needs this binary."
     )
 

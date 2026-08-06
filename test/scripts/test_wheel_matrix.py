@@ -264,6 +264,222 @@ class TestPlatformTagSelection:
 
 
 # ---------------------------------------------------------------------------------------
+# Build-time auto-staging: what makes `cao tui` work from a SOURCE install (#560)
+#
+# The defect these lock in was measured on a clean clone of main: `uv build --wheel` produced
+# `py3-none-any` with no `cao-tui` member, because the binary was only ever staged by
+# cibuildwheel's `before-build` at RELEASE time. An operator's `uv tool install <git-url>`
+# therefore installed a `cao tui` that could not run.
+#
+# The graceful-degradation tests matter as much as the happy path: a missing Rust toolchain
+# must never fail an install, or this fix trades one broken install for a worse one.
+# ---------------------------------------------------------------------------------------
+
+
+class TestAutobuildStagesTheBinary:
+    @staticmethod
+    def _fake_build_script(root: Path, body: str) -> Path:
+        """Write a stand-in scripts/build_tui.py at ``root``.
+
+        A stand-in, not the real script: invoking real cargo here would make this test need a
+        Rust toolchain and a minute of wall-clock, so what is under test is the HOOK's
+        contract with the script — is it invoked, is its exit code honoured, is its staged
+        output picked up — rather than cargo itself. The real script's own build is covered by
+        `test_cargo_build_passes_locked` and proven end-to-end by CI's `uv build`.
+        """
+        scripts = root / "scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        script = scripts / "build_tui.py"
+        script.write_text(body, encoding="utf-8")
+        return script
+
+    def test_autobuild_runs_the_build_script_and_returns_the_staged_binary(self, tmp_path):
+        """The happy path: no binary staged, cargo present, so the hook builds one."""
+        # A script that stages the binary exactly where the artifacts glob looks.
+        self._fake_build_script(
+            tmp_path,
+            "import pathlib, sys\n"
+            "pkg = pathlib.Path(sys.argv[0]).resolve().parents[1] / 'src' / "
+            "'cli_agent_orchestrator'\n"
+            "pkg.mkdir(parents=True, exist_ok=True)\n"
+            "(pkg / 'cao-tui').write_bytes(b'\\x7fELF staged by the hook')\n",
+        )
+
+        staged = hatch_hook.autobuild_binary(str(tmp_path))
+
+        assert staged is not None, "the hook did not stage a binary the build script produced"
+        assert staged.name == "cao-tui"
+        assert staged.read_bytes() == b"\x7fELF staged by the hook"
+
+    def test_resolve_build_data_autobuilds_and_then_tags_for_the_platform(self, tmp_path):
+        """THE FIX, end to end through the real decision function.
+
+        This is the test that would have caught the reported defect: with no binary staged,
+        `resolve_build_data` must now produce a binary AND a platform tag. Before #560 it
+        returned early and left `tag` unset, which is how a `py3-none-any` wheel carrying no
+        TUI reached an operator.
+        """
+        self._fake_build_script(
+            tmp_path,
+            "import pathlib, sys\n"
+            "pkg = pathlib.Path(sys.argv[0]).resolve().parents[1] / 'src' / "
+            "'cli_agent_orchestrator'\n"
+            "pkg.mkdir(parents=True, exist_ok=True)\n"
+            "(pkg / 'cao-tui').write_bytes(b'\\x7fELF')\n",
+        )
+
+        build_data = _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64")
+
+        assert build_data["tag"] == "py3-none-macosx_26_0_arm64", (
+            "a wheel that auto-built a native binary must be tagged for its platform, not "
+            "left as py3-none-any"
+        )
+        assert build_data["pure_python"] is False
+        assert (tmp_path / "src" / "cli_agent_orchestrator" / "cao-tui").is_file()
+
+    def test_install_still_succeeds_when_cargo_is_absent(self, tmp_path, monkeypatch):
+        """The non-negotiable one: no Rust toolchain must NOT fail the build.
+
+        `cao` is a Python tool whose TUI is one subcommand. Raising here would break every
+        contributor and CI job that builds without Rust — a far wider outage than the missing
+        TUI. `cao tui` already prints an actionable message when the binary is absent.
+        """
+        self._fake_build_script(tmp_path, "raise SystemExit('cargo should never be reached')\n")
+        monkeypatch.setattr(hatch_hook.shutil, "which", lambda _name: None)
+
+        assert hatch_hook.autobuild_binary(str(tmp_path)) is None
+
+        # And the wheel is a normal pure wheel: no tag forced, no exception.
+        build_data = _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64")
+        assert "tag" not in build_data
+        assert build_data["pure_python"] is True
+
+    def test_a_failed_build_is_not_staged_even_if_it_left_a_binary_behind(self, tmp_path):
+        """A NON-ZERO exit must be honoured even when a binary is sitting in the staging dir.
+
+        The stand-in stages a binary and THEN fails, because the real ``build_tui.py build``
+        does exactly that: it copies the binary into place first and only afterwards asserts
+        the artifacts glob and NFR-2's 10 MB size ceiling. So "exit non-zero with a staged
+        file present" is a reachable state, not a hypothetical — an over-ceiling or otherwise
+        rejected binary.
+
+        Written this way deliberately: the obvious version of this test (a script that merely
+        exits 1) passes even if the exit-code check is deleted entirely, because there is no
+        binary to find either way. Mutation-verified — replacing the ``returncode`` check with
+        ``if False`` leaves that version GREEN and this one RED.
+        """
+        self._fake_build_script(
+            tmp_path,
+            "import pathlib, sys\n"
+            "pkg = pathlib.Path(sys.argv[0]).resolve().parents[1] / 'src' / "
+            "'cli_agent_orchestrator'\n"
+            "pkg.mkdir(parents=True, exist_ok=True)\n"
+            "(pkg / 'cao-tui').write_bytes(b'REJECTED BY THE BUILD SCRIPT')\n"
+            "sys.exit(101)\n",
+        )
+
+        assert (
+            hatch_hook.autobuild_binary(str(tmp_path)) is None
+        ), "a build that exited non-zero must not have its leftover binary adopted"
+
+    def test_install_still_succeeds_when_the_cargo_build_fails(self, tmp_path):
+        """A compile error in the crate must not make `pip install` impossible either.
+
+        Distinct from the no-cargo case and tested separately: this path runs the script and
+        honours a NON-ZERO exit, where the other never runs it at all.
+        """
+        self._fake_build_script(tmp_path, "import sys\nsys.exit(101)\n")
+
+        assert hatch_hook.autobuild_binary(str(tmp_path)) is None
+
+        build_data = _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64")
+        assert "tag" not in build_data
+        assert build_data["pure_python"] is True
+
+    def test_a_script_that_reports_success_but_stages_nothing_is_not_trusted(self, tmp_path):
+        """Exit 0 is not proof of a staged binary — the D1 failure mode, at this boundary."""
+        self._fake_build_script(tmp_path, "pass\n")
+
+        assert hatch_hook.autobuild_binary(str(tmp_path)) is None
+
+    def test_autobuild_is_skipped_when_a_binary_is_already_staged(self, tmp_path):
+        """cibuildwheel stages via `before-build`; the hook must not rebuild over it.
+
+        The stand-in script would CORRUPT the staged binary if it ran, so the assertion on
+        the bytes is what proves the skip — not merely that a tag came out right.
+        """
+        _stage_binary(tmp_path)
+        original = (tmp_path / "src" / "cli_agent_orchestrator" / "cao-tui").read_bytes()
+        self._fake_build_script(
+            tmp_path,
+            "import pathlib, sys\n"
+            "pkg = pathlib.Path(sys.argv[0]).resolve().parents[1] / 'src' / "
+            "'cli_agent_orchestrator'\n"
+            "(pkg / 'cao-tui').write_bytes(b'REBUILT OVER THE STAGED BINARY')\n",
+        )
+
+        _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64")
+
+        assert (
+            tmp_path / "src" / "cli_agent_orchestrator" / "cao-tui"
+        ).read_bytes() == original, "the hook rebuilt over an already-staged binary"
+
+    def test_autobuild_env_opt_out_prevents_the_build(self, tmp_path, monkeypatch):
+        """`CAO_TUI_AUTOBUILD=0` restores the pre-#560 explicit-staging-only behaviour."""
+        self._fake_build_script(
+            tmp_path,
+            "import pathlib, sys\n"
+            "pkg = pathlib.Path(sys.argv[0]).resolve().parents[1] / 'src' / "
+            "'cli_agent_orchestrator'\n"
+            "pkg.mkdir(parents=True, exist_ok=True)\n"
+            "(pkg / 'cao-tui').write_bytes(b'\\x7fELF')\n",
+        )
+        monkeypatch.setenv(hatch_hook.AUTOBUILD_ENV, "0")
+
+        assert hatch_hook.autobuild_binary(str(tmp_path)) is None
+        assert not (tmp_path / "src" / "cli_agent_orchestrator" / "cao-tui").exists()
+
+    def test_an_explicit_pure_wheel_request_does_not_trigger_a_cargo_build(
+        self, tmp_path, monkeypatch
+    ):
+        """`CAO_TUI_PLATFORM_WHEEL=0` asks for a pure wheel, so building would be wasted work.
+
+        Worse than wasted: the staged binary would then hit the contradiction guard and raise,
+        turning an explicit, legitimate request into a failed build.
+        """
+        self._fake_build_script(
+            tmp_path,
+            "import pathlib, sys\n"
+            "pkg = pathlib.Path(sys.argv[0]).resolve().parents[1] / 'src' / "
+            "'cli_agent_orchestrator'\n"
+            "pkg.mkdir(parents=True, exist_ok=True)\n"
+            "(pkg / 'cao-tui').write_bytes(b'\\x7fELF')\n",
+        )
+        monkeypatch.setenv(hatch_hook.FORCE_ENV, "0")
+        monkeypatch.delenv(hatch_hook.CIBUILDWHEEL_ENV, raising=False)
+
+        build_data = _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64")
+
+        assert build_data["pure_python"] is True
+        assert not (tmp_path / "src" / "cli_agent_orchestrator" / "cao-tui").exists()
+
+    def test_the_sdist_target_never_autobuilds(self, tmp_path):
+        """An sdist carries source. Compiling a binary for it would be pure wasted time."""
+        self._fake_build_script(
+            tmp_path,
+            "import pathlib, sys\n"
+            "pkg = pathlib.Path(sys.argv[0]).resolve().parents[1] / 'src' / "
+            "'cli_agent_orchestrator'\n"
+            "pkg.mkdir(parents=True, exist_ok=True)\n"
+            "(pkg / 'cao-tui').write_bytes(b'\\x7fELF')\n",
+        )
+
+        _resolve(tmp_path, "cp312-cp312-macosx_26_0_arm64", target_name="sdist")
+
+        assert not (tmp_path / "src" / "cli_agent_orchestrator" / "cao-tui").exists()
+
+
+# ---------------------------------------------------------------------------------------
 # The publish gate: the full platform set, and no 'any' wheel
 # ---------------------------------------------------------------------------------------
 
