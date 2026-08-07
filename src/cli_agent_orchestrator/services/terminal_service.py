@@ -174,26 +174,47 @@ def _roll_back_backend_create_locked(
       linger in memory or bleed into a future reuse of the name.
     * ``created_session=False`` — this call only added a WINDOW to a session that
       already existed (``new_session=False``: every MCP spawn/assign-into-an-
-      existing-session call). Kill ONLY that window. The pre-existing session
-      must stay up and its other terminals must be untouched; killing this one
-      window cannot collapse it, since the session pre-existed and therefore
-      still holds at least one other window.
+      existing-session call). Kill ONLY that window, so the pre-existing session
+      and its other terminals are left alone. Note this is not a guarantee that
+      the session survives: tmux drops a session when its last window dies, and
+      the peer window that made the session non-empty at the `session_exists`
+      check can be reaped by its own process exiting before this rollback runs —
+      the lifecycle lock serializes CAO's transitions, not a pane's exit. In that
+      race the session collapses and the peer's registry row is left pointing at
+      a dead session. Killing the whole session instead would be strictly worse
+      (it would destroy peers that ARE alive, which is the common case), so this
+      stays window-scoped; the residual race is the same one the outer `except`
+      path already carries and is tracked separately.
 
     Best-effort and never raises: it runs while an exception is already in
     flight, and that original failure is the one the caller must see.
     """
     if created_session:
         try:
-            get_backend().kill_session(session_name)
+            if not get_backend().kill_session(session_name):
+                # Falsy means the backend could not confirm the kill (or found
+                # nothing to kill). Either way the name may still be live, so say
+                # so — a silent branch here is how an orphan goes unnoticed.
+                logger.warning(
+                    f"Rollback: kill_session({session_name}) did not confirm the kill; "
+                    "the session may still be live"
+                )
         except Exception:
             logger.exception(f"Rollback: failed to kill session {session_name}")
+        # Deliberately outside the kill's try: the env mapping must be dropped
+        # even when the kill failed, or a secret outlives the session it was
+        # forwarded to.
         try:
             clear_session_env(session_name)
         except Exception:
             logger.exception(f"Rollback: failed to clear session env for {session_name}")
     else:
         try:
-            get_backend().kill_window(session_name, window_name)
+            if not get_backend().kill_window(session_name, window_name):
+                logger.warning(
+                    f"Rollback: kill_window({session_name}:{window_name}) did not confirm "
+                    "the kill; the window may still be live"
+                )
         except Exception:
             logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
 
@@ -404,17 +425,28 @@ async def create_terminal(
             needs all three: create_window may rename the window, and the
             failure path keys its cleanup off which one this call created.
 
-            A failure ANYWHERE after the backend create rolls the backend
-            resource back HERE, still holding the lock, before re-raising, so
-            this function is all-or-nothing: on return the tmux session/window
-            and its registry row both exist; on raise neither does. Without that
-            the outer flags below would still be False (they are only assigned
-            from a successful RETURN), the `except` cleanup would tear down
-            nothing, and the failure would leave a live tmux session with no
-            registry row — the exact divergence #498 exists to eliminate. A
-            "database is locked" OperationalError out of db_create_terminal is
-            an ordinary outcome under CAO's concurrent writers, so this is a
-            routine path, not a pathological one.
+            A failure after the backend create RETURNS rolls that resource back
+            HERE, still holding the lock, before re-raising: on return the tmux
+            session/window and its registry row both exist, and on such a raise
+            neither does. Without that the outer flags below would still be False
+            (they are only assigned from a successful RETURN), the `except`
+            cleanup would tear down nothing, and the failure would leave a live
+            tmux session with no registry row — the exact divergence #498 exists
+            to eliminate. A "database is locked" OperationalError out of
+            db_create_terminal is an ordinary outcome under CAO's concurrent
+            writers, so this is a routine path, not a pathological one.
+
+            NOT covered (pre-existing, and deliberately not claimed): a failure
+            INSIDE the backend create itself, after it has already made the tmux
+            resource but before it returns. `TmuxClient.create_session` lands the
+            session at `server.new_session(...)` and only then reads
+            `session.windows[0].name` — a fresh list-windows fetch that can raise
+            (IndexError, or its own `ValueError` when the name is None), with
+            `create_window` shaped the same way. That leaks a session/window this
+            closure never learns about, so the rollback below cannot fire. Same
+            gap existed pre-#498, which set its flag only after the create
+            returned. Closing it needs the guard to extend INTO the backend
+            create; tracked separately.
 
             Why the rollback is INSIDE the lock rather than reported out to the
             outer cleanup path: the lock's entire purpose is that, for one

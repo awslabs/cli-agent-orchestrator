@@ -24,9 +24,9 @@ scrollback is an explicit step of the teardown, and it deliberately runs
 *before* the session kill, since scrollback only exists while the pane does. A
 crash bypasses both paths, so nothing is captured.
 
-Session-level capture is best-effort per terminal — a terminal whose snapshot
-fails is logged and the teardown continues, so a session shutdown does not
-guarantee a snapshot for every terminal the way an individual delete does.
+Capture is best-effort everywhere, not just at session level: a snapshot whose
+write fails is logged and teardown continues regardless of which path took it.
+So "Yes" above means the path attempts a snapshot, not that one is guaranteed.
 
 ## Snapshot files
 
