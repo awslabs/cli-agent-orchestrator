@@ -110,6 +110,25 @@ if ! curl -s -o /dev/null "$BASE/health"; then
 fi
 printf '  up (pid %s)\n' "$SERVER_PID"
 
+# Baseline the live install BEFORE this run touches anything, so J2 can assert
+# that this run changed nothing rather than that the machine was pristine.
+LIVE_DB_BASELINE="$HOME/.aws/cli-agent-orchestrator/db/cli-agent-orchestrator.db"
+LIVE_ROWS_BEFORE=0
+if [[ -f "$LIVE_DB_BASELINE" ]]; then
+  LIVE_ROWS_BEFORE=$("$VENV_PY" - "$LIVE_DB_BASELINE" <<'PYB'
+import sqlite3, sys
+try:
+    conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tracker_%'")]
+    print(sum(conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in tables))
+except Exception:
+    print("unreadable")
+PYB
+)
+fi
+printf '  live-install tracker rows before this run: %s\n' "$LIVE_ROWS_BEFORE"
+
 # Fixture directories. Note the sibling that shares a name prefix — A3.
 CONDUCTOR="$WORK/repos/cao-conductor"
 FORK="$WORK/repos/cli-agent-orchestrator"
@@ -437,7 +456,12 @@ except Exception:
     print("unreadable")
 PY
 )
-  check J2 "no tracker rows leaked into the live install" 0 "$LIVE_ROWS"
+  # Asserted as a DELTA, not an absolute. The absolute was a property of the
+  # machine rather than of the run: the moment the tracker is actually adopted —
+  # the point of shipping it — the live install legitimately holds rows and this
+  # check went red for everyone, forever. A green result whose lifetime is
+  # "until somebody uses the feature" is worse than no check.
+  check J2 "this run leaked no rows into the live install" "$LIVE_ROWS_BEFORE" "$LIVE_ROWS"
 else
   printf '  \033[33mskip\033[0m J2   no live database at %s\n' "$LIVE_DB"
 fi

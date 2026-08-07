@@ -542,3 +542,79 @@ class TestExportCompleteness:
         rendered = tracker.render_markdown("cao-system")
         assert rendered.count("\n## cond-") == 505
         assert "505 issue(s)" in rendered
+
+
+class TestPrefixNamespaceIsTheKeyTable:
+    """A vacated prefix is not a free prefix.
+
+    Found by independent review. Ownership was checked against the PROJECT
+    table, so a project that renamed its prefix left its issues holding those
+    keys while the prefix read as unowned. Giving it to a new project made every
+    filing collide — and because the counter bump shares a transaction with the
+    insert, the rollback took the bump too, so the counter never advanced and
+    the wedge was permanent: HTTP 500 on every filing, forever.
+    """
+
+    def test_a_vacated_prefix_is_still_refused_while_keys_hold_it(self, cao_system):
+        tracker.create_issue(project_id="cao-system", title="a")
+        tracker.update_project("cao-system", issue_prefix="cs")
+        with pytest.raises(TrackerError) as exc:
+            tracker.create_project(name="Beta", project_id="beta", issue_prefix="cond")
+        assert exc.value.code == "conflict"
+        assert "cond-0001" in exc.value.message
+
+    def test_the_refusal_names_a_key_and_its_project(self, cao_system):
+        tracker.create_issue(project_id="cao-system", title="a")
+        tracker.update_project("cao-system", issue_prefix="cs")
+        with pytest.raises(TrackerError) as exc:
+            tracker.create_project(name="Beta", project_id="beta", issue_prefix="cond")
+        assert "cao-system" in exc.value.message
+
+    def test_a_prefix_with_no_keys_left_is_reclaimable(self, cao_system):
+        # Vacated AND unused must stay available, or a typo'd prefix would be
+        # burned permanently.
+        tracker.update_project("cao-system", issue_prefix="cs")
+        got = tracker.create_project(name="Beta", project_id="beta", issue_prefix="cond")
+        assert got["issue_prefix"] == "cond"
+
+    def test_force_deleting_a_project_frees_its_prefix_with_its_keys(self, cao_system):
+        tracker.create_issue(project_id="cao-system", title="a")
+        tracker.delete_project("cao-system", force=True)
+        got = tracker.create_project(name="Successor", project_id="succ", issue_prefix="cond")
+        assert got["issue_prefix"] == "cond"
+
+    def test_a_project_keeps_its_own_prefix_through_an_unrelated_edit(self, cao_system):
+        tracker.create_issue(project_id="cao-system", title="a")
+        updated = tracker.update_project("cao-system", name="Renamed", issue_prefix="cond")
+        assert updated["issue_prefix"] == "cond"
+
+
+class TestDuplicateScopesInOneRequest:
+    def test_the_same_value_twice_is_a_conflict_not_a_500(self, tmp_path):
+        with pytest.raises(TrackerError) as exc:
+            tracker.create_project(
+                name="P",
+                project_id="p",
+                scopes=[
+                    {"kind": "path", "value": str(tmp_path)},
+                    {"kind": "path", "value": str(tmp_path) + "/"},
+                ],
+            )
+        assert exc.value.code == "conflict"
+        assert "twice" in exc.value.message
+
+
+class TestLabelFilterWildcards:
+    """`%` and `_` are LIKE wildcards and legal label characters."""
+
+    def test_an_underscore_label_does_not_match_every_single_character_label(self, cao_system):
+        tracker.create_issue(project_id="cao-system", title="a", labels=["_"])
+        tracker.create_issue(project_id="cao-system", title="b", labels=["x"])
+        got = tracker.list_issues(project_id="cao-system", label="_")
+        assert [i["title"] for i in got["issues"]] == ["a"]
+
+    def test_a_percent_label_does_not_match_everything(self, cao_system):
+        tracker.create_issue(project_id="cao-system", title="a", labels=["100%"])
+        tracker.create_issue(project_id="cao-system", title="b", labels=["other"])
+        got = tracker.list_issues(project_id="cao-system", label="%")
+        assert got["total"] == 0

@@ -162,3 +162,38 @@ class TestPrune:
         clock.advance(600)
         _, unchanged = obs.observe("%2")
         assert unchanged is None
+
+
+class TestPruneIsWiredIn:
+    """The cache must be pruned by the pass that already knows the live set.
+
+    Found by independent review: `prune()` and `forget()` existed and nothing
+    called them. Two consequences — a slow leak on a weeks-long server, and a
+    recycled pane id (tmux reissues them after a server restart) inheriting the
+    dead pane's quiet clock, which can accuse a genuinely fresh pane of being
+    wedged about twenty minutes in.
+    """
+
+    def test_projection_prunes_vanished_panes(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_projection as tp
+
+        pruned = {}
+        monkeypatch.setattr(tp, "_observed_panes", lambda: {"%1": {}, "%2": {}})
+        monkeypatch.setattr(tp, "list_terminals_by_session", lambda name: [])
+        monkeypatch.setattr(
+            tp.observer, "prune", lambda live: pruned.setdefault("live", list(live))
+        )
+        tp.project_session("s")
+        assert sorted(pruned["live"]) == ["%1", "%2"]
+
+    def test_an_unreadable_enumeration_prunes_nothing(self, monkeypatch):
+        # None means "this pass could not enumerate", not "no pane is live".
+        # Pruning on it would evict every clock and reset the wedge detector.
+        from cli_agent_orchestrator.services import terminal_projection as tp
+
+        called = []
+        monkeypatch.setattr(tp, "_observed_panes", lambda: None)
+        monkeypatch.setattr(tp, "list_terminals_by_session", lambda name: [])
+        monkeypatch.setattr(tp.observer, "prune", lambda live: called.append(live))
+        tp.project_session("s")
+        assert called == []

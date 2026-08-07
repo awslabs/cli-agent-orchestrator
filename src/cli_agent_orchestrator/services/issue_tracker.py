@@ -321,6 +321,16 @@ def create_project(
         (normalise_scope_value(s.get("kind", ""), s.get("value", "")), _validate_choice(s.get("kind", ""), SCOPE_KINDS, "scope kind"))
         for s in (scopes or [])
     ]
+    # Two scopes in ONE request that normalise to the same value used to reach
+    # the unique constraint and surface as a raw 500. It is the same conflict as
+    # a cross-project clash and deserves the same answer.
+    seen_values = set()
+    for value, _kind in prepared:
+        if value in seen_values:
+            raise TrackerError(
+                "conflict", f"scope {value!r} is listed twice in this request"
+            )
+        seen_values.add(value)
 
     with SessionLocal() as db:
         if db.get(TrackerProjectModel, slug) is not None:
@@ -369,6 +379,27 @@ def _assert_prefix_free(db: Any, prefix: str, *, owner: str) -> None:
             "conflict",
             f"issue prefix {prefix!r} is already used by project {clash.id!r}; "
             "issue keys are unique across the installation, so each project needs its own",
+        )
+
+    # A project that VACATED a prefix leaves its issues behind still holding
+    # those keys, so "no project owns it" is not the same as "the namespace is
+    # free". Handing it to a new project made every filing there collide with a
+    # key that already exists — and because the counter bump and the insert
+    # share one transaction, the rollback took the bump with it, so the counter
+    # never advanced and the wedge was permanent. The key table is the real
+    # namespace; ask it.
+    taken = (
+        db.query(TrackerIssueModel)
+        .filter(TrackerIssueModel.key.like(f"{prefix}-%"))
+        .filter(TrackerIssueModel.project_id != owner)
+        .first()
+    )
+    if taken is not None:
+        raise TrackerError(
+            "conflict",
+            f"issue prefix {prefix!r} is still held by existing keys "
+            f"(e.g. {taken.key} in project {taken.project_id!r}); keys outlive the "
+            "project that minted them, so the prefix is not free",
         )
 
 
@@ -978,8 +1009,12 @@ def list_issues(
             q = q.filter(TrackerIssueModel.reporter == reporter)
         if label:
             # Substring match against the JSON array. Quoted on both sides so
-            # `ui` cannot match `ui-polish`.
-            q = q.filter(TrackerIssueModel.labels.like(f'%"{label}"%'))
+            # `ui` cannot match `ui-polish`. `%` and `_` are LIKE wildcards and
+            # are legal label characters, so they are escaped — otherwise a
+            # label of `_` matches every single-character label, which is a
+            # silently over-broad filter rather than an error anybody sees.
+            needle = label.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            q = q.filter(TrackerIssueModel.labels.like(f'%"{needle}"%', escape="\\"))
         if query:
             needle = f"%{query.strip()}%"
             q = q.filter(

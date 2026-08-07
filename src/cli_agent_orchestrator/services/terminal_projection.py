@@ -41,6 +41,7 @@ from cli_agent_orchestrator.clients.database import (
     report_terminal_missing_from_every_store,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services.pane_observer import observer
 from cli_agent_orchestrator.services import terminal_service
 
 logger = logging.getLogger(__name__)
@@ -231,8 +232,6 @@ def _inactive_seconds(row: Dict[str, Any]) -> Optional[float]:
 def _fused_status(row: Dict[str, Any], *, native_tui: bool):
     """Fuse every available signal for one LIVE terminal."""
     from cli_agent_orchestrator.services import status_fusion as sf
-    from cli_agent_orchestrator.services.pane_observer import observer
-
     terminal_id = row["id"]
     lines, unchanged_for = observer.observe(row.get("pane_id"))
 
@@ -374,6 +373,20 @@ def project_session(session_name: str) -> List[Dict[str, Any]]:
             else get_terminal_metadata(row["id"])
         )
         projected.append(project_row(full or row, panes, vintage=vintage))
+
+    # The observer holds one viewport sample per pane id for the process's
+    # lifetime, and tmux reissues pane ids after a server restart. An entry
+    # outliving its pane is a slow leak; a RECYCLED id inheriting the dead
+    # pane's quiet clock is worse — it can accuse a genuinely fresh pane of
+    # being wedged about twenty minutes in. `panes` is the live set this pass
+    # already computed, so pruning here costs nothing extra.
+    #
+    # Scoped to the panes observed in THIS pass: a session-scoped projection
+    # sees only its own session's panes, so pruning against `panes` (the whole
+    # observed fleet) rather than the projected subset is what keeps a
+    # single-session refresh from evicting every other session's clock.
+    if panes:
+        observer.prune(panes)
     return projected
 
 
