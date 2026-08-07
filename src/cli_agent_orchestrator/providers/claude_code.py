@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -129,9 +129,36 @@ THINKING_BEFORE_SEPARATOR_PATTERN = re.compile(
     re.MULTILINE,
 )
 IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" prompt styles
-WAITING_USER_ANSWER_PATTERN = (
-    r"↑/↓ to navigate"  # Ink TUI footer shown only while a selection widget is active
-)
+# Broadened beyond the original arrow-key-navigate footer to also catch the "Enter to confirm ·
+# Esc to cancel" footer Ink's Select component renders for a plain numbered/lettered choice --
+# confirmed live via a real, deterministic repro (CLAUDE_CODE_FORCE_FULLSCREEN_UPSELL=1, the CLI's
+# own env var for forcing its "Try the new fullscreen renderer?" first-run upsell, found via
+# `strings` on the installed binary) that this exact footer text is what a brand-new,
+# never-before-seen CLI prompt used, distinct wording from the arrow-navigable case. This is
+# deliberately generic CHROME text, not any one prompt's own wording -- the point is to classify a
+# FUTURE, still-unrecognized choice-type prompt as WAITING_USER_ANSWER too, not just the specific
+# prompts this file happens to already special-case by name below. Confirmed this does not
+# overlap PLAN_APPROVAL_PATTERN's own dialog below: that dialog's real footer is "shift+tab to
+# approve with feedback" (see test_plan_approval_active_with_option_markers_is_waiting), not this
+# text, and PLAN_APPROVAL_PATTERN's own bottom_region check only runs once this check has already
+# missed. TRUST_PROMPT_PATTERN/BYPASS_PROMPT_PATTERN are explicitly excluded below so the
+# trust/bypass dialogs -- which this file DOES actively dismiss, in _handle_startup_prompts -- are
+# never reported as WAITING_USER_ANSWER while still unaccepted.
+#
+# "Enter to confirm" is anchored to the "[ \t]*·" that follows it in both live-captured footers
+# (e.g. "Enter to confirm · Esc to cancel") rather than matching the bare prose. A settled/completed
+# turn whose response TEXT happens to contain "...press Enter to confirm your changes..." within
+# the bottom_chrome window (get_status's last-6-lines anchor) is not followed by that chrome
+# separator, so it no longer false-matches as WAITING_USER_ANSWER (see
+# test_get_status_completed_response_mentioning_enter_to_confirm_is_not_waiting). Anchored to
+# same-line whitespace only (round-3 review nit, gutosantos82) -- a bare "\s*" also matches
+# newlines, so a completed turn whose bottom-chrome window happens to end "...Enter to confirm"
+# with the next line starting "·" would still false-match; real footers always render the
+# separator on the same line, so "[ \t]*" is strictly tighter with no loss of real-footer coverage.
+# The "↑/↓ to navigate" arm has the same class of false-positive risk from agent prose (see the
+# existing xfail test_agent_prose_with_nav_text_in_footer_false_waiting) but is left as-is here --
+# out of scope for this fix, which only addresses the "Enter to confirm" case flagged in review.
+WAITING_USER_ANSWER_PATTERN = r"↑/↓ to navigate|Enter to confirm[ \t]*·"
 PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
@@ -685,18 +712,41 @@ class ClaudeCodeProvider(BaseProvider):
         await self._handle_startup_prompts(outer_timeout=init_timeout)
 
         # Wait for Claude Code prompt to be ready.
-        # Accept both IDLE and COMPLETED — some CLI versions show a startup
+        # Accept IDLE, COMPLETED, and WAITING_USER_ANSWER — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
         # The StatusMonitor push pipeline (FifoReader -> get_status(buffer))
         # drives wait_until_status; it only fires once the provider's own
         # get_status returns IDLE/COMPLETED on Claude-rendered content, so the
         # old stale-zsh-prompt false-IDLE guard is no longer needed.
+        #
+        # WAITING_USER_ANSWER added to this accept-set on purpose. Before this change, ANY
+        # interactive choice-type prompt this file doesn't explicitly dismiss (bypass/trust above)
+        # was structurally indistinguishable from a genuinely hung/broken launch: both left the
+        # terminal sitting outside {IDLE, COMPLETED} until init_timeout, at which point
+        # `create_terminal`'s own except-block tore the whole session down (kill_session, FIFO
+        # stop, DB row deleted) -- so the operator never even got a CHANCE to see and answer it.
+        # Confirmed live and 100% reproducible on an unpatched build via
+        # CLAUDE_CODE_FORCE_FULLSCREEN_UPSELL=1. WAITING_USER_ANSWER is CAO's own existing,
+        # positive-evidence-only status (never a default/fallback -- see get_status()'s own
+        # WAITING_USER_ANSWER_PATTERN check above), so accepting it here cannot make initialize()
+        # return early on a blank/still-launching terminal the way accepting UNKNOWN would.
         if not await wait_until_status(
             self.terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
             timeout=init_timeout,
             polling_interval=1.0,
         ):
+            # Bare TimeoutError here, not TerminalInputBlockedError (round-3 review fix,
+            # call-me-ram): this is the genuine "never reached any recognized status" case --
+            # IDLE/COMPLETED/WAITING_USER_ANSWER all missed within the timeout window. The
+            # keep-worker-alive signal for a *recognized* WAITING_USER_ANSWER prompt no longer
+            # needs to flow through this raise site as of the round-2 fix -- it now comes from
+            # send_input's own guard (ClaudeCodeProvider.blocks_orchestrated_input_while_waiting_user_answer),
+            # which fires independently of what exception initialize() raises. Keeping this
+            # fallback a TimeoutError instead restores main's clean teardown for a genuinely
+            # broken/unrecognized launch, rather than leaving an unreapable worker alive in
+            # UNKNOWN status that answer_user_prompt would hard-refuse to touch (it only accepts
+            # WAITING_USER_ANSWER) and that no watchdog reaps.
             raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
 
         # The status wait fires as soon as the input box RENDERS, but the Ink
@@ -874,6 +924,12 @@ class ClaudeCodeProvider(BaseProvider):
         bottom_region = "\n".join(lines[-_DIALOG_BOTTOM_LINES:])
         # AskUserQuestion footer can be pushed down by notes-hint, error banner,
         # or IDE status line — use a 6-line anchor.
+        # Deliberately asymmetric window sizes (round-3 review, gutosantos82): the trust/bypass
+        # exclusion below reads the wider 15-line bottom_region while the WAITING match itself
+        # reads only the narrower 6-line bottom_chrome. This is fail-closed, not a bug -- the
+        # exclusion window being a strict superset of the match window means a trust/bypass dialog
+        # can only ever be excluded MORE often, never less, so it can't accidentally let a real
+        # trust/bypass dialog through as WAITING_USER_ANSWER.
         bottom_chrome = "\n".join(lines[-6:])
 
         if not re.search(TRUST_PROMPT_PATTERN, bottom_region) and not re.search(
@@ -1127,6 +1183,28 @@ class ClaudeCodeProvider(BaseProvider):
         isn't ready to accept input even though get_status() sees PROCESSING.
         """
         return self._initialized
+
+    @property
+    def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
+        """Claude Code's Ink Select/choice dialogs consume pasted text as the answer.
+
+        initialize() now succeeds (rather than timing out) when startup lands on a
+        recognized choice-prompt, classifying it WAITING_USER_ANSWER instead of
+        tearing the session down (see the WAITING_USER_ANSWER acceptance in
+        initialize() above). Without this override, the deferred-init path
+        (_schedule_deferred_init -> send_input(initial_message)) would proceed
+        straight through send_input's guard (services/terminal_service.py) — which
+        only fires when this property is True — and paste the assigned task text
+        plus Enter into the live widget, auto-confirming whichever option happens
+        to be highlighted. That is exactly the "auto-answer a prompt a human should
+        see" behavior issue #538 deliberately rejected; pre-#539 the same scenario
+        at least ended in a clean teardown + notification rather than a silent
+        wrong answer. Opting in here (matching antigravity_cli/hermes) makes
+        send_input raise TerminalInputBlockedError instead, so
+        _schedule_deferred_init's existing WAITING_USER_ANSWER handling leaves the
+        worker alive for answer_user_prompt rather than auto-pasting into it.
+        """
+        return True
 
     def mark_input_received(self) -> None:
         """Capture content-based snapshots for the staleness guard (issue #407).

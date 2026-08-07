@@ -48,7 +48,11 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    Terminal,
+    TerminalInputBlockedError,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
     PostCreateTerminalEvent,
@@ -93,10 +97,6 @@ _memory_injected_lock = threading.Lock()
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
-
-
-class TerminalInputBlockedError(Exception):
-    """Raised when orchestrated input would answer an active interactive prompt."""
 
 
 def inject_memory_context(first_message: str, terminal_id: str) -> str:
@@ -845,14 +845,28 @@ def _schedule_deferred_init(
                 update_terminal_shell_command(terminal_id, shell_command)
             if initial_message:
                 # For assign/handoff the sender is the CALLER (the supervisor),
-                # not this MCP server. But the deferred path is used only via
-                # /assign, and _assign_impl on the MCP-server side already
-                # embedded the callback instructions into initial_message.
+                # not this MCP server; _assign_impl on the MCP-server side already
+                # embedded the callback instructions into initial_message. The
+                # deferred path is also reached from POST /sessions?initial_message=
+                # (session_service.create_session), which has no supervisor and no
+                # orchestration_type requirement on its caller.
                 # We still pass sender_id=caller_id if present in DB metadata
                 # so plugin events see it.
                 metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
                 if metadata:
                     caller_id = metadata.get("caller_id")
+                # Round-3 review fix (call-me-ram): a raw POST /sessions caller that
+                # supplies initial_message with no orchestration_type previously sailed
+                # straight past send_input's WAITING_USER_ANSWER guard entirely -- the
+                # guard only fires for OrchestrationType.ASSIGN/HANDOFF, so an unstated
+                # type meant no protection at all against pasting the initial task into
+                # a live choice prompt. Every call that reaches THIS function is by
+                # construction an unattended initial-task delivery (never an interactive
+                # human answer -- those go through answer_user_prompt's own separate
+                # /terminals/{id}/input call, which never routes through
+                # _schedule_deferred_init), so defaulting an unstated orchestration_type
+                # to ASSIGN here is always correct and cannot affect answer_user_prompt.
+                effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
                 # send_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
                 await asyncio.to_thread(
@@ -861,7 +875,7 @@ def _schedule_deferred_init(
                     initial_message,
                     registry=registry,
                     sender_id=caller_id,
-                    orchestration_type=orchestration_type,
+                    orchestration_type=effective_orchestration_type,
                 )
                 # Delivery can be silently dropped (Enter swallowed / paste lost)
                 # when the TUI isn't input-ready. Confirm the worker actually
@@ -872,7 +886,10 @@ def _schedule_deferred_init(
                     initial_message,
                     registry,
                     caller_id,
-                    orchestration_type,
+                    # Same guard-eligible default as the initial send_input above --
+                    # a resubmit is still an unattended initial-task delivery, so it
+                    # must not silently drop back to the unguarded original type.
+                    effective_orchestration_type,
                     provider=provider_instance,
                 )
                 if not started:
@@ -910,8 +927,10 @@ def _schedule_deferred_init(
                 _notify_caller_of_deferred_failure,
                 terminal_id,
                 f"Worker {terminal_id} is waiting on an interactive prompt; the "
-                f"assigned task has not been delivered yet. Use answer_user_prompt "
-                f"to unblock it, then it will receive the task.",
+                f"assigned task has not been delivered. Use answer_user_prompt to "
+                f"clear the prompt, then re-send the task yourself (e.g. via "
+                f"send_message) -- it is not automatically re-delivered once the "
+                f"prompt is answered.",
                 registry,
                 delete_worker=False,
             )
