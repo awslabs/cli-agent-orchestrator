@@ -189,6 +189,12 @@ class TestAntigravityCliSkills:
         _run_skill_injection_test(provider="antigravity_cli", agent_profile="developer")
 
 
+@pytest.mark.e2e
+class TestOmpSkills:
+    def test_skill_catalog_is_appended(self, require_omp):
+        _run_skill_injection_test(provider="omp", agent_profile="developer")
+
+
 # ---------------------------------------------------------------------------
 # Skill API endpoint test (deterministic — no agent needed)
 # ---------------------------------------------------------------------------

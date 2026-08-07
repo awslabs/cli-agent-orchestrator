@@ -17,6 +17,7 @@ CAO orchestrates AI coding CLI agents from multiple providers within the same se
 | **Kimi CLI** | `kimi_cli` | Moonshot API key | [Provider docs](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/kimi-cli.md) |
 | **GitHub Copilot CLI** | `copilot_cli` | GitHub auth | [Provider docs](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/copilot-cli.md) |
 | **OpenCode CLI** | `opencode_cli` | Per-model API key | [Provider docs](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/opencode-cli.md) |
+| **Oh My Pi** | `omp` | OMP authenticated model account | [Provider docs](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/omp-cli.md) |
 | **Cursor CLI** | `cursor_cli` | Cursor subscription / API key | [Provider docs](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/cursor-cli.md) |
 | **Antigravity CLI** | `antigravity_cli` | Google account | [Provider docs](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/antigravity-cli.md) |
 
@@ -29,7 +30,7 @@ CAO orchestrates AI coding CLI agents from multiple providers within the same se
 cao launch --agents code_supervisor --provider claude_code
 
 # Valid values: kiro_cli | claude_code | codex | antigravity_cli |
-#              hermes | kimi_cli | copilot_cli | opencode_cli | cursor_cli
+#              hermes | kimi_cli | copilot_cli | opencode_cli | omp | cursor_cli
 ```
 
 ### In an agent profile (frontmatter)
@@ -117,6 +118,7 @@ Each provider preserves its native capabilities inside CAO:
 - **Hermes** -- profile aliases, structured approval prompts (`answer_user_prompt`)
 - **Copilot CLI** -- baked-in `.agent.md` skill delivery
 - **OpenCode** -- CAO-managed config root, temporary inbox polling fallback
+- **Oh My Pi** -- native `.omp` configuration and skills preserved; CAO context/MCP are additive
 
 ## Status Detection
 

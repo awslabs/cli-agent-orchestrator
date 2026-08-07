@@ -32,6 +32,7 @@ from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.omp import OmpProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 
 
@@ -48,6 +49,7 @@ PROVIDERS = [
     pytest.param(CopilotCliProvider, None, id="copilot_cli"),
     pytest.param(KimiCliProvider, "_has_received_input", id="kimi_cli"),
     pytest.param(OpenCodeCliProvider, None, id="opencode_cli"),
+    pytest.param(OmpProvider, "_turns", id="omp"),
     pytest.param(CursorCliProvider, "_turns", id="cursor_cli"),
     pytest.param(AntigravityCliProvider, "_turns", id="antigravity_cli"),
     pytest.param(HermesProvider, None, id="hermes"),
